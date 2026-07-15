@@ -884,16 +884,16 @@ fn settings_nav_switches_panes(cx: &mut TestAppContext) {
 fn settings_backends_tabs_switch(cx: &mut TestAppContext) {
     use eidola_gui::backends_settings::BackendsTab;
 
-    // The Backends pane's internal tab strip is view-local state. Account
-    // moved from a top-level pane into the Eidola tab, so the three tabs
-    // (Eidola · Local · External) are how you reach each surface.
+    // The Backends pane's internal tab strip is view-local state. The three
+    // tabs (Eidola · Local · External) split the registry; the Eidola tab is
+    // the connection + trust surface (base URL / measurements / hardware CAs).
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
     });
     let pane = view.read_with(cx, |v, _| v.backends_pane());
 
-    // Eidola is the resting tab (it hosts the account).
+    // Eidola is the resting tab.
     pane.read_with(cx, |p, _| assert_eq!(p.tab(), BackendsTab::Eidola));
 
     pane.update(cx, |p, cx| p.select_tab(BackendsTab::Local, cx));
@@ -904,11 +904,151 @@ fn settings_backends_tabs_switch(cx: &mut TestAppContext) {
 
     pane.update(cx, |p, cx| p.select_tab(BackendsTab::Eidola, cx));
     pane.read_with(cx, |p, _| assert_eq!(p.tab(), BackendsTab::Eidola));
+}
 
-    // The embedded Account view is reachable through the pane (its reset
-    // flow is now hosted in the Eidola tab).
-    let account = pane.read_with(cx, |p, _| p.account());
+#[gpui::test]
+fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
+    // Account and Wallet nav items render only while the eidola backend is
+    // enabled — nav visibility doubles as state.
+    let enabled = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
+    });
+    let (_w, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(enabled.clone(), WindowInput::new(cx), window, cx))
+    });
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.visible_panes(cx),
+            vec![
+                SettingsPane::General,
+                SettingsPane::Backends,
+                SettingsPane::Account,
+                SettingsPane::Wallet,
+            ],
+            "eidola enabled shows all four panes"
+        );
+    });
+
+    let disabled = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(false);
+    });
+    let (_w2, view2) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(disabled.clone(), WindowInput::new(cx), window, cx))
+    });
+    view2.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.visible_panes(cx),
+            vec![SettingsPane::General, SettingsPane::Backends],
+            "eidola disabled hides Account and Wallet"
+        );
+    });
+}
+
+#[gpui::test]
+fn settings_selection_falls_back_when_eidola_disabled(cx: &mut TestAppContext) {
+    // Selecting Account, then disabling eidola (the toggle lives in Backends →
+    // Eidola, but a Change::Backends refresh can arrive any time), must fall
+    // the selection back to Backends — never a blank body or phantom nav.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
+    });
+    let (_w, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+    });
+
+    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Account));
+
+    // Disable the eidola singleton through the store (the optimistic flip
+    // fires the bus-less observer path).
+    stores
+        .backends
+        .update(cx, |b, cx| b.set_enabled("eidola".into(), false, cx));
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.selected(),
+            SettingsPane::Backends,
+            "a hidden selection reconciles to Backends"
+        );
+    });
+}
+
+#[gpui::test]
+fn settings_eidola_url_editor_save_cancel_revert(cx: &mut TestAppContext) {
+    // The base-URL override editor moved out of General into Backends → Eidola.
+    // Its edit/cancel state machine is view-local; save/revert write through
+    // the config store (a stub write stops at the backend guard — the same
+    // honest no-op the other panes assert).
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+
+    // At rest: not editing.
+    pane.read_with(cx, |p, _| assert!(!p.editing_base_url()));
+
+    // Change… enters the edit state; Cancel leaves it.
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_edit_base_url(window, cx));
+    })
+    .unwrap();
+    pane.read_with(cx, |p, _| assert!(p.editing_base_url()));
+    pane.update(cx, |p, cx| p.cancel_edit_base_url(cx));
+    pane.read_with(cx, |p, _| assert!(!p.editing_base_url()));
+
+    // Save exits the edit state (stub write is a no-op past the guard).
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_edit_base_url(window, cx));
+    })
+    .unwrap();
+    pane.update(cx, |p, cx| p.save_base_url(cx));
+    pane.read_with(cx, |p, _| assert!(!p.editing_base_url()));
+
+    // Revert-to-pin is a no-op-safe path too.
+    pane.update(cx, |p, cx| p.revert_base_url(cx));
+    pane.read_with(cx, |p, _| assert!(!p.editing_base_url()));
+
+    // Reverting measurements routes through the store without panicking.
+    pane.update(cx, |p, cx| p.revert_measurements(cx));
+}
+
+#[gpui::test]
+fn settings_account_pane_reachable_at_top_level(cx: &mut TestAppContext) {
+    // Account is a top-level pane again; its reset-confirm flow is reachable
+    // through `SettingsView::account_pane()`.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
+        s.balances = Some(BalancesResult {
+            available: 5_000_000,
+            pools: Vec::new(),
+        });
+    });
+    let (_w, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+    });
+
+    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Account));
+
+    let account = view.read_with(cx, |v, _| v.account_pane());
     account.read_with(cx, |a, _| assert!(!a.reset_armed()));
+    account.update(cx, |a, cx| a.request_reset(cx));
+    account.read_with(cx, |a, _| assert!(a.reset_armed()));
 }
 
 #[gpui::test]
@@ -1652,6 +1792,40 @@ fn eidola_trust() -> eidola_app_core::EidolaTrust {
         has_hardware_root_ca: false,
         has_hardware_intermediate_ca: false,
     }
+}
+
+/// A backend registry fixture with the two singletons; `eidola_enabled`
+/// flips the eidola row so nav-gating tests can exercise both states.
+fn backends_fixture(eidola_enabled: bool) -> Vec<eidola_app_core::BackendInfo> {
+    use eidola_app_core::{BackendInfo, BackendKind};
+    vec![
+        BackendInfo {
+            id: "eidola".into(),
+            kind: BackendKind::Eidola,
+            display_name: "Eidola".into(),
+            enabled: eidola_enabled,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        },
+        BackendInfo {
+            id: "local".into(),
+            kind: BackendKind::Local,
+            display_name: "Local".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        },
+    ]
 }
 
 /// Build stub stores from a declaratively-described scene — the replacement

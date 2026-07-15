@@ -532,6 +532,7 @@ fn settings_backends_stores(cx: &mut App) -> Stores {
     };
     stub_stores(cx, |s| {
         s.config_state = Some(stub_config_state(true));
+        s.eidola_trust = Some(stub_eidola_trust());
         s.balances = Some(BalancesResult {
             available: 4_200_000,
             pools: vec![BalancePoolInfo {
@@ -687,8 +688,9 @@ fn register_settings(s: &mut Snapshots) {
         view
     });
 
-    // Backends → Eidola: the singleton toggle plus the embedded account
-    // surface (balance, pools with humanized expiry, plans).
+    // Backends → Eidola: the singleton toggle plus the connection + trust
+    // surface (base-URL pin/override, trusted-measurements state, hardware CA
+    // lines).
     s.add("settings_backends_eidola", settings_size, |window, cx| {
         let core = settings_backends_stores(cx);
         let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
@@ -720,12 +722,60 @@ fn register_settings(s: &mut Snapshots) {
         view
     });
 
+    // Account pane (top-level again): balance + pools + plans, shown while
+    // the eidola backend is enabled.
+    s.add("settings_account", settings_size, |window, cx| {
+        let core = settings_stores(cx);
+        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+        view
+    });
+
     // Wallet pane: the four lifecycle states in one honest listing.
     s.add("settings_wallet", settings_size, |window, cx| {
         let core = settings_stores(cx);
         let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
         view.update(cx, |v, cx| v.select(SettingsPane::Wallet, cx));
         view
+    });
+
+    // Nav gating: with the eidola backend disabled, only General and Backends
+    // show (Account/Wallet are hidden — "on-device only").
+    s.add("settings_nav_no_eidola", settings_size, |window, cx| {
+        use eidola_app_core::{BackendInfo, BackendKind};
+        let core = stub_stores(cx, |s| {
+            s.config_state = Some(stub_config_state(true));
+            s.eidola_trust = Some(stub_eidola_trust());
+            s.backends = vec![
+                BackendInfo {
+                    id: "eidola".into(),
+                    kind: BackendKind::Eidola,
+                    display_name: "Eidola".into(),
+                    enabled: false,
+                    base_url: None,
+                    has_api_key: false,
+                    models_dir: None,
+                    model_overrides: None,
+                    engine_path: None,
+                    auto_start: true,
+                    created_at: 0,
+                },
+                BackendInfo {
+                    id: "local".into(),
+                    kind: BackendKind::Local,
+                    display_name: "Local".into(),
+                    enabled: true,
+                    base_url: None,
+                    has_api_key: false,
+                    models_dir: None,
+                    model_overrides: None,
+                    engine_path: None,
+                    auto_start: true,
+                    created_at: 0,
+                },
+            ];
+        });
+        cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx))
     });
 }
 

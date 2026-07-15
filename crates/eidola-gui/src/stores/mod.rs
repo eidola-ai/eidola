@@ -316,8 +316,13 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
         }
         // The set of configured destinations changed: re-snapshot the
         // registry, the per-backend model catalogs, and the engine domain
-        // (a llamacpp backend may have appeared/vanished).
+        // (a llamacpp backend may have appeared/vanished). The eidola row also
+        // carries the connection + trust bundle (base URL / measurements /
+        // hardware CAs), so refresh the config store's `EidolaTrust` snapshot
+        // too — the base-URL editor and trust rows live in Settings → Backends
+        // → Eidola and must reflect another window's write.
         Change::Backends => {
+            stores.config.update(cx, |s, cx| s.refresh(cx));
             stores.backends.update(cx, |s, cx| s.refresh(cx));
             stores.models.update(cx, |s, cx| s.refresh(cx));
             stores.local_models.update(cx, |s, cx| s.refresh(cx));

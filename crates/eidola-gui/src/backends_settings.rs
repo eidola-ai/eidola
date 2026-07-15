@@ -4,11 +4,15 @@
 //! into the three mental buckets; the selected tab renders in the settings
 //! voice (hairline rows, no cards):
 //!
-//! - **Eidola** — the confidential service. Enable/disable the singleton;
-//!   when enabled, the embedded [`AccountView`] hosts the full account
-//!   surface (create/reset, balance + pools, plans/checkout). When disabled,
-//!   a short "no account, on-device only" explanation. (Disabling `eidola`
-//!   *is* the on-device-only configuration.)
+//! - **Eidola** — the confidential service's connection + trust surface.
+//!   Enable/disable the singleton; when enabled, the **base-URL override**
+//!   editor (edit/save/cancel/change/revert-to-pin — honest about pin vs
+//!   override), the **trusted-measurements** override state (+ revert), and
+//!   the **hardware CA** override state (two quiet lines; editing stays
+//!   CLI-only). When disabled, a short "no account, on-device only"
+//!   explanation. (Disabling `eidola` *is* the on-device-only configuration.)
+//!   The account surface is a top-level Settings pane (`AccountView`), shown
+//!   only while this backend is enabled.
 //! - **Local** — the managed local store: enable/disable, the **engine**
 //!   line (resolved bundled `llama-server`, or an honest dev-build hint), the
 //!   installed models (status + per-state verbs: load / unload / cancel /
@@ -37,15 +41,16 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    ActiveTheme, StyledExt, h_flex,
+    ActiveTheme, Sizable, StyledExt,
+    button::{Button, ButtonVariants},
+    h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
     v_flex,
 };
 
-use crate::account::AccountView;
 use crate::probe::Probe as _;
-use crate::stores::{BackendsStore, LocalModelsStore, Stores};
+use crate::stores::{BackendsStore, ConfigStore, LocalModelsStore, Stores};
 
 /// Which internal tab of the Backends pane is showing. View-local state — the
 /// selection isn't persisted.
@@ -100,15 +105,19 @@ struct AddForm {
 pub struct BackendsSettingsView {
     backends: Entity<BackendsStore>,
     local_models: Entity<LocalModelsStore>,
-    /// The embedded Account surface, shown in the Eidola tab when the
-    /// singleton is enabled. Hosting `AccountView` here (rather than as a
-    /// top-level Settings pane) keeps its `settings/account/*` probe names
-    /// stable while folding the account *into* the eidola backend.
-    account: Entity<AccountView>,
+    /// The config store — the Eidola tab's base-URL + trust rows read the
+    /// `EidolaTrust` snapshot from here (it lives on the eidola backend row;
+    /// the store keeps a cached copy refreshed on `Change::Backends`) and
+    /// write via its async setters.
+    config: Entity<ConfigStore>,
     /// Which internal tab is showing (view-local; not persisted).
     tab: BackendsTab,
     /// The paste-a-URL input (the local section's download row).
     url_state: Entity<InputState>,
+    /// The Eidola tab's base-URL editor state.
+    base_url_state: Entity<InputState>,
+    /// Whether the base-URL row is in its edit state (input + save/cancel).
+    editing_base_url: bool,
     /// The inline add-backend form, while one is open.
     add_form: Option<AddForm>,
     _subscriptions: Vec<Subscription>,
@@ -118,14 +127,18 @@ impl BackendsSettingsView {
     pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let backends = stores.backends.clone();
         let local_models = stores.local_models.clone();
-        let account = cx.new(|cx| AccountView::new(stores.clone(), window, cx));
+        let config = stores.config.clone();
         let url_state = cx.new(|cx| {
             InputState::new(window, cx).placeholder("https://huggingface.co/…/model.gguf")
         });
+        let base_url_state = cx.new(|cx| InputState::new(window, cx).placeholder("https://…"));
 
         let _subscriptions = vec![
             cx.observe(&backends, |_, _, cx| cx.notify()),
             cx.observe(&local_models, |_, _, cx| cx.notify()),
+            // The base-URL + trust rows read the config store's cached
+            // `EidolaTrust`; re-render when it refreshes (bus `Change::Backends`).
+            cx.observe(&config, |_, _, cx| cx.notify()),
             // Enter in the URL field submits, mirroring the button.
             cx.subscribe_in(
                 &url_state,
@@ -141,19 +154,80 @@ impl BackendsSettingsView {
         Self {
             backends,
             local_models,
-            account,
+            config,
             tab: BackendsTab::Eidola,
             url_state,
+            base_url_state,
+            editing_base_url: false,
             add_form: None,
             _subscriptions,
         }
     }
 
-    /// The embedded Account view — exposed so behavior/visual tests reach the
-    /// reset-confirm and checkout flows now that the Account pane is hosted
-    /// here.
-    pub fn account(&self) -> Entity<AccountView> {
-        self.account.clone()
+    /// Whether the Eidola tab's base-URL row is in its edit state (test
+    /// accessor).
+    pub fn editing_base_url(&self) -> bool {
+        self.editing_base_url
+    }
+
+    /// Enter the base-URL edit state, seeding the input with the resolved
+    /// value.
+    pub fn begin_edit_base_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self
+            .config
+            .read(cx)
+            .eidola_trust()
+            .map(|t| t.base_url.clone())
+            .unwrap_or_default();
+        self.base_url_state.update(cx, |s, cx| {
+            s.set_value(&current, window, cx);
+        });
+        self.editing_base_url = true;
+        cx.notify();
+    }
+
+    pub fn cancel_edit_base_url(&mut self, cx: &mut Context<Self>) {
+        self.editing_base_url = false;
+        cx.notify();
+    }
+
+    /// Save the edited value as an override. Saving the pin itself is
+    /// treated as a revert — the row stays honest about its source.
+    pub fn save_base_url(&mut self, cx: &mut Context<Self>) {
+        let value = self.base_url_state.read(cx).value().trim().to_string();
+        if value.is_empty() {
+            return;
+        }
+        let pin = self
+            .config
+            .read(cx)
+            .eidola_trust()
+            .map(|t| t.base_url_pin.clone());
+        self.config.update(cx, |c, cx| {
+            if pin.as_deref() == Some(value.as_str()) {
+                c.clear_base_url_override(cx);
+            } else {
+                c.set_base_url(value, cx);
+            }
+        });
+        self.editing_base_url = false;
+        cx.notify();
+    }
+
+    /// One-click revert from a base-URL override back to the built-in pin.
+    pub fn revert_base_url(&mut self, cx: &mut Context<Self>) {
+        self.config
+            .update(cx, |c, cx| c.clear_base_url_override(cx));
+        self.editing_base_url = false;
+        cx.notify();
+    }
+
+    /// One-click revert of a trusted-measurements override back to the
+    /// built-in pin.
+    pub fn revert_measurements(&mut self, cx: &mut Context<Self>) {
+        self.config
+            .update(cx, |c, cx| c.revert_trusted_measurements(cx));
+        cx.notify();
     }
 
     /// The selected internal tab (test accessor).
@@ -1151,7 +1225,10 @@ impl Render for BackendsSettingsView {
 
 impl BackendsSettingsView {
     /// The Eidola tab: the singleton's enable/disable header, and — when
-    /// enabled — the embedded Account surface (create/reset, balance, plans).
+    /// enabled — the connection + trust surface (base-URL override editor,
+    /// trusted-measurements override state, hardware CA state). The account
+    /// itself is a top-level Settings pane, shown only while this backend is
+    /// enabled.
     fn eidola_tab(&self, backends: &[BackendInfo], cx: &Context<Self>) -> Vec<gpui::AnyElement> {
         let theme = cx.theme();
         let mut out: Vec<gpui::AnyElement> = Vec::new();
@@ -1170,8 +1247,7 @@ impl BackendsSettingsView {
             .into_any_element(),
         );
         if backend.enabled {
-            // The account *is* the eidola backend's configuration.
-            out.push(self.account.clone().into_any_element());
+            out.extend(self.eidola_trust_surface(cx));
         } else {
             out.push(
                 div()
@@ -1184,6 +1260,203 @@ impl BackendsSettingsView {
                     .into_any_element(),
             );
         }
+        out
+    }
+
+    /// The connection + trust rows: base-URL override editor, then the
+    /// measurement + hardware-CA override state. Reads the config store's
+    /// cached `EidolaTrust` (the eidola backend row's bundle, NULL = the
+    /// embedded pin) and writes via the async setters. Full measurement /
+    /// CA editing stays CLI-only (`eidola configure`); this surface shows the
+    /// security state and offers revert-to-pin where an override exists.
+    fn eidola_trust_surface(&self, cx: &Context<Self>) -> Vec<gpui::AnyElement> {
+        let theme = cx.theme();
+        let mut out: Vec<gpui::AnyElement> = Vec::new();
+        let trust = self.config.read(cx).eidola_trust().cloned();
+        let Some(trust) = trust else {
+            out.push(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Loading connection settings…")
+                    .into_any_element(),
+            );
+            return out;
+        };
+
+        // --- Base URL: honest about override vs pin --------------------
+        let mut base_value = v_flex().flex_1().gap_1();
+        if self.editing_base_url {
+            base_value = base_value
+                .child(
+                    // Probed wrapper for the a11y role/label — probe the
+                    // wrapping div, not the gpui-component Input.
+                    div()
+                        .id("eidola-base-url-input-wrap")
+                        .probe(
+                            "settings/backends/eidola/url/base-url",
+                            gpui::Role::TextInput,
+                            "Base URL",
+                        )
+                        .w_full()
+                        .flex()
+                        .child(Input::new(&self.base_url_state).flex_1()),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .pt_1()
+                        .child(
+                            div()
+                                .id("eidola-save-base-url-wrap")
+                                .probe(
+                                    "settings/backends/eidola/url/save",
+                                    gpui::Role::Button,
+                                    "Save",
+                                )
+                                .child(
+                                    Button::new("eidola-save-base-url")
+                                        .primary()
+                                        .small()
+                                        .label("Save")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.save_base_url(cx)),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("eidola-cancel-base-url-wrap")
+                                .probe(
+                                    "settings/backends/eidola/url/cancel",
+                                    gpui::Role::Button,
+                                    "Cancel",
+                                )
+                                .child(
+                                    Button::new("eidola-cancel-base-url")
+                                        .ghost()
+                                        .small()
+                                        .label("Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_edit_base_url(cx)
+                                        })),
+                                ),
+                        ),
+                );
+        } else {
+            base_value = base_value.child(
+                div()
+                    .text_sm()
+                    .font_family("Menlo")
+                    .child(SharedString::from(trust.base_url.clone())),
+            );
+            let status: String = if trust.base_url_is_override {
+                format!("Override — the built-in pin is {}.", trust.base_url_pin)
+            } else {
+                "Built-in pin — verified against this build's trust root.".into()
+            };
+            base_value = base_value.child(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(status)),
+            );
+            let mut links = h_flex().gap_3().text_xs();
+            if trust.base_url_is_override {
+                links = links.child(
+                    quiet_verb("eidola-revert-base-url", "Revert to pin", cx)
+                        .probe(
+                            "settings/backends/eidola/url/revert-to-pin",
+                            gpui::Role::Button,
+                            "Revert to pin",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.revert_base_url(cx))),
+                );
+            }
+            links = links.child(
+                quiet_verb("eidola-edit-base-url", "Change…", cx)
+                    .probe(
+                        "settings/backends/eidola/url/change",
+                        gpui::Role::Button,
+                        "Change base URL",
+                    )
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.begin_edit_base_url(window, cx)),
+                    ),
+            );
+            base_value = base_value.child(links);
+        }
+        out.push(trust_row("Base URL", cx, base_value).into_any_element());
+
+        // --- Trusted measurements: pin vs override + revert ------------
+        let measurements_len = trust.trusted_measurements.len();
+        let summary = if trust.trusted_measurements_are_override {
+            format!(
+                "{} user-trusted measurement{} — overriding the pin.",
+                measurements_len,
+                if measurements_len == 1 { "" } else { "s" }
+            )
+        } else {
+            "1 measurement — pinned at build.".to_string()
+        };
+        let mut measurements_value = v_flex()
+            .flex_1()
+            .gap_1()
+            .child(muted_text(summary, cx))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground.opacity(0.8))
+                    .child("Editing the trusted set is a CLI operation (`eidola configure`)."),
+            );
+        if trust.trusted_measurements_are_override {
+            measurements_value = measurements_value.child(
+                h_flex().text_xs().child(
+                    quiet_verb("eidola-revert-measurements", "Revert to pin", cx)
+                        .probe(
+                            "settings/backends/eidola/measurements/revert",
+                            gpui::Role::Button,
+                            "Revert trusted measurements to pin",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.revert_measurements(cx))),
+                ),
+            );
+        }
+        out.push(trust_row("Trusted measurements", cx, measurements_value).into_any_element());
+
+        // --- Hardware CAs: quiet override-state lines (CLI-only) -------
+        out.push(
+            trust_row(
+                "Hardware root CA",
+                cx,
+                muted_text(
+                    if trust.has_hardware_root_ca {
+                        "Custom certificate set (override)."
+                    } else {
+                        "Built-in AMD/Intel vendor chain (pin)."
+                    },
+                    cx,
+                ),
+            )
+            .into_any_element(),
+        );
+        out.push(
+            trust_row(
+                "Intermediate CA",
+                cx,
+                muted_text(
+                    if trust.has_hardware_intermediate_ca {
+                        "Custom certificate set (override)."
+                    } else {
+                        "Built-in AMD/Intel vendor chain (pin)."
+                    },
+                    cx,
+                ),
+            )
+            .into_any_element(),
+        );
+
         out
     }
 
@@ -1240,6 +1513,35 @@ fn section_header(label: &str, cx: &gpui::App) -> gpui::Div {
         .text_color(theme.foreground)
         .font_medium()
         .child(SharedString::from(label.to_string()))
+}
+
+/// A two-column label/value field row (mirrors general.rs's `field_row`),
+/// used by the Eidola tab's connection + trust surface.
+fn trust_row<C: IntoElement>(label: &str, cx: &gpui::App, child: C) -> impl IntoElement {
+    let theme = cx.theme();
+    h_flex()
+        .w_full()
+        .gap_4()
+        .py_1()
+        .items_start()
+        .child(
+            div()
+                .w(px(144.))
+                .flex_none()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(div().flex_1().min_w_0().child(child))
+}
+
+/// A muted value cell for the trust rows.
+fn muted_text(text: impl Into<String>, cx: &gpui::App) -> impl IntoElement {
+    let theme = cx.theme();
+    let text = text.into();
+    div()
+        .text_color(theme.muted_foreground)
+        .child(SharedString::from(text))
 }
 
 fn subsection_header(label: &str, cx: &gpui::App) -> impl IntoElement {

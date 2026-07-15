@@ -542,23 +542,19 @@ fn record_probes_cover_rows_tabs_and_chrome(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
-    use eidola_gui::backends_settings::BackendsSettingsView;
+    use eidola_gui::account::AccountView;
 
     let _guard = probes_on();
 
-    // Account is no longer a top-level pane — it's embedded in Backends →
-    // Eidola (the account *is* the eidola backend's configuration). Its
-    // `settings/account/*` probes must stay stable through the new host.
+    // Account is a top-level Settings pane again (shown while the eidola
+    // backend is enabled). Its `settings/account/*` probes stay stable.
     let stores = account_backends_stores(cx);
     let (window, _view) = open_view(cx, |window, cx| {
-        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+        cx.new(|cx| AccountView::new(stores, window, cx))
     });
 
-    // The default (Eidola) tab hosts the account surface when eidola is
-    // enabled.
     let names = fresh_names(cx, window);
     for expected in [
-        "settings/backends/eidola/toggle",
         "settings/account/reset",
         "settings/account/refresh-balances",
         // The shared plans component, scoped to the Account host.
@@ -575,8 +571,7 @@ fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
 }
 
 /// Stores with a linked account (balance + plans) *and* an eidola-enabled
-/// registry, so `BackendsSettingsView`'s Eidola tab renders the embedded
-/// account surface.
+/// registry.
 fn account_backends_stores(cx: &mut TestAppContext) -> Stores {
     stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
@@ -626,7 +621,7 @@ fn wallet_pane_probes_cover_refresh(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn general_pane_probes_cover_change_and_advanced(cx: &mut TestAppContext) {
+fn general_pane_probes_cover_appearance_and_advanced(cx: &mut TestAppContext) {
     let _guard = probes_on();
 
     let stores = ready_stores(cx);
@@ -636,17 +631,22 @@ fn general_pane_probes_cover_change_and_advanced(cx: &mut TestAppContext) {
         cx.new(|cx| GeneralView::new(stores.config.clone(), wi, window, cx))
     });
 
-    // At rest: the "Change…" affordance and the appearance chips are probed.
+    // At rest: the appearance chips are probed. (The base-URL editor moved to
+    // Backends → Eidola; General no longer carries a "Change…" affordance.)
     let names = fresh_names(cx, window);
     for expected in [
-        "settings/general/change",
         "settings/general/appearance/system",
+        "settings/general/time-of-day/on",
     ] {
         assert!(
             names.contains(&expected.to_string()),
             "general probe {expected:?} missing; recorded: {names:?}"
         );
     }
+    assert!(
+        !names.contains(&"settings/general/change".to_string()),
+        "the base-URL editor must no longer live in General: {names:?}"
+    );
 
     // Holding ⌥ reveals the advanced rows, including the Record cross-link.
     cx.update(|cx| {
@@ -1004,6 +1004,8 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
     let _guard = probes_on();
 
     let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
         s.backends = backends_fixture();
         s.local_models = Some(local_models_fixture());
     });
@@ -1012,13 +1014,15 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
     });
 
     // The tab strip is present regardless of the selected tab. The Eidola tab
-    // (default) carries the eidola singleton's enable/disable toggle.
+    // (default) carries the eidola singleton's enable/disable toggle plus the
+    // connection + trust surface (the base-URL editor moved here from General).
     let names = fresh_names(cx, window);
     for expected in [
         "settings/backends/tab/eidola",
         "settings/backends/tab/local",
         "settings/backends/tab/external",
         "settings/backends/eidola/toggle",
+        "settings/backends/eidola/url/change",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -1076,6 +1080,65 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
         !names.contains(&"settings/backends/my-box/model/0/delete".to_string()),
         "a llamacpp backend's files are the user's: {names:?}"
     );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::BackendsSettingsView;
+
+    let _guard = probes_on();
+
+    // An overridden trust bundle so the revert affordances render.
+    let mut trust = probe_eidola_trust();
+    trust.base_url = "https://staging.eidola.example/v1".into();
+    trust.base_url_is_override = true;
+    trust.trusted_measurements = vec![eidola_app_core::MeasurementInfo {
+        snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+        tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+    }];
+    trust.trusted_measurements_are_override = true;
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(trust);
+        s.backends = backends_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    });
+
+    // At rest: change + both revert affordances.
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/eidola/url/change",
+        "settings/backends/eidola/url/revert-to-pin",
+        "settings/backends/eidola/measurements/revert",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "eidola trust-surface probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    // Entering the editor swaps in the input + save/cancel.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit_base_url(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/eidola/url/base-url",
+        "settings/backends/eidola/url/save",
+        "settings/backends/eidola/url/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "eidola url-editor probe {expected:?} missing: {names:?}"
+        );
+    }
 
     probe::set_probes_enabled(false);
 }

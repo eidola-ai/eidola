@@ -123,6 +123,31 @@ impl ConfigStore {
         self.write(cx, |c| c.runtime().block_on(c.clear_base_url_override()));
     }
 
+    /// Revert the trusted-measurements override back to the built-in pin.
+    /// There is no single "clear" core call — untrusting every entry in the
+    /// override list reverts to the pin (clearing the last one does it), so
+    /// this reads the current override set off the trust snapshot and
+    /// untrusts each. Writes through the eidola backend row; emits
+    /// `Change::Backends`.
+    pub fn revert_trusted_measurements(&mut self, cx: &mut Context<Self>) {
+        self.write(cx, |c| {
+            let snps: Vec<String> = c
+                .runtime()
+                .block_on(c.eidola_trust())
+                .map(|t| {
+                    t.trusted_measurements
+                        .iter()
+                        .map(|m| m.snp.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for snp in snps {
+                c.runtime().block_on(c.untrust_measurement(snp))?;
+            }
+            Ok(())
+        });
+    }
+
     pub fn set_default_model(&mut self, model: String, cx: &mut Context<Self>) {
         self.write(cx, |c| c.set_default_model(model));
     }

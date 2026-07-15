@@ -1,11 +1,17 @@
 //! Settings window — a calm two-pane surface. A narrow nav list (General ·
-//! Backends · Wallet) sits on a `theme.sidebar` band down the left edge; the
-//! selected pane renders in the content column. No primary-button tab strip,
-//! no boxes-in-boxes: the nav is quiet text, the content is hairline rows.
+//! Backends · Account · Wallet) sits on a `theme.sidebar` band down the left
+//! edge; the selected pane renders in the content column. No primary-button
+//! tab strip, no boxes-in-boxes: the nav is quiet text, the content is
+//! hairline rows.
 //!
-//! Account (create/reset, balance, plans) is no longer a top-level pane — it
-//! lives inside **Backends → Eidola** (the account *is* the eidola backend's
-//! configuration). `BackendsSettingsView` hosts the `AccountView` entity.
+//! **Account and Wallet are gated on the eidola backend being enabled** — the
+//! account *is* the eidola backend's configuration, and with the backend
+//! disabled ("on-device only") there is nothing to bill. Nav visibility
+//! doubles as state; disabling eidola while one of those panes is selected
+//! falls the selection back to Backends (see `effective_selected`). The
+//! gating is optimistic: until the `BackendsStore` snapshot loads, the
+//! singleton reads as enabled (matching `BackendsStore::is_enabled`), so the
+//! panes render rather than flashing hidden on a cold open.
 //!
 //! Settings deliberately keeps **no raw-data dumps** — measurement hex,
 //! attestation documents, and the request log live in the Record window
@@ -18,11 +24,12 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
+use crate::account::AccountView;
 use crate::actions::CloseWindow;
 use crate::backends_settings::BackendsSettingsView;
 use crate::general::GeneralView;
 use crate::probe::Probe as _;
-use crate::stores::Stores;
+use crate::stores::{BackendsStore, Stores};
 use crate::wallet::WalletView;
 use crate::window_input::WindowInput;
 
@@ -38,6 +45,7 @@ const NAV_WIDTH: gpui::Pixels = gpui::px(132.);
 pub enum SettingsPane {
     General,
     Backends,
+    Account,
     Wallet,
 }
 
@@ -46,8 +54,15 @@ impl SettingsPane {
         match self {
             SettingsPane::General => "General",
             SettingsPane::Backends => "Backends",
+            SettingsPane::Account => "Account",
             SettingsPane::Wallet => "Wallet",
         }
+    }
+
+    /// Whether this pane is only shown while the eidola backend is enabled.
+    /// Account (its config) and Wallet (its credentials) both are.
+    fn requires_eidola(self) -> bool {
+        matches!(self, SettingsPane::Account | SettingsPane::Wallet)
     }
 }
 
@@ -55,7 +70,12 @@ pub struct SettingsView {
     selected: SettingsPane,
     general: Entity<GeneralView>,
     backends: Entity<BackendsSettingsView>,
+    account: Entity<AccountView>,
     wallet: Entity<WalletView>,
+    /// The backend registry — read to gate the Account/Wallet nav items on
+    /// the eidola singleton being enabled (observed so a bus-driven flip
+    /// re-renders the nav and reconciles the selection).
+    backends_store: Entity<BackendsStore>,
     /// The per-window modifier state. The root's `on_modifiers_changed`
     /// listener (registered in `Render`) mirrors events here; `GeneralView`
     /// observes it for the ⌥-reveal rather than registering its own listener.
@@ -81,7 +101,18 @@ impl SettingsView {
         let general =
             cx.new(|cx| GeneralView::new(stores.config.clone(), window_input.clone(), window, cx));
         let backends = cx.new(|cx| BackendsSettingsView::new(stores.clone(), window, cx));
-        let wallet = cx.new(|cx| WalletView::new(stores, window, cx));
+        let account = cx.new(|cx| AccountView::new(stores.clone(), window, cx));
+        let wallet = cx.new(|cx| WalletView::new(stores.clone(), window, cx));
+        let backends_store = stores.backends.clone();
+
+        // Observe the registry: an eidola enable/disable flip both re-renders
+        // the nav (visibility) and reconciles a now-hidden selection back to
+        // Backends (see `effective_selected`).
+        cx.observe(&backends_store, |this, _, cx| {
+            this.selected = this.effective_selected(cx);
+            cx.notify();
+        })
+        .detach();
 
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
@@ -90,10 +121,43 @@ impl SettingsView {
             selected: SettingsPane::General,
             general,
             backends,
+            account,
             wallet,
+            backends_store,
             window_input,
             focus_handle,
         }
+    }
+
+    /// Whether the eidola backend is enabled (gates the Account/Wallet panes).
+    /// Optimistic while the registry snapshot hasn't loaded — matches
+    /// `BackendsStore::is_enabled`, so a cold open shows the panes rather than
+    /// hiding them until the first fetch lands.
+    fn eidola_enabled(&self, cx: &gpui::App) -> bool {
+        self.backends_store.read(cx).is_enabled("eidola")
+    }
+
+    /// The pane actually shown: `selected`, unless it requires eidola and the
+    /// backend is disabled — then Backends (never a blank body / phantom nav
+    /// highlight).
+    fn effective_selected(&self, cx: &gpui::App) -> SettingsPane {
+        if self.selected.requires_eidola() && !self.eidola_enabled(cx) {
+            SettingsPane::Backends
+        } else {
+            self.selected
+        }
+    }
+
+    /// The nav panes currently visible: General and Backends always, then
+    /// Account and Wallet while the eidola backend is enabled. The one source
+    /// of truth for both the rendered nav and the gating behavior tests.
+    pub fn visible_panes(&self, cx: &gpui::App) -> Vec<SettingsPane> {
+        let mut panes = vec![SettingsPane::General, SettingsPane::Backends];
+        if self.eidola_enabled(cx) {
+            panes.push(SettingsPane::Account);
+            panes.push(SettingsPane::Wallet);
+        }
+        panes
     }
 
     /// The focus handle the view tracks. Exposed so behavior tests can
@@ -122,16 +186,25 @@ impl SettingsView {
     }
 
     /// The Backends pane entity — exposed for behavior tests asserting the
-    /// backend + local-model affordances (and, via
-    /// `BackendsSettingsView::account()`, the Account controls now hosted in
-    /// its Eidola tab).
+    /// backend + local-model affordances and the Eidola tab's trust surface.
     pub fn backends_pane(&self) -> Entity<BackendsSettingsView> {
         self.backends.clone()
     }
 
-    fn nav_item(&self, pane: SettingsPane, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The Account pane entity — a top-level pane again, exposed for tests
+    /// asserting the reset-confirm / checkout flows.
+    pub fn account_pane(&self) -> Entity<AccountView> {
+        self.account.clone()
+    }
+
+    fn nav_item(
+        &self,
+        pane: SettingsPane,
+        active_pane: SettingsPane,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
-        let active = self.selected == pane;
+        let active = active_pane == pane;
         let mut item = div()
             .id(pane.label())
             .probe(
@@ -162,14 +235,29 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+        // The pane actually shown, and the nav highlight, both track the
+        // effective selection so disabling eidola while on Account/Wallet
+        // never leaves a blank body or a phantom highlight.
+        let effective = self.effective_selected(cx);
+        let visible = self.visible_panes(cx);
 
-        let body: gpui::AnyElement = match self.selected {
+        let body: gpui::AnyElement = match effective {
             SettingsPane::General => self.general.clone().into_any_element(),
             SettingsPane::Backends => self.backends.clone().into_any_element(),
+            SettingsPane::Account => self.account.clone().into_any_element(),
             SettingsPane::Wallet => self.wallet.clone().into_any_element(),
         };
 
+        // Nav items: General/Backends always, Account/Wallet gated. Built with
+        // a plain loop (each `nav_item` takes `&mut cx` in turn) *before* the
+        // `theme` borrow below, so the mutable-cx loop and the theme's
+        // immutable borrow don't overlap.
+        let mut nav_items: Vec<gpui::AnyElement> = Vec::with_capacity(visible.len());
+        for pane in visible {
+            nav_items.push(self.nav_item(pane, effective, cx).into_any_element());
+        }
+
+        let theme = cx.theme();
         let wi = self.window_input.clone();
         crate::chrome::round_client_corners(h_flex(), window)
             .track_focus(&self.focus_handle)
@@ -208,9 +296,7 @@ impl Render for SettingsView {
                 .pt(NAV_TOP_RESERVE)
                 .px_2()
                 .gap_0p5()
-                .child(self.nav_item(SettingsPane::General, cx))
-                .child(self.nav_item(SettingsPane::Backends, cx))
-                .child(self.nav_item(SettingsPane::Wallet, cx)),
+                .children(nav_items),
             )
             // The scroll container needs the same width discipline as the
             // chat transcript (see the scroll-container invariant in
