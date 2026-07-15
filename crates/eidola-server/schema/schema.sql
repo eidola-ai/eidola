@@ -184,7 +184,7 @@ COMMENT ON COLUMN credit_ledger.reason IS
     'Informational tag for filtering and auditing. Does not drive business '
     'logic — only delta and expires_at have operational meaning. Reasons: '
     'subscription_renewal = recurring Stripe subscription payment; '
-    'purchase = one-time Stripe purchase (premium pricing, no expiry); '
+    'purchase = one-time Stripe purchase (premium pricing, 1-year expiry); '
     'refund = Stripe refund (full or partial), cooperative; '
     'credential_issuance = credits converted into anonymous credentials (the privacy boundary); '
     'dispute_clawback = Stripe dispute/chargeback, adversarial; '
@@ -202,8 +202,9 @@ COMMENT ON COLUMN credit_ledger.memo IS
     'Not exposed to end users.';
 
 COMMENT ON COLUMN credit_ledger.expires_at IS
-    'NULL means credits never expire (top-ups, manual adjustments). '
-    'For subscription renewals, set to the billing period end date. '
+    'NULL means credits never expire (e.g., manual adjustments). '
+    'For subscription renewals, set to the billing period end date; '
+    'for one-time purchases, set to one year after the purchase. '
     'Expired credits are excluded from balance calculations by the query, '
     'not by a cron job. '
     'For debit entries (credential_issuance, refund, dispute_clawback), '
