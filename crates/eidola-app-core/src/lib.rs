@@ -3053,6 +3053,28 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Remove the eidola hardware root CA (ARK) override (row column back to
+    /// NULL), reverting to the production AMD chain. Emits
+    /// [`Change::Backends`].
+    pub async fn clear_hardware_root_ca(&self) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.set_hardware_ca(HardwareCa::Root, None).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Remove the eidola hardware intermediate CA (ASK) override (row column
+    /// back to NULL), reverting to the production AMD chain. Emits
+    /// [`Change::Backends`].
+    pub async fn clear_hardware_intermediate_ca(&self) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.set_hardware_ca(HardwareCa::Intermediate, None).await })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Add a trusted enclave measurement to the eidola backend row's override
     /// list. Returns whether it was newly added (idempotent by SNP
     /// measurement). Emits [`Change::Backends`] when it writes.

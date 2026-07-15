@@ -32,6 +32,15 @@ enum Command {
         /// Remove a trusted enclave release by SNP measurement
         #[arg(long)]
         untrust_measurement: Option<String>,
+        /// Remove the base-URL override (revert to the trust-root pin)
+        #[arg(long, conflicts_with = "base_url")]
+        clear_base_url: bool,
+        /// Remove the ARK override (revert to the production AMD chain)
+        #[arg(long, conflicts_with = "hardware_root_ca")]
+        clear_hardware_root_ca: bool,
+        /// Remove the ASK override (revert to the production AMD chain)
+        #[arg(long, conflicts_with = "hardware_intermediate_ca")]
+        clear_hardware_intermediate_ca: bool,
     },
     /// Manage account
     Account {
@@ -416,6 +425,9 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             hardware_intermediate_ca,
             trust_measurement,
             untrust_measurement,
+            clear_base_url,
+            clear_hardware_root_ca,
+            clear_hardware_intermediate_ca,
         }) => {
             if base_url.is_none()
                 && attestation_url.is_none()
@@ -423,6 +435,9 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 && hardware_intermediate_ca.is_none()
                 && trust_measurement.is_none()
                 && untrust_measurement.is_none()
+                && !clear_base_url
+                && !clear_hardware_root_ca
+                && !clear_hardware_intermediate_ca
             {
                 return Err(AppError::Config {
                     message: "specify at least one option (see --help)".into(),
@@ -431,6 +446,18 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             if let Some(url) = base_url {
                 core.set_base_url(url.clone()).await?;
                 println!("base_url set to {url}");
+            }
+            if clear_base_url {
+                core.clear_base_url_override().await?;
+                println!("base_url override removed (using the trust-root pin)");
+            }
+            if clear_hardware_root_ca {
+                core.clear_hardware_root_ca().await?;
+                println!("hardware_root_ca override removed (production AMD chain)");
+            }
+            if clear_hardware_intermediate_ca {
+                core.clear_hardware_intermediate_ca().await?;
+                println!("hardware_intermediate_ca override removed (production AMD chain)");
             }
             if let Some(url) = attestation_url {
                 core.set_attestation_url(url.clone())?;

@@ -140,7 +140,15 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
                 },
                 |_, _, _, _| {},
             )
+            // Inset-0 is load-bearing: with auto insets an absolute child
+            // falls back to its *static position* — after any siblings — so
+            // a probe added after the element's content records bounds
+            // offset by that content (a click-by-name then misses). Pinning
+            // to the parent's origin makes recording independent of whether
+            // `.probe()` is called before or after `.child(…)`.
             .absolute()
+            .top_0()
+            .left_0()
             .size_full(),
         )
     }
