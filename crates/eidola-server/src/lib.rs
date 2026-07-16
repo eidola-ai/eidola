@@ -50,6 +50,9 @@ pub struct AppStateInner {
     pub credential_master_key: [u8; 32],
     pub credential_key_cache: credentials::KeyCache,
     pub epoch_config: helpers::EpochConfig,
+    /// Document versions (terms of service, privacy policy) whose acceptance
+    /// gates purchases and credential issuance. Empty = gate disabled.
+    pub required_terms: Vec<account::RequiredDocument>,
 }
 
 impl AppState {
@@ -62,6 +65,7 @@ impl AppState {
         credential_master_key: [u8; 32],
         credential_key_cache: credentials::KeyCache,
         epoch_config: helpers::EpochConfig,
+        required_terms: Vec<account::RequiredDocument>,
     ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
@@ -72,6 +76,7 @@ impl AppState {
                 credential_master_key,
                 credential_key_cache,
                 epoch_config,
+                required_terms,
             }),
         }
     }
@@ -94,6 +99,8 @@ pub fn build_router() -> OpenApiRouter<AppState> {
         .routes(routes!(handlers::chat_completions))
         .routes(routes!(account::list_prices))
         .routes(routes!(account::create_account, account::get_account))
+        .routes(routes!(account::get_terms))
+        .routes(routes!(account::accept_terms))
         .routes(routes!(account::get_subscription))
         .routes(routes!(account::create_checkout))
         .routes(routes!(account::get_balances))

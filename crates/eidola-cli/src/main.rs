@@ -124,7 +124,19 @@ enum UpdateCommand {
 #[derive(Subcommand)]
 enum AccountCommand {
     /// Create a new account on the server
-    Create,
+    Create {
+        /// Agree to the current terms of service and privacy policy.
+        /// Required when the server has an acceptance gate configured;
+        /// run without it to see the documents first.
+        #[arg(long)]
+        accept_terms: bool,
+    },
+    /// Review and accept the current terms of service and privacy policy
+    AcceptTerms {
+        /// Accept without the interactive confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
     /// Remove stored account credentials
     Reset,
     /// Set existing account credentials
@@ -345,6 +357,12 @@ fn main() {
                      `eidola account checkout <price_id>` to add credit"
                 );
             }
+            AppError::TermsAcceptanceRequired { .. } => {
+                eprintln!(
+                    "hint: the terms of service or privacy policy changed — run \
+                     `eidola account accept-terms` to review and accept"
+                );
+            }
             _ => {}
         }
         std::process::exit(1);
@@ -516,11 +534,49 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 println!("created_at: {}", info.created_at);
                 Ok(())
             }
-            Some(AccountCommand::Create) => {
+            Some(AccountCommand::Create { accept_terms }) => {
+                // Consent is captured here, not in app-core: creating an
+                // account records acceptance of the current terms/privacy
+                // versions, so the documents must be surfaced first.
+                let docs = core.current_terms().await?;
+                if !docs.is_empty() && !accept_terms {
+                    eprintln!("creating an account means agreeing to:");
+                    for d in &docs {
+                        eprintln!("  {} — {} (sha256 {})", d.document, d.url, d.sha256);
+                    }
+                    eprintln!("re-run with --accept-terms to agree and create the account");
+                    std::process::exit(2);
+                }
                 let result = core.account_create().await?;
                 println!("account created");
                 println!("id: {}", result.id);
                 println!("created_at: {}", result.created_at);
+                Ok(())
+            }
+            Some(AccountCommand::AcceptTerms { yes }) => {
+                let docs = core.current_terms().await?;
+                if docs.is_empty() {
+                    println!("the server requires no terms acceptance");
+                    return Ok(());
+                }
+                println!("the server requires acceptance of:");
+                for d in &docs {
+                    println!("  {} — {} (sha256 {})", d.document, d.url, d.sha256);
+                }
+                if !yes {
+                    use std::io::Write;
+                    print!("accept these documents? [y/N] ");
+                    std::io::stdout().flush().ok();
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer).ok();
+                    let answer = answer.trim().to_lowercase();
+                    if answer != "y" && answer != "yes" {
+                        eprintln!("not accepted");
+                        std::process::exit(2);
+                    }
+                }
+                let accepted = core.accept_current_terms().await?;
+                println!("accepted {} document(s)", accepted.len());
                 Ok(())
             }
             Some(AccountCommand::Reset) => {

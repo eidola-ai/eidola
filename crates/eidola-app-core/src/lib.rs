@@ -160,6 +160,20 @@ pub struct AllocateResult {
     pub issuer_key_id: String,
 }
 
+/// A document (terms of service / privacy policy) whose current version the
+/// server requires accounts to accept, identified by the SHA-256 of its
+/// exact published text — the same accept-by-hash mechanism the
+/// repository's CLA uses.
+#[derive(Clone, Debug)]
+pub struct TermsDocument {
+    /// `terms_of_service` or `privacy_policy`.
+    pub document: String,
+    /// Where the current text is published.
+    pub url: String,
+    /// Hex-encoded SHA-256 of the exact published document text.
+    pub sha256: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatResult {
     pub space_id: String,
@@ -920,11 +934,89 @@ impl Inner {
         cfg.save_to(&self.config_path)?;
         self.bus.emit(Change::Config);
 
+        // Record acceptance of the currently required terms/privacy versions
+        // against the new account. The caller is responsible for having
+        // presented the documents first (the GUI's consent checkbox, the
+        // CLI's --accept-terms flag). Best-effort: if this fails, the
+        // server's 428 gate re-prompts at the first purchase or conversion,
+        // so a network blip here must not fail the already-created account.
+        let _ = self.accept_current_terms().await;
+
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
             secret: created.secret,
             created_at: iso_to_ms(&created.created_at)?,
         })
+    }
+
+    /// The documents (terms of service, privacy policy) whose current
+    /// versions the server requires accounts to accept, with published URLs
+    /// and content hashes. Empty when the server has no acceptance gate
+    /// configured.
+    async fn current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
+        let cfg = self.load_config();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+
+        let client = self.build_client(&cfg, &eidola, None).await?;
+        let resp = client
+            .get(format!("{base_url}/v1/terms"))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let terms: TermsResponse = serde_json::from_str(&body).map_err(|e| AppError::Network {
+            message: format!("failed to parse response: {e}"),
+        })?;
+
+        Ok(terms
+            .documents
+            .into_iter()
+            .map(|d| TermsDocument {
+                document: d.document,
+                url: d.url,
+                sha256: d.sha256,
+            })
+            .collect())
+    }
+
+    /// Record acceptance of every currently required document version
+    /// against the configured account, returning what was accepted.
+    ///
+    /// Callers are responsible for having *presented* the documents to the
+    /// user first — this method transmits consent, it does not obtain it.
+    async fn accept_current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
+        let docs = self.current_terms().await?;
+        if docs.is_empty() {
+            return Ok(docs);
+        }
+
+        let cfg = self.load_config();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let (id, secret) = self.require_credentials(&cfg)?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
+
+        for d in &docs {
+            let resp = client
+                .post(format!("{base_url}/v1/account/terms"))
+                .basic_auth(id, Some(secret))
+                .json(&serde_json::json!({
+                    "document": d.document,
+                    "sha256": d.sha256,
+                }))
+                .send()
+                .await
+                .map_err(AppError::from_request)?;
+
+            let (status, body) = read_response(resp).await?;
+            check_status(status, &body)?;
+        }
+
+        Ok(docs)
     }
 
     async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
@@ -3213,6 +3305,29 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// The documents (terms of service, privacy policy) whose current
+    /// versions the server requires accounts to accept. Empty when the
+    /// server has no acceptance gate configured.
+    pub async fn current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.current_terms().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Record the user's acceptance of every currently required document
+    /// version, returning what was accepted. Callers must have presented
+    /// the documents to the user first — this transmits consent, it does
+    /// not obtain it. Routes here after [`AppError::TermsAcceptanceRequired`].
+    pub async fn accept_current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.accept_current_terms().await })
+            .await
+            .map_err(join_err)?
+    }
+
     pub async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -3692,6 +3807,18 @@ struct GetAccountResponse {
     id: Uuid,
     stripe_customer_id: Option<String>,
     created_at: String,
+}
+
+#[derive(Deserialize)]
+struct TermsResponse {
+    documents: Vec<TermsDocumentResponse>,
+}
+
+#[derive(Deserialize)]
+struct TermsDocumentResponse {
+    document: String,
+    url: String,
+    sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -4611,6 +4738,14 @@ fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError>
     if status.is_success() {
         return Ok(());
     }
+    // 428 Precondition Required is the server's terms-acceptance gate —
+    // typed so UIs route to a review-and-accept step instead of showing a
+    // generic server error.
+    if status == reqwest::StatusCode::PRECONDITION_REQUIRED {
+        return Err(AppError::TermsAcceptanceRequired {
+            message: parse_server_error_message(body),
+        });
+    }
     Err(AppError::Server {
         status: status.as_u16(),
         message: parse_server_error_message(body),
@@ -4839,6 +4974,18 @@ mod tests {
     fn auto_allocation_exact_balance_allocates_it_all() {
         let amount = auto_allocation_amount(6_200, 6_200).unwrap();
         assert_eq!(amount, 6_200);
+    }
+
+    #[test]
+    fn check_status_maps_428_to_terms_acceptance_required() {
+        let body = r#"{"error":{"message":"acceptance of the current terms_of_service is required","type":"terms_acceptance_required"}}"#;
+        let err = check_status(reqwest::StatusCode::PRECONDITION_REQUIRED, body).unwrap_err();
+        match err {
+            AppError::TermsAcceptanceRequired { message } => {
+                assert!(message.contains("terms_of_service"));
+            }
+            other => panic!("expected TermsAcceptanceRequired, got {other:?}"),
+        }
     }
 
     #[test]

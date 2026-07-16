@@ -49,6 +49,34 @@ CREATE INDEX idx_account_stripe_customer ON account (stripe_customer_id)
     WHERE stripe_customer_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
+-- Account Acceptance
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE account_acceptance (
+    account_id  UUID NOT NULL REFERENCES account(id),
+    document    TEXT NOT NULL
+        CHECK (document IN ('terms_of_service', 'privacy_policy')),
+    sha256      TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (account_id, document, sha256)
+);
+
+COMMENT ON TABLE account_acceptance IS
+    'Append-only record of terms-of-service / privacy-policy acceptance. '
+    'Each row binds an account to the SHA-256 of the exact document text it '
+    'accepted (the same accept-by-hash mechanism the repository''s CLA uses), '
+    'so a dispute can be resolved against the precise version in git history. '
+    'Rows are never updated or deleted; re-accepting an already-accepted '
+    'version is a no-op that preserves the original timestamp. The currently '
+    'REQUIRED versions live in server configuration (TERMS_OF_SERVICE_SHA256 '
+    '/ PRIVACY_POLICY_SHA256), not in the database.';
+
+COMMENT ON COLUMN account_acceptance.sha256 IS
+    'Hex-encoded SHA-256 of the exact published document text the account '
+    'accepted.';
+
+-- ---------------------------------------------------------------------------
 -- Issuer Key
 -- ---------------------------------------------------------------------------
 

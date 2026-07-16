@@ -58,6 +58,37 @@ pub struct CheckoutRequest {
     pub cancel_url: String,
 }
 
+/// A document whose current version must be accepted before purchases or
+/// credential issuance. `sha256` identifies the exact text (the markdown
+/// source committed in the repository), so acceptance binds to precise
+/// words rather than a mutable URL.
+#[derive(Clone, Serialize, ToSchema)]
+pub struct RequiredDocument {
+    /// `terms_of_service` or `privacy_policy`.
+    pub document: String,
+    /// Where the current text is published.
+    pub url: String,
+    /// Hex-encoded SHA-256 of the exact published document text.
+    pub sha256: String,
+}
+
+/// The documents (and versions) whose acceptance the server currently
+/// requires. Empty when no acceptance gate is configured.
+#[derive(Serialize, ToSchema)]
+pub struct TermsResponse {
+    pub documents: Vec<RequiredDocument>,
+}
+
+/// Acceptance of one currently required document version.
+#[derive(Deserialize, ToSchema)]
+pub struct AcceptTermsRequest {
+    /// `terms_of_service` or `privacy_policy`.
+    pub document: String,
+    /// Hex-encoded SHA-256 of the document text being accepted; must match
+    /// the currently required version from `GET /v1/terms`.
+    pub sha256: String,
+}
+
 /// A purchasable plan.
 #[derive(Serialize, ToSchema)]
 pub struct PriceResponse {
@@ -153,6 +184,50 @@ fn require_stripe(stripe: &Option<StripeClient>) -> Result<&StripeClient, Server
         .ok_or_else(|| ServerError::ServiceUnavailable("stripe is not configured".to_string()))
 }
 
+/// The required documents the account has not (yet) accepted at their
+/// current versions. Pure so the gate logic is unit-testable without a
+/// database.
+pub(crate) fn missing_documents<'a>(
+    required: &'a [RequiredDocument],
+    accepted: &[(String, String)],
+) -> Vec<&'a str> {
+    required
+        .iter()
+        .filter(|d| {
+            !accepted
+                .iter()
+                .any(|(doc, hash)| *doc == d.document && *hash == d.sha256)
+        })
+        .map(|d| d.document.as_str())
+        .collect()
+}
+
+/// Gate for purchases and credential issuance: the account must have
+/// accepted every currently required document version (`AppState::
+/// required_terms`, from `TERMS_OF_SERVICE_SHA256` / `PRIVACY_POLICY_SHA256`).
+/// A no-op when no gate is configured.
+pub(crate) async fn ensure_terms_accepted(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<(), ServerError> {
+    if state.required_terms.is_empty() {
+        return Ok(());
+    }
+    let accepted = db::get_acceptances(&state.db_pool, account_id).await?;
+    let missing = missing_documents(&state.required_terms, &accepted);
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(ServerError::TermsAcceptanceRequired {
+            message: format!(
+                "acceptance of the current {} is required — fetch GET /v1/terms \
+                 and record acceptance via POST /v1/account/terms",
+                missing.join(" and ")
+            ),
+        })
+    }
+}
+
 // Bring the trait into scope for fill_bytes.
 use argon2::password_hash::rand_core::RngCore;
 
@@ -197,6 +272,59 @@ pub async fn create_account(
     };
 
     Ok((StatusCode::CREATED, Json(resp)))
+}
+
+/// GET /v1/terms — the document versions whose acceptance is required.
+#[utoipa::path(
+    get,
+    path = "/v1/terms",
+    tag = "Linked",
+    responses(
+        (status = 200, description = "Currently required document versions", body = TermsResponse)
+    )
+)]
+pub async fn get_terms(State(state): State<AppState>) -> Json<TermsResponse> {
+    Json(TermsResponse {
+        documents: state.required_terms.clone(),
+    })
+}
+
+/// POST /v1/account/terms — record acceptance of a current document version
+/// (authenticated).
+#[utoipa::path(
+    post,
+    path = "/v1/account/terms",
+    tag = "Linked",
+    request_body = AcceptTermsRequest,
+    security(("basic" = [])),
+    responses(
+        (status = 204, description = "Acceptance recorded"),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 409, description = "Not the currently required version", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn accept_terms(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+    Json(req): Json<AcceptTermsRequest>,
+) -> Result<StatusCode, ServerError> {
+    let sha256 = req.sha256.to_lowercase();
+    let is_current = state
+        .required_terms
+        .iter()
+        .any(|d| d.document == req.document && d.sha256 == sha256);
+    if !is_current {
+        return Err(ServerError::Conflict {
+            message: format!(
+                "{} version {} is not a currently required version — \
+                 fetch GET /v1/terms for the current documents",
+                req.document, req.sha256
+            ),
+        });
+    }
+
+    db::insert_acceptance(&state.db_pool, account_id, &req.document, &sha256).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /v1/account — retrieve account info (authenticated).
@@ -326,6 +454,7 @@ pub async fn list_prices(
         (status = 400, description = "Invalid request", body = crate::types::ErrorResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
         (status = 409, description = "Already subscribed", body = crate::types::ErrorResponse),
+        (status = 428, description = "Terms acceptance required", body = crate::types::ErrorResponse),
         (status = 503, description = "Stripe not configured", body = crate::types::ErrorResponse)
     )
 )]
@@ -335,6 +464,8 @@ pub async fn create_checkout(
     Json(checkout_req): Json<CheckoutRequest>,
 ) -> Result<Json<CheckoutUrlResponse>, ServerError> {
     let stripe = require_stripe(&state.stripe)?;
+
+    ensure_terms_accepted(&state, account_id).await?;
 
     if checkout_req.price_id.is_empty() {
         return Err(ServerError::BadRequest {
@@ -371,15 +502,24 @@ pub async fn create_checkout(
         "payment"
     };
 
-    // Conspicuous expiry disclosure at the point of purchase: rendered by
-    // Stripe Checkout next to the pay button. Must stay consistent with the
-    // published terms (www/pages/terms.md) and the webhook expiry logic.
-    let submit_note = if mode == "subscription" {
-        "Credits granted each billing period expire at the end of that period. \
-         Unused, unexpired credits are refundable on request. Details: eidola.ai/terms"
+    // Conspicuous expiry disclosure at the point of purchase: `submit_note`
+    // renders next to Checkout's pay button; `description` lands on the
+    // PaymentIntent / Subscription and thus on Stripe's email receipts and
+    // invoices. Must stay consistent with the published terms
+    // (www/pages/terms.md) and the webhook expiry logic.
+    let (submit_note, description) = if mode == "subscription" {
+        (
+            "Credits granted each billing period expire at the end of that period. \
+             Unused, unexpired credits are refundable on request. Details: eidola.ai/terms",
+            "Eidola subscription — each period's credits expire at the end of that \
+             billing period (see eidola.ai/terms)",
+        )
     } else {
-        "Credits expire one year after purchase. Unused, unexpired credits are \
-         refundable on request. Details: eidola.ai/terms"
+        (
+            "Credits expire one year after purchase. Unused, unexpired credits are \
+             refundable on request. Details: eidola.ai/terms",
+            "Eidola credits — expire one year after purchase (see eidola.ai/terms)",
+        )
     };
 
     let account_id_str = account_id.to_string();
@@ -391,6 +531,7 @@ pub async fn create_checkout(
         cancel_url: &checkout_req.cancel_url,
         client_reference_id: Some(&account_id_str),
         submit_note: Some(submit_note),
+        description: Some(description),
     };
 
     let checkout_url = stripe.create_checkout_session(&params).await?;
@@ -495,4 +636,58 @@ pub async fn get_ledger(
         .collect();
 
     Ok(Json(LedgerResponse { data }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(document: &str, sha256: &str) -> RequiredDocument {
+        RequiredDocument {
+            document: document.to_string(),
+            url: format!("https://www.eidola.ai/{document}/"),
+            sha256: sha256.to_string(),
+        }
+    }
+
+    #[test]
+    fn no_required_documents_means_nothing_missing() {
+        assert!(missing_documents(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn unaccepted_documents_are_missing() {
+        let required = [doc("terms_of_service", &"a".repeat(64))];
+        assert_eq!(missing_documents(&required, &[]), vec!["terms_of_service"]);
+    }
+
+    #[test]
+    fn acceptance_of_current_version_satisfies() {
+        let required = [doc("terms_of_service", &"a".repeat(64))];
+        let accepted = [("terms_of_service".to_string(), "a".repeat(64))];
+        assert!(missing_documents(&required, &accepted).is_empty());
+    }
+
+    #[test]
+    fn acceptance_of_old_version_does_not_satisfy() {
+        let required = [doc("terms_of_service", &"b".repeat(64))];
+        let accepted = [("terms_of_service".to_string(), "a".repeat(64))];
+        assert_eq!(
+            missing_documents(&required, &accepted),
+            vec!["terms_of_service"]
+        );
+    }
+
+    #[test]
+    fn each_document_is_gated_independently() {
+        let required = [
+            doc("terms_of_service", &"a".repeat(64)),
+            doc("privacy_policy", &"b".repeat(64)),
+        ];
+        let accepted = [("terms_of_service".to_string(), "a".repeat(64))];
+        assert_eq!(
+            missing_documents(&required, &accepted),
+            vec!["privacy_policy"]
+        );
+    }
 }

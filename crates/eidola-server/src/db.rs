@@ -342,6 +342,59 @@ pub async fn insert_credit_ledger(
     Ok(result == 1)
 }
 
+// --- Account acceptance queries ---
+
+/// Record acceptance of a document version. Append-only and idempotent —
+/// re-accepting an already-accepted version is a no-op that preserves the
+/// original timestamp.
+pub async fn insert_acceptance(
+    pool: &Pool,
+    account_id: Uuid,
+    document: &str,
+    sha256: &str,
+) -> Result<(), ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    client
+        .execute(
+            "INSERT INTO account_acceptance (account_id, document, sha256) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT DO NOTHING",
+            &[&account_id, &document, &sha256],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("insert acceptance failed: {e:?}")))?;
+
+    Ok(())
+}
+
+/// Every (document, sha256) pair the account has ever accepted.
+pub async fn get_acceptances(
+    pool: &Pool,
+    account_id: Uuid,
+) -> Result<Vec<(String, String)>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let rows = client
+        .query(
+            "SELECT document, sha256 FROM account_acceptance WHERE account_id = $1",
+            &[&account_id],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("query acceptances failed: {e:?}")))?;
+
+    Ok(rows
+        .iter()
+        .map(|r| (r.get("document"), r.get("sha256")))
+        .collect())
+}
+
 // --- Issuer Key queries ---
 
 /// A row from the `issuer_key` table.

@@ -30,6 +30,7 @@ struct Config {
     stripe_webhook_secret: Option<String>,
     credential_master_key: [u8; 32],
     pricing_markup: Option<f64>,
+    required_terms: Vec<eidola_server::account::RequiredDocument>,
 }
 
 impl Config {
@@ -110,6 +111,42 @@ impl Config {
             ),
         ])?;
 
+        // Terms-acceptance gate: when a *_SHA256 var is set, purchases and
+        // credential issuance require the account to have accepted that
+        // exact document version (the hash of the published markdown text,
+        // e.g. `shasum -a 256 www/pages/terms.md`). Unset = gate disabled.
+        let mut required_terms = Vec::new();
+        for (document, hash_var, url_var, default_url) in [
+            (
+                "terms_of_service",
+                "TERMS_OF_SERVICE_SHA256",
+                "TERMS_OF_SERVICE_URL",
+                "https://www.eidola.ai/terms/",
+            ),
+            (
+                "privacy_policy",
+                "PRIVACY_POLICY_SHA256",
+                "PRIVACY_POLICY_URL",
+                "https://www.eidola.ai/privacy/",
+            ),
+        ] {
+            let Some(sha256) = std::env::var(hash_var).ok().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!("{hash_var} must be 64 hex chars (a SHA-256)"));
+            }
+            let url = std::env::var(url_var)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| default_url.to_string());
+            required_terms.push(eidola_server::account::RequiredDocument {
+                document: document.to_string(),
+                url,
+                sha256: sha256.to_lowercase(),
+            });
+        }
+
         Ok(Config {
             bind_addr,
             tinfoil_api_key,
@@ -122,6 +159,7 @@ impl Config {
             stripe_webhook_secret,
             credential_master_key,
             pricing_markup,
+            required_terms,
         })
     }
 }
@@ -345,6 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.credential_master_key,
         credential_key_cache,
         epoch_config,
+        config.required_terms,
     );
 
     // Verify that this server's clock agrees with the database clock

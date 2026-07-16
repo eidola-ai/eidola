@@ -38,6 +38,14 @@ pub enum AppError {
     #[error("insufficient balance: {required} credits required, {available} available")]
     InsufficientBalance { available: i64, required: i64 },
 
+    /// The server requires acceptance of the current terms-of-service /
+    /// privacy-policy versions before purchases or credential issuance can
+    /// proceed (HTTP 428). UIs route to a review-and-accept step:
+    /// `AppCore::current_terms` lists the documents,
+    /// `AppCore::accept_current_terms` records acceptance.
+    #[error("terms acceptance required: {message}")]
+    TermsAcceptanceRequired { message: String },
+
     /// A local database operation failed.
     #[error("database error: {message}")]
     Database { message: String },
