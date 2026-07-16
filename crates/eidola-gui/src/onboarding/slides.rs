@@ -462,7 +462,8 @@ pub(super) struct Purchase {
 
 impl Purchase {
     const MARKDOWN: &'static str = "## Add credit\n\nChoose a plan or purchase credits directly. We use Stripe to \
-         process payments.";
+         process payments.\n\nSubscription credits last their billing period; one-time purchases last a \
+         year. Unused, unexpired credits are refundable on request.";
 }
 
 impl RenderOnce for Purchase {

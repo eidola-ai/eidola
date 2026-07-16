@@ -743,6 +743,7 @@
       },
       "BalancePool": {
         "type": "object",
+        "description": "One balance pool: credits sharing an origin and expiration.",
         "required": [
           "amount",
           "source"
@@ -750,21 +751,25 @@
         "properties": {
           "amount": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Credits remaining in this pool (micro-USD denominated)."
           },
           "expires_at": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "ISO-8601 instant at which these credits expire; absent for credits\nthat never expire."
           },
           "source": {
-            "type": "string"
+            "type": "string",
+            "description": "Where the pool came from: `subscription`, `purchase`, or `other`."
           }
         }
       },
       "BalancesResponse": {
         "type": "object",
+        "description": "Credit balance breakdown. All amounts are credits, denominated in\nmicro-USD (1 credit = $0.000001).",
         "required": [
           "available",
           "pools"
@@ -772,13 +777,15 @@
         "properties": {
           "available": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Total spendable credits (expired pools excluded)."
           },
           "pools": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/BalancePool"
-            }
+            },
+            "description": "Per-pool breakdown, earliest expiry first."
           }
         }
       },
@@ -1662,6 +1669,7 @@
       },
       "PriceResponse": {
         "type": "object",
+        "description": "A purchasable plan.",
         "required": [
           "id",
           "product_name",
@@ -1672,7 +1680,8 @@
         "properties": {
           "credits": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Credits granted by this plan, denominated in micro-USD\n(1 credit = $0.000001). Subscription credits expire at the end of\neach billing period; one-time purchase credits expire one year\nafter purchase."
           },
           "currency": {
             "type": "string"
@@ -1713,7 +1722,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Purchase price in the minor unit of `currency` (e.g. cents for USD)."
           }
         }
       },

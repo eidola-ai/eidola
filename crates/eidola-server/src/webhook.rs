@@ -312,12 +312,17 @@ async fn handle_checkout_completed(
     let event_time = UNIX_EPOCH + Duration::from_secs(event.created.max(0) as u64);
     let expires_at = event_time + Duration::from_secs(365 * 24 * 3600);
 
+    // Payment-mode checkout sessions carry the PaymentIntent; recording it
+    // lets a later charge.refunded event match the refund back to this pool.
+    let payment_intent = obj["payment_intent"].as_str();
+
     match db::insert_credit_ledger(
         pool,
         account.id,
         credits,
         "purchase",
         &event.id,
+        payment_intent,
         Some(expires_at),
     )
     .await
@@ -432,12 +437,19 @@ async fn handle_invoice_paid(
     let period_end = first_line["period"]["end"].as_i64();
     let expires_at = period_end.map(|ts| UNIX_EPOCH + Duration::from_secs(ts as u64));
 
+    // Best-effort: older Stripe API versions expose the PaymentIntent on the
+    // invoice object; newer ones moved it under `payments` (not expanded
+    // here). When absent, refunds of this charge fall back to pool-order
+    // debiting in debit_account.
+    let payment_intent = obj["payment_intent"].as_str();
+
     match db::insert_credit_ledger(
         pool,
         account.id,
         credits,
         "subscription_renewal",
         &event.id,
+        payment_intent,
         expires_at,
     )
     .await
@@ -504,16 +516,48 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         }
     };
 
-    match db::debit_stripe_event(pool, account.id, amount, "refund", &event.id).await {
-        Ok(true) => info!(
-            "webhook: debited {} from account {} (refund, event {})",
-            amount, account.id, event.id
-        ),
-        Ok(false) => info!("webhook: duplicate event {}, skipping", event.id),
-        Err(e) => {
-            error!("webhook: failed to insert ledger entry: {}", e);
-            return WebhookOutcome::RetryableError;
+    // Prefer matching the refund to the original payment's balance pool via
+    // the charge's PaymentIntent, so the debit inherits that pool's
+    // expires_at even if it has already lapsed (goodwill refunds of expired
+    // credits net to zero instead of clawing back live credits). Fall back
+    // to pool-order debiting when no linked entry exists.
+    let payment_intent = obj["payment_intent"].as_str();
+
+    let matched = match payment_intent {
+        Some(pi) => {
+            match db::refund_matched_to_payment_intent(pool, account.id, amount, &event.id, pi)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    error!("webhook: failed to insert matched refund: {}", e);
+                    return WebhookOutcome::RetryableError;
+                }
+            }
         }
+        None => None,
+    };
+
+    match matched {
+        Some(true) => info!(
+            "webhook: debited {} from account {} (refund matched to {}, event {})",
+            amount,
+            account.id,
+            payment_intent.unwrap_or_default(),
+            event.id
+        ),
+        Some(false) => info!("webhook: duplicate event {}, skipping", event.id),
+        None => match db::debit_stripe_event(pool, account.id, amount, "refund", &event.id).await {
+            Ok(true) => info!(
+                "webhook: debited {} from account {} (refund, event {})",
+                amount, account.id, event.id
+            ),
+            Ok(false) => info!("webhook: duplicate event {}, skipping", event.id),
+            Err(e) => {
+                error!("webhook: failed to insert ledger entry: {}", e);
+                return WebhookOutcome::RetryableError;
+            }
+        },
     }
 
     WebhookOutcome::Handled
@@ -654,8 +698,16 @@ async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutco
         }
     };
 
-    match db::insert_credit_ledger(pool, account.id, delta, "dispute_reversal", &event.id, None)
-        .await
+    match db::insert_credit_ledger(
+        pool,
+        account.id,
+        delta,
+        "dispute_reversal",
+        &event.id,
+        None,
+        None,
+    )
+    .await
     {
         Ok(true) => info!(
             "webhook: credited {} to account {} (dispute_reversal, event {})",
@@ -906,6 +958,7 @@ mod tests {
             "subscription_renewal",
             &format!("evt_seed_{}", uuid::Uuid::new_v4()),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -926,6 +979,117 @@ mod tests {
         assert_eq!(count_ledger_entries(&pool, account_id).await, 2);
     }
 
+    /// A refund whose charge carries a PaymentIntent linked to an
+    /// already-expired purchase pool nets against that pool: zero effect on
+    /// the live balance, and the refund debit inherits the pool's (past)
+    /// expires_at instead of becoming a permanent negative entry.
+    #[tokio::test]
+    #[ignore]
+    async fn charge_refunded_matches_expired_original_pool() {
+        let pool = test_pool();
+        let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
+        let account_id = create_test_account(&pool, &cust).await;
+        let pi = format!("pi_test_{}", uuid::Uuid::new_v4());
+
+        let expired = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        db::insert_credit_ledger(
+            &pool,
+            account_id,
+            50_000_000,
+            "purchase",
+            &format!("evt_seed_{}", uuid::Uuid::new_v4()),
+            Some(&pi),
+            Some(expired),
+        )
+        .await
+        .unwrap();
+        assert_eq!(get_balance(&pool, account_id).await, 0);
+
+        let event = make_event(
+            &format!("evt_{}", uuid::Uuid::new_v4()),
+            "charge.refunded",
+            serde_json::json!({
+                "customer": cust,
+                "payment_intent": pi,
+                "amount_refunded": 5000
+            }),
+        );
+
+        let outcome = handle_charge_refunded(&event, &pool).await;
+
+        assert!(!outcome.is_retryable());
+        assert_eq!(get_balance(&pool, account_id).await, 0);
+        assert_eq!(count_ledger_entries(&pool, account_id).await, 2);
+
+        let client = pool.get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT expires_at FROM credit_ledger \
+                 WHERE account_id = $1 AND reason = 'refund'",
+                &[&account_id],
+            )
+            .await
+            .unwrap();
+        let refund_expiry: Option<std::time::SystemTime> = row.get("expires_at");
+        assert!(
+            refund_expiry.is_some_and(|t| t < std::time::SystemTime::now()),
+            "refund debit must inherit the expired pool's past expires_at"
+        );
+    }
+
+    /// A refund with no PaymentIntent linkage still avoids the phantom
+    /// permanent negative: with no live pools, debit_account's expired-pool
+    /// backfill nets it against the expired positive pool.
+    #[tokio::test]
+    #[ignore]
+    async fn charge_refunded_without_intent_backfills_expired_pool() {
+        let pool = test_pool();
+        let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
+        let account_id = create_test_account(&pool, &cust).await;
+
+        let expired = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        db::insert_credit_ledger(
+            &pool,
+            account_id,
+            50_000_000,
+            "purchase",
+            &format!("evt_seed_{}", uuid::Uuid::new_v4()),
+            None,
+            Some(expired),
+        )
+        .await
+        .unwrap();
+
+        let event = make_event(
+            &format!("evt_{}", uuid::Uuid::new_v4()),
+            "charge.refunded",
+            serde_json::json!({
+                "customer": cust,
+                "amount_refunded": 5000
+            }),
+        );
+
+        let outcome = handle_charge_refunded(&event, &pool).await;
+
+        assert!(!outcome.is_retryable());
+        assert_eq!(get_balance(&pool, account_id).await, 0);
+
+        let client = pool.get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT expires_at FROM credit_ledger \
+                 WHERE account_id = $1 AND reason = 'refund'",
+                &[&account_id],
+            )
+            .await
+            .unwrap();
+        let refund_expiry: Option<std::time::SystemTime> = row.get("expires_at");
+        assert!(
+            refund_expiry.is_some(),
+            "refund debit must land on the expired pool, not the permanent (NULL) pool"
+        );
+    }
+
     #[tokio::test]
     #[ignore]
     async fn dispute_created_claws_back() {
@@ -939,6 +1103,7 @@ mod tests {
             50_000_000,
             "subscription_renewal",
             &format!("evt_seed_{}", uuid::Uuid::new_v4()),
+            None,
             None,
         )
         .await

@@ -58,12 +58,14 @@ pub struct CheckoutRequest {
     pub cancel_url: String,
 }
 
+/// A purchasable plan.
 #[derive(Serialize, ToSchema)]
 pub struct PriceResponse {
     pub id: String,
     pub product_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub product_description: Option<String>,
+    /// Purchase price in the minor unit of `currency` (e.g. cents for USD).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit_amount: Option<i64>,
     pub currency: String,
@@ -73,6 +75,10 @@ pub struct PriceResponse {
     pub recurring: Option<RecurringResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lookup_key: Option<String>,
+    /// Credits granted by this plan, denominated in micro-USD
+    /// (1 credit = $0.000001). Subscription credits expire at the end of
+    /// each billing period; one-time purchase credits expire one year
+    /// after purchase.
     pub credits: i64,
 }
 
@@ -87,16 +93,25 @@ pub struct ListPricesResponse {
     pub data: Vec<PriceResponse>,
 }
 
+/// Credit balance breakdown. All amounts are credits, denominated in
+/// micro-USD (1 credit = $0.000001).
 #[derive(Serialize, ToSchema)]
 pub struct BalancesResponse {
+    /// Total spendable credits (expired pools excluded).
     pub available: i64,
+    /// Per-pool breakdown, earliest expiry first.
     pub pools: Vec<BalancePool>,
 }
 
+/// One balance pool: credits sharing an origin and expiration.
 #[derive(Serialize, ToSchema)]
 pub struct BalancePool {
+    /// Credits remaining in this pool (micro-USD denominated).
     pub amount: i64,
+    /// Where the pool came from: `subscription`, `purchase`, or `other`.
     pub source: String,
+    /// ISO-8601 instant at which these credits expire; absent for credits
+    /// that never expire.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 }
@@ -356,6 +371,17 @@ pub async fn create_checkout(
         "payment"
     };
 
+    // Conspicuous expiry disclosure at the point of purchase: rendered by
+    // Stripe Checkout next to the pay button. Must stay consistent with the
+    // published terms (www/pages/terms.md) and the webhook expiry logic.
+    let submit_note = if mode == "subscription" {
+        "Credits granted each billing period expire at the end of that period. \
+         Unused, unexpired credits are refundable on request. Details: eidola.ai/terms"
+    } else {
+        "Credits expire one year after purchase. Unused, unexpired credits are \
+         refundable on request. Details: eidola.ai/terms"
+    };
+
     let account_id_str = account_id.to_string();
     let params = CheckoutParams {
         customer_id: &customer_id,
@@ -364,6 +390,7 @@ pub async fn create_checkout(
         success_url: &checkout_req.success_url,
         cancel_url: &checkout_req.cancel_url,
         client_reference_id: Some(&account_id_str),
+        submit_note: Some(submit_note),
     };
 
     let checkout_url = stripe.create_checkout_session(&params).await?;

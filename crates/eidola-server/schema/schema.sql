@@ -129,6 +129,7 @@ CREATE TABLE credit_ledger (
             'manual_adjustment'
         )),
     stripe_event_id TEXT UNIQUE,
+    stripe_payment_intent TEXT,
     memo            TEXT,
     expires_at      TIMESTAMPTZ,
     credential_key_id    TEXT REFERENCES issuer_key(id),
@@ -196,6 +197,15 @@ COMMENT ON COLUMN credit_ledger.stripe_event_id IS
     'UNIQUE constraint provides idempotent webhook handling — duplicate '
     'delivery simply fails the insert. NULL for non-Stripe entries.';
 
+COMMENT ON COLUMN credit_ledger.stripe_payment_intent IS
+    'Stripe PaymentIntent ID (pi_xxx) for entries originating from a payment '
+    '(purchase, subscription_renewal) and for refund debits matched to one. '
+    'Lets a later charge.refunded event locate the original credit entry and '
+    'issue the refund debit against the same balance pool — inheriting its '
+    'expires_at even when that pool has already expired, so the refund nets '
+    'against the credits it reverses. NULL for non-payment entries and for '
+    'events where Stripe did not include a payment intent.';
+
 COMMENT ON COLUMN credit_ledger.memo IS
     'Optional free-text note. Primarily useful for manual_adjustment entries '
     '("reversed accidental double-credit per support ticket #123"). '
@@ -234,6 +244,10 @@ CREATE INDEX idx_ledger_account_balance ON credit_ledger (account_id, expires_at
 
 -- Audit/admin: "show me all entries for a given reason this month"
 CREATE INDEX idx_ledger_reason_created ON credit_ledger (reason, created_at);
+
+-- Refund matching: locate the original credit entry for a payment intent.
+CREATE INDEX idx_ledger_payment_intent ON credit_ledger (stripe_payment_intent)
+    WHERE stripe_payment_intent IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- Nullifier
@@ -370,6 +384,56 @@ BEGIN
         v_remaining := v_remaining - v_take;
     END LOOP;
 
+    -- Cooperative refunds that exceed all live pools are next allocated
+    -- against EXPIRED positive pools (most recently expired first), each
+    -- debit inheriting the expired pool's own (past) expires_at.  This nets
+    -- a refund of already-expired credits against the pool it reverses —
+    -- both sides invisible to the balance — instead of creating a permanent
+    -- negative entry that would claw back credits the account never had
+    -- (the "phantom negative balance" hazard documented on expires_at).
+    -- Adversarial debits (dispute_clawback) intentionally skip this pass:
+    -- a clawback should outlive the credits it reverses.
+    IF v_remaining > 0 AND NOT p_require_balance AND p_reason = 'refund' THEN
+        FOR v_pool IN
+            SELECT expires_at, SUM(delta)::bigint AS pool_amount
+            FROM credit_ledger
+            WHERE account_id = p_account_id
+              AND expires_at IS NOT NULL
+              AND expires_at <= now()
+            GROUP BY expires_at
+            HAVING SUM(delta) > 0
+            ORDER BY expires_at DESC
+        LOOP
+            EXIT WHEN v_remaining <= 0;
+
+            v_take := LEAST(v_remaining, v_pool.pool_amount);
+            v_pool_idx := v_pool_idx + 1;
+
+            IF p_stripe_event_id IS NOT NULL THEN
+                v_event_id := CASE WHEN v_pool_idx = 1
+                    THEN p_stripe_event_id
+                    ELSE p_stripe_event_id || ':' || v_pool_idx
+                END;
+            ELSE
+                v_event_id := NULL;
+            END IF;
+
+            INSERT INTO credit_ledger (
+                id, account_id, delta, reason, stripe_event_id, expires_at,
+                credential_key_id, credential_credits, created_at
+            ) VALUES (
+                gen_random_uuid(), p_account_id, -v_take, p_reason, v_event_id,
+                v_pool.expires_at, p_credential_key_id,
+                CASE WHEN p_credential_key_id IS NOT NULL THEN v_take ELSE NULL END,
+                now()
+            )
+            RETURNING id INTO v_entry_id;
+
+            v_entry_ids := v_entry_ids || v_entry_id;
+            v_remaining := v_remaining - v_take;
+        END LOOP;
+    END IF;
+
     -- Remainder that exceeds all positive pools (refunds/clawbacks that
     -- exceed the current balance).  Placed in the permanent (NULL) pool.
     IF v_remaining > 0 AND NOT p_require_balance THEN
@@ -408,8 +472,11 @@ COMMENT ON FUNCTION debit_account IS
     'each debit row carries the expires_at of the pool it draws from. '
     'Returns NULL when p_require_balance is TRUE and the balance is '
     'insufficient.  Returns an empty array on duplicate stripe_event_id. '
-    'For refunds/clawbacks (p_require_balance = FALSE), any remainder '
-    'beyond existing pools is placed in the permanent (NULL expiry) pool.';
+    'For refunds (reason = ''refund'', p_require_balance = FALSE), any '
+    'remainder beyond live pools is next netted against expired positive '
+    'pools (most recently expired first, inheriting their past expires_at); '
+    'only what exceeds those too is placed in the permanent (NULL expiry) '
+    'pool.  Clawbacks skip the expired-pool pass and go permanent directly.';
 
 CREATE FUNCTION prune_expired_nullifiers()
 RETURNS BIGINT

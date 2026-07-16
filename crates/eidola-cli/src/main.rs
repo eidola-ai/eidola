@@ -564,13 +564,13 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             Some(AccountCommand::Balances) => {
                 let balances = core.account_balances().await?;
-                println!("available: {}", balances.available);
+                println!("available: {} credits", balances.available);
                 for pool in &balances.pools {
                     let expires = pool
                         .expires_at
-                        .map(|e| format!(", expires {e}"))
+                        .map(|e| format!(", {}", format_expiry(e)))
                         .unwrap_or_default();
-                    println!("  {} ({}{})", pool.amount, pool.source, expires);
+                    println!("  {} credits ({}{})", pool.amount, pool.source, expires);
                 }
                 Ok(())
             }
@@ -707,11 +707,12 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             let (result, ()) = tokio::join!(chat_fut, printer);
             let result = result?;
             eprintln!(
-                "---\nspace: {}  model: {}  tokens: {}/{}",
+                "---\nspace: {}  model: {}  tokens: {}/{}  credits: {}",
                 result.space_id,
                 result.model,
                 result.input_tokens.unwrap_or(0),
                 result.output_tokens.unwrap_or(0),
+                result.credits_charged,
             );
             Ok(())
         }
@@ -1097,6 +1098,26 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             Ok(())
         }
+    }
+}
+
+/// Human-readable relative expiry for balance pools (`expires_at` is epoch
+/// milliseconds). Mirrors the GUI's humanized expiry rather than printing a
+/// raw timestamp.
+fn format_expiry(expires_at_ms: i64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let days = (expires_at_ms - now_ms) / 86_400_000;
+    if expires_at_ms <= now_ms {
+        "expired".to_string()
+    } else if days == 0 {
+        "expires today".to_string()
+    } else if days == 1 {
+        "expires tomorrow".to_string()
+    } else {
+        format!("expires in {days}d")
     }
 }
 
