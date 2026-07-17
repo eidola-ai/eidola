@@ -60,12 +60,16 @@ pub struct CheckoutRequest {
 
 /// A document whose current version must be accepted before purchases or
 /// credential issuance. `sha256` identifies the exact text (the markdown
-/// source committed in the repository), so acceptance binds to precise
-/// words rather than a mutable URL.
+/// source, retrievable at `{url}source.md`), so acceptance binds to
+/// precise words rather than a mutable URL; `version` is the document's
+/// monotonically increasing front-matter version, which orders releases
+/// (accepting version N satisfies any requirement ≤ N).
 #[derive(Clone, Serialize, ToSchema)]
 pub struct RequiredDocument {
     /// `terms_of_service` or `privacy_policy`.
     pub document: String,
+    /// Monotonically increasing document version.
+    pub version: i64,
     /// Where the current text is published.
     pub url: String,
     /// Hex-encoded SHA-256 of the exact published document text.
@@ -184,37 +188,41 @@ fn require_stripe(stripe: &Option<StripeClient>) -> Result<&StripeClient, Server
         .ok_or_else(|| ServerError::ServiceUnavailable("stripe is not configured".to_string()))
 }
 
-/// The required documents the account has not (yet) accepted at their
-/// current versions. Pure so the gate logic is unit-testable without a
-/// database.
+/// The required documents the account has not accepted at (or above) their
+/// required versions. The `>=` comparison is what makes brief cross-instance
+/// requirement skew invisible to users: accepting version 6 satisfies an
+/// instance still requiring version 5. Pure so the gate logic is
+/// unit-testable without a database.
 pub(crate) fn missing_documents<'a>(
-    required: &'a [RequiredDocument],
-    accepted: &[(String, String)],
+    required: &'a [db::RequiredDocumentRow],
+    accepted_versions: &[(String, i64)],
 ) -> Vec<&'a str> {
     required
         .iter()
         .filter(|d| {
-            !accepted
+            !accepted_versions
                 .iter()
-                .any(|(doc, hash)| *doc == d.document && *hash == d.sha256)
+                .any(|(doc, version)| *doc == d.document && *version >= d.version)
         })
         .map(|d| d.document.as_str())
         .collect()
 }
 
 /// Gate for purchases and credential issuance: the account must have
-/// accepted every currently required document version (`AppState::
-/// required_terms`, from `TERMS_OF_SERVICE_SHA256` / `PRIVACY_POLICY_SHA256`).
-/// A no-op when no gate is configured.
+/// accepted every required document at (or above) the cluster-wide
+/// required version (the `required_document` table, advanced by the
+/// terms-feed poller and/or the startup env seed). A no-op when the table
+/// is empty (gate disabled).
 pub(crate) async fn ensure_terms_accepted(
     state: &AppState,
     account_id: Uuid,
 ) -> Result<(), ServerError> {
-    if state.required_terms.is_empty() {
+    let required = db::get_required_documents(&state.db_pool).await?;
+    if required.is_empty() {
         return Ok(());
     }
-    let accepted = db::get_acceptances(&state.db_pool, account_id).await?;
-    let missing = missing_documents(&state.required_terms, &accepted);
+    let accepted = db::get_accepted_versions(&state.db_pool, account_id).await?;
+    let missing = missing_documents(&required, &accepted);
     if missing.is_empty() {
         Ok(())
     } else {
@@ -283,10 +291,18 @@ pub async fn create_account(
         (status = 200, description = "Currently required document versions", body = TermsResponse)
     )
 )]
-pub async fn get_terms(State(state): State<AppState>) -> Json<TermsResponse> {
-    Json(TermsResponse {
-        documents: state.required_terms.clone(),
-    })
+pub async fn get_terms(State(state): State<AppState>) -> Result<Json<TermsResponse>, ServerError> {
+    let documents = db::get_required_documents(&state.db_pool)
+        .await?
+        .into_iter()
+        .map(|d| RequiredDocument {
+            document: d.document,
+            version: d.version,
+            url: d.url,
+            sha256: d.sha256,
+        })
+        .collect();
+    Ok(Json(TermsResponse { documents }))
 }
 
 /// POST /v1/account/terms — record acceptance of a current document version
@@ -309,21 +325,28 @@ pub async fn accept_terms(
     Json(req): Json<AcceptTermsRequest>,
 ) -> Result<StatusCode, ServerError> {
     let sha256 = req.sha256.to_lowercase();
-    let is_current = state
-        .required_terms
+    let required = db::get_required_documents(&state.db_pool).await?;
+    let Some(current) = required
         .iter()
-        .any(|d| d.document == req.document && d.sha256 == sha256);
-    if !is_current {
+        .find(|d| d.document == req.document && d.sha256 == sha256)
+    else {
         return Err(ServerError::Conflict {
             message: format!(
-                "{} version {} is not a currently required version — \
+                "{} with hash {} is not the currently required version — \
                  fetch GET /v1/terms for the current documents",
                 req.document, req.sha256
             ),
         });
-    }
+    };
 
-    db::insert_acceptance(&state.db_pool, account_id, &req.document, &sha256).await?;
+    db::insert_acceptance(
+        &state.db_pool,
+        account_id,
+        &current.document,
+        current.version,
+        &current.sha256,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -642,11 +665,12 @@ pub async fn get_ledger(
 mod tests {
     use super::*;
 
-    fn doc(document: &str, sha256: &str) -> RequiredDocument {
-        RequiredDocument {
+    fn doc(document: &str, version: i64) -> db::RequiredDocumentRow {
+        db::RequiredDocumentRow {
             document: document.to_string(),
+            version,
+            sha256: "a".repeat(64),
             url: format!("https://www.eidola.ai/{document}/"),
-            sha256: sha256.to_string(),
         }
     }
 
@@ -657,21 +681,30 @@ mod tests {
 
     #[test]
     fn unaccepted_documents_are_missing() {
-        let required = [doc("terms_of_service", &"a".repeat(64))];
+        let required = [doc("terms_of_service", 1)];
         assert_eq!(missing_documents(&required, &[]), vec!["terms_of_service"]);
     }
 
     #[test]
     fn acceptance_of_current_version_satisfies() {
-        let required = [doc("terms_of_service", &"a".repeat(64))];
-        let accepted = [("terms_of_service".to_string(), "a".repeat(64))];
+        let required = [doc("terms_of_service", 2)];
+        let accepted = [("terms_of_service".to_string(), 2)];
+        assert!(missing_documents(&required, &accepted).is_empty());
+    }
+
+    #[test]
+    fn acceptance_of_newer_version_satisfies_a_lagging_requirement() {
+        // The cross-instance skew case: the user accepted version 6 via a
+        // fresh instance; this instance still requires version 5.
+        let required = [doc("terms_of_service", 5)];
+        let accepted = [("terms_of_service".to_string(), 6)];
         assert!(missing_documents(&required, &accepted).is_empty());
     }
 
     #[test]
     fn acceptance_of_old_version_does_not_satisfy() {
-        let required = [doc("terms_of_service", &"b".repeat(64))];
-        let accepted = [("terms_of_service".to_string(), "a".repeat(64))];
+        let required = [doc("terms_of_service", 3)];
+        let accepted = [("terms_of_service".to_string(), 2)];
         assert_eq!(
             missing_documents(&required, &accepted),
             vec!["terms_of_service"]
@@ -680,11 +713,8 @@ mod tests {
 
     #[test]
     fn each_document_is_gated_independently() {
-        let required = [
-            doc("terms_of_service", &"a".repeat(64)),
-            doc("privacy_policy", &"b".repeat(64)),
-        ];
-        let accepted = [("terms_of_service".to_string(), "a".repeat(64))];
+        let required = [doc("terms_of_service", 1), doc("privacy_policy", 1)];
+        let accepted = [("terms_of_service".to_string(), 1)];
         assert_eq!(
             missing_documents(&required, &accepted),
             vec!["privacy_policy"]

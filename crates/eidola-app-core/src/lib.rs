@@ -163,11 +163,15 @@ pub struct AllocateResult {
 /// A document (terms of service / privacy policy) whose current version the
 /// server requires accounts to accept, identified by the SHA-256 of its
 /// exact published text — the same accept-by-hash mechanism the
-/// repository's CLA uses.
+/// repository's CLA uses. `version` is the document's monotonically
+/// increasing version number; accepting version N satisfies any server
+/// requirement ≤ N.
 #[derive(Clone, Debug)]
 pub struct TermsDocument {
     /// `terms_of_service` or `privacy_policy`.
     pub document: String,
+    /// Monotonically increasing document version.
+    pub version: i64,
     /// Where the current text is published.
     pub url: String,
     /// Hex-encoded SHA-256 of the exact published document text.
@@ -977,6 +981,7 @@ impl Inner {
             .into_iter()
             .map(|d| TermsDocument {
                 document: d.document,
+                version: d.version,
                 url: d.url,
                 sha256: d.sha256,
             })
@@ -3817,6 +3822,7 @@ struct TermsResponse {
 #[derive(Deserialize)]
 struct TermsDocumentResponse {
     document: String,
+    version: i64,
     url: String,
     sha256: String,
 }

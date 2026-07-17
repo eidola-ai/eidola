@@ -73,6 +73,17 @@ fn load_page(path: &Path, kind: PageKind, route: String, source_dir: &str) -> Re
         PageKind::Post => rendered.first_paragraph,
         _ => None,
     });
+    // Versioned legal documents publish their exact source bytes and the
+    // SHA-256 of those bytes — the acceptance hash the server's
+    // terms-acceptance gate polls and verifies.
+    let (source_sha256, source_raw) = if matter.version.is_some() {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(src.as_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        (Some(hex), Some(src.clone()))
+    } else {
+        (None, None)
+    };
     Ok(Page {
         kind,
         route,
@@ -83,6 +94,10 @@ fn load_page(path: &Path, kind: PageKind, route: String, source_dir: &str) -> Re
         html: rendered.html,
         headings: rendered.headings,
         source_path: None,
+        version: matter.version,
+        effective: matter.effective,
+        source_sha256,
+        source_raw,
     })
 }
 
@@ -95,6 +110,9 @@ fn write_page(out: &Path, page: &Page, docs_nav: Option<&[NavSection]>) -> Resul
     };
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("index.html"), layout(page, docs_nav))?;
+    if let Some(raw) = &page.source_raw {
+        fs::write(dir.join("source.md"), raw)?;
+    }
     Ok(())
 }
 
@@ -231,6 +249,10 @@ fn blog_index(posts: &[Page]) -> Page {
         html,
         headings: Vec::new(),
         source_path: None,
+        version: None,
+        effective: None,
+        source_sha256: None,
+        source_raw: None,
     }
 }
 

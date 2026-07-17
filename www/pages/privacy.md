@@ -1,6 +1,7 @@
 +++
 title = "Privacy policy"
 description = "The formal privacy policy for Eidola, Inc. — the whole company, not just the service."
+version = 1
 +++
 
 # Privacy policy

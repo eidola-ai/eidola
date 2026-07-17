@@ -2777,6 +2777,7 @@ version = "0.1.0"
 dependencies = [
  "pulldown-cmark 0.13.4",
  "serde",
+ "sha2 0.10.9",
  "toml 0.8.23",
 ]
 

@@ -542,7 +542,10 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 if !docs.is_empty() && !accept_terms {
                     eprintln!("creating an account means agreeing to:");
                     for d in &docs {
-                        eprintln!("  {} — {} (sha256 {})", d.document, d.url, d.sha256);
+                        eprintln!(
+                            "  {} v{} — {} (sha256 {})",
+                            d.document, d.version, d.url, d.sha256
+                        );
                     }
                     eprintln!("re-run with --accept-terms to agree and create the account");
                     std::process::exit(2);
@@ -561,7 +564,10 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 }
                 println!("the server requires acceptance of:");
                 for d in &docs {
-                    println!("  {} — {} (sha256 {})", d.document, d.url, d.sha256);
+                    println!(
+                        "  {} v{} — {} (sha256 {})",
+                        d.document, d.version, d.url, d.sha256
+                    );
                 }
                 if !yes {
                     use std::io::Write;

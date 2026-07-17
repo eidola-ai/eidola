@@ -1923,9 +1923,10 @@
       },
       "RequiredDocument": {
         "type": "object",
-        "description": "A document whose current version must be accepted before purchases or\ncredential issuance. `sha256` identifies the exact text (the markdown\nsource committed in the repository), so acceptance binds to precise\nwords rather than a mutable URL.",
+        "description": "A document whose current version must be accepted before purchases or\ncredential issuance. `sha256` identifies the exact text (the markdown\nsource, retrievable at `{url}source.md`), so acceptance binds to\nprecise words rather than a mutable URL; `version` is the document's\nmonotonically increasing front-matter version, which orders releases\n(accepting version N satisfies any requirement ≤ N).",
         "required": [
           "document",
+          "version",
           "url",
           "sha256"
         ],
@@ -1941,6 +1942,11 @@
           "url": {
             "type": "string",
             "description": "Where the current text is published."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Monotonically increasing document version."
           }
         }
       },

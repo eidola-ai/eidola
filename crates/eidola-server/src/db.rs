@@ -342,7 +342,105 @@ pub async fn insert_credit_ledger(
     Ok(result == 1)
 }
 
-// --- Account acceptance queries ---
+// --- Account acceptance / required document queries ---
+
+/// The currently required version of one legal document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequiredDocumentRow {
+    pub document: String,
+    pub version: i64,
+    pub sha256: String,
+    pub url: String,
+}
+
+/// Outcome of recording an observed document version.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecordRequiredOutcome {
+    /// A new (document, version) row was recorded; the requirement history
+    /// grew (and, if this is the highest version, the gate advanced).
+    Recorded,
+    /// This exact (document, version, sha256) was already on record — a
+    /// no-op that preserves the original `first_required_at`.
+    AlreadyRecorded,
+    /// A row for this (document, version) exists **with a different
+    /// hash** — the published bytes changed without a version increment,
+    /// violating the versioning contract CI enforces. Nothing is written;
+    /// the stored hash remains authoritative.
+    HashConflict { stored_sha256: String },
+}
+
+/// Record that a document version was observed as published. Append-only:
+/// one row per (document, version), first observation wins, rows are never
+/// updated — so the table is a complete history of what was required and
+/// since when, and the current requirement (the highest version per
+/// document) can never regress no matter how stale an observation is.
+pub async fn record_required_document(
+    pool: &Pool,
+    doc: &RequiredDocumentRow,
+) -> Result<RecordRequiredOutcome, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let rows = client
+        .execute(
+            "INSERT INTO required_document (document, version, sha256, url) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (document, version) DO NOTHING",
+            &[&doc.document, &doc.version, &doc.sha256, &doc.url],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("record required_document failed: {e:?}")))?;
+
+    if rows == 1 {
+        return Ok(RecordRequiredOutcome::Recorded);
+    }
+
+    let row = client
+        .query_one(
+            "SELECT sha256 FROM required_document WHERE document = $1 AND version = $2",
+            &[&doc.document, &doc.version],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("query required_document failed: {e:?}")))?;
+    let stored_sha256: String = row.get("sha256");
+
+    if stored_sha256 == doc.sha256 {
+        Ok(RecordRequiredOutcome::AlreadyRecorded)
+    } else {
+        Ok(RecordRequiredOutcome::HashConflict { stored_sha256 })
+    }
+}
+
+/// The currently required version of every gated document — the highest
+/// recorded version per document. Empty when the acceptance gate is
+/// disabled (nothing seeded or polled yet).
+pub async fn get_required_documents(pool: &Pool) -> Result<Vec<RequiredDocumentRow>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let rows = client
+        .query(
+            "SELECT DISTINCT ON (document) document, version, sha256, url \
+             FROM required_document ORDER BY document, version DESC",
+            &[],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("query required_document failed: {e:?}")))?;
+
+    Ok(rows
+        .iter()
+        .map(|r| RequiredDocumentRow {
+            document: r.get("document"),
+            version: r.get("version"),
+            sha256: r.get("sha256"),
+            url: r.get("url"),
+        })
+        .collect())
+}
 
 /// Record acceptance of a document version. Append-only and idempotent —
 /// re-accepting an already-accepted version is a no-op that preserves the
@@ -351,6 +449,7 @@ pub async fn insert_acceptance(
     pool: &Pool,
     account_id: Uuid,
     document: &str,
+    version: i64,
     sha256: &str,
 ) -> Result<(), ServerError> {
     let client = pool
@@ -360,10 +459,10 @@ pub async fn insert_acceptance(
 
     client
         .execute(
-            "INSERT INTO account_acceptance (account_id, document, sha256) \
-             VALUES ($1, $2, $3) \
+            "INSERT INTO account_acceptance (account_id, document, version, sha256) \
+             VALUES ($1, $2, $3, $4) \
              ON CONFLICT DO NOTHING",
-            &[&account_id, &document, &sha256],
+            &[&account_id, &document, &version, &sha256],
         )
         .await
         .map_err(|e| ServerError::Internal(format!("insert acceptance failed: {e:?}")))?;
@@ -371,11 +470,11 @@ pub async fn insert_acceptance(
     Ok(())
 }
 
-/// Every (document, sha256) pair the account has ever accepted.
-pub async fn get_acceptances(
+/// The highest version of each document the account has ever accepted.
+pub async fn get_accepted_versions(
     pool: &Pool,
     account_id: Uuid,
-) -> Result<Vec<(String, String)>, ServerError> {
+) -> Result<Vec<(String, i64)>, ServerError> {
     let client = pool
         .get()
         .await
@@ -383,7 +482,8 @@ pub async fn get_acceptances(
 
     let rows = client
         .query(
-            "SELECT document, sha256 FROM account_acceptance WHERE account_id = $1",
+            "SELECT document, MAX(version) AS version \
+             FROM account_acceptance WHERE account_id = $1 GROUP BY document",
             &[&account_id],
         )
         .await
@@ -391,7 +491,7 @@ pub async fn get_acceptances(
 
     Ok(rows
         .iter()
-        .map(|r| (r.get("document"), r.get("sha256")))
+        .map(|r| (r.get("document"), r.get("version")))
         .collect())
 }
 

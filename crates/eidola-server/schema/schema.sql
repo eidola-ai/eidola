@@ -56,6 +56,7 @@ CREATE TABLE account_acceptance (
     account_id  UUID NOT NULL REFERENCES account(id),
     document    TEXT NOT NULL
         CHECK (document IN ('terms_of_service', 'privacy_policy')),
+    version     BIGINT NOT NULL CHECK (version >= 1),
     sha256      TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
     accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -69,12 +70,55 @@ COMMENT ON TABLE account_acceptance IS
     'so a dispute can be resolved against the precise version in git history. '
     'Rows are never updated or deleted; re-accepting an already-accepted '
     'version is a no-op that preserves the original timestamp. The currently '
-    'REQUIRED versions live in server configuration (TERMS_OF_SERVICE_SHA256 '
-    '/ PRIVACY_POLICY_SHA256), not in the database.';
+    'REQUIRED versions live in required_document (advanced by the terms-feed '
+    'poller and/or seeded from server configuration).';
+
+COMMENT ON COLUMN account_acceptance.version IS
+    'The document''s front-matter version number at acceptance time, '
+    'stamped from the requiring server''s view. The acceptance gate is '
+    'MAX(version) >= required version, so accepting a newer version '
+    'satisfies an instance whose required view briefly lags.';
 
 COMMENT ON COLUMN account_acceptance.sha256 IS
     'Hex-encoded SHA-256 of the exact published document text the account '
     'accepted.';
+
+-- ---------------------------------------------------------------------------
+-- Required Document
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE required_document (
+    document    TEXT NOT NULL
+        CHECK (document IN ('terms_of_service', 'privacy_policy')),
+    version     BIGINT NOT NULL CHECK (version >= 1),
+    sha256      TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    url         TEXT NOT NULL,
+    first_required_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (document, version)
+);
+
+COMMENT ON TABLE required_document IS
+    'Append-only record of every legal-document version this cluster has '
+    'ever required. One row per (document, version); rows are never '
+    'updated or deleted. The CURRENT requirement is the highest version '
+    'per document, so monotonicity is structural — a stale poll or a '
+    'website briefly serving old content inserts nothing new and can '
+    'never regress the requirement — and the full history answers "which '
+    'version was being enforced on date X" forever (the acceptance-record '
+    'counterpart in account_acceptance answers "what did this account '
+    'agree to, and when"). Fed by the terms-feed poller and/or the '
+    'startup env seed, both through the same insert-if-absent. Empty '
+    'table = acceptance gate disabled. CI enforces that a published '
+    'document''s bytes never change without a version increment, which is '
+    'what makes the integer ordering trustworthy; a same-version row with '
+    'a different hash is a contract violation the poller detects and '
+    'refuses to record.';
+
+COMMENT ON COLUMN required_document.first_required_at IS
+    'When this version was first observed and became enforced '
+    'cluster-wide. Never overwritten — later observations of the same '
+    'version are no-ops.';
 
 -- ---------------------------------------------------------------------------
 -- Issuer Key

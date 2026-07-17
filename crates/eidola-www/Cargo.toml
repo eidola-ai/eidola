@@ -9,4 +9,5 @@ publish.workspace = true
 [dependencies]
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 toml = "0.8"

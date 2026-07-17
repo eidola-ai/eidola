@@ -138,6 +138,21 @@ jobs:
             echo "markdown=$markdown"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Check legal document versioning
+        # The published legal documents (www/pages/terms.md, privacy.md)
+        # are accepted by the SHA-256 of their exact bytes, ordered by a
+        # front-matter `version` integer — any change to a document's bytes
+        # must increment it by exactly one (see the script header). Runs on
+        # every PR into either trunk (cheap: git + sed, no toolchain);
+        # pushes are exempt because next/main only receive PR-vetted
+        # commits (the promotion is a fast-forward of a vetted next head).
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          ./scripts/check-legal-doc-versions.sh "$BASE_SHA"
+
       - name: Free up disk space
         # gpui is a very large dep tree, and the debug + `--all-targets` build
         # (with the `inspector` feature) plus the cargo registry/git and the

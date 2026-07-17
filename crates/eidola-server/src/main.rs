@@ -30,7 +30,15 @@ struct Config {
     stripe_webhook_secret: Option<String>,
     credential_master_key: [u8; 32],
     pricing_markup: Option<f64>,
-    required_terms: Vec<eidola_server::account::RequiredDocument>,
+    /// Static seed for the required-terms gate (dev/test pin; see
+    /// `terms_seed` parsing). Applied via the same monotonic upsert the
+    /// terms-feed poller uses.
+    terms_seed: Vec<eidola_server::db::RequiredDocumentRow>,
+    /// Base URL of the published website to poll for the current legal
+    /// document versions (e.g. `https://www.eidola.ai`). None = no polling.
+    terms_feed_base_url: Option<String>,
+    /// How often the terms feed re-polls.
+    terms_refresh: std::time::Duration,
 }
 
 impl Config {
@@ -111,21 +119,52 @@ impl Config {
             ),
         ])?;
 
-        // Terms-acceptance gate: when a *_SHA256 var is set, purchases and
-        // credential issuance require the account to have accepted that
-        // exact document version (the hash of the published markdown text,
-        // e.g. `shasum -a 256 www/pages/terms.md`). Unset = gate disabled.
-        let mut required_terms = Vec::new();
-        for (document, hash_var, url_var, default_url) in [
+        // Terms-acceptance gate. Two independent sources feed the shared
+        // `required_document` table (both through the same monotonic
+        // upsert — version may only increase):
+        //
+        //  - TERMS_FEED_BASE_URL: the published website to poll for each
+        //    document's exact source (`/terms/source.md`,
+        //    `/privacy/source.md`). This is the production source of
+        //    truth — legal documents outlive any client/server release,
+        //    so their required versions must never be baked into the
+        //    measured server config (which would make a terms update
+        //    require a coordinated client update).
+        //  - TERMS_OF_SERVICE_SHA256 / PRIVACY_POLICY_SHA256 (+ optional
+        //    `_VERSION`, default 1, and `_URL`): a static dev/test pin,
+        //    seeded once at startup.
+        //
+        // Neither set = gate disabled.
+        let terms_feed_base_url = std::env::var("TERMS_FEED_BASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches('/').to_string());
+
+        let terms_refresh = std::time::Duration::from_secs(
+            std::env::var("TERMS_REFRESH_SECS")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.parse::<u64>()
+                        .map_err(|_| "TERMS_REFRESH_SECS must be a positive integer".to_string())
+                })
+                .transpose()?
+                .unwrap_or(600),
+        );
+
+        let mut terms_seed = Vec::new();
+        for (document, hash_var, version_var, url_var, default_url) in [
             (
                 "terms_of_service",
                 "TERMS_OF_SERVICE_SHA256",
+                "TERMS_OF_SERVICE_VERSION",
                 "TERMS_OF_SERVICE_URL",
                 "https://www.eidola.ai/terms/",
             ),
             (
                 "privacy_policy",
                 "PRIVACY_POLICY_SHA256",
+                "PRIVACY_POLICY_VERSION",
                 "PRIVACY_POLICY_URL",
                 "https://www.eidola.ai/privacy/",
             ),
@@ -136,14 +175,27 @@ impl Config {
             if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(format!("{hash_var} must be 64 hex chars (a SHA-256)"));
             }
+            let version = std::env::var(version_var)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.parse::<i64>()
+                        .map_err(|_| format!("{version_var} must be a positive integer"))
+                })
+                .transpose()?
+                .unwrap_or(1);
+            if version < 1 {
+                return Err(format!("{version_var} must be >= 1"));
+            }
             let url = std::env::var(url_var)
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| default_url.to_string());
-            required_terms.push(eidola_server::account::RequiredDocument {
+            terms_seed.push(eidola_server::db::RequiredDocumentRow {
                 document: document.to_string(),
-                url,
+                version,
                 sha256: sha256.to_lowercase(),
+                url,
             });
         }
 
@@ -159,7 +211,9 @@ impl Config {
             stripe_webhook_secret,
             credential_master_key,
             pricing_markup,
-            required_terms,
+            terms_seed,
+            terms_feed_base_url,
+            terms_refresh,
         })
     }
 }
@@ -383,7 +437,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.credential_master_key,
         credential_key_cache,
         epoch_config,
-        config.required_terms,
     );
 
     // Verify that this server's clock agrees with the database clock
@@ -397,6 +450,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             error!("Database clock skew check failed: {}", e);
             e.to_string()
         })?;
+
+    // Terms-acceptance gate: seed any static env pins into the shared
+    // required_document table (monotonic — a stale pin can't regress a
+    // newer polled version), then start the terms-feed poller if a feed
+    // URL is configured. Seed failures are fatal (an explicitly pinned
+    // gate that silently doesn't apply would be worse than not starting);
+    // poller failures are per-tick and logged.
+    for doc in &config.terms_seed {
+        use eidola_server::db::RecordRequiredOutcome;
+        match eidola_server::db::record_required_document(&state.db_pool, doc).await {
+            Ok(RecordRequiredOutcome::Recorded) => info!(
+                "terms gate: {} seeded at version {} ({})",
+                doc.document, doc.version, doc.sha256
+            ),
+            Ok(RecordRequiredOutcome::AlreadyRecorded) => info!(
+                "terms gate: {} version {} already on record, seed unchanged",
+                doc.document, doc.version
+            ),
+            Ok(RecordRequiredOutcome::HashConflict { stored_sha256 }) => {
+                // An explicit pin that contradicts the recorded history is
+                // an operator error worth refusing to start over: either
+                // the pin is wrong, or someone changed a document's bytes
+                // without a version bump.
+                error!(
+                    "terms gate: seed for {} version {} has hash {} but that version is \
+                     recorded with hash {} — fix the pin or publish a new version",
+                    doc.document, doc.version, doc.sha256, stored_sha256
+                );
+                return Err("terms seed conflicts with recorded document history".into());
+            }
+            Err(e) => {
+                error!("terms gate: seeding {} failed: {}", doc.document, e);
+                return Err(e.to_string().into());
+            }
+        }
+    }
+    if let Some(base_url) = config.terms_feed_base_url.clone() {
+        info!(
+            "terms feed: polling {} every {:?}",
+            base_url, config.terms_refresh
+        );
+        eidola_server::terms_feed::spawn_terms_feed_task(
+            state.db_pool.clone(),
+            base_url,
+            config.terms_refresh,
+        );
+    }
 
     // Provision issuer keys on boot and start periodic rotation task.
     match credentials::ensure_keys(

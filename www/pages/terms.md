@@ -1,6 +1,7 @@
 +++
 title = "Terms of service"
 description = "Terms of service for Eidola's paid service."
+version = 1
 +++
 
 # Terms of service
@@ -132,7 +133,7 @@ We deliberately do not impose mandatory arbitration or a class-action waiver. If
 
 **In short:** If these terms change materially, the app asks you to accept the new version before your next paid action. We don't pretend that silence is consent.
 
-Each version of these terms is identified by the cryptographic hash of its exact text, and your acceptance of a specific version is recorded against your account — the same way contributions to our repository are signed. If we change these terms materially, you will be asked to review and accept the new version before making further purchases or conversions; declining means we refund your unexpired, unconverted balance and part ways. Already-issued anonymous tokens are honored under the terms in effect when they were issued, until they expire.
+Each version of these terms carries a version number and is identified by the cryptographic hash of its exact text — both are shown at the top of this page — and your acceptance of a specific version is recorded against your account, the same way contributions to our repository are signed. If we change these terms materially, you will be asked to review and accept the new version before making further purchases or conversions; declining means we refund your unexpired, unconverted balance and part ways. Already-issued anonymous tokens are honored under the terms in effect when they were issued, until they expire.
 
 Notice of changes is posted here, and this document's full history is public in the repository.
 
