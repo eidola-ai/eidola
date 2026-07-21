@@ -862,7 +862,7 @@ fn relative_time_buckets(cx: &mut TestAppContext) {
 fn settings_nav_switches_panes(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
 
     view.read_with(cx, |v, _| {
@@ -889,7 +889,7 @@ fn settings_backends_tabs_switch(cx: &mut TestAppContext) {
     // the connection + trust surface (base URL / measurements / hardware CAs).
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
     let pane = view.read_with(cx, |v, _| v.backends_pane());
 
@@ -916,7 +916,7 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
         s.backends = backends_fixture(true);
     });
     let (_w, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(enabled.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(enabled.clone(), window, cx))
     });
     view.read_with(cx, |v, cx| {
         assert_eq!(
@@ -937,7 +937,7 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
         s.backends = backends_fixture(false);
     });
     let (_w2, view2) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(disabled.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(disabled.clone(), window, cx))
     });
     view2.read_with(cx, |v, cx| {
         assert_eq!(
@@ -959,7 +959,7 @@ fn settings_selection_falls_back_when_eidola_disabled(cx: &mut TestAppContext) {
         s.backends = backends_fixture(true);
     });
     let (_w, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
 
     view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
@@ -993,7 +993,7 @@ fn settings_eidola_url_editor_save_cancel_revert(cx: &mut TestAppContext) {
         s.backends = backends_fixture(true);
     });
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
     let pane = view.read_with(cx, |v, _| v.backends_pane());
 
@@ -1025,40 +1025,47 @@ fn settings_eidola_url_editor_save_cancel_revert(cx: &mut TestAppContext) {
     pane.update(cx, |p, cx| p.revert_measurements(cx));
 }
 
-/// The measurement + hardware-CA *editors* on the Eidola tab appear only while
-/// ⌥ is held. This drives the real platform dispatch: the `SettingsView` root's
-/// single `on_modifiers_changed` listener mirrors into `WindowInput`, which the
-/// backends pane observes — the same seam the General pane uses.
+/// The measurement add input and the hardware-CA textareas reveal in place
+/// on demand (the base-URL row's edit-in-place shape, generalized — no
+/// disclosure, no hidden state): "Trust a measurement…" / "Set custom
+/// certificate…" open them, Cancel closes them.
 #[gpui::test]
-fn settings_eidola_trust_editors_gate_on_option(cx: &mut TestAppContext) {
+fn settings_eidola_trust_editors_reveal_in_place(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::CaKind;
+
     let stores = stub_stores(cx, |s| {
         s.config_state = Some(config_state(true));
         s.eidola_trust = Some(eidola_trust());
         s.backends = backends_fixture(true);
     });
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
     let pane = view.read_with(cx, |v, _| v.backends_pane());
 
+    // At rest: value displays only, no inputs.
     pane.read_with(cx, |p, _| {
-        assert!(!p.advanced(), "trust editors hidden at rest");
+        assert!(!p.adding_measurement(), "add input hidden at rest");
+        assert_eq!(p.editing_ca(), None, "CA textareas hidden at rest");
     });
 
-    // Drive the real modifier-changed dispatch path through the root listener.
-    let mut vcx = VisualTestContext::from_window(window, cx);
-    vcx.simulate_modifiers_change(Modifiers {
-        alt: true,
-        ..Modifiers::default()
-    });
-    pane.read_with(&vcx, |p, _| {
-        assert!(p.advanced(), "⌥ held reveals the trust editors");
-    });
+    // Trust a measurement… reveals the add input; Cancel hides it.
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_add_measurement(window, cx));
+    })
+    .unwrap();
+    pane.read_with(cx, |p, _| assert!(p.adding_measurement()));
+    pane.update(cx, |p, cx| p.cancel_add_measurement(cx));
+    pane.read_with(cx, |p, _| assert!(!p.adding_measurement()));
 
-    vcx.simulate_modifiers_change(Modifiers::default());
-    pane.read_with(&vcx, |p, _| {
-        assert!(!p.advanced(), "releasing ⌥ hides the trust editors");
-    });
+    // Set custom certificate… reveals that CA's textarea; Cancel hides it.
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_edit_ca(CaKind::Root, window, cx));
+    })
+    .unwrap();
+    pane.read_with(cx, |p, _| assert_eq!(p.editing_ca(), Some(CaKind::Root)));
+    pane.update(cx, |p, cx| p.cancel_edit_ca(cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.editing_ca(), None));
 }
 
 /// The Eidola trust editors route through the config store. On a stub (no
@@ -1077,6 +1084,8 @@ fn settings_eidola_trust_editors_call_through(cx: &mut TestAppContext) {
     }];
     trust.trusted_measurements_are_override = true;
     trust.has_hardware_root_ca = true;
+    trust.hardware_root_ca_pem =
+        Some("-----BEGIN CERTIFICATE-----\nMIIBcustomroot\n-----END CERTIFICATE-----".into());
 
     let stores = stub_stores(cx, |s| {
         s.config_state = Some(config_state(true));
@@ -1084,13 +1093,17 @@ fn settings_eidola_trust_editors_call_through(cx: &mut TestAppContext) {
         s.backends = backends_fixture(true);
     });
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
     let pane = view.read_with(cx, |v, _| v.backends_pane());
-    pane.update(cx, |p, cx| p.set_advanced(true, cx));
 
-    // Add a measurement: seed the input triple, submit, expect a cleared field
-    // (the stub write reports no error, so the success branch clears it).
+    // Add a measurement: reveal the input, seed the triple, submit — expect a
+    // cleared field and the input closed again (the stub write reports no
+    // error, so the success branch runs).
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_add_measurement(window, cx));
+    })
+    .unwrap();
     let triple = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44\
                   ee55ff66aa11bb22cc33dd44:\
                   0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:\
@@ -1107,6 +1120,12 @@ fn settings_eidola_trust_editors_call_through(cx: &mut TestAppContext) {
     add_input.read_with(cx, |s, _| {
         assert!(s.value().is_empty(), "a successful add clears the input");
     });
+    pane.read_with(cx, |p, _| {
+        assert!(
+            !p.adding_measurement(),
+            "a successful add closes the input again"
+        );
+    });
 
     // Untrust routes through without panicking.
     pane.update(cx, |p, cx| {
@@ -1116,8 +1135,12 @@ fn settings_eidola_trust_editors_call_through(cx: &mut TestAppContext) {
         )
     });
 
-    // CA set: seed a PEM, submit, expect a cleared field; then Clear routes
-    // through.
+    // CA set: reveal the textarea, seed a PEM, submit — expect a cleared
+    // field and the editor closed; then Clear routes through.
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_edit_ca(CaKind::Root, window, cx));
+    })
+    .unwrap();
     let ca_input = pane.read_with(cx, |p, _| p.ca_input(CaKind::Root));
     cx.update_window(window, |_, window, cx| {
         ca_input.update(cx, |s, cx| {
@@ -1136,6 +1159,13 @@ fn settings_eidola_trust_editors_call_through(cx: &mut TestAppContext) {
     ca_input.read_with(cx, |s, _| {
         assert!(s.value().is_empty(), "a successful CA set clears the input");
     });
+    pane.read_with(cx, |p, _| {
+        assert_eq!(
+            p.editing_ca(),
+            None,
+            "a successful CA set closes the editor"
+        );
+    });
     pane.update(cx, |p, cx| p.clear_ca(CaKind::Root, cx));
 }
 
@@ -1153,7 +1183,7 @@ fn settings_account_pane_reachable_at_top_level(cx: &mut TestAppContext) {
         });
     });
     let (_w, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
 
     view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
@@ -1191,7 +1221,7 @@ fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext
         });
     });
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
 
     let backends_view = view.read_with(cx, |v, _| v.backends_pane());
@@ -1340,7 +1370,7 @@ fn settings_backends_pane_add_form_and_toggle(cx: &mut TestAppContext) {
         }];
     });
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
     let pane = view.read_with(cx, |v, _| v.backends_pane());
 
@@ -1398,7 +1428,7 @@ fn settings_backends_pane_auto_start_toggle(cx: &mut TestAppContext) {
         }];
     });
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
     let pane = view.read_with(cx, |v, _| v.backends_pane());
 
@@ -1409,73 +1439,6 @@ fn settings_backends_pane_auto_start_toggle(cx: &mut TestAppContext) {
             "optimistic auto-start flip must be visible"
         );
         assert!(b.op_error().is_none(), "stub ops must not surface errors");
-    });
-}
-
-#[gpui::test]
-fn general_option_reveal_tracks_modifier_state(cx: &mut TestAppContext) {
-    // The advanced rows appear only while ⌥ is held. The pane's root
-    // registers `on_modifiers_changed`, which calls `set_advanced` with the
-    // live alt state — this drives the same method.
-    let stores = stub_stores_with_config(cx);
-    let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
-    });
-
-    let general = view.read_with(cx, |v, _| v.general());
-    general.read_with(cx, |g, _| {
-        assert!(!g.advanced(), "advanced section is hidden at rest");
-    });
-
-    general.update(cx, |g, cx| g.set_advanced(true, cx));
-    general.read_with(cx, |g, _| assert!(g.advanced()));
-
-    // Releasing ⌥ hides it again.
-    general.update(cx, |g, cx| g.set_advanced(false, cx));
-    general.read_with(cx, |g, _| assert!(!g.advanced()));
-}
-
-/// Bug replay: wave-2 bug 2 — the Settings > General ⌥ reveal was dead
-/// because `ModifiersChangedEvent` dispatches along the focused element's
-/// ancestor path only. A `GeneralView`-local listener never fired while a
-/// text input in a sibling pane (or the Base URL input inside General itself)
-/// had focus. The fix: one listener on the `SettingsView` root (always an
-/// ancestor of whatever is focused) that mirrors events into `WindowInput`;
-/// `GeneralView` observes that entity.
-///
-/// This test replays the dispatch through `VisualTestContext::simulate_modifiers_change`
-/// (the same platform-event path as production — no mock shortcuts).
-#[gpui::test]
-fn settings_general_option_reveal_works_via_root_listener(cx: &mut TestAppContext) {
-    let stores = stub_stores_with_config(cx);
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
-    });
-
-    let general = view.read_with(cx, |v, _| v.general());
-    general.read_with(cx, |g, _| {
-        assert!(!g.advanced(), "advanced section hidden at rest");
-    });
-
-    // Drive the real modifier-changed dispatch path: platform event →
-    // window → gpui focus dispatch chain → `SettingsView` root listener →
-    // `WindowInput::update_modifiers` → `GeneralView` observer →
-    // `GeneralView::set_advanced(true)`.
-    let mut vcx = VisualTestContext::from_window(window, cx);
-    vcx.simulate_modifiers_change(Modifiers {
-        alt: true,
-        ..Modifiers::default()
-    });
-    general.read_with(&vcx, |g, _| {
-        assert!(
-            g.advanced(),
-            "⌥ held must reveal advanced rows via the root listener"
-        );
-    });
-
-    vcx.simulate_modifiers_change(Modifiers::default());
-    general.read_with(&vcx, |g, _| {
-        assert!(!g.advanced(), "releasing ⌥ must hide advanced rows");
     });
 }
 
@@ -1490,7 +1453,7 @@ fn settings_appearance_choices_route_through_config_store(cx: &mut TestAppContex
 
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
 
     let general = view.read_with(cx, |v, _| v.general());
@@ -1903,8 +1866,15 @@ fn eidola_trust() -> eidola_app_core::EidolaTrust {
         base_url_is_override: false,
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
+        pinned_measurement: eidola_app_core::MeasurementInfo {
+            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
+            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+        },
         has_hardware_root_ca: false,
+        hardware_root_ca_pem: None,
         has_hardware_intermediate_ca: false,
+        hardware_intermediate_ca_pem: None,
     }
 }
 

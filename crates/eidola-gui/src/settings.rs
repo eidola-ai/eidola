@@ -18,9 +18,8 @@
 //! (⇧⌘L); the panes here summarize and link there.
 
 use gpui::{
-    AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    ModifiersChangedEvent, ParentElement, Render, StatefulInteractiveElement, Styled, Window, div,
-    px,
+    AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
+    Render, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
@@ -31,7 +30,6 @@ use crate::general::GeneralView;
 use crate::probe::Probe as _;
 use crate::stores::{BackendsStore, Stores};
 use crate::wallet::WalletView;
-use crate::window_input::WindowInput;
 
 /// Vertical reserve at the top of the nav band so the macOS traffic lights
 /// (at `point(14, 11)` per `lib.rs::transparent_titlebar`) / the Linux CSD
@@ -76,10 +74,6 @@ pub struct SettingsView {
     /// the eidola singleton being enabled (observed so a bus-driven flip
     /// re-renders the nav and reconciles the selection).
     backends_store: Entity<BackendsStore>,
-    /// The per-window modifier state. The root's `on_modifiers_changed`
-    /// listener (registered in `Render`) mirrors events here; `GeneralView`
-    /// observes it for the ⌥-reveal rather than registering its own listener.
-    window_input: Entity<WindowInput>,
     /// Focus handle the root tracks. We attach `CloseWindow`'s listener to
     /// the root; the focused node has to be at-or-below it for the listener
     /// to be in the dispatch path, so we `focus()` the handle on
@@ -88,20 +82,9 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    /// `window_input` is the per-window modifier entity created by
-    /// `open_settings_window`. This view's `Render` registers the window's
-    /// single `on_modifiers_changed` listener and mirrors events into it;
-    /// `GeneralView` observes it for the ⌥-reveal affordance.
-    pub fn new(
-        stores: Stores,
-        window_input: Entity<WindowInput>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let general =
-            cx.new(|cx| GeneralView::new(stores.config.clone(), window_input.clone(), window, cx));
-        let backends = cx
-            .new(|cx| BackendsSettingsView::new(stores.clone(), window_input.clone(), window, cx));
+    pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let general = cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx));
+        let backends = cx.new(|cx| BackendsSettingsView::new(stores.clone(), window, cx));
         let account = cx.new(|cx| AccountView::new(stores.clone(), window, cx));
         let wallet = cx.new(|cx| WalletView::new(stores.clone(), window, cx));
         let backends_store = stores.backends.clone();
@@ -125,7 +108,6 @@ impl SettingsView {
             account,
             wallet,
             backends_store,
-            window_input,
             focus_handle,
         }
     }
@@ -259,24 +241,10 @@ impl Render for SettingsView {
         }
 
         let theme = cx.theme();
-        let wi = self.window_input.clone();
         crate::chrome::round_client_corners(h_flex(), window)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
-            }))
-            // Single modifier listener for the settings window — mirrors every
-            // modifier event into `WindowInput`. Because gpui dispatches
-            // `ModifiersChangedEvent` along the focused element's ancestor path
-            // only, a listener on a sibling pane (e.g. GeneralView) would be
-            // dead while a text input in the Account/Wallet pane has focus.
-            // Placing the listener here on the h_flex root (whose focus handle
-            // is always an ancestor) ensures it fires regardless of which pane
-            // or input is focused. `GeneralView` observes the entity instead.
-            .on_modifiers_changed(cx.listener(move |_, event: &ModifiersChangedEvent, _, cx| {
-                wi.update(cx, |wi, cx| {
-                    wi.update_modifiers(event, cx);
-                });
             }))
             .relative()
             .size_full()

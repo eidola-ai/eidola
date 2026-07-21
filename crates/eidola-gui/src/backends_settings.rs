@@ -6,16 +6,24 @@
 //!
 //! - **Eidola** — the confidential service's connection + trust surface.
 //!   Enable/disable the singleton; when enabled, an always-visible danger
-//!   warning band whenever any override is active, the **base-URL override**
-//!   editor (edit/save/cancel/change/revert-to-pin — honest about pin vs
-//!   override), the **trusted-measurements** state (+ revert), and the
-//!   **hardware CA** state. The measurement (add/untrust) and CA (set/clear)
-//!   *editors* are gated behind holding **⌥** (mirroring the General pane's
-//!   advanced-reveal via `WindowInput`); the read-only state and the
-//!   revert-toward-pin affordances stay ungated. When disabled, a short "no
-//!   account, on-device only" explanation. (Disabling `eidola` *is* the
-//!   on-device-only configuration.) The account surface is a top-level
-//!   Settings pane (`AccountView`), shown only while this backend is enabled.
+//!   warning band whenever any override is active, then **one row per trust
+//!   setting, each row both display and editor** (the macOS settings idiom:
+//!   the current value is always visible, and a quiet verb swaps in the
+//!   input on demand — the base-URL row's edit-in-place pattern,
+//!   generalized). Base URL (change/save/cancel/revert-to-pin), trusted
+//!   measurements (compact per-measurement lines with Copy — full triple —
+//!   and Untrust/Trust verbs, a reveal-on-demand add input, revert, and a
+//!   link to the Record for the attestation evidence), and the two hardware
+//!   CAs (status + Copy/Replace…/Clear when overridden, "Set custom
+//!   certificate…" revealing a paste-PEM textarea otherwise). Nothing is
+//!   duplicated and nothing hides behind a disclosure — sovereignty means
+//!   the trust surface is always visible; the danger states carry the
+//!   warning band and one-click reverts. Read-only connection details
+//!   (attestation URL, domain separator) close the tab. When disabled, a
+//!   short "no account, on-device only" explanation. (Disabling `eidola`
+//!   *is* the on-device-only configuration.) The account surface is a
+//!   top-level Settings pane (`AccountView`), shown only while this backend
+//!   is enabled.
 //! - **Local** — the managed local store: enable/disable, the **engine**
 //!   line (resolved bundled `llama-server`, or an honest dev-build hint), the
 //!   installed models (status + per-state verbs: load / unload / cancel /
@@ -36,11 +44,12 @@
 //! this window interrupts nothing.
 
 use eidola_app_core::{
-    BackendInfo, BackendKind, LOCAL_MODEL_CATALOG, LocalModelInfo, LocalModelStatus, NewBackend,
+    BackendInfo, BackendKind, EidolaTrust, LOCAL_MODEL_CATALOG, LocalModelInfo, LocalModelStatus,
+    MeasurementInfo, NewBackend,
 };
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
+    AppContext, ClipboardItem, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
     prelude::FluentBuilder, px,
 };
 use gpui_component::{
@@ -49,12 +58,13 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
+    switch::Switch,
     v_flex,
 };
 
+use crate::actions::OpenRecord;
 use crate::probe::Probe as _;
 use crate::stores::{BackendsStore, ConfigStore, LocalModelsStore, Stores};
-use crate::window_input::WindowInput;
 
 /// Which hardware CA a trust-editor row targets. The two are the same
 /// component parameterized; the core has a separate setter/clearer per kind.
@@ -63,6 +73,19 @@ use crate::window_input::WindowInput;
 pub enum CaKind {
     Root,
     Intermediate,
+}
+
+/// How a measurement line in the trusted-measurements row should present —
+/// which verbs it carries and how it's tagged. See `measurement_line`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MeasurementRole {
+    /// The build pin, and it is the trusted set (no override). Read-only.
+    Pinned,
+    /// A user override entry at this index in `trusted_measurements`.
+    Override(usize),
+    /// The build pin while an override set has replaced it — auditable, and
+    /// re-addable via a Trust verb.
+    PinNotTrusted,
 }
 
 /// Which internal tab of the Backends pane is showing. View-local state — the
@@ -131,13 +154,15 @@ pub struct BackendsSettingsView {
     base_url_state: Entity<InputState>,
     /// Whether the base-URL row is in its edit state (input + save/cancel).
     editing_base_url: bool,
-    /// Whether the ⌥-revealed trust *editors* (measurement add/untrust, CA
-    /// set/clear) are visible. Driven by the per-window `WindowInput` entity
-    /// observed in `new` — mirrors the General pane's advanced-reveal so ⌥
-    /// tracks regardless of which pane holds focus. The base-URL editor and
-    /// the revert-to-pin affordances stay ungated (reverting *toward* the pin
-    /// is the safe direction).
-    advanced: bool,
+    /// Whether the trusted-measurements row is showing its add input
+    /// ("Trust a measurement…" revealed it). The same edit-in-place shape as
+    /// the base-URL row: the input appears on demand, the row's resting state
+    /// stays a value display.
+    adding_measurement: bool,
+    /// Which hardware-CA row is showing its paste-PEM textarea, if any
+    /// ("Set custom certificate…" / "Replace…" revealed it). One at a time —
+    /// the two rows share the edit-in-place shape with the base-URL row.
+    editing_ca: Option<CaKind>,
     /// The Eidola tab's add-a-measurement input (`<snp>:<rtmr1>:<rtmr2>`).
     add_measurement_state: Entity<InputState>,
     /// The Eidola tab's hardware root-CA paste-PEM input.
@@ -150,17 +175,7 @@ pub struct BackendsSettingsView {
 }
 
 impl BackendsSettingsView {
-    /// `window_input` is the per-window modifier entity owned by
-    /// `SettingsView`. The Eidola trust *editors* observe it so ⌥ transitions
-    /// reveal/hide them regardless of which pane or input has focus — the same
-    /// seam the General pane uses. This view never registers its own
-    /// `on_modifiers_changed` listener.
-    pub fn new(
-        stores: Stores,
-        window_input: Entity<WindowInput>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let backends = stores.backends.clone();
         let local_models = stores.local_models.clone();
         let config = stores.config.clone();
@@ -170,10 +185,19 @@ impl BackendsSettingsView {
         let base_url_state = cx.new(|cx| InputState::new(window, cx).placeholder("https://…"));
         let add_measurement_state =
             cx.new(|cx| InputState::new(window, cx).placeholder("<snp>:<rtmr1>:<rtmr2>"));
-        let root_ca_state =
-            cx.new(|cx| InputState::new(window, cx).placeholder("-----BEGIN CERTIFICATE-----…"));
-        let intermediate_ca_state =
-            cx.new(|cx| InputState::new(window, cx).placeholder("-----BEGIN CERTIFICATE-----…"));
+        // Hardware-CA overrides are full PEM blocks — multi-line textareas
+        // that grow with the pasted certificate rather than a single-line
+        // field that hides all but a sliver of it.
+        let root_ca_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(4, 16)
+                .placeholder("-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----")
+        });
+        let intermediate_ca_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(4, 16)
+                .placeholder("-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----")
+        });
 
         let _subscriptions = vec![
             cx.observe(&backends, |_, _, cx| cx.notify()),
@@ -181,12 +205,6 @@ impl BackendsSettingsView {
             // The base-URL + trust rows read the config store's cached
             // `EidolaTrust`; re-render when it refreshes (bus `Change::Backends`).
             cx.observe(&config, |_, _, cx| cx.notify()),
-            // Mirror ⌥ transitions into the trust-editor reveal (see the
-            // General pane; the listener lives on the `SettingsView` root).
-            cx.observe(&window_input, |this: &mut Self, wi, cx| {
-                let alt = wi.read(cx).alt_held();
-                this.set_advanced(alt, cx);
-            }),
             // Enter in the URL field submits, mirroring the button.
             cx.subscribe_in(
                 &url_state,
@@ -217,7 +235,8 @@ impl BackendsSettingsView {
             url_state,
             base_url_state,
             editing_base_url: false,
-            advanced: false,
+            adding_measurement: false,
+            editing_ca: None,
             add_measurement_state,
             root_ca_state,
             intermediate_ca_state,
@@ -226,18 +245,48 @@ impl BackendsSettingsView {
         }
     }
 
-    /// Whether the ⌥-revealed trust editors are visible (test accessor).
-    pub fn advanced(&self) -> bool {
-        self.advanced
+    /// Whether the trusted-measurements row is showing its add input (test
+    /// accessor).
+    pub fn adding_measurement(&self) -> bool {
+        self.adding_measurement
     }
 
-    /// Set the ⌥-revealed trust-editor state. Public so the modifiers observer
-    /// and behavior tests share one path.
-    pub fn set_advanced(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.advanced != on {
-            self.advanced = on;
-            cx.notify();
-        }
+    /// Reveal the add-a-measurement input ("Trust a measurement…") and focus
+    /// it.
+    pub fn begin_add_measurement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.adding_measurement = true;
+        self.add_measurement_state
+            .update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Hide the add-a-measurement input without adding.
+    pub fn cancel_add_measurement(&mut self, cx: &mut Context<Self>) {
+        self.adding_measurement = false;
+        cx.notify();
+    }
+
+    /// Which hardware-CA row is in its edit state, if any (test accessor).
+    pub fn editing_ca(&self) -> Option<CaKind> {
+        self.editing_ca
+    }
+
+    /// Reveal a hardware-CA row's paste-PEM textarea ("Set custom
+    /// certificate…" / "Replace…") and focus it.
+    pub fn begin_edit_ca(&mut self, kind: CaKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_ca = Some(kind);
+        let state = match kind {
+            CaKind::Root => &self.root_ca_state,
+            CaKind::Intermediate => &self.intermediate_ca_state,
+        };
+        state.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Hide the CA textarea without setting anything.
+    pub fn cancel_edit_ca(&mut self, cx: &mut Context<Self>) {
+        self.editing_ca = None;
+        cx.notify();
     }
 
     /// The add-a-measurement input entity (test seam — behavior tests seed a
@@ -342,6 +391,7 @@ impl BackendsSettingsView {
         if self.config.read(cx).error().is_none() {
             self.add_measurement_state
                 .update(cx, |s, cx| s.set_value("", window, cx));
+            self.adding_measurement = false;
         }
         cx.notify();
     }
@@ -351,6 +401,16 @@ impl BackendsSettingsView {
     pub fn untrust_measurement(&mut self, snp: String, cx: &mut Context<Self>) {
         self.config
             .update(cx, |c, cx| c.untrust_measurement(snp, cx));
+        cx.notify();
+    }
+
+    /// Trust a measurement from an explicit `<snp>:<rtmr1>:<rtmr2>` triple
+    /// (not the add-field). Backs the pin card's "Trust" verb — re-adding the
+    /// build pin to a trusted set that overrode it. Failures land in the
+    /// config store's op-error banner.
+    pub fn trust_measurement_spec(&mut self, spec: String, cx: &mut Context<Self>) {
+        self.config
+            .update(cx, |c, cx| c.trust_measurement(spec, cx));
         cx.notify();
     }
 
@@ -372,6 +432,7 @@ impl BackendsSettingsView {
         });
         if self.config.read(cx).error().is_none() {
             state.update(cx, |s, cx| s.set_value("", window, cx));
+            self.editing_ca = None;
         }
         cx.notify();
     }
@@ -1114,19 +1175,20 @@ impl BackendsSettingsView {
         out
     }
 
-    /// A llamacpp backend's auto-start toggle: a checkbox-style row wired to
-    /// `update_backend`. Auto-start gates *request-triggered* engine loads;
-    /// an explicit Load ignores it.
+    /// A llamacpp backend's auto-start toggle: a gpui-component `Switch` wired
+    /// to `update_backend`. Auto-start gates *request-triggered* engine loads;
+    /// an explicit Load ignores it. The probed wrapper carries the a11y
+    /// role/label + selected state for the QA driver; the `Switch` owns the
+    /// interaction and its own focus/keyboard handling.
     fn auto_start_toggle(
         &self,
         backend_id: &str,
         auto_start: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
-        let theme = cx.theme();
         let id = backend_id.to_string();
         let id_click = id.clone();
-        h_flex()
+        div()
             .id(SharedString::from(format!("autostart-{id}")))
             .probe(
                 format!("settings/backends/{id}/autostart"),
@@ -1134,28 +1196,14 @@ impl BackendsSettingsView {
                 "Start an engine automatically on request",
             )
             .aria_selected(auto_start)
-            .cursor_pointer()
-            .gap_2()
-            .items_center()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.set_auto_start(id_click.clone(), !auto_start, cx);
-            }))
             .child(
-                div()
-                    .size(px(14.))
-                    .flex_none()
-                    .rounded(px(3.))
-                    .border_1()
-                    .border_color(theme.border)
-                    .when(auto_start, |d| {
-                        d.bg(theme.primary).border_color(theme.primary)
-                    }),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child("Start an engine automatically when a request needs one"),
+                Switch::new(SharedString::from(format!("autostart-switch-{id}")))
+                    .small()
+                    .checked(auto_start)
+                    .label("Start an engine automatically when a request needs one")
+                    .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                        this.set_auto_start(id_click.clone(), *checked, cx);
+                    })),
             )
     }
 
@@ -1241,7 +1289,7 @@ impl BackendsSettingsView {
                     ))
                     .child(
                         h_flex().pl(px(132.)).child(
-                            h_flex()
+                            div()
                                 .id("add-autostart")
                                 .probe(
                                     "settings/backends/add/autostart",
@@ -1249,28 +1297,14 @@ impl BackendsSettingsView {
                                     "Start an engine automatically on request",
                                 )
                                 .aria_selected(form.auto_start)
-                                .cursor_pointer()
-                                .gap_2()
-                                .items_center()
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.toggle_add_auto_start(cx)),
-                                )
                                 .child(
-                                    div()
-                                        .size(px(14.))
-                                        .flex_none()
-                                        .rounded(px(3.))
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .when(form.auto_start, |d| {
-                                            d.bg(theme.primary).border_color(theme.primary)
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme.muted_foreground)
-                                        .child("Start an engine automatically on request"),
+                                    Switch::new("add-autostart-switch")
+                                        .small()
+                                        .checked(form.auto_start)
+                                        .label("Start an engine automatically on request")
+                                        .on_click(cx.listener(|this, _checked: &bool, _, cx| {
+                                            this.toggle_add_auto_start(cx)
+                                        })),
                                 ),
                         ),
                     );
@@ -1420,12 +1454,13 @@ impl BackendsSettingsView {
     }
 
     /// The connection + trust rows: an always-visible override warning band,
-    /// the base-URL override editor, then the trusted-measurements and
-    /// hardware-CA surfaces. Reads the config store's cached `EidolaTrust`
-    /// (the eidola backend row's bundle, NULL = the embedded pin) and writes
-    /// via the async setters. The measurement (add/untrust) and CA (set/clear)
-    /// *editors* are gated behind holding ⌥ (`self.advanced`); the read-only
-    /// state and the revert-toward-pin affordances stay visible.
+    /// then one row per setting, each both display and editor — base URL,
+    /// trusted measurements, and the two hardware CAs — followed by the
+    /// read-only connection details (attestation URL, domain separator).
+    /// Reads the config store's cached `EidolaTrust` (the eidola backend
+    /// row's bundle, NULL = the embedded pin) and writes via the async
+    /// setters. Nothing hides behind a disclosure: the resting state of each
+    /// row is its current value, and the inputs appear in place on demand.
     fn eidola_trust_surface(&self, cx: &Context<Self>) -> Vec<gpui::AnyElement> {
         let theme = cx.theme();
         let mut out: Vec<gpui::AnyElement> = Vec::new();
@@ -1568,19 +1603,102 @@ impl BackendsSettingsView {
         }
         out.push(trust_row("Base URL", cx, base_value).into_any_element());
 
-        // --- Trusted measurements: pin vs override, revert, ⌥ editors --
+        // --- Trusted measurements: one row, display + editor ------------
+        out.push(self.measurements_row(&trust, cx));
+
+        // --- Hardware CAs: one row each, display + editor ---------------
+        out.push(self.ca_row(
+            CaKind::Root,
+            "Hardware root CA",
+            "root",
+            trust.hardware_root_ca_pem.as_deref(),
+            cx,
+        ));
+        out.push(self.ca_row(
+            CaKind::Intermediate,
+            "Intermediate CA",
+            "intermediate",
+            trust.hardware_intermediate_ca_pem.as_deref(),
+            cx,
+        ));
+
+        // --- Connection details: read-only facts about the service ------
+        // (Moved here from the General pane — everything about the Eidola
+        // connection lives on the Eidola backend.)
+        if let Some(state) = self.config.read(cx).state() {
+            out.push(
+                div()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .into_any_element(),
+            );
+            out.push(
+                trust_row(
+                    "Attestation URL",
+                    cx,
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(
+                            state
+                                .attestation_url
+                                .clone()
+                                .unwrap_or_else(|| "Default (Tinfoil ATC)".into()),
+                        )),
+                )
+                .into_any_element(),
+            );
+            // The domain separator is one long unbreakable token, so it gets
+            // a stacked row (value under label, full width) rather than the
+            // two-column layout.
+            out.push(
+                v_flex()
+                    .w_full()
+                    .py_1()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("Domain separator"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(state.domain_separator.clone())),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        out
+    }
+
+    /// The trusted-measurements row — display and editor in one place. The
+    /// status line, one compact line per measurement (`measurement_line`),
+    /// the verbs (revert toward the pin, "Trust a measurement…"), the
+    /// reveal-on-demand add input, and a link to the Record — the raw
+    /// attestation evidence's home. Full values never render inline; they
+    /// travel via the Copy verbs and a11y labels.
+    fn measurements_row(&self, trust: &EidolaTrust, cx: &Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme();
         let is_override = trust.trusted_measurements_are_override;
-        let measurements_len = trust.trusted_measurements.len();
+        let count = trust.trusted_measurements.len();
+
+        let mut value = v_flex().flex_1().gap_1();
+
+        // Status line — danger when overriding the pin.
         let summary = if is_override {
             format!(
-                "{} user-trusted measurement{} — overriding the pin.",
-                measurements_len,
-                if measurements_len == 1 { "" } else { "s" }
+                "{count} user-trusted measurement{} — overriding the pin.",
+                if count == 1 { "" } else { "s" }
             )
         } else {
             "1 measurement — pinned at build.".to_string()
         };
-        let mut measurements_value = v_flex().flex_1().gap_1().child(
+        value = value.child(
             div()
                 .text_color(if is_override {
                     theme.danger
@@ -1590,136 +1708,252 @@ impl BackendsSettingsView {
                 .child(SharedString::from(summary)),
         );
 
-        // Under ⌥: list each trusted measurement with an Untrust verb, plus a
-        // single add-a-triple input. Truncated hex for display; the full SNP
-        // is the aria label.
-        if self.advanced {
+        // The measurement lines.
+        if is_override {
             for (idx, m) in trust.trusted_measurements.iter().enumerate() {
-                let snp = m.snp.clone();
-                let display = format!("{}…", &snp[..12.min(snp.len())]);
-                measurements_value = measurements_value.child(
-                    h_flex()
-                        .w_full()
-                        .gap_3()
-                        .items_baseline()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_xs()
-                                .font_family("Menlo")
-                                .text_color(theme.muted_foreground)
-                                .child(SharedString::from(display)),
-                        )
-                        .child(
-                            quiet_verb(
-                                SharedString::from(format!("eidola-untrust-{idx}")),
-                                "Untrust",
-                                cx,
-                            )
-                            .probe(
-                                format!("settings/backends/eidola/measurements/{idx}/untrust"),
-                                gpui::Role::Button,
-                                format!("Untrust measurement {snp}"),
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| this.untrust_measurement(snp.clone(), cx),
-                            )),
-                        ),
-                );
+                value = value.child(self.measurement_line(m, MeasurementRole::Override(idx), cx));
             }
-            measurements_value = measurements_value.child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .items_center()
-                    .pt_1()
-                    .child(
-                        div()
-                            .id("eidola-add-measurement-wrap")
-                            .probe(
-                                "settings/backends/eidola/measurements/add",
-                                gpui::Role::TextInput,
-                                "Add a trusted measurement",
-                            )
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.add_measurement_state)),
+            // The build pin, if the override set dropped it (an override
+            // *replaces* the pin): auditable + re-addable — the "trust
+            // official + my canary" flow.
+            let pin = &trust.pinned_measurement;
+            let pin_trusted = trust
+                .trusted_measurements
+                .iter()
+                .any(|m| m.snp.eq_ignore_ascii_case(&pin.snp));
+            if !pin_trusted {
+                value = value.child(self.measurement_line(pin, MeasurementRole::PinNotTrusted, cx));
+            }
+        } else {
+            value = value.child(self.measurement_line(
+                &trust.pinned_measurement,
+                MeasurementRole::Pinned,
+                cx,
+            ));
+        }
+
+        // Verbs: revert toward the pin (the safe direction, only meaningful
+        // on an override) and the add-input reveal.
+        let mut verbs = h_flex().gap_3().pt_0p5().text_xs();
+        if is_override {
+            verbs = verbs.child(
+                quiet_verb("eidola-revert-measurements", "Revert to pin", cx)
+                    .text_xs()
+                    .probe(
+                        "settings/backends/eidola/measurements/revert",
+                        gpui::Role::Button,
+                        "Revert trusted measurements to pin",
                     )
-                    .child(
-                        quiet_verb("eidola-add-measurement", "Add", cx)
-                            .probe(
-                                "settings/backends/eidola/measurements/add/submit",
-                                gpui::Role::Button,
-                                "Add trusted measurement",
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.submit_add_measurement(window, cx)
-                            })),
+                    .on_click(cx.listener(|this, _, _, cx| this.revert_measurements(cx))),
+            );
+        }
+        if !self.adding_measurement {
+            verbs = verbs.child(
+                quiet_verb("eidola-begin-add-measurement", "Trust a measurement…", cx)
+                    .text_xs()
+                    .probe(
+                        "settings/backends/eidola/measurements/trust-new",
+                        gpui::Role::Button,
+                        "Trust a new measurement",
+                    )
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.begin_add_measurement(window, cx)),
                     ),
             );
-        } else {
-            measurements_value = measurements_value.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground.opacity(0.8))
-                    .child("Hold ⌥ to edit the trusted set."),
-            );
         }
+        value = value.child(verbs);
 
-        // Revert stays visible ungated — reverting *toward* the pin is safe.
-        if is_override {
-            measurements_value = measurements_value.child(
-                h_flex().text_xs().child(
-                    quiet_verb("eidola-revert-measurements", "Revert to pin", cx)
+        // The add input, revealed on demand (edit-in-place, like the
+        // base-URL row). Enter submits, mirroring the Add verb.
+        if self.adding_measurement {
+            value = value
+                .child(
+                    div()
+                        .id("eidola-add-measurement-wrap")
                         .probe(
-                            "settings/backends/eidola/measurements/revert",
-                            gpui::Role::Button,
-                            "Revert trusted measurements to pin",
+                            "settings/backends/eidola/measurements/add",
+                            gpui::Role::TextInput,
+                            "Add a trusted measurement",
                         )
-                        .on_click(cx.listener(|this, _, _, cx| this.revert_measurements(cx))),
-                ),
-            );
+                        .w_full()
+                        .flex()
+                        .child(Input::new(&self.add_measurement_state).flex_1()),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .text_xs()
+                        .child(
+                            quiet_verb("eidola-add-measurement", "Add", cx)
+                                .text_xs()
+                                .probe(
+                                    "settings/backends/eidola/measurements/add/submit",
+                                    gpui::Role::Button,
+                                    "Add trusted measurement",
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.submit_add_measurement(window, cx)
+                                })),
+                        )
+                        .child(
+                            quiet_verb("eidola-add-measurement-cancel", "Cancel", cx)
+                                .text_xs()
+                                .probe(
+                                    "settings/backends/eidola/measurements/add/cancel",
+                                    gpui::Role::Button,
+                                    "Cancel adding a measurement",
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.cancel_add_measurement(cx)),
+                                ),
+                        ),
+                );
         }
-        out.push(trust_row("Trusted measurements", cx, measurements_value).into_any_element());
 
-        // --- Hardware CAs: state line + ⌥-revealed set/clear editor -----
-        out.push(self.ca_trust_row(
-            CaKind::Root,
-            "Hardware root CA",
-            "root",
-            trust.has_hardware_root_ca,
-            cx,
-        ));
-        out.push(self.ca_trust_row(
-            CaKind::Intermediate,
-            "Intermediate CA",
-            "intermediate",
-            trust.has_hardware_intermediate_ca,
-            cx,
-        ));
+        // The raw attestation evidence lives in the Record.
+        value = value.child(
+            h_flex().pt_0p5().text_xs().child(
+                quiet_verb(
+                    "eidola-open-record",
+                    format!(
+                        "Inspect attestation evidence in the Record ({})",
+                        crate::actions::primary_shift_chord("L")
+                    ),
+                    cx,
+                )
+                .text_xs()
+                .probe(
+                    "settings/backends/eidola/open-record",
+                    gpui::Role::Link,
+                    "Inspect attestation evidence in the Record",
+                )
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(OpenRecord), cx);
+                }),
+            ),
+        );
 
-        out
+        trust_row("Trusted measurements", cx, value).into_any_element()
     }
 
-    /// One hardware-CA trust row (root or intermediate — the same component
-    /// parameterized). Shows the pin-vs-override state (override in the danger
-    /// color), and while ⌥ is held reveals a paste-PEM input with a Set verb
-    /// and, when overridden, a Clear verb. PEM validation lives in app-core;
-    /// failures surface in the config store's op-error banner.
-    fn ca_trust_row(
+    /// One compact measurement line: the middle-truncated SNP launch digest
+    /// (mono — the full `<snp>:<rtmr1>:<rtmr2>` triple travels via the Copy
+    /// verb and the a11y labels), a role tag, and the role's verbs. Copy is
+    /// always offered; Untrust only on user-override entries (the build pin
+    /// is never untrustable — `untrust_measurement` edits the *override*
+    /// list, so an Untrust on the pin was a no-op bug); Trust re-adds a
+    /// dropped pin.
+    fn measurement_line(
+        &self,
+        m: &MeasurementInfo,
+        role: MeasurementRole,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let triple = measurement_triple(m);
+        let slug = match role {
+            MeasurementRole::Override(idx) => format!("{idx}"),
+            MeasurementRole::Pinned | MeasurementRole::PinNotTrusted => "pin".to_string(),
+        };
+
+        // Only the dropped pin needs an inline marker — the row's status line
+        // already says "pinned at build" in the no-override state, and
+        // override entries are what the danger-colored status line counts.
+        let tag = match role {
+            MeasurementRole::PinNotTrusted => Some("pin — not trusted"),
+            MeasurementRole::Pinned | MeasurementRole::Override(_) => None,
+        };
+
+        let mut verbs = h_flex().gap_3().flex_none().text_xs().child(copy_verb(
+            SharedString::from(format!("eidola-measurement-{slug}-copy")),
+            format!("settings/backends/eidola/measurements/{slug}/copy"),
+            format!("Copy measurement {}", m.snp),
+            triple.clone(),
+            cx,
+        ));
+        match role {
+            MeasurementRole::Pinned => {}
+            MeasurementRole::Override(idx) => {
+                let snp = m.snp.clone();
+                let aria = format!("Untrust measurement {snp}");
+                verbs =
+                    verbs.child(
+                        quiet_verb(
+                            SharedString::from(format!("eidola-untrust-{idx}")),
+                            "Untrust",
+                            cx,
+                        )
+                        .text_xs()
+                        .probe(
+                            format!("settings/backends/eidola/measurements/{idx}/untrust"),
+                            gpui::Role::Button,
+                            aria,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.untrust_measurement(snp.clone(), cx)
+                        })),
+                    );
+            }
+            MeasurementRole::PinNotTrusted => {
+                verbs = verbs.child(
+                    quiet_verb("eidola-trust-pin", "Trust", cx)
+                        .text_xs()
+                        .probe(
+                            "settings/backends/eidola/measurements/pin/trust",
+                            gpui::Role::Button,
+                            "Trust the build pin measurement",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.trust_measurement_spec(triple.clone(), cx)
+                        })),
+                );
+            }
+        }
+
+        h_flex()
+            .w_full()
+            .gap_2()
+            .items_baseline()
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .font_family("Menlo")
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(hex_summary(&m.snp))),
+            )
+            .when_some(tag, |line, tag| {
+                line.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme.muted_foreground.opacity(0.8))
+                        .child(tag),
+                )
+            })
+            .child(div().flex_1())
+            .child(verbs)
+            .into_any_element()
+    }
+
+    /// One hardware-CA row (root or intermediate) — display and editor in one
+    /// place. The status line (danger when overridden), then either the
+    /// resting verbs (Copy / Replace… / Clear on an override; "Set custom
+    /// certificate…" on the vendor-chain pin) or, while editing, the
+    /// paste-PEM textarea with Set/Cancel. PEM validation lives in app-core;
+    /// a failure lands in the op-error banner and the input is kept.
+    fn ca_row(
         &self,
         kind: CaKind,
         label: &'static str,
         slug: &'static str,
-        is_override: bool,
+        current_pem: Option<&str>,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let theme = cx.theme();
-        let state = match kind {
-            CaKind::Root => &self.root_ca_state,
-            CaKind::Intermediate => &self.intermediate_ca_state,
-        };
+        let is_override = current_pem.is_some();
+        let editing = self.editing_ca == Some(kind);
 
         let mut value = v_flex().flex_1().gap_1().child(
             div()
@@ -1729,52 +1963,124 @@ impl BackendsSettingsView {
                     theme.muted_foreground
                 })
                 .child(if is_override {
-                    "Custom certificate set (override)."
+                    "Custom certificate — overriding the AMD/Intel vendor chain."
                 } else {
-                    "Built-in AMD/Intel vendor chain (pin)."
+                    "Built-in AMD/Intel vendor chain."
                 }),
         );
 
-        if self.advanced {
-            value = value.child(
-                div()
-                    .id(SharedString::from(format!("eidola-ca-{slug}-input-wrap")))
-                    .probe(
-                        format!("settings/backends/eidola/ca/{slug}/input"),
-                        gpui::Role::TextInput,
-                        format!("Paste {label} PEM"),
-                    )
-                    .w_full()
-                    .flex()
-                    .child(Input::new(state).flex_1()),
-            );
-            let mut verbs = h_flex().gap_3().text_xs().pt_1().child(
-                quiet_verb(
-                    SharedString::from(format!("eidola-ca-{slug}-set")),
-                    "Set",
-                    cx,
+        if editing {
+            let state = match kind {
+                CaKind::Root => &self.root_ca_state,
+                CaKind::Intermediate => &self.intermediate_ca_state,
+            };
+            value = value
+                .child(
+                    div()
+                        .id(SharedString::from(format!("eidola-ca-{slug}-input-wrap")))
+                        .probe(
+                            format!("settings/backends/eidola/ca/{slug}/input"),
+                            gpui::Role::TextInput,
+                            format!("Paste {label} PEM"),
+                        )
+                        .w_full()
+                        .flex()
+                        .child(Input::new(state).flex_1()),
                 )
-                .probe(
-                    format!("settings/backends/eidola/ca/{slug}/set"),
-                    gpui::Role::Button,
-                    format!("Set {label}"),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| this.submit_ca(kind, window, cx))),
-            );
-            if is_override {
-                verbs = verbs.child(
-                    quiet_verb(
-                        SharedString::from(format!("eidola-ca-{slug}-clear")),
-                        "Clear",
-                        cx,
-                    )
-                    .probe(
-                        format!("settings/backends/eidola/ca/{slug}/clear"),
-                        gpui::Role::Button,
-                        format!("Clear {label}"),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| this.clear_ca(kind, cx))),
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .text_xs()
+                        .child(
+                            quiet_verb(
+                                SharedString::from(format!("eidola-ca-{slug}-set")),
+                                "Set",
+                                cx,
+                            )
+                            .text_xs()
+                            .probe(
+                                format!("settings/backends/eidola/ca/{slug}/set"),
+                                gpui::Role::Button,
+                                format!("Set {label}"),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| this.submit_ca(kind, window, cx),
+                            )),
+                        )
+                        .child(
+                            quiet_verb(
+                                SharedString::from(format!("eidola-ca-{slug}-cancel")),
+                                "Cancel",
+                                cx,
+                            )
+                            .text_xs()
+                            .probe(
+                                format!("settings/backends/eidola/ca/{slug}/cancel"),
+                                gpui::Role::Button,
+                                format!("Cancel editing {label}"),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_edit_ca(cx))),
+                        ),
                 );
+        } else {
+            let mut verbs = h_flex().gap_3().text_xs();
+            if is_override {
+                verbs = verbs
+                    .child(copy_verb(
+                        SharedString::from(format!("eidola-ca-{slug}-copy")),
+                        format!("settings/backends/eidola/ca/{slug}/copy"),
+                        format!("Copy {label}"),
+                        current_pem.unwrap_or_default().to_string(),
+                        cx,
+                    ))
+                    .child(
+                        quiet_verb(
+                            SharedString::from(format!("eidola-ca-{slug}-change")),
+                            "Replace…",
+                            cx,
+                        )
+                        .text_xs()
+                        .probe(
+                            format!("settings/backends/eidola/ca/{slug}/change"),
+                            gpui::Role::Button,
+                            format!("Replace {label}"),
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.begin_edit_ca(kind, window, cx),
+                        )),
+                    )
+                    .child(
+                        quiet_verb(
+                            SharedString::from(format!("eidola-ca-{slug}-clear")),
+                            "Clear",
+                            cx,
+                        )
+                        .text_xs()
+                        .probe(
+                            format!("settings/backends/eidola/ca/{slug}/clear"),
+                            gpui::Role::Button,
+                            format!("Clear {label}"),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.clear_ca(kind, cx))),
+                    );
+            } else {
+                verbs =
+                    verbs.child(
+                        quiet_verb(
+                            SharedString::from(format!("eidola-ca-{slug}-change")),
+                            "Set custom certificate…",
+                            cx,
+                        )
+                        .text_xs()
+                        .probe(
+                            format!("settings/backends/eidola/ca/{slug}/change"),
+                            gpui::Role::Button,
+                            format!("Set a custom {label}"),
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.begin_edit_ca(kind, window, cx),
+                        )),
+                    );
             }
             value = value.child(verbs);
         }
@@ -1828,6 +2134,49 @@ impl BackendsSettingsView {
 }
 
 // --- Local helpers (the settings voice — mirrors general.rs) --------------
+
+/// Middle-truncated hex for compact display (`ab12cd…90abcd`). Full values
+/// never render inline in Settings — they travel via the Copy verbs and a11y
+/// labels, and the Record window holds the raw evidence.
+fn hex_summary(hex: &str) -> String {
+    if hex.len() <= 16 {
+        hex.to_string()
+    } else {
+        format!("{}…{}", &hex[..6], &hex[hex.len() - 6..])
+    }
+}
+
+/// The re-addable `<snp>:<rtmr1>:<rtmr2>` triple form of a measurement — the
+/// format the add field / CLI accept, and what the Copy verbs place on the
+/// clipboard.
+fn measurement_triple(m: &MeasurementInfo) -> String {
+    format!("{}:{}:{}", m.snp, m.tdx_rtmr1, m.tdx_rtmr2)
+}
+
+/// A quiet "Copy" text verb that places `value` on the clipboard. Mirrors the
+/// Record window's copy affordance (`write_to_clipboard`); the click touches
+/// no view state, so it takes a plain handler rather than `cx.listener`.
+fn copy_verb(
+    id: impl Into<gpui::ElementId>,
+    probe_name: String,
+    aria: String,
+    value: String,
+    cx: &gpui::App,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = cx.theme();
+    div()
+        .id(id)
+        .probe(probe_name, gpui::Role::Button, aria)
+        .flex_none()
+        .text_xs()
+        .cursor_pointer()
+        .text_color(theme.link)
+        .hover(|s| s.text_color(theme.link_hover))
+        .child("Copy")
+        .on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
+        })
+}
 
 fn section_header(label: &str, cx: &gpui::App) -> gpui::Div {
     let theme = cx.theme();
@@ -1923,7 +2272,7 @@ fn error_banner(message: &str, cx: &gpui::App) -> impl IntoElement {
 /// A quiet text verb (the settings surface's button voice).
 fn quiet_verb(
     id: impl Into<gpui::ElementId>,
-    label: &'static str,
+    label: impl Into<SharedString>,
     cx: &gpui::App,
 ) -> gpui::Stateful<gpui::Div> {
     let theme = cx.theme();
@@ -1934,7 +2283,7 @@ fn quiet_verb(
         .text_sm()
         .text_color(theme.link)
         .hover(|s| s.text_color(theme.link_hover))
-        .child(label)
+        .child(label.into())
 }
 
 /// A labelled input row for the add-backend form.

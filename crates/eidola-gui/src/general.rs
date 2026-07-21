@@ -1,21 +1,14 @@
-//! General settings pane — appearance and the advanced trust summary.
+//! General settings pane — how the app looks.
 //!
-//! The resting state is small: the circadian **Appearance** axes. Everything
-//! else — attestation URL, domain separator, hardware CAs, and a
-//! trusted-measurements summary linking to the Record — is advanced
-//! configuration that appears only while **⌥ is held**. The server's
-//! connection + trust *editors* (base URL, measurement override, hardware CA
-//! state) live in Settings → Backends → Eidola (the eidola backend's own
-//! configuration surface); this pane only summarizes and links.
-//!
-//! The ⌥ state comes from the per-window `WindowInput` entity. `SettingsView`
-//! (the root) is the one view that registers `on_modifiers_changed` and
-//! mirrors events into it; `GeneralView` observes the entity here. This is
-//! the fix for wave-2 bug 2: gpui dispatches `ModifiersChangedEvent` along
-//! the focused element's ancestor path only, so a listener on this sibling
-//! pane would be dead while a text input in a sibling pane has focus.
-//! Measurement rows summarize and link to the Record window instead of
-//! dumping truncated hex.
+//! The whole pane is the circadian **Appearance** axes (day/night, time of
+//! day, and the fixed light character while the sun is off). Everything
+//! about the Eidola *connection* — base URL, trusted measurements, hardware
+//! CAs, attestation URL, domain separator — lives in Settings → Backends →
+//! Eidola, the eidola backend's own configuration surface; this pane no
+//! longer summarizes or duplicates any of it. (Earlier iterations kept
+//! read-only trust summaries here, first behind a ⌥-hold reveal and then a
+//! click-to-expand disclosure; both duplicated the Backends surface and are
+//! gone.)
 
 use eidola_app_core::config::{AppearanceSetting, LightCharacter, TimeOfDayTint};
 use gpui::{
@@ -24,62 +17,22 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, StyledExt, h_flex, label::Label, v_flex};
 
-use crate::actions::OpenRecord;
 use crate::probe::Probe as _;
 use crate::stores::ConfigStore;
-use crate::window_input::WindowInput;
 
 pub struct GeneralView {
     config: Entity<ConfigStore>,
-    /// Whether the ⌥-revealed advanced section is visible. Driven by the
-    /// per-window `WindowInput` entity observed below; `set_advanced` is the
-    /// single path (observer + behavior tests).
-    advanced: bool,
     _subscriptions: Vec<Subscription>,
 }
 
 impl GeneralView {
-    /// `window_input` is the per-window modifier entity owned by
-    /// `SettingsView`. This view observes it so ⌥ transitions fire
-    /// `set_advanced` regardless of which pane or input has focus in the
-    /// window — the fix for wave-2 bug 2. `GeneralView` never registers its
-    /// own `on_modifiers_changed` listener.
-    pub fn new(
-        config: Entity<ConfigStore>,
-        window_input: Entity<WindowInput>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let _subscriptions = vec![
-            cx.observe(&config, |_, _, cx| cx.notify()),
-            // Mirror ⌥ transitions into the advanced flag. The observer fires
-            // whenever `WindowInput` emits (on every modifier change), so this
-            // is always in sync with the root's listener — even while a text
-            // input in a sibling pane has focus.
-            cx.observe(&window_input, |this: &mut Self, wi, cx| {
-                let alt = wi.read(cx).alt_held();
-                this.set_advanced(alt, cx);
-            }),
-        ];
+    pub fn new(config: Entity<ConfigStore>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let _subscriptions = vec![cx.observe(&config, |_, _, cx| cx.notify())];
 
         Self {
             config,
-            advanced: false,
             _subscriptions,
         }
-    }
-
-    /// Set the advanced (⌥-revealed) state. Public so the modifiers listener
-    /// and behavior tests share one path.
-    pub fn set_advanced(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.advanced != on {
-            self.advanced = on;
-            cx.notify();
-        }
-    }
-
-    pub fn advanced(&self) -> bool {
-        self.advanced
     }
 
     /// Circadian day/night axis. Writes through the store; the theme
@@ -111,12 +64,8 @@ impl Render for GeneralView {
         let theme = cx.theme();
         let store = self.config.read(cx);
         let state = store.state().cloned();
-        let trust = store.eidola_trust().cloned();
         let error = store.error().map(|e| e.to_string());
 
-        // Note: ⌥ state is driven by the `WindowInput` observer installed in
-        // `new`; there is no `on_modifiers_changed` listener here. See the
-        // module doc for why the listener lives on the `SettingsView` root.
         let mut col = v_flex().id("general-pane").px_6().py_5().gap_4().w_full();
 
         // --- Appearance: the circadian theme's two axes -----------------
@@ -257,137 +206,6 @@ impl Render for GeneralView {
             }
         }
 
-        // --- Advanced (⌥-revealed) --------------------------------------
-        if self.advanced {
-            if let Some(s) = state.as_ref() {
-                col = col.child(div().pt_2().child(section_header("Advanced", cx)));
-
-                col = col.child(field_row(
-                    "Attestation URL",
-                    cx,
-                    muted_text(
-                        s.attestation_url
-                            .clone()
-                            .unwrap_or_else(|| "Default (Tinfoil ATC)".into()),
-                        cx,
-                    ),
-                ));
-
-                // The domain separator is one long unbreakable token, so it
-                // gets a stacked row (value under label, full width) rather
-                // than the two-column layout.
-                col = col.child(
-                    v_flex()
-                        .w_full()
-                        .py_1()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("Domain separator"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_family("Menlo")
-                                .text_color(theme.muted_foreground)
-                                .child(SharedString::from(s.domain_separator.clone())),
-                        ),
-                );
-
-                // The hardware CAs + trusted-measurements summary come from
-                // the eidola backend row (the connection + trust bundle),
-                // not `ConfigState`. These are read-only summaries here; the
-                // editors live in Backends → Eidola.
-                let (has_root_ca, has_intermediate_ca) = trust
-                    .as_ref()
-                    .map(|t| (t.has_hardware_root_ca, t.has_hardware_intermediate_ca))
-                    .unwrap_or((false, false));
-                col = col.child(field_row(
-                    "Hardware root CA",
-                    cx,
-                    muted_text(
-                        if has_root_ca {
-                            "Custom certificate set"
-                        } else {
-                            "Not set — AMD/Intel vendor chain"
-                        },
-                        cx,
-                    ),
-                ));
-                col = col.child(field_row(
-                    "Intermediate CA",
-                    cx,
-                    muted_text(
-                        if has_intermediate_ca {
-                            "Custom certificate set"
-                        } else {
-                            "Not set — AMD/Intel vendor chain"
-                        },
-                        cx,
-                    ),
-                ));
-
-                // Measurements: a summary + a door, never a hex dump.
-                let measurements_are_override = trust
-                    .as_ref()
-                    .map(|t| t.trusted_measurements_are_override)
-                    .unwrap_or(false);
-                let measurements_len = trust
-                    .as_ref()
-                    .map(|t| t.trusted_measurements.len())
-                    .unwrap_or(0);
-                let summary = if measurements_are_override {
-                    format!(
-                        "{} user-trusted measurement{}",
-                        measurements_len,
-                        if measurements_len == 1 { "" } else { "s" }
-                    )
-                } else {
-                    "1 measurement — pinned at build".to_string()
-                };
-                col = col.child(field_row(
-                    "Trusted measurements",
-                    cx,
-                    v_flex().gap_1().child(muted_text(summary, cx)).child(
-                        h_flex().text_xs().text_color(theme.muted_foreground).child(
-                            quiet_link(
-                                "open-record",
-                                format!(
-                                    "Inspect attestation evidence in the Record ({})",
-                                    crate::actions::primary_shift_chord("L")
-                                ),
-                                cx,
-                            )
-                            .probe(
-                                "settings/general/open-record",
-                                gpui::Role::Link,
-                                "Inspect attestation evidence in the Record",
-                            )
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(OpenRecord), cx);
-                            }),
-                        ),
-                    ),
-                ));
-            }
-        } else {
-            // One quiet line of disclosure so the ⌥ affordance is
-            // discoverable without a persistent "Advanced" section.
-            col = col.child(
-                div()
-                    .pt_2()
-                    .text_xs()
-                    .italic()
-                    .text_color(theme.muted_foreground.opacity(0.8))
-                    .child(format!(
-                        "Hold {} for advanced configuration.",
-                        crate::actions::alt_name()
-                    )),
-            );
-        }
-
         if let Some(err) = error {
             col = col.child(
                 div()
@@ -428,14 +246,6 @@ fn field_row<C: IntoElement>(label: &str, cx: &gpui::App, child: C) -> impl Into
         .child(div().flex_1().min_w_0().child(child))
 }
 
-fn muted_text(text: impl Into<String>, cx: &gpui::App) -> impl IntoElement {
-    let theme = cx.theme();
-    let text = text.into();
-    div()
-        .text_color(theme.muted_foreground)
-        .child(SharedString::from(text))
-}
-
 /// One selectable option in a small chip row (the appearance settings).
 /// The active chip gets the sidebar-accent pill, matching the settings nav.
 fn choice_chip(
@@ -460,22 +270,6 @@ fn choice_chip(
             .hover(|s| s.text_color(theme.foreground))
     };
     el.child(label)
-}
-
-/// A quiet inline text link: muted, brightening on hover. The settings
-/// surface's only interaction affordance besides explicit buttons.
-fn quiet_link(
-    id: &'static str,
-    label: impl Into<gpui::SharedString>,
-    cx: &gpui::App,
-) -> gpui::Stateful<gpui::Div> {
-    let theme = cx.theme();
-    div()
-        .id(id)
-        .cursor_pointer()
-        .text_color(theme.link)
-        .hover(|s| s.text_color(theme.link_hover))
-        .child(label.into())
 }
 
 fn error_banner(message: &str, cx: &gpui::App) -> impl IntoElement {

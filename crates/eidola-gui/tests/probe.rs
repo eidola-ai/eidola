@@ -137,8 +137,15 @@ fn probe_eidola_trust() -> eidola_app_core::EidolaTrust {
         base_url_is_override: false,
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
+        pinned_measurement: eidola_app_core::MeasurementInfo {
+            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
+            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+        },
         has_hardware_root_ca: false,
+        hardware_root_ca_pem: None,
         has_hardware_intermediate_ca: false,
+        hardware_intermediate_ca_pem: None,
     }
 }
 
@@ -632,18 +639,16 @@ fn wallet_pane_probes_cover_refresh(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn general_pane_probes_cover_appearance_and_advanced(cx: &mut TestAppContext) {
+fn general_pane_probes_cover_appearance_only(cx: &mut TestAppContext) {
     let _guard = probes_on();
 
     let stores = ready_stores(cx);
-    let window_input = cx.update(WindowInput::new);
-    let wi = window_input.clone();
     let (window, _view) = open_view(cx, move |window, cx| {
-        cx.new(|cx| GeneralView::new(stores.config.clone(), wi, window, cx))
+        cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx))
     });
 
-    // At rest: the appearance chips are probed. (The base-URL editor moved to
-    // Backends → Eidola; General no longer carries a "Change…" affordance.)
+    // The pane is the appearance chips and nothing else — every trust /
+    // connection affordance lives in Backends → Eidola now.
     let names = fresh_names(cx, window);
     for expected in [
         "settings/general/appearance/system",
@@ -654,20 +659,18 @@ fn general_pane_probes_cover_appearance_and_advanced(cx: &mut TestAppContext) {
             "general probe {expected:?} missing; recorded: {names:?}"
         );
     }
-    assert!(
-        !names.contains(&"settings/general/change".to_string()),
-        "the base-URL editor must no longer live in General: {names:?}"
-    );
-
-    // Holding ⌥ reveals the advanced rows, including the Record cross-link.
-    cx.update(|cx| {
-        window_input.update(cx, |wi, cx| wi.set_alt_for_test(true, cx));
-    });
-    let names = fresh_names(cx, window);
-    assert!(
-        names.contains(&"settings/general/open-record".to_string()),
-        "advanced open-record link probe missing under ⌥; recorded: {names:?}"
-    );
+    for absent in [
+        // The base-URL editor and the trust summaries moved to Backends →
+        // Eidola; the Advanced disclosure is gone entirely.
+        "settings/general/change",
+        "settings/general/advanced/toggle",
+        "settings/general/open-record",
+    ] {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "General must carry no trust/connection affordance: {absent:?} in {names:?}"
+        );
+    }
 
     probe::set_probes_enabled(false);
 }
@@ -1021,7 +1024,7 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
         s.local_models = Some(local_models_fixture());
     });
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| BackendsSettingsView::new(stores, WindowInput::new(cx), window, cx))
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
     });
 
     // The tab strip is present regardless of the selected tab. The Eidola tab
@@ -1116,46 +1119,70 @@ fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContex
         tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
     }];
     trust.trusted_measurements_are_override = true;
-    // Root CA overridden so the Clear verb renders; intermediate left at the
-    // pin (only Set shows there).
+    // Root CA overridden (with a viewable PEM) so the view/copy + Clear verbs
+    // render; intermediate left at the pin (only the Set textarea shows there).
     trust.has_hardware_root_ca = true;
+    trust.hardware_root_ca_pem =
+        Some("-----BEGIN CERTIFICATE-----\nMIIBcustomroot\n-----END CERTIFICATE-----".into());
 
     let stores = stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
         s.eidola_trust = Some(trust);
         s.backends = backends_fixture();
     });
-    let window_input = cx.update(WindowInput::new);
-    let wi = window_input.clone();
     let (window, view) = open_view(cx, move |window, cx| {
-        cx.new(|cx| BackendsSettingsView::new(stores, wi, window, cx))
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
     });
 
-    // At rest (⌥ not held): the override warning band, the base-URL Change
-    // affordance, and both revert-to-pin verbs. The measurement/CA *editors*
-    // are gated behind ⌥, so they must be absent here.
+    // At rest with an active override: the warning band, the base-URL Change
+    // affordance, both revert-to-pin verbs, and every trust row's resting
+    // affordances — nothing hides behind a disclosure. The *inputs* (add
+    // field, CA textareas) stay out of the tree until revealed on demand.
     let names = fresh_names(cx, window);
     for expected in [
         "settings/backends/eidola/trust-warning",
         "settings/backends/eidola/url/change",
         "settings/backends/eidola/url/revert-to-pin",
         "settings/backends/eidola/measurements/revert",
+        // The override measurement line: copyable (full triple) + untrustable.
+        "settings/backends/eidola/measurements/0/copy",
+        "settings/backends/eidola/measurements/0/untrust",
+        // The build pin (dropped by the override): auditable + re-addable.
+        "settings/backends/eidola/measurements/pin/copy",
+        "settings/backends/eidola/measurements/pin/trust",
+        // The add-input reveal + the Record cross-link.
+        "settings/backends/eidola/measurements/trust-new",
+        "settings/backends/eidola/open-record",
+        // Root CA override: copyable, replaceable, clearable.
+        "settings/backends/eidola/ca/root/copy",
+        "settings/backends/eidola/ca/root/change",
+        "settings/backends/eidola/ca/root/clear",
+        // Intermediate CA at the pin: just the set-custom reveal.
+        "settings/backends/eidola/ca/intermediate/change",
     ] {
         assert!(
             names.contains(&expected.to_string()),
             "eidola trust-surface probe {expected:?} missing: {names:?}"
         );
     }
-    for gated in [
-        "settings/backends/eidola/measurements/0/untrust",
+    for absent in [
+        // The inputs reveal on demand — not in the tree at rest.
         "settings/backends/eidola/measurements/add",
         "settings/backends/eidola/measurements/add/submit",
+        "settings/backends/eidola/ca/root/input",
         "settings/backends/eidola/ca/root/set",
-        "settings/backends/eidola/ca/intermediate/set",
+        "settings/backends/eidola/ca/intermediate/input",
+        // Pinned intermediate CA: nothing to copy or clear.
+        "settings/backends/eidola/ca/intermediate/copy",
+        "settings/backends/eidola/ca/intermediate/clear",
+        // No raw PEM dump in Settings (the Copy verb carries it).
+        "settings/backends/eidola/ca/root/current",
+        // The disclosure is gone.
+        "settings/backends/eidola/advanced/toggle",
     ] {
         assert!(
-            !names.contains(&gated.to_string()),
-            "trust editor probe {gated:?} must be hidden without ⌥: {names:?}"
+            !names.contains(&absent.to_string()),
+            "{absent:?} must not render at rest: {names:?}"
         );
     }
 
@@ -1174,26 +1201,53 @@ fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContex
         );
     }
 
-    // Holding ⌥ reveals the measurement + CA editors.
-    cx.update(|cx| {
-        window_input.update(cx, |wi, cx| wi.set_alt_for_test(true, cx));
-    });
+    // Revealing the add input swaps in the field + submit/cancel and retires
+    // the reveal verb (edit-in-place).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_add_measurement(window, cx));
+    })
+    .unwrap();
     let names = fresh_names(cx, window);
     for expected in [
-        "settings/backends/eidola/measurements/0/untrust",
         "settings/backends/eidola/measurements/add",
         "settings/backends/eidola/measurements/add/submit",
-        "settings/backends/eidola/ca/root/input",
-        "settings/backends/eidola/ca/root/set",
-        "settings/backends/eidola/ca/root/clear",
-        "settings/backends/eidola/ca/intermediate/input",
-        "settings/backends/eidola/ca/intermediate/set",
+        "settings/backends/eidola/measurements/add/cancel",
     ] {
         assert!(
             names.contains(&expected.to_string()),
-            "eidola ⌥-editor probe {expected:?} missing: {names:?}"
+            "revealed add-measurement probe {expected:?} missing: {names:?}"
         );
     }
+    assert!(
+        !names.contains(&"settings/backends/eidola/measurements/trust-new".to_string()),
+        "the reveal verb retires while the input is open: {names:?}"
+    );
+    view.update(cx, |v, cx| v.cancel_add_measurement(cx));
+
+    // Revealing a CA editor swaps in that row's textarea + Set/Cancel; the
+    // other CA row is untouched.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.begin_edit_ca(eidola_gui::backends_settings::CaKind::Root, window, cx)
+        });
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/eidola/ca/root/input",
+        "settings/backends/eidola/ca/root/set",
+        "settings/backends/eidola/ca/root/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "revealed CA editor probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/backends/eidola/ca/intermediate/input".to_string()),
+        "editing one CA must not reveal the other's textarea: {names:?}"
+    );
+    view.update(cx, |v, cx| v.cancel_edit_ca(cx));
 
     // Entering the base-URL editor swaps in the input + save/cancel.
     cx.update_window(window, |_, window, cx| {
@@ -1215,6 +1269,49 @@ fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContex
     probe::set_probes_enabled(false);
 }
 
+/// The pinned (no-override) measurement is auditable — its full value is
+/// copyable — but **not** untrustable (removing the build root is meaningless;
+/// this was the no-op "Untrust" bug). The pin-not-trusted line's Trust verb
+/// only appears when an override has actually dropped the pin.
+#[gpui::test]
+fn eidola_pinned_measurement_copyable_not_untrustable(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::BackendsSettingsView;
+
+    let _guard = probes_on();
+
+    // Non-override trust: the resolved set is the single build pin.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.backends = backends_fixture();
+    });
+    let (window, _view) = open_view(cx, move |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    });
+
+    // The measurement lines are always visible — no disclosure to expand.
+    let names = fresh_names(cx, window);
+
+    assert!(
+        names.contains(&"settings/backends/eidola/measurements/pin/copy".to_string()),
+        "the pinned measurement must be copyable for audit: {names:?}"
+    );
+    for absent in [
+        // No Untrust anywhere — not on the pin card, not on a phantom index.
+        "settings/backends/eidola/measurements/pin/untrust",
+        "settings/backends/eidola/measurements/0/untrust",
+        // Trust (re-add) only shows when an override dropped the pin.
+        "settings/backends/eidola/measurements/pin/trust",
+    ] {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "pinned measurement must not carry {absent:?}: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn backends_pane_add_form_probes_appear_per_kind(cx: &mut TestAppContext) {
     use eidola_gui::backends_settings::{AddKind, BackendsSettingsView, BackendsTab};
@@ -1225,7 +1322,7 @@ fn backends_pane_add_form_probes_appear_per_kind(cx: &mut TestAppContext) {
         s.backends = backends_fixture();
     });
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| BackendsSettingsView::new(stores, WindowInput::new(cx), window, cx))
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
     });
 
     // The add form lives in the External tab.

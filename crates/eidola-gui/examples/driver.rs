@@ -277,8 +277,7 @@ mod driver {
                 default_size: size(px(620.), px(520.)),
                 build: |window, cx| {
                     let stores = settings_stores(cx);
-                    let view =
-                        cx.new(|cx| SettingsView::new(stores, WindowInput::new(cx), window, cx));
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
                     root(view, window, cx)
                 },
             },
@@ -461,8 +460,17 @@ mod driver {
             base_url_is_override: false,
             trusted_measurements: Vec::new(),
             trusted_measurements_are_override: false,
+            pinned_measurement: eidola_app_core::MeasurementInfo {
+                snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
+                tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                    .into(),
+                tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa"
+                    .into(),
+            },
             has_hardware_root_ca: false,
+            hardware_root_ca_pem: None,
             has_hardware_intermediate_ca: false,
+            hardware_intermediate_ca_pem: None,
         }
     }
 

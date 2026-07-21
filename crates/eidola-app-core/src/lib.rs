@@ -87,8 +87,19 @@ pub struct EidolaTrust {
     /// Whether `trusted_measurements` is a row override list (`true`) or the
     /// single pinned build measurement (`false`).
     pub trusted_measurements_are_override: bool,
+    /// The build-time pinned enclave measurement — present regardless of
+    /// override state, so a UI can display/copy it for audit and (since an
+    /// override *replaces* the pin in the trusted set) re-add it alongside
+    /// custom measurements.
+    pub pinned_measurement: MeasurementInfo,
     pub has_hardware_root_ca: bool,
+    /// The custom root-CA PEM override, if set (`None` = the built-in AMD/Intel
+    /// vendor chain). Exposed so a UI can display/copy the certificate that is
+    /// actually trusted, not just a "custom certificate set" flag.
+    pub hardware_root_ca_pem: Option<String>,
     pub has_hardware_intermediate_ca: bool,
+    /// The custom intermediate-CA PEM override, if set (`None` = vendor chain).
+    pub hardware_intermediate_ca_pem: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -657,8 +668,11 @@ impl Inner {
             base_url_is_override: resolved.base_url_is_override,
             trusted_measurements: resolved.measurements.iter().map(to_info).collect(),
             trusted_measurements_are_override: resolved.measurements_are_override,
+            pinned_measurement: to_info(&trust_root::server_measurement()),
             has_hardware_root_ca: resolved.hardware_root_ca.is_some(),
+            hardware_root_ca_pem: resolved.hardware_root_ca.clone(),
             has_hardware_intermediate_ca: resolved.hardware_intermediate_ca.is_some(),
+            hardware_intermediate_ca_pem: resolved.hardware_intermediate_ca.clone(),
         })
     }
 

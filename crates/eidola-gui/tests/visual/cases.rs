@@ -655,37 +655,11 @@ fn settings_backends_stores(cx: &mut App) -> Stores {
 fn register_settings(s: &mut Snapshots) {
     let settings_size = size(px(620.), px(520.));
 
-    // General at rest: base URL pin, advanced rows hidden behind ⌥.
+    // General: the appearance chips — the whole pane (the trust/connection
+    // surface lives in Backends → Eidola).
     s.add("settings_general", settings_size, |window, cx| {
         let core = settings_stores(cx);
-        cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx))
-    });
-
-    // ⌥ held: advanced rows visible, with an overridden base URL and a
-    // user-trusted measurement so the honest "override" annotations show.
-    s.add("settings_general_advanced", settings_size, |window, cx| {
-        let core = stub_stores(cx, |s| {
-            let mut state = stub_config_state(true);
-            state.attestation_url = Some("https://atc.tinfoil.sh/v1/attest".into());
-            s.config_state = Some(state);
-            let mut trust = stub_eidola_trust();
-            trust.base_url = "https://staging.eidola.example/v1".into();
-            trust.base_url_is_override = true;
-            trust.has_hardware_root_ca = true;
-            trust.trusted_measurements = vec![MeasurementInfo {
-                snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
-                tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .into(),
-                tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-                    .into(),
-            }];
-            trust.trusted_measurements_are_override = true;
-            s.eidola_trust = Some(trust);
-        });
-        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
-        let general = view.read(cx).general();
-        general.update(cx, |g, cx| g.set_advanced(true, cx));
-        view
+        cx.new(|cx| SettingsView::new(core, window, cx))
     });
 
     // Backends → Eidola: the singleton toggle plus the connection + trust
@@ -693,16 +667,18 @@ fn register_settings(s: &mut Snapshots) {
     // lines).
     s.add("settings_backends_eidola", settings_size, |window, cx| {
         let core = settings_backends_stores(cx);
-        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
         view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
         let pane = view.read(cx).backends_pane();
         pane.update(cx, |p, cx| p.select_tab(BackendsTab::Eidola, cx));
         view
     });
 
-    // Backends → Eidola with the whole trust bundle overridden and ⌥ held:
-    // the danger warning band up top, danger-tinted override status lines, and
-    // the ⌥-revealed measurement + hardware-CA editors.
+    // Backends → Eidola with the whole trust bundle overridden: the danger
+    // warning band up top, danger-tinted override status lines, the compact
+    // measurement lines (override + dropped-pin) with their Copy/Untrust/
+    // Trust verbs, and the overridden root CA's Copy/Replace…/Clear verbs —
+    // everything visible at rest, no disclosure.
     s.add(
         "settings_backends_eidola_overridden",
         settings_size,
@@ -722,6 +698,12 @@ fn register_settings(s: &mut Snapshots) {
                 }];
                 trust.trusted_measurements_are_override = true;
                 trust.has_hardware_root_ca = true;
+                trust.hardware_root_ca_pem = Some(
+                    "-----BEGIN CERTIFICATE-----\n\
+                     MIIByDCCAW6gAwIBAgIUExampleCustomRootCAForSnapshotsOnly0\n\
+                     -----END CERTIFICATE-----"
+                        .into(),
+                );
                 s.eidola_trust = Some(trust);
                 s.backends = vec![
                     BackendInfo {
@@ -752,12 +734,30 @@ fn register_settings(s: &mut Snapshots) {
                     },
                 ];
             });
-            let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
+            let view = cx.new(|cx| SettingsView::new(core, window, cx));
+            view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+            let pane = view.read(cx).backends_pane();
+            pane.update(cx, |p, cx| p.select_tab(BackendsTab::Eidola, cx));
+            view
+        },
+    );
+
+    // Backends → Eidola with the in-place editors revealed: the add-a-
+    // measurement input and the root-CA paste-PEM textarea open at once
+    // (each revealed by its own quiet verb; Cancel closes them).
+    s.add(
+        "settings_backends_eidola_editing",
+        settings_size,
+        |window, cx| {
+            use eidola_gui::backends_settings::CaKind;
+            let core = settings_backends_stores(cx);
+            let view = cx.new(|cx| SettingsView::new(core, window, cx));
             view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
             let pane = view.read(cx).backends_pane();
             pane.update(cx, |p, cx| {
                 p.select_tab(BackendsTab::Eidola, cx);
-                p.set_advanced(true, cx);
+                p.begin_add_measurement(window, cx);
+                p.begin_edit_ca(CaKind::Root, window, cx);
             });
             view
         },
@@ -767,7 +767,7 @@ fn register_settings(s: &mut Snapshots) {
     // catalog, paste-a-URL.
     s.add("settings_backends_local", settings_size, |window, cx| {
         let core = settings_backends_stores(cx);
-        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
         view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
         let pane = view.read(cx).backends_pane();
         pane.update(cx, |p, cx| p.select_tab(BackendsTab::Local, cx));
@@ -778,7 +778,7 @@ fn register_settings(s: &mut Snapshots) {
     // scanned models) and the add-a-backend affordances.
     s.add("settings_backends_external", settings_size, |window, cx| {
         let core = settings_backends_stores(cx);
-        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
         view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
         let pane = view.read(cx).backends_pane();
         pane.update(cx, |p, cx| p.select_tab(BackendsTab::External, cx));
@@ -789,7 +789,7 @@ fn register_settings(s: &mut Snapshots) {
     // the eidola backend is enabled.
     s.add("settings_account", settings_size, |window, cx| {
         let core = settings_stores(cx);
-        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
         view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
         view
     });
@@ -797,7 +797,7 @@ fn register_settings(s: &mut Snapshots) {
     // Wallet pane: the four lifecycle states in one honest listing.
     s.add("settings_wallet", settings_size, |window, cx| {
         let core = settings_stores(cx);
-        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
         view.update(cx, |v, cx| v.select(SettingsPane::Wallet, cx));
         view
     });
@@ -838,7 +838,7 @@ fn register_settings(s: &mut Snapshots) {
                 },
             ];
         });
-        cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(core, window, cx))
     });
 }
 
@@ -1184,7 +1184,14 @@ fn stub_eidola_trust() -> eidola_app_core::EidolaTrust {
         base_url_is_override: false,
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
+        pinned_measurement: eidola_app_core::MeasurementInfo {
+            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
+            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+        },
         has_hardware_root_ca: false,
+        hardware_root_ca_pem: None,
         has_hardware_intermediate_ca: false,
+        hardware_intermediate_ca_pem: None,
     }
 }

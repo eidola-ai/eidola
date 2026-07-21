@@ -777,8 +777,7 @@ fn open_settings_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        let wi = WindowInput::new(cx);
-        let view = cx.new(|cx| SettingsView::new(stores.clone(), wi, window, cx));
+        let view = cx.new(|cx| SettingsView::new(stores.clone(), window, cx));
         let view = chrome::ChromeRoot::wrap(view.into(), cx);
         cx.new(|cx| chrome::themed_root(view, window, cx))
     });

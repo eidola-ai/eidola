@@ -137,7 +137,7 @@ pub enum Change {
 
 ### Input-state sharing (the ⌥ pattern)
 
-gpui dispatches `ModifiersChangedEvent` along the **focused element's ancestor path only** (verified at pin 969a67fc) — a listener on a sibling branch never fires (wave-2 bug 2). Therefore: exactly one listener per window, on the window-root view (the one whose tracked focus handle is always an ancestor of focus), mirroring into a per-window `WindowInput` entity (`alt_held`, future modifier/chord state). Descendant views observe `WindowInput`; **no view below the root may register `on_modifiers_changed`**. Chat's existing reveal migrates onto this; the Settings ⌥ reveal starts working structurally.
+gpui dispatches `ModifiersChangedEvent` along the **focused element's ancestor path only** (verified at pin 969a67fc) — a listener on a sibling branch never fires (wave-2 bug 2). Therefore: exactly one listener per window, on the window-root view (the one whose tracked focus handle is always an ancestor of focus), mirroring into a per-window `WindowInput` entity (`alt_held`, future modifier/chord state). Descendant views observe `WindowInput`; **no view below the root may register `on_modifiers_changed`**. This backs `SpaceView`'s ⌥-reveal of the composer's Post affordance. *(Settings used to use it too, for a ⌥-hold "advanced" reveal — but that pattern was unusable for the editors it gated (releasing ⌥ to type hid the field). Settings dropped its `WindowInput` wiring entirely; its trust editors are now always-visible rows that reveal their inputs in place on click — no modifier, no disclosure.)*
 
 ### Lists
 
