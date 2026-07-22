@@ -127,6 +127,7 @@ fn probe_config_state() -> ConfigState {
         appearance: eidola_app_core::config::AppearanceSetting::System,
         time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
         light_character: eidola_app_core::config::LightCharacter::Neutral,
+        font_scale: 1.0,
     }
 }
 
@@ -850,6 +851,64 @@ fn chrome_menu_opens_on_f10_keystroke(cx: &mut TestAppContext) {
     assert!(
         names.contains(&"chrome/menu/panel".to_string()),
         "F10 keystroke must open the primary menu: {names:?}"
+    );
+}
+
+/// The View → zoom *keystrokes* must resolve through the production keymap to
+/// their actions with the composer focused, as a user would hit them. Guards
+/// the `secondary-0 / secondary-= / secondary-+ / secondary--` binding strings
+/// end to end: an invalid keystroke string would either panic
+/// `install_keybindings` (run in setup) or silently bind nothing (the
+/// assertions below would then fail). macOS-only because the chords are ⌘-based.
+#[cfg(target_os = "macos")]
+#[gpui::test]
+fn zoom_keystrokes_resolve_to_actions(cx: &mut TestAppContext) {
+    use eidola_gui::actions::{ActualSize, ZoomIn, ZoomOut};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let _guard = probes_on();
+
+    let fired: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    let stores = ready_stores(cx);
+    let window: AnyWindowHandle = cx.update(|cx| {
+        gpui_component::init(cx);
+        eidola_gui::theme::install(cx);
+        eidola_gui::install_keybindings(cx);
+        // Global test handlers standing in for the production ones (which need
+        // `AppGlobal`); they only record which action each keystroke dispatched.
+        {
+            let f = fired.clone();
+            cx.on_action(move |_: &ActualSize, _| f.borrow_mut().push("actual"));
+        }
+        {
+            let f = fired.clone();
+            cx.on_action(move |_: &ZoomIn, _| f.borrow_mut().push("in"));
+        }
+        {
+            let f = fired.clone();
+            cx.on_action(move |_: &ZoomOut, _| f.borrow_mut().push("out"));
+        }
+        cx.open_window(WindowOptions::default(), |window, cx| {
+            let view =
+                cx.new(|cx| SpaceView::new(stores.clone(), None, WindowInput::new(cx), window, cx));
+            cx.new(|cx| Root::new(view, window, cx))
+        })
+        .expect("open test window")
+        .into()
+    });
+    draw(cx, window);
+
+    cx.simulate_keystrokes(window, "cmd-0");
+    cx.simulate_keystrokes(window, "cmd-=");
+    cx.simulate_keystrokes(window, "cmd-+");
+    cx.simulate_keystrokes(window, "cmd--");
+    cx.run_until_parked();
+
+    assert_eq!(
+        *fired.borrow(),
+        vec!["actual", "in", "in", "out"],
+        "⌘0/⌘=/⌘+/⌘- must dispatch Actual Size / Zoom In (×2) / Zoom Out"
     );
 }
 

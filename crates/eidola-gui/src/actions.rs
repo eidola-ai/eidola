@@ -67,6 +67,13 @@ actions!(
         /// in the `SpaceView` key context; clicking the model chip is the
         /// pointer path to the same state.
         ToggleModelPicker,
+        /// Reset the base type scale to Actual Size (1.0). View menu; ⌘0 on
+        /// macOS / Ctrl+0 elsewhere.
+        ActualSize,
+        /// Step the base type scale up one rung. View menu; ⌘+ / Ctrl++.
+        ZoomIn,
+        /// Step the base type scale down one rung. View menu; ⌘- / Ctrl+-.
+        ZoomOut,
     ]
 );
 

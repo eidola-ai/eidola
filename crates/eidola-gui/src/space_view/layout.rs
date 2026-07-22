@@ -29,11 +29,16 @@ use gpui::SharedString;
 /// real; off-screen posts read the last recorded value (or an estimate), which
 /// is how the document total, scroll range, and minimap scale stay right while
 /// only visible posts actually shape.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Layout {
     /// The **reading-column** width (`body_width`) the cached heights were
     /// measured at — a post's height depends only on this, not the window width.
     width: Rc<Cell<f32>>,
+    /// The type-scale factor the cached heights were measured at. A post's
+    /// shaped height scales with the prose font size, so a zoom must invalidate
+    /// the cache exactly like a column change (the same estimate→real re-measure
+    /// jitter otherwise appears on the off-screen posts).
+    scale: Rc<Cell<f32>>,
     /// Measured block height (byline + body, the full post element) by node id.
     heights: Rc<RefCell<HashMap<SharedString, f32>>>,
     /// How many times the cache has been invalidated (a resize that leaves the
@@ -41,22 +46,43 @@ pub struct Layout {
     clears: Rc<Cell<u32>>,
 }
 
+impl Default for Layout {
+    fn default() -> Self {
+        Self {
+            width: Rc::new(Cell::new(0.0)),
+            scale: Rc::new(Cell::new(1.0)),
+            heights: Rc::new(RefCell::new(HashMap::new())),
+            clears: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
 impl Layout {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Point the cache at reading-column `width`, clearing measurements if it
-    /// changed. Call once per frame before reading heights. Because the width is
-    /// the *clamped* `body_width` (not the raw window width), resizes above the
-    /// column cap don't invalidate anything — the measured heights survive, so
-    /// the document height and scroll offset stay stable across the resize.
-    pub fn ensure_width(&self, width: f32) {
-        if (self.width.get() - width).abs() > 0.5 {
+    /// Point the cache at reading-column `width` and type-`scale`, clearing
+    /// measurements if either changed. Call once per frame before reading
+    /// heights. Because the width is the *clamped* `body_width` (not the raw
+    /// window width), resizes above the column cap don't invalidate anything —
+    /// the measured heights survive, so the document height and scroll offset
+    /// stay stable across the resize. A zoom, by contrast, reshapes every post,
+    /// so a scale change *does* clear.
+    pub fn ensure_width(&self, width: f32, scale: f32) {
+        if (self.width.get() - width).abs() > 0.5 || (self.scale.get() - scale).abs() > 1e-3 {
             self.width.set(width);
+            self.scale.set(scale);
             self.heights.borrow_mut().clear();
             self.clears.set(self.clears.get().wrapping_add(1));
         }
+    }
+
+    /// The type-scale factor the cache is currently keyed at — the height
+    /// estimate multiplies the prose font size by it so an unmeasured post is
+    /// approximated at the current zoom.
+    pub fn scale(&self) -> f32 {
+        self.scale.get()
     }
 
     /// How many times the cache has been invalidated (test seam).
@@ -239,7 +265,9 @@ impl SpaceView {
                 estimate_post_height(
                     content,
                     body_width(page_width),
-                    PROSE_FONT_SIZE.as_f32(),
+                    // Match the scaled prose font the post will actually shape
+                    // at, so the pre-measure estimate is right at any zoom.
+                    PROSE_FONT_SIZE.as_f32() * self.layout.scale(),
                     PROSE_LINE_HEIGHT,
                     PROSE_PARAGRAPH_GAP,
                     POST_PAD_Y.as_f32() * 2.0,
@@ -445,15 +473,35 @@ mod tests {
     #[test]
     fn width_change_invalidates() {
         let l = Layout::new();
-        l.ensure_width(600.0);
+        l.ensure_width(600.0, 1.0);
         let id = SharedString::from("a1");
         assert!(l.record(&id, 200.0));
         assert_eq!(l.measured("a1"), Some(200.0));
-        // Same width, same value → no change reported, value retained.
+        // Same width + scale, same value → no change reported, value retained.
         assert!(!l.record(&id, 200.3));
+        // Same width and scale re-asserted → cache survives (no phantom clear).
+        l.ensure_width(600.0, 1.0);
+        assert_eq!(l.measured("a1"), Some(200.0));
         // Width change clears.
-        l.ensure_width(480.0);
+        l.ensure_width(480.0, 1.0);
         assert_eq!(l.measured("a1"), None);
+    }
+
+    #[test]
+    fn scale_change_invalidates() {
+        let l = Layout::new();
+        l.ensure_width(600.0, 1.0);
+        let id = SharedString::from("a1");
+        l.record(&id, 200.0);
+        assert_eq!(l.measured("a1"), Some(200.0));
+        assert_eq!(l.scale(), 1.0);
+        // A zoom reshapes every post, so a scale change clears at the same
+        // width and updates the reported scale (which the estimate reads).
+        let before = l.clears();
+        l.ensure_width(600.0, 1.25);
+        assert_eq!(l.measured("a1"), None);
+        assert_eq!(l.scale(), 1.25);
+        assert_eq!(l.clears(), before + 1);
     }
 
     #[test]
@@ -482,7 +530,7 @@ mod tests {
     #[test]
     fn retain_prunes_dead_ids() {
         let l = Layout::new();
-        l.ensure_width(600.0);
+        l.ensure_width(600.0, 1.0);
         l.record(&SharedString::from("a1"), 100.0);
         l.record(&SharedString::from("a2"), 100.0);
         l.retain(&|id| id == "a1");

@@ -114,11 +114,18 @@ pub(crate) const VIRT_MARGIN: f32 = 600.0;
 /// `from_theme` seeds the system font + theme colors, so we override the
 /// family back to Newsreader for narrative content.
 pub(crate) fn prose_style(cx: &gpui::App) -> MarkdownStyle {
+    // The prose ramp is the one place the type ramp is spelled in absolute
+    // pixels rather than `rems()`, so it doesn't ride the scaled `rem_size`
+    // automatically — multiply the base size by the type-scale factor here. The
+    // `rems()`-relative leading and paragraph gap below *do* ride `rem_size` (=
+    // the theme UI font size, itself scaled), so they stay proportional to the
+    // scaled prose size for free.
+    let base = PROSE_FONT_SIZE * theme::font_scale(cx);
     let mut style = MarkdownStyle::from_theme(cx)
-        .font_size(PROSE_FONT_SIZE)
+        .font_size(base)
         .line_height(rems(PROSE_LINE_HEIGHT))
         .paragraph_gap(rems(PROSE_PARAGRAPH_GAP))
-        .heading_base_font_size(PROSE_FONT_SIZE)
+        .heading_base_font_size(base)
         .heading_font_size(|level, base| match level {
             1 => base * 2.5,
             2 => base * 1.75,
@@ -990,7 +997,8 @@ impl Render for SpaceView {
         // every post back to a rough estimate and jittering the page (and the
         // minimap) as the near-viewport posts re-measured estimate→real — even
         // where no text reflows. See `layout::body_width`.
-        self.layout.ensure_width(layout::body_width(page_width));
+        self.layout
+            .ensure_width(layout::body_width(page_width), theme::font_scale(cx));
         self.sync_bodies(window, cx);
         // Keep a docked tail draft at the end of every branch (the always-present
         // composer that replaces the leaf "+").

@@ -34,8 +34,9 @@ use gpui_component_assets::Assets;
 
 use crate::about::AboutView;
 use crate::actions::{
-    About, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize, NewSpace,
-    OpenLibrary, OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
+    About, ActualSize, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize,
+    NewSpace, OpenLibrary, OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom, ZoomIn,
+    ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::onboarding::OnboardingView;
@@ -285,6 +286,19 @@ fn install_menus(cx: &mut App) {
             ],
             disabled: false,
         },
+        // The View menu carries the standard macOS type-size trio (Actual
+        // Size / Zoom In / Zoom Out). Kept deliberately minimal and scoped to
+        // just these items so it doesn't collide with the concurrent File/app
+        // menu restructuring — this file only ever adds a View menu.
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("Actual Size", ActualSize),
+                MenuItem::action("Zoom In", ZoomIn),
+                MenuItem::action("Zoom Out", ZoomOut),
+            ],
+            disabled: false,
+        },
         // Naming this menu "Window" causes gpui_macos to call
         // `app.setWindowsMenu_(menu)`, which tells AppKit "this is the
         // canonical macOS Window menu". AppKit auto-populates it with the
@@ -325,6 +339,14 @@ pub fn install_keybindings(cx: &mut App) {
         KeyBinding::new("secondary-w", CloseWindow, None),
         KeyBinding::new("secondary-q", Quit, None),
         KeyBinding::new("secondary-alt-i", ToggleInspector, None),
+        // View → type size. ⌘0 / Ctrl+0 resets; ⌘=/⌘+ zooms in (both the bare
+        // `=` and the shifted `+` that shares the key, so either keypress
+        // works); ⌘-/Ctrl+- zooms out. Global (no context) so they fire even
+        // with the composer focused — the editor keymap binds none of these.
+        KeyBinding::new("secondary-0", ActualSize, None),
+        KeyBinding::new("secondary-=", ZoomIn, None),
+        KeyBinding::new("secondary-+", ZoomIn, None),
+        KeyBinding::new("secondary--", ZoomOut, None),
         // ⌘↩ (post & ask) and ⌘⇧↩ (post only) are *not* bound here. The
         // composer owns those chords — `gpui_markdown_editor::init` binds them
         // in the `MarkdownEditor` context to `Enter { secondary: true, .. }`,
@@ -444,6 +466,24 @@ fn install_action_handlers(cx: &mut App) {
             return;
         }
         open_record_window(cx);
+    });
+
+    // View → type size. Global handlers that write the `font_scale` config
+    // override through the shared `ConfigStore`; the write emits
+    // `Change::Config`, which `theme::wire_config`'s observer turns into a
+    // re-apply on every window. Reading the current scale off the store's
+    // snapshot means the ladder works from any window (or none focused).
+    cx.on_action(|_: &ActualSize, cx: &mut App| {
+        let config = cx.global::<AppGlobal>().stores.config.clone();
+        config.update(cx, |s, cx| s.reset_zoom(cx));
+    });
+    cx.on_action(|_: &ZoomIn, cx: &mut App| {
+        let config = cx.global::<AppGlobal>().stores.config.clone();
+        config.update(cx, |s, cx| s.zoom_in(cx));
+    });
+    cx.on_action(|_: &ZoomOut, cx: &mut App| {
+        let config = cx.global::<AppGlobal>().stores.config.clone();
+        config.update(cx, |s, cx| s.zoom_out(cx));
     });
 
     // macOS standard App-menu actions. Without these registered, AppKit

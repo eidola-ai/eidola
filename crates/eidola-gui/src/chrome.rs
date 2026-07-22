@@ -602,8 +602,8 @@ impl ChromeRoot {
 
     fn render_menu_panel(&self, _window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         use crate::actions::{
-            About, CheckForUpdates, NewSpace, OpenLibrary, OpenRecord, OpenSettings, Quit,
-            primary_chord, primary_shift_chord,
+            About, ActualSize, CheckForUpdates, NewSpace, OpenLibrary, OpenRecord, OpenSettings,
+            Quit, ZoomIn, ZoomOut, primary_chord, primary_shift_chord,
         };
         let theme = cx.theme();
 
@@ -624,7 +624,8 @@ impl ChromeRoot {
                 cx.notify();
             }))
             // "New Space" is the sole space-scoped command (the macOS "Space"
-            // menu's item); it sits in its own group. Library/Record are
+            // menu's item); it sits in its own group. The zoom trio is the
+            // macOS "View" menu, its own group next. Library/Record are
             // app-level and group with Settings below — mirroring the macOS
             // move of Library/Record up into the Eidola app menu.
             .child(menu_item(
@@ -632,6 +633,28 @@ impl ChromeRoot {
                 "New Space",
                 Some(primary_chord("N")),
                 |w, cx| w.dispatch_action(Box::new(NewSpace), cx),
+                cx,
+            ))
+            .child(separator())
+            .child(menu_item(
+                "actual-size",
+                "Actual Size",
+                Some(primary_chord("0")),
+                |w, cx| w.dispatch_action(Box::new(ActualSize), cx),
+                cx,
+            ))
+            .child(menu_item(
+                "zoom-in",
+                "Zoom In",
+                Some(primary_chord("+")),
+                |w, cx| w.dispatch_action(Box::new(ZoomIn), cx),
+                cx,
+            ))
+            .child(menu_item(
+                "zoom-out",
+                "Zoom Out",
+                Some(primary_chord("-")),
+                |w, cx| w.dispatch_action(Box::new(ZoomOut), cx),
                 cx,
             ))
             .child(separator())

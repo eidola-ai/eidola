@@ -21,6 +21,58 @@ pub const DEFAULT_ATTESTATION_REPO: &str = "eidola-ai/eidola";
 /// config (`default_model`) nor the caller specifies one.
 pub const DEFAULT_MODEL: &str = "gemma4-31b";
 
+/// The base type-scale factor (`1.0` = the app's designed sizes). Applied as a
+/// single multiplier over the whole type ramp — the theme's UI font size (which
+/// gpui-component uses as the window `rem_size`, so every `rems()`-relative
+/// measurement, line height, and padding rides it) and the prose reading size.
+/// Persisted so a user's chosen size survives restarts; adjusted through the
+/// GUI's View → Actual Size / Zoom In / Zoom Out.
+pub const FONT_SCALE_DEFAULT: f32 = 1.0;
+/// The smallest allowed [`Config::font_scale`] — a sane floor so text can't be
+/// shrunk to illegibility.
+pub const FONT_SCALE_MIN: f32 = 0.8;
+/// The largest allowed [`Config::font_scale`] — a ceiling that keeps even the
+/// prose ramp's h1 (2.5×) from blowing the window apart, while still doubling
+/// the base size for low-vision users.
+pub const FONT_SCALE_MAX: f32 = 2.0;
+/// The discrete zoom ladder Zoom In / Zoom Out step through (ascending). Chosen
+/// so each step is a perceptible but not jarring jump; `1.0` is the anchor
+/// Actual Size resets to.
+pub const FONT_SCALE_STEPS: &[f32] = &[0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+
+/// Clamp an arbitrary scale into the allowed range (and coerce a non-finite
+/// value back to the default), so a hand-edited or corrupt config can never
+/// wedge the UI at an unusable size.
+pub fn clamp_font_scale(scale: f32) -> f32 {
+    if !scale.is_finite() {
+        return FONT_SCALE_DEFAULT;
+    }
+    scale.clamp(FONT_SCALE_MIN, FONT_SCALE_MAX)
+}
+
+/// The next ladder step strictly above `current` (Zoom In), saturating at
+/// [`FONT_SCALE_MAX`]. Snaps to the ladder from any starting value.
+pub fn font_scale_step_up(current: f32) -> f32 {
+    let current = clamp_font_scale(current);
+    FONT_SCALE_STEPS
+        .iter()
+        .copied()
+        .find(|s| *s > current + 1e-3)
+        .unwrap_or(FONT_SCALE_MAX)
+}
+
+/// The next ladder step strictly below `current` (Zoom Out), saturating at
+/// [`FONT_SCALE_MIN`].
+pub fn font_scale_step_down(current: f32) -> f32 {
+    let current = clamp_font_scale(current);
+    FONT_SCALE_STEPS
+        .iter()
+        .rev()
+        .copied()
+        .find(|s| *s < current - 1e-3)
+        .unwrap_or(FONT_SCALE_MIN)
+}
+
 /// The day/night axis of the circadian theme: which palette family is
 /// active. `System` tracks the OS light/dark appearance; `Day`/`Night` pin
 /// one family; `Auto` switches on the sun — between (timezone-approximated)
@@ -152,6 +204,15 @@ pub struct Config {
         skip_serializing_if = "Option::is_none"
     )]
     pub light_character_override: Option<LightCharacter>,
+    /// Base type-scale factor (`1.0` = designed sizes). `None` = the default
+    /// ([`FONT_SCALE_DEFAULT`]). The resolver clamps any stored value into
+    /// `[FONT_SCALE_MIN, FONT_SCALE_MAX]`.
+    #[serde(
+        rename = "font_scale",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub font_scale_override: Option<f32>,
 }
 
 impl Config {
@@ -195,6 +256,15 @@ impl Config {
     /// the user's `light_character` override if set, otherwise `neutral`.
     pub fn light_character(&self) -> LightCharacter {
         self.light_character_override.unwrap_or_default()
+    }
+
+    /// The resolved base type-scale factor: the user's `font_scale` override
+    /// (clamped into the allowed range) if set, otherwise
+    /// [`FONT_SCALE_DEFAULT`].
+    pub fn font_scale(&self) -> f32 {
+        self.font_scale_override
+            .map(clamp_font_scale)
+            .unwrap_or(FONT_SCALE_DEFAULT)
     }
 
     /// The full URL of the latest-release endpoint the update checker
@@ -411,6 +481,61 @@ mod tests {
         assert_eq!(parsed.light_character(), LightCharacter::Cool);
         let parsed: Config = toml::from_str("light_character = \"orange\"").expect("alias parses");
         assert_eq!(parsed.light_character(), LightCharacter::Warm);
+    }
+
+    #[test]
+    fn font_scale_defaults_clamps_and_round_trips() {
+        // Absent key → the resolver falls back to the default.
+        let cfg: Config = toml::from_str("").expect("deserialize empty");
+        assert_eq!(cfg.font_scale(), FONT_SCALE_DEFAULT);
+
+        // A stored value round-trips under the public `font_scale` key.
+        let original = Config {
+            font_scale_override: Some(1.25),
+            ..Config::default()
+        };
+        let toml_text = toml::to_string_pretty(&original).expect("serialize");
+        assert!(
+            toml_text.contains("font_scale = 1.25"),
+            "override must serialize under `font_scale`: {toml_text}"
+        );
+        let parsed: Config = toml::from_str(&toml_text).expect("deserialize");
+        assert_eq!(parsed.font_scale(), 1.25);
+
+        // Out-of-range and non-finite stored values are clamped/coerced by the
+        // resolver rather than trusted verbatim.
+        let too_big = Config {
+            font_scale_override: Some(99.0),
+            ..Config::default()
+        };
+        assert_eq!(too_big.font_scale(), FONT_SCALE_MAX);
+        let too_small = Config {
+            font_scale_override: Some(0.01),
+            ..Config::default()
+        };
+        assert_eq!(too_small.font_scale(), FONT_SCALE_MIN);
+        assert_eq!(clamp_font_scale(f32::NAN), FONT_SCALE_DEFAULT);
+    }
+
+    #[test]
+    fn font_scale_ladder_steps_and_saturates() {
+        // Stepping up from the anchor lands on the next rung, not an arbitrary
+        // delta; stepping down mirrors it.
+        assert_eq!(font_scale_step_up(1.0), 1.1);
+        assert_eq!(font_scale_step_down(1.0), 0.9);
+        // From an off-ladder value it snaps to the nearest rung in the step
+        // direction.
+        assert_eq!(font_scale_step_up(1.05), 1.1);
+        assert_eq!(font_scale_step_down(1.05), 1.0);
+        // The ends saturate rather than walking off the ladder.
+        assert_eq!(font_scale_step_up(FONT_SCALE_MAX), FONT_SCALE_MAX);
+        assert_eq!(font_scale_step_down(FONT_SCALE_MIN), FONT_SCALE_MIN);
+        // A full round trip up the ladder ends exactly at the ceiling.
+        let mut s = FONT_SCALE_MIN;
+        for _ in 0..FONT_SCALE_STEPS.len() {
+            s = font_scale_step_up(s);
+        }
+        assert_eq!(s, FONT_SCALE_MAX);
     }
 
     #[test]

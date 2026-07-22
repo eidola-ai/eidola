@@ -1174,6 +1174,7 @@ fn stub_config_state(has_account: bool) -> ConfigState {
         appearance: eidola_app_core::config::AppearanceSetting::System,
         time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
         light_character: eidola_app_core::config::LightCharacter::Neutral,
+        font_scale: 1.0,
     }
 }
 

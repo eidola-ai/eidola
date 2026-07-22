@@ -65,6 +65,10 @@ pub struct ConfigState {
     /// The resolved fixed light character used while `time_of_day_tint` is
     /// `off` (`light_character` override if set, otherwise `neutral`).
     pub light_character: config::LightCharacter,
+    /// The resolved base type-scale factor (`font_scale` override clamped into
+    /// range if set, otherwise [`config::FONT_SCALE_DEFAULT`]). The GUI applies
+    /// it over the whole type ramp.
+    pub font_scale: f32,
 }
 
 /// The eidola backend's resolved connection + trust bundle, honest about
@@ -3015,6 +3019,7 @@ impl AppCore {
             appearance: cfg.appearance(),
             time_of_day_tint: cfg.time_of_day_tint(),
             light_character: cfg.light_character(),
+            font_scale: cfg.font_scale(),
         }
     }
 
@@ -3095,6 +3100,20 @@ impl AppCore {
     pub fn set_light_character(&self, character: config::LightCharacter) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.light_character_override = Some(character);
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
+    }
+
+    /// Persist the base type-scale factor (the `font_scale` config override):
+    /// the single multiplier the GUI applies over the whole type ramp. The
+    /// value is clamped into `[FONT_SCALE_MIN, FONT_SCALE_MAX]` before writing,
+    /// so callers can hand in a raw ladder step (or a stepped value) without
+    /// pre-validating. Emits [`Change::Config`] so every window's theme
+    /// re-applies.
+    pub fn set_font_scale(&self, scale: f32) -> Result<(), AppError> {
+        let mut cfg = self.inner.load_config();
+        cfg.font_scale_override = Some(config::clamp_font_scale(scale));
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
         Ok(())
@@ -4946,21 +4965,32 @@ mod tests {
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::On);
         assert_eq!(state.light_character, config::LightCharacter::Neutral);
 
+        // Font scale defaults to Actual Size and round-trips its override.
+        assert_eq!(state.font_scale, config::FONT_SCALE_DEFAULT);
+
         core.set_appearance(config::AppearanceSetting::Day).unwrap();
         core.set_time_of_day_tint(config::TimeOfDayTint::Off)
             .unwrap();
         core.set_light_character(config::LightCharacter::Cool)
             .unwrap();
+        core.set_font_scale(1.25).unwrap();
         let state = core.config_state();
         assert_eq!(state.appearance, config::AppearanceSetting::Day);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);
         assert_eq!(state.light_character, config::LightCharacter::Cool);
+        assert_eq!(state.font_scale, 1.25);
+
+        // An out-of-range scale is clamped on write, never stored verbatim.
+        core.set_font_scale(50.0).unwrap();
+        assert_eq!(core.config_state().font_scale, config::FONT_SCALE_MAX);
+        core.set_font_scale(1.0).unwrap();
 
         // A fresh core over the same config dir sees the persisted values.
         let core2 = AppCore::new(config_dir, data_dir);
         let state = core2.config_state();
         assert_eq!(state.appearance, config::AppearanceSetting::Day);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);
+        assert_eq!(state.font_scale, config::FONT_SCALE_DEFAULT);
     }
 
     // --- Auto-provisioning decision logic ---------------------------------

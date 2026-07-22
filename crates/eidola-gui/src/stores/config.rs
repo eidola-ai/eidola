@@ -233,6 +233,40 @@ impl ConfigStore {
         self.write(cx, |c| c.set_light_character(character));
     }
 
+    /// The current resolved type-scale factor (Actual Size = `1.0`); `1.0` on a
+    /// stub with no config snapshot.
+    pub fn font_scale(&self) -> f32 {
+        self.state
+            .as_ref()
+            .map(|s| s.font_scale)
+            .unwrap_or(eidola_app_core::config::FONT_SCALE_DEFAULT)
+    }
+
+    /// Persist an explicit type-scale factor (clamped in app-core). The theme
+    /// reacts via its config observation (`theme::wire_config`), not from here.
+    pub fn set_font_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
+        self.write(cx, |c| c.set_font_scale(scale));
+    }
+
+    /// View → Zoom In: step the type scale up one ladder rung (saturating at the
+    /// max). Reads the current scale off the snapshot so it works on any window.
+    pub fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        let next = eidola_app_core::config::font_scale_step_up(self.font_scale());
+        self.set_font_scale(next, cx);
+    }
+
+    /// View → Zoom Out: step the type scale down one ladder rung (saturating at
+    /// the min).
+    pub fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        let next = eidola_app_core::config::font_scale_step_down(self.font_scale());
+        self.set_font_scale(next, cx);
+    }
+
+    /// View → Actual Size: reset the type scale to the designed `1.0`.
+    pub fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        self.set_font_scale(eidola_app_core::config::FONT_SCALE_DEFAULT, cx);
+    }
+
     #[allow(dead_code)]
     pub fn set_attestation_url(&mut self, url: String, cx: &mut Context<Self>) {
         self.write(cx, |c| c.set_attestation_url(url));
