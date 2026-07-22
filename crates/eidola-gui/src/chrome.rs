@@ -535,7 +535,7 @@ impl ChromeRoot {
         cx.notify();
     }
 
-    /// The primary menu — the Linux stand-in for the macOS app/File menus
+    /// The primary menu — the Linux stand-in for the macOS app/Space menus
     /// (GNOME's "primary menu" idiom, in our voice): a quiet italic "Eidola"
     /// wordmark in the window's top-left corner that opens a popover of the
     /// app-scoped commands, each with its chord rendered beside it (so the
@@ -623,6 +623,10 @@ impl ChromeRoot {
                 this.menu_open = false;
                 cx.notify();
             }))
+            // "New Space" is the sole space-scoped command (the macOS "Space"
+            // menu's item); it sits in its own group. Library/Record are
+            // app-level and group with Settings below — mirroring the macOS
+            // move of Library/Record up into the Eidola app menu.
             .child(menu_item(
                 "new-space",
                 "New Space",
@@ -630,6 +634,7 @@ impl ChromeRoot {
                 |w, cx| w.dispatch_action(Box::new(NewSpace), cx),
                 cx,
             ))
+            .child(separator())
             .child(menu_item(
                 "library",
                 "Library…",
@@ -644,7 +649,6 @@ impl ChromeRoot {
                 |w, cx| w.dispatch_action(Box::new(OpenRecord), cx),
                 cx,
             ))
-            .child(separator())
             .child(menu_item(
                 "settings",
                 "Settings…",

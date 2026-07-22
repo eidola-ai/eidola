@@ -732,7 +732,7 @@ fn request_panel_probes_appear_on_open_and_clear_on_dismiss(cx: &mut TestAppCont
 }
 
 /// Linux window chrome: `ChromeRoot` wraps every production window and hosts
-/// the primary menu (the macOS app/File-menu replacement). The wordmark
+/// the primary menu (the macOS app/Space-menu replacement). The wordmark
 /// affordance must probe at rest; toggling the menu (the F10 action path)
 /// must mount the panel + item probes; toggling again must clear them (no
 /// ghost targets). macOS is excluded because `ChromeRoot::wrap` is an

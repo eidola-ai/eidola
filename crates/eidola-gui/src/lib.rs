@@ -236,6 +236,9 @@ fn install_menus(cx: &mut App) {
                 MenuItem::action("Get Started", GetStarted),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::Separator,
+                MenuItem::action("Library…", OpenLibrary),
+                MenuItem::action("Record…", OpenRecord),
+                MenuItem::Separator,
                 MenuItem::action("Hide Eidola", Hide),
                 MenuItem::action("Hide Others", HideOthers),
                 MenuItem::action("Show All", ShowAll),
@@ -244,12 +247,15 @@ fn install_menus(cx: &mut App) {
             ],
             disabled: false,
         },
+        // "Space" is the space-centric replacement for the conventional
+        // "File" menu — the space (conversation) is our unit of work. "New
+        // Space" keeps the File-menu New idiom; Library/Record moved up into
+        // the Eidola app menu. Future space-scoped items (space settings,
+        // export, …) land here.
         Menu {
-            name: "File".into(),
+            name: "Space".into(),
             items: vec![
                 MenuItem::action("New Space", NewSpace),
-                MenuItem::action("Library…", OpenLibrary),
-                MenuItem::action("Record…", OpenRecord),
                 MenuItem::Separator,
                 MenuItem::action("Close Window", CloseWindow),
             ],
