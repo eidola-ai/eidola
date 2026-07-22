@@ -32,6 +32,15 @@ enum Command {
         /// Remove a trusted enclave release by SNP measurement
         #[arg(long)]
         untrust_measurement: Option<String>,
+        /// Remove the base-URL override (revert to the trust-root pin)
+        #[arg(long, conflicts_with = "base_url")]
+        clear_base_url: bool,
+        /// Remove the ARK override (revert to the production AMD chain)
+        #[arg(long, conflicts_with = "hardware_root_ca")]
+        clear_hardware_root_ca: bool,
+        /// Remove the ASK override (revert to the production AMD chain)
+        #[arg(long, conflicts_with = "hardware_intermediate_ca")]
+        clear_hardware_intermediate_ca: bool,
     },
     /// Manage account
     Account {
@@ -58,6 +67,16 @@ enum Command {
     Spaces {
         #[command(subcommand)]
         command: SpacesCommand,
+    },
+    /// Manage local inference models (llama.cpp)
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+    /// Manage inference backends (where an ask can be routed)
+    Backend {
+        #[command(subcommand)]
+        command: BackendCommand,
     },
     /// Check for and verify newer releases
     Update {
@@ -105,7 +124,19 @@ enum UpdateCommand {
 #[derive(Subcommand)]
 enum AccountCommand {
     /// Create a new account on the server
-    Create,
+    Create {
+        /// Agree to the current terms of service and privacy policy.
+        /// Required when the server has an acceptance gate configured;
+        /// run without it to see the documents first.
+        #[arg(long)]
+        accept_terms: bool,
+    },
+    /// Review and accept the current terms of service and privacy policy
+    AcceptTerms {
+        /// Accept without the interactive confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
     /// Remove stored account credentials
     Reset,
     /// Set existing account credentials
@@ -149,6 +180,121 @@ enum CredentialsCommand {
     List,
     /// Recover stuck (in-flight) credentials
     Recover,
+}
+
+#[derive(Subcommand)]
+enum ModelCommand {
+    /// List local models (downloaded / loading / loaded) and the curated
+    /// Gemma 4 catalog
+    List,
+    /// Download a model: a catalog id (see `model list`) or a `.gguf` URL
+    /// (direct or a Hugging Face file page). Waits with a progress line.
+    Download {
+        /// Catalog id (e.g. `gemma-4-e2b`) or URL
+        source: String,
+    },
+    /// Delete a downloaded model
+    Delete {
+        /// Model id (`<slug>@local`) or bare slug
+        id: String,
+    },
+    /// Load a model: start its llama-server engine and wait until ready
+    Load {
+        /// Model id (`<slug>@<backend>`) or bare slug (the local store)
+        id: String,
+    },
+    /// Unload a model, terminating its engine
+    Unload {
+        /// Model id (`<slug>@<backend>`) or bare slug (the local store)
+        id: String,
+    },
+    /// Pin a loaded model: protect it from automatic (LRU) unloading when
+    /// another model needs the memory
+    Pin {
+        /// Model id (`<slug>@<backend>`) or bare slug (the local store)
+        id: String,
+    },
+    /// Unpin a loaded model
+    Unpin {
+        /// Model id (`<slug>@<backend>`) or bare slug (the local store)
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackendCommand {
+    /// List configured backends
+    List,
+    /// Add an external backend
+    Add {
+        #[command(subcommand)]
+        kind: BackendAddCommand,
+    },
+    /// Enable a backend
+    Enable {
+        /// Backend id
+        id: String,
+    },
+    /// Disable a backend (for `eidola`: run with no account, on-device only)
+    Disable {
+        /// Backend id
+        id: String,
+    },
+    /// Remove an external backend (its forensic trail is preserved;
+    /// re-adding the same id revives it)
+    Remove {
+        /// Backend id
+        id: String,
+    },
+    /// List the models a backend offers (`model list` covers `local`)
+    Models {
+        /// Backend id
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackendAddCommand {
+    /// Any OpenAI-compatible HTTP server (self-hosted vLLM/Ollama/llama.cpp,
+    /// or a conventional provider you choose to trust)
+    Openai {
+        /// Backend id (lowercase letters, digits, hyphens) — models are then
+        /// addressed as `<model>@<id>`
+        id: String,
+        /// Base URL (e.g. http://192.168.1.20:8000)
+        #[arg(long)]
+        url: String,
+        /// API key, sent as a Bearer token
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Display name (defaults to the id)
+        #[arg(long)]
+        name: Option<String>,
+        /// Pin the model list (comma-separated) instead of trusting
+        /// GET /v1/models — not every "OpenAI-compatible" server offers it
+        #[arg(long, value_delimiter = ',')]
+        models: Option<Vec<String>>,
+    },
+    /// A llama.cpp install whose models you manage yourself: Eidola scans
+    /// the directory and starts/stops llama-server engines on demand
+    Llamacpp {
+        /// Backend id (lowercase letters, digits, hyphens)
+        id: String,
+        /// Directory of .gguf files (never written to by Eidola)
+        #[arg(long)]
+        models_dir: String,
+        /// Explicit llama-server binary path (default: discover on $PATH and
+        /// the usual install prefixes)
+        #[arg(long)]
+        engine_path: Option<String>,
+        /// Require models to be pre-loaded (`eidola model load …`) instead of
+        /// auto-starting an engine on the first request
+        #[arg(long)]
+        no_auto_start: bool,
+        /// Display name (defaults to the id)
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -211,6 +357,12 @@ fn main() {
                      `eidola account checkout <price_id>` to add credit"
                 );
             }
+            AppError::TermsAcceptanceRequired { .. } => {
+                eprintln!(
+                    "hint: the terms of service or privacy policy changed — run \
+                     `eidola account accept-terms` to review and accept"
+                );
+            }
             _ => {}
         }
         std::process::exit(1);
@@ -221,8 +373,17 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
     match cli.command {
         None => {
             let state = core.config_state();
+            let trust = core.eidola_trust().await?;
             println!("config path: {:?}", config::default_config_path());
-            println!("base_url: {}", state.base_url);
+            println!(
+                "base_url: {}{}",
+                trust.base_url,
+                if trust.base_url_is_override {
+                    format!(" (override; pin is {})", trust.base_url_pin)
+                } else {
+                    " (built-in pin)".to_string()
+                }
+            );
             println!("default_model: {}", state.default_model);
             println!(
                 "account_id: {}",
@@ -240,15 +401,22 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     "<not set>"
                 }
             );
-            println!("trusted_measurements:");
-            for m in &state.trusted_measurements {
+            println!(
+                "trusted_measurements:{}",
+                if trust.trusted_measurements_are_override {
+                    " (override)"
+                } else {
+                    " (built-in pin)"
+                }
+            );
+            for m in &trust.trusted_measurements {
                 println!("  - snp = {}", m.snp);
                 println!("    tdx.rtmr1 = {}", m.tdx_rtmr1);
                 println!("    tdx.rtmr2 = {}", m.tdx_rtmr2);
             }
             println!(
                 "hardware_root_ca: {}",
-                if state.has_hardware_root_ca {
+                if trust.has_hardware_root_ca {
                     "<set>"
                 } else {
                     "<not set>"
@@ -256,7 +424,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             );
             println!(
                 "hardware_intermediate_ca: {}",
-                if state.has_hardware_intermediate_ca {
+                if trust.has_hardware_intermediate_ca {
                     "<set>"
                 } else {
                     "<not set>"
@@ -275,6 +443,9 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             hardware_intermediate_ca,
             trust_measurement,
             untrust_measurement,
+            clear_base_url,
+            clear_hardware_root_ca,
+            clear_hardware_intermediate_ca,
         }) => {
             if base_url.is_none()
                 && attestation_url.is_none()
@@ -282,14 +453,29 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 && hardware_intermediate_ca.is_none()
                 && trust_measurement.is_none()
                 && untrust_measurement.is_none()
+                && !clear_base_url
+                && !clear_hardware_root_ca
+                && !clear_hardware_intermediate_ca
             {
                 return Err(AppError::Config {
                     message: "specify at least one option (see --help)".into(),
                 });
             }
             if let Some(url) = base_url {
-                core.set_base_url(url.clone())?;
+                core.set_base_url(url.clone()).await?;
                 println!("base_url set to {url}");
+            }
+            if clear_base_url {
+                core.clear_base_url_override().await?;
+                println!("base_url override removed (using the trust-root pin)");
+            }
+            if clear_hardware_root_ca {
+                core.clear_hardware_root_ca().await?;
+                println!("hardware_root_ca override removed (production AMD chain)");
+            }
+            if clear_hardware_intermediate_ca {
+                core.clear_hardware_intermediate_ca().await?;
+                println!("hardware_intermediate_ca override removed (production AMD chain)");
             }
             if let Some(url) = attestation_url {
                 core.set_attestation_url(url.clone())?;
@@ -299,23 +485,25 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 let pem = std::fs::read_to_string(&path).map_err(|e| AppError::Config {
                     message: format!("failed to read {path}: {e}"),
                 })?;
-                core.set_hardware_root_ca(pem)?;
+                core.set_hardware_root_ca(pem).await?;
                 println!("hardware_root_ca set from {path}");
             }
             if let Some(path) = hardware_intermediate_ca {
                 let pem = std::fs::read_to_string(&path).map_err(|e| AppError::Config {
                     message: format!("failed to read {path}: {e}"),
                 })?;
-                core.set_hardware_intermediate_ca(pem)?;
+                core.set_hardware_intermediate_ca(pem).await?;
                 println!("hardware_intermediate_ca set from {path}");
             }
             if let Some(spec) = trust_measurement {
                 let m = config::parse_trust_measurement(&spec)?;
-                let added = core.trust_measurement(
-                    m.snp_measurement.clone(),
-                    m.tdx_measurement.rtmr1.clone(),
-                    m.tdx_measurement.rtmr2.clone(),
-                )?;
+                let added = core
+                    .trust_measurement(
+                        m.snp_measurement.clone(),
+                        m.tdx_measurement.rtmr1.clone(),
+                        m.tdx_measurement.rtmr2.clone(),
+                    )
+                    .await?;
                 if added {
                     println!(
                         "added trusted measurement: snp={}, tdx.rtmr1={}, tdx.rtmr2={}",
@@ -327,7 +515,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             if let Some(spec) = untrust_measurement {
                 let key = config::parse_untrust_key(&spec)?;
-                let removed = core.untrust_measurement(key.clone())?;
+                let removed = core.untrust_measurement(key.clone()).await?;
                 if removed {
                     println!("removed trusted measurement (snp={key})");
                 } else {
@@ -346,11 +534,55 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 println!("created_at: {}", info.created_at);
                 Ok(())
             }
-            Some(AccountCommand::Create) => {
+            Some(AccountCommand::Create { accept_terms }) => {
+                // Consent is captured here, not in app-core: creating an
+                // account records acceptance of the current terms/privacy
+                // versions, so the documents must be surfaced first.
+                let docs = core.current_terms().await?;
+                if !docs.is_empty() && !accept_terms {
+                    eprintln!("creating an account means agreeing to:");
+                    for d in &docs {
+                        eprintln!(
+                            "  {} v{} — {} (sha256 {})",
+                            d.document, d.version, d.url, d.sha256
+                        );
+                    }
+                    eprintln!("re-run with --accept-terms to agree and create the account");
+                    std::process::exit(2);
+                }
                 let result = core.account_create().await?;
                 println!("account created");
                 println!("id: {}", result.id);
                 println!("created_at: {}", result.created_at);
+                Ok(())
+            }
+            Some(AccountCommand::AcceptTerms { yes }) => {
+                let docs = core.current_terms().await?;
+                if docs.is_empty() {
+                    println!("the server requires no terms acceptance");
+                    return Ok(());
+                }
+                println!("the server requires acceptance of:");
+                for d in &docs {
+                    println!(
+                        "  {} v{} — {} (sha256 {})",
+                        d.document, d.version, d.url, d.sha256
+                    );
+                }
+                if !yes {
+                    use std::io::Write;
+                    print!("accept these documents? [y/N] ");
+                    std::io::stdout().flush().ok();
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer).ok();
+                    let answer = answer.trim().to_lowercase();
+                    if answer != "y" && answer != "yes" {
+                        eprintln!("not accepted");
+                        std::process::exit(2);
+                    }
+                }
+                let accepted = core.accept_current_terms().await?;
+                println!("accepted {} document(s)", accepted.len());
                 Ok(())
             }
             Some(AccountCommand::Reset) => {
@@ -394,13 +626,13 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             Some(AccountCommand::Balances) => {
                 let balances = core.account_balances().await?;
-                println!("available: {}", balances.available);
+                println!("available: {} credits", balances.available);
                 for pool in &balances.pools {
                     let expires = pool
                         .expires_at
-                        .map(|e| format!(", expires {e}"))
+                        .map(|e| format!(", {}", format_expiry(e)))
                         .unwrap_or_default();
-                    println!("  {} ({}{})", pool.amount, pool.source, expires);
+                    println!("  {} credits ({}{})", pool.amount, pool.source, expires);
                 }
                 Ok(())
             }
@@ -472,6 +704,21 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             // default).
             let model = model.unwrap_or_else(|| core.config_state().default_model);
 
+            // Engine-served models load on demand inside the request path
+            // (app-core evicts LRU idle engines to make room); this block
+            // only narrates the potentially-long first-load wait. Engines
+            // are owned by *this* process, so they die with the run.
+            let mref = eidola_app_core::parse_model_ref(&model);
+            let engine_backed = mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID
+                || core.list_backends().await?.iter().any(|b| {
+                    b.id == mref.backend_id
+                        && b.kind == eidola_app_core::BackendKind::LlamaCpp
+                        && b.auto_start
+                });
+            if engine_backed {
+                eprintln!("loading {model}… (a request loads the engine on demand)");
+            }
+
             // Stream chunks straight to stdout. Reasoning goes to stderr
             // (dim, prefixed with "thinking: ") so a piped stdout still
             // captures only the final answer text.
@@ -522,11 +769,12 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             let (result, ()) = tokio::join!(chat_fut, printer);
             let result = result?;
             eprintln!(
-                "---\nspace: {}  model: {}  tokens: {}/{}",
+                "---\nspace: {}  model: {}  tokens: {}/{}  credits: {}",
                 result.space_id,
                 result.model,
                 result.input_tokens.unwrap_or(0),
                 result.output_tokens.unwrap_or(0),
+                result.credits_charged,
             );
             Ok(())
         }
@@ -564,6 +812,288 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             SpacesCommand::Rename { id, title } => {
                 core.rename_space(id.clone(), title).await?;
                 println!("renamed space {id}");
+                Ok(())
+            }
+        },
+        Some(Command::Model { command }) => match command {
+            ModelCommand::List => {
+                let state = core.local_models_state().await?;
+                match &state.engine_path {
+                    Some(p) => println!("engine: {p}"),
+                    None => println!(
+                        "engine: not present in this build — set `llama_server_path` in config \
+                         to point at a `llama-server` binary"
+                    ),
+                }
+                println!();
+                if state.models.is_empty() {
+                    println!("no local models yet");
+                } else {
+                    for m in &state.models {
+                        let status = match &m.status {
+                            eidola_app_core::LocalModelStatus::Downloading { received, total } => {
+                                match total {
+                                    Some(t) if *t > 0 => {
+                                        format!("downloading {}%", received * 100 / t)
+                                    }
+                                    _ => "downloading".to_string(),
+                                }
+                            }
+                            eidola_app_core::LocalModelStatus::Available => "available".into(),
+                            eidola_app_core::LocalModelStatus::Loading => "loading".into(),
+                            eidola_app_core::LocalModelStatus::Loaded { port, pinned, .. } => {
+                                format!(
+                                    "loaded (127.0.0.1:{port}{})",
+                                    if *pinned { ", pinned" } else { "" }
+                                )
+                            }
+                        };
+                        println!(
+                            "{:<40} {:>9}  {}",
+                            m.id,
+                            m.size_bytes.map(fmt_size).unwrap_or_default(),
+                            status
+                        );
+                        if let Some(err) = &m.last_error {
+                            println!("    last error: {}", err.lines().next().unwrap_or(err));
+                        }
+                    }
+                }
+                println!("\ncatalog (download with `eidola model download <id>`):");
+                for entry in core.local_model_catalog() {
+                    let installed = state.models.iter().any(|m| m.file_name == entry.file_name);
+                    println!(
+                        "{:<18} {:>9}  {}{}",
+                        entry.id,
+                        fmt_size(entry.size_bytes),
+                        entry.description,
+                        if installed { "  [installed]" } else { "" }
+                    );
+                }
+                Ok(())
+            }
+            ModelCommand::Download { source } => {
+                // A catalog id resolves to its URL; anything else is a URL.
+                let url = core
+                    .local_model_catalog()
+                    .iter()
+                    .find(|c| c.id == source)
+                    .map(|c| c.url.to_string())
+                    .unwrap_or(source);
+                let id = core.download_local_model(url).await?;
+                println!("downloading {id}…");
+                // The transfer task dies with this process, so wait for it,
+                // rendering a progress line.
+                let slug = eidola_app_core::parse_model_ref(&id).model;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let state = core.local_models_state().await?;
+                    let Some(m) = state.models.iter().find(|m| m.slug == slug) else {
+                        return Err(AppError::LocalModel {
+                            message: "model disappeared during download".into(),
+                        });
+                    };
+                    match &m.status {
+                        eidola_app_core::LocalModelStatus::Downloading { received, total } => {
+                            match total {
+                                Some(t) if *t > 0 => print!(
+                                    "\r{} / {} ({}%)   ",
+                                    fmt_size(*received),
+                                    fmt_size(*t),
+                                    received * 100 / t
+                                ),
+                                _ => print!("\r{}   ", fmt_size(*received)),
+                            }
+                            let _ = std::io::stdout().flush();
+                        }
+                        _ => {
+                            println!();
+                            match &m.last_error {
+                                Some(err) => {
+                                    return Err(AppError::LocalModel {
+                                        message: format!("download failed: {err}"),
+                                    });
+                                }
+                                None => println!("downloaded {id}"),
+                            }
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ModelCommand::Delete { id } => {
+                core.delete_local_model(id.clone()).await?;
+                println!("deleted {id}");
+                Ok(())
+            }
+            ModelCommand::Load { id } => {
+                println!("loading {id} (this can take a while for large models)…");
+                core.load_local_model(id.clone()).await?;
+                let state = core.local_models_state().await?;
+                let mref = eidola_app_core::parse_model_ref(&id);
+                let in_backend: Vec<&eidola_app_core::LocalModelInfo> = if mref.backend_id
+                    == eidola_app_core::EIDOLA_BACKEND_ID
+                    || mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID
+                {
+                    state.models.iter().collect()
+                } else {
+                    state
+                        .external
+                        .iter()
+                        .find(|b| b.backend_id == mref.backend_id)
+                        .map(|b| b.models.iter().collect())
+                        .unwrap_or_default()
+                };
+                if let Some(m) = in_backend.iter().find(|m| {
+                    matches!(m.status, eidola_app_core::LocalModelStatus::Loaded { .. })
+                        && m.slug == mref.model
+                }) {
+                    if let eidola_app_core::LocalModelStatus::Loaded { port, .. } = m.status {
+                        println!("loaded — serving on 127.0.0.1:{port}");
+                    }
+                    println!("chat with it: `eidola chat \"hi\" --model {}`", m.id);
+                }
+                // The engine is a child of *this* process, so exiting would
+                // kill it. Keep serving until Ctrl-C (the GUI, by contrast,
+                // holds engines for its whole app lifetime).
+                println!("serving — press Ctrl-C to stop");
+                let _ = tokio::signal::ctrl_c().await;
+                core.unload_local_model(id.clone()).await.ok();
+                println!("\nunloaded {id}");
+                Ok(())
+            }
+            ModelCommand::Unload { id } => {
+                core.unload_local_model(id.clone()).await?;
+                println!("unloaded {id}");
+                Ok(())
+            }
+            ModelCommand::Pin { id } => {
+                core.set_local_model_pinned(id.clone(), true).await?;
+                println!("pinned {id} — protected from automatic unloading");
+                Ok(())
+            }
+            ModelCommand::Unpin { id } => {
+                core.set_local_model_pinned(id.clone(), false).await?;
+                println!("unpinned {id}");
+                Ok(())
+            }
+        },
+        Some(Command::Backend { command }) => match command {
+            BackendCommand::List => {
+                let backends = core.list_backends().await?;
+                for b in &backends {
+                    let state = if b.enabled { "enabled" } else { "disabled" };
+                    println!(
+                        "{:<16} {:<9} {:<9} {}",
+                        b.id,
+                        b.kind.as_str(),
+                        state,
+                        b.display_name
+                    );
+                    if let Some(url) = &b.base_url {
+                        println!(
+                            "    url: {url}{}",
+                            if b.has_api_key { "  (api key set)" } else { "" }
+                        );
+                    }
+                    if let Some(dir) = &b.models_dir {
+                        println!("    models dir: {dir}");
+                    }
+                    if b.kind == eidola_app_core::BackendKind::LlamaCpp {
+                        println!(
+                            "    auto-start: {}",
+                            if b.auto_start { "on" } else { "off" }
+                        );
+                        match &b.engine_path {
+                            Some(p) => println!("    engine: {p}"),
+                            None => println!("    engine: discovered ($PATH / install prefixes)"),
+                        }
+                    }
+                    if let Some(pinned) = &b.model_overrides {
+                        println!("    pinned models: {}", pinned.join(", "));
+                    }
+                }
+                Ok(())
+            }
+            BackendCommand::Add { kind } => {
+                let new = match kind {
+                    BackendAddCommand::Openai {
+                        id,
+                        url,
+                        api_key,
+                        name,
+                        models,
+                    } => eidola_app_core::NewBackend {
+                        id,
+                        kind: eidola_app_core::BackendKind::OpenAi,
+                        display_name: name.unwrap_or_default(),
+                        base_url: Some(url),
+                        api_key,
+                        models_dir: None,
+                        model_overrides: models,
+                        engine_path: None,
+                        auto_start: true,
+                    },
+                    BackendAddCommand::Llamacpp {
+                        id,
+                        models_dir,
+                        engine_path,
+                        no_auto_start,
+                        name,
+                    } => eidola_app_core::NewBackend {
+                        id,
+                        kind: eidola_app_core::BackendKind::LlamaCpp,
+                        display_name: name.unwrap_or_default(),
+                        base_url: None,
+                        api_key: None,
+                        models_dir: Some(models_dir),
+                        model_overrides: None,
+                        engine_path,
+                        auto_start: !no_auto_start,
+                    },
+                };
+                let added = core.add_backend(new).await?;
+                println!("added backend `{}` ({})", added.id, added.kind.as_str());
+                println!(
+                    "address its models as `<model>@{}` (see `eidola backend models {}`)",
+                    added.id, added.id
+                );
+                Ok(())
+            }
+            BackendCommand::Enable { id } => {
+                core.set_backend_enabled(id.clone(), true).await?;
+                println!("enabled backend `{id}`");
+                Ok(())
+            }
+            BackendCommand::Disable { id } => {
+                core.set_backend_enabled(id.clone(), false).await?;
+                println!("disabled backend `{id}`");
+                if id == "eidola" {
+                    println!(
+                        "asks now route only to local / configured backends (no account needed)"
+                    );
+                }
+                Ok(())
+            }
+            BackendCommand::Remove { id } => {
+                core.remove_backend(id.clone()).await?;
+                println!("removed backend `{id}`");
+                Ok(())
+            }
+            BackendCommand::Models { id } => {
+                let models = core.backend_models(id.clone()).await?;
+                if models.is_empty() {
+                    println!("no models offered (for engine-backed backends, load one first)");
+                    return Ok(());
+                }
+                for m in &models {
+                    if m.context_length > 0 {
+                        println!("{:<48} {}-token context", m.id, m.context_length);
+                    } else {
+                        println!("{}", m.id);
+                    }
+                }
                 Ok(())
             }
         },
@@ -630,6 +1160,35 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             Ok(())
         }
+    }
+}
+
+/// Human-readable relative expiry for balance pools (`expires_at` is epoch
+/// milliseconds). Mirrors the GUI's humanized expiry rather than printing a
+/// raw timestamp.
+fn format_expiry(expires_at_ms: i64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let days = (expires_at_ms - now_ms) / 86_400_000;
+    if expires_at_ms <= now_ms {
+        "expired".to_string()
+    } else if days == 0 {
+        "expires today".to_string()
+    } else if days == 1 {
+        "expires tomorrow".to_string()
+    } else {
+        format!("expires in {days}d")
+    }
+}
+
+/// Human-readable byte size (GB/MB) for model listings.
+fn fmt_size(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.2} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{:.0} MB", bytes as f64 / 1e6)
     }
 }
 

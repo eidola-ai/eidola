@@ -39,7 +39,9 @@ fn test_core() -> (Arc<AppCore>, tempfile::TempDir) {
     let config_dir = dir.path().to_path_buf();
     let data_dir = dir.path().join("data");
     let core = AppCore::new(config_dir, data_dir);
-    core.set_base_url("https://127.0.0.1:1/v1".into()).unwrap();
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
+        .unwrap();
     (Arc::new(core), dir)
 }
 
@@ -158,6 +160,87 @@ fn bus_bridge_routes_record_change_to_record_store(cx: &mut TestAppContext) {
         2,
         "a Lagged signal must also reach the RecordStore"
     );
+}
+
+/// `Change::Backends` routes to the registry snapshot *and* the model
+/// catalogs (the set of destinations changed, so the catalog set is stale).
+/// As everywhere in this file, only the synchronous `Loading` transition is
+/// asserted — the tasks' results need no network.
+#[gpui::test]
+fn bus_bridge_routes_backends_change(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+
+    stores.backends.read_with(cx, |b, _| {
+        assert!(
+            matches!(b.state(), eidola_gui::loadable::Loadable::NotLoaded),
+            "backends start NotLoaded"
+        );
+    });
+
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Backends), cx));
+
+    stores.backends.read_with(cx, |b, _| {
+        assert!(
+            b.state().is_loading(),
+            "a Change::Backends must start the registry refresh"
+        );
+    });
+    stores.models.read_with(cx, |m, _| {
+        assert!(
+            m.models().is_loading(),
+            "a Change::Backends must re-fetch the model catalogs"
+        );
+    });
+}
+
+/// A failed backend operation must reconcile its optimistic edit. `remove`
+/// drops the row from the cached list immediately; when the core write
+/// fails (the eidola singleton is built in and can't be removed) no
+/// `Change::Backends` is emitted, so the failure arm itself re-fetches the
+/// registry — otherwise the UI would keep showing durably-false state
+/// (codex finding, PR #216). Unlike the transition-only tests above, this
+/// one drives the (purely local-DB) tasks to completion by polling.
+#[gpui::test]
+fn backends_op_failure_refreshes_registry(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+
+    // Load the real registry (a local DB read — no network involved).
+    stores.backends.update(cx, |b, cx| b.refresh(cx));
+    wait_for_backends(cx, &stores, "registry loads", |b| b.get("eidola").is_some());
+
+    // The optimistic removal drops the row synchronously…
+    stores
+        .backends
+        .update(cx, |b, cx| b.remove("eidola".into(), cx));
+    stores.backends.read_with(cx, |b, _| {
+        assert!(b.get("eidola").is_none(), "optimistic removal applies");
+    });
+
+    // …the core refuses, and the failure arm's refresh restores the row.
+    wait_for_backends(cx, &stores, "failure refresh reconciles", |b| {
+        b.get("eidola").is_some()
+    });
+    stores.backends.read_with(cx, |b, _| {
+        assert!(b.op_error().is_some(), "the failure surfaces in op_error");
+    });
+}
+
+/// Poll the backends store until `pred` holds (the tokio side is a local DB
+/// op, so this settles in milliseconds; ~10s ceiling).
+fn wait_for_backends(
+    cx: &mut TestAppContext,
+    stores: &Stores,
+    what: &str,
+    pred: impl Fn(&eidola_gui::stores::BackendsStore) -> bool,
+) {
+    for _ in 0..400 {
+        cx.run_until_parked();
+        if stores.backends.read_with(cx, |b, _| pred(b)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("timed out waiting until {what}");
 }
 
 /// The space-entity registry's join-existing semantics: two `open` calls for
@@ -307,20 +390,22 @@ fn config_store_circadian_settings_write_through(cx: &mut TestAppContext) {
 
     stores.config.read_with(cx, |c, _| {
         let s = c.state().expect("backed store seeds a snapshot");
-        assert_eq!(s.appearance, AppearanceSetting::System, "default");
+        // `auto` (follow the sun) is the shipped default since the
+        // local-inference wave flipped it from `system`.
+        assert_eq!(s.appearance, AppearanceSetting::Auto, "default");
         assert_eq!(s.time_of_day_tint, TimeOfDayTint::On, "default");
         assert_eq!(s.light_character, LightCharacter::Neutral, "default");
     });
 
     stores.config.update(cx, |c, cx| {
-        c.set_appearance(AppearanceSetting::Auto, cx);
+        c.set_appearance(AppearanceSetting::Day, cx);
         c.set_time_of_day_tint(TimeOfDayTint::Off, cx);
         c.set_light_character(LightCharacter::Warm, cx);
     });
 
     stores.config.read_with(cx, |c, _| {
         let s = c.state().expect("snapshot re-read after write");
-        assert_eq!(s.appearance, AppearanceSetting::Auto);
+        assert_eq!(s.appearance, AppearanceSetting::Day);
         assert_eq!(s.time_of_day_tint, TimeOfDayTint::Off);
         assert_eq!(s.light_character, LightCharacter::Warm);
     });

@@ -116,6 +116,13 @@ pub struct CheckoutParams<'a> {
     pub success_url: &'a str,
     pub cancel_url: &'a str,
     pub client_reference_id: Option<&'a str>,
+    /// Disclosure text rendered next to Checkout's pay button
+    /// (`custom_text[submit][message]`) — e.g. the credit-expiry terms.
+    pub submit_note: Option<&'a str>,
+    /// Customer-visible description stamped on the PaymentIntent (payment
+    /// mode) or Subscription (subscription mode). Stripe renders it on
+    /// email receipts and invoices — the receipt-side expiry disclosure.
+    pub description: Option<&'a str>,
 }
 
 pub struct StripeClient {
@@ -290,6 +297,19 @@ impl StripeClient {
 
         if let Some(ref_id) = params.client_reference_id {
             form.push(("client_reference_id", ref_id));
+        }
+
+        if let Some(note) = params.submit_note {
+            form.push(("custom_text[submit][message]", note));
+        }
+
+        if let Some(desc) = params.description {
+            let key = if params.mode == "subscription" {
+                "subscription_data[description]"
+            } else {
+                "payment_intent_data[description]"
+            };
+            form.push((key, desc));
         }
 
         let response = self

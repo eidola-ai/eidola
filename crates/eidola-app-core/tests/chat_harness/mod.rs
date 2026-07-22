@@ -133,6 +133,13 @@ pub struct MockServer {
     /// order — lets tests assert exactly what context the client sent
     /// upstream (e.g. regenerate's upstream-only thread).
     chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    /// Whether each `POST /v1/chat/completions` carried an `Authorization`
+    /// header, in arrival order — local turns must send none (no spend).
+    chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
+    /// The raw `Authorization` header of each `POST /v1/chat/completions`,
+    /// in arrival order — lets tests distinguish a spend's `PrivateToken`
+    /// from an external backend's `Bearer` key.
+    chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     /// Number of `POST /v1/credentials/refund` requests received.
     refund_hits: Arc<AtomicU64>,
     _task: tokio::task::JoinHandle<()>,
@@ -148,6 +155,23 @@ impl MockServer {
     /// The recorded chat request bodies (see `chat_bodies`).
     pub fn chat_bodies(&self) -> Vec<serde_json::Value> {
         self.chat_bodies.lock().unwrap().clone()
+    }
+    /// Per-chat-request `Authorization` presence (see `chat_auths`).
+    pub fn chat_auths(&self) -> Vec<bool> {
+        self.chat_auths.lock().unwrap().clone()
+    }
+    /// Per-chat-request raw `Authorization` values (see `chat_auth_values`).
+    pub fn chat_auth_values(&self) -> Vec<Option<String>> {
+        self.chat_auth_values.lock().unwrap().clone()
+    }
+    /// The loopback port the mock listens on — used by local-model tests to
+    /// register a fake "loaded engine" at the mock's address.
+    pub fn port(&self) -> u16 {
+        self.base_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("mock base_url always carries a port")
     }
 }
 
@@ -245,12 +269,17 @@ pub async fn start(config: MockConfig) -> MockServer {
     let chat_hits = Arc::new(AtomicU64::new(0));
     let chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chat_auths: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let refund_hits = Arc::new(AtomicU64::new(0));
 
     let task = {
         let issuer = issuer.clone();
         let chat_hits = chat_hits.clone();
         let chat_bodies = chat_bodies.clone();
+        let chat_auths = chat_auths.clone();
+        let chat_auth_values = chat_auth_values.clone();
         let refund_hits = refund_hits.clone();
         tokio::spawn(async move {
             loop {
@@ -261,11 +290,21 @@ pub async fn start(config: MockConfig) -> MockServer {
                 let config = config.clone();
                 let chat_hits = chat_hits.clone();
                 let chat_bodies = chat_bodies.clone();
+                let chat_auths = chat_auths.clone();
+                let chat_auth_values = chat_auth_values.clone();
                 let refund_hits = refund_hits.clone();
                 tokio::spawn(async move {
-                    let _ =
-                        handle_conn(stream, issuer, config, chat_hits, chat_bodies, refund_hits)
-                            .await;
+                    let _ = handle_conn(
+                        stream,
+                        issuer,
+                        config,
+                        chat_hits,
+                        chat_bodies,
+                        chat_auths,
+                        chat_auth_values,
+                        refund_hits,
+                    )
+                    .await;
                 });
             }
         })
@@ -275,6 +314,8 @@ pub async fn start(config: MockConfig) -> MockServer {
         base_url,
         chat_hits,
         chat_bodies,
+        chat_auths,
+        chat_auth_values,
         refund_hits,
         _task: task,
     }
@@ -344,12 +385,15 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn(
     mut stream: TcpStream,
     issuer: Arc<Issuer>,
     config: MockConfig,
     chat_hits: Arc<AtomicU64>,
     chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
+    chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     refund_hits: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
     // Each connection serves at most one request (reqwest opens a fresh
@@ -405,6 +449,8 @@ async fn handle_conn(
             if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) {
                 chat_bodies.lock().unwrap().push(body);
             }
+            chat_auths.lock().unwrap().push(req.auth.is_some());
+            chat_auth_values.lock().unwrap().push(req.auth.clone());
             handle_chat(&mut stream, &issuer, &config, req.auth.as_deref()).await?;
         }
         _ => {
@@ -639,7 +685,8 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
         .expect("plain http client");
     let core = AppCore::with_test_http_client(config_dir, data_dir, client);
     let mock = core.runtime().block_on(async { start(config).await });
-    core.set_base_url(mock.base_url.clone())
+    core.runtime()
+        .block_on(core.set_base_url(mock.base_url.clone()))
         .expect("set base url");
     (mock, core, dir)
 }

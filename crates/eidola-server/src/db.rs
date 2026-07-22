@@ -304,12 +304,16 @@ pub async fn get_account_by_stripe_customer(
 
 /// Insert a credit ledger entry. Returns true if inserted, false if duplicate
 /// (based on `stripe_event_id` uniqueness).
+///
+/// `stripe_payment_intent` links payment-originated credits to their Stripe
+/// PaymentIntent so a later refund can be matched back to the same pool.
 pub async fn insert_credit_ledger(
     pool: &Pool,
     account_id: Uuid,
     delta: i64,
     reason: &str,
     stripe_event_id: &str,
+    stripe_payment_intent: Option<&str>,
     expires_at: Option<SystemTime>,
 ) -> Result<bool, ServerError> {
     let client = pool
@@ -319,15 +323,176 @@ pub async fn insert_credit_ledger(
 
     let result = client
         .execute(
-            "INSERT INTO credit_ledger (account_id, delta, reason, stripe_event_id, expires_at) \
-             VALUES ($1, $2, $3, $4, $5) \
+            "INSERT INTO credit_ledger \
+                 (account_id, delta, reason, stripe_event_id, stripe_payment_intent, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (stripe_event_id) DO NOTHING",
-            &[&account_id, &delta, &reason, &stripe_event_id, &expires_at],
+            &[
+                &account_id,
+                &delta,
+                &reason,
+                &stripe_event_id,
+                &stripe_payment_intent,
+                &expires_at,
+            ],
         )
         .await
         .map_err(|e| ServerError::Internal(format!("insert credit_ledger failed: {e:?}")))?;
 
     Ok(result == 1)
+}
+
+// --- Account acceptance / required document queries ---
+
+/// The currently required version of one legal document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequiredDocumentRow {
+    pub document: String,
+    pub version: i64,
+    pub sha256: String,
+    pub url: String,
+}
+
+/// Outcome of recording an observed document version.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecordRequiredOutcome {
+    /// A new (document, version) row was recorded; the requirement history
+    /// grew (and, if this is the highest version, the gate advanced).
+    Recorded,
+    /// This exact (document, version, sha256) was already on record — a
+    /// no-op that preserves the original `first_required_at`.
+    AlreadyRecorded,
+    /// A row for this (document, version) exists **with a different
+    /// hash** — the published bytes changed without a version increment,
+    /// violating the versioning contract CI enforces. Nothing is written;
+    /// the stored hash remains authoritative.
+    HashConflict { stored_sha256: String },
+}
+
+/// Record that a document version was observed as published. Append-only:
+/// one row per (document, version), first observation wins, rows are never
+/// updated — so the table is a complete history of what was required and
+/// since when, and the current requirement (the highest version per
+/// document) can never regress no matter how stale an observation is.
+pub async fn record_required_document(
+    pool: &Pool,
+    doc: &RequiredDocumentRow,
+) -> Result<RecordRequiredOutcome, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let rows = client
+        .execute(
+            "INSERT INTO required_document (document, version, sha256, url) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (document, version) DO NOTHING",
+            &[&doc.document, &doc.version, &doc.sha256, &doc.url],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("record required_document failed: {e:?}")))?;
+
+    if rows == 1 {
+        return Ok(RecordRequiredOutcome::Recorded);
+    }
+
+    let row = client
+        .query_one(
+            "SELECT sha256 FROM required_document WHERE document = $1 AND version = $2",
+            &[&doc.document, &doc.version],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("query required_document failed: {e:?}")))?;
+    let stored_sha256: String = row.get("sha256");
+
+    if stored_sha256 == doc.sha256 {
+        Ok(RecordRequiredOutcome::AlreadyRecorded)
+    } else {
+        Ok(RecordRequiredOutcome::HashConflict { stored_sha256 })
+    }
+}
+
+/// The currently required version of every gated document — the highest
+/// recorded version per document. Empty when the acceptance gate is
+/// disabled (nothing seeded or polled yet).
+pub async fn get_required_documents(pool: &Pool) -> Result<Vec<RequiredDocumentRow>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let rows = client
+        .query(
+            "SELECT DISTINCT ON (document) document, version, sha256, url \
+             FROM required_document ORDER BY document, version DESC",
+            &[],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("query required_document failed: {e:?}")))?;
+
+    Ok(rows
+        .iter()
+        .map(|r| RequiredDocumentRow {
+            document: r.get("document"),
+            version: r.get("version"),
+            sha256: r.get("sha256"),
+            url: r.get("url"),
+        })
+        .collect())
+}
+
+/// Record acceptance of a document version. Append-only and idempotent —
+/// re-accepting an already-accepted version is a no-op that preserves the
+/// original timestamp.
+pub async fn insert_acceptance(
+    pool: &Pool,
+    account_id: Uuid,
+    document: &str,
+    version: i64,
+    sha256: &str,
+) -> Result<(), ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    client
+        .execute(
+            "INSERT INTO account_acceptance (account_id, document, version, sha256) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT DO NOTHING",
+            &[&account_id, &document, &version, &sha256],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("insert acceptance failed: {e:?}")))?;
+
+    Ok(())
+}
+
+/// The highest version of each document the account has ever accepted.
+pub async fn get_accepted_versions(
+    pool: &Pool,
+    account_id: Uuid,
+) -> Result<Vec<(String, i64)>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let rows = client
+        .query(
+            "SELECT document, MAX(version) AS version \
+             FROM account_acceptance WHERE account_id = $1 GROUP BY document",
+            &[&account_id],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("query acceptances failed: {e:?}")))?;
+
+    Ok(rows
+        .iter()
+        .map(|r| (r.get("document"), r.get("version")))
+        .collect())
 }
 
 // --- Issuer Key queries ---
@@ -510,6 +675,64 @@ pub async fn debit_stripe_event(
         Some(v) if v.is_empty() => Ok(false), // duplicate event
         Some(_) => Ok(true),
     }
+}
+
+/// Insert a refund debit matched to the original payment's balance pool.
+///
+/// Looks up the credit entry recorded for `payment_intent` and, if found,
+/// inserts the refund debit with that entry's `expires_at` — even when the
+/// pool has already expired — so the refund nets against exactly the credits
+/// it reverses instead of draining unrelated pools or creating a permanent
+/// negative entry. Returns `Ok(None)` when no credit entry carries this
+/// payment intent (caller should fall back to `debit_stripe_event`),
+/// `Ok(Some(false))` on a duplicate `stripe_event_id`, and `Ok(Some(true))`
+/// on success.
+pub async fn refund_matched_to_payment_intent(
+    pool: &Pool,
+    account_id: Uuid,
+    amount: i64,
+    stripe_event_id: &str,
+    payment_intent: &str,
+) -> Result<Option<bool>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let original = client
+        .query_opt(
+            "SELECT expires_at FROM credit_ledger \
+             WHERE account_id = $1 AND stripe_payment_intent = $2 AND delta > 0 \
+             ORDER BY created_at ASC LIMIT 1",
+            &[&account_id, &payment_intent],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("refund pool lookup failed: {e:?}")))?;
+
+    let Some(row) = original else {
+        return Ok(None);
+    };
+    let expires_at: Option<SystemTime> = row.get("expires_at");
+    let delta = -amount;
+
+    let result = client
+        .execute(
+            "INSERT INTO credit_ledger \
+                 (account_id, delta, reason, stripe_event_id, stripe_payment_intent, expires_at) \
+             VALUES ($1, $2, 'refund', $3, $4, $5) \
+             ON CONFLICT (stripe_event_id) DO NOTHING",
+            &[
+                &account_id,
+                &delta,
+                &stripe_event_id,
+                &payment_intent,
+                &expires_at,
+            ],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("matched refund insert failed: {e:?}")))?;
+
+    Ok(Some(result == 1))
 }
 
 /// Get the current available balance for an account.

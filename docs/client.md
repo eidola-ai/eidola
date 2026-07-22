@@ -66,6 +66,6 @@ Both surfaces run the same verifier code, against the same embedded trust root, 
 
 ## Configuration overrides
 
-A user can override the embedded `base_url` and trusted measurements via `config.toml` in the platform config directory (`~/Library/Application Support/eidola/` on macOS, `~/.config/eidola/` on Linux). This exists for development and for advanced users running their own server. The overrides do *not* lower verification rigor — the client still verifies the attestation against whatever measurement is configured.
+A user can override the embedded `base_url` and trusted measurements (plus the hardware ARK/ASK CAs) on the `eidola` backend row in the local database — via `eidola configure` on the CLI or Settings → Backends → Eidola in the GUI. This exists for development and for advanced users running their own server. The overrides do *not* lower verification rigor — the client still verifies the attestation against whatever measurement is configured.
 
 In production use against Eidola's deployment, no overrides are needed; the embedded values are what's used.

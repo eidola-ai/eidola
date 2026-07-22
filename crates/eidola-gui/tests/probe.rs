@@ -14,7 +14,6 @@ use eidola_app_core::{
     AttestationInfo, BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
     PriceInfo, RequestInfo, SpendTrailEntry,
 };
-use eidola_gui::account::AccountView;
 use eidola_gui::actions::ToggleModelPicker;
 use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
@@ -118,25 +117,42 @@ fn stub_stores(cx: &mut TestAppContext, setup: impl FnOnce(&mut StoresStub)) -> 
     })
 }
 
+fn probe_config_state() -> ConfigState {
+    ConfigState {
+        default_model: "gemma4-31b".into(),
+        has_account: true,
+        has_account_secret: true,
+        domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
+        attestation_url: None,
+        appearance: eidola_app_core::config::AppearanceSetting::System,
+        time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
+        light_character: eidola_app_core::config::LightCharacter::Neutral,
+    }
+}
+
+fn probe_eidola_trust() -> eidola_app_core::EidolaTrust {
+    eidola_app_core::EidolaTrust {
+        base_url: "https://eidola.example/v1".into(),
+        base_url_pin: "https://eidola.example/v1".into(),
+        base_url_is_override: false,
+        trusted_measurements: Vec::new(),
+        trusted_measurements_are_override: false,
+        pinned_measurement: eidola_app_core::MeasurementInfo {
+            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
+            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+        },
+        has_hardware_root_ca: false,
+        hardware_root_ca_pem: None,
+        has_hardware_intermediate_ca: false,
+        hardware_intermediate_ca_pem: None,
+    }
+}
+
 fn ready_stores(cx: &mut TestAppContext) -> Stores {
     stub_stores(cx, |s| {
-        s.config_state = Some(ConfigState {
-            base_url: "https://eidola.example/v1".into(),
-            default_model: "gemma4-31b".into(),
-            base_url_pin: "https://eidola.example/v1".into(),
-            base_url_is_override: false,
-            has_account: true,
-            has_account_secret: true,
-            domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
-            trusted_measurements: Vec::new(),
-            trusted_measurements_are_override: false,
-            has_hardware_root_ca: false,
-            has_hardware_intermediate_ca: false,
-            attestation_url: None,
-            appearance: eidola_app_core::config::AppearanceSetting::System,
-            time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
-            light_character: eidola_app_core::config::LightCharacter::Neutral,
-        });
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
         s.balances = Some(BalancesResult {
             available: 4_200_000,
             pools: Vec::new(),
@@ -275,7 +291,7 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
     assert!(
         names
             .iter()
-            .any(|n| n.starts_with("space/request-panel/row/")),
+            .any(|n| n.starts_with("space/request-panel/remote/eidola/")),
         "request panel model rows missing; recorded: {names:?}"
     );
     // The minimap is a navigable table of contents: a labelled Group of
@@ -373,6 +389,17 @@ fn onboarding_probes_record_ctas_and_inputs(cx: &mut TestAppContext) {
             "existing-account probe {expected:?} missing; recorded: {names:?}"
         );
     }
+    // Every revealed slide past the first carries a "back" affordance (the
+    // visible up-arrow alternative to the scroll-back gesture); the first slide
+    // (index 0) does not.
+    assert!(
+        names.iter().any(|n| n.starts_with("onboarding/back/")),
+        "back-arrow probe missing on a non-first slide; recorded: {names:?}"
+    );
+    assert!(
+        !names.contains(&"onboarding/back/0"),
+        "the first slide must not carry a back arrow; recorded: {names:?}"
+    );
 
     // Re-choose the new-account branch: the create slide carries the required
     // agreement checkbox and the (checkbox-gated) create CTA.
@@ -533,9 +560,13 @@ fn record_probes_cover_rows_tabs_and_chrome(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
     let _guard = probes_on();
 
-    let stores = ready_stores(cx);
+    // Account is a top-level Settings pane again (shown while the eidola
+    // backend is enabled). Its `settings/account/*` probes stay stable.
+    let stores = account_backends_stores(cx);
     let (window, _view) = open_view(cx, |window, cx| {
         cx.new(|cx| AccountView::new(stores, window, cx))
     });
@@ -557,6 +588,38 @@ fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// Stores with a linked account (balance + plans) *and* an eidola-enabled
+/// registry.
+fn account_backends_stores(cx: &mut TestAppContext) -> Stores {
+    stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.balances = Some(BalancesResult {
+            available: 4_200_000,
+            pools: Vec::new(),
+        });
+        s.prices = vec![
+            PriceInfo {
+                id: "price_month".into(),
+                product_name: "Monthly".into(),
+                product_description: Some("Recurring top-up".into()),
+                amount_display: "$10".into(),
+                recurrence: "/mo".into(),
+                credits: 10_000_000,
+            },
+            PriceInfo {
+                id: "price_once".into(),
+                product_name: "One-time".into(),
+                product_description: None,
+                amount_display: "$5".into(),
+                recurrence: "".into(),
+                credits: 5_000_000,
+            },
+        ];
+        s.backends = backends_fixture();
+    })
+}
+
 #[gpui::test]
 fn wallet_pane_probes_cover_refresh(cx: &mut TestAppContext) {
     let _guard = probes_on();
@@ -576,37 +639,38 @@ fn wallet_pane_probes_cover_refresh(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn general_pane_probes_cover_change_and_advanced(cx: &mut TestAppContext) {
+fn general_pane_probes_cover_appearance_only(cx: &mut TestAppContext) {
     let _guard = probes_on();
 
     let stores = ready_stores(cx);
-    let window_input = cx.update(WindowInput::new);
-    let wi = window_input.clone();
     let (window, _view) = open_view(cx, move |window, cx| {
-        cx.new(|cx| GeneralView::new(stores.config.clone(), wi, window, cx))
+        cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx))
     });
 
-    // At rest: the "Change…" affordance and the appearance chips are probed.
+    // The pane is the appearance chips and nothing else — every trust /
+    // connection affordance lives in Backends → Eidola now.
     let names = fresh_names(cx, window);
     for expected in [
-        "settings/general/change",
         "settings/general/appearance/system",
+        "settings/general/time-of-day/on",
     ] {
         assert!(
             names.contains(&expected.to_string()),
             "general probe {expected:?} missing; recorded: {names:?}"
         );
     }
-
-    // Holding ⌥ reveals the advanced rows, including the Record cross-link.
-    cx.update(|cx| {
-        window_input.update(cx, |wi, cx| wi.set_alt_for_test(true, cx));
-    });
-    let names = fresh_names(cx, window);
-    assert!(
-        names.contains(&"settings/general/open-record".to_string()),
-        "advanced open-record link probe missing under ⌥; recorded: {names:?}"
-    );
+    for absent in [
+        // The base-URL editor and the trust summaries moved to Backends →
+        // Eidola; the Advanced disclosure is gone entirely.
+        "settings/general/change",
+        "settings/general/advanced/toggle",
+        "settings/general/open-record",
+    ] {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "General must carry no trust/connection affordance: {absent:?} in {names:?}"
+        );
+    }
 
     probe::set_probes_enabled(false);
 }
@@ -643,8 +707,8 @@ fn request_panel_probes_appear_on_open_and_clear_on_dismiss(cx: &mut TestAppCont
         "panel probe missing after open: {names:?}"
     );
     assert!(
-        names.contains(&"space/request-panel/row/0".to_string())
-            && names.contains(&"space/request-panel/row/2".to_string()),
+        names.contains(&"space/request-panel/remote/eidola/0".to_string())
+            && names.contains(&"space/request-panel/remote/eidola/2".to_string()),
         "per-model row probes missing: {names:?}"
     );
 
@@ -841,4 +905,710 @@ fn chrome_menu_opens_on_wordmark_click(cx: &mut TestAppContext) {
         names.contains(&"chrome/menu/panel".to_string()),
         "clicking the wordmark must open the primary menu: {names:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Local models — the Settings Models pane and the request panel's
+// on-this-device group.
+// ---------------------------------------------------------------------------
+
+fn local_models_fixture() -> eidola_app_core::LocalModelsState {
+    use eidola_app_core::{
+        ExternalEngineBackend, LocalModelInfo, LocalModelStatus, LocalModelsState,
+    };
+    LocalModelsState {
+        engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+        external: vec![ExternalEngineBackend {
+            backend_id: "my-box".into(),
+            display_name: "My box".into(),
+            enabled: true,
+            models_dir: "/Users/me/models".into(),
+            engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+            auto_start: true,
+            models: vec![LocalModelInfo {
+                id: "qwen3-8b@my-box".into(),
+                slug: "qwen3-8b".into(),
+                display_name: "Qwen3 8B".into(),
+                file_name: "qwen3-8b.gguf".into(),
+                size_bytes: Some(5_200_000_000),
+                source_url: None,
+                status: LocalModelStatus::Available,
+                last_error: None,
+            }],
+        }],
+        models: vec![
+            LocalModelInfo {
+                id: "tiny-a@local".into(),
+                slug: "tiny-a".into(),
+                display_name: "Tiny A".into(),
+                file_name: "tiny-a.gguf".into(),
+                size_bytes: Some(3_000_000_000),
+                source_url: None,
+                status: LocalModelStatus::Available,
+                last_error: None,
+            },
+            LocalModelInfo {
+                id: "tiny-b@local".into(),
+                slug: "tiny-b".into(),
+                display_name: "Tiny B".into(),
+                file_name: "tiny-b.gguf".into(),
+                size_bytes: Some(5_000_000_000),
+                source_url: None,
+                status: LocalModelStatus::Loaded {
+                    port: 4242,
+                    context_tokens: 8192,
+                    pinned: false,
+                },
+                last_error: None,
+            },
+        ],
+    }
+}
+
+/// A registry fixture: the two singletons plus one llamacpp external.
+fn backends_fixture() -> Vec<eidola_app_core::BackendInfo> {
+    use eidola_app_core::{BackendInfo, BackendKind};
+    vec![
+        BackendInfo {
+            id: "eidola".into(),
+            kind: BackendKind::Eidola,
+            display_name: "Eidola".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        },
+        BackendInfo {
+            id: "local".into(),
+            kind: BackendKind::Local,
+            display_name: "Local".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        },
+        BackendInfo {
+            id: "my-box".into(),
+            kind: BackendKind::LlamaCpp,
+            display_name: "My box".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: Some("/Users/me/models".into()),
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 1,
+        },
+    ]
+}
+
+#[gpui::test]
+fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::{BackendsSettingsView, BackendsTab};
+
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.backends = backends_fixture();
+        s.local_models = Some(local_models_fixture());
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    });
+
+    // The tab strip is present regardless of the selected tab. The Eidola tab
+    // (default) carries the eidola singleton's enable/disable toggle plus the
+    // connection + trust surface (the base-URL editor moved here from General).
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/tab/eidola",
+        "settings/backends/tab/local",
+        "settings/backends/tab/external",
+        "settings/backends/eidola/toggle",
+        "settings/backends/eidola/url/change",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "eidola-tab probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+    // No overrides in this fixture: the danger warning band must be absent.
+    assert!(
+        !names.contains(&"settings/backends/eidola/trust-warning".to_string()),
+        "no override → no warning band: {names:?}"
+    );
+
+    // The Local tab: the singleton toggle, installed-model verbs, catalog,
+    // and the paste-a-URL row.
+    view.update(cx, |v, cx| v.select_tab(BackendsTab::Local, cx));
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/local/toggle",
+        // The Available model affords load + delete; the Loaded one,
+        // pin + unload.
+        "settings/backends/local/installed/0/load",
+        "settings/backends/local/installed/0/delete",
+        "settings/backends/local/installed/1/pin",
+        "settings/backends/local/installed/1/unload",
+        // No fixture file matches a catalog entry, so every catalog row
+        // affords download.
+        "settings/backends/local/catalog/0/download",
+        // The paste-a-URL affordances.
+        "settings/backends/local/url",
+        "settings/backends/local/url/download",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "local-tab probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    // The External tab: the llamacpp backend's toggle/remove/autostart, its
+    // scanned model's load verb, and the add-a-backend affordances.
+    view.update(cx, |v, cx| v.select_tab(BackendsTab::External, cx));
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/my-box/toggle",
+        "settings/backends/my-box/remove",
+        "settings/backends/my-box/autostart",
+        // The llamacpp backend's scanned model affords load (never delete —
+        // the file is the user's).
+        "settings/backends/my-box/model/0/load",
+        // The add-a-backend affordances.
+        "settings/backends/add/openai",
+        "settings/backends/add/llamacpp",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "external-tab probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+    // The user-owned file must never afford deletion through Eidola.
+    assert!(
+        !names.contains(&"settings/backends/my-box/model/0/delete".to_string()),
+        "a llamacpp backend's files are the user's: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::BackendsSettingsView;
+
+    let _guard = probes_on();
+
+    // An overridden trust bundle so the revert affordances render.
+    let mut trust = probe_eidola_trust();
+    trust.base_url = "https://staging.eidola.example/v1".into();
+    trust.base_url_is_override = true;
+    trust.trusted_measurements = vec![eidola_app_core::MeasurementInfo {
+        snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+        tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+    }];
+    trust.trusted_measurements_are_override = true;
+    // Root CA overridden (with a viewable PEM) so the view/copy + Clear verbs
+    // render; intermediate left at the pin (only the Set textarea shows there).
+    trust.has_hardware_root_ca = true;
+    trust.hardware_root_ca_pem =
+        Some("-----BEGIN CERTIFICATE-----\nMIIBcustomroot\n-----END CERTIFICATE-----".into());
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(trust);
+        s.backends = backends_fixture();
+    });
+    let (window, view) = open_view(cx, move |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    });
+
+    // At rest with an active override: the warning band, the base-URL Change
+    // affordance, both revert-to-pin verbs, and every trust row's resting
+    // affordances — nothing hides behind a disclosure. The *inputs* (add
+    // field, CA textareas) stay out of the tree until revealed on demand.
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/eidola/trust-warning",
+        "settings/backends/eidola/url/change",
+        "settings/backends/eidola/url/revert-to-pin",
+        "settings/backends/eidola/measurements/revert",
+        // The override measurement line: copyable (full triple) + untrustable.
+        "settings/backends/eidola/measurements/0/copy",
+        "settings/backends/eidola/measurements/0/untrust",
+        // The build pin (dropped by the override): auditable + re-addable.
+        "settings/backends/eidola/measurements/pin/copy",
+        "settings/backends/eidola/measurements/pin/trust",
+        // The add-input reveal + the Record cross-link.
+        "settings/backends/eidola/measurements/trust-new",
+        "settings/backends/eidola/open-record",
+        // Root CA override: copyable, replaceable, clearable.
+        "settings/backends/eidola/ca/root/copy",
+        "settings/backends/eidola/ca/root/change",
+        "settings/backends/eidola/ca/root/clear",
+        // Intermediate CA at the pin: just the set-custom reveal.
+        "settings/backends/eidola/ca/intermediate/change",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "eidola trust-surface probe {expected:?} missing: {names:?}"
+        );
+    }
+    for absent in [
+        // The inputs reveal on demand — not in the tree at rest.
+        "settings/backends/eidola/measurements/add",
+        "settings/backends/eidola/measurements/add/submit",
+        "settings/backends/eidola/ca/root/input",
+        "settings/backends/eidola/ca/root/set",
+        "settings/backends/eidola/ca/intermediate/input",
+        // Pinned intermediate CA: nothing to copy or clear.
+        "settings/backends/eidola/ca/intermediate/copy",
+        "settings/backends/eidola/ca/intermediate/clear",
+        // No raw PEM dump in Settings (the Copy verb carries it).
+        "settings/backends/eidola/ca/root/current",
+        // The disclosure is gone.
+        "settings/backends/eidola/advanced/toggle",
+    ] {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "{absent:?} must not render at rest: {names:?}"
+        );
+    }
+
+    // The warning band (role Alert) names exactly which values are overridden.
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let band = entries
+        .iter()
+        .find(|(n, _)| n == "settings/backends/eidola/trust-warning")
+        .expect("trust warning band recorded");
+    assert_eq!(band.1.role, gpui::Role::Alert);
+    let label = band.1.label.to_string();
+    for named in ["base URL", "trusted measurements", "hardware root CA"] {
+        assert!(
+            label.contains(named),
+            "warning band must name {named:?}; label: {label:?}"
+        );
+    }
+
+    // Revealing the add input swaps in the field + submit/cancel and retires
+    // the reveal verb (edit-in-place).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_add_measurement(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/eidola/measurements/add",
+        "settings/backends/eidola/measurements/add/submit",
+        "settings/backends/eidola/measurements/add/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "revealed add-measurement probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/backends/eidola/measurements/trust-new".to_string()),
+        "the reveal verb retires while the input is open: {names:?}"
+    );
+    view.update(cx, |v, cx| v.cancel_add_measurement(cx));
+
+    // Revealing a CA editor swaps in that row's textarea + Set/Cancel; the
+    // other CA row is untouched.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.begin_edit_ca(eidola_gui::backends_settings::CaKind::Root, window, cx)
+        });
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/eidola/ca/root/input",
+        "settings/backends/eidola/ca/root/set",
+        "settings/backends/eidola/ca/root/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "revealed CA editor probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/backends/eidola/ca/intermediate/input".to_string()),
+        "editing one CA must not reveal the other's textarea: {names:?}"
+    );
+    view.update(cx, |v, cx| v.cancel_edit_ca(cx));
+
+    // Entering the base-URL editor swaps in the input + save/cancel.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit_base_url(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/eidola/url/base-url",
+        "settings/backends/eidola/url/save",
+        "settings/backends/eidola/url/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "eidola url-editor probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+/// The pinned (no-override) measurement is auditable — its full value is
+/// copyable — but **not** untrustable (removing the build root is meaningless;
+/// this was the no-op "Untrust" bug). The pin-not-trusted line's Trust verb
+/// only appears when an override has actually dropped the pin.
+#[gpui::test]
+fn eidola_pinned_measurement_copyable_not_untrustable(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::BackendsSettingsView;
+
+    let _guard = probes_on();
+
+    // Non-override trust: the resolved set is the single build pin.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.backends = backends_fixture();
+    });
+    let (window, _view) = open_view(cx, move |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    });
+
+    // The measurement lines are always visible — no disclosure to expand.
+    let names = fresh_names(cx, window);
+
+    assert!(
+        names.contains(&"settings/backends/eidola/measurements/pin/copy".to_string()),
+        "the pinned measurement must be copyable for audit: {names:?}"
+    );
+    for absent in [
+        // No Untrust anywhere — not on the pin card, not on a phantom index.
+        "settings/backends/eidola/measurements/pin/untrust",
+        "settings/backends/eidola/measurements/0/untrust",
+        // Trust (re-add) only shows when an override dropped the pin.
+        "settings/backends/eidola/measurements/pin/trust",
+    ] {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "pinned measurement must not carry {absent:?}: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn backends_pane_add_form_probes_appear_per_kind(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::{AddKind, BackendsSettingsView, BackendsTab};
+
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.backends = backends_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    });
+
+    // The add form lives in the External tab.
+    view.update(cx, |v, cx| v.select_tab(BackendsTab::External, cx));
+
+    // Open the OpenAI form: id + url + key inputs plus submit/cancel.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_add(AddKind::OpenAi, window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/add/id",
+        "settings/backends/add/url",
+        "settings/backends/add/key",
+        "settings/backends/add/submit",
+        "settings/backends/add/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "openai add-form probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    // Switching to the System llama.cpp form swaps url/key for the directory,
+    // and adds the optional engine-path input + auto-start checkbox.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_add(AddKind::LlamaCpp, window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/add/dir",
+        "settings/backends/add/engine-path",
+        "settings/backends/add/autostart",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "llamacpp add-form probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/backends/add/url".to_string()),
+        "url input must not linger on the llamacpp form: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn request_panel_lists_all_on_disk_local_models_first(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = None;
+        s.models = vec![ModelInfo {
+            id: "gemma4-31b".into(),
+            context_length: 131_072,
+            prompt_credits_per_token: 0.53,
+            completion_credits_per_token: 1.5,
+            request_credits: None,
+        }];
+        s.local_models = Some(local_models_fixture());
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    // *Every* on-disk local model appears ahead of the remote rows — the
+    // merely-downloaded Tiny A included (a request loads it on demand).
+    assert!(
+        names.contains(&"space/request-panel/engine/local/0".to_string()),
+        "downloaded (unloaded) local model row missing: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/request-panel/engine/local/1".to_string()),
+        "loaded local model row missing: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/request-panel/remote/eidola/0".to_string()),
+        "remote model rows must still render below the local group: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn request_panel_offline_shows_local_models_and_retry(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    // Offline: no remote models, and the remote store forced into a failed
+    // state (the app-launch fetch couldn't reach the upstream).
+    let stores = stub_stores(cx, |s| {
+        s.config_state = None;
+        s.local_models = Some(local_models_fixture());
+    });
+    cx.update(|cx| {
+        stores
+            .models
+            .update(cx, |s, cx| s.set_failed_for_test("offline", cx));
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    // The loaded local model stays selectable even though the remote fetch
+    // failed — the panel is never a dead end.
+    assert!(
+        names.contains(&"space/request-panel/engine/local/0".to_string()),
+        "loaded local model must show while offline: {names:?}"
+    );
+    // ...and the remote list offers a retry, not silent nothing.
+    assert!(
+        names.contains(&"space/request-panel/eidola/retry".to_string()),
+        "per-backend retry affordance missing on a failed eidola fetch: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/request-panel/eidola/refresh".to_string()),
+        "a failed fetch shows retry, not refresh: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn request_panel_shows_refresh_when_remote_loaded(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = None;
+        s.models = vec![ModelInfo {
+            id: "gemma4-31b".into(),
+            context_length: 131_072,
+            prompt_credits_per_token: 0.53,
+            completion_credits_per_token: 1.5,
+            request_credits: None,
+        }];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    // A refresh is offered even over a *successful* remote list.
+    assert!(
+        names.contains(&"space/request-panel/eidola/refresh".to_string()),
+        "per-backend refresh affordance must be available over a good list: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/request-panel/eidola/retry".to_string()),
+        "a good fetch shows refresh, not retry: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn request_panel_groups_per_backend_with_independent_health(cx: &mut TestAppContext) {
+    use eidola_gui::loadable::Loadable;
+    use eidola_gui::stores::BackendCatalog;
+
+    let _guard = probes_on();
+
+    // A full multi-backend scene: the local singleton with a loaded engine,
+    // a llamacpp backend with a loaded engine, a healthy eidola catalog,
+    // and an openai backend whose fetch failed.
+    let mut external_fixture = local_models_fixture();
+    if let Some(m) = external_fixture
+        .external
+        .get_mut(0)
+        .and_then(|b| b.models.get_mut(0))
+    {
+        m.status = eidola_app_core::LocalModelStatus::Loaded {
+            port: 4243,
+            context_tokens: 8192,
+            pinned: false,
+        };
+    }
+    let stores = stub_stores(cx, |s| {
+        s.config_state = None;
+        s.backends = backends_fixture();
+        s.local_models = Some(external_fixture);
+        s.backend_catalogs = Some(vec![
+            BackendCatalog {
+                backend: eidola_app_core::BackendInfo {
+                    id: "eidola".into(),
+                    kind: eidola_app_core::BackendKind::Eidola,
+                    display_name: "Eidola".into(),
+                    enabled: true,
+                    base_url: None,
+                    has_api_key: false,
+                    models_dir: None,
+                    model_overrides: None,
+                    engine_path: None,
+                    auto_start: true,
+                    created_at: 0,
+                },
+                models: Loadable::loaded(vec![ModelInfo {
+                    id: "gemma4-31b".into(),
+                    context_length: 131_072,
+                    prompt_credits_per_token: 0.53,
+                    completion_credits_per_token: 1.5,
+                    request_credits: None,
+                }]),
+            },
+            BackendCatalog {
+                backend: eidola_app_core::BackendInfo {
+                    id: "my-vllm".into(),
+                    kind: eidola_app_core::BackendKind::OpenAi,
+                    display_name: "My vLLM".into(),
+                    enabled: true,
+                    base_url: Some("http://10.0.0.2:8000".into()),
+                    has_api_key: true,
+                    models_dir: None,
+                    model_overrides: None,
+                    engine_path: None,
+                    auto_start: true,
+                    created_at: 1,
+                },
+                models: Loadable::Failed {
+                    error: eidola_app_core::error::AppError::Internal {
+                        message: "connection refused".into(),
+                    },
+                    prior: None,
+                },
+            },
+        ]);
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    for expected in [
+        // Engine groups: the managed store and the llamacpp backend.
+        "space/request-panel/engine/local/0",
+        "space/request-panel/engine/my-box/0",
+        // The healthy eidola catalog: rows + refresh, no retry.
+        "space/request-panel/remote/eidola/0",
+        "space/request-panel/eidola/refresh",
+        // The dead openai backend: its own retry — nobody else's health.
+        "space/request-panel/my-vllm/retry",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "multi-backend panel probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"space/request-panel/eidola/retry".to_string()),
+        "one backend's failure must not mark another's group: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
 }

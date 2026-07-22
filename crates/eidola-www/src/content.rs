@@ -14,6 +14,17 @@ pub struct FrontMatter {
     /// (`serve` always includes them).
     #[serde(default)]
     pub draft: bool,
+    /// Monotonically increasing version for legal documents (terms of
+    /// service, privacy policy). Versioned pages get a visible version
+    /// line, `eidola:*` meta tags, and their raw source published at
+    /// `<route>/source.md` — the artifact whose SHA-256 the server's
+    /// terms-acceptance gate polls. CI enforces that any change to the
+    /// file's bytes increments this by exactly one
+    /// (`scripts/check-legal-doc-versions.sh`).
+    pub version: Option<i64>,
+    /// `YYYY-MM-DD` the version takes effect (versioned legal documents
+    /// only; optional while a document is in draft).
+    pub effective: Option<String>,
 }
 
 /// Split a source file into front matter and markdown body. Files without
@@ -67,6 +78,16 @@ pub struct Page {
     /// Repo-relative source path (docs pages only) — drives the
     /// edit-on-GitHub link.
     pub source_path: Option<String>,
+    /// Legal-document version from front matter (versioned pages only).
+    pub version: Option<i64>,
+    /// `YYYY-MM-DD` the version takes effect (versioned pages only).
+    pub effective: Option<String>,
+    /// Hex SHA-256 of the exact source file bytes (versioned pages only) —
+    /// the acceptance hash.
+    pub source_sha256: Option<String>,
+    /// The exact source file bytes (versioned pages only), published at
+    /// `<route>/source.md` so the hashed artifact is always retrievable.
+    pub source_raw: Option<String>,
 }
 
 /// Derive the site route for a docs source path relative to `docs/`

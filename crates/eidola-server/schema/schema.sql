@@ -49,6 +49,78 @@ CREATE INDEX idx_account_stripe_customer ON account (stripe_customer_id)
     WHERE stripe_customer_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
+-- Account Acceptance
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE account_acceptance (
+    account_id  UUID NOT NULL REFERENCES account(id),
+    document    TEXT NOT NULL
+        CHECK (document IN ('terms_of_service', 'privacy_policy')),
+    version     BIGINT NOT NULL CHECK (version >= 1),
+    sha256      TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (account_id, document, sha256)
+);
+
+COMMENT ON TABLE account_acceptance IS
+    'Append-only record of terms-of-service / privacy-policy acceptance. '
+    'Each row binds an account to the SHA-256 of the exact document text it '
+    'accepted (the same accept-by-hash mechanism the repository''s CLA uses), '
+    'so a dispute can be resolved against the precise version in git history. '
+    'Rows are never updated or deleted; re-accepting an already-accepted '
+    'version is a no-op that preserves the original timestamp. The currently '
+    'REQUIRED versions live in required_document (advanced by the terms-feed '
+    'poller and/or seeded from server configuration).';
+
+COMMENT ON COLUMN account_acceptance.version IS
+    'The document''s front-matter version number at acceptance time, '
+    'stamped from the requiring server''s view. The acceptance gate is '
+    'MAX(version) >= required version, so accepting a newer version '
+    'satisfies an instance whose required view briefly lags.';
+
+COMMENT ON COLUMN account_acceptance.sha256 IS
+    'Hex-encoded SHA-256 of the exact published document text the account '
+    'accepted.';
+
+-- ---------------------------------------------------------------------------
+-- Required Document
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE required_document (
+    document    TEXT NOT NULL
+        CHECK (document IN ('terms_of_service', 'privacy_policy')),
+    version     BIGINT NOT NULL CHECK (version >= 1),
+    sha256      TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    url         TEXT NOT NULL,
+    first_required_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (document, version)
+);
+
+COMMENT ON TABLE required_document IS
+    'Append-only record of every legal-document version this cluster has '
+    'ever required. One row per (document, version); rows are never '
+    'updated or deleted. The CURRENT requirement is the highest version '
+    'per document, so monotonicity is structural — a stale poll or a '
+    'website briefly serving old content inserts nothing new and can '
+    'never regress the requirement — and the full history answers "which '
+    'version was being enforced on date X" forever (the acceptance-record '
+    'counterpart in account_acceptance answers "what did this account '
+    'agree to, and when"). Fed by the terms-feed poller and/or the '
+    'startup env seed, both through the same insert-if-absent. Empty '
+    'table = acceptance gate disabled. CI enforces that a published '
+    'document''s bytes never change without a version increment, which is '
+    'what makes the integer ordering trustworthy; a same-version row with '
+    'a different hash is a contract violation the poller detects and '
+    'refuses to record.';
+
+COMMENT ON COLUMN required_document.first_required_at IS
+    'When this version was first observed and became enforced '
+    'cluster-wide. Never overwritten — later observations of the same '
+    'version are no-ops.';
+
+-- ---------------------------------------------------------------------------
 -- Issuer Key
 -- ---------------------------------------------------------------------------
 
@@ -129,6 +201,7 @@ CREATE TABLE credit_ledger (
             'manual_adjustment'
         )),
     stripe_event_id TEXT UNIQUE,
+    stripe_payment_intent TEXT,
     memo            TEXT,
     expires_at      TIMESTAMPTZ,
     credential_key_id    TEXT REFERENCES issuer_key(id),
@@ -184,7 +257,7 @@ COMMENT ON COLUMN credit_ledger.reason IS
     'Informational tag for filtering and auditing. Does not drive business '
     'logic — only delta and expires_at have operational meaning. Reasons: '
     'subscription_renewal = recurring Stripe subscription payment; '
-    'purchase = one-time Stripe purchase (premium pricing, no expiry); '
+    'purchase = one-time Stripe purchase (premium pricing, 1-year expiry); '
     'refund = Stripe refund (full or partial), cooperative; '
     'credential_issuance = credits converted into anonymous credentials (the privacy boundary); '
     'dispute_clawback = Stripe dispute/chargeback, adversarial; '
@@ -196,14 +269,24 @@ COMMENT ON COLUMN credit_ledger.stripe_event_id IS
     'UNIQUE constraint provides idempotent webhook handling — duplicate '
     'delivery simply fails the insert. NULL for non-Stripe entries.';
 
+COMMENT ON COLUMN credit_ledger.stripe_payment_intent IS
+    'Stripe PaymentIntent ID (pi_xxx) for entries originating from a payment '
+    '(purchase, subscription_renewal) and for refund debits matched to one. '
+    'Lets a later charge.refunded event locate the original credit entry and '
+    'issue the refund debit against the same balance pool — inheriting its '
+    'expires_at even when that pool has already expired, so the refund nets '
+    'against the credits it reverses. NULL for non-payment entries and for '
+    'events where Stripe did not include a payment intent.';
+
 COMMENT ON COLUMN credit_ledger.memo IS
     'Optional free-text note. Primarily useful for manual_adjustment entries '
     '("reversed accidental double-credit per support ticket #123"). '
     'Not exposed to end users.';
 
 COMMENT ON COLUMN credit_ledger.expires_at IS
-    'NULL means credits never expire (top-ups, manual adjustments). '
-    'For subscription renewals, set to the billing period end date. '
+    'NULL means credits never expire (e.g., manual adjustments). '
+    'For subscription renewals, set to the billing period end date; '
+    'for one-time purchases, set to one year after the purchase. '
     'Expired credits are excluded from balance calculations by the query, '
     'not by a cron job. '
     'For debit entries (credential_issuance, refund, dispute_clawback), '
@@ -233,6 +316,10 @@ CREATE INDEX idx_ledger_account_balance ON credit_ledger (account_id, expires_at
 
 -- Audit/admin: "show me all entries for a given reason this month"
 CREATE INDEX idx_ledger_reason_created ON credit_ledger (reason, created_at);
+
+-- Refund matching: locate the original credit entry for a payment intent.
+CREATE INDEX idx_ledger_payment_intent ON credit_ledger (stripe_payment_intent)
+    WHERE stripe_payment_intent IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- Nullifier
@@ -369,6 +456,56 @@ BEGIN
         v_remaining := v_remaining - v_take;
     END LOOP;
 
+    -- Cooperative refunds that exceed all live pools are next allocated
+    -- against EXPIRED positive pools (most recently expired first), each
+    -- debit inheriting the expired pool's own (past) expires_at.  This nets
+    -- a refund of already-expired credits against the pool it reverses —
+    -- both sides invisible to the balance — instead of creating a permanent
+    -- negative entry that would claw back credits the account never had
+    -- (the "phantom negative balance" hazard documented on expires_at).
+    -- Adversarial debits (dispute_clawback) intentionally skip this pass:
+    -- a clawback should outlive the credits it reverses.
+    IF v_remaining > 0 AND NOT p_require_balance AND p_reason = 'refund' THEN
+        FOR v_pool IN
+            SELECT expires_at, SUM(delta)::bigint AS pool_amount
+            FROM credit_ledger
+            WHERE account_id = p_account_id
+              AND expires_at IS NOT NULL
+              AND expires_at <= now()
+            GROUP BY expires_at
+            HAVING SUM(delta) > 0
+            ORDER BY expires_at DESC
+        LOOP
+            EXIT WHEN v_remaining <= 0;
+
+            v_take := LEAST(v_remaining, v_pool.pool_amount);
+            v_pool_idx := v_pool_idx + 1;
+
+            IF p_stripe_event_id IS NOT NULL THEN
+                v_event_id := CASE WHEN v_pool_idx = 1
+                    THEN p_stripe_event_id
+                    ELSE p_stripe_event_id || ':' || v_pool_idx
+                END;
+            ELSE
+                v_event_id := NULL;
+            END IF;
+
+            INSERT INTO credit_ledger (
+                id, account_id, delta, reason, stripe_event_id, expires_at,
+                credential_key_id, credential_credits, created_at
+            ) VALUES (
+                gen_random_uuid(), p_account_id, -v_take, p_reason, v_event_id,
+                v_pool.expires_at, p_credential_key_id,
+                CASE WHEN p_credential_key_id IS NOT NULL THEN v_take ELSE NULL END,
+                now()
+            )
+            RETURNING id INTO v_entry_id;
+
+            v_entry_ids := v_entry_ids || v_entry_id;
+            v_remaining := v_remaining - v_take;
+        END LOOP;
+    END IF;
+
     -- Remainder that exceeds all positive pools (refunds/clawbacks that
     -- exceed the current balance).  Placed in the permanent (NULL) pool.
     IF v_remaining > 0 AND NOT p_require_balance THEN
@@ -407,8 +544,11 @@ COMMENT ON FUNCTION debit_account IS
     'each debit row carries the expires_at of the pool it draws from. '
     'Returns NULL when p_require_balance is TRUE and the balance is '
     'insufficient.  Returns an empty array on duplicate stripe_event_id. '
-    'For refunds/clawbacks (p_require_balance = FALSE), any remainder '
-    'beyond existing pools is placed in the permanent (NULL expiry) pool.';
+    'For refunds (reason = ''refund'', p_require_balance = FALSE), any '
+    'remainder beyond live pools is next netted against expired positive '
+    'pools (most recently expired first, inheriting their past expires_at); '
+    'only what exceeds those too is placed in the permanent (NULL expiry) '
+    'pool.  Clawbacks skip the expired-pool pass and go permanent directly.';
 
 CREATE FUNCTION prune_expired_nullifiers()
 RETURNS BIGINT

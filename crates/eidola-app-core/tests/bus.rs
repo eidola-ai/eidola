@@ -46,6 +46,21 @@
 //! action/content/antecedent inserts stays *unemitted* — internal-consistency
 //! (kill-`-9`-class) failures, not durable partial state to reconcile.
 //!
+//! **Local turns (`local/<slug>` models).** `prepare_turn` routes these to the
+//! loopback llama.cpp engine with `TurnPrep.spend = None`: no credential is
+//! provisioned, no `Authorization` header is sent, and every `Wallet` emission
+//! above is skipped (spend-start, refund-recovery, and the success emission are
+//! all gated on `spend`). The rows otherwise apply unchanged — same
+//! `Space`/`SpaceIndex`/`Record` placement, same `ChatFailed` wrapping after
+//! the post persists. A local model that is not loaded fails in the routing
+//! step (typed `AppError::LocalModel`, pre-`wrap`, post surviving) — executed
+//! in `tests/local_models.rs` (`local_blocking_chat_has_no_spend_no_auth_no_wallet`,
+//! `local_streaming_chat_streams_and_persists_without_wallet`,
+//! `local_chat_with_unloaded_model_is_typed_error`). The local-domain
+//! lifecycle emissions (`Change::LocalModels` on download start / throttled
+//! progress / completion / failure / delete / engine load / ready / unload /
+//! crash) are asserted there too and never touch the chat-domain rows.
+//!
 //! **Failure-path id adoption (item C).** `post` persists the space before
 //! `run_turn` runs, so every `run_turn` error is wrapped as
 //! `AppError::ChatFailed { space_id }` (its `Display` defers to the source). A
@@ -98,16 +113,22 @@ fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
 // ===========================================================================
 
 #[test]
-fn config_write_emits_config() {
-    let (core, _dir) = make_core();
-    let mut rx = core.subscribe_changes();
+fn set_base_url_emits_backends() {
+    // The eidola connection + trust bundle lives on the `eidola` backend row
+    // now, so a base-URL write is a Backends mutation (not Config).
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let mut rx = core.subscribe_changes();
 
-    core.set_base_url("https://example.com".into()).unwrap();
-    let changes = drain(&mut rx);
-    assert!(
-        changes.contains(&Change::Config),
-        "set_base_url should emit Config; got {changes:?}"
-    );
+        core.runtime()
+            .block_on(core.set_base_url("https://example.com".into()))
+            .unwrap();
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Backends),
+            "set_base_url should emit Backends; got {changes:?}"
+        );
+    });
 }
 
 #[test]
@@ -124,17 +145,23 @@ fn set_default_model_emits_config() {
 }
 
 #[test]
-fn clear_base_url_override_emits_config() {
-    let (core, _dir) = make_core();
-    core.set_base_url("https://example.com".into()).unwrap();
+fn clear_base_url_override_emits_backends() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        core.runtime()
+            .block_on(core.set_base_url("https://example.com".into()))
+            .unwrap();
 
-    let mut rx = core.subscribe_changes();
-    core.clear_base_url_override().unwrap();
-    let changes = drain(&mut rx);
-    assert!(
-        changes.contains(&Change::Config),
-        "clear_base_url_override should emit Config; got {changes:?}"
-    );
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.clear_base_url_override())
+            .unwrap();
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Backends),
+            "clear_base_url_override should emit Backends; got {changes:?}"
+        );
+    });
 }
 
 #[test]
@@ -571,7 +598,7 @@ fn two_subscribers_both_receive() {
     let mut rx1 = core.subscribe_changes();
     let mut rx2 = core.subscribe_changes();
 
-    core.set_base_url("https://example.com".into()).unwrap();
+    core.set_default_model("kimi-k2-6".into()).unwrap();
 
     let c1 = drain(&mut rx1);
     let c2 = drain(&mut rx2);
@@ -640,7 +667,7 @@ fn set_account_credentials_followed_by_reset_emits_config_each_time() {
 fn late_subscriber_does_not_see_past_events() {
     let (core, _dir) = make_core();
 
-    core.set_base_url("https://example.com".into()).unwrap();
+    core.set_default_model("kimi-k2-6".into()).unwrap();
 
     // Subscribe AFTER the write.
     let mut rx = core.subscribe_changes();

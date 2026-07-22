@@ -36,6 +36,12 @@ pub enum ServerError {
     /// Conflict with existing resource (409).
     Conflict { message: String },
 
+    /// The account has not accepted the currently required terms of
+    /// service / privacy policy versions (428). Clients fetch the required
+    /// documents from `GET /v1/terms` and record acceptance via
+    /// `POST /v1/account/terms`.
+    TermsAcceptanceRequired { message: String },
+
     /// Service unavailable (503).
     ServiceUnavailable(String),
 
@@ -55,6 +61,7 @@ impl ServerError {
             ServerError::PaymentRequired { .. } => StatusCode::PAYMENT_REQUIRED,
             ServerError::NotFound { .. } => StatusCode::NOT_FOUND,
             ServerError::Conflict { .. } => StatusCode::CONFLICT,
+            ServerError::TermsAcceptanceRequired { .. } => StatusCode::PRECONDITION_REQUIRED,
             ServerError::Network(_) | ServerError::Parse(_) => StatusCode::BAD_GATEWAY,
             ServerError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ServerError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -80,6 +87,9 @@ impl ServerError {
             } => ErrorResponse::new(message, error_type),
             ServerError::NotFound { message } => ErrorResponse::new(message, "not_found"),
             ServerError::Conflict { message } => ErrorResponse::new(message, "conflict"),
+            ServerError::TermsAcceptanceRequired { message } => {
+                ErrorResponse::new(message, "terms_acceptance_required")
+            }
             ServerError::Network(msg) => ErrorResponse::new(msg, "upstream_error"),
             ServerError::Parse(msg) => ErrorResponse::new(msg, "upstream_error"),
             ServerError::ServiceUnavailable(msg) => ErrorResponse::new(msg, "service_unavailable"),
@@ -107,6 +117,9 @@ impl std::fmt::Display for ServerError {
             }
             ServerError::NotFound { message } => write!(f, "not found: {}", message),
             ServerError::Conflict { message } => write!(f, "conflict: {}", message),
+            ServerError::TermsAcceptanceRequired { message } => {
+                write!(f, "terms acceptance required: {}", message)
+            }
             ServerError::Network(msg) => write!(f, "network error: {}", msg),
             ServerError::Parse(msg) => write!(f, "parse error: {}", msg),
             ServerError::ServiceUnavailable(msg) => write!(f, "service unavailable: {}", msg),

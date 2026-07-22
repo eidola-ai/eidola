@@ -1,7 +1,9 @@
+pub mod backends;
 pub mod changes;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod local_models;
 pub mod trust_root;
 pub mod updater;
 pub mod updates;
@@ -21,9 +23,17 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+pub use backends::{
+    BackendInfo, BackendKind, BackendUpdate, EIDOLA_BACKEND_ID, LOCAL_BACKEND_ID, ModelRef,
+    NewBackend, parse_model_ref, qualified_model_id,
+};
 use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
 use error::AppError;
+pub use local_models::{
+    ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
+    LocalModelStatus, LocalModelsState,
+};
 
 // ============================================================================
 // Data transfer types — returned from `AppCore` methods to the apps
@@ -32,32 +42,19 @@ use error::AppError;
 
 /// Snapshot of the current config for display.
 ///
-/// `base_url` and `trusted_measurements` are the *resolved* values: the
-/// user's override if set, the trust-root pin otherwise. UI displays these
-/// directly without needing to know which source they came from.
+/// Purely config-backed (resolvable without the database). The eidola
+/// connection + trust bundle (base URL, trusted measurements, hardware CAs)
+/// moved to the `eidola` backend row — see [`EidolaTrust`] and
+/// [`AppCore::eidola_trust`].
 #[derive(Clone, Debug)]
 pub struct ConfigState {
-    pub base_url: String,
     /// The resolved default inference model: the user's `default_model`
     /// config override if set, otherwise the embedded fallback
     /// ([`config::DEFAULT_MODEL`]).
     pub default_model: String,
-    /// The trust-root pin baked into this binary. Equal to `base_url` unless
-    /// the user has set an override — the UI uses the pair to be honest
-    /// about override-vs-pin instead of presenting one undifferentiated URL.
-    pub base_url_pin: String,
-    /// Whether `base_url` comes from a user override (`true`) or the
-    /// embedded trust-root pin (`false`).
-    pub base_url_is_override: bool,
     pub has_account: bool,
     pub has_account_secret: bool,
     pub domain_separator: String,
-    pub trusted_measurements: Vec<MeasurementInfo>,
-    /// Whether `trusted_measurements` is a user override list (`true`) or
-    /// the single pinned build measurement (`false`).
-    pub trusted_measurements_are_override: bool,
-    pub has_hardware_root_ca: bool,
-    pub has_hardware_intermediate_ca: bool,
     pub attestation_url: Option<String>,
     /// The resolved circadian day/night axis (`appearance` override if set,
     /// otherwise `system`).
@@ -68,6 +65,41 @@ pub struct ConfigState {
     /// The resolved fixed light character used while `time_of_day_tint` is
     /// `off` (`light_character` override if set, otherwise `neutral`).
     pub light_character: config::LightCharacter,
+}
+
+/// The eidola backend's resolved connection + trust bundle, honest about
+/// override-vs-pin. Read from the `eidola` backend row (see
+/// [`AppCore::eidola_trust`]); each field falls back to the embedded
+/// trust-root pin when the row's column is NULL. Overriding the trust root
+/// is security-relevant state, so UIs render override state + revert-to-pin
+/// explicitly.
+#[derive(Clone, Debug)]
+pub struct EidolaTrust {
+    /// The resolved server URL (row override, else the pin).
+    pub base_url: String,
+    /// The trust-root pin baked into this binary — equal to `base_url`
+    /// unless overridden, so the UI can be honest about the source.
+    pub base_url_pin: String,
+    /// Whether `base_url` is a row override (`true`) or the pin (`false`).
+    pub base_url_is_override: bool,
+    /// The resolved measurements the client will accept on handshake.
+    pub trusted_measurements: Vec<MeasurementInfo>,
+    /// Whether `trusted_measurements` is a row override list (`true`) or the
+    /// single pinned build measurement (`false`).
+    pub trusted_measurements_are_override: bool,
+    /// The build-time pinned enclave measurement — present regardless of
+    /// override state, so a UI can display/copy it for audit and (since an
+    /// override *replaces* the pin in the trusted set) re-add it alongside
+    /// custom measurements.
+    pub pinned_measurement: MeasurementInfo,
+    pub has_hardware_root_ca: bool,
+    /// The custom root-CA PEM override, if set (`None` = the built-in AMD/Intel
+    /// vendor chain). Exposed so a UI can display/copy the certificate that is
+    /// actually trusted, not just a "custom certificate set" flag.
+    pub hardware_root_ca_pem: Option<String>,
+    pub has_hardware_intermediate_ca: bool,
+    /// The custom intermediate-CA PEM override, if set (`None` = vendor chain).
+    pub hardware_intermediate_ca_pem: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +169,24 @@ pub struct AllocateResult {
     pub nonce: String,
     pub credits: i64,
     pub issuer_key_id: String,
+}
+
+/// A document (terms of service / privacy policy) whose current version the
+/// server requires accounts to accept, identified by the SHA-256 of its
+/// exact published text — the same accept-by-hash mechanism the
+/// repository's CLA uses. `version` is the document's monotonically
+/// increasing version number; accepting version N satisfies any server
+/// requirement ≤ N.
+#[derive(Clone, Debug)]
+pub struct TermsDocument {
+    /// `terms_of_service` or `privacy_policy`.
+    pub document: String,
+    /// Monotonically increasing document version.
+    pub version: i64,
+    /// Where the current text is published.
+    pub url: String,
+    /// Hex-encoded SHA-256 of the exact published document text.
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug)]
@@ -377,6 +427,10 @@ pub struct RequestDetail {
     pub space_id: Option<String>,
     /// The space's title, if set (may be `None` for untitled spaces).
     pub space_title: Option<String>,
+    /// The configured backend this request was routed through, if recorded.
+    pub backend_id: Option<String>,
+    /// That backend's display name (soft-removed backends keep theirs).
+    pub backend_display_name: Option<String>,
 }
 
 /// One row of the `spend_trail` view: credential → request → action → space.
@@ -468,6 +522,10 @@ struct Inner {
     update_polling: std::sync::atomic::AtomicBool,
     /// Invalidation bus — emits a [`Change`] after every durable commit.
     bus: BroadcastSource,
+    /// Runtime local-inference state (downloads in flight, running
+    /// llama.cpp engines). `Arc` so core-owned transfer/supervisor tasks
+    /// can hold it beyond the initiating call.
+    local: Arc<local_models::LocalRuntime>,
     /// Test-only HTTP client override. When `Some`, [`Inner::build_client`]
     /// returns a clone of this client *instead of* constructing the
     /// attesting client, letting integration tests drive `chat`/`chat_stream`
@@ -585,9 +643,149 @@ impl Inner {
         database.connect().map_err(AppError::db)
     }
 
+    /// Load the `eidola` backend row and resolve its connection + trust
+    /// bundle against the embedded trust-root pin. This is the single place
+    /// URL / measurements / hardware CAs are sourced now that they live on
+    /// the row instead of `Config`.
+    async fn eidola_resolved(&self) -> Result<EidolaResolved, AppError> {
+        let conn = self.db_conn().await?;
+        let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID).await?;
+        EidolaResolved::from_row(row.as_ref())
+    }
+
+    /// The public [`EidolaTrust`] DTO: the resolved bundle plus the
+    /// override-vs-pin honesty flags the UIs render.
+    async fn eidola_trust(&self) -> Result<EidolaTrust, AppError> {
+        let resolved = self.eidola_resolved().await?;
+        let to_info = |m: &tinfoil_verifier::EnclaveMeasurement| MeasurementInfo {
+            snp: m.snp_measurement.clone(),
+            tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
+            tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
+        };
+        Ok(EidolaTrust {
+            base_url: resolved.base_url.clone(),
+            base_url_pin: trust_root::SERVER_URL.to_string(),
+            base_url_is_override: resolved.base_url_is_override,
+            trusted_measurements: resolved.measurements.iter().map(to_info).collect(),
+            trusted_measurements_are_override: resolved.measurements_are_override,
+            pinned_measurement: to_info(&trust_root::server_measurement()),
+            has_hardware_root_ca: resolved.hardware_root_ca.is_some(),
+            hardware_root_ca_pem: resolved.hardware_root_ca.clone(),
+            has_hardware_intermediate_ca: resolved.hardware_intermediate_ca.is_some(),
+            hardware_intermediate_ca_pem: resolved.hardware_intermediate_ca.clone(),
+        })
+    }
+
+    /// Read the eidola row's raw enclave-measurement override list (the
+    /// *stored* overrides, not the pin-resolved set). Empty when the column
+    /// is NULL — the read-modify-write base for trust/untrust.
+    async fn eidola_measurement_overrides(
+        &self,
+    ) -> Result<Vec<tinfoil_verifier::EnclaveMeasurement>, AppError> {
+        let conn = self.db_conn().await?;
+        let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID).await?;
+        match row.and_then(|r| r.trusted_measurements) {
+            Some(json) if !json.trim().is_empty() => {
+                serde_json::from_str(&json).map_err(|e| AppError::Database {
+                    message: format!("invalid trusted_measurements JSON on eidola row: {e}"),
+                })
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Add a measurement to the eidola row's override list (idempotent by
+    /// SNP measurement). Returns whether it was newly added.
+    async fn trust_measurement(
+        &self,
+        entry: tinfoil_verifier::EnclaveMeasurement,
+    ) -> Result<bool, AppError> {
+        let mut list = self.eidola_measurement_overrides().await?;
+        if list.iter().any(|m| {
+            m.snp_measurement
+                .eq_ignore_ascii_case(&entry.snp_measurement)
+        }) {
+            return Ok(false);
+        }
+        list.push(entry);
+        let json = serde_json::to_string(&list).map_err(|e| AppError::Database {
+            message: format!("failed to serialize trusted_measurements: {e}"),
+        })?;
+        self.update_backend(
+            backends::EIDOLA_BACKEND_ID,
+            backends::BackendUpdate {
+                trusted_measurements: Some(Some(json)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Remove a measurement (by SNP key) from the eidola row's override list.
+    /// Clears the column back to NULL (= pin) when the list empties. Returns
+    /// whether a measurement was removed.
+    async fn untrust_measurement(&self, key: String) -> Result<bool, AppError> {
+        let mut list = self.eidola_measurement_overrides().await?;
+        let Some(pos) = list
+            .iter()
+            .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
+        else {
+            return Ok(false);
+        };
+        list.remove(pos);
+        let json = if list.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&list).map_err(|e| AppError::Database {
+                    message: format!("failed to serialize trusted_measurements: {e}"),
+                })?,
+            )
+        };
+        self.update_backend(
+            backends::EIDOLA_BACKEND_ID,
+            backends::BackendUpdate {
+                trusted_measurements: Some(json),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Set/clear a hardware CA (ARK or ASK) override on the eidola row.
+    /// `pem = None` clears back to the vendor chain.
+    async fn set_hardware_ca(
+        &self,
+        which: HardwareCa,
+        pem: Option<String>,
+    ) -> Result<(), AppError> {
+        let pem = match pem {
+            Some(p) if !p.trim().is_empty() => {
+                config::parse_cert_config(Some(&p), which.field_name())?;
+                Some(p.trim().to_string())
+            }
+            _ => None,
+        };
+        let update = match which {
+            HardwareCa::Root => backends::BackendUpdate {
+                hardware_root_ca: Some(pem),
+                ..Default::default()
+            },
+            HardwareCa::Intermediate => backends::BackendUpdate {
+                hardware_intermediate_ca: Some(pem),
+                ..Default::default()
+            },
+        };
+        self.update_backend(backends::EIDOLA_BACKEND_ID, update)
+            .await
+    }
+
     async fn build_client(
         &self,
         config: &Config,
+        eidola: &EidolaResolved,
         attestation_observer: Option<tinfoil_verifier::AttestationObserver>,
     ) -> Result<reqwest::Client, AppError> {
         // Test seam: a plain-HTTP client injected via
@@ -599,19 +797,17 @@ impl Inner {
         if let Some(client) = &self.http_override {
             return Ok(client.clone());
         }
-        let origin = config.base_url();
-        let allowed_measurements = config.trusted_measurements();
 
         let hardware_root_der =
-            config::parse_cert_config(config.hardware_root_ca.as_deref(), "hardware_root_ca")?;
+            config::parse_cert_config(eidola.hardware_root_ca.as_deref(), "hardware_root_ca")?;
         let hardware_intermediate_der = config::parse_cert_config(
-            config.hardware_intermediate_ca.as_deref(),
+            eidola.hardware_intermediate_ca.as_deref(),
             "hardware_intermediate_ca",
         )?;
 
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &allowed_measurements,
-            inference_base_url: origin,
+            allowed_measurements: &eidola.measurements,
+            inference_base_url: &eidola.base_url,
             atc_url: config.attestation_url.as_deref(),
             enclave_repo: Some(config.attestation_repo()),
             trusted_ark_der: hardware_root_der.as_deref(),
@@ -630,15 +826,78 @@ impl Inner {
     }
 }
 
+/// The `eidola` backend's resolved connection + trust bundle. Overrides come
+/// from the eidola row; NULL columns fall back to the embedded trust-root
+/// pin. Built once per operation and shared by [`Inner::build_client`] and
+/// the request-URL construction so both agree on where they're talking.
+struct EidolaResolved {
+    base_url: String,
+    base_url_is_override: bool,
+    measurements: Vec<tinfoil_verifier::EnclaveMeasurement>,
+    measurements_are_override: bool,
+    hardware_root_ca: Option<String>,
+    hardware_intermediate_ca: Option<String>,
+}
+
+impl EidolaResolved {
+    fn from_row(row: Option<&db::BackendRow>) -> Result<Self, AppError> {
+        let base_url_override = row.and_then(|r| r.base_url.clone());
+        let base_url_is_override = base_url_override.is_some();
+        let base_url = base_url_override.unwrap_or_else(|| trust_root::SERVER_URL.to_string());
+
+        let measurements_override: Vec<tinfoil_verifier::EnclaveMeasurement> =
+            match row.and_then(|r| r.trusted_measurements.as_deref()) {
+                Some(json) if !json.trim().is_empty() => {
+                    serde_json::from_str(json).map_err(|e| AppError::Database {
+                        message: format!("invalid trusted_measurements JSON on eidola row: {e}"),
+                    })?
+                }
+                _ => Vec::new(),
+            };
+        let measurements_are_override = !measurements_override.is_empty();
+        let measurements = if measurements_are_override {
+            measurements_override
+        } else {
+            vec![trust_root::server_measurement()]
+        };
+
+        Ok(EidolaResolved {
+            base_url,
+            base_url_is_override,
+            measurements,
+            measurements_are_override,
+            hardware_root_ca: row.and_then(|r| r.hardware_root_ca.clone()),
+            hardware_intermediate_ca: row.and_then(|r| r.hardware_intermediate_ca.clone()),
+        })
+    }
+}
+
+/// Which hardware attestation-chain certificate an override targets.
+#[derive(Clone, Copy)]
+enum HardwareCa {
+    Root,
+    Intermediate,
+}
+
+impl HardwareCa {
+    fn field_name(self) -> &'static str {
+        match self {
+            HardwareCa::Root => "hardware_root_ca",
+            HardwareCa::Intermediate => "hardware_intermediate_ca",
+        }
+    }
+}
+
 // --- High-level async operations (run on the owned tokio runtime) ------------
 
 impl Inner {
     async fn account_show(&self) -> Result<AccountShowResult, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
 
-        let client = self.build_client(&cfg, None).await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let resp = client
             .get(format!("{base_url}/v1/account"))
             .basic_auth(id, Some(secret))
@@ -663,7 +922,6 @@ impl Inner {
 
     async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
 
         if cfg.account_id.is_some() || cfg.account_secret.is_some() {
             return Err(AppError::Config {
@@ -671,7 +929,9 @@ impl Inner {
             });
         }
 
-        let client = self.build_client(&cfg, None).await?;
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let resp = client
             .post(format!("{base_url}/v1/account"))
             .send()
@@ -692,6 +952,14 @@ impl Inner {
         cfg.save_to(&self.config_path)?;
         self.bus.emit(Change::Config);
 
+        // Record acceptance of the currently required terms/privacy versions
+        // against the new account. The caller is responsible for having
+        // presented the documents first (the GUI's consent checkbox, the
+        // CLI's --accept-terms flag). Best-effort: if this fails, the
+        // server's 428 gate re-prompts at the first purchase or conversion,
+        // so a network blip here must not fail the already-created account.
+        let _ = self.accept_current_terms().await;
+
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
             secret: created.secret,
@@ -699,11 +967,83 @@ impl Inner {
         })
     }
 
+    /// The documents (terms of service, privacy policy) whose current
+    /// versions the server requires accounts to accept, with published URLs
+    /// and content hashes. Empty when the server has no acceptance gate
+    /// configured.
+    async fn current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
+        let cfg = self.load_config();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+
+        let client = self.build_client(&cfg, &eidola, None).await?;
+        let resp = client
+            .get(format!("{base_url}/v1/terms"))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let terms: TermsResponse = serde_json::from_str(&body).map_err(|e| AppError::Network {
+            message: format!("failed to parse response: {e}"),
+        })?;
+
+        Ok(terms
+            .documents
+            .into_iter()
+            .map(|d| TermsDocument {
+                document: d.document,
+                version: d.version,
+                url: d.url,
+                sha256: d.sha256,
+            })
+            .collect())
+    }
+
+    /// Record acceptance of every currently required document version
+    /// against the configured account, returning what was accepted.
+    ///
+    /// Callers are responsible for having *presented* the documents to the
+    /// user first — this method transmits consent, it does not obtain it.
+    async fn accept_current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
+        let docs = self.current_terms().await?;
+        if docs.is_empty() {
+            return Ok(docs);
+        }
+
+        let cfg = self.load_config();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let (id, secret) = self.require_credentials(&cfg)?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
+
+        for d in &docs {
+            let resp = client
+                .post(format!("{base_url}/v1/account/terms"))
+                .basic_auth(id, Some(secret))
+                .json(&serde_json::json!({
+                    "document": d.document,
+                    "sha256": d.sha256,
+                }))
+                .send()
+                .await
+                .map_err(AppError::from_request)?;
+
+            let (status, body) = read_response(resp).await?;
+            check_status(status, &body)?;
+        }
+
+        Ok(docs)
+    }
+
     async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
 
-        let client = self.build_client(&cfg, None).await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let resp = client
             .get(format!("{base_url}/v1/prices"))
             .send()
@@ -753,10 +1093,11 @@ impl Inner {
 
     async fn account_checkout(&self, price_id: &str) -> Result<String, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
 
-        let client = self.build_client(&cfg, None).await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let resp = client
             .post(format!("{base_url}/v1/account/checkout"))
             .basic_auth(id, Some(secret))
@@ -778,10 +1119,11 @@ impl Inner {
 
     async fn account_balances(&self) -> Result<BalancesResult, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
 
-        let client = self.build_client(&cfg, None).await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let resp = client
             .get(format!("{base_url}/v1/account/balances"))
             .basic_auth(id, Some(secret))
@@ -822,9 +1164,10 @@ impl Inner {
         }
 
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
         let (account_id, secret) = self.require_credentials(&cfg)?;
-        let client = self.build_client(&cfg, None).await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
 
         // 1. Fetch issuer keys
         let resp = client
@@ -1126,6 +1469,8 @@ impl Inner {
             attestation_hash: r.attestation_hash,
             space_id: r.space_id,
             space_title: r.space_title,
+            backend_id: r.backend_id,
+            backend_display_name: r.backend_display_name,
         }))
     }
 
@@ -1158,8 +1503,9 @@ impl Inner {
 
     async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
-        let client = self.build_client(&cfg, None).await?;
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let db_conn = self.db_conn().await?;
         let params = params_from_domain_separator(cfg.domain_separator())?;
         let now = now_ms();
@@ -1226,10 +1572,10 @@ impl Inner {
 
     async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
-        let client = self.build_client(&cfg, None).await?;
+        let eidola = self.eidola_resolved().await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
 
-        let models = fetch_models(&client, base_url).await?;
+        let models = fetch_models(&client, &eidola.base_url).await?;
         Ok(models
             .data
             .into_iter()
@@ -1603,37 +1949,178 @@ impl Inner {
         budget: Option<i64>,
     ) -> Result<TurnPrep, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
         let now = now_ms();
 
         let db_conn = self.db_conn().await?;
-        let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
 
         let attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let log_clone = attestation_log.clone();
-        let observer: Option<tinfoil_verifier::AttestationObserver> = Some(Arc::new(
-            move |att: tinfoil_verifier::VerifiedAttestation| {
-                log_clone.lock().unwrap().push(att);
-            },
-        ));
 
-        let client = self.build_client(&cfg, observer).await?;
+        // Resolve the selection to its backend, then route on the backend's
+        // *kind*: `eidola` keeps the attested + credential-spend path;
+        // engine-backed kinds (`local`, `llamacpp`) run against their
+        // loopback llama.cpp engine; `openai` runs plain HTTPS with an
+        // optional bearer key. Only the eidola kind carries pricing —
+        // `remote_pricing` is `Some((prompt_rate, completion_rate,
+        // scale_factor))` there, and its absence is what disables the whole
+        // spend path below (no charge estimate, no credential, no refunds —
+        // which also means non-eidola inference needs no account or
+        // onboarding). `external_auth` is the non-spend Authorization header
+        // (an openai backend's key).
+        let mref = backends::parse_model_ref(model);
+        let backend = self.require_backend(&db_conn, &mref.backend_id).await?;
+        let backend_kind =
+            backends::BackendKind::parse(&backend.kind).ok_or_else(|| AppError::Database {
+                message: format!("unknown backend kind `{}`", backend.kind),
+            })?;
 
-        let models = fetch_models(&client, base_url).await?;
-        let connection_id =
-            flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?;
+        // The canonical selection string (recorded on actions, shown in
+        // UIs) and the wire model (what the backend's HTTP API expects).
+        // Engine-backed aliases are spawned equal to the canonical id, so
+        // the two coincide there (as they do for eidola, where canonical is
+        // the bare model); openai backends get the bare model.
+        let canonical_model = backends::qualified_model_id(&mref.model, &backend.id);
+        let wire_model = match backend_kind {
+            BackendKind::OpenAi => mref.model.clone(),
+            _ => canonical_model.clone(),
+        };
+        let model = canonical_model.as_str();
 
-        let model_entry =
-            models
-                .data
-                .iter()
-                .find(|m| m.id == model)
-                .ok_or_else(|| AppError::NotConfigured {
-                    message: format!("model not found: {model}"),
-                })?;
+        let mut engine_lease: Option<local_models::EngineLease> = None;
+        let (
+            provider_id,
+            client,
+            base_url,
+            connection_id,
+            context_length,
+            remote_pricing,
+            external_auth,
+        ) = match backend_kind {
+            BackendKind::Local | BackendKind::LlamaCpp => {
+                // A request *is* the load trigger: an unloaded engine is
+                // loaded on demand (the eviction planner makes room by
+                // unloading LRU idle, unpinned engines first) and a warming
+                // one is awaited. The turn then holds a lease on the engine
+                // — bumping the LRU clock and shielding it from auto-unload
+                // until the turn ends (`TurnPrep` carries the lease; its
+                // drop releases).
+                let (engine_url, context_tokens, lease) =
+                    match self.local.lease_engine(&backend.id, &mref.model) {
+                        Some(leased) => leased,
+                        None => {
+                            // Auto-start gate: a `llamacpp` backend with
+                            // auto-start disabled refuses request-triggered
+                            // loads before any spawn — the engine must be
+                            // pre-loaded explicitly. `local` always
+                            // auto-starts (it's ours).
+                            if backend_kind == BackendKind::LlamaCpp && !backend.auto_start {
+                                return Err(AppError::NotConfigured {
+                                    message: format!(
+                                        "`{model}` is not loaded and backend `{}` has auto-start \
+                                         disabled — load it explicitly (`eidola model load \
+                                         {model}`) or enable auto-start",
+                                        backend.id
+                                    ),
+                                });
+                            }
+                            self.load_local_model(model).await?;
+                            self.local
+                                .lease_engine(&backend.id, &mref.model)
+                                .ok_or_else(|| AppError::LocalModel {
+                                    message: format!(
+                                        "`{model}` was unloaded while the request was starting"
+                                    ),
+                                })?
+                        }
+                    };
+                engine_lease = Some(lease);
+                let provider_id =
+                    db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
+                let client = match &self.http_override {
+                    Some(c) => c.clone(),
+                    None => local_models::plain_http_client()?,
+                };
+                (
+                    provider_id,
+                    client,
+                    engine_url,
+                    None,
+                    context_tokens as u64,
+                    None,
+                    None,
+                )
+            }
+            BackendKind::OpenAi => {
+                let base_url = backend
+                    .base_url
+                    .clone()
+                    .ok_or_else(|| AppError::NotConfigured {
+                        message: format!("backend `{}` has no base URL", backend.id),
+                    })?;
+                let provider_id =
+                    db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
+                let client = match &self.http_override {
+                    Some(c) => c.clone(),
+                    None => local_models::plain_http_client()?,
+                };
+                let auth = backend.api_key.as_ref().map(|k| format!("Bearer {k}"));
+                // Context length is unknown for a generic server — 0
+                // resolves to the 4096 completion default below.
+                (provider_id, client, base_url, None, 0u64, None, auth)
+            }
+            BackendKind::Eidola => {
+                // The eidola row was already fetched by `require_backend`
+                // above — resolve its connection + trust bundle straight from
+                // it (base URL / measurements / hardware CAs, falling back to
+                // the embedded pin per column).
+                let eidola = EidolaResolved::from_row(Some(&backend))?;
+                let base_url = eidola.base_url.clone();
+                let provider_id =
+                    db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
+                let log_clone = attestation_log.clone();
+                let observer: Option<tinfoil_verifier::AttestationObserver> = Some(Arc::new(
+                    move |att: tinfoil_verifier::VerifiedAttestation| {
+                        log_clone.lock().unwrap().push(att);
+                    },
+                ));
 
-        let max_completion_tokens = (model_entry.context_length).min(4096) as u32;
+                let client = self.build_client(&cfg, &eidola, observer).await?;
+
+                let models = fetch_models(&client, &base_url).await?;
+                let connection_id =
+                    flush_attestations(&attestation_log, &db_conn, &provider_id, &base_url, now)
+                        .await?;
+
+                let model_entry =
+                    models
+                        .data
+                        .iter()
+                        .find(|m| m.id == wire_model)
+                        .ok_or_else(|| AppError::NotConfigured {
+                            message: format!("model not found: {model}"),
+                        })?;
+                let pricing = (
+                    model_entry.pricing.per_prompt_token.value as u128,
+                    model_entry.pricing.per_completion_token.value as u128,
+                    model_entry.pricing.per_prompt_token.scale_factor as u128,
+                );
+                (
+                    provider_id,
+                    client,
+                    base_url,
+                    connection_id,
+                    model_entry.context_length,
+                    Some(pricing),
+                    None,
+                )
+            }
+        };
+
+        let max_completion_tokens = if context_length == 0 {
+            4096
+        } else {
+            context_length.min(4096) as u32
+        };
 
         let model_participant_id =
             db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
@@ -1694,101 +2181,127 @@ impl Inner {
         };
         let prior_messages = actions_to_messages(&context_rows);
 
-        // Estimate the charge from the assembled context. The prompt side is
-        // the shared client/server pricing contract
-        // (`eidola_common::chargeable_prompt_tokens`): a content-byte term at
-        // the safe cost factor plus per-message and per-request constants.
-        // The server computes the identical function of the identical
-        // `messages` array as its pre-flight minimum and clamps its charged
-        // prompt tokens to it, so this hold covers the server's charge by
-        // construction.
-        let total_content_bytes: u64 = prior_messages.iter().map(|m| m.content.len() as u64).sum();
-        let chargeable_prompt = eidola_common::chargeable_prompt_tokens(
-            total_content_bytes,
-            prior_messages.len() as u64,
-        );
+        // The spend side runs only for eidola turns. Local and external
+        // turns carry no charge estimate, no credential, and no ACT header
+        // (an openai backend's bearer key rides in `external_auth` instead)
+        // — which also means non-eidola inference needs no account or
+        // onboarding.
+        let (charge_credits, spend, auth_value) = match remote_pricing {
+            None => (0u128, None, external_auth),
+            Some((prompt_rate, completion_rate, sf)) => {
+                // Estimate the charge from the assembled context. The prompt
+                // side is the shared client/server pricing contract
+                // (`eidola_common::chargeable_prompt_tokens`): a content-byte
+                // term at the safe cost factor plus per-message and
+                // per-request constants. The server computes the identical
+                // function of the identical `messages` array as its
+                // pre-flight minimum and clamps its charged prompt tokens to
+                // it, so this hold covers the server's charge by
+                // construction.
+                let total_content_bytes: u64 =
+                    prior_messages.iter().map(|m| m.content.len() as u64).sum();
+                let chargeable_prompt = eidola_common::chargeable_prompt_tokens(
+                    total_content_bytes,
+                    prior_messages.len() as u64,
+                );
 
-        let sf = model_entry.pricing.per_prompt_token.scale_factor as u128;
-        let prompt_rate = model_entry.pricing.per_prompt_token.value as u128;
-        let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
-        let completion_rate = model_entry.pricing.per_completion_token.value as u128;
-        let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
-        let charge_credits = prompt_credits + completion_credits;
+                let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
+                let completion_credits =
+                    (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
+                let charge_credits = prompt_credits + completion_credits;
 
-        if charge_credits == 0 {
-            return Err(wrap(AppError::Credential {
-                message: "computed charge is zero — model pricing may be missing".into(),
-            }));
-        }
+                if charge_credits == 0 {
+                    return Err(wrap(AppError::Credential {
+                        message: "computed charge is zero — model pricing may be missing".into(),
+                    }));
+                }
 
-        // Spend budget ceiling for this turn.
-        if let Some(b) = budget
-            && charge_credits as i64 > b
-        {
-            return Err(wrap(AppError::Credential {
-                message: format!("estimated charge {charge_credits} exceeds the turn budget {b}"),
-            }));
-        }
+                // Spend budget ceiling for this turn.
+                if let Some(b) = budget
+                    && charge_credits as i64 > b
+                {
+                    return Err(wrap(AppError::Credential {
+                        message: format!(
+                            "estimated charge {charge_credits} exceeds the turn budget {b}"
+                        ),
+                    }));
+                }
 
-        let cred = self
-            .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
-            .await
-            .map_err(wrap)?;
+                let cred = self
+                    .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
+                    .await
+                    .map_err(wrap)?;
 
-        let credit_token =
-            CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
-                message: format!("failed to decode credential: {e}"),
-            })?;
-        let public_key =
-            PublicKey::from_cbor(&cred.public_key_data).map_err(|e| AppError::Credential {
-                message: format!("failed to decode public key: {e}"),
-            })?;
+                let credit_token =
+                    CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
+                        message: format!("failed to decode credential: {e}"),
+                    })?;
+                let public_key = PublicKey::from_cbor(&cred.public_key_data).map_err(|e| {
+                    AppError::Credential {
+                        message: format!("failed to decode public key: {e}"),
+                    }
+                })?;
 
-        let params = params_from_domain_separator(cfg.domain_separator())?;
+                let params = params_from_domain_separator(cfg.domain_separator())?;
 
-        let charge_scalar =
-            credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
-                message: format!("invalid charge amount: {e:?}"),
-            })?;
-        let (spend_proof, pre_refund) = credit_token
-            .prove_spend::<128>(&params, charge_scalar, OsRng)
-            .map_err(|e| AppError::Credential {
-                message: format!("failed to create spend proof: {e:?}"),
-            })?;
+                let charge_scalar =
+                    credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
+                        message: format!("invalid charge amount: {e:?}"),
+                    })?;
+                let (spend_proof, pre_refund) = credit_token
+                    .prove_spend::<128>(&params, charge_scalar, OsRng)
+                    .map_err(|e| AppError::Credential {
+                        message: format!("failed to create spend proof: {e:?}"),
+                    })?;
 
-        let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode pre_refund: {e}"),
-        })?;
-        let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode spend proof: {e}"),
-        })?;
-        let pre_cred_id = Uuid::now_v7().to_string();
-        db::insert_pre_credential_refund(
-            &db_conn,
-            &pre_cred_id,
-            &cred.nonce,
-            &cred.issuer_key_id,
-            &pre_refund_cbor,
-            charge_credits as i64,
-            &spend_proof_cbor,
-            now,
-        )
-        .await?;
-        // Credential flipped to "spending" — wallet state changed regardless of
-        // whether the rest of the operation succeeds.
-        self.bus.emit(Change::Wallet);
+                let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
+                    message: format!("failed to encode pre_refund: {e}"),
+                })?;
+                let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
+                    message: format!("failed to encode spend proof: {e}"),
+                })?;
+                let pre_cred_id = Uuid::now_v7().to_string();
+                db::insert_pre_credential_refund(
+                    &db_conn,
+                    &pre_cred_id,
+                    &cred.nonce,
+                    &cred.issuer_key_id,
+                    &pre_refund_cbor,
+                    charge_credits as i64,
+                    &spend_proof_cbor,
+                    now,
+                )
+                .await?;
+                // Credential flipped to "spending" — wallet state changed
+                // regardless of whether the rest of the operation succeeds.
+                self.bus.emit(Change::Wallet);
 
-        let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
-        let challenge_digest = compute_challenge_digest();
+                let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
+                let challenge_digest = compute_challenge_digest();
 
-        let mut token_bytes = Vec::new();
-        token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
-        token_bytes.extend_from_slice(&challenge_digest);
-        token_bytes.extend_from_slice(&issuer_key_hash);
-        token_bytes.extend_from_slice(&spend_proof_cbor);
+                let mut token_bytes = Vec::new();
+                token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+                token_bytes.extend_from_slice(&challenge_digest);
+                token_bytes.extend_from_slice(&issuer_key_hash);
+                token_bytes.extend_from_slice(&spend_proof_cbor);
 
-        let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
-        let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+                let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
+                let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+
+                (
+                    charge_credits,
+                    Some(SpendPrep {
+                        cred,
+                        public_key,
+                        params,
+                        spend_proof,
+                        pre_refund,
+                        pre_cred_id,
+                    }),
+                    Some(auth_value),
+                )
+            }
+        };
 
         // Build the messages array from the assembled context. The posted user
         // turn is already part of it (post persisted it); the agent's response
@@ -1801,13 +2314,16 @@ impl Inner {
         Ok(TurnPrep {
             db_conn,
             provider_id,
+            backend_id: backend.id,
+            engine_lease,
             attestation_log,
             client,
             connection_id,
-            base_url: base_url.to_string(),
+            base_url,
             now,
             space_id,
             model: model.to_string(),
+            wire_model,
             model_participant_id,
             max_completion_tokens,
             inf_item_id,
@@ -1816,12 +2332,7 @@ impl Inner {
             context_rows,
             messages,
             charge_credits,
-            cred,
-            public_key,
-            params,
-            spend_proof,
-            pre_refund,
-            pre_cred_id,
+            spend,
             auth_value,
         })
     }
@@ -1852,14 +2363,16 @@ impl Inner {
         let request_at = now_ms();
 
         // Send the chat request. On failure, attempt refund recovery before
-        // propagating the error so the credential isn't abandoned.
-        let chat_result = prep
+        // propagating the error so the credential isn't abandoned. Local
+        // turns carry no Authorization header — there is nothing to spend.
+        let mut request = prep
             .client
             .post(format!("{}/v1/chat/completions", prep.base_url))
-            .header("Authorization", &prep.auth_value)
-            .json(&request_body_json)
-            .send()
-            .await;
+            .json(&request_body_json);
+        if let Some(auth_value) = &prep.auth_value {
+            request = request.header("Authorization", auth_value);
+        }
+        let chat_result = request.send().await;
         let response_at = now_ms();
 
         // `post` already emitted the user turn's `Space(id)` + `SpaceIndex`
@@ -1915,16 +2428,19 @@ impl Inner {
 
         // Process the refund token from the response. If none is present,
         // attempt recovery from the server (best-effort — the final Wallet
-        // emission below covers a written successor).
-        match body.get("refund") {
-            Some(refund_obj) => {
-                prep.process_refund_obj(refund_obj)
-                    .await
-                    .inspect_err(|_| emit_user_turn())
-                    .map_err(|e| prep.wrap(e))?;
-            }
-            None => {
-                let _ = prep.try_refund_recovery().await;
+        // emission below covers a written successor). Local turns have no
+        // spend, hence nothing to refund.
+        if prep.spend.is_some() {
+            match body.get("refund") {
+                Some(refund_obj) => {
+                    prep.process_refund_obj(refund_obj)
+                        .await
+                        .inspect_err(|_| emit_user_turn())
+                        .map_err(|e| prep.wrap(e))?;
+                }
+                None => {
+                    let _ = prep.try_refund_recovery().await;
+                }
             }
         }
 
@@ -1976,9 +2492,12 @@ impl Inner {
 
         // All durable writes succeeded — emit per affected domain. post owns the
         // SpaceIndex (new space / auto-title); a response doesn't change the
-        // listing's identity.
+        // listing's identity. Local turns touched no credential, so no
+        // Wallet emission.
         self.bus.emit(Change::Space(prep.space_id.clone()));
-        self.bus.emit(Change::Wallet);
+        if prep.spend.is_some() {
+            self.bus.emit(Change::Wallet);
+        }
         self.bus.emit(Change::Record);
 
         Ok(ChatResult {
@@ -2072,14 +2591,15 @@ impl Inner {
         let request_body_json = prep.request_body(true);
         let request_at = now_ms();
 
-        let chat_result = prep
+        let mut request = prep
             .client
             .post(format!("{}/v1/chat/completions", prep.base_url))
-            .header("Authorization", &prep.auth_value)
             .header("Accept", "text/event-stream")
-            .json(&request_body_json)
-            .send()
-            .await;
+            .json(&request_body_json);
+        if let Some(auth_value) = &prep.auth_value {
+            request = request.header("Authorization", auth_value);
+        }
+        let chat_result = request.send().await;
 
         // post already emitted the user turn's Space(id) + SpaceIndex; on a
         // run_turn_stream error exit we re-signal the space (idempotent
@@ -2138,8 +2658,9 @@ impl Inner {
                     response_at: Some(now_ms()),
                     duration_ms: Some(now_ms() - request_at),
                     error: None,
-                    credential_nonce: Some(prep.cred.nonce.clone()),
+                    credential_nonce: prep.credential_nonce(),
                     created_at: now_ms(),
+                    backend_id: Some(prep.backend_id.clone()),
                 },
             )
             .await?;
@@ -2272,9 +2793,12 @@ impl Inner {
         .await?;
 
         // All durable writes succeeded — emit per affected domain. post owns the
-        // SpaceIndex (new space / auto-title).
+        // SpaceIndex (new space / auto-title). Local turns touched no
+        // credential, so no Wallet emission.
         self.bus.emit(Change::Space(prep.space_id.clone()));
-        self.bus.emit(Change::Wallet);
+        if prep.spend.is_some() {
+            self.bus.emit(Change::Wallet);
+        }
         self.bus.emit(Change::Record);
 
         Ok(ChatResult {
@@ -2453,6 +2977,7 @@ impl AppCore {
                 update_state: Mutex::new(None),
                 update_polling: std::sync::atomic::AtomicBool::new(false),
                 bus,
+                local: Arc::new(local_models::LocalRuntime::default()),
                 http_override,
             }),
         }
@@ -2481,23 +3006,11 @@ impl AppCore {
 
     pub fn config_state(&self) -> ConfigState {
         let cfg = self.inner.load_config();
-        let to_info = |m: &tinfoil_verifier::EnclaveMeasurement| MeasurementInfo {
-            snp: m.snp_measurement.clone(),
-            tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
-            tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
-        };
         ConfigState {
-            base_url: cfg.base_url().to_string(),
             default_model: cfg.default_model().to_string(),
-            base_url_pin: trust_root::SERVER_URL.to_string(),
-            base_url_is_override: cfg.base_url_override.is_some(),
             has_account: cfg.account_id.is_some(),
             has_account_secret: cfg.account_secret.is_some(),
             domain_separator: cfg.domain_separator().to_string(),
-            trusted_measurements: cfg.trusted_measurements().iter().map(&to_info).collect(),
-            trusted_measurements_are_override: !cfg.trusted_measurements_override.is_empty(),
-            has_hardware_root_ca: cfg.hardware_root_ca.is_some(),
-            has_hardware_intermediate_ca: cfg.hardware_intermediate_ca.is_some(),
             attestation_url: cfg.attestation_url.clone(),
             appearance: cfg.appearance(),
             time_of_day_tint: cfg.time_of_day_tint(),
@@ -2505,12 +3018,36 @@ impl AppCore {
         }
     }
 
-    pub fn set_base_url(&self, url: String) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.base_url_override = Some(url);
-        cfg.save_to(&self.inner.config_path)?;
-        self.bus.emit(Change::Config);
-        Ok(())
+    /// The eidola backend's resolved connection + trust bundle (base URL,
+    /// measurements, hardware CAs) with the override-vs-pin honesty flags —
+    /// read from the `eidola` backend row. Async because it reads the DB;
+    /// UIs cache the snapshot and refresh it on [`Change::Backends`].
+    pub async fn eidola_trust(&self) -> Result<EidolaTrust, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.eidola_trust().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Set the eidola server URL override (persisted on the `eidola` backend
+    /// row). Validated before write; emits [`Change::Backends`].
+    pub async fn set_base_url(&self, url: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .update_backend(
+                        backends::EIDOLA_BACKEND_ID,
+                        backends::BackendUpdate {
+                            base_url: Some(Some(url)),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+            .await
+            .map_err(join_err)?
     }
 
     /// Persist the user's default inference model (the `default_model`
@@ -2563,14 +3100,36 @@ impl AppCore {
         Ok(())
     }
 
-    /// Remove the user's base-URL override, reverting to the trust-root pin
-    /// baked into this binary.
-    pub fn clear_base_url_override(&self) -> Result<(), AppError> {
+    /// Set (or clear, with `None`/blank) the explicit `llama-server` path
+    /// used for local inference. When unset, the binary is discovered on
+    /// `PATH` and in the usual install locations.
+    pub fn set_llama_server_path(&self, path: Option<String>) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
-        cfg.base_url_override = None;
+        cfg.llama_server_path_override = path.filter(|p| !p.trim().is_empty());
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
         Ok(())
+    }
+
+    /// Remove the eidola base-URL override (clears the row column back to
+    /// NULL), reverting to the trust-root pin baked into this binary. Emits
+    /// [`Change::Backends`].
+    pub async fn clear_base_url_override(&self) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .update_backend(
+                        backends::EIDOLA_BACKEND_ID,
+                        backends::BackendUpdate {
+                            base_url: Some(None),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+            .await
+            .map_err(join_err)?
     }
 
     pub fn set_attestation_url(&self, url: String) -> Result<(), AppError> {
@@ -2581,25 +3140,56 @@ impl AppCore {
         Ok(())
     }
 
-    pub fn set_hardware_root_ca(&self, pem: String) -> Result<(), AppError> {
-        config::parse_cert_config(Some(&pem), "hardware_root_ca")?;
-        let mut cfg = self.inner.load_config();
-        cfg.hardware_root_ca = Some(pem.trim().to_string());
-        cfg.save_to(&self.inner.config_path)?;
-        self.bus.emit(Change::Config);
-        Ok(())
+    /// Set the eidola hardware root CA (ARK) PEM override on the backend row.
+    /// Validated before write; emits [`Change::Backends`].
+    pub async fn set_hardware_root_ca(&self, pem: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.set_hardware_ca(HardwareCa::Root, Some(pem)).await })
+            .await
+            .map_err(join_err)?
     }
 
-    pub fn set_hardware_intermediate_ca(&self, pem: String) -> Result<(), AppError> {
-        config::parse_cert_config(Some(&pem), "hardware_intermediate_ca")?;
-        let mut cfg = self.inner.load_config();
-        cfg.hardware_intermediate_ca = Some(pem.trim().to_string());
-        cfg.save_to(&self.inner.config_path)?;
-        self.bus.emit(Change::Config);
-        Ok(())
+    /// Set the eidola hardware intermediate CA (ASK) PEM override on the
+    /// backend row. Validated before write; emits [`Change::Backends`].
+    pub async fn set_hardware_intermediate_ca(&self, pem: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .set_hardware_ca(HardwareCa::Intermediate, Some(pem))
+                    .await
+            })
+            .await
+            .map_err(join_err)?
     }
 
-    pub fn trust_measurement(
+    /// Remove the eidola hardware root CA (ARK) override (row column back to
+    /// NULL), reverting to the production AMD chain. Emits
+    /// [`Change::Backends`].
+    pub async fn clear_hardware_root_ca(&self) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.set_hardware_ca(HardwareCa::Root, None).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Remove the eidola hardware intermediate CA (ASK) override (row column
+    /// back to NULL), reverting to the production AMD chain. Emits
+    /// [`Change::Backends`].
+    pub async fn clear_hardware_intermediate_ca(&self) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.set_hardware_ca(HardwareCa::Intermediate, None).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Add a trusted enclave measurement to the eidola backend row's override
+    /// list. Returns whether it was newly added (idempotent by SNP
+    /// measurement). Emits [`Change::Backends`] when it writes.
+    pub async fn trust_measurement(
         &self,
         snp: String,
         tdx_rtmr1: String,
@@ -2607,34 +3197,23 @@ impl AppCore {
     ) -> Result<bool, AppError> {
         let spec = format!("{snp}:{tdx_rtmr1}:{tdx_rtmr2}");
         let entry = config::parse_trust_measurement(&spec)?;
-        let mut cfg = self.inner.load_config();
-        if cfg.trusted_measurements_override.iter().any(|m| {
-            m.snp_measurement
-                .eq_ignore_ascii_case(&entry.snp_measurement)
-        }) {
-            return Ok(false);
-        }
-        cfg.trusted_measurements_override.push(entry);
-        cfg.save_to(&self.inner.config_path)?;
-        self.bus.emit(Change::Config);
-        Ok(true)
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.trust_measurement(entry).await })
+            .await
+            .map_err(join_err)?
     }
 
-    pub fn untrust_measurement(&self, snp: String) -> Result<bool, AppError> {
+    /// Remove a trusted measurement (by SNP key) from the eidola backend
+    /// row's override list. Returns whether one was removed; clearing the
+    /// last reverts to the pin. Emits [`Change::Backends`] when it writes.
+    pub async fn untrust_measurement(&self, snp: String) -> Result<bool, AppError> {
         let key = config::parse_untrust_key(&snp)?;
-        let mut cfg = self.inner.load_config();
-        if let Some(pos) = cfg
-            .trusted_measurements_override
-            .iter()
-            .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
-        {
-            cfg.trusted_measurements_override.remove(pos);
-            cfg.save_to(&self.inner.config_path)?;
-            self.bus.emit(Change::Config);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.untrust_measurement(key).await })
+            .await
+            .map_err(join_err)?
     }
 
     pub fn set_account_credentials(&self, id: String, secret: String) -> Result<(), AppError> {
@@ -2741,6 +3320,29 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.account_create().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The documents (terms of service, privacy policy) whose current
+    /// versions the server requires accounts to accept. Empty when the
+    /// server has no acceptance gate configured.
+    pub async fn current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.current_terms().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Record the user's acceptance of every currently required document
+    /// version, returning what was accepted. Callers must have presented
+    /// the documents to the user first — this transmits consent, it does
+    /// not obtain it. Routes here after [`AppError::TermsAcceptanceRequired`].
+    pub async fn accept_current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.accept_current_terms().await })
             .await
             .map_err(join_err)?
     }
@@ -2882,6 +3484,196 @@ impl AppCore {
             .spawn(async move { inner.available_models().await })
             .await
             .map_err(join_err)?
+    }
+
+    // -----------------------------------------------------------------------
+    // Backends — the configured inference destinations
+    // -----------------------------------------------------------------------
+
+    /// List the configured backends (soft-removed ones excluded): the
+    /// eidola and local singletons first, then external backends in
+    /// creation order. Refresh on [`Change::Backends`].
+    pub async fn list_backends(&self) -> Result<Vec<BackendInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.list_backends().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Add an external backend (kind `openai` or `llamacpp`), or revive a
+    /// previously removed one with the same id.
+    pub async fn add_backend(&self, new: NewBackend) -> Result<BackendInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.add_backend(new).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Enable or disable a backend. Works for the singletons too —
+    /// disabling `eidola` is the "no account, on-device only" mode.
+    pub async fn set_backend_enabled(&self, id: String, enabled: bool) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.set_backend_enabled(&id, enabled).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Update an external backend's configuration (display name, base URL,
+    /// api key, models directory, pinned model list).
+    pub async fn update_backend(&self, id: String, update: BackendUpdate) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.update_backend(&id, update).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Soft-remove an external backend. Its forensic trail (request rows)
+    /// stays resolvable; re-adding the same id revives the row.
+    pub async fn remove_backend(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.remove_backend(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The models one backend offers, as selectable entries (ids are the
+    /// qualified selection strings). See `backends::backend_models` for the
+    /// per-kind sources — and note that a generic OpenAI-compatible server
+    /// is not guaranteed to implement `GET /v1/models`; a failed listing
+    /// suggests pinning the backend's models manually.
+    pub async fn backend_models(&self, id: String) -> Result<Vec<ModelInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.backend_models(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    // -----------------------------------------------------------------------
+    // Local models — download, delete, and llama.cpp engine lifecycle
+    // -----------------------------------------------------------------------
+
+    /// The curated downloadable-model catalog (static data; installed
+    /// state comes from [`AppCore::local_models_state`]).
+    pub fn local_model_catalog(&self) -> &'static [LocalCatalogEntry] {
+        LOCAL_MODEL_CATALOG
+    }
+
+    /// Snapshot of the local-inference domain: resolved engine binary and
+    /// every model with its lifecycle state. Refresh on
+    /// [`Change::LocalModels`].
+    pub async fn local_models_state(&self) -> Result<LocalModelsState, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.local_models_state().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Start a background model download from a direct `.gguf` URL (or a
+    /// Hugging Face file-page URL). Returns the future `<slug>@local` id
+    /// immediately; progress arrives via [`Change::LocalModels`].
+    pub async fn download_local_model(&self, url: String) -> Result<String, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.download_local_model(&url).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Cancel an in-flight model download; the partial file is removed.
+    pub async fn cancel_local_model_download(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.cancel_local_model_download(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Delete a downloaded model from disk. Fails while the model is
+    /// loaded (unload first) or downloading (cancel instead).
+    pub async fn delete_local_model(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.delete_local_model(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Load a local model: spawn `llama-server` for it and wait until it
+    /// is ready to serve. Resolves when the model is chat-selectable (or
+    /// the load failed); intermediate states arrive via
+    /// [`Change::LocalModels`].
+    pub async fn load_local_model(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.load_local_model(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Unload a local model, terminating its engine subprocess.
+    pub async fn unload_local_model(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.unload_local_model(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Pin or unpin a loaded model's engine. Pinned engines are protected
+    /// from automatic (LRU) unloading when another model needs the memory;
+    /// manual unload still applies.
+    pub async fn set_local_model_pinned(&self, id: String, pinned: bool) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.set_local_model_pinned(&id, pinned).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Test-only seam: mark `slug` as a loaded engine model for
+    /// `backend_id` served at `127.0.0.1:<port>`, so integration tests can
+    /// drive engine-backed chat turns against a mock upstream without
+    /// spawning a real `llama-server`.
+    #[doc(hidden)]
+    pub fn test_register_loaded_local_model(&self, backend_id: &str, slug: &str, port: u16) {
+        self.inner.local.register_for_test(backend_id, slug, port);
+    }
+
+    /// Test-only seam: register a fake ready engine with explicit
+    /// footprint / pin / LRU timestamp — the eviction tests' fixture.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn test_register_engine(
+        &self,
+        backend_id: &str,
+        slug: &str,
+        port: u16,
+        footprint: u64,
+        pinned: bool,
+        last_used_ms: i64,
+    ) {
+        self.inner.local.register_engine_for_test(
+            backend_id,
+            slug,
+            port,
+            footprint,
+            pinned,
+            last_used_ms,
+        );
+    }
+
+    /// Test-only seam: pin the engine-pool memory budget so eviction tests
+    /// are deterministic on any machine.
+    #[doc(hidden)]
+    pub fn test_set_memory_budget(&self, budget: u64) {
+        self.inner.local.set_memory_budget_for_test(budget);
     }
 
     /// List spaces, most recently active first. Archived spaces are
@@ -3037,6 +3829,19 @@ struct GetAccountResponse {
 }
 
 #[derive(Deserialize)]
+struct TermsResponse {
+    documents: Vec<TermsDocumentResponse>,
+}
+
+#[derive(Deserialize)]
+struct TermsDocumentResponse {
+    document: String,
+    version: i64,
+    url: String,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
 struct ListPricesResponse {
     data: Vec<PriceResponse>,
 }
@@ -3163,6 +3968,14 @@ struct ModelListEntry {
 struct TurnPrep {
     db_conn: turso::Connection,
     provider_id: String,
+    /// The configured backend this turn routes through — recorded on the
+    /// request row (the forensic reference).
+    backend_id: String,
+    /// For engine-backed turns: the in-flight hold on the serving engine.
+    /// Held for the turn's whole life (this struct's) so the engine is
+    /// never auto-unloaded mid-request; dropping releases it.
+    #[allow(dead_code)]
+    engine_lease: Option<local_models::EngineLease>,
     attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>>,
     client: reqwest::Client,
     /// Connection row adopted from the most recent attestation flush; the
@@ -3172,7 +3985,12 @@ struct TurnPrep {
     /// The preparation timestamp — spend/refund rows key off it.
     now: i64,
     space_id: String,
+    /// The canonical selection string (`qualified_model_id`) — recorded on
+    /// actions, shown in UIs, returned in `ChatResult`.
     model: String,
+    /// The model id the backend's HTTP API expects in the request body.
+    /// Equals `model` except for openai backends (bare wire model).
+    wire_model: String,
     model_participant_id: String,
     max_completion_tokens: u32,
     /// The inference's attach plan (Reply → fresh item; Revise → a new
@@ -3184,14 +4002,25 @@ struct TurnPrep {
     context_rows: Vec<db::SpaceActionRow>,
     /// The OpenAI messages array built from `context_rows`.
     messages: Vec<serde_json::Value>,
+    /// Estimated hold for this turn. Always `0` when `spend` is `None`.
     charge_credits: u128,
+    /// The in-flight credential spend — `None` for local turns, which have
+    /// no billing. Its absence disables the ACT header, the refund
+    /// machinery, and the `Wallet` emissions throughout the transports.
+    spend: Option<SpendPrep>,
+    /// The `Authorization` header value; present iff `spend` is.
+    auth_value: Option<String>,
+}
+
+/// The credential-spend half of a prepared (remote) turn: the spendable
+/// credential, the proof materials, and the pending-refund row id.
+struct SpendPrep {
     cred: db::SpendableCredential,
     public_key: PublicKey,
     params: Params,
     spend_proof: SpendProof<128>,
     pre_refund: PreRefund,
     pre_cred_id: String,
-    auth_value: String,
 }
 
 impl TurnPrep {
@@ -3207,12 +4036,19 @@ impl TurnPrep {
     /// The chat request body for this turn.
     fn request_body(&self, stream: bool) -> serde_json::Value {
         let mut body = serde_json::json!({
-            "model": self.model,
+            "model": self.wire_model,
             "messages": self.messages,
             "max_completion_tokens": self.max_completion_tokens,
         });
         if stream {
             body["stream"] = serde_json::Value::Bool(true);
+            // The Eidola server forces `include_usage` upstream regardless
+            // (accurate refunds depend on it), so the remote request stays
+            // minimal — but a local llama-server only reports usage when the
+            // client asks.
+            if self.spend.is_none() {
+                body["stream_options"] = serde_json::json!({ "include_usage": true });
+            }
         }
         body
     }
@@ -3236,17 +4072,21 @@ impl TurnPrep {
     }
 
     /// Apply a refund object (inline from a response body, or recovered) to
-    /// the pending spend — writes the successor credential.
+    /// the pending spend — writes the successor credential. A no-op for
+    /// local turns (nothing was spent).
     async fn process_refund_obj(&self, refund_obj: &serde_json::Value) -> Result<(), AppError> {
+        let Some(spend) = &self.spend else {
+            return Ok(());
+        };
         process_refund(
             refund_obj,
-            &self.params,
-            &self.spend_proof,
-            &self.pre_refund,
-            &self.public_key,
+            &spend.params,
+            &spend.spend_proof,
+            &spend.pre_refund,
+            &spend.public_key,
             &self.db_conn,
-            &self.pre_cred_id,
-            self.cred.generation + 1,
+            &spend.pre_cred_id,
+            spend.cred.generation + 1,
             self.now,
         )
         .await
@@ -3254,12 +4094,23 @@ impl TurnPrep {
 
     /// Best-effort refund recovery via `/v1/credentials/refund`. Returns
     /// whether a successor credential was written (the caller decides whether
-    /// that warrants an immediate `Wallet` emission).
+    /// that warrants an immediate `Wallet` emission). Always `false` for
+    /// local turns — there is no spend to recover.
     async fn try_refund_recovery(&self) -> bool {
-        match recover_refund(&self.client, &self.base_url, &self.auth_value).await {
+        let (Some(_), Some(auth_value)) = (&self.spend, &self.auth_value) else {
+            return false;
+        };
+        match recover_refund(&self.client, &self.base_url, auth_value).await {
             Ok(refund_obj) => self.process_refund_obj(&refund_obj).await.is_ok(),
             Err(_) => false,
         }
+    }
+
+    /// The nonce of the spending credential, if this turn carries a spend.
+    /// Recorded on request rows; `None` keeps local turns honest in the
+    /// Record.
+    fn credential_nonce(&self) -> Option<String> {
+        self.spend.as_ref().map(|s| s.cred.nonce.clone())
     }
 
     /// Persist the turn's durable rows — the inference action (per the attach
@@ -3295,7 +4146,8 @@ impl TurnPrep {
                 model: Some(self.model.clone()),
                 input_tokens,
                 output_tokens,
-                credits_consumed: Some(self.charge_credits as i64),
+                // Local turns record no charge (`None`), not a fake zero.
+                credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
                 created_at: now_ms(),
             },
         )
@@ -3363,8 +4215,9 @@ impl TurnPrep {
                 response_at: Some(response_at),
                 duration_ms: Some(response_at - request_at),
                 error: None,
-                credential_nonce: Some(self.cred.nonce.clone()),
+                credential_nonce: self.credential_nonce(),
                 created_at: now_ms(),
+                backend_id: Some(self.backend_id.clone()),
             },
         )
         .await?;
@@ -3905,6 +4758,14 @@ fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError>
     if status.is_success() {
         return Ok(());
     }
+    // 428 Precondition Required is the server's terms-acceptance gate —
+    // typed so UIs route to a review-and-accept step instead of showing a
+    // generic server error.
+    if status == reqwest::StatusCode::PRECONDITION_REQUIRED {
+        return Err(AppError::TermsAcceptanceRequired {
+            message: parse_server_error_message(body),
+        });
+    }
     Err(AppError::Server {
         status: status.as_u16(),
         message: parse_server_error_message(body),
@@ -4079,25 +4940,26 @@ mod tests {
 
         let core = AppCore::new(config_dir.clone(), data_dir.clone());
         let state = core.config_state();
-        assert_eq!(state.appearance, config::AppearanceSetting::System);
+        // `auto` (follow the sun) is the shipped default since the
+        // local-inference wave flipped it from `system`.
+        assert_eq!(state.appearance, config::AppearanceSetting::Auto);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::On);
         assert_eq!(state.light_character, config::LightCharacter::Neutral);
 
-        core.set_appearance(config::AppearanceSetting::Auto)
-            .unwrap();
+        core.set_appearance(config::AppearanceSetting::Day).unwrap();
         core.set_time_of_day_tint(config::TimeOfDayTint::Off)
             .unwrap();
         core.set_light_character(config::LightCharacter::Cool)
             .unwrap();
         let state = core.config_state();
-        assert_eq!(state.appearance, config::AppearanceSetting::Auto);
+        assert_eq!(state.appearance, config::AppearanceSetting::Day);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);
         assert_eq!(state.light_character, config::LightCharacter::Cool);
 
         // A fresh core over the same config dir sees the persisted values.
         let core2 = AppCore::new(config_dir, data_dir);
         let state = core2.config_state();
-        assert_eq!(state.appearance, config::AppearanceSetting::Auto);
+        assert_eq!(state.appearance, config::AppearanceSetting::Day);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);
     }
 
@@ -4132,6 +4994,18 @@ mod tests {
     fn auto_allocation_exact_balance_allocates_it_all() {
         let amount = auto_allocation_amount(6_200, 6_200).unwrap();
         assert_eq!(amount, 6_200);
+    }
+
+    #[test]
+    fn check_status_maps_428_to_terms_acceptance_required() {
+        let body = r#"{"error":{"message":"acceptance of the current terms_of_service is required","type":"terms_acceptance_required"}}"#;
+        let err = check_status(reqwest::StatusCode::PRECONDITION_REQUIRED, body).unwrap_err();
+        match err {
+            AppError::TermsAcceptanceRequired { message } => {
+                assert!(message.contains("terms_of_service"));
+            }
+            other => panic!("expected TermsAcceptanceRequired, got {other:?}"),
+        }
     }
 
     #[test]

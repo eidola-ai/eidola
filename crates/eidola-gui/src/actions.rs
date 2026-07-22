@@ -89,12 +89,3 @@ pub(crate) fn primary_shift_chord(key: &str) -> String {
         format!("Ctrl+Shift+{key}")
     }
 }
-
-/// The display name of the Option/Alt modifier.
-pub(crate) fn alt_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "⌥"
-    } else {
-        "Alt"
-    }
-}

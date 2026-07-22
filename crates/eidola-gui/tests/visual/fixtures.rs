@@ -275,7 +275,7 @@ pub fn kitchen_sink_posts() -> Vec<PostNode> {
         post(
             "a6",
             "agent",
-            "kimi-k2",
+            "gemma-4-E2B_q4_0-it@local",
             "inference",
             1,
             false,

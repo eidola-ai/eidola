@@ -23,6 +23,10 @@ These docs describe how Eidola works, what it commits to, and what it doesn't ye
 
 9. **[Known gaps](gaps.md)** — Every piece of the trust chain that is intentionally deferred, with what it would catch and what constrains it today.
 
+## Operations
+
+10. **[Infrastructure and vendors](vendors.md)** — The complete list of third parties that process data for Eidola, and exactly what each can see. Referenced by the [privacy policy](https://www.eidola.ai/privacy/).
+
 ## For contributors
 
 Contributor-facing READMEs live alongside the code they describe. Start with the top-level [`README.md`](../README.md) for the project landing page and dev setup, [`AGENTS.md`](../AGENTS.md) for the architecture overview, and [`releases/README.md`](../releases/README.md) for release-pipeline operations. Task-oriented runbooks (e.g. provisioning the release signing YubiKey) live in [`contributing/`](contributing/README.md).

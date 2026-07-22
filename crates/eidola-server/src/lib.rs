@@ -20,6 +20,7 @@ pub mod middleware;
 pub mod response;
 pub mod stripe;
 pub mod telemetry;
+pub mod terms_feed;
 pub mod types;
 pub mod upstream_trust;
 pub mod webhook;
@@ -94,6 +95,8 @@ pub fn build_router() -> OpenApiRouter<AppState> {
         .routes(routes!(handlers::chat_completions))
         .routes(routes!(account::list_prices))
         .routes(routes!(account::create_account, account::get_account))
+        .routes(routes!(account::get_terms))
+        .routes(routes!(account::accept_terms))
         .routes(routes!(account::get_subscription))
         .routes(routes!(account::create_checkout))
         .routes(routes!(account::get_balances))

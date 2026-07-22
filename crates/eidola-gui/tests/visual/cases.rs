@@ -13,6 +13,7 @@ use eidola_app_core::{
     SpaceInfo, SpendTrailEntry,
 };
 use eidola_gui::about::AboutView;
+use eidola_gui::backends_settings::BackendsTab;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::OnboardingView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
@@ -451,6 +452,7 @@ fn register_library(s: &mut Snapshots) {
 fn settings_stores(cx: &mut App) -> Stores {
     stub_stores(cx, |s| {
         s.config_state = Some(stub_config_state(true));
+        s.eidola_trust = Some(stub_eidola_trust());
         s.balances = Some(BalancesResult {
             available: 4_200_000,
             pools: vec![
@@ -521,68 +523,322 @@ fn settings_stores(cx: &mut App) -> Stores {
     })
 }
 
+/// `settings_stores` plus a populated backend registry and local-model
+/// state, so the Backends pane's three tabs render with content.
+fn settings_backends_stores(cx: &mut App) -> Stores {
+    use eidola_app_core::{
+        BackendInfo, BackendKind, ExternalEngineBackend, LocalModelInfo, LocalModelStatus,
+        LocalModelsState,
+    };
+    stub_stores(cx, |s| {
+        s.config_state = Some(stub_config_state(true));
+        s.eidola_trust = Some(stub_eidola_trust());
+        s.balances = Some(BalancesResult {
+            available: 4_200_000,
+            pools: vec![BalancePoolInfo {
+                amount: 4_200_000,
+                source: "subscription".into(),
+                expires_at: Some(eidola_app_core::now_ms() + 23 * 24 * 60 * 60 * 1000),
+            }],
+        });
+        s.prices = vec![
+            PriceInfo {
+                id: "price_starter".into(),
+                product_name: "Starter".into(),
+                product_description: Some("A month of casual questions".into()),
+                amount_display: "5.00 USD".into(),
+                recurrence: "/month".into(),
+                credits: 5_000_000,
+            },
+            PriceInfo {
+                id: "price_standard".into(),
+                product_name: "Standard".into(),
+                product_description: Some("Daily thinking, long documents".into()),
+                amount_display: "20.00 USD".into(),
+                recurrence: "/month".into(),
+                credits: 20_000_000,
+            },
+        ];
+        s.backends = vec![
+            BackendInfo {
+                id: "eidola".into(),
+                kind: BackendKind::Eidola,
+                display_name: "Eidola".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+                created_at: 0,
+            },
+            BackendInfo {
+                id: "local".into(),
+                kind: BackendKind::Local,
+                display_name: "Local".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+                created_at: 0,
+            },
+            BackendInfo {
+                id: "my-box".into(),
+                kind: BackendKind::LlamaCpp,
+                display_name: "My box".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: Some("/Users/me/models".into()),
+                model_overrides: None,
+                engine_path: None,
+                auto_start: false,
+                created_at: 1,
+            },
+        ];
+        s.local_models = Some(LocalModelsState {
+            engine_path: Some(
+                "/Applications/Eidola.app/Contents/Resources/bin/llama-server".into(),
+            ),
+            external: vec![ExternalEngineBackend {
+                backend_id: "my-box".into(),
+                display_name: "My box".into(),
+                enabled: true,
+                models_dir: "/Users/me/models".into(),
+                engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+                auto_start: false,
+                models: vec![LocalModelInfo {
+                    id: "qwen3-8b@my-box".into(),
+                    slug: "qwen3-8b".into(),
+                    display_name: "Qwen3 8B".into(),
+                    file_name: "qwen3-8b.gguf".into(),
+                    size_bytes: Some(5_200_000_000),
+                    source_url: None,
+                    status: LocalModelStatus::Available,
+                    last_error: None,
+                }],
+            }],
+            models: vec![
+                LocalModelInfo {
+                    id: "gemma-4-E2B_q4_0-it@local".into(),
+                    slug: "gemma-4-E2B_q4_0-it".into(),
+                    display_name: "Gemma 4 E2B".into(),
+                    file_name: "gemma-4-E2B_q4_0-it.gguf".into(),
+                    size_bytes: Some(3_349_514_112),
+                    source_url: None,
+                    status: LocalModelStatus::Available,
+                    last_error: None,
+                },
+                LocalModelInfo {
+                    id: "gemma-4-E4B_q4_0-it@local".into(),
+                    slug: "gemma-4-E4B_q4_0-it".into(),
+                    display_name: "Gemma 4 E4B".into(),
+                    file_name: "gemma-4-E4B_q4_0-it.gguf".into(),
+                    size_bytes: Some(5_000_000_000),
+                    source_url: None,
+                    status: LocalModelStatus::Loaded {
+                        port: 4242,
+                        context_tokens: 8192,
+                        pinned: true,
+                    },
+                    last_error: None,
+                },
+            ],
+        });
+    })
+}
+
 fn register_settings(s: &mut Snapshots) {
     let settings_size = size(px(620.), px(520.));
 
-    // General at rest: base URL pin, advanced rows hidden behind ⌥.
+    // General: the appearance chips — the whole pane (the trust/connection
+    // surface lives in Backends → Eidola).
     s.add("settings_general", settings_size, |window, cx| {
         let core = settings_stores(cx);
-        cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(core, window, cx))
     });
 
-    // ⌥ held: advanced rows visible, with an overridden base URL and a
-    // user-trusted measurement so the honest "override" annotations show.
-    s.add("settings_general_advanced", settings_size, |window, cx| {
-        let core = stub_stores(cx, |s| {
-            let mut state = stub_config_state(true);
-            state.base_url = "https://staging.eidola.example/v1".into();
-            state.base_url_is_override = true;
-            state.attestation_url = Some("https://atc.tinfoil.sh/v1/attest".into());
-            state.has_hardware_root_ca = true;
-            state.trusted_measurements = vec![MeasurementInfo {
-                snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
-                tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .into(),
-                tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-                    .into(),
-            }];
-            state.trusted_measurements_are_override = true;
-            s.config_state = Some(state);
-        });
-        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
-        let general = view.read(cx).general();
-        general.update(cx, |g, cx| g.set_advanced(true, cx));
+    // Backends → Eidola: the singleton toggle plus the connection + trust
+    // surface (base-URL pin/override, trusted-measurements state, hardware CA
+    // lines).
+    s.add("settings_backends_eidola", settings_size, |window, cx| {
+        let core = settings_backends_stores(cx);
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+        let pane = view.read(cx).backends_pane();
+        pane.update(cx, |p, cx| p.select_tab(BackendsTab::Eidola, cx));
         view
     });
 
-    // Account pane: balance, pools with humanized expiry, plans.
-    s.add("settings_account", settings_size, |window, cx| {
-        let core = settings_stores(cx);
-        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
-        view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
-        view
-    });
-
-    // Account pane with the reset confirm armed (step two of two).
+    // Backends → Eidola with the whole trust bundle overridden: the danger
+    // warning band up top, danger-tinted override status lines, the compact
+    // measurement lines (override + dropped-pin) with their Copy/Untrust/
+    // Trust verbs, and the overridden root CA's Copy/Replace…/Clear verbs —
+    // everything visible at rest, no disclosure.
     s.add(
-        "settings_account_reset_confirm",
+        "settings_backends_eidola_overridden",
         settings_size,
         |window, cx| {
-            let core = settings_stores(cx);
-            let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
-            view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
-            let account = view.read(cx).account();
-            account.update(cx, |a, cx| a.request_reset(cx));
+            use eidola_app_core::{BackendInfo, BackendKind};
+            let core = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(true));
+                let mut trust = stub_eidola_trust();
+                trust.base_url = "https://staging.eidola.example/v1".into();
+                trust.base_url_is_override = true;
+                trust.trusted_measurements = vec![MeasurementInfo {
+                    snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+                    tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .into(),
+                    tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                        .into(),
+                }];
+                trust.trusted_measurements_are_override = true;
+                trust.has_hardware_root_ca = true;
+                trust.hardware_root_ca_pem = Some(
+                    "-----BEGIN CERTIFICATE-----\n\
+                     MIIByDCCAW6gAwIBAgIUExampleCustomRootCAForSnapshotsOnly0\n\
+                     -----END CERTIFICATE-----"
+                        .into(),
+                );
+                s.eidola_trust = Some(trust);
+                s.backends = vec![
+                    BackendInfo {
+                        id: "eidola".into(),
+                        kind: BackendKind::Eidola,
+                        display_name: "Eidola".into(),
+                        enabled: true,
+                        base_url: None,
+                        has_api_key: false,
+                        models_dir: None,
+                        model_overrides: None,
+                        engine_path: None,
+                        auto_start: true,
+                        created_at: 0,
+                    },
+                    BackendInfo {
+                        id: "local".into(),
+                        kind: BackendKind::Local,
+                        display_name: "Local".into(),
+                        enabled: true,
+                        base_url: None,
+                        has_api_key: false,
+                        models_dir: None,
+                        model_overrides: None,
+                        engine_path: None,
+                        auto_start: true,
+                        created_at: 0,
+                    },
+                ];
+            });
+            let view = cx.new(|cx| SettingsView::new(core, window, cx));
+            view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+            let pane = view.read(cx).backends_pane();
+            pane.update(cx, |p, cx| p.select_tab(BackendsTab::Eidola, cx));
             view
         },
     );
 
+    // Backends → Eidola with the in-place editors revealed: the add-a-
+    // measurement input and the root-CA paste-PEM textarea open at once
+    // (each revealed by its own quiet verb; Cancel closes them).
+    s.add(
+        "settings_backends_eidola_editing",
+        settings_size,
+        |window, cx| {
+            use eidola_gui::backends_settings::CaKind;
+            let core = settings_backends_stores(cx);
+            let view = cx.new(|cx| SettingsView::new(core, window, cx));
+            view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+            let pane = view.read(cx).backends_pane();
+            pane.update(cx, |p, cx| {
+                p.select_tab(BackendsTab::Eidola, cx);
+                p.begin_add_measurement(window, cx);
+                p.begin_edit_ca(CaKind::Root, window, cx);
+            });
+            view
+        },
+    );
+
+    // Backends → Local: the managed store — engine line, installed models,
+    // catalog, paste-a-URL.
+    s.add("settings_backends_local", settings_size, |window, cx| {
+        let core = settings_backends_stores(cx);
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+        let pane = view.read(cx).backends_pane();
+        pane.update(cx, |p, cx| p.select_tab(BackendsTab::Local, cx));
+        view
+    });
+
+    // Backends → External: a llamacpp backend (engine line + auto-start +
+    // scanned models) and the add-a-backend affordances.
+    s.add("settings_backends_external", settings_size, |window, cx| {
+        let core = settings_backends_stores(cx);
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+        let pane = view.read(cx).backends_pane();
+        pane.update(cx, |p, cx| p.select_tab(BackendsTab::External, cx));
+        view
+    });
+
+    // Account pane (top-level again): balance + pools + plans, shown while
+    // the eidola backend is enabled.
+    s.add("settings_account", settings_size, |window, cx| {
+        let core = settings_stores(cx);
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+        view
+    });
+
     // Wallet pane: the four lifecycle states in one honest listing.
     s.add("settings_wallet", settings_size, |window, cx| {
         let core = settings_stores(cx);
-        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
         view.update(cx, |v, cx| v.select(SettingsPane::Wallet, cx));
         view
+    });
+
+    // Nav gating: with the eidola backend disabled, only General and Backends
+    // show (Account/Wallet are hidden — "on-device only").
+    s.add("settings_nav_no_eidola", settings_size, |window, cx| {
+        use eidola_app_core::{BackendInfo, BackendKind};
+        let core = stub_stores(cx, |s| {
+            s.config_state = Some(stub_config_state(true));
+            s.eidola_trust = Some(stub_eidola_trust());
+            s.backends = vec![
+                BackendInfo {
+                    id: "eidola".into(),
+                    kind: BackendKind::Eidola,
+                    display_name: "Eidola".into(),
+                    enabled: false,
+                    base_url: None,
+                    has_api_key: false,
+                    models_dir: None,
+                    model_overrides: None,
+                    engine_path: None,
+                    auto_start: true,
+                    created_at: 0,
+                },
+                BackendInfo {
+                    id: "local".into(),
+                    kind: BackendKind::Local,
+                    display_name: "Local".into(),
+                    enabled: true,
+                    base_url: None,
+                    has_api_key: false,
+                    models_dir: None,
+                    model_overrides: None,
+                    engine_path: None,
+                    auto_start: true,
+                    created_at: 0,
+                },
+            ];
+        });
+        cx.new(|cx| SettingsView::new(core, window, cx))
     });
 }
 
@@ -827,6 +1083,8 @@ fn register_record(s: &mut Snapshots) {
                 ),
                 space_id: None,
                 space_title: None,
+                backend_id: Some("eidola".into()),
+                backend_display_name: Some("Eidola".into()),
             }))));
             view
         })
@@ -908,20 +1166,32 @@ fn model_stores(cx: &mut App) -> Stores {
 
 fn stub_config_state(has_account: bool) -> ConfigState {
     ConfigState {
-        base_url: "https://eidola.example/v1".into(),
         default_model: "gemma4-31b".into(),
-        base_url_pin: "https://eidola.example/v1".into(),
-        base_url_is_override: false,
         has_account,
         has_account_secret: has_account,
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
-        trusted_measurements: Vec::new(),
-        trusted_measurements_are_override: false,
-        has_hardware_root_ca: false,
-        has_hardware_intermediate_ca: false,
         attestation_url: None,
         appearance: eidola_app_core::config::AppearanceSetting::System,
         time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
         light_character: eidola_app_core::config::LightCharacter::Neutral,
+    }
+}
+
+fn stub_eidola_trust() -> eidola_app_core::EidolaTrust {
+    eidola_app_core::EidolaTrust {
+        base_url: "https://eidola.example/v1".into(),
+        base_url_pin: "https://eidola.example/v1".into(),
+        base_url_is_override: false,
+        trusted_measurements: Vec::new(),
+        trusted_measurements_are_override: false,
+        pinned_measurement: eidola_app_core::MeasurementInfo {
+            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
+            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+        },
+        has_hardware_root_ca: false,
+        hardware_root_ca_pem: None,
+        has_hardware_intermediate_ca: false,
+        hardware_intermediate_ca_pem: None,
     }
 }

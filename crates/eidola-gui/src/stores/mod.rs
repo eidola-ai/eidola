@@ -20,7 +20,9 @@
 //! the individual store entities pulled from it) and call store methods.
 
 pub mod account;
+pub mod backends;
 pub mod config;
+pub mod local_models;
 pub mod models;
 pub mod record;
 pub mod spaces;
@@ -34,8 +36,10 @@ use eidola_app_core::changes::Change;
 use gpui::{App, AppContext, AsyncApp, Entity};
 
 pub use account::AccountStore;
+pub use backends::BackendsStore;
 pub use config::ConfigStore;
-pub use models::ModelsStore;
+pub use local_models::LocalModelsStore;
+pub use models::{BackendCatalog, ModelsStore};
 pub use record::RecordStore;
 pub use spaces::SpacesStore;
 pub use update::UpdateStore;
@@ -54,7 +58,9 @@ pub use wallet::WalletStore;
 pub struct Stores {
     app_core: Option<Arc<AppCore>>,
     pub config: Entity<ConfigStore>,
+    pub backends: Entity<BackendsStore>,
     pub models: Entity<ModelsStore>,
+    pub local_models: Entity<LocalModelsStore>,
     pub account: Entity<AccountStore>,
     pub wallet: Entity<WalletStore>,
     pub spaces: Entity<SpacesStore>,
@@ -92,8 +98,19 @@ impl Stores {
     /// the scene declaratively and each store is constructed via its own
     /// stub constructor with no backend.
     pub fn stub_with(fixture: StoresStub, cx: &mut App) -> Self {
-        let config = cx.new(|_| ConfigStore::stub(fixture.config_state));
-        let models = cx.new(|_| ModelsStore::stub(fixture.models));
+        let config = cx.new(|_| {
+            let mut store = ConfigStore::stub(fixture.config_state);
+            store.set_eidola_trust_for_test(fixture.eidola_trust);
+            store
+        });
+        let backends = cx.new(|_| BackendsStore::stub(fixture.backends));
+        // Explicit per-backend catalogs win; otherwise the flat model list
+        // becomes the eidola catalog (the pre-backends fixture shape).
+        let models = cx.new(|_| match fixture.backend_catalogs {
+            Some(catalogs) => ModelsStore::stub_catalogs(catalogs),
+            None => ModelsStore::stub(fixture.models),
+        });
+        let local_models = cx.new(|_| LocalModelsStore::stub(fixture.local_models));
         let account = cx.new(|_| AccountStore::stub(fixture.balances, fixture.prices));
         let wallet =
             cx.new(|_| WalletStore::stub(fixture.credential_lifecycle, fixture.credentials));
@@ -103,7 +120,9 @@ impl Stores {
         Self {
             app_core: None,
             config,
+            backends,
             models,
+            local_models,
             account,
             wallet,
             spaces,
@@ -122,7 +141,9 @@ impl Stores {
 
     fn with_core(app_core: Option<Arc<AppCore>>, cx: &mut App) -> Self {
         let config = cx.new(|_| ConfigStore::new(app_core.clone()));
+        let backends = cx.new(|_| BackendsStore::new(app_core.clone()));
         let models = cx.new(|_| ModelsStore::new(app_core.clone()));
+        let local_models = cx.new(|_| LocalModelsStore::new(app_core.clone()));
         let account = cx.new(|_| AccountStore::new(app_core.clone()));
         let wallet = cx.new(|_| WalletStore::new(app_core.clone()));
         let spaces = cx.new(|_| SpacesStore::new(app_core.clone()));
@@ -131,7 +152,9 @@ impl Stores {
         Self {
             app_core,
             config,
+            backends,
             models,
+            local_models,
             account,
             wallet,
             spaces,
@@ -154,7 +177,19 @@ impl Stores {
 #[derive(Default)]
 pub struct StoresStub {
     pub config_state: Option<eidola_app_core::ConfigState>,
+    /// The eidola connection + trust bundle (base URL, measurements, hardware
+    /// CAs) — read from the `eidola` backend row in production; supplied here
+    /// for the General pane's base-URL + trust rows in stub scenes.
+    pub eidola_trust: Option<eidola_app_core::EidolaTrust>,
+    /// Configured backends. An empty list leaves the store `NotLoaded`,
+    /// which reads as "singletons enabled" (the optimistic default).
+    pub backends: Vec<eidola_app_core::BackendInfo>,
+    /// Flat eidola model list (the pre-backends fixture shape). Ignored
+    /// when `backend_catalogs` is set.
     pub models: Vec<eidola_app_core::ModelInfo>,
+    /// Explicit per-backend catalogs for multi-backend scenes.
+    pub backend_catalogs: Option<Vec<BackendCatalog>>,
+    pub local_models: Option<eidola_app_core::LocalModelsState>,
     pub balances: Option<eidola_app_core::BalancesResult>,
     pub prices: Vec<eidola_app_core::PriceInfo>,
     pub credentials: Vec<eidola_app_core::CredentialInfo>,
@@ -274,6 +309,24 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
         Change::UpdateState => {
             stores.update.update(cx, |s, cx| s.refresh(cx));
         }
+        // Downloads progressing, engines loading/unloading, deletions — the
+        // whole local-inference domain re-snapshots from one signal.
+        Change::LocalModels => {
+            stores.local_models.update(cx, |s, cx| s.refresh(cx));
+        }
+        // The set of configured destinations changed: re-snapshot the
+        // registry, the per-backend model catalogs, and the engine domain
+        // (a llamacpp backend may have appeared/vanished). The eidola row also
+        // carries the connection + trust bundle (base URL / measurements /
+        // hardware CAs), so refresh the config store's `EidolaTrust` snapshot
+        // too — the base-URL editor and trust rows live in Settings → Backends
+        // → Eidola and must reflect another window's write.
+        Change::Backends => {
+            stores.config.update(cx, |s, cx| s.refresh(cx));
+            stores.backends.update(cx, |s, cx| s.refresh(cx));
+            stores.models.update(cx, |s, cx| s.refresh(cx));
+            stores.local_models.update(cx, |s, cx| s.refresh(cx));
+        }
     }
 }
 
@@ -281,7 +334,9 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
 /// so re-read everything we care about.
 fn refresh_everything(stores: &Stores, cx: &mut App) {
     stores.config.update(cx, |s, cx| s.refresh(cx));
+    stores.backends.update(cx, |s, cx| s.refresh(cx));
     stores.models.update(cx, |s, cx| s.refresh(cx));
+    stores.local_models.update(cx, |s, cx| s.refresh(cx));
     stores.account.update(cx, |s, cx| {
         s.refresh_balances(cx);
         s.refresh_prices(cx);

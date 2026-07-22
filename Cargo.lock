@@ -2640,6 +2640,7 @@ dependencies = [
  "eidola-common",
  "futures-util",
  "hex",
+ "libc",
  "p256",
  "p384",
  "rand_core 0.6.4",
@@ -2776,6 +2777,7 @@ version = "0.1.0"
 dependencies = [
  "pulldown-cmark 0.13.4",
  "serde",
+ "sha2 0.10.9",
  "toml 0.8.23",
 ]
 

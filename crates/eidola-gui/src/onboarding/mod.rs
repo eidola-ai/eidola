@@ -204,6 +204,19 @@ impl OnboardingView {
         self.revealed.clone()
     }
 
+    /// Glide the page to a revealed slide by index — the back arrow's action.
+    /// Public so behavior tests can drive the same path the arrow's click takes.
+    #[doc(hidden)]
+    pub fn scroll_to_slide(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.glide_to_index(index, window, cx);
+    }
+
+    /// The resting offset the current glide lands on (test seam for the snap).
+    #[doc(hidden)]
+    pub fn pinned_y_for_test(&self) -> Option<f32> {
+        self.pinned_y
+    }
+
     /// The freshly-created account id + secret, if account creation succeeded.
     #[doc(hidden)]
     pub fn created_for_test(&self) -> Option<(String, String)> {
@@ -313,6 +326,42 @@ impl OnboardingView {
     }
 
     // -- Account operations ------------------------------------------------
+
+    /// Leave onboarding through one of its deliberate exits (skip / done /
+    /// later), landing the user in the app.
+    ///
+    /// At launch onboarding opens *instead of* a blank space (see `run`), so
+    /// the exit has to open the space it stood in for — otherwise a finished
+    /// flow leaves no window at all: macOS would linger dock-only, and Linux
+    /// quits outright the moment the last window closes (gpui's own
+    /// `QuitMode::Default`, plus `run`'s `on_window_closed`). Only when this
+    /// *is* the last window, though — opened from the Eidola menu there's
+    /// already a window behind it, and a surprise second blank space is not
+    /// what "Later" means.
+    ///
+    /// Order is load-bearing: open first, close second. `remove_window` only
+    /// flags the window; gpui tears it down and runs the quit-on-empty check
+    /// as this update unwinds, so the replacement must already be in
+    /// `cx.windows()` by then. Deferring the open would land it after the
+    /// app had quit.
+    fn leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cx.windows().len() <= 1 {
+            crate::open_blank_space_window(cx, self.stores.clone());
+        }
+        window.remove_window();
+    }
+
+    /// The account-free path: disable the `eidola` backend (recorded in the
+    /// DB, so launch stops auto-opening onboarding) and leave. Asks then
+    /// route only to on-device / self-configured backends; the choice
+    /// reverses any time in Settings → Backends (or by walking this flow
+    /// again from the Eidola menu).
+    pub fn skip_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stores
+            .backends
+            .update(cx, |s, cx| s.set_enabled("eidola".into(), false, cx));
+        self.leave(window, cx);
+    }
 
     /// Create an anonymous account (new-account branch). On success, store the
     /// id/secret, refresh config + balances, and reveal the "Your new account"
@@ -459,11 +508,30 @@ impl Render for OnboardingView {
         }
 
         let revealed = self.revealed.clone();
-        let body = v_flex().w_full().children(
-            revealed
-                .into_iter()
-                .map(|slide| self.render_slide(slide, cx)),
-        );
+        let body = v_flex()
+            .w_full()
+            .children(revealed.into_iter().enumerate().map(|(idx, slide)| {
+                let inner = self.render_slide(slide, cx);
+                // Every slide past the first carries a visible up-chevron "back"
+                // affordance (a discoverable alternative to the scroll-back
+                // gesture) that glides to the previous slide. Flow sequencing —
+                // forward *and* back — lives with the parent, so the back wiring
+                // is here rather than on the stateless slide components.
+                if idx == 0 {
+                    inner
+                } else {
+                    let on_back: slides::OnClick =
+                        Box::new(cx.listener(move |this, _, window, cx| {
+                            this.glide_to_index(idx - 1, window, cx);
+                        }));
+                    div()
+                        .relative()
+                        .w_full()
+                        .child(inner)
+                        .child(slides::back_button(idx, on_back, cx))
+                        .into_any_element()
+                }
+            }));
 
         // Round all four corners to the CSD frame on Linux (no-op on
         // macOS/SSD) — the same treatment every other window root gets.
@@ -599,6 +667,9 @@ impl OnboardingView {
                 on_existing_account: Box::new(cx.listener(|this, _, _, cx| {
                     this.reveal(Slide::GetStarted, Slide::ExistingAccount, cx)
                 })),
+                on_skip_account: Box::new(
+                    cx.listener(|this, _, window, cx| this.skip_account(window, cx)),
+                ),
             }
             .into_any_element(),
             Slide::CreateAccount => slides::CreateAccount {
@@ -632,7 +703,7 @@ impl OnboardingView {
                 on_purchase: Box::new(cx.listener(|this, _, _, cx| {
                     this.reveal(Slide::ExistingAccount, Slide::Purchase, cx)
                 })),
-                on_done: Box::new(cx.listener(|_, _, window, _| window.remove_window())),
+                on_done: Box::new(cx.listener(|this, _, window, cx| this.leave(window, cx))),
             }
             .into_any_element(),
             Slide::Purchase => {
@@ -647,7 +718,7 @@ impl OnboardingView {
                     checkout_pending: self.checkout_pending.clone(),
                     checkout_error: self.checkout_error.clone(),
                     on_select,
-                    on_later: Box::new(cx.listener(|_, _, window, _| window.remove_window())),
+                    on_later: Box::new(cx.listener(|this, _, window, cx| this.leave(window, cx))),
                 }
                 .into_any_element()
             }

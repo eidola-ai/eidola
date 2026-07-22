@@ -40,7 +40,9 @@ One gpui entity per domain, created at startup, held by `AppGlobal`, observed by
 | Store | Owns | Notes |
 |---|---|---|
 | `ConfigStore` | `ConfigState` snapshot; set/clear overrides, default model | Synchronous reads, write-through; emits `Config` |
-| `ModelsStore` | model list + pricing | Refreshed at launch + on demand; first-window list comes from here (fixes wave-2 bug 1 structurally) |
+| `BackendsStore` | the backend registry (configured inference destinations) | Refreshed at launch + on `Backends`; add/enable/remove ops with optimistic list edits |
+| `ModelsStore` | per-backend model catalogs (one `Loadable` + fetch slot per fetch-based backend) | Refreshed at launch + on demand; `refresh_backend(id)` re-fetches one — a dead server never blanks another's list (first-window list comes from here; fixes wave-2 bug 1 structurally) |
+| `LocalModelsStore` | engine-domain snapshot (managed models on disk / downloading, running engines, engine binary, each llamacpp backend's scanned directory) | Refreshed at launch + on `LocalModels`; ops are thin initiating calls — the downloads/engine supervisors are core-owned tasks that survive any window |
 | `AccountStore` | balances, prices, account lifecycle, checkout | The checkout *poll* is view-owned (see scoping); its result lands here via invalidation |
 | `WalletStore` | credential lifecycle list, recovery | |
 | `SpacesStore` | the Library index **and** the space-entity registry (below) | |
@@ -124,6 +126,8 @@ pub enum Change {
     Space(SpaceId),     // actions/messages within one space
     Record,             // attestations / requests / spend trail appended
     UpdateState,
+    LocalModels,        // local model downloads / engine lifecycle
+    Backends,           // the backend registry (add/update/enable/remove)
 }
 ```
 
@@ -133,7 +137,7 @@ pub enum Change {
 
 ### Input-state sharing (the ⌥ pattern)
 
-gpui dispatches `ModifiersChangedEvent` along the **focused element's ancestor path only** (verified at pin 969a67fc) — a listener on a sibling branch never fires (wave-2 bug 2). Therefore: exactly one listener per window, on the window-root view (the one whose tracked focus handle is always an ancestor of focus), mirroring into a per-window `WindowInput` entity (`alt_held`, future modifier/chord state). Descendant views observe `WindowInput`; **no view below the root may register `on_modifiers_changed`**. Chat's existing reveal migrates onto this; the Settings ⌥ reveal starts working structurally.
+gpui dispatches `ModifiersChangedEvent` along the **focused element's ancestor path only** (verified at pin 969a67fc) — a listener on a sibling branch never fires (wave-2 bug 2). Therefore: exactly one listener per window, on the window-root view (the one whose tracked focus handle is always an ancestor of focus), mirroring into a per-window `WindowInput` entity (`alt_held`, future modifier/chord state). Descendant views observe `WindowInput`; **no view below the root may register `on_modifiers_changed`**. This backs `SpaceView`'s ⌥-reveal of the composer's Post affordance. *(Settings used to use it too, for a ⌥-hold "advanced" reveal — but that pattern was unusable for the editors it gated (releasing ⌥ to type hid the field). Settings dropped its `WindowInput` wiring entirely; its trust editors are now always-visible rows that reveal their inputs in place on click — no modifier, no disclosure.)*
 
 ### Lists
 
@@ -144,7 +148,9 @@ Any list that can exceed roughly one screen renders through gpui's virtualized p
 | State | Scope | Owner |
 |---|---|---|
 | Config / overrides / default model | global | `ConfigStore` |
-| Models + pricing | global | `ModelsStore` |
+| Backend registry | global | `BackendsStore` |
+| Per-backend model catalogs | global | `ModelsStore` |
+| Local models + engines | global | `LocalModelsStore` (snapshots; the work itself is core-owned) |
 | Balances, prices, account lifecycle | global | `AccountStore` |
 | Credential lifecycle | global | `WalletStore` |
 | Library index | global | `SpacesStore` |

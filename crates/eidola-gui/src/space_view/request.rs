@@ -97,6 +97,18 @@ impl SpaceView {
         cx.notify();
     }
 
+    /// Re-fetch one backend's model catalog — the panel's per-backend retry
+    /// (after a failed fetch) and refresh (over a good one) affordance. The
+    /// store owns the task slot; the panel stays open so the refreshing →
+    /// result transition is visible in place, and the other backends'
+    /// catalogs are untouched.
+    fn refresh_backend_models(&mut self, backend_id: String, cx: &mut Context<Self>) {
+        self.stores
+            .models
+            .update(cx, |s, cx| s.refresh_backend(backend_id, cx));
+        cx.notify();
+    }
+
     // -- The action gutter ---------------------------------------------------
 
     /// The active composer's action gutter: Ask (⌘↩), the ⌥-revealed Post
@@ -174,28 +186,39 @@ impl SpaceView {
             );
         }
 
-        // The addressee — who the ask goes to. Mirrors the time line under the
-        // byline (text_xs, muted); opens the request panel.
+        // The addressee — who the ask goes to. Mirrors the byline's display
+        // pair: the model's human name over its backend's name (text_xs,
+        // muted); opens the request panel.
         let model = self.current_model(cx);
+        let (model_name, backend_name) = self.model_display(&model, cx);
         col = col.child(
             h_flex()
                 .id("space-model-chip")
                 .probe(
                     "space/composer/model",
                     gpui::Role::Button,
-                    SharedString::from(format!("Model: {model}")),
+                    SharedString::from(format!("Model: {model_name}, via {backend_name}")),
                 )
                 .px_1()
                 .ml_neg_1()
                 .mt_0p5()
                 .rounded_md()
                 .cursor_pointer()
-                .items_baseline()
+                .items_start()
                 .gap_1()
                 .text_xs()
                 .text_color(fg)
                 .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
-                .child(SharedString::from(model))
+                .child(
+                    v_flex()
+                        .items_start()
+                        .child(model_name.clone())
+                        // Suppressed when it would just repeat the name
+                        // (mirrors the gutter's rule).
+                        .when(backend_name != model_name, |d| {
+                            d.child(div().text_color(hint_fg).child(backend_name))
+                        }),
+                )
                 .child(div().text_color(hint_fg).child(if self.request_panel_open {
                     "⌃"
                 } else {
@@ -251,7 +274,41 @@ impl SpaceView {
             .state()
             .map(|s| s.default_model.clone())
             .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string());
-        let models = self.stores.models.read(cx).list().to_vec();
+
+        // One group per backend. Engine-backed groups lead — models on this
+        // machine outrank any catalog for immediacy: the managed local
+        // store, then each enabled llamacpp backend, listing **every**
+        // on-disk model (a request against an unloaded one loads its engine
+        // on demand; the per-row info line says which are loaded). The
+        // fetch-based catalogs (eidola, then openai backends) follow, each
+        // carrying its own health so a dead server degrades to *its own*
+        // retry footer while every other group stays selectable — the panel
+        // is never a dead end.
+        let local_store = self.stores.local_models.read(cx);
+        let backends_store = self.stores.backends.read(cx);
+        let mut engine_groups: Vec<(String, String, Vec<eidola_app_core::LocalModelInfo>)> =
+            Vec::new();
+        if backends_store.is_enabled(eidola_app_core::LOCAL_BACKEND_ID) {
+            let selectable = local_store.selectable_models();
+            if !selectable.is_empty() {
+                let header = backends_store
+                    .get(eidola_app_core::LOCAL_BACKEND_ID)
+                    .map(|b| b.display_name.clone())
+                    .unwrap_or_else(|| "Local".into());
+                engine_groups.push(("local".into(), header, selectable));
+            }
+        }
+        for ext in local_store.external() {
+            if !ext.enabled {
+                continue;
+            }
+            let selectable = local_store.external_selectable_models(&ext.backend_id);
+            if !selectable.is_empty() {
+                engine_groups.push((ext.backend_id.clone(), ext.display_name.clone(), selectable));
+            }
+        }
+        let catalogs: Vec<crate::stores::BackendCatalog> =
+            self.stores.models.read(cx).catalogs().to_vec();
 
         let mut panel = v_flex()
             .id("space-request-panel")
@@ -271,86 +328,178 @@ impl SpaceView {
             panel.bottom(px(win - anchor_top + 8.0))
         };
 
-        if models.is_empty() {
-            // Honest empty state: the model list hasn't loaded (or the fetch
-            // failed) — say what a send will actually use.
-            return panel
-                .child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(SharedString::from(format!(
-                            "Model list unavailable — asks use {current}."
-                        ))),
-                )
-                .into_any_element();
+        if engine_groups.is_empty() && catalogs.is_empty() {
+            // Honest note when nothing is selectable yet — say what a send
+            // will actually use. Rendered inline (no early return) so any
+            // catalog footers below stay actionable.
+            let (name, backend) = self.model_display(&current, cx);
+            panel = panel.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(format!(
+                        "Model list unavailable — asks use {name} (via {backend})."
+                    ))),
+            );
         }
 
-        for (idx, model) in models.iter().enumerate() {
-            let is_current = model.id == current;
-            let is_default = model.id == default_model;
+        let mut first_group = true;
 
-            let mut markers: Vec<&str> = Vec::new();
-            if is_current {
-                markers.push("current");
+        // Engine-backed groups: every on-disk model, its load state told
+        // honestly in the info line.
+        for (backend_id, header, models) in &engine_groups {
+            panel = panel.child(group_header(header.clone(), !first_group, cx));
+            first_group = false;
+            for (idx, model) in models.iter().enumerate() {
+                let probe_name = format!("space/request-panel/engine/{backend_id}/{idx}");
+                let info = match model.status {
+                    eidola_app_core::LocalModelStatus::Loaded {
+                        context_tokens,
+                        pinned,
+                        ..
+                    } => format!(
+                        "loaded{} · {}-token context · no charge",
+                        if pinned { " · pinned" } else { "" },
+                        format_credits(context_tokens as i64)
+                    ),
+                    eidola_app_core::LocalModelStatus::Loading => {
+                        "starting engine… · no charge".to_string()
+                    }
+                    _ => "loads on request · no charge".to_string(),
+                };
+                panel = panel.child(self.panel_model_row(
+                    probe_name,
+                    model.display_name.clone(),
+                    model.id.clone(),
+                    info,
+                    &current,
+                    &default_model,
+                    idx > 0,
+                    cx,
+                ));
             }
-            if is_default {
-                markers.push("default");
+        }
+
+        // Fetch-based catalogs, each with its own status footer.
+        for catalog in &catalogs {
+            let backend_id = catalog.backend.id.clone();
+            let header = if catalog.backend.kind == eidola_app_core::BackendKind::Eidola {
+                "Via Eidola".to_string()
+            } else {
+                catalog.backend.display_name.clone()
+            };
+            panel = panel.child(group_header(header, !first_group, cx));
+            first_group = false;
+
+            let models = catalog.models.value().map(|v| v.as_slice()).unwrap_or(&[]);
+            for (idx, model) in models.iter().enumerate() {
+                let probe_name = format!("space/request-panel/remote/{backend_id}/{idx}");
+                panel = panel.child(self.panel_model_row(
+                    probe_name,
+                    model.id.clone(),
+                    model.id.clone(),
+                    model_info_line(model),
+                    &current,
+                    &default_model,
+                    idx > 0,
+                    cx,
+                ));
             }
 
-            let mut name = div().text_sm().child(SharedString::from(model.id.clone()));
-            if is_current {
-                name = name.font_weight(FontWeight::SEMIBOLD);
-            }
-            let mut name_row = h_flex()
-                .w_full()
-                .justify_between()
-                .items_baseline()
-                .child(name);
-            if !markers.is_empty() {
-                name_row = name_row.child(
+            // This backend's status + retry/refresh: refreshing → a quiet
+            // in-flight note; a failed/offline fetch → "Retry" quoting the
+            // error; a good list → "Refresh" (offered even over success).
+            let refreshing = catalog.models.is_loading() || catalog.models.is_stale();
+            let error = catalog.models.error().map(|e| e.to_string());
+            if refreshing {
+                panel = panel.child(
                     div()
+                        .w_full()
+                        .px_3()
+                        .py_2()
                         .text_xs()
                         .italic()
                         .text_color(theme.muted_foreground)
-                        .child(SharedString::from(markers.join(" · "))),
+                        .child("Refreshing models…"),
                 );
-            }
-
-            let id = model.id.clone();
-            panel = panel.child(
-                v_flex()
-                    .id(("space-model-row", idx))
-                    .probe(
-                        format!("space/request-panel/row/{idx}"),
-                        gpui::Role::ListBoxOption,
-                        model.id.clone(),
-                    )
-                    .aria_selected(is_current)
-                    .w_full()
-                    .px_3()
-                    .py_2()
-                    .gap_0p5()
-                    .when(idx > 0, |d| d.border_t_1().border_color(theme.border))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(cx.theme().muted.opacity(0.5)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_model(id.clone(), cx)))
-                    .child(name_row)
-                    .child(
+            } else if let Some(err) = error {
+                let id_retry = backend_id.clone();
+                panel = panel.child(
+                    v_flex()
+                        .id(SharedString::from(format!(
+                            "space-request-panel-retry-{backend_id}"
+                        )))
+                        .probe(
+                            format!("space/request-panel/{backend_id}/retry"),
+                            gpui::Role::Button,
+                            format!("Retry loading {}'s models", catalog.backend.display_name),
+                        )
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .gap_0p5()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(cx.theme().muted.opacity(0.5)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.refresh_backend_models(id_retry.clone(), cx)
+                        }))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(
+                            SharedString::from(format!("Couldn't load the model list — {err}")),
+                        ))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.foreground)
+                                .child("Retry"),
+                        ),
+                );
+            } else {
+                if models.is_empty() {
+                    panel = panel.child(
                         div()
+                            .px_3()
+                            .py_1()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(SharedString::from(model_info_line(model))),
-                    ),
-            );
+                            .child("No models listed."),
+                    );
+                }
+                let id_refresh = backend_id.clone();
+                panel = panel.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "space-request-panel-refresh-{backend_id}"
+                        )))
+                        .probe(
+                            format!("space/request-panel/{backend_id}/refresh"),
+                            gpui::Role::Button,
+                            format!("Refresh {}'s models", catalog.backend.display_name),
+                        )
+                        .w_full()
+                        .px_3()
+                        .py_1p5()
+                        .text_xs()
+                        .italic()
+                        .text_color(theme.muted_foreground)
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(cx.theme().foreground))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.refresh_backend_models(id_refresh.clone(), cx)
+                        }))
+                        .child("Refresh models"),
+                );
+            }
         }
 
         if current != default_model {
             // Quiet, secondary: persist this space's model as the config
-            // default. Only offered when it would change anything.
-            let label = format!("Set {current} as default");
+            // default. Only offered when it would change anything. Displays
+            // the human name; the persisted value stays the selection id.
+            let (name, _) = self.model_display(&current, cx);
+            let label = format!("Set {name} as default");
             panel = panel.child(
                 div()
                     .id("space-set-default-model")
@@ -376,11 +525,97 @@ impl SpaceView {
 
         panel.into_any_element()
     }
+
+    /// One selectable model row of the request panel: the name line with
+    /// current/default markers, and an honest info line. Shared by the
+    /// engine-backed and fetch-based groups (they differ only in what the
+    /// info line says).
+    #[allow(clippy::too_many_arguments)]
+    fn panel_model_row(
+        &self,
+        probe_name: String,
+        display: String,
+        model_id: String,
+        info: String,
+        current: &str,
+        default_model: &str,
+        bordered: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let is_current = model_id == current;
+        let is_default = model_id == default_model;
+
+        let mut markers: Vec<&str> = Vec::new();
+        if is_current {
+            markers.push("current");
+        }
+        if is_default {
+            markers.push("default");
+        }
+
+        let mut name = div().text_sm().child(SharedString::from(display));
+        if is_current {
+            name = name.font_weight(FontWeight::SEMIBOLD);
+        }
+        let mut name_row = h_flex()
+            .w_full()
+            .justify_between()
+            .items_baseline()
+            .child(name);
+        if !markers.is_empty() {
+            name_row = name_row.child(
+                div()
+                    .text_xs()
+                    .italic()
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(markers.join(" · "))),
+            );
+        }
+
+        let id = model_id.clone();
+        v_flex()
+            .id(SharedString::from(format!("row-{probe_name}")))
+            .probe(probe_name, gpui::Role::ListBoxOption, model_id)
+            .aria_selected(is_current)
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap_0p5()
+            .when(bordered, |d| d.border_t_1().border_color(theme.border))
+            .cursor_pointer()
+            .hover(|s| s.bg(cx.theme().muted.opacity(0.5)))
+            .on_click(cx.listener(move |this, _, _, cx| this.select_model(id.clone(), cx)))
+            .child(name_row)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(info)),
+            )
+    }
 }
 
 /// A small muted keyboard hint beside a verb (shown while ⌥ is held).
 fn kbd_hint(text: &'static str, color: gpui::Hsla) -> gpui::Div {
     div().text_xs().text_color(color).child(text)
+}
+
+/// A quiet group header inside the request panel — one per backend group.
+fn group_header(label: String, bordered: bool, cx: &gpui::App) -> gpui::Div {
+    let theme = cx.theme();
+    let mut header = div()
+        .px_3()
+        .pt_2()
+        .pb_0p5()
+        .text_xs()
+        .italic()
+        .text_color(theme.muted_foreground)
+        .child(SharedString::from(label));
+    if bordered {
+        header = header.border_t_1().border_color(theme.border);
+    }
+    header
 }
 
 /// One honest line of per-model info for the panel, from the `/models`

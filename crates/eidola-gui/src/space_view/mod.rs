@@ -382,6 +382,20 @@ impl SpaceView {
             // The request panel renders the model list + config default.
             cx.observe(&stores.models, |_, _, cx| cx.notify()),
             cx.observe(&stores.config, |_, _, cx| cx.notify()),
+            // Local models feed the request panel (a load/unload while it's
+            // open must re-render — offline, the models store is quiet, so
+            // this is the *only* signal that would refresh it) *and* the
+            // byline display names, which live in the rebuilt snapshot.
+            cx.observe(&stores.local_models, |this: &mut Self, _, cx| {
+                this.rebuild(cx);
+                cx.notify();
+            }),
+            // Backend enable/disable flips which groups the panel shows;
+            // display names feed the byline snapshot too.
+            cx.observe(&stores.backends, |this: &mut Self, _, cx| {
+                this.rebuild(cx);
+                cx.notify();
+            }),
         ];
 
         let mut this = Self {
@@ -663,14 +677,57 @@ impl SpaceView {
     /// orphaned draft whose parent vanished re-attaches as a root in
     /// [`Self::effective_tree`]).
     pub(crate) fn rebuild(&mut self, cx: &mut Context<Self>) {
-        let posts: Vec<PostData> = self
-            .space
-            .read(cx)
-            .messages()
+        let messages: Vec<crate::space::ChatMessageView> = self.space.read(cx).messages().to_vec();
+        let posts: Vec<PostData> = messages
             .iter()
-            .map(post_data_from)
+            .map(|m| {
+                // Assistant rows carry the raw model selection id as their
+                // participant label; split it into the human display pair
+                // (model name over backend name) for the gutter. Everything
+                // else ("You", "Error") passes through with no sub-line.
+                let (byline, byline_backend) = if m.message.role == "assistant" {
+                    let (name, backend) = self.model_display(&m.byline, cx);
+                    (name, Some(backend))
+                } else {
+                    (SharedString::from(m.byline.clone()), None)
+                };
+                post_data_from(m, byline, byline_backend)
+            })
             .collect();
         self.posts = posts;
+    }
+
+    /// Split a model selection id into its human display pair: the model's
+    /// display name and its backend's display name — `"Gemma 4 E2B"` over
+    /// `"Local"` instead of `gemma-4-E2B_q4_0-it@local`. Engine-served
+    /// models resolve through the local snapshot's display names; catalog
+    /// models keep their wire id as the name (it *is* the published name).
+    /// Falls back to the raw parts when nothing matches, so an unknown or
+    /// since-deleted model still renders honestly.
+    pub fn model_display(&self, selection: &str, cx: &gpui::App) -> (SharedString, SharedString) {
+        let mref = eidola_app_core::parse_model_ref(selection);
+        let backend_name = self
+            .stores
+            .backends
+            .read(cx)
+            .get(&mref.backend_id)
+            .map(|b| b.display_name.clone())
+            .unwrap_or_else(|| match mref.backend_id.as_str() {
+                // The singletons' seeded names, for scenes where the
+                // registry snapshot hasn't loaded (or stub fixtures).
+                eidola_app_core::EIDOLA_BACKEND_ID => "Eidola".to_string(),
+                eidola_app_core::LOCAL_BACKEND_ID => "Local".to_string(),
+                other => other.to_string(),
+            });
+        let local = self.stores.local_models.read(cx);
+        let model_name = local
+            .models()
+            .iter()
+            .chain(local.external().iter().flat_map(|b| b.models.iter()))
+            .find(|m| m.id == selection)
+            .map(|m| m.display_name.clone())
+            .unwrap_or_else(|| mref.model.clone());
+        (model_name.into(), backend_name.into())
     }
 
     /// The parents a **tail draft** attaches to: every current branch leaf (a
@@ -841,13 +898,20 @@ impl SpaceView {
     }
 }
 
-/// Project one transcript row into the render snapshot.
-fn post_data_from(m: &ChatMessageView) -> PostData {
+/// Project one transcript row into the render snapshot. The byline pair is
+/// resolved by the caller (`rebuild`), which has store access for the
+/// model/backend display names.
+fn post_data_from(
+    m: &ChatMessageView,
+    byline: SharedString,
+    byline_backend: Option<SharedString>,
+) -> PostData {
     PostData {
         action_id: m.action_id.clone().map(SharedString::from),
         parent_action_id: m.parent_action_id.clone().map(SharedString::from),
         role: m.message.role.clone().into(),
-        byline: m.byline.clone().into(),
+        byline,
+        byline_backend,
         time: fmt_clock(m.created_at).into(),
         content: m.message.content.clone().into(),
         generation_count: m.generation_count,

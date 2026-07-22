@@ -244,6 +244,7 @@ fn account_op_error_surfaces_and_clears(cx: &mut TestAppContext) {
     let stores = stub_stores(cx, |s| {
         // No account yet — the Account pane shows the "Create account" button.
         s.config_state = Some(config_state(false));
+        s.eidola_trust = Some(eidola_trust());
     });
     let (_window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| AccountView::new(stores.clone(), window, cx))
@@ -861,7 +862,7 @@ fn relative_time_buckets(cx: &mut TestAppContext) {
 fn settings_nav_switches_panes(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
 
     view.read_with(cx, |v, _| {
@@ -875,74 +876,569 @@ fn settings_nav_switches_panes(cx: &mut TestAppContext) {
     view.update(cx, |v, cx| v.select(SettingsPane::Wallet, cx));
     view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Wallet));
 
-    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
-    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Account));
+    view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Backends));
 }
 
 #[gpui::test]
-fn general_option_reveal_tracks_modifier_state(cx: &mut TestAppContext) {
-    // The advanced rows appear only while ⌥ is held. The pane's root
-    // registers `on_modifiers_changed`, which calls `set_advanced` with the
-    // live alt state — this drives the same method.
+fn settings_backends_tabs_switch(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::BackendsTab;
+
+    // The Backends pane's internal tab strip is view-local state. The three
+    // tabs (Eidola · Local · External) split the registry; the Eidola tab is
+    // the connection + trust surface (base URL / measurements / hardware CAs).
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
 
-    let general = view.read_with(cx, |v, _| v.general());
-    general.read_with(cx, |g, _| {
-        assert!(!g.advanced(), "advanced section is hidden at rest");
-    });
+    // Eidola is the resting tab.
+    pane.read_with(cx, |p, _| assert_eq!(p.tab(), BackendsTab::Eidola));
 
-    general.update(cx, |g, cx| g.set_advanced(true, cx));
-    general.read_with(cx, |g, _| assert!(g.advanced()));
+    pane.update(cx, |p, cx| p.select_tab(BackendsTab::Local, cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.tab(), BackendsTab::Local));
 
-    // Releasing ⌥ hides it again.
-    general.update(cx, |g, cx| g.set_advanced(false, cx));
-    general.read_with(cx, |g, _| assert!(!g.advanced()));
+    pane.update(cx, |p, cx| p.select_tab(BackendsTab::External, cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.tab(), BackendsTab::External));
+
+    pane.update(cx, |p, cx| p.select_tab(BackendsTab::Eidola, cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.tab(), BackendsTab::Eidola));
 }
 
-/// Bug replay: wave-2 bug 2 — the Settings > General ⌥ reveal was dead
-/// because `ModifiersChangedEvent` dispatches along the focused element's
-/// ancestor path only. A `GeneralView`-local listener never fired while a
-/// text input in a sibling pane (or the Base URL input inside General itself)
-/// had focus. The fix: one listener on the `SettingsView` root (always an
-/// ancestor of whatever is focused) that mirrors events into `WindowInput`;
-/// `GeneralView` observes that entity.
-///
-/// This test replays the dispatch through `VisualTestContext::simulate_modifiers_change`
-/// (the same platform-event path as production — no mock shortcuts).
 #[gpui::test]
-fn settings_general_option_reveal_works_via_root_listener(cx: &mut TestAppContext) {
-    let stores = stub_stores_with_config(cx);
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
+    // Account and Wallet nav items render only while the eidola backend is
+    // enabled — nav visibility doubles as state.
+    let enabled = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
     });
-
-    let general = view.read_with(cx, |v, _| v.general());
-    general.read_with(cx, |g, _| {
-        assert!(!g.advanced(), "advanced section hidden at rest");
+    let (_w, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(enabled.clone(), window, cx))
     });
-
-    // Drive the real modifier-changed dispatch path: platform event →
-    // window → gpui focus dispatch chain → `SettingsView` root listener →
-    // `WindowInput::update_modifiers` → `GeneralView` observer →
-    // `GeneralView::set_advanced(true)`.
-    let mut vcx = VisualTestContext::from_window(window, cx);
-    vcx.simulate_modifiers_change(Modifiers {
-        alt: true,
-        ..Modifiers::default()
-    });
-    general.read_with(&vcx, |g, _| {
-        assert!(
-            g.advanced(),
-            "⌥ held must reveal advanced rows via the root listener"
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.visible_panes(cx),
+            vec![
+                SettingsPane::General,
+                SettingsPane::Backends,
+                SettingsPane::Account,
+                SettingsPane::Wallet,
+            ],
+            "eidola enabled shows all four panes"
         );
     });
 
-    vcx.simulate_modifiers_change(Modifiers::default());
-    general.read_with(&vcx, |g, _| {
-        assert!(!g.advanced(), "releasing ⌥ must hide advanced rows");
+    let disabled = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(false);
+    });
+    let (_w2, view2) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(disabled.clone(), window, cx))
+    });
+    view2.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.visible_panes(cx),
+            vec![SettingsPane::General, SettingsPane::Backends],
+            "eidola disabled hides Account and Wallet"
+        );
+    });
+}
+
+#[gpui::test]
+fn settings_selection_falls_back_when_eidola_disabled(cx: &mut TestAppContext) {
+    // Selecting Account, then disabling eidola (the toggle lives in Backends →
+    // Eidola, but a Change::Backends refresh can arrive any time), must fall
+    // the selection back to Backends — never a blank body or phantom nav.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
+    });
+    let (_w, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+
+    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Account));
+
+    // Disable the eidola singleton through the store (the optimistic flip
+    // fires the bus-less observer path).
+    stores
+        .backends
+        .update(cx, |b, cx| b.set_enabled("eidola".into(), false, cx));
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.selected(),
+            SettingsPane::Backends,
+            "a hidden selection reconciles to Backends"
+        );
+    });
+}
+
+#[gpui::test]
+fn settings_eidola_url_editor_save_cancel_revert(cx: &mut TestAppContext) {
+    // The base-URL override editor moved out of General into Backends → Eidola.
+    // Its edit/cancel state machine is view-local; save/revert write through
+    // the config store (a stub write stops at the backend guard — the same
+    // honest no-op the other panes assert).
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+
+    // At rest: not editing.
+    pane.read_with(cx, |p, _| assert!(!p.editing_base_url()));
+
+    // Change… enters the edit state; Cancel leaves it.
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_edit_base_url(window, cx));
+    })
+    .unwrap();
+    pane.read_with(cx, |p, _| assert!(p.editing_base_url()));
+    pane.update(cx, |p, cx| p.cancel_edit_base_url(cx));
+    pane.read_with(cx, |p, _| assert!(!p.editing_base_url()));
+
+    // Save exits the edit state (stub write is a no-op past the guard).
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_edit_base_url(window, cx));
+    })
+    .unwrap();
+    pane.update(cx, |p, cx| p.save_base_url(cx));
+    pane.read_with(cx, |p, _| assert!(!p.editing_base_url()));
+
+    // Revert-to-pin is a no-op-safe path too.
+    pane.update(cx, |p, cx| p.revert_base_url(cx));
+    pane.read_with(cx, |p, _| assert!(!p.editing_base_url()));
+
+    // Reverting measurements routes through the store without panicking.
+    pane.update(cx, |p, cx| p.revert_measurements(cx));
+}
+
+/// The measurement add input and the hardware-CA textareas reveal in place
+/// on demand (the base-URL row's edit-in-place shape, generalized — no
+/// disclosure, no hidden state): "Trust a measurement…" / "Set custom
+/// certificate…" open them, Cancel closes them.
+#[gpui::test]
+fn settings_eidola_trust_editors_reveal_in_place(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::CaKind;
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+
+    // At rest: value displays only, no inputs.
+    pane.read_with(cx, |p, _| {
+        assert!(!p.adding_measurement(), "add input hidden at rest");
+        assert_eq!(p.editing_ca(), None, "CA textareas hidden at rest");
+    });
+
+    // Trust a measurement… reveals the add input; Cancel hides it.
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_add_measurement(window, cx));
+    })
+    .unwrap();
+    pane.read_with(cx, |p, _| assert!(p.adding_measurement()));
+    pane.update(cx, |p, cx| p.cancel_add_measurement(cx));
+    pane.read_with(cx, |p, _| assert!(!p.adding_measurement()));
+
+    // Set custom certificate… reveals that CA's textarea; Cancel hides it.
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_edit_ca(CaKind::Root, window, cx));
+    })
+    .unwrap();
+    pane.read_with(cx, |p, _| assert_eq!(p.editing_ca(), Some(CaKind::Root)));
+    pane.update(cx, |p, cx| p.cancel_edit_ca(cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.editing_ca(), None));
+}
+
+/// The Eidola trust editors route through the config store. On a stub (no
+/// backend) each write stops at the store's backend guard — an honest no-op —
+/// so a successful submit clears its input and nothing panics. Exercises the
+/// add-measurement, untrust, and CA set/clear paths.
+#[gpui::test]
+fn settings_eidola_trust_editors_call_through(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::CaKind;
+
+    let mut trust = eidola_trust();
+    trust.trusted_measurements = vec![eidola_app_core::MeasurementInfo {
+        snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+        tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+    }];
+    trust.trusted_measurements_are_override = true;
+    trust.has_hardware_root_ca = true;
+    trust.hardware_root_ca_pem =
+        Some("-----BEGIN CERTIFICATE-----\nMIIBcustomroot\n-----END CERTIFICATE-----".into());
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(trust);
+        s.backends = backends_fixture(true);
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+
+    // Add a measurement: reveal the input, seed the triple, submit — expect a
+    // cleared field and the input closed again (the stub write reports no
+    // error, so the success branch runs).
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_add_measurement(window, cx));
+    })
+    .unwrap();
+    let triple = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44\
+                  ee55ff66aa11bb22cc33dd44:\
+                  0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:\
+                  fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    let add_input = pane.read_with(cx, |p, _| p.add_measurement_input());
+    cx.update_window(window, |_, window, cx| {
+        add_input.update(cx, |s, cx| s.set_value(triple, window, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.submit_add_measurement(window, cx));
+    })
+    .unwrap();
+    add_input.read_with(cx, |s, _| {
+        assert!(s.value().is_empty(), "a successful add clears the input");
+    });
+    pane.read_with(cx, |p, _| {
+        assert!(
+            !p.adding_measurement(),
+            "a successful add closes the input again"
+        );
+    });
+
+    // Untrust routes through without panicking.
+    pane.update(cx, |p, cx| {
+        p.untrust_measurement(
+            "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+            cx,
+        )
+    });
+
+    // CA set: reveal the textarea, seed a PEM, submit — expect a cleared
+    // field and the editor closed; then Clear routes through.
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_edit_ca(CaKind::Root, window, cx));
+    })
+    .unwrap();
+    let ca_input = pane.read_with(cx, |p, _| p.ca_input(CaKind::Root));
+    cx.update_window(window, |_, window, cx| {
+        ca_input.update(cx, |s, cx| {
+            s.set_value(
+                "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+                window,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.submit_ca(CaKind::Root, window, cx));
+    })
+    .unwrap();
+    ca_input.read_with(cx, |s, _| {
+        assert!(s.value().is_empty(), "a successful CA set clears the input");
+    });
+    pane.read_with(cx, |p, _| {
+        assert_eq!(
+            p.editing_ca(),
+            None,
+            "a successful CA set closes the editor"
+        );
+    });
+    pane.update(cx, |p, cx| p.clear_ca(CaKind::Root, cx));
+}
+
+#[gpui::test]
+fn settings_account_pane_reachable_at_top_level(cx: &mut TestAppContext) {
+    // Account is a top-level pane again; its reset-confirm flow is reachable
+    // through `SettingsView::account_pane()`.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
+        s.balances = Some(BalancesResult {
+            available: 5_000_000,
+            pools: Vec::new(),
+        });
+    });
+    let (_w, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+
+    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Account));
+
+    let account = view.read_with(cx, |v, _| v.account_pane());
+    account.read_with(cx, |a, _| assert!(!a.reset_armed()));
+    account.update(cx, |a, cx| a.request_reset(cx));
+    account.read_with(cx, |a, _| assert!(a.reset_armed()));
+}
+
+#[gpui::test]
+fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext) {
+    // With stub stores, every local-model operation clears the standing
+    // error and stops at the backend guard — an honest no-op, no phantom
+    // Loading states, no panics.
+    let stores = stub_stores(cx, |s| {
+        s.local_models = Some(eidola_app_core::LocalModelsState {
+            engine_path: None,
+            external: Vec::new(),
+            models: vec![eidola_app_core::LocalModelInfo {
+                id: "tiny@local".into(),
+                slug: "tiny".into(),
+                display_name: "Tiny".into(),
+                file_name: "tiny.gguf".into(),
+                size_bytes: Some(1_000_000_000),
+                source_url: None,
+                status: eidola_app_core::LocalModelStatus::Loaded {
+                    port: 4242,
+                    context_tokens: 8192,
+                    pinned: false,
+                },
+                last_error: None,
+            }],
+        });
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+
+    let backends_view = view.read_with(cx, |v, _| v.backends_pane());
+    backends_view.update(cx, |m, cx| {
+        m.download_catalog("https://example.com/some.gguf", cx)
+    });
+    cx.run_until_parked();
+
+    stores.local_models.read_with(cx, |s, _| {
+        assert!(s.op_error().is_none(), "stub ops must not surface errors");
+        // The fixture snapshot survives untouched (no refresh happened).
+        assert_eq!(s.models().len(), 1);
+        assert_eq!(s.loaded_models().len(), 1);
+        assert_eq!(s.loaded_models()[0].id, "tiny@local");
+    });
+}
+
+#[gpui::test]
+fn space_model_display_splits_name_and_backend(cx: &mut TestAppContext) {
+    // The gutter/chip display pair: human model name over backend name.
+    let stores = stub_stores(cx, |s| {
+        s.backends = vec![
+            eidola_app_core::BackendInfo {
+                id: "local".into(),
+                kind: eidola_app_core::BackendKind::Local,
+                display_name: "Local".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+                created_at: 0,
+            },
+            eidola_app_core::BackendInfo {
+                id: "my-vllm".into(),
+                kind: eidola_app_core::BackendKind::OpenAi,
+                display_name: "My vLLM box".into(),
+                enabled: true,
+                base_url: Some("http://x".into()),
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+                created_at: 1,
+            },
+        ];
+        s.local_models = Some(eidola_app_core::LocalModelsState {
+            engine_path: None,
+            external: Vec::new(),
+            models: vec![eidola_app_core::LocalModelInfo {
+                id: "gemma-4-E2B_q4_0-it@local".into(),
+                slug: "gemma-4-E2B_q4_0-it".into(),
+                display_name: "Gemma 4 E2B".into(),
+                file_name: "gemma-4-E2B_q4_0-it.gguf".into(),
+                size_bytes: Some(3_349_514_112),
+                source_url: None,
+                status: eidola_app_core::LocalModelStatus::Available,
+                last_error: None,
+            }],
+        });
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+
+    view.read_with(cx, |v, cx| {
+        // An engine model resolves to its sidecar display name + "Local".
+        assert_eq!(
+            v.model_display("gemma-4-E2B_q4_0-it@local", cx),
+            ("Gemma 4 E2B".into(), "Local".into())
+        );
+        // A catalog model keeps its wire id as the name; backend resolves.
+        assert_eq!(
+            v.model_display("gemma4-31b", cx),
+            ("gemma4-31b".into(), "Eidola".into())
+        );
+        assert_eq!(
+            v.model_display("qwen3-8b@my-vllm", cx),
+            ("qwen3-8b".into(), "My vLLM box".into())
+        );
+        // An unknown/deleted engine model falls back to its raw parts.
+        assert_eq!(
+            v.model_display("gone@local", cx),
+            ("gone".into(), "Local".into())
+        );
+    });
+}
+
+#[gpui::test]
+fn local_models_store_pin_op_is_stub_safe(cx: &mut TestAppContext) {
+    // The pin/unpin op follows the standard thin-initiating-call shape:
+    // with stub stores it clears the standing error and stops at the
+    // backend guard — no phantom state, no panic.
+    let stores = stub_stores(cx, |s| {
+        s.local_models = Some(eidola_app_core::LocalModelsState {
+            engine_path: None,
+            external: Vec::new(),
+            models: vec![eidola_app_core::LocalModelInfo {
+                id: "tiny@local".into(),
+                slug: "tiny".into(),
+                display_name: "Tiny".into(),
+                file_name: "tiny.gguf".into(),
+                size_bytes: Some(1_000_000_000),
+                source_url: None,
+                status: eidola_app_core::LocalModelStatus::Loaded {
+                    port: 4242,
+                    context_tokens: 8192,
+                    pinned: false,
+                },
+                last_error: None,
+            }],
+        });
+    });
+    stores.local_models.update(cx, |s, cx| {
+        s.set_pinned("tiny@local".into(), true, cx);
+    });
+    cx.run_until_parked();
+    stores.local_models.read_with(cx, |s, _| {
+        assert!(s.op_error().is_none(), "stub ops must not surface errors");
+        // The fixture snapshot is untouched (no backend, no refresh) —
+        // the real pin lands via Change::LocalModels in production.
+        assert_eq!(s.selectable_models().len(), 1);
+    });
+}
+
+#[gpui::test]
+fn settings_backends_pane_add_form_and_toggle(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::AddKind;
+
+    let stores = stub_stores(cx, |s| {
+        s.backends = vec![eidola_app_core::BackendInfo {
+            id: "eidola".into(),
+            kind: eidola_app_core::BackendKind::Eidola,
+            display_name: "Eidola".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        }];
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+
+    // The add form opens per kind, is idempotent, and cancel closes it.
+    pane.read_with(cx, |p, _| assert_eq!(p.adding(), None));
+    cx.update(|cx| {
+        _window
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |p, cx| p.begin_add(AddKind::OpenAi, window, cx));
+            })
+            .unwrap();
+    });
+    pane.read_with(cx, |p, _| assert_eq!(p.adding(), Some(AddKind::OpenAi)));
+    cx.update(|cx| {
+        _window
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |p, cx| p.begin_add(AddKind::LlamaCpp, window, cx));
+            })
+            .unwrap();
+    });
+    pane.read_with(cx, |p, _| assert_eq!(p.adding(), Some(AddKind::LlamaCpp)));
+    pane.update(cx, |p, cx| p.cancel_add(cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.adding(), None));
+
+    // Submitting with no form open is a quiet no-op.
+    pane.update(cx, |p, cx| p.submit_add(cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.adding(), None));
+
+    // Disabling the eidola backend flips the cached row immediately (the
+    // optimistic write; the stub has no backend, so the op stops there).
+    pane.update(cx, |p, cx| p.toggle_backend("eidola".into(), false, cx));
+    stores.backends.read_with(cx, |b, _| {
+        assert!(!b.is_enabled("eidola"), "optimistic flip must be visible");
+        assert!(b.op_error().is_none(), "stub ops must not surface errors");
+    });
+}
+
+#[gpui::test]
+fn settings_backends_pane_auto_start_toggle(cx: &mut TestAppContext) {
+    // A llamacpp backend's auto-start toggle flips the cached row optimistically
+    // and stops at the stub backend guard (no phantom op-error).
+    let stores = stub_stores(cx, |s| {
+        s.backends = vec![eidola_app_core::BackendInfo {
+            id: "my-box".into(),
+            kind: eidola_app_core::BackendKind::LlamaCpp,
+            display_name: "My box".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: Some("/Users/me/models".into()),
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        }];
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+
+    pane.update(cx, |p, cx| p.set_auto_start("my-box".into(), false, cx));
+    stores.backends.read_with(cx, |b, _| {
+        assert!(
+            !b.get("my-box").unwrap().auto_start,
+            "optimistic auto-start flip must be visible"
+        );
+        assert!(b.op_error().is_none(), "stub ops must not surface errors");
     });
 }
 
@@ -957,7 +1453,7 @@ fn settings_appearance_choices_route_through_config_store(cx: &mut TestAppContex
 
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
     });
 
     let general = view.read_with(cx, |v, _| v.general());
@@ -1172,6 +1668,8 @@ fn record_request_detail_exposes_space_link(cx: &mut TestAppContext) {
         attestation_hash: None,
         space_id: Some("space-abc".into()),
         space_title: Some("The quantum eraser experiment".into()),
+        backend_id: Some("eidola".into()),
+        backend_display_name: Some("Eidola".into()),
     };
 
     view.update(cx, |v, _| {
@@ -1311,7 +1809,9 @@ fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let _dir = tempfile::tempdir().unwrap();
     let core = AppCore::new(_dir.path().to_path_buf(), _dir.path().join("data"));
-    core.set_base_url("https://127.0.0.1:1/v1".into()).unwrap();
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
+        .unwrap();
     let stores = cx.update(|cx| Stores::for_test(std::sync::Arc::new(core), cx));
     let (_window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| RecordView::new(stores.clone(), window, cx))
@@ -1346,22 +1846,70 @@ fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
 
 fn config_state(has_account: bool) -> ConfigState {
     ConfigState {
-        base_url: "https://eidola.example/v1".into(),
         default_model: "gemma4-31b".into(),
-        base_url_pin: "https://eidola.example/v1".into(),
-        base_url_is_override: false,
         has_account,
         has_account_secret: has_account,
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
-        trusted_measurements: Vec::new(),
-        trusted_measurements_are_override: false,
-        has_hardware_root_ca: false,
-        has_hardware_intermediate_ca: false,
         attestation_url: None,
         appearance: eidola_app_core::config::AppearanceSetting::System,
         time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
         light_character: eidola_app_core::config::LightCharacter::Neutral,
     }
+}
+
+/// The eidola connection + trust bundle fixture (moved off `ConfigState`);
+/// the General pane's base-URL + trust rows read it.
+fn eidola_trust() -> eidola_app_core::EidolaTrust {
+    eidola_app_core::EidolaTrust {
+        base_url: "https://eidola.example/v1".into(),
+        base_url_pin: "https://eidola.example/v1".into(),
+        base_url_is_override: false,
+        trusted_measurements: Vec::new(),
+        trusted_measurements_are_override: false,
+        pinned_measurement: eidola_app_core::MeasurementInfo {
+            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
+            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+        },
+        has_hardware_root_ca: false,
+        hardware_root_ca_pem: None,
+        has_hardware_intermediate_ca: false,
+        hardware_intermediate_ca_pem: None,
+    }
+}
+
+/// A backend registry fixture with the two singletons; `eidola_enabled`
+/// flips the eidola row so nav-gating tests can exercise both states.
+fn backends_fixture(eidola_enabled: bool) -> Vec<eidola_app_core::BackendInfo> {
+    use eidola_app_core::{BackendInfo, BackendKind};
+    vec![
+        BackendInfo {
+            id: "eidola".into(),
+            kind: BackendKind::Eidola,
+            display_name: "Eidola".into(),
+            enabled: eidola_enabled,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        },
+        BackendInfo {
+            id: "local".into(),
+            kind: BackendKind::Local,
+            display_name: "Local".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        },
+    ]
 }
 
 /// Build stub stores from a declaratively-described scene — the replacement
@@ -1379,6 +1927,7 @@ fn stub_stores(cx: &mut TestAppContext, setup: impl FnOnce(&mut StoresStub)) -> 
 fn stub_stores_with_config(cx: &mut TestAppContext) -> Stores {
     stub_stores(cx, |s| {
         s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
         s.balances = Some(BalancesResult {
             available: 5_000_000,
             pools: Vec::new(),
@@ -2704,6 +3253,81 @@ fn onboarding_starts_on_first_slide(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn onboarding_skip_account_disables_eidola_and_hands_off_to_a_space(cx: &mut TestAppContext) {
+    // The GetStarted slide's quiet third choice: no account at all. It
+    // disables the eidola backend (optimistically visible in the store; the
+    // stub has no core, so the op stops at the guard) and leaves onboarding —
+    // which, being the only window (as at launch, where onboarding opens
+    // *instead of* a blank space), must hand off to a space rather than
+    // leaving the user with no window at all.
+    let stores = stub_stores(cx, |s| {
+        s.backends = vec![eidola_app_core::BackendInfo {
+            id: "eidola".into(),
+            kind: eidola_app_core::BackendKind::Eidola,
+            display_name: "Eidola".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        }];
+    });
+    let (window, view) = open_onboarding(cx, &stores);
+
+    stores
+        .backends
+        .read_with(cx, |b, _| assert!(b.is_enabled("eidola")));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.skip_account(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    stores.backends.read_with(cx, |b, _| {
+        assert!(
+            !b.is_enabled("eidola"),
+            "skip must disable the eidola backend"
+        );
+    });
+    // The onboarding window is gone, replaced by exactly one space window —
+    // not zero (macOS would linger dock-only; Linux would quit outright on
+    // the very choice to keep using the app on-device).
+    let windows = cx.update(|cx| cx.windows());
+    assert_eq!(windows.len(), 1, "skip must hand off to a space window");
+    assert!(
+        !windows.contains(&window),
+        "skip must close the onboarding window"
+    );
+}
+
+#[gpui::test]
+fn onboarding_leaving_with_a_window_behind_opens_no_extra_space(cx: &mut TestAppContext) {
+    // The hand-off is for the launch case, where onboarding is the only
+    // window. Reached from the Eidola menu there is already a window behind
+    // it, and leaving must not conjure a second blank space on top of it.
+    let stores = stub_stores(cx, |_| {});
+    let (behind, _) = open_space(cx, &stores, None);
+    let (window, view) = open_onboarding(cx, &stores);
+    assert_eq!(cx.update(|cx| cx.windows().len()), 2);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.skip_account(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let windows = cx.update(|cx| cx.windows());
+    assert_eq!(
+        windows,
+        vec![behind],
+        "leaving must close onboarding and leave the window behind it untouched"
+    );
+}
+
+#[gpui::test]
 fn onboarding_reveal_advances_and_is_idempotent(cx: &mut TestAppContext) {
     let stores = stub_stores(cx, |_| {});
     let (_w, view) = open_onboarding(cx, &stores);
@@ -2718,6 +3342,41 @@ fn onboarding_reveal_advances_and_is_idempotent(cx: &mut TestAppContext) {
     view.read_with(cx, |v, _| {
         assert_eq!(v.revealed(), vec![Slide::Pause, Slide::Tool]);
     });
+}
+
+#[gpui::test]
+fn onboarding_back_arrow_glides_to_previous_slide(cx: &mut TestAppContext) {
+    // Each slide past the first shows an up-arrow that glides to the previous
+    // slide — the same `scroll_to_slide` path the arrow's click drives. The
+    // resting offset (`pinned_y`) is set synchronously, so no frame-pumping.
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Pause, Slide::Tool);
+    reveal(&view, cx, Slide::Tool, Slide::Control);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            // Back from the Control slide (index 2) to the Tool slide (index 1):
+            // the page pins above the top (a negative offset).
+            v.scroll_to_slide(1, window, cx);
+            let one_up = v
+                .pinned_y_for_test()
+                .expect("glide must pin a resting offset");
+            assert!(
+                one_up < 0.0,
+                "gliding to slide 1 must pin the page below the top, got {one_up}"
+            );
+
+            // Back all the way to the first slide pins exactly at the top.
+            v.scroll_to_slide(0, window, cx);
+            assert_eq!(
+                v.pinned_y_for_test(),
+                Some(0.0),
+                "gliding to the first slide must pin at the top"
+            );
+        });
+    })
+    .unwrap();
 }
 
 #[gpui::test]

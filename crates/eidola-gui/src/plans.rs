@@ -49,7 +49,15 @@ pub fn plan_rows(
         } else {
             format!("{}{}", price.amount_display, price.recurrence)
         };
-        let mut subline = format!("{} credits", format_credits(price.credits));
+        // Conspicuous expiry disclosure at the point of purchase — must stay
+        // consistent with the published terms (www/pages/terms.md) and the
+        // server's webhook expiry logic (period end vs. one year).
+        let expiry_note = if price.recurrence.is_empty() {
+            "expire one year after purchase"
+        } else {
+            "expire at the end of each billing period"
+        };
+        let mut subline = format!("{} credits, {expiry_note}", format_credits(price.credits));
         if let Some(desc) = price.product_description.as_deref() {
             subline = format!("{subline} — {desc}");
         }

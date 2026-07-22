@@ -136,6 +136,38 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
     } else {
         ""
     };
+    // Versioned legal documents get machine-readable identity in the head
+    // (the server's terms-acceptance poller and any verifier can read it)
+    // and a visible version line above the title (conspicuous versioning —
+    // the hash links to the exact bytes it identifies at `source.md`).
+    let (legal_meta, version_line) = match (&page.version, &page.source_sha256) {
+        (Some(version), Some(hash)) => {
+            let effective_meta = page
+                .effective
+                .as_deref()
+                .map(|d| {
+                    format!(
+                        "<meta name=\"eidola:effective\" content=\"{}\">\n",
+                        escape_html(d)
+                    )
+                })
+                .unwrap_or_default();
+            let effective_text = page
+                .effective
+                .as_deref()
+                .map(|d| format!(" · effective {}", escape_html(&human_date(d))))
+                .unwrap_or_default();
+            (
+                format!(
+                    "<meta name=\"eidola:version\" content=\"{version}\">\n<meta name=\"eidola:source-sha256\" content=\"{hash}\">\n{effective_meta}"
+                ),
+                format!(
+                    "<p class=\"byline doc-version\">Version {version}{effective_text} · <a href=\"source.md\">source</a> · sha256 <code>{hash}</code></p>\n"
+                ),
+            )
+        }
+        _ => (String::new(), String::new()),
+    };
     let main_class = match page.kind {
         PageKind::Home => "prose home",
         _ => "prose",
@@ -201,9 +233,10 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/circadian.css">
 <link rel="stylesheet" href="/assets/site.css">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self';">
 {feed}<meta property="og:title" content="{title}">
 <meta property="og:url" content="{canonical}">
-<script defer src="/assets/zones.js"></script>
+{legal_meta}<script defer src="/assets/zones.js"></script>
 <script defer src="/assets/circadian.js"></script>
 {toc_script}</head>
 <body>
@@ -217,7 +250,7 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
 </header>
 <div class="layout">
 {sidebar}<main class="{main_class}">
-{inline_nav}{draft_notice}{byline}{body}{edit}</main>
+{inline_nav}{draft_notice}{byline}{version_line}{body}{edit}</main>
 {toc}</div>
 <footer class="site-footer">
 <span>© 2026 <a href="/about/">Eidola, Inc.</a></span>
@@ -249,6 +282,8 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
         edit = edit,
         draft_notice = draft_notice,
         byline = byline,
+        legal_meta = legal_meta,
+        version_line = version_line,
         body = page.html,
     )
 }
@@ -275,7 +310,38 @@ mod tests {
             html: "<h1>The client</h1>".into(),
             headings: Vec::new(),
             source_path: Some("docs/client.md".into()),
+            version: None,
+            effective: None,
+            source_sha256: None,
+            source_raw: None,
         }
+    }
+
+    #[test]
+    fn versioned_pages_get_meta_and_version_line() {
+        let mut page = doc_page();
+        page.kind = PageKind::Page;
+        page.route = "/terms/".into();
+        page.version = Some(3);
+        page.effective = Some("2026-08-01".into());
+        page.source_sha256 = Some("ab".repeat(32));
+        let html = layout(&page, None);
+        assert!(html.contains("<meta name=\"eidola:version\" content=\"3\">"));
+        assert!(html.contains(&format!(
+            "<meta name=\"eidola:source-sha256\" content=\"{}\">",
+            "ab".repeat(32)
+        )));
+        assert!(html.contains("<meta name=\"eidola:effective\" content=\"2026-08-01\">"));
+        assert!(
+            html.contains(
+                "Version 3 · effective August 1, 2026 · <a href=\"source.md\">source</a>"
+            )
+        );
+
+        // Unversioned pages get none of it.
+        let html = layout(&doc_page(), None);
+        assert!(!html.contains("eidola:version"));
+        assert!(!html.contains("doc-version"));
     }
 
     #[test]

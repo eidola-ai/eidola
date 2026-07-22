@@ -203,6 +203,16 @@
               }
             }
           },
+          "428": {
+            "description": "Terms acceptance required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Stripe not configured",
             "content": {
@@ -271,6 +281,16 @@
           },
           "402": {
             "description": "Insufficient credit balance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "Terms acceptance required",
             "content": {
               "application/json": {
                 "schema": {
@@ -373,6 +393,55 @@
           },
           "503": {
             "description": "Stripe not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
+    "/v1/account/terms": {
+      "post": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "POST /v1/account/terms — record acceptance of a current document version\n(authenticated).",
+        "operationId": "accept_terms",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcceptTermsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Acceptance recorded"
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not the currently required version",
             "content": {
               "application/json": {
                 "schema": {
@@ -606,6 +675,27 @@
         }
       }
     },
+    "/v1/terms": {
+      "get": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "GET /v1/terms — the document versions whose acceptance is required.",
+        "operationId": "get_terms",
+        "responses": {
+          "200": {
+            "description": "Currently required document versions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TermsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/webhooks/stripe": {
       "post": {
         "tags": [
@@ -643,6 +733,24 @@
   },
   "components": {
     "schemas": {
+      "AcceptTermsRequest": {
+        "type": "object",
+        "description": "Acceptance of one currently required document version.",
+        "required": [
+          "document",
+          "sha256"
+        ],
+        "properties": {
+          "document": {
+            "type": "string",
+            "description": "`terms_of_service` or `privacy_policy`."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Hex-encoded SHA-256 of the document text being accepted; must match\nthe currently required version from `GET /v1/terms`."
+          }
+        }
+      },
       "AssistantMessage": {
         "type": "object",
         "description": "An assistant message in a response.",
@@ -743,6 +851,7 @@
       },
       "BalancePool": {
         "type": "object",
+        "description": "One balance pool: credits sharing an origin and expiration.",
         "required": [
           "amount",
           "source"
@@ -750,21 +859,25 @@
         "properties": {
           "amount": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Credits remaining in this pool (micro-USD denominated)."
           },
           "expires_at": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "ISO-8601 instant at which these credits expire; absent for credits\nthat never expire."
           },
           "source": {
-            "type": "string"
+            "type": "string",
+            "description": "Where the pool came from: `subscription`, `purchase`, or `other`."
           }
         }
       },
       "BalancesResponse": {
         "type": "object",
+        "description": "Credit balance breakdown. All amounts are credits, denominated in\nmicro-USD (1 credit = $0.000001).",
         "required": [
           "available",
           "pools"
@@ -772,13 +885,15 @@
         "properties": {
           "available": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Total spendable credits (expired pools excluded)."
           },
           "pools": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/BalancePool"
-            }
+            },
+            "description": "Per-pool breakdown, earliest expiry first."
           }
         }
       },
@@ -1662,6 +1777,7 @@
       },
       "PriceResponse": {
         "type": "object",
+        "description": "A purchasable plan.",
         "required": [
           "id",
           "product_name",
@@ -1672,7 +1788,8 @@
         "properties": {
           "credits": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Credits granted by this plan, denominated in micro-USD\n(1 credit = $0.000001). Subscription credits expire at the end of\neach billing period; one-time purchase credits expire one year\nafter purchase."
           },
           "currency": {
             "type": "string"
@@ -1713,7 +1830,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Purchase price in the minor unit of `currency` (e.g. cents for USD)."
           }
         }
       },
@@ -1803,6 +1921,35 @@
           }
         }
       },
+      "RequiredDocument": {
+        "type": "object",
+        "description": "A document whose current version must be accepted before purchases or\ncredential issuance. `sha256` identifies the exact text (the markdown\nsource, retrievable at `{url}source.md`), so acceptance binds to\nprecise words rather than a mutable URL; `version` is the document's\nmonotonically increasing front-matter version, which orders releases\n(accepting version N satisfies any requirement ≤ N).",
+        "required": [
+          "document",
+          "version",
+          "url",
+          "sha256"
+        ],
+        "properties": {
+          "document": {
+            "type": "string",
+            "description": "`terms_of_service` or `privacy_policy`."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Hex-encoded SHA-256 of the exact published document text."
+          },
+          "url": {
+            "type": "string",
+            "description": "Where the current text is published."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Monotonically increasing document version."
+          }
+        }
+      },
       "Role": {
         "type": "string",
         "description": "The role of a message author.",
@@ -1879,6 +2026,21 @@
           },
           "status": {
             "type": "string"
+          }
+        }
+      },
+      "TermsResponse": {
+        "type": "object",
+        "description": "The documents (and versions) whose acceptance the server currently\nrequires. Empty when no acceptance gate is configured.",
+        "required": [
+          "documents"
+        ],
+        "properties": {
+          "documents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequiredDocument"
+            }
           }
         }
       },

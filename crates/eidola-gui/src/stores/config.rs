@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, ConfigState};
+use eidola_app_core::{AppCore, ConfigState, EidolaTrust};
 use gpui::Context;
 
 pub struct ConfigStore {
@@ -22,6 +22,11 @@ pub struct ConfigStore {
     /// construction, refreshed on `Change::Config`); `None` on a stub until a
     /// test installs one.
     state: Option<ConfigState>,
+    /// The eidola connection + trust bundle (base URL, measurements, hardware
+    /// CAs) — read from the `eidola` backend row via `AppCore::eidola_trust`.
+    /// Since it moved off `ConfigState` it is fetched separately (blocking on
+    /// the core runtime, off the gpui main thread) and re-read on each write.
+    trust: Option<EidolaTrust>,
     /// The last config-write error, surfaced by the settings panes.
     error: Option<AppError>,
 }
@@ -29,9 +34,13 @@ pub struct ConfigStore {
 impl ConfigStore {
     pub fn new(app_core: Option<Arc<AppCore>>) -> Self {
         let state = app_core.as_ref().map(|c| c.config_state());
+        let trust = app_core
+            .as_ref()
+            .and_then(|c| c.runtime().block_on(c.eidola_trust()).ok());
         Self {
             app_core,
             state,
+            trust,
             error: None,
         }
     }
@@ -41,6 +50,7 @@ impl ConfigStore {
         Self {
             app_core: None,
             state,
+            trust: None,
             error: None,
         }
     }
@@ -50,10 +60,21 @@ impl ConfigStore {
         self.state.as_ref()
     }
 
+    /// The resolved eidola connection + trust bundle, if known.
+    pub fn eidola_trust(&self) -> Option<&EidolaTrust> {
+        self.trust.as_ref()
+    }
+
     /// Test-only: install a fixture config snapshot.
     #[doc(hidden)]
     pub fn set_state_for_test(&mut self, state: Option<ConfigState>) {
         self.state = state;
+    }
+
+    /// Test-only: install a fixture eidola-trust snapshot.
+    #[doc(hidden)]
+    pub fn set_eidola_trust_for_test(&mut self, trust: Option<EidolaTrust>) {
+        self.trust = trust;
     }
 
     /// The last config-write error, if any.
@@ -72,6 +93,7 @@ impl ConfigStore {
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if let Some(core) = self.app_core.as_ref() {
             self.state = Some(core.config_state());
+            self.trust = core.runtime().block_on(core.eidola_trust()).ok();
             cx.notify();
         }
     }
@@ -83,6 +105,7 @@ impl ConfigStore {
         match f(core) {
             Ok(()) => {
                 self.state = Some(core.config_state());
+                self.trust = core.runtime().block_on(core.eidola_trust()).ok();
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
@@ -91,11 +114,90 @@ impl ConfigStore {
     }
 
     pub fn set_base_url(&mut self, url: String, cx: &mut Context<Self>) {
-        self.write(cx, |c| c.set_base_url(url));
+        // The setter moved to the eidola backend row (async); block on the
+        // core runtime off the gpui main thread.
+        self.write(cx, |c| c.runtime().block_on(c.set_base_url(url)));
     }
 
     pub fn clear_base_url_override(&mut self, cx: &mut Context<Self>) {
-        self.write(cx, |c| c.clear_base_url_override());
+        self.write(cx, |c| c.runtime().block_on(c.clear_base_url_override()));
+    }
+
+    /// Revert the trusted-measurements override back to the built-in pin.
+    /// There is no single "clear" core call — untrusting every entry in the
+    /// override list reverts to the pin (clearing the last one does it), so
+    /// this reads the current override set off the trust snapshot and
+    /// untrusts each. Writes through the eidola backend row; emits
+    /// `Change::Backends`.
+    pub fn revert_trusted_measurements(&mut self, cx: &mut Context<Self>) {
+        self.write(cx, |c| {
+            let snps: Vec<String> = c
+                .runtime()
+                .block_on(c.eidola_trust())
+                .map(|t| {
+                    t.trusted_measurements
+                        .iter()
+                        .map(|m| m.snp.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for snp in snps {
+                c.runtime().block_on(c.untrust_measurement(snp))?;
+            }
+            Ok(())
+        });
+    }
+
+    /// Add a trusted enclave measurement to the eidola row's override list.
+    /// `spec` is the CLI's `<snp>:<rtmr1>:<rtmr2>` triple; a parse failure is
+    /// surfaced in the store's `error` (the settings op-error banner) rather
+    /// than silently dropped. Writes through the backend row; emits
+    /// `Change::Backends`.
+    pub fn trust_measurement(&mut self, spec: String, cx: &mut Context<Self>) {
+        self.write(cx, |c| {
+            let m = eidola_app_core::config::parse_trust_measurement(spec.trim())?;
+            c.runtime()
+                .block_on(c.trust_measurement(
+                    m.snp_measurement,
+                    m.tdx_measurement.rtmr1,
+                    m.tdx_measurement.rtmr2,
+                ))
+                .map(|_| ())
+        });
+    }
+
+    /// Remove a trusted measurement (by SNP key) from the eidola row's
+    /// override list. Clearing the last one reverts to the pin. Writes through
+    /// the backend row; emits `Change::Backends`.
+    pub fn untrust_measurement(&mut self, snp: String, cx: &mut Context<Self>) {
+        self.write(cx, |c| {
+            c.runtime().block_on(c.untrust_measurement(snp)).map(|_| ())
+        });
+    }
+
+    /// Set the eidola hardware root CA (ARK) PEM override. PEM validation
+    /// lives in app-core; a failure lands in the op-error banner.
+    pub fn set_hardware_root_ca(&mut self, pem: String, cx: &mut Context<Self>) {
+        self.write(cx, |c| c.runtime().block_on(c.set_hardware_root_ca(pem)));
+    }
+
+    /// Set the eidola hardware intermediate CA (ASK) PEM override.
+    pub fn set_hardware_intermediate_ca(&mut self, pem: String, cx: &mut Context<Self>) {
+        self.write(cx, |c| {
+            c.runtime().block_on(c.set_hardware_intermediate_ca(pem))
+        });
+    }
+
+    /// Remove the eidola hardware root CA override (row column back to NULL).
+    pub fn clear_hardware_root_ca(&mut self, cx: &mut Context<Self>) {
+        self.write(cx, |c| c.runtime().block_on(c.clear_hardware_root_ca()));
+    }
+
+    /// Remove the eidola hardware intermediate CA override.
+    pub fn clear_hardware_intermediate_ca(&mut self, cx: &mut Context<Self>) {
+        self.write(cx, |c| {
+            c.runtime().block_on(c.clear_hardware_intermediate_ca())
+        });
     }
 
     pub fn set_default_model(&mut self, model: String, cx: &mut Context<Self>) {

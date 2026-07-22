@@ -37,6 +37,10 @@ title = "What's missing"
 pages = [["gaps.md", "Known gaps"]]
 
 [[sections]]
+title = "Operations"
+pages = [["vendors.md", "Vendors"]]
+
+[[sections]]
 title = "Contributing"
 pages = [
     ["contributing/README.md", "Runbooks"],

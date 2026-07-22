@@ -55,6 +55,17 @@ pub enum Change {
     Record,
     /// The update-check state was written (last result, accepted claims).
     UpdateState,
+    /// The local-model domain changed: a download started / progressed /
+    /// finished / failed, a model was deleted, or an engine was loaded,
+    /// became ready, was unloaded, or exited. Subscribers re-snapshot via
+    /// `AppCore::local_models_state`. Progress emissions are throttled in
+    /// the transfer task, so bursts stay far below [`BUS_CAPACITY`].
+    LocalModels,
+    /// The backend registry changed: a backend was added, updated,
+    /// enabled/disabled, or removed. Subscribers re-snapshot via
+    /// `AppCore::list_backends` (and should treat per-backend model
+    /// catalogs as stale — the set of destinations changed).
+    Backends,
 }
 
 /// Identifies a single conversation space.  String form matches the UUIDs

@@ -60,6 +60,85 @@ CREATE TABLE credential (
 -- #  LAYER 1 — TRANSPORT & ATTESTATION                       #
 -- ############################################################
 
+-- ============================================================
+-- Backend: a *configured* inference destination — where an ask
+-- can be routed. Distinct from `provider` (below), which is the
+-- append-only forensic identity of whoever serviced a
+-- connection: a backend is user configuration (mutable,
+-- enable/disable-able, removable); a provider row is a record.
+--
+-- A backend row describes how to reach and trust that backend.
+--
+-- kind:
+--   eidola    the confidential Eidola service (singleton). Its
+--             base_url + trust columns (trusted_measurements,
+--             hardware_root_ca, hardware_intermediate_ca) are the
+--             connection + trust bundle; each is NULL by default,
+--             which means "use the embedded trust-root pin baked
+--             into this build."
+--   local     Eidola-managed on-device models (singleton; the
+--             models live in <data_dir>/models)
+--   openai    any OpenAI-compatible HTTP server the user
+--             configures (base_url + optional api_key)
+--   llamacpp  a user-owned llama.cpp install: Eidola scans
+--             models_dir and starts/stops llama-server engines,
+--             but does NOT manage (download/delete) the models
+--
+-- model_overrides: JSON array of model ids. "OpenAI-compatible"
+-- does not guarantee GET /v1/models (Azure's deployment model,
+-- scoped gateway keys, partial proxy listings), so a backend's
+-- model list can be pinned manually; NULL = trust the listing.
+--
+-- engine_path: for 'llamacpp' backends only, an explicit path to
+-- the user's llama-server binary; NULL = discover it ($PATH, then
+-- the usual install prefixes). The managed 'local' engine is the
+-- bundled sidecar and never reads this column.
+--
+-- auto_start: for 'llamacpp' backends only, whether a request may
+-- start an engine on demand (1) or must be pre-loaded explicitly
+-- (0). The 'local' backend always auto-starts (it's ours).
+--
+-- trusted_measurements: for the 'eidola' backend only, a JSON
+-- array of enclave-measurement overrides ({snp_measurement,
+-- tdx_measurement:{rtmr1,rtmr2}}). NULL/absent = the single build
+-- measurement pinned in the trust root.
+--
+-- hardware_root_ca / hardware_intermediate_ca: for the 'eidola'
+-- backend only, PEM certificate overrides for the AMD/Intel
+-- attestation chain (the dev-shim ARK/ASK). NULL = the vendor
+-- chain baked into the verifier.
+--
+-- removed_at: soft delete. Forensic rows (request.backend_id)
+-- keep a valid FK target forever; re-adding the same id revives
+-- the row.
+-- ============================================================
+CREATE TABLE backend (
+    id              TEXT PRIMARY KEY,          -- user-visible slug
+    kind            TEXT NOT NULL CHECK (kind IN (
+                        'eidola', 'local', 'openai', 'llamacpp'
+                    )),
+    display_name    TEXT NOT NULL,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    base_url        TEXT,
+    api_key         TEXT,
+    models_dir      TEXT,
+    model_overrides TEXT,                      -- JSON array
+    engine_path     TEXT,                      -- llamacpp: explicit binary path
+    auto_start      INTEGER NOT NULL DEFAULT 1, -- llamacpp: start engines on request
+    trusted_measurements     TEXT,             -- eidola: JSON array of measurement overrides
+    hardware_root_ca         TEXT,             -- eidola: PEM ARK override
+    hardware_intermediate_ca TEXT,             -- eidola: PEM ASK override
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    removed_at      INTEGER
+);
+
+-- The eidola and local backends are singletons; externally
+-- configured kinds may have any number of rows.
+CREATE UNIQUE INDEX idx_backend_singleton
+    ON backend (kind)
+    WHERE kind IN ('eidola', 'local');
+
 CREATE TABLE provider (
     id          TEXT PRIMARY KEY,              -- UUIDv7
     name        TEXT NOT NULL,
@@ -448,7 +527,12 @@ CREATE TABLE request (
 
     credential_nonce  TEXT REFERENCES credential(nonce),
 
-    created_at        INTEGER NOT NULL
+    created_at        INTEGER NOT NULL,
+
+    -- The configured backend this request was routed through, when the
+    -- request belongs to one (chat turns; NULL for traffic that isn't
+    -- addressed to a configured backend).
+    backend_id        TEXT REFERENCES backend(id)
 );
 
 CREATE INDEX idx_request_action

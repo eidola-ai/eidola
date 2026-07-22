@@ -34,8 +34,11 @@ pub struct PostData {
     pub parent_action_id: Option<SharedString>,
     /// `user` / `assistant` / `error`.
     pub role: SharedString,
-    /// The gutter byline ("You" / a model name / "Error").
+    /// The gutter byline: "You" / a model's human display name / "Error".
     pub byline: SharedString,
+    /// The serving backend's human display name (assistant rows only) —
+    /// the quiet second byline line ("Gemma 4 E2B" over "Local").
+    pub byline_backend: Option<SharedString>,
     /// Formatted clock time for the byline, empty when there's no timestamp.
     pub time: SharedString,
     /// The post body as markdown source.
@@ -239,6 +242,7 @@ mod tests {
             } else {
                 "You".into()
             },
+            byline_backend: (kind == "agent").then(|| "Eidola".into()),
             time: "".into(),
             content: text.into(),
             generation_count: 1,
@@ -253,6 +257,7 @@ mod tests {
             parent_action_id: None,
             role: "user".into(),
             byline: "You".into(),
+            byline_backend: None,
             time: "".into(),
             content: text.into(),
             generation_count: 1,

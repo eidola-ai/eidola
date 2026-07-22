@@ -277,8 +277,7 @@ mod driver {
                 default_size: size(px(620.), px(520.)),
                 build: |window, cx| {
                     let stores = settings_stores(cx);
-                    let view =
-                        cx.new(|cx| SettingsView::new(stores, WindowInput::new(cx), window, cx));
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
                     root(view, window, cx)
                 },
             },
@@ -331,31 +330,147 @@ mod driver {
     }
 
     /// A funded, ready account with a populated model list (so the ⌥ model
-    /// reveal and picker are live).
+    /// reveal and picker are live), the backend registry (so the Backends
+    /// settings pane and the picker's per-backend groups render), and the
+    /// engine fixtures.
     fn ready_stores(cx: &mut App) -> Stores {
         stub_stores(cx, |s| {
             s.config_state = Some(config_state(true));
+            s.eidola_trust = Some(eidola_trust());
             s.models = models();
+            s.backends = backends();
+            s.local_models = Some(local_models_state());
         })
+    }
+
+    /// Backend-registry fixture: the two singletons plus one external
+    /// OpenAI-compatible server, mirroring a configured multi-backend setup.
+    fn backends() -> Vec<eidola_app_core::BackendInfo> {
+        use eidola_app_core::{BackendInfo, BackendKind};
+        vec![
+            BackendInfo {
+                id: "eidola".into(),
+                kind: BackendKind::Eidola,
+                display_name: "Eidola".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+                created_at: 0,
+            },
+            BackendInfo {
+                id: "local".into(),
+                kind: BackendKind::Local,
+                display_name: "Local".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+                created_at: 0,
+            },
+            BackendInfo {
+                id: "my-vllm".into(),
+                kind: BackendKind::OpenAi,
+                display_name: "My vLLM box".into(),
+                enabled: true,
+                base_url: Some("http://192.168.1.20:8000".into()),
+                has_api_key: true,
+                models_dir: None,
+                model_overrides: Some(vec!["qwen3-8b".into()]),
+                engine_path: None,
+                auto_start: true,
+                created_at: 1,
+            },
+        ]
+    }
+
+    /// Local-inference fixture: one model loaded and serving, one merely
+    /// downloaded, one mid-download — every state the Models pane renders,
+    /// with the loaded one surfacing in the space view's model picker.
+    fn local_models_state() -> eidola_app_core::LocalModelsState {
+        use eidola_app_core::{LocalModelInfo, LocalModelStatus, LocalModelsState};
+        LocalModelsState {
+            engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+            external: Vec::new(),
+            models: vec![
+                LocalModelInfo {
+                    id: "gemma-4-12b-it-qat-q4_0@local".into(),
+                    slug: "gemma-4-12b-it-qat-q4_0".into(),
+                    display_name: "Gemma 4 12B".into(),
+                    file_name: "gemma-4-12b-it-qat-q4_0.gguf".into(),
+                    size_bytes: Some(6_975_877_728),
+                    source_url: None,
+                    status: LocalModelStatus::Downloading {
+                        received: 3_100_000_000,
+                        total: Some(6_975_877_728),
+                    },
+                    last_error: None,
+                },
+                LocalModelInfo {
+                    id: "gemma-4-E2B_q4_0-it@local".into(),
+                    slug: "gemma-4-E2B_q4_0-it".into(),
+                    display_name: "Gemma 4 E2B".into(),
+                    file_name: "gemma-4-E2B_q4_0-it.gguf".into(),
+                    size_bytes: Some(3_349_514_112),
+                    source_url: None,
+                    status: LocalModelStatus::Loaded {
+                        port: 51_432,
+                        context_tokens: 8192,
+                        pinned: false,
+                    },
+                    last_error: None,
+                },
+                LocalModelInfo {
+                    id: "gemma-4-E4B_q4_0-it@local".into(),
+                    slug: "gemma-4-E4B_q4_0-it".into(),
+                    display_name: "Gemma 4 E4B".into(),
+                    file_name: "gemma-4-E4B_q4_0-it.gguf".into(),
+                    size_bytes: Some(5_154_939_136),
+                    source_url: None,
+                    status: LocalModelStatus::Available,
+                    last_error: None,
+                },
+            ],
+        }
     }
 
     fn config_state(has_account: bool) -> ConfigState {
         ConfigState {
-            base_url: "https://eidola.example/v1".into(),
             default_model: "gemma4-31b".into(),
-            base_url_pin: "https://eidola.example/v1".into(),
-            base_url_is_override: false,
             has_account,
             has_account_secret: has_account,
             domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
-            trusted_measurements: Vec::new(),
-            trusted_measurements_are_override: false,
-            has_hardware_root_ca: false,
-            has_hardware_intermediate_ca: false,
             attestation_url: None,
             appearance: eidola_app_core::config::AppearanceSetting::System,
             time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
             light_character: eidola_app_core::config::LightCharacter::Neutral,
+        }
+    }
+
+    fn eidola_trust() -> eidola_app_core::EidolaTrust {
+        eidola_app_core::EidolaTrust {
+            base_url: "https://eidola.example/v1".into(),
+            base_url_pin: "https://eidola.example/v1".into(),
+            base_url_is_override: false,
+            trusted_measurements: Vec::new(),
+            trusted_measurements_are_override: false,
+            pinned_measurement: eidola_app_core::MeasurementInfo {
+                snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
+                tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                    .into(),
+                tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa"
+                    .into(),
+            },
+            has_hardware_root_ca: false,
+            hardware_root_ca_pem: None,
+            has_hardware_intermediate_ca: false,
+            hardware_intermediate_ca_pem: None,
         }
     }
 
@@ -465,6 +580,7 @@ mod driver {
     fn settings_stores(cx: &mut App) -> Stores {
         stub_stores(cx, |s| {
             s.config_state = Some(config_state(true));
+            s.eidola_trust = Some(eidola_trust());
             s.balances = Some(BalancesResult {
                 available: 4_200_000,
                 pools: vec![
@@ -481,6 +597,8 @@ mod driver {
                 ],
             });
             s.prices = prices();
+            s.backends = backends();
+            s.local_models = Some(local_models_state());
         })
     }
 

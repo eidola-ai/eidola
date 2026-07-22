@@ -48,7 +48,36 @@ fn builds_the_real_site() {
     assert!(home.contains("/assets/circadian.css"));
     assert!(home.contains("class=\"prose home\""));
 
-    // Legal placeholders.
+    // Legal documents: versioned, with the acceptance identity published
+    // three ways — meta tags, the visible version line, and the exact
+    // source bytes at <route>/source.md (the artifact the server's
+    // terms-acceptance poller fetches and hashes).
+    for (page, src) in [
+        ("terms", "www/pages/terms.md"),
+        ("privacy", "www/pages/privacy.md"),
+    ] {
+        let html = read(&out, &format!("{page}/index.html"));
+        let source = read(&out, &format!("{page}/source.md"));
+        let repo_bytes = fs::read_to_string(repo_root().join(src)).unwrap();
+        assert_eq!(
+            source, repo_bytes,
+            "{page}/source.md must be byte-identical to {src}"
+        );
+        use sha2::{Digest, Sha256};
+        let hash: String = Sha256::digest(repo_bytes.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(
+            html.contains(&format!(
+                "<meta name=\"eidola:source-sha256\" content=\"{hash}\">"
+            )),
+            "{page} page must carry the source hash of {src}"
+        );
+        assert!(html.contains("<meta name=\"eidola:version\" content=\""));
+        assert!(html.contains("class=\"byline doc-version\""));
+        assert!(html.contains("<a href=\"source.md\">source</a>"));
+    }
     assert!(read(&out, "privacy/index.html").contains("Privacy policy"));
     assert!(read(&out, "terms/index.html").contains("Terms of service"));
 

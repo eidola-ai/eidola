@@ -95,9 +95,34 @@ To run the CLI against a local development stack:
 
    `--trust-measurement` takes a `<snp>:<rtmr1>:<rtmr2>` triple — three 96-char hex strings separated by colons — since each Tinfoil release ships paired AMD SEV-SNP and Intel TDX measurements. The mock shim advertises all-zeros for every field, so the dev triple is just three zero blocks. Both `--hardware-root-ca` and `--hardware-intermediate-ca` are required when pointing the CLI at the local mock shim — without ASK, the verifier falls back to AMD's production Genoa ASK, which obviously isn't signed by your local mock ARK and the chain fails to verify. (If you ever rotate `.dev-certs/`, re-run this `configure` command to refresh the embedded certs.)
 
-   On macOS, the CLI's configuration is stored in `~/Library/Application Support/eidola/config.toml`.
+   The connection + trust bundle these flags set — base URL, hardware CAs, and trusted measurements — is stored on the `eidola` backend row in the local database (`~/Library/Application Support/eidola/eidola.db` on macOS); each is a per-column override of the embedded trust-root pin. Other CLI settings (default model, attestation URL, account credentials) live in `~/Library/Application Support/eidola/config.toml`.
 
 Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) for convenience.
+
+### Local inference
+
+The client can run models entirely on-device through its bundled inference engine (a statically-linked [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`, shipped inside every release desktop artifact) — no account, credentials, or network required for the inference itself, and no system llama.cpp install. For dev builds the sidecar isn't produced by cargo: run `just engine` once and point `EIDOLA_LLAMA_SERVER` at `crates/eidola-gui/build/llama-server/bin/llama-server` (or set `llama_server_path` in `config.toml`). Then:
+
+```bash
+cargo run -p eidola-cli -- model list                   # curated Gemma 4 catalog + installed models
+cargo run -p eidola-cli -- model download gemma-4-e2b   # or any .gguf / Hugging Face file URL
+cargo run -p eidola-cli -- chat "hello" --model gemma-4-E2B_q4_0-it@local
+```
+
+Local models are identified as `<file-stem>@local` — the same `<model>@<backend>` form every configured backend uses — and stored under the app data directory (`~/Library/Application Support/eidola/models/` on macOS). Every downloaded model is selectable; **a request loads its engine on demand**, evicting least-recently-used idle engines when memory runs short (pin a loaded model in **Settings → Backends** — or `eidola model pin` — to protect it from automatic unloading). The model picker's "Local" group shows each model's load state, and posts attribute their author as the model's human name over its backend ("Gemma 4 E2B" / "Local").
+
+### Backends
+
+Where an ask can be routed is configurable. Besides the built-in **Eidola** (confidential service) and **local** (managed on-device models) backends, you can add any OpenAI-compatible server — a self-hosted vLLM/Ollama box, or a conventional provider you choose to trust without confidential-computing guarantees — or point Eidola at a llama.cpp models directory you manage yourself (Eidola starts/stops the engines, never touches the files):
+
+```bash
+cargo run -p eidola-cli -- backend add openai my-vllm --url http://192.168.1.20:8000 --api-key sk-…
+cargo run -p eidola-cli -- backend add llamacpp my-box --models-dir ~/models
+cargo run -p eidola-cli -- chat "hello" --model "qwen3-8b@my-vllm"
+cargo run -p eidola-cli -- backend disable eidola   # no-account, on-device-only mode
+```
+
+Models on a configured backend are addressed as `<model>@<backend-id>`. Because not every "OpenAI-compatible" server implements `GET /v1/models`, a backend's model list can be pinned manually (`--models a,b`). In the GUI, **Settings → Backends** manages all of this, and the model picker groups models per backend with per-backend retry/refresh.
 
 ### GUI
 
@@ -110,6 +135,8 @@ just test           # cargo test
 ```
 
 On macOS, `just build gui` produces `crates/eidola-gui/build/Eidola.app`; on Linux, `just run gui` runs the binary directly (the Linux GUI is Wayland-only). See `crates/eidola-gui/AGENTS.md` for the architecture details.
+
+The `local` on-device backend runs a bundled, statically-linked llama.cpp `llama-server` — release desktop artifacts ship it, so no system llama.cpp install is needed. For dev, `just engine` (Nix) materializes the sidecar and `just build gui` copies it into the dev `Eidola.app`; without it the GUI's Local tab shows an honest missing-engine state (or point `llama_server_path` at your own build).
 
 ### Website
 

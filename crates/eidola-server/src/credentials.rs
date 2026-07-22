@@ -576,6 +576,7 @@ pub async fn list_keys(
         (status = 400, description = "Invalid request", body = crate::types::ErrorResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
         (status = 402, description = "Insufficient credit balance", body = crate::types::ErrorResponse),
+        (status = 428, description = "Terms acceptance required", body = crate::types::ErrorResponse),
         (status = 503, description = "Credential issuance not configured", body = crate::types::ErrorResponse),
     )
 )]
@@ -591,6 +592,10 @@ pub async fn issue_credentials(
             message: "credits must be greater than 0".to_string(),
         });
     }
+
+    // Conversion is a gated operation: the account must have accepted the
+    // currently required terms/privacy versions (no-op when unconfigured).
+    crate::account::ensure_terms_accepted(&state, account_id).await?;
 
     let issuance_cbor = URL_SAFE_NO_PAD
         .decode(&request.issuance_request)

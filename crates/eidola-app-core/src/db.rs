@@ -5,7 +5,7 @@ use turso::{Builder, Connection, Database, Value};
 use crate::error::AppError;
 
 const SCHEMA: &str = include_str!("../schema/schema.sql");
-const LATEST_VERSION: i64 = 3;
+const LATEST_VERSION: i64 = 1;
 
 /// Opens (or creates) the local database at `data_dir/eidola.db` and runs any
 /// pending migrations.
@@ -46,6 +46,33 @@ async fn initialize(conn: &Connection) -> Result<(), AppError> {
         migrate(conn, version).await?;
     }
 
+    // The singleton backends exist on every database — fresh installs and
+    // migrated ones alike. Idempotent, so it simply runs on every open.
+    ensure_default_backends(conn).await?;
+
+    Ok(())
+}
+
+/// Insert the `eidola` and `local` singleton backend rows if they are
+/// missing. Runs on every open (idempotent), so both the fresh-install and
+/// migration paths — and any database from before backends existed — end up
+/// with them. Never overwrites: a user's enabled/display choices persist.
+async fn ensure_default_backends(conn: &Connection) -> Result<(), AppError> {
+    let now = crate::now_ms();
+    conn.execute(
+        "INSERT OR IGNORE INTO backend (id, kind, display_name, enabled, created_at, updated_at) \
+         VALUES ('eidola', 'eidola', 'Eidola', 1, ?1, ?1)",
+        (Value::Integer(now),),
+    )
+    .await
+    .map_err(AppError::db)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO backend (id, kind, display_name, enabled, created_at, updated_at) \
+         VALUES ('local', 'local', 'Local', 1, ?1, ?1)",
+        (Value::Integer(now),),
+    )
+    .await
+    .map_err(AppError::db)?;
     Ok(())
 }
 
@@ -57,24 +84,6 @@ async fn migrate(conn: &Connection, current_version: i64) -> Result<(), AppError
                 message: format!("migration 1 failed: {e}"),
             })?;
         set_user_version(conn, 1).await?;
-    }
-
-    if current_version < 2 {
-        conn.execute_batch(MIGRATION_2)
-            .await
-            .map_err(|e| AppError::Database {
-                message: format!("migration 2 failed: {e}"),
-            })?;
-        set_user_version(conn, 2).await?;
-    }
-
-    if current_version < 3 {
-        conn.execute_batch(MIGRATION_3)
-            .await
-            .map_err(|e| AppError::Database {
-                message: format!("migration 3 failed: {e}"),
-            })?;
-        set_user_version(conn, 3).await?;
     }
 
     Ok(())
@@ -392,6 +401,343 @@ pub async fn ensure_provider(
 }
 
 // ---------------------------------------------------------------------------
+// Layer 1 — Backends: configured inference destinations
+// ---------------------------------------------------------------------------
+
+/// One row of the `backend` table. `model_overrides` stays the raw JSON
+/// text here; `backends::BackendInfo` parses it for consumers.
+#[derive(Clone, Debug)]
+pub struct BackendRow {
+    pub id: String,
+    pub kind: String,
+    pub display_name: String,
+    pub enabled: bool,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub models_dir: Option<String>,
+    pub model_overrides: Option<String>,
+    /// `llamacpp` only: explicit `llama-server` path; `None` = discover it.
+    pub engine_path: Option<String>,
+    /// `llamacpp` only: may a request auto-start an engine? The `local`
+    /// backend always auto-starts regardless.
+    pub auto_start: bool,
+    /// `eidola` only: JSON array of enclave-measurement overrides; `None`
+    /// = the single build measurement pinned in the trust root.
+    pub trusted_measurements: Option<String>,
+    /// `eidola` only: PEM ARK certificate override; `None` = vendor chain.
+    pub hardware_root_ca: Option<String>,
+    /// `eidola` only: PEM ASK certificate override; `None` = vendor chain.
+    pub hardware_intermediate_ca: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub removed_at: Option<i64>,
+}
+
+fn backend_row_from(row: &turso::Row) -> Result<BackendRow, AppError> {
+    Ok(BackendRow {
+        id: row.get::<String>(0).map_err(AppError::db)?,
+        kind: row.get::<String>(1).map_err(AppError::db)?,
+        display_name: row.get::<String>(2).map_err(AppError::db)?,
+        enabled: row.get::<i64>(3).map_err(AppError::db)? != 0,
+        base_url: row.get::<Option<String>>(4).map_err(AppError::db)?,
+        api_key: row.get::<Option<String>>(5).map_err(AppError::db)?,
+        models_dir: row.get::<Option<String>>(6).map_err(AppError::db)?,
+        model_overrides: row.get::<Option<String>>(7).map_err(AppError::db)?,
+        engine_path: row.get::<Option<String>>(8).map_err(AppError::db)?,
+        auto_start: row.get::<i64>(9).map_err(AppError::db)? != 0,
+        trusted_measurements: row.get::<Option<String>>(10).map_err(AppError::db)?,
+        hardware_root_ca: row.get::<Option<String>>(11).map_err(AppError::db)?,
+        hardware_intermediate_ca: row.get::<Option<String>>(12).map_err(AppError::db)?,
+        created_at: row.get::<i64>(13).map_err(AppError::db)?,
+        updated_at: row.get::<i64>(14).map_err(AppError::db)?,
+        removed_at: row.get::<Option<i64>>(15).map_err(AppError::db)?,
+    })
+}
+
+const BACKEND_COLUMNS: &str = "id, kind, display_name, enabled, base_url, api_key, \
+     models_dir, model_overrides, engine_path, auto_start, trusted_measurements, \
+     hardware_root_ca, hardware_intermediate_ca, created_at, updated_at, removed_at";
+
+/// List backends, soft-removed rows excluded. Singletons first (eidola,
+/// then local), then externals in creation order — the stable presentation
+/// order both UIs use.
+pub async fn list_backends(conn: &Connection) -> Result<Vec<BackendRow>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {BACKEND_COLUMNS} FROM backend WHERE removed_at IS NULL \
+             ORDER BY CASE kind WHEN 'eidola' THEN 0 WHEN 'local' THEN 1 ELSE 2 END, \
+             created_at, id"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut backends = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        backends.push(backend_row_from(&row)?);
+    }
+    Ok(backends)
+}
+
+/// Fetch one backend by id — including soft-removed rows (callers decide
+/// whether `removed_at` matters; the chat router treats removed as absent,
+/// while `insert_backend` uses the row to revive).
+pub async fn get_backend(conn: &Connection, id: &str) -> Result<Option<BackendRow>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {BACKEND_COLUMNS} FROM backend WHERE id = ?1"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some(backend_row_from(&row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Insert a new external backend, or **revive** a soft-removed row with the
+/// same id (fully overwriting its configuration — forensic `request` rows
+/// keep pointing at the same id, which is again a live backend of that
+/// name). Fails if a live row already holds the id.
+pub async fn insert_backend(conn: &Connection, row: &BackendRow) -> Result<(), AppError> {
+    if let Some(existing) = get_backend(conn, &row.id).await? {
+        if existing.removed_at.is_none() {
+            return Err(AppError::Config {
+                message: format!("a backend named `{}` already exists", row.id),
+            });
+        }
+        conn.execute(
+            "UPDATE backend SET kind = ?2, display_name = ?3, enabled = ?4, base_url = ?5, \
+             api_key = ?6, models_dir = ?7, model_overrides = ?8, engine_path = ?9, \
+             auto_start = ?10, trusted_measurements = ?11, hardware_root_ca = ?12, \
+             hardware_intermediate_ca = ?13, updated_at = ?14, removed_at = NULL WHERE id = ?1",
+            (
+                Value::Text(row.id.clone()),
+                Value::Text(row.kind.clone()),
+                Value::Text(row.display_name.clone()),
+                Value::Integer(row.enabled as i64),
+                opt_text(&row.base_url),
+                opt_text(&row.api_key),
+                opt_text(&row.models_dir),
+                opt_text(&row.model_overrides),
+                opt_text(&row.engine_path),
+                Value::Integer(row.auto_start as i64),
+                opt_text(&row.trusted_measurements),
+                opt_text(&row.hardware_root_ca),
+                opt_text(&row.hardware_intermediate_ca),
+                Value::Integer(row.updated_at),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO backend (id, kind, display_name, enabled, base_url, api_key, \
+         models_dir, model_overrides, engine_path, auto_start, trusted_measurements, \
+         hardware_root_ca, hardware_intermediate_ca, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        (
+            Value::Text(row.id.clone()),
+            Value::Text(row.kind.clone()),
+            Value::Text(row.display_name.clone()),
+            Value::Integer(row.enabled as i64),
+            opt_text(&row.base_url),
+            opt_text(&row.api_key),
+            opt_text(&row.models_dir),
+            opt_text(&row.model_overrides),
+            opt_text(&row.engine_path),
+            Value::Integer(row.auto_start as i64),
+            opt_text(&row.trusted_measurements),
+            opt_text(&row.hardware_root_ca),
+            opt_text(&row.hardware_intermediate_ca),
+            Value::Integer(row.created_at),
+            Value::Integer(row.updated_at),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// Flip a backend's enabled flag. Returns whether a live row was updated.
+pub async fn set_backend_enabled(
+    conn: &Connection,
+    id: &str,
+    enabled: bool,
+    now: i64,
+) -> Result<bool, AppError> {
+    let n = conn
+        .execute(
+            "UPDATE backend SET enabled = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND removed_at IS NULL",
+            (
+                Value::Text(id.to_string()),
+                Value::Integer(enabled as i64),
+                Value::Integer(now),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
+/// Update an external backend's configuration fields (each `Some` replaces;
+/// the inner `Option` clears/sets nullable columns). Returns whether a live
+/// row was updated.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_backend_config(
+    conn: &Connection,
+    id: &str,
+    display_name: Option<&str>,
+    base_url: Option<Option<&str>>,
+    api_key: Option<Option<&str>>,
+    models_dir: Option<Option<&str>>,
+    model_overrides: Option<Option<&str>>,
+    engine_path: Option<Option<&str>>,
+    auto_start: Option<bool>,
+    trusted_measurements: Option<Option<&str>>,
+    hardware_root_ca: Option<Option<&str>>,
+    hardware_intermediate_ca: Option<Option<&str>>,
+    now: i64,
+) -> Result<bool, AppError> {
+    // Build the SET list dynamically; every branch binds positionally.
+    let mut sets: Vec<String> = vec!["updated_at = ?2".into()];
+    let mut params: Vec<Value> = vec![Value::Text(id.to_string()), Value::Integer(now)];
+    let bind = |expr: &str, v: Value, params: &mut Vec<Value>, sets: &mut Vec<String>| {
+        params.push(v);
+        sets.push(format!("{expr} = ?{}", params.len()));
+    };
+    if let Some(name) = display_name {
+        bind(
+            "display_name",
+            Value::Text(name.to_string()),
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(url) = base_url {
+        bind(
+            "base_url",
+            match url {
+                Some(u) => Value::Text(u.to_string()),
+                None => Value::Null,
+            },
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(key) = api_key {
+        bind(
+            "api_key",
+            match key {
+                Some(k) => Value::Text(k.to_string()),
+                None => Value::Null,
+            },
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(dir) = models_dir {
+        bind(
+            "models_dir",
+            match dir {
+                Some(d) => Value::Text(d.to_string()),
+                None => Value::Null,
+            },
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(overrides) = model_overrides {
+        bind(
+            "model_overrides",
+            match overrides {
+                Some(o) => Value::Text(o.to_string()),
+                None => Value::Null,
+            },
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(path) = engine_path {
+        bind(
+            "engine_path",
+            match path {
+                Some(p) => Value::Text(p.to_string()),
+                None => Value::Null,
+            },
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(auto) = auto_start {
+        bind(
+            "auto_start",
+            Value::Integer(auto as i64),
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(measurements) = trusted_measurements {
+        bind(
+            "trusted_measurements",
+            match measurements {
+                Some(m) => Value::Text(m.to_string()),
+                None => Value::Null,
+            },
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(ca) = hardware_root_ca {
+        bind(
+            "hardware_root_ca",
+            match ca {
+                Some(c) => Value::Text(c.to_string()),
+                None => Value::Null,
+            },
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(ca) = hardware_intermediate_ca {
+        bind(
+            "hardware_intermediate_ca",
+            match ca {
+                Some(c) => Value::Text(c.to_string()),
+                None => Value::Null,
+            },
+            &mut params,
+            &mut sets,
+        );
+    }
+    let sql = format!(
+        "UPDATE backend SET {} WHERE id = ?1 AND removed_at IS NULL",
+        sets.join(", ")
+    );
+    let n = conn.execute(&sql, params).await.map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
+/// Soft-remove a backend (forensic rows keep their FK target). Returns
+/// whether a live row was removed.
+pub async fn remove_backend(conn: &Connection, id: &str, now: i64) -> Result<bool, AppError> {
+    let n = conn
+        .execute(
+            "UPDATE backend SET removed_at = ?2, updated_at = ?2 \
+             WHERE id = ?1 AND removed_at IS NULL",
+            (Value::Text(id.to_string()), Value::Integer(now)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
+// ---------------------------------------------------------------------------
 // Layer 1 — Transport: Attestation operations
 // ---------------------------------------------------------------------------
 
@@ -481,47 +827,52 @@ pub struct Request {
     pub error: Option<String>,
     pub credential_nonce: Option<String>,
     pub created_at: i64,
+    /// The configured backend this request was routed through, if any.
+    pub backend_id: Option<String>,
 }
 
 pub async fn insert_request(conn: &Connection, entry: &Request) -> Result<(), AppError> {
+    // 17 parameters — beyond turso's tuple IntoParams impls, so a Vec.
+    let params: Vec<Value> = vec![
+        Value::Text(entry.id.clone()),
+        opt_text(&entry.connection_id),
+        opt_text(&entry.action_id),
+        Value::Text(entry.method.clone()),
+        Value::Text(entry.path.clone()),
+        opt_text(&entry.request_headers),
+        match &entry.request_body {
+            Some(b) => Value::Blob(b.clone()),
+            None => Value::Null,
+        },
+        match entry.response_status {
+            Some(s) => Value::Integer(s),
+            None => Value::Null,
+        },
+        opt_text(&entry.response_headers),
+        match &entry.response_body {
+            Some(b) => Value::Blob(b.clone()),
+            None => Value::Null,
+        },
+        Value::Integer(entry.request_at),
+        match entry.response_at {
+            Some(t) => Value::Integer(t),
+            None => Value::Null,
+        },
+        match entry.duration_ms {
+            Some(d) => Value::Integer(d),
+            None => Value::Null,
+        },
+        opt_text(&entry.error),
+        opt_text(&entry.credential_nonce),
+        Value::Integer(entry.created_at),
+        opt_text(&entry.backend_id),
+    ];
     conn.execute(
         "INSERT INTO request (id, connection_id, action_id, method, path, \
          request_headers, request_body, response_status, response_headers, response_body, \
-         request_at, response_at, duration_ms, error, credential_nonce, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-        (
-            Value::Text(entry.id.clone()),
-            opt_text(&entry.connection_id),
-            opt_text(&entry.action_id),
-            Value::Text(entry.method.clone()),
-            Value::Text(entry.path.clone()),
-            opt_text(&entry.request_headers),
-            match &entry.request_body {
-                Some(b) => Value::Blob(b.clone()),
-                None => Value::Null,
-            },
-            match entry.response_status {
-                Some(s) => Value::Integer(s),
-                None => Value::Null,
-            },
-            opt_text(&entry.response_headers),
-            match &entry.response_body {
-                Some(b) => Value::Blob(b.clone()),
-                None => Value::Null,
-            },
-            Value::Integer(entry.request_at),
-            match entry.response_at {
-                Some(t) => Value::Integer(t),
-                None => Value::Null,
-            },
-            match entry.duration_ms {
-                Some(d) => Value::Integer(d),
-                None => Value::Null,
-            },
-            opt_text(&entry.error),
-            opt_text(&entry.credential_nonce),
-            Value::Integer(entry.created_at),
-        ),
+         request_at, response_at, duration_ms, error, credential_nonce, created_at, backend_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params,
     )
     .await
     .map_err(|e| AppError::Database {
@@ -1661,6 +2012,10 @@ pub struct RequestDetailRow {
     pub attestation_hash: Option<String>,
     pub space_id: Option<String>,
     pub space_title: Option<String>,
+    /// The configured backend this request was routed through, if recorded.
+    pub backend_id: Option<String>,
+    /// The backend's display name at read time (soft-removed rows keep it).
+    pub backend_display_name: Option<String>,
 }
 
 pub async fn get_request(
@@ -1674,11 +2029,12 @@ pub async fn get_request(
                     r.request_at, r.response_at, r.duration_ms, r.error, \
                     r.retry_of_id, r.attempt_number, r.credential_nonce, r.action_id, \
                     c.transport, c.base_url, c.attestation_hash, \
-                    a.space_id, s.title \
+                    a.space_id, s.title, r.backend_id, b.display_name \
              FROM request r \
              LEFT JOIN connection c ON c.id = r.connection_id \
              LEFT JOIN action a ON a.id = r.action_id \
              LEFT JOIN space s ON s.id = a.space_id \
+             LEFT JOIN backend b ON b.id = r.backend_id \
              WHERE r.id = ?1",
         )
         .await
@@ -1711,6 +2067,8 @@ pub async fn get_request(
             attestation_hash: row.get::<Option<String>>(18).map_err(AppError::db)?,
             space_id: row.get::<Option<String>>(19).map_err(AppError::db)?,
             space_title: row.get::<Option<String>>(20).map_err(AppError::db)?,
+            backend_id: row.get::<Option<String>>(21).map_err(AppError::db)?,
+            backend_display_name: row.get::<Option<String>>(22).map_err(AppError::db)?,
         })),
     }
 }
@@ -1820,106 +2178,13 @@ pub async fn list_credential_lifecycle(
 // Migrations
 // ---------------------------------------------------------------------------
 
+/// Migration 1 is the full current schema — the pre-release baseline (all
+/// earlier incremental migrations were collapsed while the app had no real
+/// users). Future migrations append as `MIGRATION_N` constants + version
+/// blocks in `migrate()`; see AGENTS.md ("Adding a migration") and the
+/// `migrations_match_schema` test, which structurally compares a
+/// fresh-from-schema database against a fully-migrated one.
 const MIGRATION_1: &str = include_str!("../schema/schema.sql");
-
-/// Rebuild `action` to add the denormalized `supersedes_item_id` and the
-/// compound `(supersedes_action_id, supersedes_item_id)` FK. SQLite cannot add
-/// table constraints via `ALTER TABLE`, so: create the new shape, copy
-/// (backfilling the item from the row's own `item_id` — a generation chain
-/// never hops items, which is exactly the invariant the new FK enforces), swap,
-/// and recreate the indexes. The DDL must stay textually identical to
-/// `schema.sql`'s `action` table (the `migrations_match_schema` test compares
-/// them structurally).
-///
-/// Idempotent-safe: the copy's SELECT only names columns present in both the
-/// old and new shapes, so re-running against an already-new table is a no-op
-/// rebuild.
-const MIGRATION_2: &str = "\
-CREATE TABLE action_new (
-    id              TEXT PRIMARY KEY,          -- UUIDv7
-    space_id        TEXT NOT NULL REFERENCES space(id),
-    participant_id  TEXT NOT NULL REFERENCES participant(id),
-
-    -- generation identity (generation number is derived, not stored)
-    item_id              TEXT NOT NULL,
-    supersedes_action_id TEXT,
-    supersedes_item_id   TEXT,
-
-    action_type     TEXT NOT NULL CHECK (action_type IN (
-                        'user_input',
-                        'inference',
-                        'tool_call',
-                        'tool_result',
-                        'retrieval',
-                        'request',
-                        'checkpoint',
-                        'decision',
-                        'publish',
-                        'system',
-                        'error'
-                    )),
-
-    status          TEXT NOT NULL CHECK (status IN (
-                        'draft',
-                        'streaming',
-                        'complete',
-                        'cancelled',
-                        'error'
-                    )) DEFAULT 'complete',
-
-    intent          TEXT,
-    model           TEXT,
-
-    -- usage / cost
-    input_tokens    INTEGER,
-    output_tokens   INTEGER,
-    credits_consumed INTEGER,
-
-    created_at      INTEGER NOT NULL,
-
-    -- supersedes is item-scoped: both halves present together, the item
-    -- is this row's own, and the referenced (action, item) pair must
-    -- really exist — so a generation chain cannot hop items.
-    CHECK ((supersedes_action_id IS NULL) = (supersedes_item_id IS NULL)),
-    CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
-    FOREIGN KEY (supersedes_action_id, supersedes_item_id)
-        REFERENCES action (id, item_id)
-);
-
-INSERT INTO action_new (id, space_id, participant_id, item_id,
-    supersedes_action_id, supersedes_item_id, action_type, status, intent,
-    model, input_tokens, output_tokens, credits_consumed, created_at)
-SELECT id, space_id, participant_id, item_id, supersedes_action_id,
-       CASE WHEN supersedes_action_id IS NULL THEN NULL ELSE item_id END,
-       action_type, status, intent, model, input_tokens, output_tokens,
-       credits_consumed, created_at
-FROM action;
-
-DROP TABLE action;
-ALTER TABLE action_new RENAME TO action;
-
-CREATE INDEX idx_action_space ON action (space_id, created_at);
-CREATE INDEX idx_action_participant ON action (participant_id);
-CREATE INDEX idx_action_type ON action (action_type);
-CREATE INDEX idx_action_item ON action (space_id, item_id);
-CREATE INDEX idx_action_status ON action (status)
-    WHERE status != 'complete';
-
-CREATE UNIQUE INDEX idx_one_successor_per_action
-    ON action (supersedes_action_id)
-    WHERE supersedes_action_id IS NOT NULL;
-
-CREATE UNIQUE INDEX idx_action_id_item ON action (id, item_id);
-";
-
-/// One gen-0 per item: together with `idx_one_successor_per_action`, an
-/// item's tip becomes provably unique (previously a convention only — a
-/// second gen-0 row would have given `item_current` two rows for one item).
-const MIGRATION_3: &str = "\
-CREATE UNIQUE INDEX idx_one_root_per_item
-    ON action (space_id, item_id)
-    WHERE supersedes_action_id IS NULL;
-";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2369,64 +2634,6 @@ mod tests {
         );
     }
 
-    /// A genuine v1-shaped database (the pre-`supersedes_item_id` action DDL)
-    /// migrated by MIGRATION_2: the rebuild must backfill the denormalized
-    /// item from each row's own item_id and preserve every row.
-    #[tokio::test]
-    async fn migration_2_backfills_supersedes_item_id() {
-        let db = Builder::new_local(":memory:").build().await.unwrap();
-        let conn = db.connect().unwrap();
-
-        // The v1 `action` shape (no supersedes_item_id, inline FK).
-        conn.execute_batch(
-            "CREATE TABLE action (
-                id              TEXT PRIMARY KEY,
-                space_id        TEXT NOT NULL,
-                participant_id  TEXT NOT NULL,
-                item_id              TEXT NOT NULL,
-                supersedes_action_id TEXT REFERENCES action(id),
-                action_type     TEXT NOT NULL,
-                status          TEXT NOT NULL DEFAULT 'complete',
-                intent          TEXT,
-                model           TEXT,
-                input_tokens    INTEGER,
-                output_tokens   INTEGER,
-                credits_consumed INTEGER,
-                created_at      INTEGER NOT NULL
-            );
-            INSERT INTO action (id, space_id, participant_id, item_id,
-                supersedes_action_id, action_type, status, created_at)
-            VALUES
-                ('u1',  's', 'p', 'iu1', NULL, 'user_input', 'complete', 1),
-                ('u1b', 's', 'p', 'iu1', 'u1', 'user_input', 'complete', 2);",
-        )
-        .await
-        .unwrap();
-
-        conn.execute_batch(MIGRATION_2).await.unwrap();
-
-        let mut stmt = conn
-            .prepare("SELECT id, supersedes_item_id FROM action ORDER BY id")
-            .await
-            .unwrap();
-        let mut rows = stmt.query(()).await.unwrap();
-        let mut got = Vec::new();
-        while let Some(row) = rows.next().await.unwrap() {
-            got.push((
-                row.get::<String>(0).unwrap(),
-                row.get::<Option<String>>(1).unwrap(),
-            ));
-        }
-        assert_eq!(
-            got,
-            vec![
-                ("u1".to_string(), None),
-                ("u1b".to_string(), Some("iu1".to_string())),
-            ],
-            "gen-0 stays NULL; a superseding generation backfills its own item"
-        );
-    }
-
     /// Seed a database with one connected story: two attestations, a
     /// connection, three requests (one carrying a credential + action into a
     /// space, one a retry, one errored), and a credential mid-spend. The
@@ -2528,6 +2735,7 @@ mod tests {
                 error: Some("connection refused".into()),
                 credential_nonce: None,
                 created_at: 1_500,
+                backend_id: None,
             },
         )
         .await
@@ -2551,6 +2759,7 @@ mod tests {
                 error: None,
                 credential_nonce: Some("nonce-1".into()),
                 created_at: 2_200,
+                backend_id: Some("eidola".into()),
             },
         )
         .await

@@ -466,6 +466,73 @@
               generate-openapi > $out/openapi.json
             '';
 
+        # Statically-linked llama.cpp `llama-server`, shipped as the `local`
+        # backend's on-device inference engine sidecar. Bundled inside the
+        # macOS .app (Contents/Resources/bin), next to the CLI binary, and in
+        # the Linux GUI closure (exposed via EIDOLA_LLAMA_SERVER by the
+        # wrapper). App-core resolves the engine without ever scanning $PATH,
+        # so no system llama.cpp install is required.
+        #
+        # The base package fn hardcodes LLAMA_CURL and BUILD_SHARED_LIBS to ON
+        # and exposes no curlSupport arg; we flip both OFF via *appended*
+        # cmakeFlags (later -D wins), which drops the libcurl runtime dep and
+        # statically links llama.cpp's own libs into the one binary we ship —
+        # leaving only system frameworks (Metal/Accelerate/libc++/libSystem on
+        # Darwin) so the binary is fully relocatable. On aarch64-darwin
+        # metalSupport is ON by default and the Metal library is *embedded*
+        # (LLAMA_METAL_EMBED_LIBRARY), compiled at runtime — no Xcode, no
+        # external .metallib, works inside the sandbox.
+        #
+        # Linux is CPU-only for now (default BLAS backend). A Vulkan build
+        # (`pkgs.llama-cpp.override { vulkanSupport = true; }`, shaderc compiles
+        # SPIR-V at build time) is coherent to *build*, but usable GPU
+        # inference also needs Vulkan ICD driver files at runtime, and the
+        # Linux wrapper hands app-core the bare EIDOLA_LLAMA_SERVER path
+        # (unwrapped, so it inherits none of the GUI wrapper's
+        # VK_ADD_DRIVER_FILES). Wiring that is the follow-up; CPU-only ships a
+        # working engine on every Linux host today.
+        # The pinned nixpkgs ships llama.cpp build 6981, which predates the
+        # `gemma4` GGUF architecture the curated catalog uses ("unknown model
+        # architecture: 'gemma4'"), so the source is bumped to release b9960
+        # (verified against the catalog models) while keeping the nixpkgs
+        # build recipe. The base recipe derives its src tag from `version` and
+        # only uses `leaveDotGit` to extract the short commit into a COMMIT
+        # file for `LLAMA_BUILD_COMMIT`; a plain pinned fetch plus injecting
+        # the known commit directly is equivalent and more reproducible.
+        llamaServerVersion = "9960";
+        llamaServerCommit = "a935fbff"; # short rev of tag b9960
+        llamaServer = pkgs.llama-cpp.overrideAttrs (o: {
+          version = llamaServerVersion;
+          src = pkgs.fetchFromGitHub {
+            owner = "ggml-org";
+            repo = "llama.cpp";
+            tag = "b${llamaServerVersion}";
+            hash = "sha256-FheVvdqpF3pqxmovFXBh65iNAH+lSM+jqGrM8CpLHF8=";
+          };
+          preConfigure = ''
+            prependToVar cmakeFlags "-DLLAMA_BUILD_COMMIT:STRING=${llamaServerCommit}"
+          '';
+          cmakeFlags = o.cmakeFlags ++ [
+            "-DLLAMA_CURL=OFF"
+            "-DBUILD_SHARED_LIBS=OFF"
+            # The server auto-detects OpenSSL for httplib TLS; we speak plain
+            # HTTP over loopback only, and a libssl dep would pin the binary
+            # to nix-store paths (not relocatable on user machines).
+            "-DLLAMA_SERVER_SSL=OFF"
+          ];
+          # curl is unused with LLAMA_CURL=OFF, and its presence propagates
+          # OpenSSL into the server's auto-detection — drop it entirely.
+          buildInputs = pkgs.lib.filter (d: (d.pname or "") != "curl") o.buildInputs;
+          # Trim the closure to just the one tool we ship. The static build
+          # embeds llama.cpp's libs into the binary, so the sibling llama-*
+          # tools, the `llama` symlink, and the installed headers/archives are
+          # all dead weight for a sidecar.
+          postInstall = (o.postInstall or "") + ''
+            find "$out/bin" -mindepth 1 ! -name llama-server -delete
+            rm -rf "$out/include" "$out/lib"
+          '';
+        });
+
         # Build the CLI as a macOS universal binary (Darwin only)
         eidolaCliMacosUniversal =
           if !pkgs.stdenv.isDarwin then
@@ -540,6 +607,14 @@ with open(path, "wb") as f:
 
                 # autoSignDarwinBinariesHook re-signs in postFixup
                 chmod -w "$out/bin/eidola"
+
+                # Ship the on-device inference engine sidecar next to the CLI
+                # binary; app-core accepts a sibling `llama-server` next to the
+                # exe. arm64-only (see the GUI bundle below for the rationale);
+                # the autoSignDarwinBinariesHook postFixup pass walks every
+                # Mach-O in $out and (re-)signs this one too.
+                cp ${llamaServer}/bin/llama-server "$out/bin/llama-server"
+                chmod u+w "$out/bin/llama-server"
               '';
 
               installPhase = ''
@@ -655,6 +730,28 @@ with open(path, "wb") as f:
                 # invalidates the cached build.
                 cp ${./crates/eidola-gui/Support/Info.plist} "$APP/Contents/Info.plist"
                 chmod -w "$APP/Contents/Info.plist"
+
+                # Bundle the on-device inference engine sidecar. app-core
+                # resolves …/Contents/MacOS/<x> → ../Resources/bin/llama-server.
+                #
+                # Deliberately arm64-only inside the universal app: the sidecar
+                # comes from the aarch64-darwin llamaServer derivation and is
+                # NOT lipo'd with an x86_64 slice. Intel Macs get no bundled
+                # engine — Apple's Intel Metal stack is weak/EOL, so a CPU-only
+                # x86_64 engine isn't worth its weight; the Local tab shows the
+                # honest "engine not present" state there and `llama_server_path`
+                # stays the escape hatch. Recorded as a product decision in
+                # AGENTS.md.
+                #
+                # No LC_UUID zeroing here (unlike the main binary): the sidecar
+                # is a separate derivation whose output hash Nix already fixes,
+                # so it contributes a stable path — copying it is deterministic.
+                # autoSignDarwinBinariesHook's postFixup walks every Mach-O in
+                # $out, so this sidecar is (re-)signed with the same deterministic
+                # ad-hoc signature as the main binary; no explicit sign call.
+                mkdir -p "$APP/Contents/Resources/bin"
+                cp ${llamaServer}/bin/llama-server "$APP/Contents/Resources/bin/llama-server"
+                chmod u+w "$APP/Contents/Resources/bin/llama-server"
               '';
 
               installPhase = ''
@@ -772,7 +869,8 @@ with open(path, "wb") as f:
                 mkdir -p $out/bin $out/share/applications
                 icds=$(ls ${pkgs.mesa}/share/vulkan/icd.d/*.json | tr '\n' ':')
                 makeWrapper ${eidolaGuiLinux}/bin/eidola-gui $out/bin/eidola-gui \
-                  --set-default VK_ADD_DRIVER_FILES "''${icds%:}"
+                  --set-default VK_ADD_DRIVER_FILES "''${icds%:}" \
+                  --set-default EIDOLA_LLAMA_SERVER ${llamaServer}/bin/llama-server
                 # Desktop entry — basename matches the Wayland app_id the
                 # binary sets (lib.rs APP_ID), which is what lets the shell
                 # resolve our windows to this entry. Strip the comment header
@@ -792,6 +890,10 @@ with open(path, "wb") as f:
             nixCrossSystem = null;
           };
           server-openapi-spec = serverOpenApiSpec;
+          # Static llama.cpp `llama-server` — the bundled on-device inference
+          # engine sidecar. Buildable on its own (`nix build .#llama-server`)
+          # for the dev-path `just engine` recipe.
+          llama-server = llamaServer;
         }
         // pkgs.lib.optionalAttrs (eidolaCliMacosUniversal != null) {
           eidola-cli-macos-universal = eidolaCliMacosUniversal;
