@@ -9336,3 +9336,32 @@ fn shift_click_extends_the_existing_selection(cx: &mut TestAppContext) {
         assert_eq!(e.selection(), Selection::range(4, 15));
     });
 }
+
+#[gpui::test]
+fn shift_click_and_drag_keeps_the_original_anchor(cx: &mut TestAppContext) {
+    // Native behavior: a shift-click-and-drag keeps the *original* selection
+    // anchor throughout — the shift-click sets the head, and a following drag
+    // continues to extend from the original anchor. Regression guard for the
+    // bug where the shift-click re-anchored the drag at the click point,
+    // discarding the original range on the very next mouse move.
+    let text = "the quick brown fox jumps over";
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(text));
+    // Anchor a selection at A = 4 (start of "quick"), head at 9.
+    begin_selection(cx, handle, &editor, 4, 1, false);
+    extend_selection(cx, handle, &editor, 9);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.selection(), Selection::range(4, 9));
+    });
+    // Shift-click at C = 20 extends the visible selection from the original
+    // anchor A = 4 (not a fresh anchor at 20).
+    begin_selection(cx, handle, &editor, 20, 1, true);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.selection(), Selection::range(4, 20));
+    });
+    // The subsequent drag must still be anchored at A = 4. Before the fix the
+    // drag re-anchored at the shift-click point, yielding range(20, 25).
+    extend_selection(cx, handle, &editor, 25);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.selection(), Selection::range(4, 25));
+    });
+}

@@ -1248,25 +1248,43 @@ impl MarkdownEditorState {
         cx: &mut Context<Self>,
     ) {
         self.is_selecting = true;
-        let new_sel = match click_count {
-            0 | 1 => {
-                self.select_mode = SelectMode::Char;
-                self.select_anchor_range = offset..offset;
-                if shift {
-                    // Shift-click extends the existing selection to the click.
-                    Selection::range(self.state.selection.anchor(), offset)
-                } else {
-                    Selection::Cursor(offset)
-                }
+        let mode = match click_count {
+            0 | 1 => SelectMode::Char,
+            2 => SelectMode::Word,
+            _ => SelectMode::Line,
+        };
+        self.select_mode = mode;
+
+        if shift {
+            // A shift-press *extends* the existing selection instead of starting
+            // a new one — and it must keep the existing anchor as the drag
+            // anchor, so a subsequent drag continues to grow the original range
+            // rather than discarding it and re-anchoring at the click point.
+            // For character mode we capture the live selection anchor (it may
+            // have moved by keyboard since the last press); for word/line mode
+            // we preserve the previously-anchored unit (`select_anchor_range`),
+            // so shift-double/triple-click keeps extending from the first word /
+            // line. Then extend to the click at the current granularity — the
+            // same path a drag takes.
+            if mode == SelectMode::Char {
+                let anchor = self.state.selection.anchor();
+                self.select_anchor_range = anchor..anchor;
             }
-            2 => {
-                self.select_mode = SelectMode::Word;
+            self.extend_selection_to(offset, cx);
+            return;
+        }
+
+        let new_sel = match mode {
+            SelectMode::Char => {
+                self.select_anchor_range = offset..offset;
+                Selection::Cursor(offset)
+            }
+            SelectMode::Word => {
                 let range = word_range_at(&self.state.markdown, offset);
                 self.select_anchor_range = range.clone();
                 Selection::range(range.start, range.end)
             }
-            _ => {
-                self.select_mode = SelectMode::Line;
+            SelectMode::Line => {
                 let range = line_range_at(&self.state.markdown, offset);
                 self.select_anchor_range = range.clone();
                 Selection::range(range.start, range.end)
@@ -1839,61 +1857,69 @@ impl RenderOnce for MarkdownEditor {
         // than the window that froze the selection at the fold: dragging toward
         // off-screen text left the hitbox, `on_mouse_move` stopped firing, and
         // the selection couldn't grow past the visible screenful — which read
-        // as "long responses can't be selected". While a drag is in progress we
-        // register **window-global** move/up listeners (the same pattern the
-        // space view's minimap-scrollbar drag uses), so the selection keeps
-        // extending to the offset under the pointer anywhere in the window —
-        // including off-screen rows, whose geometry is laid out because a
-        // visible post renders its whole editor. Listeners are cleared each
-        // frame, so a hitbox-free `canvas` re-registers them every frame while
-        // selecting and stops the frame the drag ends.
-        if state.read(cx).is_selecting {
-            let drag_state = state.clone();
-            container = container.child(
-                gpui::canvas(
-                    |_, _, _| {},
-                    move |_bounds, _, window, _cx| {
-                        let move_state = drag_state.clone();
-                        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _window, cx| {
-                            if phase != gpui::DispatchPhase::Bubble {
+        // as "long responses can't be selected". So we register **window-global**
+        // move/up listeners (the same pattern the space view's minimap-scrollbar
+        // drag uses), so the selection keeps extending to the offset under the
+        // pointer anywhere in the window — including off-screen rows, whose
+        // geometry is laid out because a visible post renders its whole editor.
+        //
+        // These are registered **unconditionally every frame**, not gated on
+        // `is_selecting` — matching the minimap's rationale ("registering
+        // unconditionally is cheap and avoids a first-move gap"). gpui dispatches
+        // events against the *last painted* frame's listeners and only repaints
+        // on the `cx.notify()` scheduled by the mouse-down; so had we gated on
+        // `is_selecting`, the frame that was on screen when the press landed
+        // carried no global listeners, and a fast first move that jumped outside
+        // the clipped hitbox before that repaint would be missed by both the
+        // local (hitbox-gated) and global paths — a drag starting near the
+        // viewport edge could still freeze. Registering always means the
+        // listeners are already present on the pre-press frame; they no-op unless
+        // a drag is actually in flight (the `is_selecting` guards live inside the
+        // handlers). Listeners are cleared each frame, so a hitbox-free `canvas`
+        // re-registers them every frame.
+        let drag_state = state.clone();
+        container = container.child(
+            gpui::canvas(
+                |_, _, _| {},
+                move |_bounds, _, window, _cx| {
+                    let move_state = drag_state.clone();
+                    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _window, cx| {
+                        if phase != gpui::DispatchPhase::Bubble {
+                            return;
+                        }
+                        move_state.update(cx, |st, cx| {
+                            if !st.is_selecting {
                                 return;
                             }
-                            move_state.update(cx, |st, cx| {
-                                if !st.is_selecting {
-                                    return;
-                                }
-                                // The button was released without a
-                                // delivered up event (e.g. off-window) —
-                                // end the drag rather than track a phantom.
-                                if !ev.dragging() {
-                                    st.is_selecting = false;
-                                    cx.notify();
-                                    return;
-                                }
-                                let offset = st.offset_for_position(ev.position);
-                                st.extend_selection_to(offset, cx);
-                            });
-                        });
-                        let up_state = drag_state.clone();
-                        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
-                            if phase != gpui::DispatchPhase::Bubble
-                                || ev.button != MouseButton::Left
-                            {
+                            // The button was released without a
+                            // delivered up event (e.g. off-window) —
+                            // end the drag rather than track a phantom.
+                            if !ev.dragging() {
+                                st.is_selecting = false;
+                                cx.notify();
                                 return;
                             }
-                            up_state.update(cx, |st, cx| {
-                                if st.is_selecting {
-                                    st.is_selecting = false;
-                                    cx.notify();
-                                }
-                            });
+                            let offset = st.offset_for_position(ev.position);
+                            st.extend_selection_to(offset, cx);
                         });
-                    },
-                )
-                .absolute()
-                .size_full(),
-            );
-        }
+                    });
+                    let up_state = drag_state.clone();
+                    window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
+                        if phase != gpui::DispatchPhase::Bubble || ev.button != MouseButton::Left {
+                            return;
+                        }
+                        up_state.update(cx, |st, cx| {
+                            if st.is_selecting {
+                                st.is_selecting = false;
+                                cx.notify();
+                            }
+                        });
+                    });
+                },
+            )
+            .absolute()
+            .size_full(),
+        );
 
         // The first `BlockElement::paint` of the frame registers the
         // `EntityInputHandler` (IME / typed text → `replace_text_in_range`),
