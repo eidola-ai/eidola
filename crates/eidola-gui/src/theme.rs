@@ -799,6 +799,13 @@ fn circadian_night(character: LightCharacter, font_scale: f32) -> ThemeConfig {
         // Scaled like Day (this size becomes the window `rem_size`).
         font_family: None,
         font_size: Some(UI_FONT_SIZE * font_scale),
+        // Must be set explicitly: gpui-component only overwrites the live
+        // `Theme.mono_font_size` when the config's is `Some` (theme
+        // `schema.rs`), so leaving it `None` (via `..default`) would let dark
+        // code blocks keep the framework default `px(13.)` — unscaled, and
+        // stale-dependent on whether light was applied first.
+        mono_font_family: None,
+        mono_font_size: Some(UI_FONT_SIZE * font_scale),
         radius: Some(8),
         radius_lg: Some(12),
         shadow: Some(true),
@@ -1229,14 +1236,21 @@ mod tests {
         assert_eq!(day.mono_font_size, Some(UI_FONT_SIZE));
         let night = circadian_night(LightCharacter::Neutral, 1.0);
         assert_eq!(night.font_size, Some(UI_FONT_SIZE));
+        // Night MUST set `mono_font_size` explicitly (not `None`): gpui-component
+        // only overwrites the live mono size when the config's is `Some`, so a
+        // `None` here would strand dark code blocks at the framework default and
+        // out of the zoom. Pinned in both families so the asymmetry can't return.
+        assert_eq!(night.mono_font_size, Some(UI_FONT_SIZE));
 
-        // A zoom multiplies it proportionally — this is the single lever every
-        // rems()-relative chrome size then rides.
+        // A zoom multiplies both the body and mono ramps proportionally, in
+        // both families — this is the single lever every rems()-relative chrome
+        // size then rides.
         let day_big = circadian_day(LightCharacter::Neutral, 1.5);
         assert_eq!(day_big.font_size, Some(UI_FONT_SIZE * 1.5));
         assert_eq!(day_big.mono_font_size, Some(UI_FONT_SIZE * 1.5));
         let night_big = circadian_night(LightCharacter::Neutral, 2.0);
         assert_eq!(night_big.font_size, Some(UI_FONT_SIZE * 2.0));
+        assert_eq!(night_big.mono_font_size, Some(UI_FONT_SIZE * 2.0));
 
         // The scale is orthogonal to the palette — colors are untouched.
         assert_eq!(day.colors.background, day_big.colors.background);
