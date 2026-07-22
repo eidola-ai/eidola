@@ -2921,6 +2921,43 @@ impl AppCore {
             .await
             .map_err(join_err)?
     }
+
+    /// Request a **streaming response to an already-persisted post**, without
+    /// posting a new user turn. This is the "re-request" / retry entry point:
+    /// after a failed ask the user's post is saved but has no reply, so there
+    /// is nothing to re-post — this runs a fresh turn *replying to that exact
+    /// post*. `target_action_id` is the post being answered (its current tip);
+    /// the turn attaches as its reply in `ResponseMode::Reply`.
+    ///
+    /// This is exactly the `run_turn_stream(Reply)` half of [`Self::chat_stream`]
+    /// without the leading `post`, so every exit point and emission is identical
+    /// to a `chat_stream` that reused an existing post (see `tests/bus.rs`). A
+    /// failure is wrapped as `AppError::ChatFailed { space_id }` so a GUI space
+    /// can route it the same way it routes a failed ask.
+    pub async fn respond_stream(
+        &self,
+        space_id: String,
+        model: String,
+        target_action_id: String,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .run_turn_stream(
+                        &space_id,
+                        &model,
+                        &target_action_id,
+                        ResponseMode::Reply,
+                        None,
+                        sender,
+                    )
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
 }
 
 /// Convert a `tokio::task::JoinError` (panic / cancellation) into `AppError`.

@@ -65,6 +65,44 @@ fn register_space(s: &mut Snapshots) {
         cx.new(|cx| SpaceView::new(core, None, WindowInput::new(cx), window, cx))
     });
 
+    // A failed ask: the dismissible recovery notice attached to the bottom of
+    // the exchange (Retry / Copy / ×), with the saved user post above it.
+    s.add("space_error", size(px(760.), px(680.)), |window, cx| {
+        let core = stub_stores_with_config(cx);
+        cx.new(|cx| {
+            let view = SpaceView::new(core, Some("s".into()), WindowInput::new(cx), window, cx);
+            view.space().update(cx, |sp, cx| {
+                sp.set_post_tree_for_test(
+                    vec![fixture_post(
+                        "a1",
+                        "human",
+                        "user",
+                        "user_input",
+                        "Hello, what is your name?",
+                        0,
+                        false,
+                        1,
+                    )],
+                    cx,
+                );
+                sp.apply_chat_failure_for_test(
+                    eidola_app_core::error::AppError::ChatFailed {
+                        space_id: "s".into(),
+                        source: Box::new(eidola_app_core::error::AppError::Network {
+                            message: "request failed: error sending request for url \
+                                 (https://gateway.eidola.containers.tinfoil.sh/v1/models): \
+                                 client error (Connect): dns error: failed to look up address \
+                                 information: nodename nor servname provided, or not known"
+                                .into(),
+                        }),
+                    },
+                    cx,
+                );
+            });
+            view
+        })
+    });
+
     // A draft with content: the action gutter reveals the discoverable
     // submit — Ask beside the draft, the model chip (the addressee) below it.
     s.add(

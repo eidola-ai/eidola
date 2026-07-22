@@ -3156,6 +3156,169 @@ fn space_edit_buffer_survives_transcript_sync(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+// ---------------------------------------------------------------------------
+// Failed-ask recovery — the space must never brick on a failed request. A
+// failure surfaces a *dismissible* recovery notice, and all three recovery
+// paths (edit the message, re-request a response, add a follow-up) stay live.
+// ---------------------------------------------------------------------------
+
+/// Seed a space with a single saved user post (a1, no reply) — exactly what a
+/// failed ask leaves behind — then drive a post-persist failure through the
+/// shared mutation-failure completion (as `spawn_stream`'s error arm does),
+/// so the view's recovery notice appears.
+fn seed_failed_ask(view: &Entity<SpaceView>, window: AnyWindowHandle, cx: &mut TestAppContext) {
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![fixture_user_post("a1", "Hello, what is your name?")],
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    let wrapped = AppError::ChatFailed {
+        space_id: "s".into(),
+        source: Box::new(AppError::Network {
+            message: "dns error: failed to look up address".into(),
+        }),
+    };
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.apply_chat_failure_for_test(wrapped, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn space_failed_ask_notice_is_dismissible(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_failed_ask(&view, window, cx);
+
+    // The failure surfaced the recovery notice (with the source's text).
+    view.read_with(cx, |v, _| {
+        let msg = v
+            .error_for_test()
+            .expect("a failure shows the recovery notice");
+        assert!(msg.contains("dns error"), "notice carries the error: {msg}");
+    });
+
+    // Dismissing clears only the notice — the space is untouched.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.dismiss_error(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(v.error_for_test().is_none(), "notice dismissed");
+        assert_eq!(v.post_count_for_test(), 1, "the saved post remains");
+        assert!(!v.space().read(cx).is_streaming());
+    });
+}
+
+#[gpui::test]
+fn space_failed_ask_can_edit_original(cx: &mut TestAppContext) {
+    // Recovery path 1: the failed ask's saved user post is still editable.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_failed_ask(&view, window, cx);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.editing_action_id_for_test(),
+            Some("a1".to_string()),
+            "a failed ask does not block editing the original message"
+        );
+    });
+    let editor = view
+        .read_with(cx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post's body editor exists");
+    cx.update_window(window, |_, window, cx| {
+        editor.update(cx, |e, cx| {
+            e.set_value("Actually, who are you?".to_string(), cx)
+        });
+        view.update(cx, |v, cx| v.commit_edit(window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.editing_action_id_for_test(),
+            None,
+            "the edit committed (stub Space::edit accepts)"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_failed_ask_can_re_request(cx: &mut TestAppContext) {
+    // Recovery path 2: re-request a response against the saved user post — the
+    // notice's Retry action, routed through `Space::retry` (no re-post).
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_failed_ask(&view, window, cx);
+
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.space().read(cx).can_retry(),
+            "a saved user post with no reply can be re-requested"
+        );
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.retry_failed(window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(v.error_for_test().is_none(), "retry clears the notice");
+        assert!(
+            v.space().read(cx).is_streaming(),
+            "retry re-enters the streaming state (a real send would request a response)"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_failed_ask_can_add_followup(cx: &mut TestAppContext) {
+    // Recovery path 3: a normal follow-up at the tail composer still works.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_failed_ask(&view, window, cx);
+
+    // The tail composer reappeared at the leaf a1 after the failure.
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.draft_parents_for_test().contains(&Some("a1".to_string())),
+            "a docked tail draft sits at the leaf a1 after a failed ask"
+        );
+    });
+
+    // Typing a follow-up and Ask-ing it is accepted (not bricked).
+    open_space_draft(&view, window, cx, Some("a1"));
+    set_space_composer_text(&view, window, cx, "never mind — how are you?");
+    dispatch_space_action(&view, window, cx, Send);
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "the follow-up draft was consumed"
+        );
+        assert!(
+            v.space().read(cx).is_streaming(),
+            "the follow-up entered the streaming state"
+        );
+        assert_eq!(
+            v.space().read(cx).messages().len(),
+            2,
+            "the follow-up appended a second user turn"
+        );
+    });
+}
+
 #[gpui::test]
 fn space_regenerate_uses_selected_model(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);

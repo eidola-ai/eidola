@@ -46,6 +46,17 @@
 //! action/content/antecedent inserts stays *unemitted* — internal-consistency
 //! (kill-`-9`-class) failures, not durable partial state to reconcile.
 //!
+//! **Re-request (`respond_stream`).** The GUI's failed-ask "Retry" path calls
+//! `AppCore::respond_stream`, which is exactly the `run_turn_stream(Reply)` half
+//! of `chat_stream` with **no leading `post`** — it requests a response to an
+//! already-persisted user post. So it hits every `run_turn`/`chat_stream` row
+//! above *except* the post-owned `SpaceIndex?` column (it never posts, so it
+//! never emits `SpaceIndex`), and its failures are still wrapped with the
+//! already-known space id. Executed in `chat_path.rs`
+//! (`respond_stream_requests_response_without_reposting`,
+//! `respond_stream_failure_wraps_space_id_and_keeps_single_post`), which assert
+//! the no-duplicate-post and no-`SpaceIndex` distinctions.
+//!
 //! **Local turns (`local/<slug>` models).** `prepare_turn` routes these to the
 //! loopback llama.cpp engine with `TurnPrep.spend = None`: no credential is
 //! provisioned, no `Authorization` header is sent, and every `Wallet` emission
