@@ -128,11 +128,17 @@ const NEWSREADER_BOLD_ITALIC_TTF: &[u8] =
 /// so [`apply`] can run from any context (config observer, clock task,
 /// per-window appearance observer). `character` is the user's *fixed*
 /// choice, honored only while `tint` is `Off`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ThemeSettings {
     pub appearance: AppearanceSetting,
     pub tint: TimeOfDayTint,
     pub character: LightCharacter,
+    /// The base type-scale factor (`1.0` = designed sizes). Multiplies the
+    /// theme's UI font size — which gpui-component installs as the window
+    /// `rem_size`, so every `rems()`-relative size, line height, and padding
+    /// rides it — and, via [`font_scale`], the prose reading ramp. The single
+    /// lever behind View → Actual Size / Zoom In / Zoom Out.
+    pub font_scale: f32,
 }
 
 /// Theme state global: the current settings, the (mode, character) pair
@@ -328,6 +334,7 @@ pub fn install(cx: &mut App) {
                 appearance: AppearanceSetting::System,
                 tint: TimeOfDayTint::Off,
                 character: LightCharacter::Neutral,
+                font_scale: eidola_app_core::config::FONT_SCALE_DEFAULT,
             },
             applied: None,
             zone_cache: None,
@@ -360,8 +367,8 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
 
     {
         let theme = Theme::global_mut(cx);
-        theme.light_theme = Rc::new(circadian_day(character));
-        theme.dark_theme = Rc::new(circadian_night(character));
+        theme.light_theme = Rc::new(circadian_day(character, settings.font_scale));
+        theme.dark_theme = Rc::new(circadian_night(character, settings.font_scale));
     }
     Theme::change(mode, window, cx);
     if cx.has_global::<ThemeState>() {
@@ -376,15 +383,31 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
     }
 }
 
+/// The current base type-scale factor from the theme global (`1.0` when the
+/// theme hasn't been installed yet, e.g. a bare test `App`). Read by the prose
+/// surface ([`crate::space_view::prose_style`]) — the one place the type ramp
+/// is spelled in absolute pixels rather than `rems()`, so it doesn't ride the
+/// scaled `rem_size` automatically and must multiply the factor itself.
+pub fn font_scale(cx: &App) -> f32 {
+    if cx.has_global::<ThemeState>() {
+        cx.global::<ThemeState>().settings.font_scale
+    } else {
+        eidola_app_core::config::FONT_SCALE_DEFAULT
+    }
+}
+
 /// Install the palettes for a specific (mode, character) pair, bypassing
 /// the settings + clock resolution. QA seam for the UI driver's `theme`
 /// command (and any test that wants to *see* a tinted palette) — production
 /// always routes through [`apply`].
 pub fn apply_fixed(mode: ThemeMode, character: LightCharacter, cx: &mut App) {
+    // Honor the current type scale so the driver's forced-palette previews and
+    // any test that wants to *see* a tinted palette also reflect a zoom.
+    let scale = font_scale(cx);
     {
         let theme = Theme::global_mut(cx);
-        theme.light_theme = Rc::new(circadian_day(character));
-        theme.dark_theme = Rc::new(circadian_night(character));
+        theme.light_theme = Rc::new(circadian_day(character, scale));
+        theme.dark_theme = Rc::new(circadian_night(character, scale));
     }
     Theme::change(mode, None, cx);
     for handle in cx.windows() {
@@ -402,6 +425,7 @@ pub fn wire_config(config: &Entity<ConfigStore>, cx: &mut App) {
             appearance: s.appearance,
             tint: s.time_of_day_tint,
             character: s.light_character,
+            font_scale: s.font_scale,
         })
     };
 
@@ -635,7 +659,7 @@ fn character_colors(
 // Day
 // ---------------------------------------------------------------------------
 
-fn circadian_day(character: LightCharacter) -> ThemeConfig {
+fn circadian_day(character: LightCharacter, font_scale: f32) -> ThemeConfig {
     let name = match character {
         LightCharacter::Cool => "Circadian Sunrise",
         LightCharacter::Neutral => "Circadian Day",
@@ -650,9 +674,13 @@ fn circadian_day(character: LightCharacter) -> ThemeConfig {
         // `MarkdownStyle` (see `FONT_FAMILY`); the two font systems are kept
         // separate on purpose.
         font_family: None,
-        font_size: Some(14.),
+        // gpui-component installs this as the window `rem_size`, so scaling it
+        // scales every `rems()`-relative chrome size, line height, and padding
+        // in one move (see `space_view::prose_style` for the prose ramp — the
+        // one absolute-pixel exception that scales itself).
+        font_size: Some(UI_FONT_SIZE * font_scale),
         mono_font_family: None,
-        mono_font_size: Some(14.),
+        mono_font_size: Some(UI_FONT_SIZE * font_scale),
         radius: Some(6),
         radius_lg: Some(12),
         shadow: Some(true),
@@ -660,6 +688,11 @@ fn circadian_day(character: LightCharacter) -> ThemeConfig {
         ..ThemeConfig::default()
     }
 }
+
+/// The designed UI (chrome/component) font size at Actual Size — the value
+/// gpui-component installs as the window `rem_size`. The type-scale factor
+/// multiplies it.
+const UI_FONT_SIZE: f32 = 14.;
 
 fn day_colors() -> ThemeConfigColors {
     let mut c = ThemeConfigColors::default();
@@ -752,7 +785,7 @@ fn day_colors() -> ThemeConfigColors {
 // Night
 // ---------------------------------------------------------------------------
 
-fn circadian_night(character: LightCharacter) -> ThemeConfig {
+fn circadian_night(character: LightCharacter, font_scale: f32) -> ThemeConfig {
     let name = match character {
         LightCharacter::Cool => "Circadian Dawn",
         LightCharacter::Neutral => "Circadian Night",
@@ -763,8 +796,16 @@ fn circadian_night(character: LightCharacter) -> ThemeConfig {
         name: SharedString::new_static(name),
         mode: ThemeMode::Dark,
         // System UI font for components; prose opts into Newsreader itself.
+        // Scaled like Day (this size becomes the window `rem_size`).
         font_family: None,
-        font_size: Some(14.),
+        font_size: Some(UI_FONT_SIZE * font_scale),
+        // Must be set explicitly: gpui-component only overwrites the live
+        // `Theme.mono_font_size` when the config's is `Some` (theme
+        // `schema.rs`), so leaving it `None` (via `..default`) would let dark
+        // code blocks keep the framework default `px(13.)` — unscaled, and
+        // stale-dependent on whether light was applied first.
+        mono_font_family: None,
+        mono_font_size: Some(UI_FONT_SIZE * font_scale),
         radius: Some(8),
         radius_lg: Some(12),
         shadow: Some(true),
@@ -944,6 +985,7 @@ mod tests {
             appearance,
             tint,
             character: LightCharacter::Neutral,
+            font_scale: 1.0,
         }
     }
 
@@ -1186,6 +1228,35 @@ mod tests {
     }
 
     #[test]
+    fn font_scale_multiplies_the_ui_font_size() {
+        // Actual Size is the designed UI size (the window rem_size) in both
+        // families, for the body and mono ramps.
+        let day = circadian_day(LightCharacter::Neutral, 1.0);
+        assert_eq!(day.font_size, Some(UI_FONT_SIZE));
+        assert_eq!(day.mono_font_size, Some(UI_FONT_SIZE));
+        let night = circadian_night(LightCharacter::Neutral, 1.0);
+        assert_eq!(night.font_size, Some(UI_FONT_SIZE));
+        // Night MUST set `mono_font_size` explicitly (not `None`): gpui-component
+        // only overwrites the live mono size when the config's is `Some`, so a
+        // `None` here would strand dark code blocks at the framework default and
+        // out of the zoom. Pinned in both families so the asymmetry can't return.
+        assert_eq!(night.mono_font_size, Some(UI_FONT_SIZE));
+
+        // A zoom multiplies both the body and mono ramps proportionally, in
+        // both families — this is the single lever every rems()-relative chrome
+        // size then rides.
+        let day_big = circadian_day(LightCharacter::Neutral, 1.5);
+        assert_eq!(day_big.font_size, Some(UI_FONT_SIZE * 1.5));
+        assert_eq!(day_big.mono_font_size, Some(UI_FONT_SIZE * 1.5));
+        let night_big = circadian_night(LightCharacter::Neutral, 2.0);
+        assert_eq!(night_big.font_size, Some(UI_FONT_SIZE * 2.0));
+        assert_eq!(night_big.mono_font_size, Some(UI_FONT_SIZE * 2.0));
+
+        // The scale is orthogonal to the palette — colors are untouched.
+        assert_eq!(day.colors.background, day_big.colors.background);
+    }
+
+    #[test]
     fn six_palettes_are_distinct() {
         let mut backgrounds = vec![];
         for ch in [
@@ -1193,8 +1264,8 @@ mod tests {
             LightCharacter::Neutral,
             LightCharacter::Warm,
         ] {
-            backgrounds.push(circadian_day(ch).colors.background.clone().unwrap());
-            backgrounds.push(circadian_night(ch).colors.background.clone().unwrap());
+            backgrounds.push(circadian_day(ch, 1.0).colors.background.clone().unwrap());
+            backgrounds.push(circadian_night(ch, 1.0).colors.background.clone().unwrap());
         }
         let unique: std::collections::HashSet<_> = backgrounds.iter().collect();
         assert_eq!(

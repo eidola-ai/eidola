@@ -13,7 +13,7 @@
 use eidola_app_core::config::{AppearanceSetting, LightCharacter, TimeOfDayTint};
 use gpui::{
     Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, div,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder,
 };
 use gpui_component::{ActiveTheme, StyledExt, h_flex, label::Label, v_flex};
 
@@ -55,6 +55,24 @@ impl GeneralView {
     pub fn set_light_character(&mut self, character: LightCharacter, cx: &mut Context<Self>) {
         self.config
             .update(cx, |c, cx| c.set_light_character(character, cx));
+        cx.notify();
+    }
+
+    /// Text size — the same type-scale ladder as View → Zoom In / Zoom Out /
+    /// Actual Size, surfaced here as a visible control (the menu shortcuts stay
+    /// the fast path, but a settings row is where an older user looks first).
+    pub fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        self.config.update(cx, |c, cx| c.zoom_in(cx));
+        cx.notify();
+    }
+
+    pub fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        self.config.update(cx, |c, cx| c.zoom_out(cx));
+        cx.notify();
+    }
+
+    pub fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        self.config.update(cx, |c, cx| c.reset_zoom(cx));
         cx.notify();
     }
 }
@@ -204,6 +222,62 @@ impl Render for GeneralView {
                     ),
                 ));
             }
+
+            // --- Text size: the type-scale ladder (also View → Zoom …) -------
+            let at_min = s.font_scale <= eidola_app_core::config::FONT_SCALE_MIN + 1e-3;
+            let at_max = s.font_scale >= eidola_app_core::config::FONT_SCALE_MAX - 1e-3;
+            let percent = format!("{}%", (s.font_scale * 100.0).round() as i32);
+            let size_row = h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    choice_chip("text-size-smaller", "A−", false, cx)
+                        .probe(
+                            "settings/general/text-size/smaller",
+                            gpui::Role::Button,
+                            "Smaller text",
+                        )
+                        .when(at_min, |el| el.opacity(0.4))
+                        .on_click(cx.listener(|this, _, _, cx| this.zoom_out(cx))),
+                )
+                .child(
+                    choice_chip("text-size-larger", "A+", false, cx)
+                        .probe(
+                            "settings/general/text-size/larger",
+                            gpui::Role::Button,
+                            "Larger text",
+                        )
+                        .when(at_max, |el| el.opacity(0.4))
+                        .on_click(cx.listener(|this, _, _, cx| this.zoom_in(cx))),
+                )
+                .child(
+                    choice_chip("text-size-reset", "Reset", false, cx)
+                        .probe(
+                            "settings/general/text-size/reset",
+                            gpui::Role::Button,
+                            "Reset text size",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.reset_zoom(cx))),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(percent)),
+                );
+            col = col.child(field_row(
+                "Text size",
+                cx,
+                v_flex().gap_1().child(size_row).child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground.opacity(0.8))
+                        .child(
+                            "Scales all text. Also on the View menu — Actual Size, Zoom In, \
+                             Zoom Out.",
+                        ),
+                ),
+            ));
         }
 
         if let Some(err) = error {

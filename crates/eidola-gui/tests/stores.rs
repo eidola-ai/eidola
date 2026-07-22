@@ -410,3 +410,54 @@ fn config_store_circadian_settings_write_through(cx: &mut TestAppContext) {
         assert_eq!(s.light_character, LightCharacter::Warm);
     });
 }
+
+/// The View → Zoom In / Zoom Out / Actual Size ladder writes the `font_scale`
+/// override through `AppCore` and re-reads the snapshot in the same update.
+/// Stepping walks the ladder, saturates at the ends, and resets to Actual Size.
+#[gpui::test]
+fn config_store_zoom_ladder_writes_through(cx: &mut TestAppContext) {
+    use eidola_app_core::config::{FONT_SCALE_DEFAULT, FONT_SCALE_MAX, FONT_SCALE_MIN};
+
+    let (stores, _dir) = backed_stores(cx);
+
+    // Fresh backed store opens at Actual Size.
+    stores.config.read_with(cx, |c, _| {
+        assert_eq!(c.font_scale(), FONT_SCALE_DEFAULT);
+    });
+
+    // Zoom In steps up one rung and persists it.
+    stores.config.update(cx, |c, cx| c.zoom_in(cx));
+    stores
+        .config
+        .read_with(cx, |c, _| assert_eq!(c.font_scale(), 1.1));
+
+    // Zoom Out returns to the anchor.
+    stores.config.update(cx, |c, cx| c.zoom_out(cx));
+    stores
+        .config
+        .read_with(cx, |c, _| assert_eq!(c.font_scale(), FONT_SCALE_DEFAULT));
+
+    // Zooming in past the top rung saturates at the max rather than overshooting.
+    for _ in 0..12 {
+        stores.config.update(cx, |c, cx| c.zoom_in(cx));
+    }
+    stores
+        .config
+        .read_with(cx, |c, _| assert_eq!(c.font_scale(), FONT_SCALE_MAX));
+
+    // Actual Size resets from any zoom.
+    stores.config.update(cx, |c, cx| c.reset_zoom(cx));
+    stores
+        .config
+        .read_with(cx, |c, _| assert_eq!(c.font_scale(), FONT_SCALE_DEFAULT));
+
+    // Zooming out past the bottom rung saturates at the min. (Persistence
+    // across an AppCore re-open — the config.toml round-trip — is covered in
+    // app-core's `set_circadian_settings_round_trip_through_config_state`.)
+    for _ in 0..12 {
+        stores.config.update(cx, |c, cx| c.zoom_out(cx));
+    }
+    stores
+        .config
+        .read_with(cx, |c, _| assert_eq!(c.font_scale(), FONT_SCALE_MIN));
+}
