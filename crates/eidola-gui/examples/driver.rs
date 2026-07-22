@@ -25,6 +25,9 @@
 //! {"cmd":"windows"}
 //! {"cmd":"elements","window":1}                          // named probe targets
 //! {"cmd":"click","window":1,"target":"chat/model-label"} // or "x"/"y"; alt/command/shift bools
+//! {"cmd":"drag","window":1,"from_x":300,"from_y":320,"to_x":560,"to_y":660} // press-move-release
+//!   //   optional "click_count":2|3 (double/triple-click selection); "hold":true pumps frames at
+//!   //   `to` so host autoscroll-while-selecting runs before release
 //! {"cmd":"type","window":1,"text":"Hello there"}
 //! {"cmd":"keys","window":1,"keys":"cmd-enter"}           // space-separated keystrokes
 //! {"cmd":"modifiers","window":1,"alt":true}              // hold/release modifiers
@@ -84,8 +87,9 @@ mod driver {
     use eidola_gui::updates::UpdatesView;
     use eidola_gui::window_input::WindowInput;
     use gpui::{
-        AnyWindowHandle, App, AppContext, Capslock, Modifiers, ModifiersChangedEvent, Pixels,
-        ScrollDelta, ScrollWheelEvent, Size, TouchPhase, VisualTestAppContext, point, px, size,
+        AnyWindowHandle, App, AppContext, Capslock, Modifiers, ModifiersChangedEvent, MouseButton,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent, Size,
+        TouchPhase, VisualTestAppContext, point, px, size,
     };
     use gpui_component::{Root, ThemeMode};
     use gpui_component_assets::Assets;
@@ -95,6 +99,10 @@ mod driver {
     // ---------------------------------------------------------------------------
     // Protocol
     // ---------------------------------------------------------------------------
+
+    fn one() -> usize {
+        1
+    }
 
     #[derive(Deserialize)]
     #[serde(tag = "cmd", rename_all = "snake_case", deny_unknown_fields)]
@@ -120,6 +128,19 @@ mod driver {
             command: bool,
             #[serde(default)]
             shift: bool,
+        },
+        Drag {
+            window: u64,
+            from_x: f32,
+            from_y: f32,
+            to_x: f32,
+            to_y: f32,
+            #[serde(default = "one")]
+            click_count: usize,
+            /// Hold the button at `to` (running any host autoscroll loop to a
+            /// settled state) before releasing.
+            #[serde(default)]
+            hold: bool,
         },
         Type {
             window: u64,
@@ -226,6 +247,26 @@ mod driver {
                     });
                     let space = view.read(cx).space().clone();
                     space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_long_post",
+                description: "Space view: a conversation whose assistant reply is far taller than the window (selection repro)",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.set_messages_for_test(long_conversation(), cx));
                     root(view, window, cx)
                 },
             },
@@ -550,6 +591,54 @@ mod driver {
         ]
     }
 
+    fn long_conversation() -> Vec<SpaceMessage> {
+        // One short question and one enormous multi-paragraph answer, far taller
+        // than any test window — the readonly-selection repro fixture.
+        let mut body = String::new();
+        body.push_str("# Rayleigh scattering, in depth\n\n");
+        for i in 1..=20 {
+            body.push_str(&format!(
+                "Paragraph {i}. Sunlight is a fairly even mix across the visible spectrum, \
+                 and as it crosses the atmosphere it meets molecules far smaller than its \
+                 wavelength; those scatter short blue wavelengths far more strongly than \
+                 long red ones, which is the whole story of why the daytime sky is blue.\n\n"
+            ));
+            if i == 5 {
+                body.push_str(
+                    "```python\ndef rayleigh(wavelength):\n    # intensity scales as 1/lambda^4\n    return 1.0 / wavelength ** 4\n```\n\n",
+                );
+            }
+            if i == 10 {
+                body.push_str("- short wavelengths scatter more\n- long wavelengths pass through\n- the eye integrates the result\n\n");
+            }
+        }
+        let body = body.trim_end().to_string();
+        // The long reply sits *mid-conversation* (not the leaf), so it renders
+        // nested inside single-child `render_strip` horizontal scrollers — the
+        // real structure a multi-turn conversation produces.
+        vec![
+            SpaceMessage {
+                role: "user".into(),
+                content: "Explain the sky at length.".into(),
+            },
+            SpaceMessage {
+                role: "assistant".into(),
+                content: body,
+            },
+            SpaceMessage {
+                role: "user".into(),
+                content: "Thanks — and what about at sunset?".into(),
+            },
+            SpaceMessage {
+                role: "assistant".into(),
+                content: "Near sunset the light skims a long, slanted path through the air, \
+                          the blue is scattered away entirely, and what survives to reach you \
+                          is the warm red-orange of a low sun."
+                    .into(),
+            },
+        ]
+    }
+
     fn library_spaces() -> Vec<SpaceInfo> {
         fn space(id: &str, title: Option<&str>, snippet: Option<&str>, days_ago: i64) -> SpaceInfo {
             let ts = eidola_app_core::now_ms() - days_ago * 24 * 60 * 60 * 1000;
@@ -804,6 +893,77 @@ mod driver {
                     };
                     cx.simulate_click(handle, pos, modifiers);
                     Ok(json!({"clicked": {"x": pos.x.as_f32(), "y": pos.y.as_f32()}}))
+                }
+
+                Cmd::Drag {
+                    window,
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                    click_count,
+                    hold,
+                } => {
+                    let handle = self.window(window)?;
+                    let from = point(px(from_x), px(from_y));
+                    let to = point(px(to_x), px(to_y));
+                    cx.simulate_event(
+                        handle,
+                        MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: from,
+                            modifiers: Modifiers::default(),
+                            click_count,
+                            first_mouse: false,
+                        },
+                    );
+                    // A few interpolated moves so the drag crosses intervening
+                    // rows the way a real pointer would.
+                    for step in 1..=4 {
+                        let t = step as f32 / 4.0;
+                        let pos = point(
+                            px(from_x + (to_x - from_x) * t),
+                            px(from_y + (to_y - from_y) * t),
+                        );
+                        cx.simulate_event(
+                            handle,
+                            MouseMoveEvent {
+                                position: pos,
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers: Modifiers::default(),
+                            },
+                        );
+                    }
+                    if hold {
+                        // Hold the button at `to` and pump frames so any host
+                        // autoscroll-while-selecting loop advances. Re-issuing
+                        // the (unchanged) move each iteration forces a render —
+                        // the harness doesn't drive the continuous frame loop a
+                        // real window would — and keeps the pointer in the edge
+                        // margin so autoscroll keeps stepping until it clamps.
+                        for _ in 0..120 {
+                            cx.simulate_event(
+                                handle,
+                                MouseMoveEvent {
+                                    position: to,
+                                    pressed_button: Some(MouseButton::Left),
+                                    modifiers: Modifiers::default(),
+                                },
+                            );
+                            cx.run_until_parked();
+                        }
+                    }
+                    cx.simulate_event(
+                        handle,
+                        MouseUpEvent {
+                            button: MouseButton::Left,
+                            position: to,
+                            modifiers: Modifiers::default(),
+                            click_count,
+                        },
+                    );
+                    cx.run_until_parked();
+                    Ok(json!({"dragged": {"from": [from_x, from_y], "to": [to_x, to_y]}}))
                 }
 
                 Cmd::Type { window, text } => {

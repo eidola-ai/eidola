@@ -149,6 +149,22 @@ enum WrapAffinity {
     Upstream,
 }
 
+/// The granularity a pointer selection extends by, set at the mouse-down that
+/// began the drag from its click count (native macOS text-view idiom):
+/// single-click selects by character, double-click by word, triple-click by
+/// line. A drag started at a higher granularity keeps that granularity — so
+/// dragging after a double-click extends the selection word-by-word, and after
+/// a triple-click line-by-line, anchored on the originally-clicked unit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SelectMode {
+    /// Single click — the caret/character granularity (the default).
+    Char,
+    /// Double click — whole words (whitespace and punctuation delimit).
+    Word,
+    /// Triple click — whole `\n`-delimited lines / paragraphs.
+    Line,
+}
+
 /// Sentinel string tagged onto every `copy` / `cut` clipboard write via
 /// `ClipboardItem::new_string_with_metadata`. Paired with the metadata
 /// check in `paste` so an editor → editor round-trip can skip the
@@ -183,6 +199,50 @@ fn normalize_line_endings(text: &str) -> String {
         }
     }
     out
+}
+
+/// The source range of the "word" containing `offset`, for double-click
+/// selection. Words are Unicode word-boundary segments (the same segmentation
+/// the word-motion commands use): a maximal run of word characters selects the
+/// run, while a click on whitespace or punctuation selects that delimiter
+/// segment — matching native macOS text-view double-click, where whitespace and
+/// punctuation delimit words. A click exactly on a boundary between two
+/// segments takes the segment starting there (the one to the right), except at
+/// end-of-buffer where it takes the last segment. An empty buffer yields `0..0`.
+fn word_range_at(text: &str, offset: usize) -> Range<usize> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let offset = offset.min(text.len());
+    let mut last: Option<Range<usize>> = None;
+    for (idx, seg) in text.split_word_bound_indices() {
+        let range = idx..idx + seg.len();
+        // A segment strictly containing the offset (or starting at it) is the
+        // hit — start-inclusive, so a boundary click takes the right-hand word.
+        if range.start <= offset && offset < range.end {
+            return range;
+        }
+        last = Some(range);
+    }
+    // Offset at end-of-buffer: take the final segment so a double-click at the
+    // very end still selects the trailing word.
+    last.unwrap_or(offset..offset)
+}
+
+/// The source range of the `\n`-delimited line containing `offset`, for
+/// triple-click selection (the whole paragraph on a hard-line-broken source).
+/// The trailing newline is *not* included, so the selection covers the line's
+/// text without swallowing the break into the next line.
+fn line_range_at(text: &str, offset: usize) -> Range<usize> {
+    let bytes = text.as_bytes();
+    let offset = offset.min(text.len());
+    let mut start = offset;
+    while start > 0 && bytes[start - 1] != b'\n' {
+        start -= 1;
+    }
+    let mut end = offset;
+    while end < bytes.len() && bytes[end] != b'\n' {
+        end += 1;
+    }
+    start..end
 }
 
 /// Decide whether the transition `before → after` is a *coalescible
@@ -239,6 +299,14 @@ pub struct MarkdownEditorState {
     /// and copied. Synced from the element's `.disabled(..)` prop each frame.
     pub(crate) disabled: bool,
     is_selecting: bool,
+    /// Granularity the active pointer drag extends by (set from the mouse-down
+    /// click count — see [`SelectMode`]).
+    select_mode: SelectMode,
+    /// The source range of the unit (word / line) the current drag is anchored
+    /// on — the double/triple-click selection the drag extends *from*, so a
+    /// word/line drag grows symmetrically around the originally-clicked unit
+    /// rather than from a bare offset. Ignored in [`SelectMode::Char`].
+    select_anchor_range: Range<usize>,
     pub(crate) last_blocks: HashMap<usize, LaidOutBlock>,
     pub(crate) last_bounds: Option<Bounds<Pixels>>,
     pub(crate) frame_input_handler_set: bool,
@@ -313,6 +381,8 @@ impl MarkdownEditorState {
             focus_handle,
             disabled: false,
             is_selecting: false,
+            select_mode: SelectMode::Char,
+            select_anchor_range: 0..0,
             last_blocks: HashMap::new(),
             last_bounds: None,
             frame_input_handler_set: false,
@@ -342,6 +412,31 @@ impl MarkdownEditorState {
     /// The current selection.
     pub fn selection(&self) -> Selection {
         self.state.selection
+    }
+
+    /// Whether a pointer selection drag is currently in progress (mouse held
+    /// down after a press on the editor). A host that owns the scroll — the
+    /// editor has no internal vertical scroll — reads this to drive
+    /// autoscroll-while-selecting: while any editor reports `true`, scroll the
+    /// page when the pointer nears a viewport edge so a drag can pull off-screen
+    /// content into the selection.
+    pub fn is_selecting(&self) -> bool {
+        self.is_selecting
+    }
+
+    /// Extend the in-progress selection so its head reaches the row under
+    /// `window_pos` (window coordinates), honoring the drag's granularity. A
+    /// no-op unless a drag is active. The host calls this while autoscrolling a
+    /// selection drag: the pointer sits still against a viewport edge while the
+    /// page scrolls under it, so no mouse-move fires — the host re-extends each
+    /// frame from the (unchanged) pointer position against the freshly-scrolled
+    /// geometry.
+    pub fn drag_extend_to(&mut self, window_pos: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.is_selecting {
+            return;
+        }
+        let offset = self.offset_for_position(window_pos);
+        self.extend_selection_to(offset, cx);
     }
 
     /// True when the buffer is empty (after trimming) — the common host check
@@ -385,6 +480,30 @@ impl MarkdownEditorState {
     #[doc(hidden)]
     pub fn apply_event_for_test(&mut self, event: EditorEvent, cx: &mut Context<Self>) {
         self.dispatch(event, cx);
+    }
+
+    /// Test seam: begin a pointer selection at a source `offset` with a given
+    /// `click_count` (1 = char, 2 = word, 3 = line), bypassing hit-testing so
+    /// double/triple-click and drag-granularity behavior can be exercised
+    /// without laid-out geometry. Mirrors what [`Self::on_mouse_down`] does
+    /// after resolving the click position.
+    #[doc(hidden)]
+    pub fn begin_selection_for_test(
+        &mut self,
+        offset: usize,
+        click_count: usize,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_selection(offset, click_count, shift, cx);
+    }
+
+    /// Test seam: extend the in-progress selection to a source `offset`
+    /// (mirrors a drag step), honoring the [`SelectMode`] set by the last
+    /// [`Self::begin_selection_for_test`].
+    #[doc(hidden)]
+    pub fn extend_selection_for_test(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.extend_selection_to(offset, cx);
     }
 
     pub(crate) fn code_block_scroll(&self, block_index: usize) -> Pixels {
@@ -1113,11 +1232,45 @@ impl MarkdownEditorState {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let offset = self.offset_for_position(event.position);
+        self.begin_selection(offset, event.click_count, event.modifiers.shift, cx);
+    }
+
+    /// Start (or, with `shift`, extend) a pointer selection at `offset`, keyed
+    /// by `click_count`: 1 = character (caret / shift-range), 2 = the word at
+    /// `offset`, ≥3 = the whole line. The chosen granularity is recorded as the
+    /// drag's [`SelectMode`] so a subsequent drag extends by the same unit
+    /// (native macOS behavior). Shared by the mouse handler and the test seam.
+    fn begin_selection(
+        &mut self,
+        offset: usize,
+        click_count: usize,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.is_selecting = true;
-        let new_sel = if event.modifiers.shift {
-            Selection::range(self.state.selection.anchor(), offset)
-        } else {
-            Selection::Cursor(offset)
+        let new_sel = match click_count {
+            0 | 1 => {
+                self.select_mode = SelectMode::Char;
+                self.select_anchor_range = offset..offset;
+                if shift {
+                    // Shift-click extends the existing selection to the click.
+                    Selection::range(self.state.selection.anchor(), offset)
+                } else {
+                    Selection::Cursor(offset)
+                }
+            }
+            2 => {
+                self.select_mode = SelectMode::Word;
+                let range = word_range_at(&self.state.markdown, offset);
+                self.select_anchor_range = range.clone();
+                Selection::range(range.start, range.end)
+            }
+            _ => {
+                self.select_mode = SelectMode::Line;
+                let range = line_range_at(&self.state.markdown, offset);
+                self.select_anchor_range = range.clone();
+                Selection::range(range.start, range.end)
+            }
         };
         self.dispatch(EditorEvent::SetSelection(new_sel), cx);
     }
@@ -1131,7 +1284,37 @@ impl MarkdownEditorState {
             return;
         }
         let offset = self.offset_for_position(event.position);
-        let new_sel = Selection::range(self.state.selection.anchor(), offset);
+        self.extend_selection_to(offset, cx);
+    }
+
+    /// Extend the in-progress selection so its head reaches `offset`, honoring
+    /// the drag's [`SelectMode`]: a character drag moves the head to `offset`; a
+    /// word/line drag grows to cover the union of the anchored unit and the
+    /// unit at `offset`, with the head on whichever side the pointer is past —
+    /// so dragging back past the anchor flips the selected end the way a native
+    /// word/line drag does. Shared by the in-bounds handler, the window-global
+    /// drag listener, and the test seam.
+    fn extend_selection_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let anchor = self.select_anchor_range.clone();
+        let new_sel = match self.select_mode {
+            SelectMode::Char => Selection::range(anchor.start, offset),
+            SelectMode::Word | SelectMode::Line => {
+                let unit = if self.select_mode == SelectMode::Word {
+                    word_range_at(&self.state.markdown, offset)
+                } else {
+                    line_range_at(&self.state.markdown, offset)
+                };
+                if offset >= anchor.end {
+                    // Dragging forward: anchor's start is fixed, head grows to
+                    // the far edge of the unit under the pointer.
+                    Selection::range(anchor.start, unit.end.max(anchor.end))
+                } else {
+                    // Dragging back past the anchored unit: anchor's end is
+                    // fixed, head shrinks to the near edge of the unit.
+                    Selection::range(anchor.end, unit.start.min(anchor.start))
+                }
+            }
+        };
         self.dispatch(EditorEvent::SetSelection(new_sel), cx);
     }
 
@@ -1649,6 +1832,69 @@ impl RenderOnce for MarkdownEditor {
             ));
         }
 
+        // Window-global drag tracking. `on_mouse_down` starts a selection, but
+        // gpui only fires the div's hitbox-gated `on_mouse_move` while the
+        // pointer stays inside the editor's bounds — and those bounds are
+        // clipped to the visible viewport (the content mask). For a post taller
+        // than the window that froze the selection at the fold: dragging toward
+        // off-screen text left the hitbox, `on_mouse_move` stopped firing, and
+        // the selection couldn't grow past the visible screenful — which read
+        // as "long responses can't be selected". While a drag is in progress we
+        // register **window-global** move/up listeners (the same pattern the
+        // space view's minimap-scrollbar drag uses), so the selection keeps
+        // extending to the offset under the pointer anywhere in the window —
+        // including off-screen rows, whose geometry is laid out because a
+        // visible post renders its whole editor. Listeners are cleared each
+        // frame, so a hitbox-free `canvas` re-registers them every frame while
+        // selecting and stops the frame the drag ends.
+        if state.read(cx).is_selecting {
+            let drag_state = state.clone();
+            container = container.child(
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |_bounds, _, window, _cx| {
+                        let move_state = drag_state.clone();
+                        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _window, cx| {
+                            if phase != gpui::DispatchPhase::Bubble {
+                                return;
+                            }
+                            move_state.update(cx, |st, cx| {
+                                if !st.is_selecting {
+                                    return;
+                                }
+                                // The button was released without a
+                                // delivered up event (e.g. off-window) —
+                                // end the drag rather than track a phantom.
+                                if !ev.dragging() {
+                                    st.is_selecting = false;
+                                    cx.notify();
+                                    return;
+                                }
+                                let offset = st.offset_for_position(ev.position);
+                                st.extend_selection_to(offset, cx);
+                            });
+                        });
+                        let up_state = drag_state.clone();
+                        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
+                            if phase != gpui::DispatchPhase::Bubble
+                                || ev.button != MouseButton::Left
+                            {
+                                return;
+                            }
+                            up_state.update(cx, |st, cx| {
+                                if st.is_selecting {
+                                    st.is_selecting = false;
+                                    cx.notify();
+                                }
+                            });
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            );
+        }
+
         // The first `BlockElement::paint` of the frame registers the
         // `EntityInputHandler` (IME / typed text → `replace_text_in_range`),
         // unless `disabled`.
@@ -1782,4 +2028,61 @@ pub fn init(cx: &mut App) {
     ]);
 
     cx.bind_keys(bindings);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{line_range_at, word_range_at};
+
+    #[test]
+    fn word_range_selects_the_alphanumeric_run() {
+        let text = "the quick brown fox";
+        // Click inside "quick" → the whole word, not the spaces around it.
+        assert_eq!(word_range_at(text, 6), 4..9);
+        assert_eq!(&text[word_range_at(text, 6)], "quick");
+        // Click at the word's first byte still selects it.
+        assert_eq!(&text[word_range_at(text, 4)], "quick");
+        // First and last words.
+        assert_eq!(&text[word_range_at(text, 0)], "the");
+        assert_eq!(&text[word_range_at(text, 17)], "fox");
+    }
+
+    #[test]
+    fn word_range_treats_punctuation_and_whitespace_as_delimiters() {
+        let text = "scatter short (blue) wavelengths";
+        let paren_open = text.find('(').unwrap();
+        // Double-clicking the word inside the parens selects just "blue".
+        assert_eq!(&text[word_range_at(text, paren_open + 1)], "blue");
+        // Clicking the "(" selects the punctuation segment, not the word.
+        assert_eq!(&text[word_range_at(text, paren_open)], "(");
+        // Clicking whitespace selects the whitespace run (native behavior).
+        let space = text.find(' ').unwrap();
+        assert!(text[word_range_at(text, space)].chars().all(|c| c == ' '));
+    }
+
+    #[test]
+    fn word_range_edges() {
+        // End-of-buffer takes the trailing word; empty buffer is a caret.
+        let text = "alpha";
+        assert_eq!(&text[word_range_at(text, 5)], "alpha");
+        assert_eq!(word_range_at("", 0), 0..0);
+    }
+
+    #[test]
+    fn line_range_covers_the_paragraph_without_the_newline() {
+        let text = "first line\nsecond line\nthird";
+        // Anywhere on the middle line → the whole middle line, no `\n`.
+        assert_eq!(&text[line_range_at(text, 15)], "second line");
+        assert_eq!(&text[line_range_at(text, 11)], "second line"); // at line start
+        assert_eq!(&text[line_range_at(text, 22)], "second line"); // at line end
+        // First and last lines.
+        assert_eq!(&text[line_range_at(text, 0)], "first line");
+        assert_eq!(&text[line_range_at(text, 26)], "third");
+    }
+
+    #[test]
+    fn line_range_on_a_blank_line_is_empty() {
+        let text = "a\n\nb";
+        assert_eq!(line_range_at(text, 2), 2..2);
+    }
 }
