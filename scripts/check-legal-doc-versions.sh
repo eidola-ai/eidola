@@ -52,13 +52,14 @@ for f in "${DOCS[@]}"; do
         continue
     fi
 
-    old=$(git show "$base:$f")
-    new=$(cat "$f")
-    if [ "$old" = "$new" ]; then
+    # Compare blob hashes, not shell strings: command substitution strips
+    # trailing newlines, and a newline-only change still changes the
+    # acceptance SHA-256, so it must increment the version too.
+    if [ "$(git rev-parse "$base:$f")" = "$(git hash-object -- "$f")" ]; then
         continue
     fi
 
-    old_v=$(printf '%s\n' "$old" | version_of)
+    old_v=$(git show "$base:$f" | version_of)
     if [ -z "$old_v" ]; then
         # First versioned revision of a previously unversioned document.
         if [ "$new_v" != "1" ]; then

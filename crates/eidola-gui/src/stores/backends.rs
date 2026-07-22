@@ -165,7 +165,10 @@ impl BackendsStore {
     /// Shared operation shape (mirrors `LocalModelsStore::run_op`): clear
     /// the standing error, run the initiating core call in this operation's
     /// keyed slot, and surface a failure in `op_error`. Success needs no
-    /// local action — the bus-driven refresh carries the new state.
+    /// local action — the bus-driven refresh carries the new state. Failure
+    /// additionally re-fetches the registry: a failed write emits no
+    /// `Change::Backends`, so any optimistic edit (enable/auto-start flip,
+    /// removal) would otherwise keep showing durably-false state.
     fn run_op<F, Fut>(&mut self, key: String, cx: &mut Context<Self>, f: F)
     where
         F: FnOnce(Arc<AppCore>) -> Fut + Send + 'static,
@@ -182,6 +185,7 @@ impl BackendsStore {
             let _ = this.update(cx, |this, cx| {
                 if let Err(e) = result {
                     this.op_error = Some(e.to_string());
+                    this.refresh(cx);
                 }
                 this.op_tasks.remove(&slot_key);
                 cx.notify();

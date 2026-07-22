@@ -246,6 +246,37 @@ fn delete_removes_files_and_emits() {
     });
 }
 
+/// The scan accepts any case variant of `.gguf`, so the slug→file mapping
+/// must find the actual file rather than synthesizing a lowercase
+/// extension — on a case-sensitive filesystem `Mixed.GgUf` would otherwise
+/// be advertised but never loadable or deletable (codex finding, PR #216).
+#[test]
+fn mixed_case_extension_scans_and_deletes() {
+    run(|| {
+        let (core, dir) = bare_core();
+        let models_dir = dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("Mixed.GgUf"), b"gguf").unwrap();
+
+        let state = core
+            .runtime()
+            .block_on(core.local_models_state())
+            .expect("state");
+        let model = state
+            .models
+            .iter()
+            .find(|m| m.slug == "Mixed")
+            .expect("mixed-case file is scanned under its stripped slug");
+        assert_eq!(model.id, "Mixed@local");
+        assert_eq!(model.file_name, "Mixed.GgUf");
+
+        core.runtime()
+            .block_on(core.delete_local_model("Mixed@local".into()))
+            .expect("delete resolves the actual file name");
+        assert!(!models_dir.join("Mixed.GgUf").exists());
+    });
+}
+
 // ===========================================================================
 // Pinning + the on-demand load's eviction pass
 // ===========================================================================

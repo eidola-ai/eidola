@@ -193,6 +193,56 @@ fn bus_bridge_routes_backends_change(cx: &mut TestAppContext) {
     });
 }
 
+/// A failed backend operation must reconcile its optimistic edit. `remove`
+/// drops the row from the cached list immediately; when the core write
+/// fails (the eidola singleton is built in and can't be removed) no
+/// `Change::Backends` is emitted, so the failure arm itself re-fetches the
+/// registry — otherwise the UI would keep showing durably-false state
+/// (codex finding, PR #216). Unlike the transition-only tests above, this
+/// one drives the (purely local-DB) tasks to completion by polling.
+#[gpui::test]
+fn backends_op_failure_refreshes_registry(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+
+    // Load the real registry (a local DB read — no network involved).
+    stores.backends.update(cx, |b, cx| b.refresh(cx));
+    wait_for_backends(cx, &stores, "registry loads", |b| b.get("eidola").is_some());
+
+    // The optimistic removal drops the row synchronously…
+    stores
+        .backends
+        .update(cx, |b, cx| b.remove("eidola".into(), cx));
+    stores.backends.read_with(cx, |b, _| {
+        assert!(b.get("eidola").is_none(), "optimistic removal applies");
+    });
+
+    // …the core refuses, and the failure arm's refresh restores the row.
+    wait_for_backends(cx, &stores, "failure refresh reconciles", |b| {
+        b.get("eidola").is_some()
+    });
+    stores.backends.read_with(cx, |b, _| {
+        assert!(b.op_error().is_some(), "the failure surfaces in op_error");
+    });
+}
+
+/// Poll the backends store until `pred` holds (the tokio side is a local DB
+/// op, so this settles in milliseconds; ~10s ceiling).
+fn wait_for_backends(
+    cx: &mut TestAppContext,
+    stores: &Stores,
+    what: &str,
+    pred: impl Fn(&eidola_gui::stores::BackendsStore) -> bool,
+) {
+    for _ in 0..400 {
+        cx.run_until_parked();
+        if stores.backends.read_with(cx, |b, _| pred(b)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("timed out waiting until {what}");
+}
+
 /// The space-entity registry's join-existing semantics: two `open` calls for
 /// the same id return the *same* `Space` entity (so two windows on one space
 /// share one transcript + streaming buffer — wave-2 bug 4), while a different

@@ -267,6 +267,37 @@ impl Drop for EngineLease {
     }
 }
 
+/// Rolls back a warming-engine reservation (made by
+/// [`LocalRuntime::reserve_engine`]) if the load never reaches its
+/// supervisor — an error return or the loading future being dropped
+/// between reserve and spawn. Without it a stranded warming entry would
+/// wedge every later load of the model into joining a load no task owns.
+struct ReservationGuard {
+    local: Arc<LocalRuntime>,
+    bus: BroadcastSource,
+    key: Option<EngineKey>,
+}
+
+impl ReservationGuard {
+    /// The supervisor now owns the entry; the guard stands down.
+    fn defuse(mut self) {
+        self.key = None;
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.local
+                .engines
+                .lock()
+                .expect("engines lock")
+                .remove(&key);
+            self.bus.emit(Change::LocalModels);
+        }
+    }
+}
+
 /// Engine/failure map key: `(backend_id, slug)`. The `local` singleton and
 /// every `llamacpp` backend share one runtime, so the backend id is part of
 /// the identity (two backends may hold same-named files).
@@ -328,10 +359,25 @@ impl LocalRuntime {
         self.engines.lock().expect("engines lock").contains_key(key)
     }
 
-    /// Snapshot the loaded engines for the eviction planner.
-    fn plan_snapshot(&self) -> Vec<EngineUsage> {
-        let engines = self.engines.lock().expect("engines lock");
-        engines
+    /// Atomically plan evictions for a new engine and insert its warming
+    /// entry — one critical section over the engines map, so two concurrent
+    /// loads of different models can never both conclude that the same free
+    /// memory covers them (each sees the other's reservation in its own
+    /// plan). Returns `Ok(None)` when an entry for `key` already exists
+    /// (join that load) and `Ok(Some(victims))` when the reservation is in
+    /// place; `Err` refuses without reserving or unloading anything.
+    fn reserve_engine(
+        &self,
+        key: &EngineKey,
+        port: u16,
+        footprint: u64,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<Option<Vec<EngineKey>>, String> {
+        let mut engines = self.engines.lock().expect("engines lock");
+        if engines.contains_key(key) {
+            return Ok(None);
+        }
+        let snapshot: Vec<EngineUsage> = engines
             .iter()
             .map(|(key, e)| EngineUsage {
                 key: key.clone(),
@@ -339,8 +385,24 @@ impl LocalRuntime {
                 last_used_ms: e.last_used_ms,
                 pinned: e.pinned,
                 in_flight: e.in_flight.load(Ordering::SeqCst),
+                warming: !e.ready,
             })
-            .collect()
+            .collect();
+        let victims = plan_evictions(footprint, self.memory_budget(), &snapshot)?;
+        engines.insert(
+            key.clone(),
+            EngineEntry {
+                port,
+                context_tokens: LOCAL_CONTEXT_TOKENS,
+                ready: false,
+                shutdown,
+                footprint,
+                pinned: false,
+                last_used_ms: crate::now_ms(),
+                in_flight: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        Ok(Some(victims))
     }
 
     /// The total memory the engine pool may occupy: a fixed fraction of
@@ -468,6 +530,9 @@ struct EngineUsage {
     last_used_ms: i64,
     pinned: bool,
     in_flight: u64,
+    /// Still warming up (another load's reservation) — its memory is
+    /// committed but there is no engine to gracefully unload yet.
+    warming: bool,
 }
 
 /// Decide which engines to unload so a new engine of `required` footprint
@@ -500,7 +565,7 @@ fn plan_evictions(
 
     let mut candidates: Vec<&EngineUsage> = engines
         .iter()
-        .filter(|e| !e.pinned && e.in_flight == 0)
+        .filter(|e| !e.pinned && e.in_flight == 0 && !e.warming)
         .collect();
     candidates.sort_by_key(|e| e.last_used_ms);
 
@@ -517,7 +582,7 @@ fn plan_evictions(
     } else {
         let held: u64 = engines
             .iter()
-            .filter(|e| e.pinned || e.in_flight > 0)
+            .filter(|e| e.pinned || e.in_flight > 0 || e.warming)
             .map(|e| e.footprint)
             .sum();
         Err(format!(
@@ -618,13 +683,43 @@ pub fn normalize_model_url(input: &str) -> Result<(String, String), AppError> {
     Ok((url, file_name))
 }
 
-/// The slug (and thus the `<slug>@local` id) for a model file name.
+/// The slug (and thus the `<slug>@local` id) for a model file name. The
+/// extension strip is case-insensitive to match the directory scan, which
+/// accepts any case variant of `.gguf`.
 fn slug_for_file(file_name: &str) -> String {
-    file_name
-        .strip_suffix(".gguf")
-        .or_else(|| file_name.strip_suffix(".GGUF"))
-        .unwrap_or(file_name)
-        .to_string()
+    match file_name
+        .len()
+        .checked_sub(5)
+        .and_then(|i| file_name.get(i..))
+    {
+        Some(ext) if ext.eq_ignore_ascii_case(".gguf") => {
+            file_name[..file_name.len() - 5].to_string()
+        }
+        _ => file_name.to_string(),
+    }
+}
+
+/// Resolve a slug back to its on-disk model file. The scan accepts any case
+/// variant of the `.gguf` extension, so on a case-sensitive filesystem the
+/// synthesized `<slug>.gguf` may not name the file that was advertised —
+/// fall back to scanning the directory for the file whose slug matches.
+async fn find_model_file(dir: &Path, slug: &str) -> Option<PathBuf> {
+    let exact = dir.join(format!("{slug}.gguf"));
+    if exact.is_file() {
+        return Some(exact);
+    }
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let matches = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_ascii_lowercase().ends_with(".gguf") && slug_for_file(n) == slug);
+        if matches && path.is_file() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// A human display name derived from a file stem when no sidecar or
@@ -695,8 +790,119 @@ pub(crate) fn resolve_local_engine(cfg: &Config) -> Option<PathBuf> {
         cfg.llama_server_path_override.as_deref(),
         env.as_deref(),
         exe.as_deref(),
-        &|p| p.is_file(),
+        &usable_engine_binary,
     )
+}
+
+/// Whether `path` is an engine binary this machine can actually execute.
+/// The macOS universal app deliberately ships the arm64-only sidecar (see
+/// the workspace `AGENTS.md`), so on an Intel Mac the file *exists* inside
+/// the `.app` but can only fail with an exec-format error — treating it as
+/// present would advertise an engine instead of the honest missing-engine
+/// state. Anything unreadable or unrecognized passes through: the check
+/// only rejects the known-dishonest case, and a real spawn failure still
+/// surfaces its own error.
+fn usable_engine_binary(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Read;
+        let mut header = Vec::new();
+        let readable = std::fs::File::open(path)
+            .map(|f| f.take(MACHO_HEADER_READ_LEN).read_to_end(&mut header))
+            .is_ok();
+        if readable {
+            return macho_machine_compatible(
+                macho_cpu_types(&header).as_deref(),
+                machine_supports_arm64(),
+            );
+        }
+    }
+    true
+}
+
+/// Enough bytes for a fat header with a generous arch count (8-byte header
+/// + 32 `fat_arch_64` entries at 32 bytes each).
+#[cfg(target_os = "macos")]
+const MACHO_HEADER_READ_LEN: u64 = 8 + 32 * 32;
+
+#[cfg(any(test, target_os = "macos"))]
+const CPU_TYPE_ARM64: u32 = 0x0100_000C;
+
+/// Whether the current machine can execute arm64 code (`hw.optional.arm64`
+/// — present and 1 on Apple Silicon, including under Rosetta; absent on
+/// Intel Macs).
+#[cfg(target_os = "macos")]
+fn machine_supports_arm64() -> bool {
+    let mut val: i32 = 0;
+    let mut len = std::mem::size_of::<i32>();
+    let name = c"hw.optional.arm64";
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut val as *mut i32 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    rc == 0 && val == 1
+}
+
+/// Pure policy over a parsed Mach-O header: reject only a file whose every
+/// slice is arm64 on a machine that can't execute arm64. Unknown formats
+/// (`None`/empty) pass — the spawn surfaces real errors.
+#[cfg(any(test, target_os = "macos"))]
+fn macho_machine_compatible(cpu_types: Option<&[u32]>, machine_arm64: bool) -> bool {
+    match cpu_types {
+        Some(types) if !types.is_empty() => {
+            machine_arm64 || !types.iter().all(|&t| t == CPU_TYPE_ARM64)
+        }
+        _ => true,
+    }
+}
+
+/// The CPU types declared by a Mach-O header (thin or fat). `None` when the
+/// bytes aren't recognizably Mach-O.
+#[cfg(any(test, target_os = "macos"))]
+fn macho_cpu_types(bytes: &[u8]) -> Option<Vec<u32>> {
+    let word = |off: usize, be: bool| -> Option<u32> {
+        let b: [u8; 4] = bytes.get(off..off + 4)?.try_into().ok()?;
+        Some(if be {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        })
+    };
+    const MH_MAGIC: u32 = 0xfeed_face;
+    const MH_MAGIC_64: u32 = 0xfeed_facf;
+    const FAT_MAGIC: u32 = 0xcafe_babe;
+    const FAT_MAGIC_64: u32 = 0xcafe_babf;
+    let be = word(0, true)?;
+    match be {
+        FAT_MAGIC | FAT_MAGIC_64 => {
+            // Fat headers are big-endian; entries are 20 (`fat_arch`) or 32
+            // (`fat_arch_64`) bytes. A Java class file shares FAT_MAGIC, so
+            // bound the count to something a real binary would have.
+            let entry_size = if be == FAT_MAGIC_64 { 32 } else { 20 };
+            let count = word(4, true)? as usize;
+            if count == 0 || count > 32 {
+                return None;
+            }
+            (0..count).map(|i| word(8 + i * entry_size, true)).collect()
+        }
+        MH_MAGIC | MH_MAGIC_64 => Some(vec![word(4, true)?]),
+        _ => {
+            let le = word(0, false)?;
+            if le == MH_MAGIC || le == MH_MAGIC_64 {
+                Some(vec![word(4, false)?])
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Resolve a **`llamacpp`** backend's engine: the row's explicit
@@ -736,9 +942,11 @@ fn external_discovery_dirs() -> Vec<PathBuf> {
 
 /// A `llamacpp` backend's engine binary, resolved against the live system.
 pub(crate) fn resolve_external_engine(engine_path: Option<&str>) -> Option<PathBuf> {
-    resolve_external_engine_path(engine_path, external_discovery_dirs().into_iter(), &|p| {
-        p.is_file()
-    })
+    resolve_external_engine_path(
+        engine_path,
+        external_discovery_dirs().into_iter(),
+        &usable_engine_binary,
+    )
 }
 
 /// A plain (non-attesting) HTTPS-capable client: native trust roots, used
@@ -1072,8 +1280,7 @@ impl Inner {
                 });
             }
         }
-        let path = models_dir(&self.data_dir).join(format!("{slug}.gguf"));
-        if path.exists() {
+        if let Some(path) = find_model_file(&models_dir(&self.data_dir), &slug).await {
             tokio::fs::remove_file(&path)
                 .await
                 .map_err(|e| AppError::LocalModel {
@@ -1149,12 +1356,12 @@ impl Inner {
             (dir, EngineSource::External(row.engine_path))
         };
 
-        let model_path = dir.join(format!("{slug}.gguf"));
-        if !model_path.is_file() {
-            return Err(AppError::LocalModel {
-                message: format!("no model file at `{}`", model_path.display()),
-            });
-        }
+        let model_path =
+            find_model_file(&dir, &slug)
+                .await
+                .ok_or_else(|| AppError::LocalModel {
+                    message: format!("no model file for `{slug}` in `{}`", dir.display()),
+                })?;
 
         let engine = match engine_source {
             EngineSource::Bundled => {
@@ -1178,22 +1385,43 @@ impl Inner {
         // `model` field matches what the engine expects verbatim.
         let model_id = engine_model_id(&backend_id, &slug);
 
-        // Make room: evict LRU idle, unpinned engines until this model's
-        // estimated footprint fits the budget. A refusal unloads nothing.
         let footprint = engine_footprint(
             tokio::fs::metadata(&model_path)
                 .await
                 .map(|m| m.len())
                 .unwrap_or(0),
         );
-        let victims = plan_evictions(
-            footprint,
-            self.local.memory_budget(),
-            &self.local.plan_snapshot(),
-        )
-        .map_err(|message| AppError::LocalModel {
-            message: format!("cannot load `{model_id}`: {message}"),
-        })?;
+
+        // Make room: plan LRU evictions and insert this load's warming
+        // entry in one critical section ([`LocalRuntime::reserve_engine`]),
+        // so concurrent loads of different models can't double-book the
+        // budget. A refusal reserves and unloads nothing.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let reserved = self
+            .local
+            .reserve_engine(&key, port, footprint, shutdown_tx)
+            .map_err(|message| AppError::LocalModel {
+                message: format!("cannot load `{model_id}`: {message}"),
+            })?;
+        let Some(victims) = reserved else {
+            // Raced another load between the presence check and here — join
+            // that load instead of double-spawning.
+            return self.await_engine_ready(&key).await;
+        };
+        // Until the supervisor takes ownership at spawn, an error return
+        // (or this future being dropped) must roll the reservation back.
+        let reservation = ReservationGuard {
+            local: self.local.clone(),
+            bus: self.bus.clone(),
+            key: Some(key.clone()),
+        };
+        self.local
+            .failures
+            .lock()
+            .expect("failures lock")
+            .remove(&key);
+        self.bus.emit(Change::LocalModels);
+
         for victim in victims {
             // Best-effort: a victim may have been unloaded concurrently.
             let _ = self
@@ -1217,40 +1445,6 @@ impl Inner {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let raced_existing = {
-            let mut engines = self.local.engines.lock().expect("engines lock");
-            if engines.contains_key(&key) {
-                true
-            } else {
-                engines.insert(
-                    key.clone(),
-                    EngineEntry {
-                        port,
-                        context_tokens: LOCAL_CONTEXT_TOKENS,
-                        ready: false,
-                        shutdown: shutdown_tx,
-                        footprint,
-                        pinned: false,
-                        last_used_ms: crate::now_ms(),
-                        in_flight: Arc::new(AtomicU64::new(0)),
-                    },
-                );
-                false
-            }
-        };
-        if raced_existing {
-            // Raced another load between the presence check and here — join
-            // that load instead of double-spawning.
-            return self.await_engine_ready(&key).await;
-        }
-        self.local
-            .failures
-            .lock()
-            .expect("failures lock")
-            .remove(&key);
-        self.bus.emit(Change::LocalModels);
-
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let bus = self.bus.clone();
         let local = self.local.clone();
@@ -1258,6 +1452,7 @@ impl Inner {
             Some(c) => c.clone(),
             None => plain_http_client()?,
         };
+        reservation.defuse();
         // Supervisor task: owns the child for its whole life. Cancellation
         // authority is the shutdown channel (map removal → send) — and if
         // the whole runtime is torn down, `kill_on_drop` reaps the child.
@@ -1691,6 +1886,18 @@ mod tests {
         assert_eq!(engine_model_id("local", &slug), "gemma-4-E2B_q4_0-it@local");
     }
 
+    #[test]
+    fn slug_strips_any_case_variant_of_the_extension() {
+        // The scan filter is case-insensitive, so the slug strip must be
+        // too — otherwise a `model.GGUF` is advertised but can never be
+        // loaded (its path would be reconstructed as `model.gguf`).
+        assert_eq!(slug_for_file("model.GGUF"), "model");
+        assert_eq!(slug_for_file("model.GgUf"), "model");
+        assert_eq!(slug_for_file("model.gguf"), "model");
+        assert_eq!(slug_for_file("model.bin"), "model.bin");
+        assert_eq!(slug_for_file(".gguf"), "");
+    }
+
     // -- The eviction planner -------------------------------------------
 
     const GIB: u64 = 1 << 30;
@@ -1708,6 +1915,7 @@ mod tests {
             last_used_ms: last_used,
             pinned,
             in_flight,
+            warming: false,
         }
     }
 
@@ -1764,6 +1972,102 @@ mod tests {
     fn plan_refuses_models_larger_than_the_budget() {
         let err = plan_evictions(20 * GIB, 16 * GIB, &[]).unwrap_err();
         assert!(err.contains("memory budget"), "got {err}");
+    }
+
+    #[test]
+    fn plan_never_evicts_a_warming_engine() {
+        // A warming entry is another load's reservation: its memory is
+        // committed but there is no engine to gracefully unload yet.
+        let mut warming = usage("warming", 6 * GIB, 1, false, 0);
+        warming.warming = true;
+        let err = plan_evictions(6 * GIB, 10 * GIB, &[warming]).unwrap_err();
+        assert!(err.contains("held"), "got {err}");
+    }
+
+    #[test]
+    fn reserve_engine_is_atomic_across_models() {
+        // Two loads that would each fit alone must not both fit: the first
+        // reservation is visible to (and protected from) the second plan,
+        // because planning and reserving share one critical section.
+        let runtime = LocalRuntime::default();
+        runtime.set_memory_budget_for_test(10 * GIB);
+
+        let key_a = ("local".to_string(), "a".to_string());
+        let (tx_a, _rx_a) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            runtime.reserve_engine(&key_a, 4001, 6 * GIB, tx_a).unwrap(),
+            Some(Vec::new()),
+            "the first load fits with no evictions"
+        );
+
+        let key_b = ("local".to_string(), "b".to_string());
+        let (tx_b, _rx_b) = tokio::sync::oneshot::channel();
+        let err = runtime
+            .reserve_engine(&key_b, 4002, 6 * GIB, tx_b)
+            .unwrap_err();
+        assert!(err.contains("held"), "got {err}");
+        assert!(
+            !runtime.engine_present(&key_b),
+            "a refused reservation must leave nothing behind"
+        );
+
+        // Re-reserving an existing key joins rather than double-books.
+        let (tx_a2, _rx_a2) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            runtime
+                .reserve_engine(&key_a, 4003, 6 * GIB, tx_a2)
+                .unwrap(),
+            None
+        );
+    }
+
+    // -- Mach-O architecture gate --------------------------------------
+
+    #[test]
+    fn macho_cpu_types_reads_thin_and_fat_headers() {
+        const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+        // Thin arm64 (little-endian on disk, as produced on macOS).
+        let mut thin = 0xfeed_facf_u32.to_le_bytes().to_vec();
+        thin.extend(CPU_TYPE_ARM64.to_le_bytes());
+        assert_eq!(macho_cpu_types(&thin), Some(vec![CPU_TYPE_ARM64]));
+
+        // Fat with both slices (big-endian header, 20-byte entries).
+        let mut fat = 0xcafe_babe_u32.to_be_bytes().to_vec();
+        fat.extend(2_u32.to_be_bytes());
+        for cpu in [CPU_TYPE_X86_64, CPU_TYPE_ARM64] {
+            fat.extend(cpu.to_be_bytes());
+            fat.extend([0u8; 16]); // cpusubtype, offset, size, align
+        }
+        assert_eq!(
+            macho_cpu_types(&fat),
+            Some(vec![CPU_TYPE_X86_64, CPU_TYPE_ARM64])
+        );
+
+        // Not Mach-O: an ELF header, or a Java class file (which shares
+        // FAT_MAGIC but has an implausible entry count).
+        assert_eq!(macho_cpu_types(b"\x7fELF\x02\x01\x01\x00"), None);
+        let mut class = 0xcafe_babe_u32.to_be_bytes().to_vec();
+        class.extend(65_u32.to_be_bytes()); // minor+major version words
+        assert_eq!(macho_cpu_types(&class), None);
+        assert_eq!(macho_cpu_types(b""), None);
+    }
+
+    #[test]
+    fn macho_compatibility_rejects_only_arm64_only_on_intel() {
+        const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+        // The shipped sidecar case: arm64-only binary on an Intel Mac.
+        assert!(!macho_machine_compatible(Some(&[CPU_TYPE_ARM64]), false));
+        // Same binary on Apple Silicon is fine.
+        assert!(macho_machine_compatible(Some(&[CPU_TYPE_ARM64]), true));
+        // A universal or x86_64 binary passes everywhere.
+        assert!(macho_machine_compatible(
+            Some(&[CPU_TYPE_X86_64, CPU_TYPE_ARM64]),
+            false
+        ));
+        assert!(macho_machine_compatible(Some(&[CPU_TYPE_X86_64]), false));
+        // Unknown formats pass — the spawn surfaces real errors.
+        assert!(macho_machine_compatible(None, false));
+        assert!(macho_machine_compatible(Some(&[]), false));
     }
 
     // -- Engine resolution --------------------------------------------
