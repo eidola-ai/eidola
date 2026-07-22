@@ -3320,6 +3320,68 @@ fn space_failed_ask_can_add_followup(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_failed_ask_retry_selects_the_failed_posts_branch(cx: &mut TestAppContext) {
+    // PR #218 review (comment 2): in a branched space, Retry must select the
+    // failed post's branch before streaming, so the response streams under the
+    // right post — not whatever branch is currently selected (which would
+    // stream under the wrong post until the DB reload snapped it over).
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // a1 (user root) with two replies: a2 (assistant) is the default-selected
+    // spine leaf; a3 (user) is a second branch — a saved user post awaiting a
+    // reply (the failed ask). `retry_target` = last user post in DFS = a3.
+    let mut a2 = fixture_assistant_post("a2", "an answer");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "the failed ask");
+    a3.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "root"), a2, a3], cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    // Default selection is the first branch (a2), NOT the retry target (a3).
+    let before = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_leaf_for_test(window)
+        })
+        .unwrap();
+    assert_eq!(
+        before.as_deref(),
+        Some("a2"),
+        "default selected leaf is the spine branch, not the failed post"
+    );
+    view.read_with(cx, |v, cx| {
+        assert!(v.space().read(cx).can_retry());
+        assert_eq!(v.space().read(cx).retry_target().as_deref(), Some("a3"));
+    });
+
+    // Retry re-selects the failed post's branch, so the streaming node attaches
+    // under a3.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.retry_failed(window, cx));
+    })
+    .unwrap();
+    let after = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_leaf_for_test(window)
+        })
+        .unwrap();
+    assert_eq!(
+        after.as_deref(),
+        Some("a3"),
+        "retry selects the failed post's branch so streaming attaches under it"
+    );
+    view.read_with(cx, |v, cx| assert!(v.space().read(cx).is_streaming()));
+}
+
+#[gpui::test]
 fn space_regenerate_uses_selected_model(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, Some("s".into()));

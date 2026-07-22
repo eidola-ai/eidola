@@ -666,6 +666,17 @@ impl SpaceView {
         self.error.clone()
     }
 
+    /// The node id of the currently-selected leaf — where `effective_tree`
+    /// attaches the synthetic streaming node. Drives the branched-retry
+    /// regression (retry must select the failed post's branch).
+    #[doc(hidden)]
+    pub fn selected_leaf_for_test(&self, window: &Window) -> Option<String> {
+        let page_width = crate::chrome::content_size(window).width;
+        let roots = model::build_tree(&self.posts);
+        self.selected_leaf_id(&roots, page_width)
+            .map(|s| s.to_string())
+    }
+
     /// A post's `(reasoning, expanded)` from the render snapshot.
     #[doc(hidden)]
     pub fn post_reasoning_for_test(&self, i: usize) -> Option<(String, bool)> {
@@ -1554,9 +1565,19 @@ impl SpaceView {
     pub fn retry_failed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.current_model(cx);
         self.error = None;
-        self.space.update(cx, |s, cx| {
-            s.retry(model, cx);
-        });
+        let target = self.space.update(cx, |s, cx| s.retry(model, cx));
+        // Select the failed post's branch *before* the next render so the
+        // synthetic streaming node (attached at the selected leaf by
+        // `effective_tree`) appears under the post the reply will actually land
+        // on — not whatever branch the user navigated to after the failure (PR
+        // #218 review). `self.posts` still reflects the transcript (retry only
+        // adds the streaming overlay), and a persisted user-post retry target is
+        // a leaf, so selecting its path makes it the selected leaf.
+        if let Some(target) = target {
+            let page_width = crate::chrome::content_size(window).width;
+            let roots = model::build_tree(&self.posts);
+            self.select_path_to(&roots, &target, page_width);
+        }
         self.scroll_to_tail(window, cx);
         cx.notify();
     }

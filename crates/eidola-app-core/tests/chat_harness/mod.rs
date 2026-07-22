@@ -110,6 +110,11 @@ pub struct MockConfig {
     pub refund: RefundMode,
     /// Account available balance returned by `/v1/account/balances`.
     pub balance: i64,
+    /// When set, `GET /v1/models` responds with this HTTP status instead of the
+    /// pricing catalog — simulating a `prepare_turn` setup failure (the fetch
+    /// the original PR #218 screenshot failed on) before the turn's own error
+    /// wrapping exists.
+    pub models_status: Option<u16>,
 }
 
 impl Default for MockConfig {
@@ -118,6 +123,7 @@ impl Default for MockConfig {
             chat: ChatBehavior::OkBlocking,
             refund: RefundMode::Succeed,
             balance: 10_000_000,
+            models_status: None,
         }
     }
 }
@@ -407,9 +413,14 @@ async fn handle_conn(
 
     // Route. Paths are matched without the `?...` query (none used here).
     match (req.method.as_str(), path) {
-        ("GET", "/v1/models") => {
-            write_json(&mut stream, 200, &models_body()).await?;
-        }
+        ("GET", "/v1/models") => match config.models_status {
+            Some(status) => {
+                write_json(&mut stream, status, r#"{"error":"models unavailable"}"#).await?;
+            }
+            None => {
+                write_json(&mut stream, 200, &models_body()).await?;
+            }
+        },
         ("GET", "/v1/keys") => {
             write_json(&mut stream, 200, &keys_body(&issuer)).await?;
         }

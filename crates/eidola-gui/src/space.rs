@@ -801,13 +801,16 @@ impl Space {
     /// response (exactly the state a failed ask leaves — a saved user post with
     /// no reply). The view gates its "Retry" affordance on this.
     pub fn can_retry(&self) -> bool {
-        !self.is_streaming() && self.submit_runner.is_none() && self.tail_retry_target().is_some()
+        !self.is_streaming() && self.submit_runner.is_none() && self.retry_target().is_some()
     }
 
     /// The action id of the retry target — the last post carrying a real id,
     /// but only when it is a **user** turn (a reply already exists otherwise,
-    /// so there is nothing to re-request). Requires a persisted space id.
-    fn tail_retry_target(&self) -> Option<String> {
+    /// so there is nothing to re-request). Requires a persisted space id. Public
+    /// so the view can select the target's path before the retry stream begins
+    /// (so the streaming node attaches under the *failed* post, not whatever
+    /// branch the user has since navigated to — PR #218 review).
+    pub fn retry_target(&self) -> Option<String> {
         self.id.as_ref()?;
         let msgs = self.transcript.value()?;
         let last = msgs.iter().rev().find(|m| m.action_id.is_some())?;
@@ -822,15 +825,14 @@ impl Space {
     /// failed ask — **without** re-posting the prompt (the post is already
     /// durable; app-core's [`AppCore::respond_stream`] runs a fresh turn
     /// replying to it). Enters the streaming state exactly like [`Self::submit`]
-    /// and shares its runner ([`Self::drive_stream`]). A no-op (returns `false`)
-    /// if nothing is retryable or an exchange is already in flight.
-    pub fn retry(&mut self, model: String, cx: &mut Context<Self>) -> bool {
+    /// and shares its runner ([`Self::drive_stream`]). Returns the **target
+    /// action id** the retry ran against (so the view can select its branch),
+    /// or `None` if nothing is retryable or an exchange is already in flight.
+    pub fn retry(&mut self, model: String, cx: &mut Context<Self>) -> Option<String> {
         if self.submit_runner.is_some() || self.streaming.is_some() {
-            return false;
+            return None;
         }
-        let (Some(space_id), Some(target)) = (self.id.clone(), self.tail_retry_target()) else {
-            return false;
-        };
+        let (space_id, target) = (self.id.clone()?, self.retry_target()?);
 
         self.last_submitted_model = Some(model.clone());
         self.supersede_load_for_mutation();
@@ -843,11 +845,12 @@ impl Space {
         let Some(app_core) = self.app_core.clone() else {
             // Stub stores (behavior tests): the streaming-state entry above is
             // the observable effect; no backend to drive.
-            return true;
+            return Some(target);
         };
-        let (event_rx, done_rx) = bridge::respond_stream(app_core.clone(), space_id, model, target);
+        let (event_rx, done_rx) =
+            bridge::respond_stream(app_core.clone(), space_id, model, target.clone());
         self.drive_stream(app_core, event_rx, done_rx, cx);
-        true
+        Some(target)
     }
 
     /// Install the streaming runner shared by [`Self::submit`] (post + request)

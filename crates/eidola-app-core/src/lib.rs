@@ -2359,9 +2359,14 @@ impl Inner {
         mode: ResponseMode,
         budget: Option<i64>,
     ) -> Result<ChatResult, AppError> {
+        // The space is already persisted (post created it) before prepare_turn
+        // runs, so every setup failure inside it — client build, `/v1/models`
+        // fetch, attestation flush, all *before* the turn's own `wrap` closure
+        // — must still carry the space id for blank-space adoption / Retry.
         let mut prep = self
             .prepare_turn(space_id, model, target_action_id, mode, budget)
-            .await?;
+            .await
+            .map_err(|e| e.into_chat_failed(space_id))?;
 
         let request_body_json = prep.request_body(false);
         let request_at = now_ms();
@@ -2582,9 +2587,13 @@ impl Inner {
     ) -> Result<ChatResult, AppError> {
         use futures_util::StreamExt;
 
+        // Setup failures (client build / `/v1/models` fetch / attestation
+        // flush) happen before the turn's inline `wrap` closure — carry the
+        // already-persisted space id so they wrap like every later exit.
         let mut prep = self
             .prepare_turn(space_id, model, target_action_id, mode, budget)
-            .await?;
+            .await
+            .map_err(|e| e.into_chat_failed(space_id))?;
 
         // No `stream_options` here — the server unconditionally sets
         // `include_usage: true` when forwarding the streaming request
