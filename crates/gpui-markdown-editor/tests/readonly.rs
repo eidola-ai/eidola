@@ -163,8 +163,13 @@ fn readonly_editor_refuses_mutating_events(cx: &mut TestAppContext) {
 #[test]
 fn update_readonly_preserves_the_buffer_where_update_normalizes() {
     // The same SetSelection that makes the editable pipeline canonicalize a
-    // soft break leaves the read-only buffer byte-identical.
-    let raw = "| a | b |\n| --- | --- |\n| c | d |";
+    // soft break leaves the read-only buffer byte-identical. (This used to
+    // use a pipe table as the normalized shape; tables are first-class now
+    // and survive the editable pipeline too — see
+    // `editable_pipeline_no_longer_rewrites_tables` — so the precondition
+    // uses a heading tightly followed by its paragraph, which the editable
+    // path still promotes.)
+    let raw = "### heading\nbody text directly under the heading";
     let state = EditorState {
         markdown: raw.to_string(),
         selection: Selection::Cursor(0),
@@ -182,6 +187,28 @@ fn update_readonly_preserves_the_buffer_where_update_normalizes() {
     let readonly = update_readonly(state, EditorEvent::SetSelection(Selection::Cursor(2)));
     assert_eq!(readonly.markdown, raw);
     assert_eq!(readonly.selection, Selection::Cursor(2));
+}
+
+#[test]
+fn editable_pipeline_no_longer_rewrites_tables() {
+    // The flip side of the regression above: a table's `\n`-separated pipe
+    // rows are *first-class structure* now, sacred in the editable pipeline
+    // too — a bare SetSelection (or any other event) must leave a canonical
+    // table byte-identical instead of promoting its row separators to
+    // paragraph breaks.
+    let raw = "| a | b |\n| --- | --- |\n| c | d |\n";
+    let state = EditorState {
+        markdown: raw.to_string(),
+        selection: Selection::Cursor(0),
+    };
+    let editable = update(
+        state.clone(),
+        EditorEvent::SetSelection(Selection::Cursor(2)),
+    );
+    assert_eq!(
+        editable.markdown, raw,
+        "the editable canonicalizer must preserve a canonical table"
+    );
 }
 
 #[test]

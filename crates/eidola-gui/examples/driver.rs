@@ -291,6 +291,28 @@ mod driver {
                 },
             },
             Scene {
+                name: "markdown_table",
+                description: "Space view: an assistant reply carrying GFM tables (aligned columns, styled cells, a wide overflow table) — the table display-mode QA scene; the tail composer is live for edit-mode QA",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_messages_for_test(table_conversation(), cx)
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_branches",
                 description: "Space view: a branched post tree with docked tail drafts (kitchen-sink fixture)",
                 default_size: size(px(900.), px(700.)),
@@ -606,6 +628,37 @@ mod driver {
                 content: "Near sunset the light skims a long, slanted path through the air, \
                       the blue is scattered away entirely, and what survives to reach you \
                       is the warm red-orange of a low sun."
+                    .into(),
+            },
+        ]
+    }
+
+    fn table_conversation() -> Vec<SpaceMessage> {
+        vec![
+            SpaceMessage {
+                role: "user".into(),
+                content: "Compare the local models I can run.".into(),
+            },
+            SpaceMessage {
+                role: "assistant".into(),
+                content: "Here is a comparison of the curated local models:\n\n\
+                    | Model | Params | Context | Disk |\n\
+                    | :-- | --: | --: | --: |\n\
+                    | Gemma 4 E2B | 2B | 32k | 1.6 GB |\n\
+                    | Gemma 4 4B | 4B | 128k | 3.2 GB |\n\
+                    | Gemma 4 12B | 12B | 128k | 8.1 GB |\n\
+                    | Gemma 4 27B | 27B | 128k | 17 GB |\n\n\
+                    Styling composes inside cells:\n\n\
+                    | Feature | Status |\n\
+                    | :-- | :-- |\n\
+                    | **Bold** and `inline code` | ~~cut~~ kept |\n\
+                    | a\\|b literal pipe | plain text |\n\n\
+                    And a deliberately wide table that overflows the reading column \
+                    and scrolls horizontally:\n\n\
+                    | A rather long header cell one | Header two with more words | Third header column | Fourth column header | Fifth and final header |\n\
+                    | --- | --- | --- | --- | --- |\n\
+                    | some content here | more cell content | further content | yet more words | the last cell |\n\n\
+                    Everything above should read as a quiet, hairline-ruled book table."
                     .into(),
             },
         ]

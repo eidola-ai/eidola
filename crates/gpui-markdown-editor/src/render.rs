@@ -469,9 +469,138 @@ fn render_node(
         NodeKind::DisplayMath { .. } => {
             emit_display_math_block(node, source, cursor, containers, out)
         }
+        NodeKind::Table { alignments } => {
+            render_table(node, alignments, source, cursor, containers, out)
+        }
         // Anything else at top level — nothing to do yet.
         _ => {}
     }
+}
+
+/// Render a GFM pipe table.
+///
+/// **Top-level tables** become a `BlockKind::Table` leaf: rows shape
+/// one line each, with the between-cell chrome (pipes + padding) and
+/// the delimiter row hidden in display mode or dimmed in edit mode,
+/// and each cell's inline children styled through the standard
+/// [`walk_inline`] walk (header cells add the table-header weight).
+/// Column alignment is a display-time concern — the element layer
+/// measures cells and inserts pad substitutions; the render layer only
+/// decides visibility and styling.
+///
+/// **Nested tables** (inside a blockquote / list chain) fall back to a
+/// plain paragraph-shaped leaf over the raw source lines: honest raw
+/// markdown rather than a half-working grid. The v1 editing rules gate
+/// on the same top-level test (`crate::table::table_at`), so what you
+/// can edit as a table is exactly what renders as one.
+fn render_table(
+    node: &SyntaxNode,
+    alignments: &[crate::syntax::TableAlignment],
+    source: &str,
+    cursor: CursorRange,
+    containers: &[Container],
+    out: &mut Vec<RenderBlock>,
+) {
+    let bytes = source.as_bytes();
+    let trimmed_end = block_content_end_excl(bytes, &node.range).max(node.range.start);
+    let block_range = node.range.start..trimmed_end;
+
+    if !containers.is_empty() {
+        // Nested fallback: raw source lines, standard chain hiding.
+        let mut block = RenderBlock::new(block_range, BlockKind::Paragraph);
+        block.containers = containers.to_vec();
+        out.push(block);
+        return;
+    }
+
+    let geometry = crate::table::geometry_from_range(source, node.range.clone(), alignments);
+    // Inclusive overlap on the trimmed range — a cursor touching
+    // either end of the construct flips to edit mode (the shared
+    // click-to-edit rule; see `emit_display_math_block`).
+    let edit_mode = cursor.overlaps(&block_range);
+    let cursor_row = if edit_mode {
+        geometry.row_at(cursor.start.min(cursor.end))
+    } else {
+        None
+    };
+    let mut block = RenderBlock::new(
+        block_range,
+        BlockKind::Table {
+            geometry: geometry.clone(),
+            edit_mode,
+            cursor_row,
+        },
+    );
+
+    // Chrome visibility: every byte of a row's line that is not cell
+    // content is chrome — the leading `| `, each ` | `, the trailing
+    // ` |` — plus the entire delimiter row. Hidden in display mode,
+    // dimmed in edit mode.
+    let mut chrome: Vec<Range<usize>> = Vec::new();
+    for row in &geometry.rows {
+        if row.kind == crate::table::RowKind::Delimiter {
+            chrome.push(row.line.clone());
+            continue;
+        }
+        let mut pos = row.line.start;
+        for cell in &row.cells {
+            if cell.start > pos {
+                chrome.push(pos..cell.start);
+            }
+            pos = cell.end;
+        }
+        if row.line.end > pos {
+            chrome.push(pos..row.line.end);
+        }
+    }
+    for range in chrome {
+        if range.is_empty() {
+            continue;
+        }
+        if edit_mode {
+            block.inlines.push(InlineRun {
+                source_range: range,
+                style: InlineStyle::dimmed(),
+            });
+        } else {
+            block.hidden_ranges.push(range);
+        }
+    }
+
+    // Cell content: inline children styled through the standard walk;
+    // header cells carry the table-header weight as their base style.
+    for (row_node, row_geo) in node.children.iter().zip(geometry.rows.iter().filter(|r| {
+        // `node.children` holds header + body rows only (pulldown
+        // never emits the delimiter row) — align the zip accordingly.
+        r.kind != crate::table::RowKind::Delimiter
+    })) {
+        let is_header = matches!(row_node.kind, NodeKind::TableRow { is_header: true });
+        let base = if is_header {
+            InlineStyle::table_header()
+        } else {
+            InlineStyle::default()
+        };
+        if is_header {
+            // The weight must cover the whole cell content (plain
+            // text children produce no styled runs of their own), so
+            // emit one run per cell over its trimmed content range.
+            for cell in &row_geo.cells {
+                if cell.start < cell.end {
+                    block.inlines.push(InlineRun {
+                        source_range: cell.clone(),
+                        style: InlineStyle::table_header(),
+                    });
+                }
+            }
+        }
+        for cell_node in &row_node.children {
+            for inline in &cell_node.children {
+                walk_inline(inline, cursor, base.clone(), &mut block);
+            }
+        }
+    }
+
+    out.push(block);
 }
 
 /// Emit a `BlockKind::DisplayMath` block for `math` (a `NodeKind::DisplayMath`

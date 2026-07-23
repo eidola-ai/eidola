@@ -107,8 +107,49 @@ The first cut covers:
   - **Cursor outside**: render emits an `ImageOverlay`. The element layer's `augment_block_with_images` pre-pass calls `crate::image::load`, measures the natural size, caps height to `INLINE_HEIGHT_FACTOR * line_height`, and substitutes a width-matched NBSP run so surrounding text reserves space. `paint_inline_image_overlays` paints each loaded image vertically centered on the row that hosts its substitution.
   - **Cursor inside**: dim-delimiter / visible-alt-text fallback so the user can edit the raw markdown.
   A paragraph whose sole content is an Image promotes to `BlockKind::Image { alt_range, dest_url, edit_mode }` — same promotion rule and inclusive-overlap edit-mode test as `DisplayMath`. In display mode the element layer scales the image to fit the available content width (`crate::image::block_size`) and paints directly via `window.paint_image`. Edit mode reserves at least the natural display-mode height (the same `max(natural edit, natural display)` rule as `BlockKind::DisplayMath`) so toggling edit mode doesn't shift surrounding content. Image loading is asynchronous: the cache returns `Loading` until the asset resolves, `Failed` on error. `Loading` reserves a placeholder (square at the inline height cap; ~8em-tall banner for block images) and invalidates the view when the load completes; `Failed` falls back to the dim-delimiter + alt-text inline run pair so the user sees the construct and the broken URL. Loaders for `http://`, `https://`, `file://`, and absolute paths come for free via gpui's image cache; relative-path / embedded resolution depends on hosts registering an `AssetSource`.
+- GFM pipe tables — see [Tables](#tables--gfm-pipe-tables) below for the model, the two render modes, and the full keystroke map.
 
-Explicitly *out* of this phase: setext-heading normalization, tables, HTML, IME marked-text, reference-style images (`![alt][label]`), the `title` attribute on images, image data URIs, image links (`[![alt](img)](url)`), rich-content paste from HTML / RTF (depends on a gpui-side clipboard-mime extension that doesn't exist yet — see [Clipboard pipeline](#clipboard-pipeline) for the deferred path).
+Explicitly *out* of this phase: setext-heading normalization, HTML, IME marked-text, reference-style images (`![alt][label]`), the `title` attribute on images, image data URIs, image links (`[![alt](img)](url)`), rich-content paste from HTML / RTF (depends on a gpui-side clipboard-mime extension that doesn't exist yet — see [Clipboard pipeline](#clipboard-pipeline) for the deferred path).
+
+### Tables — GFM pipe tables
+
+The design survey (Typora's always-WYSIWYG grid, Obsidian Live Preview's flip-to-source, org-mode's aligned-source magic, ProseMirror's structured table nodes) resolved to the **aligned-source hybrid**: the buffer stays *minimal canonical GFM* at all times (`| a | b |` single-space cells, compact `| --- | :-: |` delimiter row — never org-style physical space padding), and column alignment is **display-only** — the element layer measures every cell and splices width-matched pad substitutions (the math-overlay NBSP mechanism) into the shaped lines. A structured-grid widget (the Typora/ProseMirror route) was rejected because it inverts the crate's foundation — one selectable document over source bytes, per-block shaped *lines* with `display_to_source` maps — and Obsidian's flip-to-raw was rejected as visually violent; the hybrid keeps the table a table in both modes while every byte stays honest markdown.
+
+**The model** (`src/table.rs`): a table is a **structural leaf block** like a fenced code block — its internal single `\n`s are row separators (GFM's own shape), exempt from soft-break promotion (`promote_soft_breaks` consults `table_ranges_in_tree`; the table's *final* newline still promotes at the block boundary). `TableGeometry` (rows × cells, line ranges, trimmed content ranges, untrimmed segments, alignments) is computed **from source bytes** by an unescaped-pipe line scanner — not from pulldown's cell events, which never include the delimiter row, synthesize degenerate ranges for missing cells, and report untrimmed content — while pulldown remains the authority on *whether* a table parses (the scanner only runs inside a parsed `NodeKind::Table`). V1 is **top-level tables only**: a table nested in a BQ/LI still parses (newlines protected) but renders as raw source lines and takes no table editing rules — what you can edit as a table is exactly what renders as one.
+
+**Two render modes** (`BlockKind::Table { geometry, edit_mode, .. }`, the display-math click-to-edit pattern, inclusive boundary overlap):
+
+- **Display mode** (cursor outside; also the read-only path): pipes, cell padding and the whole delimiter row are hidden; the element pre-pass (`augment_block_with_table`) measures cells, derives per-column slots (widest cell wins), and pads columns into alignment honoring the delimiter colons (right/center fills lead the cell). Header cells set at `MarkdownStyle::table_header_weight` (Medium — the app's flat-heading discipline), hairline rules paint under the header (full `table_rule_color`) and between body rows (0.45×) — the booktabs/Library idiom: no boxes, no vertical rules, no zebra. Pad rounding is error-corrected per boundary (±half a ~⅙-em pad char, non-cumulative).
+- **Edit mode** (cursor inside): every byte shapes; pipes and the delimiter row dim into view (the standard reveal), and the *same* pad substitutions keep the columns visually aligned while editing — org-mode's aligned table without ever writing pad spaces into the buffer. No painted rules (the dimmed delimiter row is the boundary).
+
+Tables never soft-wrap; a wide table takes the code block's horizontal-scroll treatment (shared per-block scroll slot, content mask, the shared `paint_h_scrollbar_at` overlay) minus the background chrome.
+
+**Canonicalizer** (`normalize_tables` in `enforce_invariants`, after `normalize_lists`): every row **not hosting the caret** rewrites to canonical form — single-space padding, short rows padded with empty cells, the delimiter row regenerated from its alignments at the header's width (header and delimiter must agree or GFM drops the whole table). The caret's row is deliberately left alone (the `inject_unordered_marker_space` cursor-guard discipline) and snaps canonical when the caret leaves it. Idempotent; `update_readonly` never runs it.
+
+**Allowed caret positions**: between-cell chrome is forbidden (the hidden-list-indent pattern — `is_table_chrome_position` in `analysis::is_forbidden_position`, with a pipe-on-the-line prefilter before parsing). Allowed = cell content plus the strict interior of a cell's untrimmed segment (so a just-typed trailing space keeps the caret until normalize trims it). This is what makes arrows hop cell-to-cell and clicks land in cells.
+
+**Keystroke map** (all in `update.rs`, computing edits via `src/table.rs`; every op is one undo step):
+
+| Keys | In a table |
+|------|-----------|
+| `\| a \| b \|` + **Enter** | The scaffold: a pipe-shaped paragraph line (starts+ends with `\|`, ≥1 non-empty cell, top-level, non-verbatim) grows the delimiter row + one empty body row; caret in the first body cell |
+| **Tab** / **Shift-Tab** | Next / previous cell (delimiter row skipped) — selects the target's content (typing replaces), caret when empty; Tab past the last cell appends a fresh row |
+| **Enter** | New empty row below the caret's row (header ⇒ first body position); on the **last body row with all cells empty** ⇒ exit the table into a paragraph (the empty-item Enter-outdent analog) |
+| **`\|`** | Insert a **column boundary at the caret, table-wide** — the caret cell splits, header/delimiter/body rows gain a matching cell at the same index; `\\` then `\|` types a literal pipe |
+| **Backspace** at cell start (k > 0) | Remove that column boundary table-wide (merge cells k−1,k in every row; the merged delimiter cell keeps the left column's alignment) — the exact inverse of `\|`, so the two round-trip |
+| **Backspace** in an all-empty body row | Delete the row (caret to the previous row's last cell) |
+| **Backspace** at a body row's first cell start | Hop to the previous row's last cell, no deletion (structure protection; the header's first cell falls through so the table can merge into the preceding block honestly) |
+| **Delete-forward** at cell end | Hop to the next cell's start |
+| **`:`** on the delimiter row | Alignment *is* the colons — the delimiter row's dash cells are ordinary editable content; normalize re-canonicalizes (`:--`/`:-:`/`--:`/`---`) when the caret leaves |
+| **←/→** | Hop across chrome cell-to-cell (forbidden-position snapping) |
+| **⌥⌫ / ⌥Del** | Word-delete clamped to the caret's cell |
+| **Paste** | Cell-safe splice: newlines → spaces, unescaped pipes → `\|` (one cell, table stays well-formed) |
+
+A collapse to plain text is always honest: any edit that breaks the GFM shape (e.g. deleting the delimiter row, a header/delimiter width mismatch mid-edit) simply stops parsing as a table and renders as the raw paragraphs it now is — no phantom grid, and re-completing the shape restores the table.
+
+**Deliberately out of v1**: tables nested in blockquotes/lists (raw-source fallback, above); a dedicated column-*move* command (org's M-arrows — delete/insert via `\|`/Backspace covers restructuring); stretching the delimiter row's dashes to the column width in edit mode (a display nicety); multi-line cell content via `<br>` (we don't model HTML); pasting a whole table into a cell as cells.
+
+Tests: `tests/table.rs` (the keystroke gate — construction, Tab flow, row/column ops, alignment editing, canonicalization + caret-row guard, round-trips, readonly, paste, render-spec chrome/emphasis, nested fallback), unit tests in `src/table.rs` (scanner, geometry, per-op edits), `tests/readonly.rs` (`editable_pipeline_no_longer_rewrites_tables` — the flip side of the readonly-canonicalization regression), and the table visual cases in `tests/visual/cases.rs`. The eidola-gui driver scene `markdown_table` is the interactive QA fixture (display grid, styled cells, wide overflow table, live composer for edit-mode QA).
 
 ### Container chain (composability invariant)
 
@@ -254,6 +295,7 @@ Real HTML / RTF passthrough depends on a gpui-side `ClipboardEntry::Html(String)
 | `render.rs` | Pure `render(state, tree, style) -> RenderSpec` |
 | `render_spec.rs` | `RenderSpec`, `RenderBlock`, `InlineRun`, `InlineStyle` |
 | `style.rs` | `MarkdownStyle` — derived from `gpui_component::Theme` |
+| `table.rs` | GFM pipe-table model: `TableGeometry` (source-byte line/cell scanner), the structural edit computations (Tab/Enter/`\|`/Backspace/scaffold/normalize), chrome-position detection. See [Tables](#tables--gfm-pipe-tables) |
 | `element.rs` | `BlockElement` — paints one block, owns a `display_to_source` map per shaped line |
 | `editor.rs` | `MarkdownEditorState` (state entity: focus, IME, caches, events, setters) + `MarkdownEditor` (the `RenderOnce` element) + `init` (keymap). See [Widget shape](#widget-shape--stateelement-split-mirrors-gpui_componentinput) |
 | `escapes.rs` | CommonMark §2.4 / §2.5 source-byte scanner. Returns one `ResolvedSpan` per `\X` or `&entity;` occurrence; the render post-pass turns each into a `Substitution` (cursor outside) or a dimmed `InlineRun` (cursor inside). |
@@ -332,6 +374,7 @@ cargo run -p gpui-markdown-editor --bin demo
 | What | Where |
 |------|-------|
 | Keyboard behavior (Enter, Backspace, Tab) | `update.rs` |
+| Table structure / editing rules | `src/table.rs` (pure edits) + `update.rs` (event arms) — see [Tables](#tables--gfm-pipe-tables) |
 | New events | `event.rs` + `update.rs` + `editor.rs` action wiring |
 | New construct (parsing) | `parser.rs` + `syntax.rs` |
 | Cursor-aware delimiter visibility | `render.rs` |

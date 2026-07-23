@@ -537,6 +537,72 @@ pub fn register(s: &mut Snapshots) {
         })
     });
 
+    // ---- Tables ---------------------------------------------------------
+
+    const TABLE_DOC: &str = "Some intro prose above the table.\n\n\
+        | Model | Params | Context |\n\
+        | :-- | --: | --: |\n\
+        | Gemma 4 E2B | 2B | 32k |\n\
+        | Gemma 4 4B | 4B | 128k |\n\
+        | Kimi K2 | 1T | 256k |\n\n\
+        Trailing prose below the table.";
+
+    // Cursor outside — the rendered grid: pipes + delimiter row
+    // hidden, header in the table-header weight, alignment colons
+    // honored (numbers right-aligned), hairline rules.
+    s.add("table_cursor_outside", win, |window, cx| {
+        editor_with_cursor(window, cx, TABLE_DOC, "Trailing")
+    });
+
+    // Cursor inside — org-style aligned source: pipes + delimiter
+    // row dim into view; the pad substitutions keep the columns
+    // aligned while editing.
+    s.add("table_cursor_inside", win, |window, cx| {
+        editor_with_cursor(window, cx, TABLE_DOC, "Gemma 4 4B")
+    });
+
+    // Selection overlapping the table (drag from prose into cells).
+    s.add("table_selection_across", win, |window, cx| {
+        cx.new(|cx| {
+            let start = TABLE_DOC.find("intro").unwrap();
+            let end = TABLE_DOC.find("4B |").unwrap();
+            let state = EditorState {
+                markdown: TABLE_DOC.into(),
+                selection: Selection::range(start, end),
+            };
+            EditorHarness::with_state(state, window, cx)
+        })
+    });
+
+    // Inline styling inside cells (bold / code / strikethrough) plus
+    // an escaped pipe, cursor outside.
+    s.add("table_styled_cells", win, |window, cx| {
+        editor_with_cursor(
+            window,
+            cx,
+            "| Feature | Status |\n\
+             | :-- | :-- |\n\
+             | **Bold** and `code` | ~~cut~~ kept |\n\
+             | a\\|b literal pipe | plain |\n\n\
+             after",
+            "after",
+        )
+    });
+
+    // Wide table — overflows 720px and triggers the horizontal
+    // scrollbar (the code-block treatment, minus the chrome).
+    s.add("table_overflow_scrollbar", win, |window, cx| {
+        editor_with_cursor(
+            window,
+            cx,
+            "| A rather long header cell one | Header two with more words | Third header column | Fourth column header | Fifth and final header |\n\
+             | --- | --- | --- | --- | --- |\n\
+             | some content here | more cell content | further content | yet more words | the last cell |\n\n\
+             after",
+            "after",
+        )
+    });
+
     // Ordered list with an empty intermediate item that hosts a
     // nested sublist (`2. ` followed by `   1. Two, One`). The empty
     // marker row should sit at the outer LI's indent — same column
