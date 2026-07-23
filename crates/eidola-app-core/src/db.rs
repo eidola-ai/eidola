@@ -92,6 +92,17 @@ pub async fn connect(db: &Database) -> Result<Connection, AppError> {
     conn.execute("PRAGMA foreign_keys = ON", ())
         .await
         .map_err(AppError::db)?;
+    // turso is single-writer, and defaults to erroring immediately ("database
+    // is locked") when a second connection tries to write concurrently.
+    // Participants v1 (wave 2) drives concurrent turns — a multi-participant
+    // fan-out runs several `respond_stream_as` at once, each writing its own
+    // rows — so give every connection a bounded busy wait: a concurrent writer
+    // blocks until the current write commits instead of failing. The
+    // wallet-level `spend_gate` already serializes the *credential* step; this
+    // covers the remaining per-turn row writes (posts, inference rows).
+    conn.execute("PRAGMA busy_timeout = 5000", ())
+        .await
+        .map_err(AppError::db)?;
     Ok(conn)
 }
 
@@ -2889,6 +2900,94 @@ pub async fn reply_antecedent(
         None => Ok(None),
         Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
     }
+}
+
+/// The acting participant of an action: `(participant_id, participant_scope,
+/// kind)`. `None` if the action doesn't exist. Used by `plan_notifications`
+/// to identify a post's author (to exclude it from the notify set and to
+/// resolve the `human`-policy predicate).
+pub async fn action_author(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<(String, String, String)>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.participant_id, a.participant_scope, p.kind \
+             FROM action a JOIN participant p ON p.id = a.participant_id \
+             WHERE a.id = ?1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<String>(1).map_err(AppError::db)?,
+            row.get::<String>(2).map_err(AppError::db)?,
+        ))),
+    }
+}
+
+/// The participant *kind* of an action (`human`/`agent`/`tool`/`system`), or
+/// `None` if the action doesn't exist.
+async fn action_kind(conn: &Connection, action_id: &str) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.kind FROM action a \
+             JOIN participant p ON p.id = a.participant_id WHERE a.id = ?1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// The **cascade depth** of a post: the number of consecutive agent-authored
+/// posts in its reply ancestry, counting from the post itself back to (but not
+/// including) the most recent human-authored post. A human-authored post has
+/// depth 0.
+///
+/// This is the data-derived cascade guard — no schema state. Each hop resolves
+/// to the antecedent item's **current tip** (matching `get_upstream_context`),
+/// and the walk is **branch-scoped** (only the target's own reply ancestry, so
+/// sibling branches carry independent depths). Authorship is stable across an
+/// item's generations (a `user_input` item is always human, an `inference` item
+/// always its agent), so an edit or regeneration never changes the count.
+/// Cycle-guarded like `get_upstream_context` (item-tip re-rooting can create
+/// logical cycles even though raw edges only point backward).
+pub async fn agent_cascade_depth(conn: &Connection, action_id: &str) -> Result<i64, AppError> {
+    let mut depth: i64 = 0;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Start at the post's own item tip (a reply to a since-edited post answers
+    // the latest generation; authorship is unchanged either way).
+    let mut cursor = item_tip_of_action(conn, action_id)
+        .await?
+        .unwrap_or_else(|| action_id.to_string());
+    loop {
+        if !seen.insert(cursor.clone()) {
+            break;
+        }
+        match action_kind(conn, &cursor).await? {
+            Some(kind) if kind == "agent" => depth += 1,
+            // A human (or non-agent) post — or a vanished action — ends the run.
+            _ => break,
+        }
+        match reply_antecedent_tip(conn, &cursor).await? {
+            Some(parent) => cursor = parent,
+            None => break,
+        }
+    }
+    Ok(depth)
 }
 
 /// Returns all action IDs in a space with terminal status, ordered by created_at.
