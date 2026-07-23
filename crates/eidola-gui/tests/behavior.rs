@@ -1806,13 +1806,22 @@ fn record_marks_stale_on_record_change_and_refresh_clears(cx: &mut TestAppContex
 fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
     // A real `AppCore` over tempdirs (the Record queries are local-DB reads),
     // mirroring `tests/stores.rs::test_core`. `_dir` keeps the tempdir alive.
+    // The RecordView's page fetches run as spawned tasks on the AppCore's own
+    // tokio runtime (each holding an `Arc<AppCore>`), so declare that
+    // cross-thread mixing to the test scheduler — the established idiom (see
+    // `tests/stores.rs`), which also lets us join those tasks below without the
+    // non-determinism detector flagging their cross-thread completion wakes.
+    cx.executor().allow_parking();
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let _dir = tempfile::tempdir().unwrap();
-    let core = AppCore::new(_dir.path().to_path_buf(), _dir.path().join("data"));
+    let core = std::sync::Arc::new(AppCore::new(
+        _dir.path().to_path_buf(),
+        _dir.path().join("data"),
+    ));
     core.runtime()
         .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
         .unwrap();
-    let stores = cx.update(|cx| Stores::for_test(std::sync::Arc::new(core), cx));
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
     let (_window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| RecordView::new(stores.clone(), window, cx))
     });
@@ -1838,6 +1847,23 @@ fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
              superseded task was cancelled at replacement"
         );
     });
+
+    // Deterministic teardown — join every in-flight bridge task before the test
+    // returns. Each page fetch (including the one `refresh` superseded, which is
+    // *orphaned* on the tokio side once its gpui receiver is dropped, so no
+    // `run_until_parked` ever drains it) holds an `Arc<AppCore>` until it
+    // finishes on a tokio worker. The store entities keep the AppCore alive
+    // until `cx` teardown on this thread, but if a bridge task is still running
+    // then, it becomes the *last* owner and drops the tokio runtime from within
+    // its own worker → "Cannot drop a runtime ... from within an asynchronous
+    // context" — the intermittent CI panic (Linux-scheduler-sensitive; a local
+    // DB read almost always finishes first on macOS, so this never reproduced
+    // here). Waiting until the runtime is idle guarantees the last `Arc` always
+    // drops on the test thread. This is a precise join on the runtime's live
+    // task count, not a timed sleep, and does not touch the assertions above.
+    while core.runtime().metrics().num_alive_tasks() > 0 {
+        std::thread::yield_now();
+    }
 }
 
 // ---------------------------------------------------------------------------
