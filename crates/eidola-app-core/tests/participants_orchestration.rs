@@ -14,11 +14,17 @@
 //!   explicit asks (`respond_stream_as`) bypass the guard.
 //! * **ACT provisioning queue** — two concurrent turns each obtain their own
 //!   real, spendable credential (the wallet-level serialization prevents two
-//!   turns from double-booking one credential).
+//!   turns from double-booking one credential); the wait predicate fast-fails
+//!   with `InsufficientBalance` when no in-flight credential could ever cover
+//!   the charge, and waits/succeeds when a covering one is mid-spend.
+//! * **Space consistency** — `plan_notifications`, `respond_stream_as`, and a
+//!   `post_reply` `reply_to` all reject an action from another space (no
+//!   cross-space context / reply edges); an out-of-space participant is
+//!   rejected too.
 
 mod chat_harness;
 
-use chat_harness::{ChatBehavior, MODEL, MockConfig, with_account};
+use chat_harness::{ChatBehavior, MODEL, MockConfig, RefundMode, with_account};
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AppCore, ChatResult, ChatStreamEvent, NewParticipant, NotificationPlan, ParticipantUpdate,
@@ -420,6 +426,175 @@ fn concurrent_turns_each_get_their_own_credential() {
 
         // Two chats each hit the mock once.
         assert_eq!(mock.chat_hits(), 2);
+    });
+}
+
+#[test]
+fn provisioning_fast_fails_when_no_covering_in_flight() {
+    run(|| {
+        // A tiny static balance (< a normal turn's charge) and a refund that
+        // never lands, so the first turn leaves a credential mid-spend whose
+        // face value cannot cover the *second* (huge-prompt) turn's charge.
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig {
+            refund: RefundMode::Fail,
+            balance: 20_000,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // First turn: a small prompt. It allocates a 20_000 credential, spends
+        // it, and — refund failing — leaves it in the `spending` state.
+        core.runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect("first turn succeeds (refund failure is best-effort)");
+
+        // Second turn: a huge prompt whose charge far exceeds both the static
+        // balance (20_000) and the in-flight credential's face value (20_000).
+        // No allocation is possible and the mid-spend credential — even fully
+        // refunded — could never cover it, so provisioning must fail FAST with
+        // InsufficientBalance, not burn the 30s bounded wait.
+        let huge = "x".repeat(200_000);
+        let started = std::time::Instant::now();
+        let err = core
+            .runtime()
+            .block_on(core.chat(huge, MODEL.into(), None))
+            .expect_err("second turn cannot be funded");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err.root(), AppError::InsufficientBalance { available, .. } if *available == 20_000),
+            "expected an immediate InsufficientBalance, got {:?}",
+            err.root()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must not burn the provisioning wait when no in-flight credential can cover the charge \
+             (took {elapsed:?})"
+        );
+    });
+}
+
+#[test]
+fn provisioning_waits_and_succeeds_when_covering_in_flight() {
+    run(|| {
+        // Static balance too small to allocate ANY turn's charge, plus one
+        // pre-seeded large credential. Two concurrent turns: the first spends
+        // the seeded credential (flipping it to `spending`); the second cannot
+        // allocate (balance too small) but sees a covering in-flight credential,
+        // waits for its refund recovery, and is funded by the resulting
+        // successor. Both must succeed — the covering in-flight case works.
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig {
+            balance: 100,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // Seed one large active credential (the explicit allocate path issues
+        // the requested amount regardless of the reported balance).
+        core.runtime()
+            .block_on(core.account_allocate(1_000_000))
+            .expect("seed a large credential");
+
+        let (a, b) = core.runtime().block_on(async {
+            tokio::join!(
+                core.chat("first".into(), MODEL.into(), None),
+                core.chat("second".into(), MODEL.into(), None),
+            )
+        });
+        // Neither turn could allocate a fresh credential (balance is 100), so the
+        // second was necessarily funded by the first's recovered refund — the
+        // covering-in-flight wait path.
+        a.expect("first turn");
+        b.expect("second turn funded by the recovered refund");
+    });
+}
+
+// ===========================================================================
+// Space consistency — an action must belong to the supplied space
+// ===========================================================================
+
+#[test]
+fn plan_notifications_rejects_action_from_another_space() {
+    run(|| {
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig::default());
+        let a = core.runtime().block_on(core.create_space(None)).unwrap().id;
+        let b = core.runtime().block_on(core.create_space(None)).unwrap().id;
+        let post_b = core
+            .runtime()
+            .block_on(core.post("in B".into(), Some(b.clone())))
+            .expect("post in B");
+
+        // Planning space A over a post that lives in space B must be rejected.
+        assert!(
+            core.runtime()
+                .block_on(core.plan_notifications(a, post_b.action_id))
+                .is_err(),
+            "plan_notifications must reject an action from another space"
+        );
+    });
+}
+
+#[test]
+fn respond_stream_as_rejects_target_and_participant_from_another_space() {
+    run(|| {
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let a = core.runtime().block_on(core.create_space(None)).unwrap().id;
+        let b = core.runtime().block_on(core.create_space(None)).unwrap().id;
+
+        let post_a = core
+            .runtime()
+            .block_on(core.post("in A".into(), Some(a.clone())))
+            .expect("post in A");
+        let post_b = core
+            .runtime()
+            .block_on(core.post("in B".into(), Some(b.clone())))
+            .expect("post in B");
+        let agent_a = agent_id(&core, &a, &default_agent_label());
+        let agent_b = agent_id(&core, &b, &default_agent_label());
+
+        // A target from another space is rejected (cross-space context + edge).
+        assert!(
+            drive_as(&core, &a, &agent_a, &post_b.action_id).is_err(),
+            "respond_stream_as must reject a target from another space"
+        );
+        // A participant from another space is rejected (not a member here).
+        assert!(
+            drive_as(&core, &a, &agent_b, &post_a.action_id).is_err(),
+            "respond_stream_as must reject a participant from another space"
+        );
+    });
+}
+
+#[test]
+fn post_reply_rejects_reply_to_from_another_space() {
+    run(|| {
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig::default());
+        let a = core.runtime().block_on(core.create_space(None)).unwrap().id;
+        let b = core.runtime().block_on(core.create_space(None)).unwrap().id;
+        let post_b = core
+            .runtime()
+            .block_on(core.post("in B".into(), Some(b.clone())))
+            .expect("post in B");
+
+        assert!(
+            core.runtime()
+                .block_on(core.post_reply("reply".into(), Some(a.clone()), Some(post_b.action_id),))
+                .is_err(),
+            "post_reply must reject a reply_to from another space"
+        );
+        // The rejected reply left no trace in space A (validated before any write).
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(a))
+            .expect("tree");
+        assert!(
+            tree.is_empty(),
+            "a rejected cross-space reply must not persist"
+        );
     });
 }
 

@@ -2012,6 +2012,31 @@ impl Inner {
         Ok(row)
     }
 
+    /// Verify `action_id` exists **and belongs to `space_id`**, returning its
+    /// item id. This is the app-layer guard against splicing one space's thread
+    /// into another: nothing in the schema constrains an `action_antecedent`
+    /// edge (or a turn's `target_action_id`) to a single space — the edge is
+    /// keyed on action ids only — so a caller supplying a mismatched
+    /// (space, action) pair could otherwise send space A's ancestry to space
+    /// B's agent and persist a cross-space reply edge. Typed
+    /// [`AppError::NotConfigured`] on a missing or foreign action.
+    async fn require_action_in_space(
+        &self,
+        conn: &turso::Connection,
+        action_id: &str,
+        space_id: &str,
+    ) -> Result<String, AppError> {
+        match db::action_item_and_space(conn, action_id).await? {
+            Some((item_id, sp)) if sp == space_id => Ok(item_id),
+            Some((_, sp)) => Err(AppError::NotConfigured {
+                message: format!("action {action_id} belongs to space {sp}, not {space_id}"),
+            }),
+            None => Err(AppError::NotConfigured {
+                message: format!("action not found: {action_id}"),
+            }),
+        }
+    }
+
     // --- Participant CRUD (per-space) -----------------------------------
 
     async fn list_space_participants(
@@ -2419,6 +2444,17 @@ impl Inner {
         // DB open, joined into every space by the template instantiation).
         let user_participant_id = db::HUMAN_PARTICIPANT_ID.to_string();
 
+        // A `reply_to` branch antecedent must name an action in the SAME,
+        // existing space — replying into a brand-new space is meaningless, and a
+        // cross-space reply edge is not something the schema prevents. Validate
+        // before any write so a bad `reply_to` leaves no trace.
+        if let Some(rt) = reply_to {
+            let sid = space_id.ok_or_else(|| AppError::NotConfigured {
+                message: "reply_to requires an existing space".into(),
+            })?;
+            self.require_action_in_space(&db_conn, rt, sid).await?;
+        }
+
         let (space_id, space_title, is_new_space) = if let Some(sid) = space_id {
             let row =
                 db::get_space(&db_conn, sid)
@@ -2604,12 +2640,16 @@ impl Inner {
     /// 3. Account exists and the available balance covers a fresh allocation →
     ///    allocate `min(available, max(DEFAULT_ALLOCATION_CREDITS, charge))`
     ///    (the pool) and retry.
-    /// 4. Balance can't cover another allocation but a credential is mid-spend
-    ///    (a concurrent turn holds the coverage) → wait bounded for its refund
-    ///    recovery to write a successor, then retry.
-    /// 5. Bounded wait elapses with the credential still in flight →
-    ///    [`AppError::ProvisioningTimeout`]; genuinely out of balance with
-    ///    nothing in flight → [`AppError::InsufficientBalance`].
+    /// 4. Balance can't cover another allocation but a mid-spend credential
+    ///    whose own `credits` cover the charge exists (a concurrent turn holds
+    ///    usable coverage) → wait bounded for its refund recovery to write a
+    ///    successor, then retry. A mid-spend credential *smaller* than the
+    ///    charge is ignored — its refund can never yield a covering successor
+    ///    (a successor is worth at most the original face value) and refunds
+    ///    don't top up balance, so waiting on it is futile.
+    /// 5. Bounded wait elapses with a covering credential still in flight →
+    ///    [`AppError::ProvisioningTimeout`]; no covering credential in flight
+    ///    (true shortfall) → [`AppError::InsufficientBalance`] *immediately*.
     async fn ensure_spendable_credential(
         &self,
         cfg: &Config,
@@ -2634,15 +2674,26 @@ impl Inner {
                 continue;
             }
 
-            // Balance can't cover a fresh allocation. If a credential is
-            // mid-spend, a concurrent turn holds the coverage; wait bounded for
-            // its refund recovery to write a successor credential we can use.
-            let in_flight = db::list_spending_credentials(db_conn).await?;
-            if !in_flight.is_empty() && tokio::time::Instant::now() < deadline {
+            // Balance can't cover a fresh allocation. Waiting only helps if a
+            // concurrent turn holds coverage this turn could actually use once
+            // its refund lands. A refund recovers a *wallet successor* worth at
+            // most the original credential's face value (a full refund on a
+            // failed turn) — it never tops up the account balance, and a spend
+            // consumes one credential (no combining balance + a credential, or
+            // two credentials, to fund one turn). So an in-flight credential can
+            // only become spendable for THIS turn if its own `credits` already
+            // cover the charge; a smaller one — even fully refunded — never
+            // will, and no allocation is possible either. Wait only when such a
+            // credential exists; otherwise this is a true shortfall.
+            let recoverable = db::list_spending_credentials(db_conn)
+                .await?
+                .into_iter()
+                .any(|c| c.credits >= charge_credits);
+            if recoverable && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
                 continue;
             }
-            if !in_flight.is_empty() {
+            if recoverable {
                 return Err(AppError::ProvisioningTimeout {
                     message: format!(
                         "timed out waiting for an in-flight credential refund to free \
@@ -2894,6 +2945,14 @@ impl Inner {
             .ok_or_else(|| AppError::NotConfigured {
                 message: format!("space not found: {space_id}"),
             })?;
+        // The target (the post being replied to / the generation being revised)
+        // must belong to this space — otherwise a caller could splice another
+        // space's thread into this turn (cross-space context + reply edge). This
+        // covers both modes and every entry point (`respond_stream_as` /
+        // `respond_stream`, and the same-space `chat` / `regenerate`). Wrapped
+        // by the caller's `into_chat_failed` like the space-existence check.
+        self.require_action_in_space(&db_conn, target_action_id, space_id)
+            .await?;
         // Record the inference against the responding agent participant, and
         // capture its effective system prompt. An explicit participant supplies
         // all three directly; a bare model resolves (or mints) the space's
@@ -3682,6 +3741,14 @@ impl Inner {
         post_action_id: &str,
     ) -> Result<NotificationPlan, AppError> {
         let conn = self.db_conn().await?;
+
+        // The post must belong to this space: the notify set + cascade limit come
+        // from `space_id`, but depth + authorship come from `post_action_id`, so
+        // a mismatched pair would plan this space's participants against another
+        // space's post (and driving one would send that post's ancestry to this
+        // space's agent, persisting a cross-space reply edge). Reject up front.
+        self.require_action_in_space(&conn, post_action_id, space_id)
+            .await?;
 
         let limit = db::space_cascade_limit(&conn, space_id).await?.unwrap_or(4);
         let depth = db::agent_cascade_depth(&conn, post_action_id).await?;
