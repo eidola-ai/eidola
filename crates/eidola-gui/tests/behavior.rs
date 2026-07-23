@@ -3473,3 +3473,125 @@ fn onboarding_create_on_stub_is_safe_noop(cx: &mut TestAppContext) {
         assert!(v.created_for_test().is_none());
     });
 }
+
+// ---------------------------------------------------------------------------
+// Read-only post selection — REGRESSION (content-dependent selection failure).
+// ---------------------------------------------------------------------------
+
+/// REGRESSION: pointer selection on a post whose markdown is *non-canonical*
+/// for the editor (a table's `\n`-separated pipe rows, a heading tightly
+/// followed by its paragraph, a paragraph directly followed by a blockquote —
+/// shapes model output routinely produces) used to be impossible. The click's
+/// `SetSelection` ran the editable pipeline's `enforce_invariants`, rewriting
+/// the read-only buffer away from the post's persisted content; the next
+/// frame's `sync_bodies` saw the divergence and re-seeded the editor
+/// (`set_value` → selection reset to `Cursor(0)`), so every drag step was
+/// wiped a frame later — while the autoscroll path, which re-extends *after*
+/// the reset within the same render, appeared to work. Two fixes hold the
+/// line: the editor's read-only dispatch never rewrites the buffer
+/// (`update::update_readonly`), and `sync_bodies` re-seeds only when the
+/// *post's* content changes (`body_seeds`), never because the live buffer
+/// differs. The fixture mirrors the reported space's shape: a branched root
+/// whose spine reply carries the heavy markdown (the strip is incidental —
+/// the failure was content-dependent — but keeping it exercises selection
+/// inside a branch scroller too).
+#[gpui::test]
+fn space_readonly_selection_sticks_on_noncanonical_post(cx: &mut TestAppContext) {
+    let noncanonical = "### heading\nbody text directly under the heading\n\n\
+        **Note:**\n> a quoted line right after a paragraph\n\n\
+        | left | right |\n| --- | --- |\n| cell one | cell two |";
+
+    let post =
+        |action_id: &str, parent: Option<&str>, depth: usize, is_branch: bool, text: &str| {
+            let mut n = fixture_user_post(action_id, text);
+            n.parent_action_id = parent.map(String::from);
+            n.relation = parent.map(|_| "reply".to_string());
+            n.depth = depth;
+            n.is_branch = is_branch;
+            n
+        };
+    let nodes = vec![
+        post(
+            "s1",
+            None,
+            0,
+            false,
+            "a short root question\n\nwith a second paragraph of ordinary prose",
+        ),
+        post("s2", Some("s1"), 0, false, noncanonical),
+        post("s3", Some("s1"), 1, true, "a branch aside"),
+        post("s4", Some("s3"), 1, false, "a branch reply"),
+    ];
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("sel".into()));
+    view.update(cx, |v, cx| {
+        v.space()
+            .update(cx, |s, cx| s.set_post_tree_for_test(nodes, cx));
+    });
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(680.)));
+    vcx.run_until_parked();
+
+    // Aim the drag from the painted geometry of s2's first block, so the test
+    // doesn't hardcode layout metrics — and assert the target is actually
+    // within the viewport (a fully-in-view drag, the reported case).
+    let (x, y, h) = view
+        .read_with(&vcx, |v, cx| {
+            v.post_body_editor_for_test("s2").and_then(|e| {
+                e.read(cx)
+                    .debug_line_geometry()
+                    .first()
+                    .and_then(|(_, lines)| lines.first().copied())
+            })
+        })
+        .expect("s2's first painted line");
+    assert!(
+        y > 0.0 && y + 30.0 < 680.0,
+        "fixture drift: s2's first line must be in view (y = {y})"
+    );
+    let mid = y + h.min(24.0) / 2.0;
+    let start = gpui::point(px(x + 30.0), px(mid));
+    let end = gpui::point(px(x + 180.0), px(mid + 25.0));
+
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: start,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(gpui::MouseMoveEvent {
+        position: end,
+        pressed_button: Some(gpui::MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: end,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    // Let further frames run: the old bug wiped the selection on the *next*
+    // render (the sync_bodies re-seed), so surviving parked frames is the
+    // regression's teeth.
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        let editor = v.post_body_editor_for_test("s2").expect("s2's editor");
+        let e = editor.read(cx);
+        assert_eq!(
+            e.value(),
+            noncanonical,
+            "the read-only buffer must stay byte-identical to the post"
+        );
+        let sel = e.selection();
+        assert!(
+            sel.upper_bound() > sel.lower_bound(),
+            "the in-view drag must leave a selection that survives subsequent \
+             frames, got {sel:?}"
+        );
+    });
+}

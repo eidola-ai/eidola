@@ -106,6 +106,13 @@ pub(crate) const MINIMAP_FADE: std::time::Duration = std::time::Duration::from_m
 /// past this margin renders as a sized placeholder.
 pub(crate) const VIRT_MARGIN: f32 = 600.0;
 
+/// Vertical band (px) at the top and bottom of the viewport within which an
+/// active readonly-post selection drag autoscrolls the page.
+pub(crate) const SELECTION_AUTOSCROLL_MARGIN: f32 = 56.0;
+/// Peak autoscroll speed (px per frame) at the very edge of the viewport,
+/// ramping down to zero at the inner edge of [`SELECTION_AUTOSCROLL_MARGIN`].
+pub(crate) const SELECTION_AUTOSCROLL_MAX_SPEED: f32 = 32.0;
+
 /// `MarkdownStyle` for prose bodies and the composer: Newsreader at a book
 /// size/leading with a size-led heading ramp (h1 2.5× … h4 1.125×) at a
 /// uniform Medium (500) weight — size carries the hierarchy — and Courier-New
@@ -214,6 +221,17 @@ pub struct SpaceView {
     /// One read-only markdown-editor state per persisted post, keyed by node id.
     /// Posts render `disabled` so they're pixel-identical to the composer.
     pub(crate) bodies: HashMap<SharedString, Entity<MarkdownEditorState>>,
+    /// The post content each body editor was last seeded with, keyed like
+    /// [`Self::bodies`]. `sync_bodies` re-seeds an editor only when the
+    /// *post's* content changes (edit/regenerate replacing it in place) —
+    /// never because the editor's live buffer differs from the post. Comparing
+    /// against the buffer instead (the previous behavior) turned any
+    /// buffer-vs-source divergence into a per-frame `set_value` reset loop
+    /// that made selection impossible on the affected post. The editor no
+    /// longer rewrites read-only buffers at all (`update_readonly`), so this
+    /// is defense in depth: if a divergence ever reappears, it must not
+    /// escalate into a frame loop.
+    pub(crate) body_seeds: HashMap<SharedString, SharedString>,
     /// A read-only editor synced to the live streaming partial each frame.
     pub(crate) streaming_body: Entity<MarkdownEditorState>,
     /// Last value pushed into `streaming_body`, to skip redundant re-parses.
@@ -413,6 +431,7 @@ impl SpaceView {
             _subs,
             posts: Vec::new(),
             bodies: HashMap::new(),
+            body_seeds: HashMap::new(),
             streaming_body,
             streaming_synced: String::new(),
             drafts: Vec::new(),
@@ -824,14 +843,17 @@ impl SpaceView {
             let content = self.posts[i].content.clone();
             match self.bodies.get(&id) {
                 Some(editor) => {
-                    // Keep an existing editor in sync if its content changed
-                    // (an edit/regenerate replaced the post in place) — but
-                    // never clobber the editor holding an in-progress inline
-                    // edit: its divergence from the persisted content *is* the
-                    // edit.
+                    // Re-seed an existing editor only when the *post's*
+                    // content changed (an edit/regenerate replaced it in
+                    // place) — compared against what we last seeded, never
+                    // against the editor's live buffer (see `body_seeds`) —
+                    // and never clobber the editor holding an in-progress
+                    // inline edit: its divergence from the persisted content
+                    // *is* the edit.
                     let is_editing = self.editing.as_ref().map(|e| &e.node_id) == Some(&id);
-                    if !is_editing && editor.read(cx).value() != content.as_ref() {
+                    if !is_editing && self.body_seeds.get(&id) != Some(&content) {
                         editor.update(cx, |e, cx| e.set_value(content.to_string(), cx));
+                        self.body_seeds.insert(id.clone(), content);
                     }
                 }
                 None => {
@@ -841,10 +863,12 @@ impl SpaceView {
                         s
                     });
                     self.bodies.insert(id.clone(), editor);
+                    self.body_seeds.insert(id.clone(), content);
                 }
             }
         }
         self.bodies.retain(|id, _| live.contains(id));
+        self.body_seeds.retain(|id, _| live.contains(id));
         // An edit session whose post vanished (transcript reshaped under it)
         // has nothing to commit into — drop it with the editor.
         if let Some(ed) = &self.editing
@@ -902,6 +926,30 @@ impl SpaceView {
             }
         }
         roots
+    }
+}
+
+/// The per-frame page-scroll delta (px) for a selection drag whose pointer is
+/// at window-y `my` in a viewport `h` tall. Zero in the neutral middle; near
+/// the top margin returns a positive delta (scroll the page toward its start —
+/// a less-negative offset); near the bottom a negative one (toward the end).
+/// The magnitude ramps linearly from zero at a margin's inner edge to
+/// `max_speed` at the viewport edge (and holds `max_speed` past the edge, where
+/// a drag pushed off-window sits). Pure so the direction/ramp/clamp is tested
+/// without a window.
+pub(crate) fn selection_autoscroll_delta(my: f32, h: f32, margin: f32, max_speed: f32) -> f32 {
+    if margin <= 0.0 || h <= 0.0 {
+        return 0.0;
+    }
+    if my < margin {
+        // Depth into the top band; past the top edge (`my < 0`) holds full speed.
+        let depth = ((margin - my) / margin).clamp(0.0, 1.0);
+        depth * max_speed
+    } else if my > h - margin {
+        let depth = ((my - (h - margin)) / margin).clamp(0.0, 1.0);
+        -depth * max_speed
+    } else {
+        0.0
     }
 }
 
@@ -1060,6 +1108,13 @@ impl Render for SpaceView {
         self.scroll_min_y
             .set((window_h.as_f32() - total_doc).min(0.0));
 
+        // While a readonly post is being drag-selected, autoscroll the page when
+        // the pointer sits against a viewport edge — so a selection can pull
+        // off-screen content into view (the post editors have no internal
+        // scroll; this page scroll is theirs). Runs after `scroll_min_y` is set
+        // so the scroll stays clamped to the real range.
+        self.autoscroll_selection(window_h, window, cx);
+
         // Schedule a single catch-up frame when the minimap's layout inputs
         // change, so it converges once the layout settles.
         let sig = self.minimap_signature(page_width, window_h);
@@ -1148,6 +1203,69 @@ impl Render for SpaceView {
 }
 
 impl SpaceView {
+    /// The readonly post editor (or the streaming reply) currently mid
+    /// drag-selection, if any. Drafts (the editable composer) are excluded —
+    /// they float in their own scroll and route caret-into-view separately, so
+    /// page autoscroll is only for the in-page readonly posts.
+    fn selecting_editor(&self, cx: &gpui::App) -> Option<Entity<MarkdownEditorState>> {
+        if self.streaming_body.read(cx).is_selecting() {
+            return Some(self.streaming_body.clone());
+        }
+        self.bodies
+            .values()
+            .find(|e| e.read(cx).is_selecting())
+            .cloned()
+    }
+
+    /// While a readonly post is being drag-selected, scroll the page toward
+    /// whichever viewport edge the pointer is pressed against, then re-extend
+    /// the drag from the (stationary) pointer against the freshly-scrolled
+    /// geometry — so a selection started on-screen can pull off-screen rows into
+    /// itself the way a native scroll-view text selection does. A no-op unless a
+    /// post drag is live and the pointer is within
+    /// [`SELECTION_AUTOSCROLL_MARGIN`] of an edge; self-terminating when the drag
+    /// ends (the editor clears `is_selecting` on mouse-up).
+    fn autoscroll_selection(
+        &mut self,
+        window_h: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.selecting_editor(cx) else {
+            return;
+        };
+        let mouse = window.mouse_position();
+        let dy = selection_autoscroll_delta(
+            mouse.y.as_f32(),
+            window_h.as_f32(),
+            SELECTION_AUTOSCROLL_MARGIN,
+            SELECTION_AUTOSCROLL_MAX_SPEED,
+        );
+        if dy == 0.0 {
+            return;
+        }
+
+        let off = self.page_scroll.offset();
+        let new_y = (off.y.as_f32() + dy).clamp(self.scroll_min_y.get(), 0.0);
+        let scrolled = (new_y - off.y.as_f32()).abs() > 0.01;
+        if scrolled {
+            self.page_scroll.set_offset(gpui::point(off.x, px(new_y)));
+        }
+        // Re-extend the selection to the row now under the (unmoved) pointer.
+        editor.update(cx, |e, cx| e.drag_extend_to(mouse, cx));
+        // Keep the autoscroll loop alive as long as the drag holds at the edge
+        // *and* there is still room to scroll (there are no pointer-move events
+        // while it sits still). Stopping once the page is clamped at an end
+        // bounds the loop — so a headless `run_until_parked` can't spin — and is
+        // correct: at an end there is no more off-screen content to reveal.
+        if scrolled {
+            let entity = cx.entity();
+            window.on_next_frame(move |_, cx| {
+                entity.update(cx, |_, cx| cx.notify());
+            });
+        }
+    }
+
     /// Render the top of the forest: a single root is rendered directly; a
     /// multi-root forest gets the implicit top-level branch scroller.
     fn render_forest(
@@ -1451,4 +1569,52 @@ pub(crate) fn record_bounds(
     )
     .absolute()
     .size_full()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selection_autoscroll_delta;
+
+    #[test]
+    fn autoscroll_is_neutral_in_the_middle() {
+        // Pointer well inside the viewport — no autoscroll.
+        assert_eq!(selection_autoscroll_delta(340.0, 680.0, 56.0, 32.0), 0.0);
+        assert_eq!(selection_autoscroll_delta(56.0, 680.0, 56.0, 32.0), 0.0);
+        assert_eq!(
+            selection_autoscroll_delta(680.0 - 56.0, 680.0, 56.0, 32.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn autoscroll_scrolls_toward_the_pressed_edge() {
+        // Near the top → positive delta (scroll toward the document start).
+        assert!(selection_autoscroll_delta(20.0, 680.0, 56.0, 32.0) > 0.0);
+        // Near the bottom → negative delta (scroll toward the end).
+        assert!(selection_autoscroll_delta(660.0, 680.0, 56.0, 32.0) < 0.0);
+    }
+
+    #[test]
+    fn autoscroll_ramps_and_caps_at_the_edge() {
+        let margin = 56.0;
+        let h = 680.0;
+        let max = 32.0;
+        // At the very top edge the up-speed is the full max…
+        assert!((selection_autoscroll_delta(0.0, h, margin, max) - max).abs() < 1e-4);
+        // …and past the edge (pointer dragged above the window) it holds max.
+        assert!((selection_autoscroll_delta(-500.0, h, margin, max) - max).abs() < 1e-4);
+        // Bottom edge: full negative speed, holding past the edge.
+        assert!((selection_autoscroll_delta(h, h, margin, max) + max).abs() < 1e-4);
+        assert!((selection_autoscroll_delta(h + 500.0, h, margin, max) + max).abs() < 1e-4);
+        // Halfway into the top band → about half speed.
+        let half = selection_autoscroll_delta(margin / 2.0, h, margin, max);
+        assert!((half - max / 2.0).abs() < 1e-3, "half-depth ramp: {half}");
+    }
+
+    #[test]
+    fn autoscroll_degrades_safely() {
+        // A zero/negative margin or viewport never scrolls (guards div-by-zero).
+        assert_eq!(selection_autoscroll_delta(10.0, 680.0, 0.0, 32.0), 0.0);
+        assert_eq!(selection_autoscroll_delta(10.0, 0.0, 56.0, 32.0), 0.0);
+    }
 }

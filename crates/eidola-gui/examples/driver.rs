@@ -25,6 +25,9 @@
 //! {"cmd":"windows"}
 //! {"cmd":"elements","window":1}                          // named probe targets
 //! {"cmd":"click","window":1,"target":"chat/model-label"} // or "x"/"y"; alt/command/shift bools
+//! {"cmd":"drag","window":1,"from_x":300,"from_y":320,"to_x":560,"to_y":660} // press-move-release
+//!   //   optional "click_count":2|3 (double/triple-click selection); "hold":true pumps frames at
+//!   //   `to` so host autoscroll-while-selecting runs before release
 //! {"cmd":"type","window":1,"text":"Hello there"}
 //! {"cmd":"keys","window":1,"keys":"cmd-enter"}           // space-separated keystrokes
 //! {"cmd":"modifiers","window":1,"alt":true}              // hold/release modifiers
@@ -84,8 +87,9 @@ mod driver {
     use eidola_gui::updates::UpdatesView;
     use eidola_gui::window_input::WindowInput;
     use gpui::{
-        AnyWindowHandle, App, AppContext, Capslock, Modifiers, ModifiersChangedEvent, Pixels,
-        ScrollDelta, ScrollWheelEvent, Size, TouchPhase, VisualTestAppContext, point, px, size,
+        AnyWindowHandle, App, AppContext, Capslock, Modifiers, ModifiersChangedEvent, MouseButton,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent, Size,
+        TouchPhase, VisualTestAppContext, point, px, size,
     };
     use gpui_component::{Root, ThemeMode};
     use gpui_component_assets::Assets;
@@ -95,6 +99,10 @@ mod driver {
     // ---------------------------------------------------------------------------
     // Protocol
     // ---------------------------------------------------------------------------
+
+    fn one() -> usize {
+        1
+    }
 
     #[derive(Deserialize)]
     #[serde(tag = "cmd", rename_all = "snake_case", deny_unknown_fields)]
@@ -120,6 +128,19 @@ mod driver {
             command: bool,
             #[serde(default)]
             shift: bool,
+        },
+        Drag {
+            window: u64,
+            from_x: f32,
+            from_y: f32,
+            to_x: f32,
+            to_y: f32,
+            #[serde(default = "one")]
+            click_count: usize,
+            /// Hold the button at `to` (running any host autoscroll loop to a
+            /// settled state) before releasing.
+            #[serde(default)]
+            hold: bool,
         },
         Type {
             window: u64,
@@ -226,6 +247,46 @@ mod driver {
                     });
                     let space = view.read(cx).space().clone();
                     space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_long_post",
+                description: "Space view: a conversation whose assistant reply is far taller than the window (selection repro)",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.set_messages_for_test(long_conversation(), cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_structured",
+                description: "Space view: a branched space whose spine reply is markdown-heavy (tables, nested lists, quote, rules) — structural repro of a user-reported selection failure",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.set_post_tree_for_test(structured_posts(), cx));
                     root(view, window, cx)
                 },
             },
@@ -550,6 +611,301 @@ mod driver {
         ]
     }
 
+    fn long_conversation() -> Vec<SpaceMessage> {
+        // One short question and one enormous multi-paragraph answer, far taller
+        // than any test window — the readonly-selection repro fixture.
+        let mut body = String::new();
+        body.push_str("# Rayleigh scattering, in depth\n\n");
+        for i in 1..=20 {
+            body.push_str(&format!(
+                "Paragraph {i}. Sunlight is a fairly even mix across the visible spectrum, \
+                 and as it crosses the atmosphere it meets molecules far smaller than its \
+                 wavelength; those scatter short blue wavelengths far more strongly than \
+                 long red ones, which is the whole story of why the daytime sky is blue.\n\n"
+            ));
+            if i == 5 {
+                body.push_str(
+                    "```python\ndef rayleigh(wavelength):\n    # intensity scales as 1/lambda^4\n    return 1.0 / wavelength ** 4\n```\n\n",
+                );
+            }
+            if i == 10 {
+                body.push_str("- short wavelengths scatter more\n- long wavelengths pass through\n- the eye integrates the result\n\n");
+            }
+        }
+        let body = body.trim_end().to_string();
+        // The long reply sits *mid-conversation* (not the leaf), so it renders
+        // nested inside single-child `render_strip` horizontal scrollers — the
+        // real structure a multi-turn conversation produces.
+        vec![
+            SpaceMessage {
+                role: "user".into(),
+                content: "Explain the sky at length.".into(),
+            },
+            SpaceMessage {
+                role: "assistant".into(),
+                content: body,
+            },
+            SpaceMessage {
+                role: "user".into(),
+                content: "Thanks — and what about at sunset?".into(),
+            },
+            SpaceMessage {
+                role: "assistant".into(),
+                content: "Near sunset the light skims a long, slanted path through the air, \
+                          the blue is scattered away entirely, and what survives to reach you \
+                          is the warm red-orange of a low sun."
+                    .into(),
+            },
+        ]
+    }
+
+    /// Placeholder prose of roughly `n` bytes (word-salad, never real user
+    /// text) — used by [`structured_posts`] to mirror a real post's *markdown
+    /// structure* without its content.
+    fn lorem(n: usize) -> String {
+        const WORDS: &[&str] = &[
+            "lorem",
+            "ipsum",
+            "dolor",
+            "sit",
+            "amet",
+            "consetetur",
+            "sadipscing",
+            "elitr",
+            "sed",
+            "diam",
+            "nonumy",
+            "eirmod",
+            "tempor",
+            "invidunt",
+            "ut",
+            "labore",
+            "et",
+            "dolore",
+            "magna",
+            "aliquyam",
+            "erat",
+        ];
+        let mut out = String::new();
+        let mut i = 0;
+        while out.len() < n {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(WORDS[i % WORDS.len()]);
+            i += 1;
+        }
+        out.truncate(n);
+
+        out.trim_end().to_string()
+    }
+
+    /// A `PostNode` tree mirroring the *structure* of a real user-reported
+    /// space where in-view selection failed on certain posts: a branched root
+    /// (two replies — spine + branch) whose spine reply is markdown-heavy
+    /// (headings, rules, nested lists, a long blockquote, bold + inline code,
+    /// and a trailing table). All text is placeholder.
+    fn structured_posts() -> Vec<eidola_app_core::PostNode> {
+        let post = |action_id: &str,
+                    kind: &str,
+                    label: &str,
+                    atype: &str,
+                    depth: usize,
+                    is_branch: bool,
+                    parent: Option<&str>,
+                    content: String,
+                    at: i64|
+         -> eidola_app_core::PostNode {
+            let mut n = fixtures::fixture_post(
+                action_id, kind, label, atype, &content, depth, is_branch, 1,
+            );
+            n.parent_action_id = parent.map(String::from);
+            n.relation = parent.map(|_| "reply".to_string());
+            n.created_at = at;
+            n
+        };
+
+        // The markdown-heavy spine reply (line-structure mirror of the real
+        // failing post: paragraphs, ---, ##/###, tight heading→para, bulleted
+        // lists with bold lead-ins + inline code, a para immediately followed
+        // by a long quote, nested ordered list, and a 3-column table).
+        let mut big = String::new();
+        big.push_str(&format!("{}\n\n", lorem(319)));
+        big.push_str(&format!(
+            "{} **{}** {}\n\n",
+            lorem(120),
+            lorem(20),
+            lorem(158)
+        ));
+        big.push_str(&format!(
+            "{}\n\n---\n\n## {}\n\n{}\n\n",
+            lorem(229),
+            lorem(52),
+            lorem(123)
+        ));
+        big.push_str(&format!("### {}\n{}\n\n", lorem(48), lorem(150)));
+        for len in [140usize, 160, 220, 90] {
+            big.push_str(&format!(
+                "- **{}:** {} `{}` {}\n",
+                lorem(14),
+                lorem(len / 2),
+                lorem(8),
+                lorem(len / 2)
+            ));
+        }
+        big.push('\n');
+        big.push_str(&format!(
+            "**{}:**\n> {} `{}` {} `{}` {}\n\n",
+            lorem(8),
+            lorem(160),
+            lorem(10),
+            lorem(140),
+            lorem(9),
+            lorem(100)
+        ));
+        big.push_str(&format!("### {}\n{}\n\n", lorem(56), lorem(115)));
+        big.push_str(&format!("- **{}:** {}\n", lorem(10), lorem(60)));
+        for len in [55usize, 90, 85] {
+            big.push_str(&format!("    1. **{}:** {}\n", lorem(8), lorem(len)));
+        }
+        big.push_str(&format!("- **{}:** {}\n", lorem(10), lorem(155)));
+        big.push_str(&format!(
+            "    - {}\n    - **{}:** {}\n\n",
+            lorem(170),
+            lorem(9),
+            lorem(95)
+        ));
+        big.push_str(&format!(
+            "### {}\n{} **{}** {} **{}** {}\n\n---\n\n",
+            lorem(20),
+            lorem(90),
+            lorem(15),
+            lorem(90),
+            lorem(14),
+            lorem(80)
+        ));
+        big.push_str(&format!("## {}\n\n{}\n\n", lorem(48), lorem(115)));
+        for (h, p, l1, l2) in [
+            (64usize, 131usize, 270usize, 225usize),
+            (67, 128, 230, 265),
+            (41, 154, 325, 0),
+        ] {
+            big.push_str(&format!("### {}\n{}\n\n", lorem(h), lorem(p)));
+            big.push_str(&format!(
+                "- **{}:** {} `{}` {}\n",
+                lorem(12),
+                lorem(l1 / 2),
+                lorem(6),
+                lorem(l1 / 2)
+            ));
+            if l2 > 0 {
+                big.push_str(&format!("- **{}:** {}\n", lorem(12), lorem(l2)));
+            }
+            big.push('\n');
+        }
+        big.push_str(&format!("## {}\n\n", lorem(12)));
+        big.push_str(&format!(
+            "| {} | {} | {} |\n| --- | --- | --- |\n",
+            lorem(8),
+            lorem(12),
+            lorem(14)
+        ));
+        for _ in 0..5 {
+            big.push_str(&format!(
+                "| **{}** | {} | {} |\n",
+                lorem(12),
+                lorem(48),
+                lorem(52)
+            ));
+        }
+        let big = big.trim_end().to_string();
+
+        vec![
+            // Root: a three-line, two-paragraph user question.
+            post(
+                "s1",
+                "human",
+                "You",
+                "user_input",
+                0,
+                false,
+                None,
+                format!("{}\n\n{}", lorem(212), lorem(205)),
+                1,
+            ),
+            // Spine: the markdown-heavy reply, then a short follow-up exchange.
+            post(
+                "s2",
+                "agent",
+                "gemma",
+                "inference",
+                0,
+                false,
+                Some("s1"),
+                big,
+                2,
+            ),
+            post(
+                "s3",
+                "human",
+                "You",
+                "user_input",
+                0,
+                false,
+                Some("s2"),
+                lorem(61),
+                3,
+            ),
+            post(
+                "s4",
+                "agent",
+                "gemma",
+                "inference",
+                0,
+                false,
+                Some("s3"),
+                format!(
+                    "{}\n\n1. **{}:** {}\n2. **{}:** {}\n3. **{}:** {}\n4. **{}:** {}\n5. **{}:** {}",
+                    lorem(48),
+                    lorem(10),
+                    lorem(165),
+                    lorem(10),
+                    lorem(200),
+                    lorem(10),
+                    lorem(195),
+                    lorem(10),
+                    lorem(195),
+                    lorem(10),
+                    lorem(215),
+                ),
+                4,
+            ),
+            // Branch off the root: a tiny aside exchange.
+            post(
+                "s5",
+                "human",
+                "You",
+                "user_input",
+                1,
+                true,
+                Some("s1"),
+                lorem(18),
+                5,
+            ),
+            post(
+                "s6",
+                "agent",
+                "gemma",
+                "inference",
+                1,
+                false,
+                Some("s5"),
+                lorem(77),
+                6,
+            ),
+        ]
+    }
+
     fn library_spaces() -> Vec<SpaceInfo> {
         fn space(id: &str, title: Option<&str>, snippet: Option<&str>, days_ago: i64) -> SpaceInfo {
             let ts = eidola_app_core::now_ms() - days_ago * 24 * 60 * 60 * 1000;
@@ -804,6 +1160,77 @@ mod driver {
                     };
                     cx.simulate_click(handle, pos, modifiers);
                     Ok(json!({"clicked": {"x": pos.x.as_f32(), "y": pos.y.as_f32()}}))
+                }
+
+                Cmd::Drag {
+                    window,
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                    click_count,
+                    hold,
+                } => {
+                    let handle = self.window(window)?;
+                    let from = point(px(from_x), px(from_y));
+                    let to = point(px(to_x), px(to_y));
+                    cx.simulate_event(
+                        handle,
+                        MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: from,
+                            modifiers: Modifiers::default(),
+                            click_count,
+                            first_mouse: false,
+                        },
+                    );
+                    // A few interpolated moves so the drag crosses intervening
+                    // rows the way a real pointer would.
+                    for step in 1..=4 {
+                        let t = step as f32 / 4.0;
+                        let pos = point(
+                            px(from_x + (to_x - from_x) * t),
+                            px(from_y + (to_y - from_y) * t),
+                        );
+                        cx.simulate_event(
+                            handle,
+                            MouseMoveEvent {
+                                position: pos,
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers: Modifiers::default(),
+                            },
+                        );
+                    }
+                    if hold {
+                        // Hold the button at `to` and pump frames so any host
+                        // autoscroll-while-selecting loop advances. Re-issuing
+                        // the (unchanged) move each iteration forces a render —
+                        // the harness doesn't drive the continuous frame loop a
+                        // real window would — and keeps the pointer in the edge
+                        // margin so autoscroll keeps stepping until it clamps.
+                        for _ in 0..120 {
+                            cx.simulate_event(
+                                handle,
+                                MouseMoveEvent {
+                                    position: to,
+                                    pressed_button: Some(MouseButton::Left),
+                                    modifiers: Modifiers::default(),
+                                },
+                            );
+                            cx.run_until_parked();
+                        }
+                    }
+                    cx.simulate_event(
+                        handle,
+                        MouseUpEvent {
+                            button: MouseButton::Left,
+                            position: to,
+                            modifiers: Modifiers::default(),
+                            click_count,
+                        },
+                    );
+                    cx.run_until_parked();
+                    Ok(json!({"dragged": {"from": [from_x, from_y], "to": [to_x, to_y]}}))
                 }
 
                 Cmd::Type { window, text } => {

@@ -73,7 +73,51 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
     };
     let prev_head = state.selection.head();
 
-    let next = match event {
+    let next = apply_event(state, event);
+    let next = enforce_invariants(next);
+    avoid_forbidden_positions(next, prev_anchor, prev_head)
+}
+
+/// Like [`update`], but for a **read-only** (disabled) editor: selection and
+/// navigation events apply, and the buffer is never rewritten. A read-only
+/// editor renders the persisted document verbatim, so the canonicalization
+/// passes ([`enforce_invariants`] — soft-break promotion, list/blockquote
+/// normalization) must not run: they belong to *editing*, and rewriting a
+/// document the host owns on a mere click makes the buffer diverge from the
+/// host's source of truth. (In the space view that divergence made
+/// `sync_bodies` re-seed the editor every frame, resetting the selection to a
+/// collapsed cursor — pointer selection on any non-canonical post was
+/// impossible, while the autoscroll path re-extended after each reset and so
+/// appeared to work. See `space_view`.)
+///
+/// If a document-mutating event reaches a read-only editor anyway, it is
+/// refused wholesale (the state is returned unchanged) rather than half
+/// applied.
+pub fn update_readonly(state: EditorState, event: EditorEvent) -> EditorState {
+    let prev_anchor = match state.selection {
+        Selection::Cursor(p) => p,
+        Selection::Range { anchor, .. } => anchor,
+    };
+    let prev_head = state.selection.head();
+    let before_markdown = state.markdown.clone();
+
+    let before_selection = state.selection;
+    let next = apply_event(state, event);
+    if next.markdown != before_markdown {
+        // A mutating event on a read-only editor: refuse it wholesale.
+        return EditorState {
+            markdown: before_markdown,
+            selection: before_selection,
+        };
+    }
+    avoid_forbidden_positions(next, prev_anchor, prev_head)
+}
+
+/// Apply one [`EditorEvent`] to the state — the shared event match, with no
+/// invariant enforcement. Callers layer the appropriate post-passes:
+/// [`update`] canonicalizes the buffer, [`update_readonly`] preserves it.
+fn apply_event(state: EditorState, event: EditorEvent) -> EditorState {
+    match event {
         EditorEvent::InsertText(text) => insert_text(state, &text),
         EditorEvent::Paste { text, internal } => paste(state, &text, internal),
         EditorEvent::PastePlain { text } => plain_paste(state, &text),
@@ -114,9 +158,7 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
         EditorEvent::DeleteWordForward => delete_word_forward(state),
         EditorEvent::DeleteToLineStart => delete_to_line_start(state),
         EditorEvent::DeleteToLineEnd => delete_to_line_end(state),
-    };
-    let next = enforce_invariants(next);
-    avoid_forbidden_positions(next, prev_anchor, prev_head)
+    }
 }
 
 /// Promote any lone, mid-content `\n` into `\n\n` so the buffer never

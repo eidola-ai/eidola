@@ -9166,3 +9166,202 @@ fn set_value_clears_history(cx: &mut TestAppContext) {
         assert_eq!(e.value(), "new document");
     });
 }
+
+// ---------------------------------------------------------------------------
+// Pointer selection — double / triple click granularity and drag extension.
+// Exercised through the `begin_selection_for_test` / `extend_selection_for_test`
+// seams (offset-based, so they need no laid-out geometry); the position→offset
+// hit-test and the window-global drag routing are exercised by the eidola-gui
+// driver against real rendering.
+// ---------------------------------------------------------------------------
+
+fn begin_selection(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    editor: &Entity<MarkdownEditorState>,
+    offset: usize,
+    click_count: usize,
+    shift: bool,
+) {
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            e.begin_selection_for_test(offset, click_count, shift, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn extend_selection(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    editor: &Entity<MarkdownEditorState>,
+    offset: usize,
+) {
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| e.extend_selection_for_test(offset, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn single_click_places_a_collapsed_cursor(cx: &mut TestAppContext) {
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown("the quick brown fox"));
+    begin_selection(cx, handle, &editor, 6, 1, false);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.selection(), Selection::Cursor(6));
+        assert!(e.is_selecting(), "a press begins a drag");
+    });
+}
+
+#[gpui::test]
+fn double_click_selects_the_word(cx: &mut TestAppContext) {
+    let text = "scatter short (blue) wavelengths";
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(text));
+    let inside_blue = text.find("blue").unwrap() + 1;
+    begin_selection(cx, handle, &editor, inside_blue, 2, false);
+    editor.read_with(cx, |e, _| {
+        let sel = e.selection();
+        assert_eq!(&e.value()[sel.lower_bound()..sel.upper_bound()], "blue");
+    });
+}
+
+#[gpui::test]
+fn triple_click_selects_the_line(cx: &mut TestAppContext) {
+    let text = "first line\nsecond line here\nthird";
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(text));
+    let mid_second = text.find("second").unwrap() + 3;
+    begin_selection(cx, handle, &editor, mid_second, 3, false);
+    editor.read_with(cx, |e, _| {
+        let sel = e.selection();
+        assert_eq!(
+            &e.value()[sel.lower_bound()..sel.upper_bound()],
+            "second line here"
+        );
+    });
+}
+
+#[gpui::test]
+fn drag_after_double_click_extends_by_whole_words(cx: &mut TestAppContext) {
+    let text = "alpha beta gamma delta";
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(text));
+    // Double-click "beta", then drag into "gamma".
+    let in_beta = text.find("beta").unwrap() + 1;
+    let in_gamma = text.find("gamma").unwrap() + 2;
+    begin_selection(cx, handle, &editor, in_beta, 2, false);
+    extend_selection(cx, handle, &editor, in_gamma);
+    editor.read_with(cx, |e, _| {
+        let sel = e.selection();
+        // The selection snaps to whole-word bounds: all of "beta gamma",
+        // never a mid-word offset.
+        assert_eq!(
+            &e.value()[sel.lower_bound()..sel.upper_bound()],
+            "beta gamma"
+        );
+    });
+}
+
+#[gpui::test]
+fn drag_after_triple_click_extends_by_whole_lines(cx: &mut TestAppContext) {
+    // The editor promotes single `\n` soft breaks to `\n\n` paragraph breaks,
+    // so compute offsets and the expectation from the normalized buffer.
+    let (handle, editor) = open_editor(
+        cx,
+        EditorState::with_markdown("line one\nline two\nline three\nline four"),
+    );
+    let value = editor.read_with(cx, |e, _| e.value().to_string());
+    let in_two = value.find("line two").unwrap() + 2;
+    let in_three = value.find("line three").unwrap() + 2;
+    begin_selection(cx, handle, &editor, in_two, 3, false);
+    extend_selection(cx, handle, &editor, in_three);
+    editor.read_with(cx, |e, _| {
+        let sel = e.selection();
+        let selected = &e.value()[sel.lower_bound()..sel.upper_bound()];
+        // Whole lines from the start of "line two" through the end of "line
+        // three" — bounded to those two lines regardless of the buffer's
+        // (normalized) inter-line separators.
+        assert!(
+            selected.starts_with("line two"),
+            "starts at line two: {selected:?}"
+        );
+        assert!(
+            selected.ends_with("line three"),
+            "ends at line three: {selected:?}"
+        );
+        assert!(!selected.contains("line one"));
+        assert!(!selected.contains("line four"));
+    });
+}
+
+#[gpui::test]
+fn word_drag_back_before_the_anchor_flips_the_selected_end(cx: &mut TestAppContext) {
+    let text = "alpha beta gamma delta";
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(text));
+    // Double-click "gamma", then drag back into "alpha".
+    let in_gamma = text.find("gamma").unwrap() + 1;
+    let in_alpha = text.find("alpha").unwrap() + 1;
+    begin_selection(cx, handle, &editor, in_gamma, 2, false);
+    extend_selection(cx, handle, &editor, in_alpha);
+    editor.read_with(cx, |e, _| {
+        let sel = e.selection();
+        // Dragging back covers whole words from "alpha" through "gamma".
+        assert_eq!(
+            &e.value()[sel.lower_bound()..sel.upper_bound()],
+            "alpha beta gamma"
+        );
+    });
+}
+
+#[gpui::test]
+fn char_drag_extends_by_offset(cx: &mut TestAppContext) {
+    // Single-click (char mode) drag extends the head to the exact offset —
+    // the long-content selection path (window-global drag) rides on this.
+    let text = "the quick brown fox jumps";
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(text));
+    begin_selection(cx, handle, &editor, 4, 1, false);
+    extend_selection(cx, handle, &editor, 15);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.selection(), Selection::range(4, 15));
+    });
+}
+
+#[gpui::test]
+fn shift_click_extends_the_existing_selection(cx: &mut TestAppContext) {
+    let text = "the quick brown fox";
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(text));
+    begin_selection(cx, handle, &editor, 4, 1, false); // caret at 4
+    begin_selection(cx, handle, &editor, 15, 1, true); // shift-click at 15
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.selection(), Selection::range(4, 15));
+    });
+}
+
+#[gpui::test]
+fn shift_click_and_drag_keeps_the_original_anchor(cx: &mut TestAppContext) {
+    // Native behavior: a shift-click-and-drag keeps the *original* selection
+    // anchor throughout — the shift-click sets the head, and a following drag
+    // continues to extend from the original anchor. Regression guard for the
+    // bug where the shift-click re-anchored the drag at the click point,
+    // discarding the original range on the very next mouse move.
+    let text = "the quick brown fox jumps over";
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(text));
+    // Anchor a selection at A = 4 (start of "quick"), head at 9.
+    begin_selection(cx, handle, &editor, 4, 1, false);
+    extend_selection(cx, handle, &editor, 9);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.selection(), Selection::range(4, 9));
+    });
+    // Shift-click at C = 20 extends the visible selection from the original
+    // anchor A = 4 (not a fresh anchor at 20).
+    begin_selection(cx, handle, &editor, 20, 1, true);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.selection(), Selection::range(4, 20));
+    });
+    // The subsequent drag must still be anchored at A = 4. Before the fix the
+    // drag re-anchored at the shift-click point, yielding range(20, 25).
+    extend_selection(cx, handle, &editor, 25);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.selection(), Selection::range(4, 25));
+    });
+}
