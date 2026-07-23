@@ -66,6 +66,23 @@ pub enum Change {
     /// `AppCore::list_backends` (and should treat per-backend model
     /// catalogs as stale — the set of destinations changed).
     Backends,
+    /// A space's participant membership/config changed: a participant was
+    /// added to, edited in, or removed from a space (the per-space
+    /// Participants surface). Subscribers re-snapshot the affected space's
+    /// participants via `AppCore::list_space_participants`. Distinct from
+    /// [`Change::Templates`] (the reusable blueprints) — the two map to two
+    /// GUI surfaces (the per-space Participants view vs. the Space Templates
+    /// settings pane), so a template edit never over-invalidates a space's
+    /// live participant list and vice versa (the STATE.md 1:1 variant↔store
+    /// rule). Carries no id: the per-space participant list is small and the
+    /// active surface re-snapshots on receipt.
+    Participants,
+    /// The space-template registry changed: a template was created, edited,
+    /// removed (soft), or set as the default. Subscribers re-snapshot via
+    /// `AppCore::list_space_templates`. `Change::Config` is emitted
+    /// *additionally* when set-as-default writes the `default_template`
+    /// config key.
+    Templates,
 }
 
 /// Identifies a single conversation space.  String form matches the UUIDs

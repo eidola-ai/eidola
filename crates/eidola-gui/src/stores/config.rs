@@ -27,6 +27,12 @@ pub struct ConfigStore {
     /// Since it moved off `ConfigState` it is fetched separately (blocking on
     /// the core runtime, off the gpui main thread) and re-read on each write.
     trust: Option<EidolaTrust>,
+    /// The transitional resolved default inference model — fetched separately
+    /// from the (DB-free) `ConfigState` via the async `AppCore::default_model`
+    /// (blocking on the core runtime off the gpui main thread; `config_state`
+    /// deliberately no longer touches the DB). Re-read on each write and on
+    /// `Change::Config`/`Change::Templates`.
+    default_model: Option<String>,
     /// The last config-write error, surfaced by the settings panes.
     error: Option<AppError>,
 }
@@ -37,10 +43,14 @@ impl ConfigStore {
         let trust = app_core
             .as_ref()
             .and_then(|c| c.runtime().block_on(c.eidola_trust()).ok());
+        let default_model = app_core
+            .as_ref()
+            .and_then(|c| c.runtime().block_on(c.default_model()).ok());
         Self {
             app_core,
             state,
             trust,
+            default_model,
             error: None,
         }
     }
@@ -51,8 +61,17 @@ impl ConfigStore {
             app_core: None,
             state,
             trust: None,
+            default_model: None,
             error: None,
         }
+    }
+
+    /// The transitional resolved default inference model — the seeded default
+    /// (`config::DEFAULT_MODEL`) on a stub or before it is known.
+    pub fn default_model(&self) -> String {
+        self.default_model
+            .clone()
+            .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string())
     }
 
     /// The current config snapshot, if known.
@@ -94,6 +113,7 @@ impl ConfigStore {
         if let Some(core) = self.app_core.as_ref() {
             self.state = Some(core.config_state());
             self.trust = core.runtime().block_on(core.eidola_trust()).ok();
+            self.default_model = core.runtime().block_on(core.default_model()).ok();
             cx.notify();
         }
     }
@@ -106,6 +126,7 @@ impl ConfigStore {
             Ok(()) => {
                 self.state = Some(core.config_state());
                 self.trust = core.runtime().block_on(core.eidola_trust()).ok();
+                self.default_model = core.runtime().block_on(core.default_model()).ok();
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
@@ -198,10 +219,6 @@ impl ConfigStore {
         self.write(cx, |c| {
             c.runtime().block_on(c.clear_hardware_intermediate_ca())
         });
-    }
-
-    pub fn set_default_model(&mut self, model: String, cx: &mut Context<Self>) {
-        self.write(cx, |c| c.set_default_model(model));
     }
 
     /// Circadian day/night axis (`appearance`). The theme reacts via its

@@ -81,6 +81,21 @@
 //! unwrapped. Unit-tested in `error.rs` (`chat_failed_display_defers_to_source`,
 //! `root_unwraps_*`, `chat_space_id_only_on_wrapper`).
 //!
+//! **Participants & templates (Participants v1).** Two domains outside the
+//! chat path. Per-space participant CRUD emits `Change::Participants`
+//! (`add_space_participant` / `update_space_participant` /
+//! `remove_space_participant`, each after its durable write; a rejected update
+//! emits nothing). The space-template registry emits `Change::Templates`
+//! (`create_template` / `update_template` / `remove_template` /
+//! `template_from_space`), and `set_default_template` emits **both**
+//! `Change::Config` (the config key) and `Change::Templates` (the default
+//! marker moved). New spaces are instantiated from the default template, so a
+//! fresh space already carries its participants (the human "You" + the
+//! template's agents) — creation still emits only `SpaceIndex` (the
+//! participants are part of the space's birth, not a separate mutation).
+//! Covered by the `*_emit_participants` / `*_emits_templates` /
+//! `space_born_with_template_participants` tests below.
+//!
 //! The happy-path tests below confirm the success-path emissions remain intact
 //! and that the shared infrastructure (bus capacity, multi-subscriber delivery)
 //! works. The full chat HTTP paths — happy-path persistence/emission and the
@@ -144,15 +159,20 @@ fn set_base_url_emits_backends() {
 }
 
 #[test]
-fn set_default_model_emits_config() {
+fn set_default_template_emits_config_and_templates() {
     let (core, _dir) = make_core();
     let mut rx = core.subscribe_changes();
 
-    core.set_default_model("kimi-k2-6".into()).unwrap();
+    core.set_default_template("00000000-0000-7000-8000-0000000000ab".into())
+        .unwrap();
     let changes = drain(&mut rx);
     assert!(
         changes.contains(&Change::Config),
-        "set_default_model should emit Config; got {changes:?}"
+        "set_default_template should emit Config; got {changes:?}"
+    );
+    assert!(
+        changes.contains(&Change::Templates),
+        "set_default_template should emit Templates; got {changes:?}"
     );
 }
 
@@ -208,9 +228,9 @@ fn reset_account_emits_config() {
 #[test]
 fn config_write_failure_does_not_emit() {
     let (core, _dir) = make_core();
-    // set_default_model rejects empty strings — no write, no emit.
+    // set_default_template rejects empty strings — no write, no emit.
     let mut rx = core.subscribe_changes();
-    let _ = core.set_default_model("   ".into()); // returns Err
+    let _ = core.set_default_template("   ".into()); // returns Err
     let changes = drain(&mut rx);
     assert!(
         changes.is_empty(),
@@ -610,7 +630,8 @@ fn two_subscribers_both_receive() {
     let mut rx1 = core.subscribe_changes();
     let mut rx2 = core.subscribe_changes();
 
-    core.set_default_model("kimi-k2-6".into()).unwrap();
+    core.set_default_template("00000000-0000-7000-8000-0000000000ab".into())
+        .unwrap();
 
     let c1 = drain(&mut rx1);
     let c2 = drain(&mut rx2);
@@ -679,7 +700,8 @@ fn set_account_credentials_followed_by_reset_emits_config_each_time() {
 fn late_subscriber_does_not_see_past_events() {
     let (core, _dir) = make_core();
 
-    core.set_default_model("kimi-k2-6".into()).unwrap();
+    core.set_default_template("00000000-0000-7000-8000-0000000000ab".into())
+        .unwrap();
 
     // Subscribe AFTER the write.
     let mut rx = core.subscribe_changes();
@@ -688,4 +710,262 @@ fn late_subscriber_does_not_see_past_events() {
         changes.is_empty(),
         "late subscriber must not see prior events; got {changes:?}"
     );
+}
+
+// ===========================================================================
+// Participants & templates domain (Participants v1)
+// ===========================================================================
+
+#[test]
+fn space_born_with_template_participants() {
+    // A fresh space is instantiated from the default template, so it has the
+    // shared human "You" plus the template's single agent from birth.
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let space = core.runtime().block_on(core.create_space(None)).unwrap();
+        let ps = core
+            .runtime()
+            .block_on(core.list_space_participants(space.id.clone()))
+            .unwrap();
+        assert_eq!(ps.len(), 2, "You + one template agent; got {ps:?}");
+        let human = ps
+            .iter()
+            .find(|p| p.kind == "human")
+            .expect("human present");
+        assert_eq!(human.label, "You");
+        assert_eq!(human.role, "owner");
+        assert_eq!(human.scope, "global");
+        assert_eq!(human.source, "referenced");
+        let agent = ps
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("agent present");
+        assert_eq!(
+            agent.model_ref.as_deref(),
+            Some(eidola_app_core::config::DEFAULT_MODEL)
+        );
+        assert_eq!(agent.scope, "space", "agents are space-owned instances");
+        assert_eq!(agent.source, "owned");
+    });
+}
+
+#[test]
+fn add_update_remove_participant_emit_participants() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let space = core.runtime().block_on(core.create_space(None)).unwrap();
+        let sid = space.id.clone();
+
+        let mut rx = core.subscribe_changes();
+        let added = core
+            .runtime()
+            .block_on(core.add_space_participant(
+                sid.clone(),
+                eidola_app_core::NewParticipant {
+                    label: "Justin".into(),
+                    model_ref: Some("kimi-k2-6".into()),
+                    notify_policy: "all".into(),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        assert_eq!(added.notify_policy, "all");
+        assert!(
+            drain(&mut rx).contains(&Change::Participants),
+            "add_space_participant should emit Participants"
+        );
+
+        core.runtime()
+            .block_on(core.update_space_participant(
+                added.id.clone(),
+                eidola_app_core::ParticipantUpdate {
+                    label: Some("Justin 2".into()),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        assert!(
+            drain(&mut rx).contains(&Change::Participants),
+            "update_space_participant should emit Participants"
+        );
+
+        // An invalid notify policy is rejected and emits nothing.
+        assert!(
+            core.runtime()
+                .block_on(core.update_space_participant(
+                    added.id.clone(),
+                    eidola_app_core::ParticipantUpdate {
+                        notify_policy: Some("sometimes".into()),
+                        ..Default::default()
+                    },
+                ))
+                .is_err()
+        );
+        assert!(drain(&mut rx).is_empty(), "rejected update must not emit");
+
+        let removed = core
+            .runtime()
+            .block_on(core.remove_space_participant(sid.clone(), added.id.clone()))
+            .unwrap();
+        assert!(removed);
+        assert!(
+            drain(&mut rx).contains(&Change::Participants),
+            "remove_space_participant should emit Participants"
+        );
+
+        // The shared human cannot be removed.
+        assert!(
+            core.runtime()
+                .block_on(
+                    core.remove_space_participant(
+                        sid,
+                        "00000000-0000-7000-8000-000000000001".into()
+                    )
+                )
+                .is_err()
+        );
+    });
+}
+
+#[test]
+fn template_crud_emits_templates() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let mut rx = core.subscribe_changes();
+
+        let tmpl = core
+            .runtime()
+            .block_on(core.create_template(
+                "My Template".into(),
+                6,
+                vec![eidola_app_core::NewTemplateParticipant {
+                    label: "Agent".into(),
+                    model_ref: Some("gemma4-31b".into()),
+                    notify_policy: "human".into(),
+                    ..Default::default()
+                }],
+            ))
+            .unwrap();
+        assert_eq!(tmpl.cascade_limit, 6);
+        assert_eq!(tmpl.participants.len(), 1);
+        assert!(
+            drain(&mut rx).contains(&Change::Templates),
+            "create_template should emit Templates"
+        );
+
+        core.runtime()
+            .block_on(core.update_template(tmpl.id.clone(), Some("Renamed".into()), Some(3), None))
+            .unwrap();
+        assert!(
+            drain(&mut rx).contains(&Change::Templates),
+            "update_template should emit Templates"
+        );
+
+        // Listing includes the seeded default plus this one.
+        let templates = core
+            .runtime()
+            .block_on(core.list_space_templates())
+            .unwrap();
+        assert!(
+            templates
+                .iter()
+                .any(|t| t.id == tmpl.id && t.title == "Renamed")
+        );
+
+        let removed = core
+            .runtime()
+            .block_on(core.remove_template(tmpl.id.clone()))
+            .unwrap();
+        assert!(removed);
+        assert!(
+            drain(&mut rx).contains(&Change::Templates),
+            "remove_template should emit Templates"
+        );
+
+        // The built-in Default template cannot be removed.
+        assert!(
+            core.runtime()
+                .block_on(core.remove_template(eidola_app_core::config::DEFAULT_TEMPLATE_ID.into()))
+                .is_err()
+        );
+    });
+}
+
+/// A failed `update_template` (participant replacement rejected) emits nothing
+/// and leaves the template's participants unchanged — the emit-after-commit
+/// contract at the AppCore boundary (the atomic rollback itself is covered in
+/// `db.rs`'s `update_template_tx_rolls_back_on_failure`).
+#[test]
+fn failed_template_update_emits_nothing_and_preserves_participants() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let tmpl = core
+            .runtime()
+            .block_on(core.create_template(
+                "Keep".into(),
+                4,
+                vec![eidola_app_core::NewTemplateParticipant {
+                    label: "Original".into(),
+                    model_ref: Some("gemma4-31b".into()),
+                    notify_policy: "human".into(),
+                    ..Default::default()
+                }],
+            ))
+            .unwrap();
+
+        let mut rx = core.subscribe_changes();
+        // An invalid notify_policy is rejected; no write, no emit.
+        let err = core.runtime().block_on(core.update_template(
+            tmpl.id.clone(),
+            Some("Renamed".into()),
+            Some(9),
+            Some(vec![eidola_app_core::NewTemplateParticipant {
+                label: "Replacement".into(),
+                model_ref: Some("kimi-k2-6".into()),
+                notify_policy: "sometimes".into(),
+                ..Default::default()
+            }]),
+        ));
+        assert!(err.is_err(), "invalid notify_policy must fail the update");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "a failed template update must emit nothing"
+        );
+
+        // The template still has its original participant and title.
+        let templates = core
+            .runtime()
+            .block_on(core.list_space_templates())
+            .unwrap();
+        let t = templates.iter().find(|t| t.id == tmpl.id).unwrap();
+        assert_eq!(t.title, "Keep");
+        assert_eq!(t.participants.len(), 1);
+        assert_eq!(t.participants[0].label, "Original");
+    });
+}
+
+#[test]
+fn template_from_space_projects_and_emits_templates() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let space = core.runtime().block_on(core.create_space(None)).unwrap();
+        let sid = space.id.clone();
+
+        let mut rx = core.subscribe_changes();
+        let tmpl = core
+            .runtime()
+            .block_on(core.template_from_space(sid, "From Space".into()))
+            .unwrap();
+        // The space's one agent (from the default template) projects across;
+        // the human is excluded (its membership is implicit).
+        assert_eq!(tmpl.participants.len(), 1);
+        assert_eq!(
+            tmpl.participants[0].model_ref.as_deref(),
+            Some(eidola_app_core::config::DEFAULT_MODEL)
+        );
+        assert!(
+            drain(&mut rx).contains(&Change::Templates),
+            "template_from_space should emit Templates"
+        );
+    });
 }

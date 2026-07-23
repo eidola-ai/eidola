@@ -48,10 +48,13 @@ pub use local_models::{
 /// [`AppCore::eidola_trust`].
 #[derive(Clone, Debug)]
 pub struct ConfigState {
-    /// The resolved default inference model: the user's `default_model`
-    /// config override if set, otherwise the embedded fallback
-    /// ([`config::DEFAULT_MODEL`]).
-    pub default_model: String,
+    /// The UUID of the default space template new spaces are instantiated from
+    /// (the `default_template` config key; the seeded "Default" template's id
+    /// by default). The transitional resolved default *model* is **not** on
+    /// this (config-backed, DB-free) snapshot — it reads the DB, so it is the
+    /// async [`AppCore::default_model`] instead (a nested `block_on` in
+    /// `config_state` panicked when called from inside the core runtime).
+    pub default_template: String,
     pub has_account: bool,
     pub has_account_secret: bool,
     pub domain_separator: String,
@@ -111,6 +114,141 @@ pub struct MeasurementInfo {
     pub snp: String,
     pub tdx_rtmr1: String,
     pub tdx_rtmr2: String,
+}
+
+// --- Participants & space templates (Participants v1) ----------------------
+
+/// One effective participant of a space (the override-resolved config + how it
+/// is a member). `scope` = the participant's own scope: `global` members are
+/// **references** (a shared-library identity — editing edits everywhere, or the
+/// GUI can override just this space), `space` members are **owned** by this
+/// space (editing edits this space only). `source` echoes that as
+/// `"referenced"`/`"owned"`.
+#[derive(Clone, Debug)]
+pub struct ParticipantInfo {
+    pub id: String,
+    pub scope: String,
+    pub source: String,
+    pub kind: String,
+    pub label: String,
+    pub model_ref: Option<String>,
+    pub system_prompt: Option<String>,
+    pub notify_policy: String,
+    /// `owner`/`member`/`observer`.
+    pub role: String,
+}
+
+impl ParticipantInfo {
+    fn from_effective(r: db::EffectiveParticipantRow) -> Self {
+        Self {
+            id: r.participant_id,
+            scope: r.scope,
+            source: r.source,
+            kind: r.kind,
+            label: r.label,
+            model_ref: r.model_ref,
+            system_prompt: r.system_prompt,
+            notify_policy: r.notify_policy,
+            role: r.role,
+        }
+    }
+
+    fn from_owned(r: db::ParticipantRow) -> Self {
+        Self {
+            id: r.id,
+            scope: r.scope,
+            source: "owned".to_string(),
+            kind: r.kind,
+            label: r.label,
+            model_ref: r.model_ref,
+            system_prompt: r.system_prompt,
+            notify_policy: r.notify_policy,
+            role: r.role,
+        }
+    }
+}
+
+/// A new agent participant to add to a space (agents only — the human is the
+/// seeded shared "You"). `notify_policy` empty ⇒ `explicit`.
+#[derive(Clone, Debug, Default)]
+pub struct NewParticipant {
+    pub label: String,
+    pub model_ref: Option<String>,
+    pub system_prompt: Option<String>,
+    pub notify_policy: String,
+}
+
+/// A partial update to a space participant's mirrored config columns (each
+/// `Some` replaces; the inner `Option` clears/sets the nullable columns).
+#[derive(Clone, Debug, Default)]
+pub struct ParticipantUpdate {
+    pub label: Option<String>,
+    pub model_ref: Option<Option<String>>,
+    pub system_prompt: Option<Option<String>>,
+    pub notify_policy: Option<String>,
+}
+
+/// A space template (its settings + agent participants).
+#[derive(Clone, Debug)]
+pub struct SpaceTemplateInfo {
+    pub id: String,
+    pub title: String,
+    pub cascade_limit: i64,
+    pub participants: Vec<TemplateParticipantInfo>,
+}
+
+/// One agent participant a template OWNS (`scope='template'`).
+#[derive(Clone, Debug)]
+pub struct TemplateParticipantInfo {
+    pub id: String,
+    pub label: String,
+    pub model_ref: Option<String>,
+    pub system_prompt: Option<String>,
+    pub notify_policy: String,
+}
+
+impl TemplateParticipantInfo {
+    fn from_owned(r: db::ParticipantRow) -> Self {
+        Self {
+            id: r.id,
+            label: r.label,
+            model_ref: r.model_ref,
+            system_prompt: r.system_prompt,
+            notify_policy: r.notify_policy,
+        }
+    }
+}
+
+/// A new agent participant for a template.
+#[derive(Clone, Debug, Default)]
+pub struct NewTemplateParticipant {
+    pub label: String,
+    pub model_ref: Option<String>,
+    pub system_prompt: Option<String>,
+    pub notify_policy: String,
+}
+
+/// A validated, normalized template participant input:
+/// `(label, model_ref, system_prompt, notify_policy)`.
+type ValidatedTemplateParticipant = (String, Option<String>, Option<String>, String);
+
+/// Valid notify-policy values (mirrors the schema CHECK).
+fn validate_notify_policy(policy: &str) -> Result<String, AppError> {
+    match policy {
+        "explicit" | "human" | "all" => Ok(policy.to_string()),
+        other => Err(AppError::Config {
+            message: format!("invalid notify_policy `{other}` (expected explicit, human, or all)"),
+        }),
+    }
+}
+
+/// Normalize a notify-policy input, defaulting empty to `explicit`.
+fn notify_policy_or_default(policy: &str) -> Result<String, AppError> {
+    if policy.trim().is_empty() {
+        Ok("explicit".to_string())
+    } else {
+        validate_notify_policy(policy.trim())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -555,6 +693,42 @@ impl Inner {
             }),
         }
     }
+
+    /// The **live** default-template id: the configured `default_template` when
+    /// it names a non-removed template, otherwise the seeded default. New
+    /// spaces are instantiated from this, so a config pointing at a
+    /// removed/absent template falls back honestly to a template that exists.
+    async fn resolve_default_template_id(
+        &self,
+        conn: &turso::Connection,
+    ) -> Result<String, AppError> {
+        let cfg = self.load_config();
+        let configured = cfg.default_template().to_string();
+        let live = db::get_space_template(conn, &configured)
+            .await?
+            .filter(|t| t.removed_at.is_none())
+            .is_some();
+        Ok(if live {
+            configured
+        } else {
+            config::DEFAULT_TEMPLATE_ID.to_string()
+        })
+    }
+
+    /// The transitional resolved "default model" (see `ConfigState::default_model`):
+    /// the default template's first agent participant's `model_ref`, falling
+    /// back to [`config::DEFAULT_MODEL`] when the template has no agent.
+    async fn resolve_default_model(&self) -> Result<String, AppError> {
+        let conn = self.db_conn().await?;
+        let template_id = self.resolve_default_template_id(&conn).await?;
+        let model = db::list_template_owned_participants(&conn, &template_id)
+            .await?
+            .into_iter()
+            .find(|p| p.kind == "agent")
+            .and_then(|p| p.model_ref)
+            .unwrap_or_else(|| config::DEFAULT_MODEL.to_string());
+        Ok(model)
+    }
 }
 
 // --- Update checking ----------------------------------------------------------
@@ -644,7 +818,9 @@ impl Inner {
 impl Inner {
     async fn db_conn(&self) -> Result<turso::Connection, AppError> {
         let database = self.db.get_or_try_init(|| db::open(&self.data_dir)).await?;
-        database.connect().map_err(AppError::db)
+        // FK enforcement is per-connection (turso defaults it OFF), and the
+        // scope-owned schema depends on it — enable it on every connection.
+        db::connect(database).await
     }
 
     /// Load the `eidola` backend row and resolve its connection + trust
@@ -1645,16 +1821,415 @@ impl Inner {
         Ok(build_post_tree(data))
     }
 
+    /// Create a new space by instantiating the (live) default space template:
+    /// the space copies the template's `cascade_limit`, the shared human "You"
+    /// joins as owner, and each template agent participant is copied into a
+    /// fresh per-space instance. This is the single new-space path so every
+    /// space has participants from birth. Returns the new space id.
+    async fn instantiate_default_space(
+        &self,
+        conn: &turso::Connection,
+        title: Option<&str>,
+        now: i64,
+    ) -> Result<String, AppError> {
+        let template_id = self.resolve_default_template_id(conn).await?;
+        let space_id = Uuid::now_v7().to_string();
+        db::instantiate_template(conn, &template_id, &space_id, title, "unlinked", now).await?;
+        Ok(space_id)
+    }
+
+    /// Resolve the agent participant an inference should be recorded against —
+    /// the wave-1 seam between "the space's participants" and "`run_turn` takes
+    /// a model string". Reuses the space's existing per-space agent whose
+    /// `model_ref` matches (the one copied from the template on instantiation);
+    /// if the selected model isn't among the space's participants, mints a
+    /// fresh per-space agent instance for it and joins it. **Wave 2** makes
+    /// `run_turn` take the participant directly, retiring this by-model lookup.
+    async fn ensure_space_agent_participant(
+        &self,
+        conn: &turso::Connection,
+        space_id: &str,
+        model_ref: &str,
+        provider_id: &str,
+        now: i64,
+    ) -> Result<(String, String), AppError> {
+        if let Some((id, scope)) =
+            db::space_agent_participant_by_model(conn, space_id, model_ref).await?
+        {
+            return Ok((id, scope));
+        }
+        // No matching member — mint a fresh SPACE-OWNED agent (scope='space',
+        // owner_space_id = this space). Ownership implies membership, so no
+        // reference row is needed.
+        let pid = Uuid::now_v7().to_string();
+        db::insert_participant(
+            conn,
+            &pid,
+            "space",
+            Some(space_id),
+            None,
+            "agent",
+            &db::default_agent_label(model_ref),
+            Some(model_ref),
+            None,
+            "explicit",
+            "member",
+            Some(provider_id),
+            now,
+        )
+        .await?;
+        Ok((pid, "space".to_string()))
+    }
+
+    // --- Participant CRUD (per-space) -----------------------------------
+
+    async fn list_space_participants(
+        &self,
+        space_id: &str,
+    ) -> Result<Vec<ParticipantInfo>, AppError> {
+        let conn = self.db_conn().await?;
+        Ok(db::space_participants(&conn, space_id)
+            .await?
+            .into_iter()
+            .map(ParticipantInfo::from_effective)
+            .collect())
+    }
+
+    async fn add_space_participant(
+        &self,
+        space_id: &str,
+        new: NewParticipant,
+    ) -> Result<ParticipantInfo, AppError> {
+        let label = new.label.trim().to_string();
+        if label.is_empty() {
+            return Err(AppError::Config {
+                message: "participant label must not be empty".into(),
+            });
+        }
+        let policy = notify_policy_or_default(&new.notify_policy)?;
+        let model_ref = new
+            .model_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let system_prompt = new.system_prompt.as_deref().filter(|s| !s.is_empty());
+
+        let conn = self.db_conn().await?;
+        db::get_space(&conn, space_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            })?;
+        let now = now_ms();
+        // Added agents are SPACE-OWNED (a fresh per-space instance). Ownership
+        // implies membership, so no reference row.
+        let pid = Uuid::now_v7().to_string();
+        db::insert_participant(
+            &conn,
+            &pid,
+            "space",
+            Some(space_id),
+            None,
+            "agent",
+            &label,
+            model_ref,
+            system_prompt,
+            &policy,
+            "member",
+            None,
+            now,
+        )
+        .await?;
+        self.bus.emit(Change::Participants);
+        let row = db::get_participant(&conn, &pid)
+            .await?
+            .ok_or_else(|| AppError::Internal {
+                message: "participant vanished after insert".into(),
+            })?;
+        Ok(ParticipantInfo::from_owned(row))
+    }
+
+    /// Edit a participant's **own** config — "edit everywhere" for a global,
+    /// "edit this space" for a space-owned row. The complementary "override
+    /// here" path (per-membership override, this space only) is the DB
+    /// primitive `db::update_space_participant_override` + the COALESCE in
+    /// `db::space_participants`; the GUI affordance for it lands in wave 3.
+    async fn update_space_participant(
+        &self,
+        participant_id: &str,
+        update: ParticipantUpdate,
+    ) -> Result<(), AppError> {
+        let policy = match &update.notify_policy {
+            Some(p) => Some(validate_notify_policy(p.trim())?),
+            None => None,
+        };
+        let label = match &update.label {
+            Some(l) if l.trim().is_empty() => {
+                return Err(AppError::Config {
+                    message: "participant label must not be empty".into(),
+                });
+            }
+            Some(l) => Some(l.trim().to_string()),
+            None => None,
+        };
+        let conn = self.db_conn().await?;
+        let model_ref = update
+            .model_ref
+            .as_ref()
+            .map(|inner| inner.as_deref().filter(|s| !s.is_empty()));
+        let system_prompt = update
+            .system_prompt
+            .as_ref()
+            .map(|inner| inner.as_deref().filter(|s| !s.is_empty()));
+        let changed = db::update_participant_config(
+            &conn,
+            participant_id,
+            label.as_deref(),
+            model_ref,
+            system_prompt,
+            policy.as_deref(),
+            None,
+        )
+        .await?;
+        if changed {
+            self.bus.emit(Change::Participants);
+        }
+        Ok(())
+    }
+
+    async fn remove_space_participant(
+        &self,
+        space_id: &str,
+        participant_id: &str,
+    ) -> Result<bool, AppError> {
+        if participant_id == db::HUMAN_PARTICIPANT_ID {
+            return Err(AppError::Config {
+                message: "the human participant is shared and cannot be removed from a space"
+                    .into(),
+            });
+        }
+        let conn = self.db_conn().await?;
+        // A space-owned participant is soft-removed (its row deactivated); a
+        // referenced global leaves the space (its reference row's left_at set).
+        let removed = match db::get_participant(&conn, participant_id).await? {
+            Some(p) if p.scope == "space" && p.owner_space_id.as_deref() == Some(space_id) => {
+                db::soft_remove_participant(&conn, participant_id, now_ms()).await?
+            }
+            _ => db::leave_space_participant(&conn, space_id, participant_id, now_ms()).await?,
+        };
+        if removed {
+            self.bus.emit(Change::Participants);
+        }
+        Ok(removed)
+    }
+
+    // --- Space template CRUD --------------------------------------------
+
+    async fn build_template_info(
+        &self,
+        conn: &turso::Connection,
+        id: &str,
+    ) -> Result<SpaceTemplateInfo, AppError> {
+        let t = db::get_space_template(conn, id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space template not found: {id}"),
+            })?;
+        let participants = db::list_template_owned_participants(conn, id)
+            .await?
+            .into_iter()
+            .filter(|p| p.kind == "agent")
+            .map(TemplateParticipantInfo::from_owned)
+            .collect();
+        Ok(SpaceTemplateInfo {
+            id: t.id,
+            title: t.title,
+            cascade_limit: t.cascade_limit,
+            participants,
+        })
+    }
+
+    async fn list_space_templates(&self) -> Result<Vec<SpaceTemplateInfo>, AppError> {
+        let conn = self.db_conn().await?;
+        let templates = db::list_space_templates(&conn).await?;
+        let mut out = Vec::with_capacity(templates.len());
+        for t in templates {
+            out.push(self.build_template_info(&conn, &t.id).await?);
+        }
+        Ok(out)
+    }
+
+    /// Validate a template's participant inputs before any write (so a
+    /// partial template can't be created). Returns the normalized tuples
+    /// `(label, model_ref, system_prompt, notify_policy)`.
+    fn validate_template_participants(
+        participants: &[NewTemplateParticipant],
+    ) -> Result<Vec<ValidatedTemplateParticipant>, AppError> {
+        participants
+            .iter()
+            .map(|p| {
+                let label = p.label.trim().to_string();
+                if label.is_empty() {
+                    return Err(AppError::Config {
+                        message: "template participant label must not be empty".into(),
+                    });
+                }
+                let policy = notify_policy_or_default(&p.notify_policy)?;
+                let model_ref = p
+                    .model_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let system_prompt = p
+                    .system_prompt
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                Ok((label, model_ref, system_prompt, policy))
+            })
+            .collect()
+    }
+
+    async fn create_template(
+        &self,
+        title: &str,
+        cascade_limit: i64,
+        participants: Vec<NewTemplateParticipant>,
+    ) -> Result<SpaceTemplateInfo, AppError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(AppError::Config {
+                message: "template title must not be empty".into(),
+            });
+        }
+        if cascade_limit < 1 {
+            return Err(AppError::Config {
+                message: "cascade limit must be at least 1".into(),
+            });
+        }
+        let validated = Self::validate_template_participants(&participants)?;
+
+        let conn = self.db_conn().await?;
+        let now = now_ms();
+        let id = Uuid::now_v7().to_string();
+        db::insert_space_template(&conn, &id, title, cascade_limit, now).await?;
+        for (label, model_ref, system_prompt, policy) in &validated {
+            // Template agents are TEMPLATE-OWNED participant rows.
+            db::insert_participant(
+                &conn,
+                &Uuid::now_v7().to_string(),
+                "template",
+                None,
+                Some(&id),
+                "agent",
+                label,
+                model_ref.as_deref(),
+                system_prompt.as_deref(),
+                policy,
+                "member",
+                None,
+                now,
+            )
+            .await?;
+        }
+        self.bus.emit(Change::Templates);
+        self.build_template_info(&conn, &id).await
+    }
+
+    async fn template_from_space(
+        &self,
+        space_id: &str,
+        title: &str,
+    ) -> Result<SpaceTemplateInfo, AppError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(AppError::Config {
+                message: "template title must not be empty".into(),
+            });
+        }
+        let conn = self.db_conn().await?;
+        let now = now_ms();
+        let id = Uuid::now_v7().to_string();
+        db::template_from_space(&conn, space_id, title, &id, now).await?;
+        self.bus.emit(Change::Templates);
+        self.build_template_info(&conn, &id).await
+    }
+
+    async fn update_template(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        cascade_limit: Option<i64>,
+        participants: Option<Vec<NewTemplateParticipant>>,
+    ) -> Result<(), AppError> {
+        let title = match title {
+            Some(t) if t.trim().is_empty() => {
+                return Err(AppError::Config {
+                    message: "template title must not be empty".into(),
+                });
+            }
+            Some(t) => Some(t.trim().to_string()),
+            None => None,
+        };
+        if let Some(c) = cascade_limit
+            && c < 1
+        {
+            return Err(AppError::Config {
+                message: "cascade limit must be at least 1".into(),
+            });
+        }
+        let validated = match &participants {
+            Some(ps) => Some(Self::validate_template_participants(ps)?),
+            None => None,
+        };
+
+        let conn = self.db_conn().await?;
+        let live = db::get_space_template(&conn, id)
+            .await?
+            .filter(|t| t.removed_at.is_none());
+        if live.is_none() {
+            return Err(AppError::NotConfigured {
+                message: format!("space template not found or removed: {id}"),
+            });
+        }
+        let now = now_ms();
+        // Settings-update + owned-participant replacement run in ONE transaction
+        // (`db::update_template_tx`): a concurrent `instantiate_template` can
+        // never observe a half-rebuilt agent set, and an insert error rolls the
+        // whole thing back leaving the prior state intact — so the emit below
+        // fires only after a committed change (changes.rs emit-after-commit).
+        db::update_template_tx(
+            &conn,
+            id,
+            title.as_deref(),
+            cascade_limit,
+            validated.as_deref(),
+            now,
+        )
+        .await?;
+        self.bus.emit(Change::Templates);
+        Ok(())
+    }
+
+    async fn remove_template(&self, id: &str) -> Result<bool, AppError> {
+        if id == config::DEFAULT_TEMPLATE_ID {
+            return Err(AppError::Config {
+                message: "the built-in Default template cannot be removed".into(),
+            });
+        }
+        let conn = self.db_conn().await?;
+        let removed = db::soft_remove_space_template(&conn, id, now_ms()).await?;
+        if removed {
+            self.bus.emit(Change::Templates);
+        }
+        Ok(removed)
+    }
+
     async fn create_space(&self, title: Option<&str>) -> Result<SpaceInfo, AppError> {
         let db_conn = self.db_conn().await?;
         let now = now_ms();
-        let space_id = Uuid::now_v7().to_string();
-        db::insert_space(&db_conn, &space_id, title, "unlinked", now).await?;
-
-        let user_participant_id =
-            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
-        db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
-            .await?;
+        let space_id = self.instantiate_default_space(&db_conn, title, now).await?;
 
         self.bus.emit(Change::SpaceIndex);
 
@@ -1709,8 +2284,9 @@ impl Inner {
         let db_conn = self.db_conn().await?;
         let now = now_ms();
 
-        let user_participant_id =
-            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+        // The one shared human participant records every human post (seeded at
+        // DB open, joined into every space by the template instantiation).
+        let user_participant_id = db::HUMAN_PARTICIPANT_ID.to_string();
 
         let (space_id, space_title, is_new_space) = if let Some(sid) = space_id {
             let row =
@@ -1721,10 +2297,9 @@ impl Inner {
                     })?;
             (sid.to_string(), row.title, false)
         } else {
-            let sid = Uuid::now_v7().to_string();
-            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
-            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
-                .await?;
+            // A new space is instantiated from the default template, so it has
+            // its participants (You + the template agents) from birth.
+            let sid = self.instantiate_default_space(&db_conn, None, now).await?;
             (sid, None, true)
         };
 
@@ -1740,6 +2315,8 @@ impl Inner {
                 id: action_id.clone(),
                 space_id: space_id.clone(),
                 participant_id: user_participant_id,
+                // The human "You" is a global participant.
+                participant_scope: "global".to_string(),
                 item_id: item_id.clone(),
                 supersedes_action_id: None,
                 action_type: "user_input".to_string(),
@@ -1825,8 +2402,8 @@ impl Inner {
             })?;
         let reply_parent = db::reply_antecedent(&db_conn, &tip).await?;
 
-        let user_participant_id =
-            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+        // Edits are the human's — recorded against the shared "You" participant.
+        let user_participant_id = db::HUMAN_PARTICIPANT_ID.to_string();
 
         let new_action_id = Uuid::now_v7().to_string();
         db::insert_action(
@@ -1835,6 +2412,8 @@ impl Inner {
                 id: new_action_id.clone(),
                 space_id: space_id.clone(),
                 participant_id: user_participant_id,
+                // The human "You" is a global participant.
+                participant_scope: "global".to_string(),
                 item_id: item_id.clone(),
                 supersedes_action_id: Some(tip),
                 action_type: "user_input".to_string(),
@@ -2126,19 +2705,20 @@ impl Inner {
             context_length.min(4096) as u32
         };
 
-        let model_participant_id =
-            db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
-
-        // The space already exists (post created it). Validate it and ensure the
-        // model participant is a member.
+        // The space already exists (post created it). Validate it first.
         db::get_space(&db_conn, space_id)
             .await?
             .ok_or_else(|| AppError::NotConfigured {
                 message: format!("space not found: {space_id}"),
             })?;
-        let _ =
-            db::insert_space_participant(&db_conn, space_id, &model_participant_id, "member", now)
-                .await; // ignore duplicate
+        // Record the inference against the space's agent participant matching
+        // this model (a space-owned instance from the template, a referenced
+        // global agent, or a fresh space-owned instance if the selected model
+        // isn't among the space's participants). The scope feeds the action's
+        // pinned composite echo.
+        let (model_participant_id, model_participant_scope) = self
+            .ensure_space_agent_participant(&db_conn, space_id, model, &provider_id, now)
+            .await?;
         let space_id = space_id.to_string();
 
         // The space is always persisted here, so every error exit carries its id
@@ -2329,6 +2909,7 @@ impl Inner {
             model: model.to_string(),
             wire_model,
             model_participant_id,
+            model_participant_scope,
             max_completion_tokens,
             inf_item_id,
             inf_supersedes,
@@ -3054,10 +3635,15 @@ impl AppCore {
     // Config — sync methods (no runtime needed, delegate directly)
     // -----------------------------------------------------------------------
 
+    /// A synchronous, purely config-backed snapshot (no DB, no runtime
+    /// re-entry) — safe to call from any thread, **including from inside the
+    /// core runtime** (the CLI calls it within `runtime().block_on(run(..))`).
+    /// The transitional resolved default model is **not** here (it reads the
+    /// DB); callers that need it use the async [`AppCore::default_model`].
     pub fn config_state(&self) -> ConfigState {
         let cfg = self.inner.load_config();
         ConfigState {
-            default_model: cfg.default_model().to_string(),
+            default_template: cfg.default_template().to_string(),
             has_account: cfg.account_id.is_some(),
             has_account_secret: cfg.account_secret.is_some(),
             domain_separator: cfg.domain_separator().to_string(),
@@ -3067,6 +3653,21 @@ impl AppCore {
             light_character: cfg.light_character(),
             font_scale: cfg.font_scale(),
         }
+    }
+
+    /// The transitional resolved default inference model (see the
+    /// `default_model` note in the docs): the default template's first agent
+    /// participant's `model_ref`, falling back to [`config::DEFAULT_MODEL`].
+    /// Async because it reads the DB — this is the panic-free replacement for
+    /// the old DB-in-`config_state` resolution, consistent with the rest of
+    /// AppCore's async surface. UIs cache the value and refresh it on
+    /// `Change::Config` / `Change::Templates`.
+    pub async fn default_model(&self) -> Result<String, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.resolve_default_model().await })
+            .await
+            .map_err(join_err)?
     }
 
     /// The eidola backend's resolved connection + trust bundle (base URL,
@@ -3101,20 +3702,24 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// Persist the user's default inference model (the `default_model`
-    /// config override). New chat surfaces resolve their starting model
-    /// from this; an existing window's explicit selection is unaffected.
-    pub fn set_default_model(&self, model: String) -> Result<(), AppError> {
-        let model = model.trim().to_string();
-        if model.is_empty() {
+    /// Persist the default space template new spaces are instantiated from
+    /// (the `default_template` config key). Replaces the removed
+    /// `set_default_model`. Emits [`Change::Config`] **and**
+    /// [`Change::Templates`] (the template registry's default marker moved).
+    /// The id should name a live template; a stale id is tolerated (space
+    /// creation falls back to the seeded default), so this only rejects blanks.
+    pub fn set_default_template(&self, template_id: String) -> Result<(), AppError> {
+        let template_id = template_id.trim().to_string();
+        if template_id.is_empty() {
             return Err(AppError::Config {
-                message: "default model must not be empty".into(),
+                message: "default template id must not be empty".into(),
             });
         }
         let mut cfg = self.inner.load_config();
-        cfg.default_model_override = Some(model);
+        cfg.default_template_override = Some(template_id);
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
+        self.bus.emit(Change::Templates);
         Ok(())
     }
 
@@ -3873,6 +4478,145 @@ impl AppCore {
             .await
             .map_err(join_err)?
     }
+
+    // -----------------------------------------------------------------------
+    // Participants & space templates (Participants v1)
+    // -----------------------------------------------------------------------
+
+    /// The current participants of a space (the shared human "You" plus the
+    /// space's per-space agent instances).
+    pub async fn list_space_participants(
+        &self,
+        space_id: String,
+    ) -> Result<Vec<ParticipantInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.list_space_participants(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Add a new agent participant to a space. Emits [`Change::Participants`].
+    pub async fn add_space_participant(
+        &self,
+        space_id: String,
+        participant: NewParticipant,
+    ) -> Result<ParticipantInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.add_space_participant(&space_id, participant).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Update a space participant's config (label, model, system prompt, notify
+    /// policy). Editing a participant edits **that space only**. Emits
+    /// [`Change::Participants`].
+    pub async fn update_space_participant(
+        &self,
+        participant_id: String,
+        update: ParticipantUpdate,
+    ) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .update_space_participant(&participant_id, update)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Remove an agent participant from a space (soft — the participant row
+    /// survives so forensic `action.participant_id` references resolve). The
+    /// shared human cannot be removed. Emits [`Change::Participants`].
+    pub async fn remove_space_participant(
+        &self,
+        space_id: String,
+        participant_id: String,
+    ) -> Result<bool, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .remove_space_participant(&space_id, &participant_id)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The live (non-removed) space templates, each with its agent participants.
+    pub async fn list_space_templates(&self) -> Result<Vec<SpaceTemplateInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.list_space_templates().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Create a new space template. Emits [`Change::Templates`].
+    pub async fn create_template(
+        &self,
+        title: String,
+        cascade_limit: i64,
+        participants: Vec<NewTemplateParticipant>,
+    ) -> Result<SpaceTemplateInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .create_template(&title, cascade_limit, participants)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Project a space's current participants + settings into a **new** template
+    /// ("Make template from this space"). Emits [`Change::Templates`].
+    pub async fn template_from_space(
+        &self,
+        space_id: String,
+        title: String,
+    ) -> Result<SpaceTemplateInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.template_from_space(&space_id, &title).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Update a template's title / cascade limit and (when `participants` is
+    /// `Some`) replace its participant set. Emits [`Change::Templates`].
+    pub async fn update_template(
+        &self,
+        id: String,
+        title: Option<String>,
+        cascade_limit: Option<i64>,
+        participants: Option<Vec<NewTemplateParticipant>>,
+    ) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .update_template(&id, title.as_deref(), cascade_limit, participants)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Soft-remove a template (the built-in Default cannot be removed). Emits
+    /// [`Change::Templates`].
+    pub async fn remove_template(&self, id: String) -> Result<bool, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.remove_template(&id).await })
+            .await
+            .map_err(join_err)?
+    }
 }
 
 // ============================================================================
@@ -4057,6 +4801,9 @@ struct TurnPrep {
     /// Equals `model` except for openai backends (bare wire model).
     wire_model: String,
     model_participant_id: String,
+    /// The acting agent participant's scope (`'space'` or `'global'`) — the
+    /// action's pinned composite echo.
+    model_participant_scope: String,
     max_completion_tokens: u32,
     /// The inference's attach plan (Reply → fresh item; Revise → a new
     /// generation superseding the target).
@@ -4203,6 +4950,7 @@ impl TurnPrep {
                 id: inference_action_id.clone(),
                 space_id: self.space_id.clone(),
                 participant_id: self.model_participant_id.clone(),
+                participant_scope: self.model_participant_scope.clone(),
                 item_id: self.inf_item_id.clone(),
                 supersedes_action_id: self.inf_supersedes.clone(),
                 action_type: "inference".to_string(),
@@ -4974,27 +5722,73 @@ mod tests {
         assert!(params_from_domain_separator("bad").is_err());
     }
 
-    // --- Default model config ----------------------------------------------
+    // --- Default template config -------------------------------------------
 
     #[test]
-    fn set_default_model_round_trips_through_config_state() {
+    fn default_model_resolves_from_default_template_agent() {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().to_path_buf();
         let data_dir = dir.path().join("data");
 
         let core = AppCore::new(config_dir.clone(), data_dir.clone());
-        assert_eq!(core.config_state().default_model, config::DEFAULT_MODEL);
+        // Fresh install: default_template is the seeded id, and the async
+        // default_model resolves from the seeded template's agent (= DEFAULT_MODEL).
+        assert_eq!(
+            core.config_state().default_template,
+            config::DEFAULT_TEMPLATE_ID
+        );
+        let model = core.runtime().block_on(core.default_model()).unwrap();
+        assert_eq!(model, config::DEFAULT_MODEL);
+    }
 
-        core.set_default_model("kimi-k2-6".into()).unwrap();
-        assert_eq!(core.config_state().default_model, "kimi-k2-6");
+    /// Regression for the nested-runtime panic (PR #221 review): the CLI runs
+    /// `runtime().block_on(run(..))` and inside `run` calls `config_state()`
+    /// (no-subcommand + `chat` without `--model`). config_state must be
+    /// runtime-safe, and default_model resolution must work via `.await`
+    /// inside that context — not a nested `block_on` ("Cannot start a runtime
+    /// from within a runtime").
+    #[test]
+    fn config_state_and_default_model_are_safe_inside_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = AppCore::new(dir.path().to_path_buf(), dir.path().join("data"));
+        // Exactly the CLI's shape: sync config_state() + awaited default_model()
+        // driven from within the core runtime.
+        let (tmpl, model) = core.runtime().block_on(async {
+            let state = core.config_state(); // must not panic here
+            let model = core.default_model().await.unwrap();
+            (state.default_template, model)
+        });
+        assert_eq!(tmpl, config::DEFAULT_TEMPLATE_ID);
+        assert_eq!(model, config::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn set_default_template_round_trips_and_rejects_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().to_path_buf();
+        let data_dir = dir.path().join("data");
+
+        let core = AppCore::new(config_dir.clone(), data_dir.clone());
+        core.set_default_template("00000000-0000-7000-8000-0000000000ab".into())
+            .unwrap();
+        assert_eq!(
+            core.config_state().default_template,
+            "00000000-0000-7000-8000-0000000000ab"
+        );
 
         // A fresh core over the same config dir sees the persisted value.
         let core2 = AppCore::new(config_dir, data_dir);
-        assert_eq!(core2.config_state().default_model, "kimi-k2-6");
+        assert_eq!(
+            core2.config_state().default_template,
+            "00000000-0000-7000-8000-0000000000ab"
+        );
 
         // Whitespace-only is rejected and leaves the config untouched.
-        assert!(core2.set_default_model("   ".into()).is_err());
-        assert_eq!(core2.config_state().default_model, "kimi-k2-6");
+        assert!(core2.set_default_template("   ".into()).is_err());
+        assert_eq!(
+            core2.config_state().default_template,
+            "00000000-0000-7000-8000-0000000000ab"
+        );
     }
 
     #[test]

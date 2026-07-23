@@ -128,6 +128,48 @@ fn blocking_chat_persists_and_emits() {
         // The inline refund recovered a successor credential — no recovery hit.
         assert_eq!(mock.refund_hits(), 0);
         assert_eq!(mock.chat_hits(), 1);
+
+        // Participants v1: the fresh chat space was instantiated from the
+        // default template, so it carries the shared human "You" and the
+        // template's agent (model = MODEL = DEFAULT_MODEL) from birth.
+        let participants = core
+            .runtime()
+            .block_on(core.list_space_participants(result.space_id.clone()))
+            .expect("participants");
+        assert_eq!(
+            participants.len(),
+            2,
+            "You + one agent; got {participants:?}"
+        );
+        let human = participants
+            .iter()
+            .find(|p| p.kind == "human")
+            .expect("human participant");
+        assert_eq!(human.label, "You");
+        let agent = participants
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("agent participant");
+        assert_eq!(agent.model_ref.as_deref(), Some(MODEL));
+
+        // The persisted actions carry real participant identities: the user
+        // turn is the human, the inference is the responding agent.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(result.space_id.clone()))
+            .expect("tree");
+        let user_post = tree
+            .iter()
+            .find(|n| n.action_type == "user_input")
+            .expect("user post");
+        assert_eq!(user_post.participant.kind, "human");
+        assert_eq!(user_post.participant.label, "You");
+        let inference = tree
+            .iter()
+            .find(|n| n.action_type == "inference")
+            .expect("inference post");
+        assert_eq!(inference.participant.kind, "agent");
+        assert!(!inference.action_id.is_empty());
     });
 }
 

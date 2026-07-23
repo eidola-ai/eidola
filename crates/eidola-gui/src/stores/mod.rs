@@ -327,6 +327,14 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
             stores.models.update(cx, |s, cx| s.refresh(cx));
             stores.local_models.update(cx, |s, cx| s.refresh(cx));
         }
+        // Participants v1 domains. No GUI store consumes per-space
+        // participants yet (that view lands in wave 3). A template change,
+        // though, can move the resolved default model (the default template's
+        // agent), so refresh the config store's cached `default_model`.
+        Change::Templates => {
+            stores.config.update(cx, |s, cx| s.refresh(cx));
+        }
+        Change::Participants => {}
     }
 }
 
