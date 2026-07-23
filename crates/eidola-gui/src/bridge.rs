@@ -79,6 +79,30 @@ pub fn chat_stream(
     (event_rx, done_rx)
 }
 
+/// Streaming re-request: request a response to an **already-persisted** post
+/// (the retry entry point after a failed ask) without posting a new user turn.
+/// Same channels as [`chat_stream`]; drives `AppCore::respond_stream` targeting
+/// `target_action_id` (the saved user post awaiting a reply).
+pub fn respond_stream(
+    core: Arc<AppCore>,
+    space_id: String,
+    model: String,
+    target_action_id: String,
+) -> (
+    mpsc::UnboundedReceiver<ChatStreamEvent>,
+    oneshot::Receiver<Result<ChatResult, AppError>>,
+) {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (done_tx, done_rx) = oneshot::channel();
+    core.runtime().handle().clone().spawn(async move {
+        let res = core
+            .respond_stream(space_id, model, target_action_id, event_tx)
+            .await;
+        let _ = done_tx.send(res);
+    });
+    (event_rx, done_rx)
+}
+
 /// Save a post without requesting a response (the save side of save-vs-request:
 /// `⌘⇧↩`). Creates the space when `space_id` is `None`; needs no credential.
 /// `reply_to`, when set, branches off that post (vs the linear tail).

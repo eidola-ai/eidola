@@ -2359,9 +2359,14 @@ impl Inner {
         mode: ResponseMode,
         budget: Option<i64>,
     ) -> Result<ChatResult, AppError> {
+        // The space is already persisted (post created it) before prepare_turn
+        // runs, so every setup failure inside it — client build, `/v1/models`
+        // fetch, attestation flush, all *before* the turn's own `wrap` closure
+        // — must still carry the space id for blank-space adoption / Retry.
         let mut prep = self
             .prepare_turn(space_id, model, target_action_id, mode, budget)
-            .await?;
+            .await
+            .map_err(|e| e.into_chat_failed(space_id))?;
 
         let request_body_json = prep.request_body(false);
         let request_at = now_ms();
@@ -2582,9 +2587,13 @@ impl Inner {
     ) -> Result<ChatResult, AppError> {
         use futures_util::StreamExt;
 
+        // Setup failures (client build / `/v1/models` fetch / attestation
+        // flush) happen before the turn's inline `wrap` closure — carry the
+        // already-persisted space id so they wrap like every later exit.
         let mut prep = self
             .prepare_turn(space_id, model, target_action_id, mode, budget)
-            .await?;
+            .await
+            .map_err(|e| e.into_chat_failed(space_id))?;
 
         // No `stream_options` here — the server unconditionally sets
         // `include_usage: true` when forwarding the streaming request
@@ -2914,6 +2923,43 @@ impl AppCore {
                         &model,
                         space_id.as_deref(),
                         reply_to.as_deref(),
+                        sender,
+                    )
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Request a **streaming response to an already-persisted post**, without
+    /// posting a new user turn. This is the "re-request" / retry entry point:
+    /// after a failed ask the user's post is saved but has no reply, so there
+    /// is nothing to re-post — this runs a fresh turn *replying to that exact
+    /// post*. `target_action_id` is the post being answered (its current tip);
+    /// the turn attaches as its reply in `ResponseMode::Reply`.
+    ///
+    /// This is exactly the `run_turn_stream(Reply)` half of [`Self::chat_stream`]
+    /// without the leading `post`, so every exit point and emission is identical
+    /// to a `chat_stream` that reused an existing post (see `tests/bus.rs`). A
+    /// failure is wrapped as `AppError::ChatFailed { space_id }` so a GUI space
+    /// can route it the same way it routes a failed ask.
+    pub async fn respond_stream(
+        &self,
+        space_id: String,
+        model: String,
+        target_action_id: String,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .run_turn_stream(
+                        &space_id,
+                        &model,
+                        &target_action_id,
+                        ResponseMode::Reply,
+                        None,
                         sender,
                     )
                     .await

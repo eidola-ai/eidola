@@ -35,15 +35,16 @@ use std::rc::Rc;
 
 use eidola_app_core::error::AppError;
 use gpui::{
-    AnyElement, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
-    InteractiveElement, IntoElement, IsZero, Overflow, ParentElement, Pixels, Render, ScrollHandle,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    TouchPhase, Window, div, px, rems,
+    AnyElement, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
+    FontWeight, InteractiveElement, IntoElement, IsZero, Overflow, ParentElement, Pixels, Render,
+    Role, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Task, TouchPhase, Window, div, px, rems,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditorState, MarkdownStyle};
 
 use crate::actions::CloseWindow;
+use crate::probe::Probe as _;
 use crate::space::{ChatMessageView, Space, SpaceEvent};
 use crate::stores::Stores;
 use crate::theme;
@@ -676,6 +677,23 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn hovered_post_for_test(&self) -> Option<String> {
         self.hovered_post.as_ref().map(|s| s.to_string())
+    }
+
+    /// The recovery-notice error text, if the notice is showing.
+    #[doc(hidden)]
+    pub fn error_for_test(&self) -> Option<String> {
+        self.error.clone()
+    }
+
+    /// The node id of the currently-selected leaf — where `effective_tree`
+    /// attaches the synthetic streaming node. Drives the branched-retry
+    /// regression (retry must select the failed post's branch).
+    #[doc(hidden)]
+    pub fn selected_leaf_for_test(&self, window: &Window) -> Option<String> {
+        let page_width = crate::chrome::content_size(window).width;
+        let roots = model::build_tree(&self.posts);
+        self.selected_leaf_id(&roots, page_width)
+            .map(|s| s.to_string())
     }
 
     /// A post's `(reasoning, expanded)` from the render snapshot.
@@ -1526,11 +1544,76 @@ impl SpaceView {
     /// A minimal honest error band pinned over the bottom (Phase 1 surface for a
     /// typed submit failure; onboarding is a later, separate window). Renders
     /// nothing when there's no error.
+    /// The failed-attempt **recovery notice** — a dismissible, on-theme card
+    /// attached to the bottom of the failed exchange (never a terminal wall).
+    /// It carries the error text (with a Copy affordance, since gpui text isn't
+    /// selectable here — the app's established "get this text out" idiom, cf.
+    /// onboarding's credential rows) and, when the saved user post can be
+    /// re-requested ([`Space::can_retry`]), a **Retry** action that re-runs the
+    /// ask without re-posting. Dismissing clears only the notice; the space
+    /// itself is already recovered (the composer and per-post Edit remain live),
+    /// so the user can also just keep typing a follow-up or edit their message.
     fn render_error_band(&self, cx: &Context<Self>) -> AnyElement {
         let Some(msg) = self.error.clone() else {
             return div().into_any_element();
         };
         let theme = cx.theme();
+        let can_retry = self.space.read(cx).can_retry();
+        let to_copy = msg.clone();
+
+        // A quiet text action chip (Retry / Copy), matching the app's calm
+        // hover-reveal verbs (cf. post.rs's action gutter).
+        let chip = |id: SharedString,
+                    probe: SharedString,
+                    label: &'static str,
+                    aria: SharedString,
+                    accent: bool| {
+            let base = if accent {
+                theme.danger
+            } else {
+                theme.muted_foreground
+            };
+            let hover_fg = theme.foreground;
+            let hover_bg = theme.muted;
+            h_flex()
+                .id(id)
+                .probe(probe, Role::Button, aria)
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .cursor_pointer()
+                .text_sm()
+                .text_color(base)
+                .hover(move |s| s.text_color(hover_fg).bg(hover_bg))
+                .child(label)
+        };
+
+        let mut actions = h_flex().items_center().gap_1();
+        if can_retry {
+            actions = actions.child(
+                chip(
+                    "space-error-retry".into(),
+                    "space/error/retry".into(),
+                    "Retry",
+                    "Re-request a response".into(),
+                    true,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.retry_failed(window, cx))),
+            );
+        }
+        actions = actions.child(
+            chip(
+                "space-error-copy".into(),
+                "space/error/copy".into(),
+                "Copy",
+                "Copy the error message".into(),
+                false,
+            )
+            .on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(to_copy.clone()));
+            }),
+        );
+
         div()
             .absolute()
             .bottom_0()
@@ -1540,17 +1623,81 @@ impl SpaceView {
             .justify_center()
             .p_3()
             .child(
-                div()
+                v_flex()
                     .max_w(rems(34.))
+                    .gap_2()
                     .px_4()
-                    .py_2()
+                    .py_3()
                     .rounded_lg()
-                    .bg(theme.danger.opacity(0.12))
-                    .text_color(theme.danger)
-                    .text_sm()
-                    .child(msg),
+                    .border_1()
+                    .border_color(theme.danger.opacity(0.35))
+                    .bg(theme.danger.opacity(0.1))
+                    .child(
+                        h_flex()
+                            .items_start()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(theme.danger)
+                                    .child(msg),
+                            )
+                            .child(
+                                div()
+                                    .id("space-error-dismiss")
+                                    .probe("space/error/dismiss", Role::Button, "Dismiss")
+                                    .flex_none()
+                                    .size_5()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(theme.muted_foreground)
+                                    .hover(|s| {
+                                        s.text_color(cx.theme().foreground).bg(cx.theme().muted)
+                                    })
+                                    .child("×")
+                                    .on_click(cx.listener(|this, _, _, cx| this.dismiss_error(cx))),
+                            ),
+                    )
+                    .child(actions),
             )
             .into_any_element()
+    }
+
+    /// Dismiss the recovery notice (clears the view's error state only — the
+    /// space is already recovered).
+    pub fn dismiss_error(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
+        cx.notify();
+    }
+
+    /// Re-request a response for the saved user post left behind by a failed
+    /// ask (the notice's Retry action). Clears the notice and routes through
+    /// [`Space::retry`] with the currently-resolved model; the streaming state
+    /// (and later `StreamEnded`/`Failed`) drives the rest.
+    pub fn retry_failed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let model = self.current_model(cx);
+        self.error = None;
+        let target = self.space.update(cx, |s, cx| s.retry(model, cx));
+        // Select the failed post's branch *before* the next render so the
+        // synthetic streaming node (attached at the selected leaf by
+        // `effective_tree`) appears under the post the reply will actually land
+        // on — not whatever branch the user navigated to after the failure (PR
+        // #218 review). `self.posts` still reflects the transcript (retry only
+        // adds the streaming overlay), and a persisted user-post retry target is
+        // a leaf, so selecting its path makes it the selected leaf.
+        if let Some(target) = target {
+            let page_width = crate::chrome::content_size(window).width;
+            let roots = model::build_tree(&self.posts);
+            self.select_path_to(&roots, &target, page_width);
+        }
+        self.scroll_to_tail(window, cx);
+        cx.notify();
     }
 }
 

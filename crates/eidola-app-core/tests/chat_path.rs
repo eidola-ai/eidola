@@ -812,6 +812,238 @@ fn mid_sse_abort_emits_user_turn_and_wraps_space_id() {
 }
 
 // ===========================================================================
+// Re-request (`respond_stream`): request a response to an already-persisted
+// post without re-posting — the retry entry point after a failed ask.
+// It is the `run_turn_stream(Reply)` half of `chat_stream` with no leading
+// `post`, so it shares that path's exit points / emissions (see tests/bus.rs);
+// these assert the distinguishing behavior: no duplicated user turn, and no
+// `SpaceIndex` (which is `post`'s concern, and `respond_stream` never posts).
+// ===========================================================================
+
+#[test]
+fn respond_stream_requests_response_without_reposting() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // A saved user post with no reply (exactly what a failed ask leaves).
+        let posted = core
+            .runtime()
+            .block_on(core.post("Hello, what is your name?".into(), None))
+            .expect("post should save the user turn");
+
+        // Subscribe *after* the post so only the re-request's emissions are drained.
+        let mut rx = core.subscribe_changes();
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+
+        let res = core.runtime().block_on(async {
+            let collector = async {
+                let mut content = String::new();
+                while let Some(ev) = events_rx.recv().await {
+                    if let ChatStreamEvent::ContentDelta(t) = ev {
+                        content.push_str(&t);
+                    }
+                }
+                content
+            };
+            let respond = core.respond_stream(
+                posted.space_id.clone(),
+                MODEL.into(),
+                posted.action_id.clone(),
+                tx,
+            );
+            let (res, content) = tokio::join!(respond, collector);
+            (res.expect("re-request should stream a reply"), content)
+        });
+        let (res, content) = res;
+
+        assert_eq!(res.space_id, posted.space_id);
+        assert_eq!(content, "Hello from the stream.");
+        assert_eq!(mock.chat_hits(), 1, "exactly one model call");
+
+        // The saved user turn was answered in place — user + assistant, NOT a
+        // second user turn (respond_stream does not re-post).
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(posted.space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.len(),
+            2,
+            "re-request answers the existing post, no duplicate; got {messages:?}"
+        );
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "Hello, what is your name?");
+        assert_eq!(messages[1].role, "assistant");
+
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Space(res.space_id.clone())));
+        assert!(changes.contains(&Change::Wallet), "got {changes:?}");
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        assert!(
+            !changes.contains(&Change::SpaceIndex),
+            "respond_stream never posts, so it never emits SpaceIndex; got {changes:?}"
+        );
+    });
+}
+
+#[test]
+fn respond_stream_failure_wraps_space_id_and_keeps_single_post() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::Non2xx(503),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let posted = core
+            .runtime()
+            .block_on(core.post("Hello, what is your name?".into(), None))
+            .expect("post should save the user turn");
+
+        let mut rx = core.subscribe_changes();
+        let (tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+
+        let err = core
+            .runtime()
+            .block_on(core.respond_stream(
+                posted.space_id.clone(),
+                MODEL.into(),
+                posted.action_id.clone(),
+                tx,
+            ))
+            .expect_err("non-2xx re-request should fail");
+
+        // Wrapped with the (already-known) space id so the GUI routes it the
+        // same way a failed ask is routed.
+        assert_eq!(
+            err.chat_space_id().expect("space id"),
+            posted.space_id,
+            "failure carries the space id"
+        );
+        match err.root() {
+            AppError::Server { status, .. } => assert_eq!(*status, 503),
+            other => panic!("expected Server(503), got {other:?}"),
+        }
+
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        assert!(
+            changes.contains(&Change::Space(posted.space_id.clone())),
+            "got {changes:?}"
+        );
+        assert!(changes.contains(&Change::Wallet), "got {changes:?}");
+        assert!(
+            !changes.contains(&Change::SpaceIndex),
+            "no SpaceIndex on a re-request (post's concern); got {changes:?}"
+        );
+
+        // No assistant turn persisted, and still exactly one user turn.
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(posted.space_id))
+            .expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+    });
+}
+
+// ===========================================================================
+// Setup-failure wrapping: a `prepare_turn` failure (e.g. the `/v1/models`
+// fetch the PR #218 screenshot failed on) happens *before* the turn's inline
+// `wrap` closure — it must still carry the persisted space id, or a blank
+// GUI space can't adopt its id (Retry suppressed; a follow-up strands a
+// second space). Both transports share the fix (the wrapped prepare_turn
+// call), so both are asserted.
+// ===========================================================================
+
+#[test]
+fn streaming_setup_failure_wraps_space_id_and_keeps_single_space() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            // The chat behavior never matters — we fail earlier, in prepare_turn's
+            // `/v1/models` fetch.
+            models_status: Some(503),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let (tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        // A blank window (space_id None) — post persists the space, then the
+        // models fetch fails inside prepare_turn.
+        let err = core
+            .runtime()
+            .block_on(core.chat_stream("Hello, what is your name?".into(), MODEL.into(), None, tx))
+            .expect_err("models-fetch failure should fail the turn");
+
+        // The persisted space id is carried even though the failure was pre-wrap.
+        let space_id = err
+            .chat_space_id()
+            .expect("setup failure must carry the space id")
+            .to_string();
+
+        // The user post survived (post ran before prepare_turn) — exactly one
+        // space with exactly one user turn, retryable rather than stranded.
+        let spaces = core
+            .runtime()
+            .block_on(core.list_spaces(false))
+            .expect("spaces");
+        assert_eq!(spaces.len(), 1, "one space, not a stranded pair");
+        assert_eq!(spaces[0].id, space_id);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id.clone()))
+            .expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+
+        // post emitted Space+SpaceIndex; the pre-wrap setup failure itself emits
+        // nothing further (no request row, no spend).
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Space(space_id.clone())));
+        assert!(changes.contains(&Change::SpaceIndex));
+        assert!(
+            !changes.contains(&Change::Record),
+            "no request row on a models-fetch failure; got {changes:?}"
+        );
+        assert!(
+            !changes.contains(&Change::Wallet),
+            "no spend started before the models fetch; got {changes:?}"
+        );
+    });
+}
+
+#[test]
+fn blocking_setup_failure_wraps_space_id() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            models_status: Some(503),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // The blocking `chat` shares the same wrapped prepare_turn call.
+        let err = core
+            .runtime()
+            .block_on(core.chat("boom".into(), MODEL.into(), None))
+            .expect_err("models-fetch failure should fail the turn");
+        let space_id = err
+            .chat_space_id()
+            .expect("blocking setup failure must carry the space id")
+            .to_string();
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "user turn persisted; no assistant reply");
+    });
+}
+
+// ===========================================================================
 // Refund-recovery variants: succeed vs fail on the non-2xx path
 // ===========================================================================
 

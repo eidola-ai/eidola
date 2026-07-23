@@ -30,6 +30,7 @@
 //!
 //! | Exit point | Writes committed | Emissions | Tested here |
 //! |---|---|---|---|
+//! | `prepare_turn` setup failure (client build / `/v1/models` fetch / attestation flush) — *before* the turn's inline `wrap` | The posted user turn (post committed it) | `Space(id)`, `SpaceIndex` (from post); **error wraps the space id** via the call-site `into_chat_failed` | `chat_path.rs` (`streaming_setup_failure_wraps_space_id_and_keeps_single_space`, `blocking_setup_failure_wraps_space_id`) — these exits used to escape unwrapped, suppressing the GUI's Retry and stranding a second space (PR #218 review) |
 //! | Funding failure at request time (`NoAccount`, `InsufficientBalance`, zero-charge) | The posted user turn (post committed it) | `Space(id)`, `SpaceIndex` (from post); error wraps the space id | `chat_path.rs` (`no_account_persists_post_*`, `insufficient_balance_persists_post_*`) — root() still routes onboarding; the post survives |
 //! | `chat`/`chat_stream` — `insert_pre_credential_refund` succeeds, later step fails | Credential in `spending` state | `Wallet` | `chat_path.rs` (every post-send failure test asserts `Wallet`; the failed-recovery test asserts the credential stays `spending`) |
 //! | `chat`/`chat_stream` — network-error arm (`send` `Err`), `process_refund` `Ok` | Successor credential + user turn | `Wallet`, `Space(id)`, `SpaceIndex`? | `chat_path.rs` (`network_error_after_send_*`; the non-2xx-with-recovery test covers the recovered-successor `Wallet`) |
@@ -45,6 +46,17 @@
 //! auto-title); `run_turn` never emits it. Plain `?` on intervening local-DB
 //! action/content/antecedent inserts stays *unemitted* — internal-consistency
 //! (kill-`-9`-class) failures, not durable partial state to reconcile.
+//!
+//! **Re-request (`respond_stream`).** The GUI's failed-ask "Retry" path calls
+//! `AppCore::respond_stream`, which is exactly the `run_turn_stream(Reply)` half
+//! of `chat_stream` with **no leading `post`** — it requests a response to an
+//! already-persisted user post. So it hits every `run_turn`/`chat_stream` row
+//! above *except* the post-owned `SpaceIndex?` column (it never posts, so it
+//! never emits `SpaceIndex`), and its failures are still wrapped with the
+//! already-known space id. Executed in `chat_path.rs`
+//! (`respond_stream_requests_response_without_reposting`,
+//! `respond_stream_failure_wraps_space_id_and_keeps_single_post`), which assert
+//! the no-duplicate-post and no-`SpaceIndex` distinctions.
 //!
 //! **Local turns (`local/<slug>` models).** `prepare_turn` routes these to the
 //! loopback llama.cpp engine with `TurnPrep.spend = None`: no credential is

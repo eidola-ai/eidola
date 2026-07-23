@@ -147,6 +147,26 @@ impl AppError {
             _ => None,
         }
     }
+
+    /// Wrap `self` as [`AppError::ChatFailed`] carrying `space_id`, **unless it
+    /// is already a `ChatFailed` wrapper** (idempotent — the innermost space id,
+    /// stamped where the failure actually occurred, wins). This guarantees that
+    /// *every* error out of a request against an already-persisted space carries
+    /// that space's id — including the early `prepare_turn` setup failures
+    /// (client build / `/v1/models` fetch / attestation flush) that happen
+    /// before the turn's own inline `wrap` closure exists. Without it, those
+    /// setup errors escaped unwrapped, so a blank GUI `Space` could not adopt
+    /// its id and its "Retry" affordance was suppressed while a follow-up could
+    /// silently create a second space (PR #218 review).
+    pub fn into_chat_failed(self, space_id: &str) -> AppError {
+        match self {
+            AppError::ChatFailed { .. } => self,
+            other => AppError::ChatFailed {
+                space_id: space_id.to_string(),
+                source: Box::new(other),
+            },
+        }
+    }
 }
 
 fn format_error_chain(e: &reqwest::Error) -> String {

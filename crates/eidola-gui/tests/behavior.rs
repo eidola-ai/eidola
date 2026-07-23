@@ -1806,13 +1806,22 @@ fn record_marks_stale_on_record_change_and_refresh_clears(cx: &mut TestAppContex
 fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
     // A real `AppCore` over tempdirs (the Record queries are local-DB reads),
     // mirroring `tests/stores.rs::test_core`. `_dir` keeps the tempdir alive.
+    // The RecordView's page fetches run as spawned tasks on the AppCore's own
+    // tokio runtime (each holding an `Arc<AppCore>`), so declare that
+    // cross-thread mixing to the test scheduler — the established idiom (see
+    // `tests/stores.rs`), which also lets us join those tasks below without the
+    // non-determinism detector flagging their cross-thread completion wakes.
+    cx.executor().allow_parking();
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let _dir = tempfile::tempdir().unwrap();
-    let core = AppCore::new(_dir.path().to_path_buf(), _dir.path().join("data"));
+    let core = std::sync::Arc::new(AppCore::new(
+        _dir.path().to_path_buf(),
+        _dir.path().join("data"),
+    ));
     core.runtime()
         .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
         .unwrap();
-    let stores = cx.update(|cx| Stores::for_test(std::sync::Arc::new(core), cx));
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
     let (_window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| RecordView::new(stores.clone(), window, cx))
     });
@@ -1838,6 +1847,23 @@ fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
              superseded task was cancelled at replacement"
         );
     });
+
+    // Deterministic teardown — join every in-flight bridge task before the test
+    // returns. Each page fetch (including the one `refresh` superseded, which is
+    // *orphaned* on the tokio side once its gpui receiver is dropped, so no
+    // `run_until_parked` ever drains it) holds an `Arc<AppCore>` until it
+    // finishes on a tokio worker. The store entities keep the AppCore alive
+    // until `cx` teardown on this thread, but if a bridge task is still running
+    // then, it becomes the *last* owner and drops the tokio runtime from within
+    // its own worker → "Cannot drop a runtime ... from within an asynchronous
+    // context" — the intermittent CI panic (Linux-scheduler-sensitive; a local
+    // DB read almost always finishes first on macOS, so this never reproduced
+    // here). Waiting until the runtime is idle guarantees the last `Arc` always
+    // drops on the test thread. This is a precise join on the runtime's live
+    // task count, not a timed sleep, and does not touch the assertions above.
+    while core.runtime().metrics().num_alive_tasks() > 0 {
+        std::thread::yield_now();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3154,6 +3180,231 @@ fn space_edit_buffer_survives_transcript_sync(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Failed-ask recovery — the space must never brick on a failed request. A
+// failure surfaces a *dismissible* recovery notice, and all three recovery
+// paths (edit the message, re-request a response, add a follow-up) stay live.
+// ---------------------------------------------------------------------------
+
+/// Seed a space with a single saved user post (a1, no reply) — exactly what a
+/// failed ask leaves behind — then drive a post-persist failure through the
+/// shared mutation-failure completion (as `spawn_stream`'s error arm does),
+/// so the view's recovery notice appears.
+fn seed_failed_ask(view: &Entity<SpaceView>, window: AnyWindowHandle, cx: &mut TestAppContext) {
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![fixture_user_post("a1", "Hello, what is your name?")],
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    let wrapped = AppError::ChatFailed {
+        space_id: "s".into(),
+        source: Box::new(AppError::Network {
+            message: "dns error: failed to look up address".into(),
+        }),
+    };
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.apply_chat_failure_for_test(wrapped, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn space_failed_ask_notice_is_dismissible(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_failed_ask(&view, window, cx);
+
+    // The failure surfaced the recovery notice (with the source's text).
+    view.read_with(cx, |v, _| {
+        let msg = v
+            .error_for_test()
+            .expect("a failure shows the recovery notice");
+        assert!(msg.contains("dns error"), "notice carries the error: {msg}");
+    });
+
+    // Dismissing clears only the notice — the space is untouched.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.dismiss_error(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(v.error_for_test().is_none(), "notice dismissed");
+        assert_eq!(v.post_count_for_test(), 1, "the saved post remains");
+        assert!(!v.space().read(cx).is_streaming());
+    });
+}
+
+#[gpui::test]
+fn space_failed_ask_can_edit_original(cx: &mut TestAppContext) {
+    // Recovery path 1: the failed ask's saved user post is still editable.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_failed_ask(&view, window, cx);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.editing_action_id_for_test(),
+            Some("a1".to_string()),
+            "a failed ask does not block editing the original message"
+        );
+    });
+    let editor = view
+        .read_with(cx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post's body editor exists");
+    cx.update_window(window, |_, window, cx| {
+        editor.update(cx, |e, cx| {
+            e.set_value("Actually, who are you?".to_string(), cx)
+        });
+        view.update(cx, |v, cx| v.commit_edit(window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.editing_action_id_for_test(),
+            None,
+            "the edit committed (stub Space::edit accepts)"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_failed_ask_can_re_request(cx: &mut TestAppContext) {
+    // Recovery path 2: re-request a response against the saved user post — the
+    // notice's Retry action, routed through `Space::retry` (no re-post).
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_failed_ask(&view, window, cx);
+
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.space().read(cx).can_retry(),
+            "a saved user post with no reply can be re-requested"
+        );
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.retry_failed(window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(v.error_for_test().is_none(), "retry clears the notice");
+        assert!(
+            v.space().read(cx).is_streaming(),
+            "retry re-enters the streaming state (a real send would request a response)"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_failed_ask_can_add_followup(cx: &mut TestAppContext) {
+    // Recovery path 3: a normal follow-up at the tail composer still works.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_failed_ask(&view, window, cx);
+
+    // The tail composer reappeared at the leaf a1 after the failure.
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.draft_parents_for_test().contains(&Some("a1".to_string())),
+            "a docked tail draft sits at the leaf a1 after a failed ask"
+        );
+    });
+
+    // Typing a follow-up and Ask-ing it is accepted (not bricked).
+    open_space_draft(&view, window, cx, Some("a1"));
+    set_space_composer_text(&view, window, cx, "never mind — how are you?");
+    dispatch_space_action(&view, window, cx, Send);
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "the follow-up draft was consumed"
+        );
+        assert!(
+            v.space().read(cx).is_streaming(),
+            "the follow-up entered the streaming state"
+        );
+        assert_eq!(
+            v.space().read(cx).messages().len(),
+            2,
+            "the follow-up appended a second user turn"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_failed_ask_retry_selects_the_failed_posts_branch(cx: &mut TestAppContext) {
+    // PR #218 review (comment 2): in a branched space, Retry must select the
+    // failed post's branch before streaming, so the response streams under the
+    // right post — not whatever branch is currently selected (which would
+    // stream under the wrong post until the DB reload snapped it over).
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // a1 (user root) with two replies: a2 (assistant) is the default-selected
+    // spine leaf; a3 (user) is a second branch — a saved user post awaiting a
+    // reply (the failed ask). `retry_target` = last user post in DFS = a3.
+    let mut a2 = fixture_assistant_post("a2", "an answer");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "the failed ask");
+    a3.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "root"), a2, a3], cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    // Default selection is the first branch (a2), NOT the retry target (a3).
+    let before = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_leaf_for_test(window)
+        })
+        .unwrap();
+    assert_eq!(
+        before.as_deref(),
+        Some("a2"),
+        "default selected leaf is the spine branch, not the failed post"
+    );
+    view.read_with(cx, |v, cx| {
+        assert!(v.space().read(cx).can_retry());
+        assert_eq!(v.space().read(cx).retry_target().as_deref(), Some("a3"));
+    });
+
+    // Retry re-selects the failed post's branch, so the streaming node attaches
+    // under a3.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.retry_failed(window, cx));
+    })
+    .unwrap();
+    let after = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_leaf_for_test(window)
+        })
+        .unwrap();
+    assert_eq!(
+        after.as_deref(),
+        Some("a3"),
+        "retry selects the failed post's branch so streaming attaches under it"
+    );
+    view.read_with(cx, |v, cx| assert!(v.space().read(cx).is_streaming()));
 }
 
 #[gpui::test]

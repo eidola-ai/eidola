@@ -319,6 +319,56 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+#[gpui::test]
+fn space_error_notice_exposes_recovery_probes(cx: &mut TestAppContext) {
+    // After a failed ask, the recovery notice exposes its three affordances
+    // (Retry / Copy / Dismiss) as probes — the driver click targets and the
+    // AccessKit annotations.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+
+    // Seed a saved user post, then drive a wrapped post-persist failure (which
+    // adopts the space id, so the tail user post is re-requestable → Retry
+    // renders alongside Copy / Dismiss).
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "Hello, what is your name?")], cx)
+        });
+        space.update(cx, |s, cx| {
+            s.apply_chat_failure_for_test(
+                eidola_app_core::error::AppError::ChatFailed {
+                    space_id: "s".into(),
+                    source: Box::new(eidola_app_core::error::AppError::Network {
+                        message: "dns error".into(),
+                    }),
+                },
+                cx,
+            )
+        });
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    for expected in [
+        "space/error/dismiss",
+        "space/error/copy",
+        "space/error/retry",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "{expected} probe missing; recorded: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
 fn probe_post(action_id: &str, text: &str) -> PostNode {
     PostNode {
         action_id: action_id.into(),
