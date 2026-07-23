@@ -439,6 +439,35 @@ impl MarkdownEditorState {
         self.extend_selection_to(offset, cx);
     }
 
+    /// Diagnostic seam: the recorded (window-coordinate) line geometry from
+    /// the last paint — `(block_index, [(origin_x, origin_y, wrapped_height)])`
+    /// per block, sorted by block index.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn debug_line_geometry(&self) -> Vec<(usize, Vec<(f32, f32, f32)>)> {
+        let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|k| {
+                let block = &self.last_blocks[&k];
+                (
+                    k,
+                    block
+                        .lines
+                        .iter()
+                        .map(|l| {
+                            (
+                                l.origin.x.as_f32(),
+                                l.origin.y.as_f32(),
+                                l.wrapped_height.as_f32(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     /// True when the buffer is empty (after trimming) — the common host check
     /// for "is there anything to submit?".
     pub fn is_empty(&self) -> bool {
@@ -616,7 +645,16 @@ impl MarkdownEditorState {
         // start of the next row, and an edit's caret prefers the lower row.
         self.wrap_affinity = WrapAffinity::Downstream;
         let before = std::mem::take(&mut self.state);
-        self.state = update::update(before.clone(), event);
+        // A read-only editor's events (selection, navigation, select-all) must
+        // never rewrite the buffer: the host owns the document, and the
+        // canonicalization passes belong to editing. Routing through the
+        // readonly update keeps the buffer byte-identical to what the host
+        // seeded (see `update::update_readonly`).
+        self.state = if self.disabled {
+            update::update_readonly(before.clone(), event)
+        } else {
+            update::update(before.clone(), event)
+        };
         self.marked_range = None;
         // Compare the buffer across the update so selection-only events
         // (Move*/Extend*/SetSelection) don't push an undo step or count

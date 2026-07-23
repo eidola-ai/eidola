@@ -271,6 +271,26 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_structured",
+                description: "Space view: a branched space whose spine reply is markdown-heavy (tables, nested lists, quote, rules) — structural repro of a user-reported selection failure",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.set_post_tree_for_test(structured_posts(), cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_branches",
                 description: "Space view: a branched post tree with docked tail drafts (kitchen-sink fixture)",
                 default_size: size(px(900.), px(700.)),
@@ -636,6 +656,253 @@ mod driver {
                           is the warm red-orange of a low sun."
                     .into(),
             },
+        ]
+    }
+
+    /// Placeholder prose of roughly `n` bytes (word-salad, never real user
+    /// text) — used by [`structured_posts`] to mirror a real post's *markdown
+    /// structure* without its content.
+    fn lorem(n: usize) -> String {
+        const WORDS: &[&str] = &[
+            "lorem",
+            "ipsum",
+            "dolor",
+            "sit",
+            "amet",
+            "consetetur",
+            "sadipscing",
+            "elitr",
+            "sed",
+            "diam",
+            "nonumy",
+            "eirmod",
+            "tempor",
+            "invidunt",
+            "ut",
+            "labore",
+            "et",
+            "dolore",
+            "magna",
+            "aliquyam",
+            "erat",
+        ];
+        let mut out = String::new();
+        let mut i = 0;
+        while out.len() < n {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(WORDS[i % WORDS.len()]);
+            i += 1;
+        }
+        out.truncate(n);
+
+        out.trim_end().to_string()
+    }
+
+    /// A `PostNode` tree mirroring the *structure* of a real user-reported
+    /// space where in-view selection failed on certain posts: a branched root
+    /// (two replies — spine + branch) whose spine reply is markdown-heavy
+    /// (headings, rules, nested lists, a long blockquote, bold + inline code,
+    /// and a trailing table). All text is placeholder.
+    fn structured_posts() -> Vec<eidola_app_core::PostNode> {
+        let post = |action_id: &str,
+                    kind: &str,
+                    label: &str,
+                    atype: &str,
+                    depth: usize,
+                    is_branch: bool,
+                    parent: Option<&str>,
+                    content: String,
+                    at: i64|
+         -> eidola_app_core::PostNode {
+            let mut n = fixtures::fixture_post(
+                action_id, kind, label, atype, &content, depth, is_branch, 1,
+            );
+            n.parent_action_id = parent.map(String::from);
+            n.relation = parent.map(|_| "reply".to_string());
+            n.created_at = at;
+            n
+        };
+
+        // The markdown-heavy spine reply (line-structure mirror of the real
+        // failing post: paragraphs, ---, ##/###, tight heading→para, bulleted
+        // lists with bold lead-ins + inline code, a para immediately followed
+        // by a long quote, nested ordered list, and a 3-column table).
+        let mut big = String::new();
+        big.push_str(&format!("{}\n\n", lorem(319)));
+        big.push_str(&format!(
+            "{} **{}** {}\n\n",
+            lorem(120),
+            lorem(20),
+            lorem(158)
+        ));
+        big.push_str(&format!(
+            "{}\n\n---\n\n## {}\n\n{}\n\n",
+            lorem(229),
+            lorem(52),
+            lorem(123)
+        ));
+        big.push_str(&format!("### {}\n{}\n\n", lorem(48), lorem(150)));
+        for len in [140usize, 160, 220, 90] {
+            big.push_str(&format!(
+                "- **{}:** {} `{}` {}\n",
+                lorem(14),
+                lorem(len / 2),
+                lorem(8),
+                lorem(len / 2)
+            ));
+        }
+        big.push('\n');
+        big.push_str(&format!(
+            "**{}:**\n> {} `{}` {} `{}` {}\n\n",
+            lorem(8),
+            lorem(160),
+            lorem(10),
+            lorem(140),
+            lorem(9),
+            lorem(100)
+        ));
+        big.push_str(&format!("### {}\n{}\n\n", lorem(56), lorem(115)));
+        big.push_str(&format!("- **{}:** {}\n", lorem(10), lorem(60)));
+        for len in [55usize, 90, 85] {
+            big.push_str(&format!("    1. **{}:** {}\n", lorem(8), lorem(len)));
+        }
+        big.push_str(&format!("- **{}:** {}\n", lorem(10), lorem(155)));
+        big.push_str(&format!(
+            "    - {}\n    - **{}:** {}\n\n",
+            lorem(170),
+            lorem(9),
+            lorem(95)
+        ));
+        big.push_str(&format!(
+            "### {}\n{} **{}** {} **{}** {}\n\n---\n\n",
+            lorem(20),
+            lorem(90),
+            lorem(15),
+            lorem(90),
+            lorem(14),
+            lorem(80)
+        ));
+        big.push_str(&format!("## {}\n\n{}\n\n", lorem(48), lorem(115)));
+        for (h, p, l1, l2) in [
+            (64usize, 131usize, 270usize, 225usize),
+            (67, 128, 230, 265),
+            (41, 154, 325, 0),
+        ] {
+            big.push_str(&format!("### {}\n{}\n\n", lorem(h), lorem(p)));
+            big.push_str(&format!(
+                "- **{}:** {} `{}` {}\n",
+                lorem(12),
+                lorem(l1 / 2),
+                lorem(6),
+                lorem(l1 / 2)
+            ));
+            if l2 > 0 {
+                big.push_str(&format!("- **{}:** {}\n", lorem(12), lorem(l2)));
+            }
+            big.push('\n');
+        }
+        big.push_str(&format!("## {}\n\n", lorem(12)));
+        big.push_str(&format!(
+            "| {} | {} | {} |\n| --- | --- | --- |\n",
+            lorem(8),
+            lorem(12),
+            lorem(14)
+        ));
+        for _ in 0..5 {
+            big.push_str(&format!(
+                "| **{}** | {} | {} |\n",
+                lorem(12),
+                lorem(48),
+                lorem(52)
+            ));
+        }
+        let big = big.trim_end().to_string();
+
+        vec![
+            // Root: a three-line, two-paragraph user question.
+            post(
+                "s1",
+                "human",
+                "You",
+                "user_input",
+                0,
+                false,
+                None,
+                format!("{}\n\n{}", lorem(212), lorem(205)),
+                1,
+            ),
+            // Spine: the markdown-heavy reply, then a short follow-up exchange.
+            post(
+                "s2",
+                "agent",
+                "gemma",
+                "inference",
+                0,
+                false,
+                Some("s1"),
+                big,
+                2,
+            ),
+            post(
+                "s3",
+                "human",
+                "You",
+                "user_input",
+                0,
+                false,
+                Some("s2"),
+                lorem(61),
+                3,
+            ),
+            post(
+                "s4",
+                "agent",
+                "gemma",
+                "inference",
+                0,
+                false,
+                Some("s3"),
+                format!(
+                    "{}\n\n1. **{}:** {}\n2. **{}:** {}\n3. **{}:** {}\n4. **{}:** {}\n5. **{}:** {}",
+                    lorem(48),
+                    lorem(10),
+                    lorem(165),
+                    lorem(10),
+                    lorem(200),
+                    lorem(10),
+                    lorem(195),
+                    lorem(10),
+                    lorem(195),
+                    lorem(10),
+                    lorem(215),
+                ),
+                4,
+            ),
+            // Branch off the root: a tiny aside exchange.
+            post(
+                "s5",
+                "human",
+                "You",
+                "user_input",
+                1,
+                true,
+                Some("s1"),
+                lorem(18),
+                5,
+            ),
+            post(
+                "s6",
+                "agent",
+                "gemma",
+                "inference",
+                1,
+                false,
+                Some("s5"),
+                lorem(77),
+                6,
+            ),
         ]
     }
 

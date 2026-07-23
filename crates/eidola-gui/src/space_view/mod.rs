@@ -221,6 +221,17 @@ pub struct SpaceView {
     /// One read-only markdown-editor state per persisted post, keyed by node id.
     /// Posts render `disabled` so they're pixel-identical to the composer.
     pub(crate) bodies: HashMap<SharedString, Entity<MarkdownEditorState>>,
+    /// The post content each body editor was last seeded with, keyed like
+    /// [`Self::bodies`]. `sync_bodies` re-seeds an editor only when the
+    /// *post's* content changes (edit/regenerate replacing it in place) —
+    /// never because the editor's live buffer differs from the post. Comparing
+    /// against the buffer instead (the previous behavior) turned any
+    /// buffer-vs-source divergence into a per-frame `set_value` reset loop
+    /// that made selection impossible on the affected post. The editor no
+    /// longer rewrites read-only buffers at all (`update_readonly`), so this
+    /// is defense in depth: if a divergence ever reappears, it must not
+    /// escalate into a frame loop.
+    pub(crate) body_seeds: HashMap<SharedString, SharedString>,
     /// A read-only editor synced to the live streaming partial each frame.
     pub(crate) streaming_body: Entity<MarkdownEditorState>,
     /// Last value pushed into `streaming_body`, to skip redundant re-parses.
@@ -420,6 +431,7 @@ impl SpaceView {
             _subs,
             posts: Vec::new(),
             bodies: HashMap::new(),
+            body_seeds: HashMap::new(),
             streaming_body,
             streaming_synced: String::new(),
             drafts: Vec::new(),
@@ -831,14 +843,17 @@ impl SpaceView {
             let content = self.posts[i].content.clone();
             match self.bodies.get(&id) {
                 Some(editor) => {
-                    // Keep an existing editor in sync if its content changed
-                    // (an edit/regenerate replaced the post in place) — but
-                    // never clobber the editor holding an in-progress inline
-                    // edit: its divergence from the persisted content *is* the
-                    // edit.
+                    // Re-seed an existing editor only when the *post's*
+                    // content changed (an edit/regenerate replaced it in
+                    // place) — compared against what we last seeded, never
+                    // against the editor's live buffer (see `body_seeds`) —
+                    // and never clobber the editor holding an in-progress
+                    // inline edit: its divergence from the persisted content
+                    // *is* the edit.
                     let is_editing = self.editing.as_ref().map(|e| &e.node_id) == Some(&id);
-                    if !is_editing && editor.read(cx).value() != content.as_ref() {
+                    if !is_editing && self.body_seeds.get(&id) != Some(&content) {
                         editor.update(cx, |e, cx| e.set_value(content.to_string(), cx));
+                        self.body_seeds.insert(id.clone(), content);
                     }
                 }
                 None => {
@@ -848,10 +863,12 @@ impl SpaceView {
                         s
                     });
                     self.bodies.insert(id.clone(), editor);
+                    self.body_seeds.insert(id.clone(), content);
                 }
             }
         }
         self.bodies.retain(|id, _| live.contains(id));
+        self.body_seeds.retain(|id, _| live.contains(id));
         // An edit session whose post vanished (transcript reshaped under it)
         // has nothing to commit into — drop it with the editor.
         if let Some(ed) = &self.editing
