@@ -813,12 +813,7 @@ impl SpaceView {
         if let Some(model) = self.space.read(cx).selected_model() {
             return model.to_string();
         }
-        self.stores
-            .config
-            .read(cx)
-            .state()
-            .map(|s| s.default_model.clone())
-            .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string())
+        self.stores.config.read(cx).default_model()
     }
 
     /// React to a semantic `SpaceEvent`: re-snapshot + re-render, surface a

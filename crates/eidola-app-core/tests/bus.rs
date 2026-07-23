@@ -891,6 +891,59 @@ fn template_crud_emits_templates() {
     });
 }
 
+/// A failed `update_template` (participant replacement rejected) emits nothing
+/// and leaves the template's participants unchanged — the emit-after-commit
+/// contract at the AppCore boundary (the atomic rollback itself is covered in
+/// `db.rs`'s `update_template_tx_rolls_back_on_failure`).
+#[test]
+fn failed_template_update_emits_nothing_and_preserves_participants() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let tmpl = core
+            .runtime()
+            .block_on(core.create_template(
+                "Keep".into(),
+                4,
+                vec![eidola_app_core::NewTemplateParticipant {
+                    label: "Original".into(),
+                    model_ref: Some("gemma4-31b".into()),
+                    notify_policy: "human".into(),
+                    ..Default::default()
+                }],
+            ))
+            .unwrap();
+
+        let mut rx = core.subscribe_changes();
+        // An invalid notify_policy is rejected; no write, no emit.
+        let err = core.runtime().block_on(core.update_template(
+            tmpl.id.clone(),
+            Some("Renamed".into()),
+            Some(9),
+            Some(vec![eidola_app_core::NewTemplateParticipant {
+                label: "Replacement".into(),
+                model_ref: Some("kimi-k2-6".into()),
+                notify_policy: "sometimes".into(),
+                ..Default::default()
+            }]),
+        ));
+        assert!(err.is_err(), "invalid notify_policy must fail the update");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "a failed template update must emit nothing"
+        );
+
+        // The template still has its original participant and title.
+        let templates = core
+            .runtime()
+            .block_on(core.list_space_templates())
+            .unwrap();
+        let t = templates.iter().find(|t| t.id == tmpl.id).unwrap();
+        assert_eq!(t.title, "Keep");
+        assert_eq!(t.participants.len(), 1);
+        assert_eq!(t.participants[0].label, "Original");
+    });
+}
+
 #[test]
 fn template_from_space_projects_and_emits_templates() {
     run_in_thread(|| {

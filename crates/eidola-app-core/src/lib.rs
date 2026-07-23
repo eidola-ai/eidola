@@ -48,18 +48,12 @@ pub use local_models::{
 /// [`AppCore::eidola_trust`].
 #[derive(Clone, Debug)]
 pub struct ConfigState {
-    /// The resolved default inference model — **transitional (wave 1)**. The
-    /// `default_model` config key is gone (Participants v1); this is now
-    /// *resolved from* the default space template's first agent participant's
-    /// `model_ref` (falling back to [`config::DEFAULT_MODEL`]). It stays here
-    /// so the model-picker flow keeps working through waves 1–2 while
-    /// `run_turn` still takes a model; wave 3 replaces the picker with the
-    /// participant/template surfaces. There is no `set_default_model` — the
-    /// model lives on the template's participant.
-    pub default_model: String,
     /// The UUID of the default space template new spaces are instantiated from
     /// (the `default_template` config key; the seeded "Default" template's id
-    /// by default).
+    /// by default). The transitional resolved default *model* is **not** on
+    /// this (config-backed, DB-free) snapshot — it reads the DB, so it is the
+    /// async [`AppCore::default_model`] instead (a nested `block_on` in
+    /// `config_state` panicked when called from inside the core runtime).
     pub default_template: String,
     pub has_account: bool,
     pub has_account_secret: bool,
@@ -2200,32 +2194,20 @@ impl Inner {
             });
         }
         let now = now_ms();
-        if title.is_some() || cascade_limit.is_some() {
-            db::update_space_template(&conn, id, title.as_deref(), cascade_limit).await?;
-        }
-        if let Some(validated) = validated {
-            // Replace the template's OWNED agents (references to globals, if
-            // any, are managed separately and left intact).
-            db::delete_template_owned_participants(&conn, id).await?;
-            for (label, model_ref, system_prompt, policy) in &validated {
-                db::insert_participant(
-                    &conn,
-                    &Uuid::now_v7().to_string(),
-                    "template",
-                    None,
-                    Some(id),
-                    "agent",
-                    label,
-                    model_ref.as_deref(),
-                    system_prompt.as_deref(),
-                    policy,
-                    "member",
-                    None,
-                    now,
-                )
-                .await?;
-            }
-        }
+        // Settings-update + owned-participant replacement run in ONE transaction
+        // (`db::update_template_tx`): a concurrent `instantiate_template` can
+        // never observe a half-rebuilt agent set, and an insert error rolls the
+        // whole thing back leaving the prior state intact — so the emit below
+        // fires only after a committed change (changes.rs emit-after-commit).
+        db::update_template_tx(
+            &conn,
+            id,
+            title.as_deref(),
+            cascade_limit,
+            validated.as_deref(),
+            now,
+        )
+        .await?;
         self.bus.emit(Change::Templates);
         Ok(())
     }
@@ -3653,19 +3635,14 @@ impl AppCore {
     // Config — sync methods (no runtime needed, delegate directly)
     // -----------------------------------------------------------------------
 
+    /// A synchronous, purely config-backed snapshot (no DB, no runtime
+    /// re-entry) — safe to call from any thread, **including from inside the
+    /// core runtime** (the CLI calls it within `runtime().block_on(run(..))`).
+    /// The transitional resolved default model is **not** here (it reads the
+    /// DB); callers that need it use the async [`AppCore::default_model`].
     pub fn config_state(&self) -> ConfigState {
         let cfg = self.inner.load_config();
-        // `default_model` is resolved from the default template's agent
-        // (transitional — see `ConfigState::default_model`); it reads the DB,
-        // so block on the core runtime off the caller's thread. config_state is
-        // always called from outside the runtime (GUI store thread, CLI, tests).
-        let inner = self.inner.clone();
-        let default_model = self
-            .runtime
-            .block_on(async move { inner.resolve_default_model().await })
-            .unwrap_or_else(|_| config::DEFAULT_MODEL.to_string());
         ConfigState {
-            default_model,
             default_template: cfg.default_template().to_string(),
             has_account: cfg.account_id.is_some(),
             has_account_secret: cfg.account_secret.is_some(),
@@ -3676,6 +3653,21 @@ impl AppCore {
             light_character: cfg.light_character(),
             font_scale: cfg.font_scale(),
         }
+    }
+
+    /// The transitional resolved default inference model (see the
+    /// `default_model` note in the docs): the default template's first agent
+    /// participant's `model_ref`, falling back to [`config::DEFAULT_MODEL`].
+    /// Async because it reads the DB — this is the panic-free replacement for
+    /// the old DB-in-`config_state` resolution, consistent with the rest of
+    /// AppCore's async surface. UIs cache the value and refresh it on
+    /// `Change::Config` / `Change::Templates`.
+    pub async fn default_model(&self) -> Result<String, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.resolve_default_model().await })
+            .await
+            .map_err(join_err)?
     }
 
     /// The eidola backend's resolved connection + trust bundle (base URL,
@@ -5739,12 +5731,35 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let core = AppCore::new(config_dir.clone(), data_dir.clone());
-        // Fresh install: the resolved default_model comes from the seeded
-        // Default template's agent participant (= DEFAULT_MODEL), and the
-        // default_template is the seeded id.
-        let state = core.config_state();
-        assert_eq!(state.default_model, config::DEFAULT_MODEL);
-        assert_eq!(state.default_template, config::DEFAULT_TEMPLATE_ID);
+        // Fresh install: default_template is the seeded id, and the async
+        // default_model resolves from the seeded template's agent (= DEFAULT_MODEL).
+        assert_eq!(
+            core.config_state().default_template,
+            config::DEFAULT_TEMPLATE_ID
+        );
+        let model = core.runtime().block_on(core.default_model()).unwrap();
+        assert_eq!(model, config::DEFAULT_MODEL);
+    }
+
+    /// Regression for the nested-runtime panic (PR #221 review): the CLI runs
+    /// `runtime().block_on(run(..))` and inside `run` calls `config_state()`
+    /// (no-subcommand + `chat` without `--model`). config_state must be
+    /// runtime-safe, and default_model resolution must work via `.await`
+    /// inside that context — not a nested `block_on` ("Cannot start a runtime
+    /// from within a runtime").
+    #[test]
+    fn config_state_and_default_model_are_safe_inside_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = AppCore::new(dir.path().to_path_buf(), dir.path().join("data"));
+        // Exactly the CLI's shape: sync config_state() + awaited default_model()
+        // driven from within the core runtime.
+        let (tmpl, model) = core.runtime().block_on(async {
+            let state = core.config_state(); // must not panic here
+            let model = core.default_model().await.unwrap();
+            (state.default_template, model)
+        });
+        assert_eq!(tmpl, config::DEFAULT_TEMPLATE_ID);
+        assert_eq!(model, config::DEFAULT_MODEL);
     }
 
     #[test]

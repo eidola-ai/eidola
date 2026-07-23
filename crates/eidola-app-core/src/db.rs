@@ -1864,6 +1864,79 @@ pub async fn update_space_template(
     Ok(n > 0)
 }
 
+/// A validated template-participant tuple for the transactional update:
+/// `(label, model_ref, system_prompt, notify_policy)` (agents only).
+pub type TemplateParticipantInput = (String, Option<String>, Option<String>, String);
+
+/// Update a template's settings **and/or** replace its OWNED participant set,
+/// **atomically** in one transaction. turso autocommits each statement, so a
+/// plain "DELETE owned; then re-INSERT" (the previous shape) exposed a window:
+/// a concurrent `instantiate_template` could observe the template with zero (or
+/// partially rebuilt) agents, and an insert error mid-loop left the set
+/// destroyed. Wrapping settings-update + delete + re-insert in `BEGIN … COMMIT`
+/// closes both — the replacement is all-or-nothing and a reader on another
+/// connection never sees the in-between. On any error the transaction is rolled
+/// back (prior state intact) and the error propagates; the caller emits
+/// `Change::Templates` only after this returns `Ok` (the changes.rs
+/// emit-after-commit rule). `participants = None` leaves the participant set
+/// untouched; `Some(&[])` clears it.
+pub async fn update_template_tx(
+    conn: &Connection,
+    id: &str,
+    title: Option<&str>,
+    cascade_limit: Option<i64>,
+    participants: Option<&[TemplateParticipantInput]>,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    match update_template_tx_body(conn, id, title, cascade_limit, participants, now).await {
+        Ok(()) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn update_template_tx_body(
+    conn: &Connection,
+    id: &str,
+    title: Option<&str>,
+    cascade_limit: Option<i64>,
+    participants: Option<&[TemplateParticipantInput]>,
+    now: i64,
+) -> Result<(), AppError> {
+    if title.is_some() || cascade_limit.is_some() {
+        update_space_template(conn, id, title, cascade_limit).await?;
+    }
+    if let Some(participants) = participants {
+        delete_template_owned_participants(conn, id).await?;
+        for (label, model_ref, system_prompt, notify_policy) in participants {
+            insert_participant(
+                conn,
+                &uuid::Uuid::now_v7().to_string(),
+                "template",
+                None,
+                Some(id),
+                "agent",
+                label,
+                model_ref.as_deref(),
+                system_prompt.as_deref(),
+                notify_policy,
+                "member",
+                None,
+                now,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Soft-remove a template. Returns whether a live row was removed.
 pub async fn soft_remove_space_template(
     conn: &Connection,
@@ -4363,6 +4436,112 @@ mod tests {
         );
         let r = instantiate_template(&conn, "t-gone", "space-z", None, "unlinked", 3_000).await;
         assert!(r.is_err(), "instantiating a removed template must fail");
+    }
+
+    /// PR #221 review comment 2: the template-update replacement is atomic. A
+    /// failure mid-replacement must roll back — the owned participant set (and
+    /// the settings) are left exactly as they were, so a concurrent reader
+    /// never sees a destroyed/partial set and no `Change::Templates` fires
+    /// (the caller emits only after this returns `Ok`).
+    #[tokio::test]
+    async fn update_template_tx_rolls_back_on_failure() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        insert_space_template(&conn, "t-atomic", "Orig", 4, 1_000)
+            .await
+            .unwrap();
+        for (pid, label, model) in [("a1", "One", "m1"), ("a2", "Two", "m2")] {
+            insert_participant(
+                &conn,
+                pid,
+                "template",
+                None,
+                Some("t-atomic"),
+                "agent",
+                label,
+                Some(model),
+                None,
+                "explicit",
+                "member",
+                None,
+                1_000,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Replacement whose SECOND participant has an invalid notify_policy —
+        // its insert violates the CHECK mid-transaction, forcing a rollback.
+        let bad: Vec<TemplateParticipantInput> = vec![
+            ("New1".into(), Some("nm1".into()), None, "explicit".into()),
+            ("New2".into(), Some("nm2".into()), None, "bogus".into()),
+        ];
+        let r = update_template_tx(
+            &conn,
+            "t-atomic",
+            Some("Renamed"),
+            Some(9),
+            Some(&bad),
+            2_000,
+        )
+        .await;
+        assert!(r.is_err(), "a mid-replacement CHECK violation must fail");
+
+        // Atomicity: owned set unchanged (not destroyed, not partially rebuilt).
+        let after = list_template_owned_participants(&conn, "t-atomic")
+            .await
+            .unwrap();
+        let labels: Vec<&str> = after.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, vec!["One", "Two"], "owned set survives rollback");
+        // …and the settings rolled back too (one transaction).
+        let tmpl = get_space_template(&conn, "t-atomic")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tmpl.title, "Orig");
+        assert_eq!(tmpl.cascade_limit, 4);
+    }
+
+    #[tokio::test]
+    async fn update_template_tx_commits_a_valid_replacement() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        insert_space_template(&conn, "t-ok", "Orig", 4, 1_000)
+            .await
+            .unwrap();
+        insert_participant(
+            &conn,
+            "a1",
+            "template",
+            None,
+            Some("t-ok"),
+            "agent",
+            "Old",
+            Some("m"),
+            None,
+            "explicit",
+            "member",
+            None,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        let new: Vec<TemplateParticipantInput> =
+            vec![("Fresh".into(), Some("nm".into()), None, "human".into())];
+        update_template_tx(&conn, "t-ok", Some("Renamed"), Some(7), Some(&new), 2_000)
+            .await
+            .unwrap();
+
+        let after = list_template_owned_participants(&conn, "t-ok")
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].label, "Fresh");
+        assert_eq!(after[0].notify_policy, "human");
+        let tmpl = get_space_template(&conn, "t-ok").await.unwrap().unwrap();
+        assert_eq!(tmpl.title, "Renamed");
+        assert_eq!(tmpl.cascade_limit, 7);
     }
 
     #[tokio::test]

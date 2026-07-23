@@ -256,13 +256,7 @@ impl SpaceView {
         .max(120.0);
 
         let current = self.current_model(cx);
-        let default_model = self
-            .stores
-            .config
-            .read(cx)
-            .state()
-            .map(|s| s.default_model.clone())
-            .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string());
+        let default_model = self.stores.config.read(cx).default_model();
 
         // One group per backend. Engine-backed groups lead — models on this
         // machine outrank any catalog for immediacy: the managed local

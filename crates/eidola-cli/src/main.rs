@@ -374,6 +374,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
     match cli.command {
         None => {
             let state = core.config_state();
+            let default_model = core.default_model().await?;
             let trust = core.eidola_trust().await?;
             println!("config path: {:?}", config::default_config_path());
             println!(
@@ -386,7 +387,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 }
             );
             println!("default_template: {}", state.default_template);
-            println!("default_model: {}", state.default_model);
+            println!("default_model: {default_model}");
             println!(
                 "account_id: {}",
                 if state.has_account {
@@ -701,11 +702,13 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             model,
             space,
         }) => {
-            // No --model flag → the default template's agent model
-            // (resolved into `ConfigState::default_model`, falling back to the
-            // embedded default). Transitional until wave 2 makes turns
-            // participant-aware.
-            let model = model.unwrap_or_else(|| core.config_state().default_model);
+            // No --model flag → the default template's agent model (async
+            // `AppCore::default_model`, falling back to the embedded default).
+            // Transitional until wave 2 makes turns participant-aware.
+            let model = match model {
+                Some(m) => m,
+                None => core.default_model().await?,
+            };
 
             // Engine-served models load on demand inside the request path
             // (app-core evicts LRU idle engines to make room); this block
