@@ -56,7 +56,8 @@ enum Command {
     Chat {
         /// The prompt to send
         prompt: String,
-        /// Model to use (defaults to the configured `default_model`)
+        /// Model to use (defaults to the default template's agent model —
+        /// transitional until wave 2 makes turns participant-aware)
         #[arg(long, short)]
         model: Option<String>,
         /// Continue an existing conversation by space ID
@@ -384,6 +385,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     " (built-in pin)".to_string()
                 }
             );
+            println!("default_template: {}", state.default_template);
             println!("default_model: {}", state.default_model);
             println!(
                 "account_id: {}",
@@ -699,9 +701,10 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             model,
             space,
         }) => {
-            // No --model flag → the user's configured default (the
-            // `default_model` override, falling back to the embedded
-            // default).
+            // No --model flag → the default template's agent model
+            // (resolved into `ConfigState::default_model`, falling back to the
+            // embedded default). Transitional until wave 2 makes turns
+            // participant-aware.
             let model = model.unwrap_or_else(|| core.config_state().default_model);
 
             // Engine-served models load on demand inside the request path

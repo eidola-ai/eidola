@@ -86,17 +86,6 @@ impl SpaceView {
         cx.notify();
     }
 
-    /// Persist the current model as the config default — the panel's quiet
-    /// footer affordance. The panel stays open so the moved "default" marker
-    /// is the visible confirmation.
-    fn set_current_model_as_default(&mut self, cx: &mut Context<Self>) {
-        let model = self.current_model(cx);
-        self.stores
-            .config
-            .update(cx, |c, cx| c.set_default_model(model, cx));
-        cx.notify();
-    }
-
     /// Re-fetch one backend's model catalog — the panel's per-backend retry
     /// (after a failed fetch) and refresh (over a good one) affordance. The
     /// store owns the task slot; the panel stays open so the refreshing →
@@ -494,34 +483,11 @@ impl SpaceView {
             }
         }
 
-        if current != default_model {
-            // Quiet, secondary: persist this space's model as the config
-            // default. Only offered when it would change anything. Displays
-            // the human name; the persisted value stays the selection id.
-            let (name, _) = self.model_display(&current, cx);
-            let label = format!("Set {name} as default");
-            panel = panel.child(
-                div()
-                    .id("space-set-default-model")
-                    .probe(
-                        "space/request-panel/set-default",
-                        gpui::Role::Button,
-                        label.clone(),
-                    )
-                    .w_full()
-                    .px_3()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .text_xs()
-                    .italic()
-                    .text_color(theme.muted_foreground)
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(cx.theme().foreground))
-                    .on_click(cx.listener(|this, _, _, cx| this.set_current_model_as_default(cx)))
-                    .child(SharedString::from(label)),
-            );
-        }
+        // The "default model" now lives on the default space template's agent
+        // (Participants v1); the config-level set-default affordance was
+        // removed with `set_default_model`. The picker still marks the current
+        // resolved default via `default_model` above; changing the default
+        // moves to the template surfaces (wave 3).
 
         panel.into_any_element()
     }

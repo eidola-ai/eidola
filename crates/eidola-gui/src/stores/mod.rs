@@ -327,6 +327,12 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
             stores.models.update(cx, |s, cx| s.refresh(cx));
             stores.local_models.update(cx, |s, cx| s.refresh(cx));
         }
+        // Participants v1 domains. No GUI store consumes these yet (the
+        // per-space Participants view and the Space Templates settings pane
+        // land in wave 3); the routing seam exists so app-core can emit today.
+        // `set_default_template` additionally emits `Change::Config`, which
+        // already refreshes the config store (and its resolved default model).
+        Change::Participants | Change::Templates => {}
     }
 }
 

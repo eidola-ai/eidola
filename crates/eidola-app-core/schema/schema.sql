@@ -177,18 +177,11 @@ CREATE INDEX idx_connection_attestation
 -- #  LAYER 2 — SEMANTIC / LOGICAL                            #
 -- ############################################################
 
--- ============================================================
--- Participant: an actor that can emit actions into a space
--- ============================================================
-CREATE TABLE participant (
-    id          TEXT PRIMARY KEY,              -- UUIDv7
-    kind        TEXT NOT NULL CHECK (kind IN (
-                    'human', 'agent', 'tool', 'system'
-                )),
-    label       TEXT NOT NULL,
-    provider_id TEXT REFERENCES provider(id),
-    created_at  INTEGER NOT NULL
-);
+-- Participants are SCOPE-OWNED (Participants v1, spec §0). Every
+-- participant row has exactly one scope; the config columns live
+-- ONLY on `participant`, so cross-table drift is impossible rather
+-- than managed. `space` and `space_template` are defined first
+-- because `participant` references both as owner FKs.
 
 -- ============================================================
 -- Space: a context namespace
@@ -208,23 +201,157 @@ CREATE TABLE space (
     linkability       TEXT NOT NULL CHECK (linkability IN (
                           'linked', 'unlinked', 'public'
                       )),
+    -- The first real space setting: the cascade guard (wave 2). At this
+    -- many auto-notified turns from one triggering post, planning pauses.
+    -- Seeded from the template a space is instantiated from (default 4);
+    -- the PoC for the future copy-from-template space-settings surface.
+    cascade_limit     INTEGER NOT NULL DEFAULT 4,
     created_at        INTEGER NOT NULL,
     archived_at       INTEGER
 );
 
 -- ============================================================
--- Space membership
+-- Space template: a reusable blueprint for new spaces. A DB-backed
+-- registry (soft-remove, backend-registry style) so a config
+-- pointing at a removed template fails honestly and revives
+-- cleanly. Distinct from spaces — templates have no actions/posts,
+-- no linkability, no archival; they are edited rather than
+-- appended to. "Template from space" is a projection between the
+-- two types (template_from_space), never a type mutation.
+--
+-- A template OWNS participant rows exactly like a space does
+-- (participant.scope = 'template'); cascade_limit is copied into a
+-- space at instantiation. removed_at is the soft delete.
+-- ============================================================
+CREATE TABLE space_template (
+    id            TEXT PRIMARY KEY,            -- UUIDv7 (well-known for the seeded default)
+    title         TEXT NOT NULL,
+    cascade_limit INTEGER NOT NULL DEFAULT 4,
+    created_at    INTEGER NOT NULL,
+    removed_at    INTEGER                      -- soft delete
+);
+
+-- ============================================================
+-- Participant: an actor that can emit actions into a space.
+--
+-- SCOPE-OWNED (spec §0). Every row has exactly one `scope`:
+--   global    the shared library — today just "You"; later the
+--             agent library and other humans. Owns no space/template.
+--   space     a per-space instance, born by copying a template's
+--             owned rows (owner_space_id = the space).
+--   template  a per-template instance — templates own participant
+--             rows just like spaces (owner_template_id = the template).
+-- The three-way CHECK ties scope to exactly the matching owner
+-- column, so an invalid ownership shape is unrepresentable.
+--
+-- The CONFIG COLUMNS LIVE ONLY HERE (kind, label, model_ref,
+-- system_prompt, notify_policy) — drift across tables becomes
+-- impossible rather than managed. Reference tables
+-- (space_participant / space_template_participant) may point only
+-- at globals and carry per-membership overrides.
+--
+--   model_ref     qualified `<model>@<backend-id>` (bare = eidola
+--                 sugar, per backends.rs) the agent answers with
+--   system_prompt the agent's system prompt
+--   notify_policy auto-response policy (wave 2 plan_notifications):
+--                 'explicit' (only when asked) / 'human' (when a
+--                 human posted) / 'all' (always)
+--   role          membership role of an OWNED participant
+--                 (referenced globals carry their role on the
+--                 reference row instead)
+--   removed_at    global: library soft-remove; owned: left/deactivated
+--
+-- UNIQUE(id, scope) is the target the pinned composite-FK echoes on
+-- space_participant / space_template_participant / action reference.
+-- ============================================================
+CREATE TABLE participant (
+    id                TEXT PRIMARY KEY,        -- UUIDv7
+    scope             TEXT NOT NULL CHECK (scope IN ('global', 'space', 'template')),
+    owner_space_id    TEXT REFERENCES space(id),
+    owner_template_id TEXT REFERENCES space_template(id),
+    kind              TEXT NOT NULL CHECK (kind IN (
+                          'human', 'agent', 'tool', 'system'
+                      )),
+    label             TEXT NOT NULL,
+    model_ref         TEXT,
+    system_prompt     TEXT,
+    notify_policy     TEXT NOT NULL DEFAULT 'explicit'
+                      CHECK (notify_policy IN ('explicit', 'human', 'all')),
+    role              TEXT NOT NULL DEFAULT 'member'
+                      CHECK (role IN ('owner', 'member', 'observer')),
+    provider_id       TEXT REFERENCES provider(id),
+    created_at        INTEGER NOT NULL,
+    removed_at        INTEGER,
+
+    CHECK ((scope = 'global'   AND owner_space_id IS NULL     AND owner_template_id IS NULL)
+        OR (scope = 'space'    AND owner_space_id IS NOT NULL AND owner_template_id IS NULL)
+        OR (scope = 'template' AND owner_space_id IS NULL     AND owner_template_id IS NOT NULL))
+);
+
+-- The composite-FK target for the pinned `(participant_id, participant_scope)`
+-- echoes on the reference tables and `action`.
+CREATE UNIQUE INDEX idx_participant_id_scope ON participant (id, scope);
+CREATE INDEX idx_participant_owner_space ON participant (owner_space_id)
+    WHERE owner_space_id IS NOT NULL;
+CREATE INDEX idx_participant_owner_template ON participant (owner_template_id)
+    WHERE owner_template_id IS NOT NULL;
+
+-- ============================================================
+-- Space membership: a space's participants = its OWNED rows
+-- (participant.owner_space_id = space) ∪ the GLOBALS it references
+-- here. This table holds references to globals ONLY, made
+-- declarative by the pinned echo + composite FK: `participant_scope`
+-- is CHECK-pinned to 'global' and the tuple FK points at
+-- participant(id, scope), so an owned participant can never be
+-- smuggled into a reference row.
+--
+-- Overrides mirror the config columns, per-membership: NULL =
+-- inherit the global's config; '' = override to empty. Effective
+-- config = COALESCE(override, participant config). `role` is the
+-- membership role for the referenced global (owned rows carry role
+-- on the participant row).
 -- ============================================================
 CREATE TABLE space_participant (
-    space_id       TEXT NOT NULL REFERENCES space(id),
-    participant_id TEXT NOT NULL REFERENCES participant(id),
-    role           TEXT NOT NULL CHECK (role IN (
-                       'owner', 'member', 'observer'
-                   )) DEFAULT 'member',
-    joined_at      INTEGER NOT NULL,
-    left_at        INTEGER,
+    space_id               TEXT NOT NULL REFERENCES space(id),
+    participant_id         TEXT NOT NULL,
+    participant_scope      TEXT NOT NULL CHECK (participant_scope = 'global'),
+    override_label         TEXT,               -- NULL = inherit; '' = override to empty
+    override_model_ref     TEXT,               -- NULL = inherit; '' = override to empty
+    override_system_prompt TEXT,               -- NULL = inherit; '' = override to empty
+    override_notify_policy TEXT CHECK (override_notify_policy IS NULL
+                               OR override_notify_policy IN ('explicit', 'human', 'all')),
+    role                   TEXT NOT NULL DEFAULT 'member'
+                           CHECK (role IN ('owner', 'member', 'observer')),
+    joined_at              INTEGER NOT NULL,
+    left_at                INTEGER,
 
-    PRIMARY KEY (space_id, participant_id)
+    PRIMARY KEY (space_id, participant_id),
+    FOREIGN KEY (participant_id, participant_scope)
+        REFERENCES participant (id, scope)
+);
+
+-- ============================================================
+-- Space template membership: identical shape keyed on template_id.
+-- Templates reference globals here (with overrides) and own their
+-- agents via participant.scope = 'template'.
+-- ============================================================
+CREATE TABLE space_template_participant (
+    template_id            TEXT NOT NULL REFERENCES space_template(id),
+    participant_id         TEXT NOT NULL,
+    participant_scope      TEXT NOT NULL CHECK (participant_scope = 'global'),
+    override_label         TEXT,               -- NULL = inherit; '' = override to empty
+    override_model_ref     TEXT,               -- NULL = inherit; '' = override to empty
+    override_system_prompt TEXT,               -- NULL = inherit; '' = override to empty
+    override_notify_policy TEXT CHECK (override_notify_policy IS NULL
+                               OR override_notify_policy IN ('explicit', 'human', 'all')),
+    role                   TEXT NOT NULL DEFAULT 'member'
+                           CHECK (role IN ('owner', 'member', 'observer')),
+    joined_at              INTEGER NOT NULL,
+    left_at                INTEGER,
+
+    PRIMARY KEY (template_id, participant_id),
+    FOREIGN KEY (participant_id, participant_scope)
+        REFERENCES participant (id, scope)
 );
 
 -- ============================================================
@@ -267,7 +394,12 @@ CREATE TABLE space_participant (
 CREATE TABLE action (
     id              TEXT PRIMARY KEY,          -- UUIDv7
     space_id        TEXT NOT NULL REFERENCES space(id),
-    participant_id  TEXT NOT NULL REFERENCES participant(id),
+    -- The acting participant, referenced by the pinned composite echo. An
+    -- action can only be authored by a GLOBAL (e.g. the shared "You") or a
+    -- SPACE-owned participant — never a template-owned one — enforced by the
+    -- CHECK + tuple FK, not convention.
+    participant_id     TEXT NOT NULL,
+    participant_scope  TEXT NOT NULL CHECK (participant_scope IN ('global', 'space')),
 
     -- generation identity (generation number is derived, not stored)
     item_id              TEXT NOT NULL,
@@ -312,7 +444,9 @@ CREATE TABLE action (
     CHECK ((supersedes_action_id IS NULL) = (supersedes_item_id IS NULL)),
     CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
     FOREIGN KEY (supersedes_action_id, supersedes_item_id)
-        REFERENCES action (id, item_id)
+        REFERENCES action (id, item_id),
+    FOREIGN KEY (participant_id, participant_scope)
+        REFERENCES participant (id, scope)
 );
 
 CREATE INDEX idx_action_space ON action (space_id, created_at);

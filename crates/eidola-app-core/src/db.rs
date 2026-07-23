@@ -5,7 +5,57 @@ use turso::{Builder, Connection, Database, Value};
 use crate::error::AppError;
 
 const SCHEMA: &str = include_str!("../schema/schema.sql");
-const LATEST_VERSION: i64 = 1;
+
+/// Current schema version. `schema.sql` is the whole baseline — there are no
+/// incremental migrations (the pre-release history was collapsed for the
+/// Participants v1 fresh start; there are no real users). A database whose
+/// `user_version` is neither `0` (fresh) nor this value is from an
+/// incompatible build and [`initialize`] refuses to open it (delete the dev
+/// database; see the error text). Bump this on every fresh-start reset so
+/// stale databases are detected rather than silently limping.
+const LATEST_VERSION: i64 = 2;
+
+/// Well-known id of the shared human "You" participant — the single
+/// participant row joined into every space (agent participants are per-space
+/// instances; the human is the one shared identity). Seeded idempotently at
+/// every DB open; stable so `INSERT OR IGNORE` re-seeds are no-ops and human
+/// actions across all spaces reference one row.
+pub const HUMAN_PARTICIPANT_ID: &str = "00000000-0000-7000-8000-000000000001";
+
+/// Well-known id of the seeded "Default" template's single agent participant
+/// (seed-only; user-created template participants get fresh UUIDv7s).
+const DEFAULT_TEMPLATE_AGENT_ID: &str = "00000000-0000-7000-8000-000000000011";
+
+/// The generic system prompt the seeded default agent participant carries.
+const DEFAULT_AGENT_SYSTEM_PROMPT: &str =
+    "You are a helpful assistant. Answer clearly and concisely.";
+
+/// A readable default label derived from a model reference (e.g.
+/// `gemma4-31b` → `Gemma4 31b`). Only a *default* — the user edits it — so
+/// title-casing hyphen tokens is enough; it never needs to be canonical.
+pub fn default_agent_label(model_ref: &str) -> String {
+    // Drop any `@backend` suffix, then title-case hyphen/underscore tokens.
+    let model = model_ref
+        .rsplit_once('@')
+        .map(|(m, _)| m)
+        .unwrap_or(model_ref);
+    let words: Vec<String> = model
+        .split(['-', '_'])
+        .filter(|s| !s.is_empty())
+        .map(|tok| {
+            let mut chars = tok.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        model.to_string()
+    } else {
+        words.join(" ")
+    }
+}
 
 /// Opens (or creates) the local database at `data_dir/eidola.db` and runs any
 /// pending migrations.
@@ -24,14 +74,34 @@ pub async fn open(data_dir: &Path) -> Result<Database, AppError> {
             message: format!("failed to open database: {e}"),
         })?;
 
-    let conn = db.connect().map_err(AppError::db)?;
+    let conn = connect(&db).await?;
     initialize(&conn).await?;
 
     Ok(db)
 }
 
-/// Initialize: fresh install gets schema.sql directly, existing databases run
-/// incremental migrations.
+/// Open a connection with FK enforcement enabled. turso defaults
+/// `foreign_keys` **OFF** (every `REFERENCES`/composite FK is then unenforced
+/// documentation), and the scope-owned participant model relies on the tuple
+/// FKs + CHECKs actually firing — so enable it on **every** connection, since
+/// the pragma is per-connection. See `turso_enforcement_smoke` for the proof
+/// that this build enforces single/composite FKs, MATCH-SIMPLE NULL-skip, and
+/// CHECKs once it's on.
+pub async fn connect(db: &Database) -> Result<Connection, AppError> {
+    let conn = db.connect().map_err(AppError::db)?;
+    conn.execute("PRAGMA foreign_keys = ON", ())
+        .await
+        .map_err(AppError::db)?;
+    Ok(conn)
+}
+
+/// Initialize the database. A fresh (`user_version == 0`) database gets
+/// `schema.sql` applied directly and stamped at [`LATEST_VERSION`]. There are
+/// no incremental migrations (the Participants v1 fresh start reset the
+/// baseline), so a database already at [`LATEST_VERSION`] just re-seeds its
+/// idempotent defaults; any *other* non-zero version is from an incompatible
+/// pre-release build and is refused with an honest "delete your dev database"
+/// error rather than limping against a schema it doesn't match.
 async fn initialize(conn: &Connection) -> Result<(), AppError> {
     let version = get_user_version(conn).await?;
 
@@ -42,13 +112,81 @@ async fn initialize(conn: &Connection) -> Result<(), AppError> {
                 message: format!("schema init failed: {e}"),
             })?;
         set_user_version(conn, LATEST_VERSION).await?;
-    } else {
-        migrate(conn, version).await?;
+    } else if version != LATEST_VERSION {
+        return Err(AppError::Database {
+            message: format!(
+                "your local Eidola database is from an incompatible build \
+                 (schema v{version}; this build expects v{LATEST_VERSION}). \
+                 There are no real users yet, so there is no migration — \
+                 delete your dev database and restart: \
+                 ~/Library/Application Support/eidola/eidola.db \
+                 (or the eidola.db in your data directory)."
+            ),
+        });
     }
 
-    // The singleton backends exist on every database — fresh installs and
-    // migrated ones alike. Idempotent, so it simply runs on every open.
+    // The idempotent defaults exist on every database — fresh installs and
+    // already-current ones alike. They simply run on every open.
     ensure_default_backends(conn).await?;
+    ensure_default_participants(conn).await?;
+
+    Ok(())
+}
+
+/// Seed the shared human "You" participant and the "Default" space template
+/// (with its single agent participant) if missing. Idempotent via well-known
+/// ids + `INSERT OR IGNORE`, so it runs on every open and never overwrites a
+/// user's edits. Mirrors the `ensure_default_backends` pattern.
+async fn ensure_default_participants(conn: &Connection) -> Result<(), AppError> {
+    let now = crate::now_ms();
+
+    // The one shared human "You" — a GLOBAL participant, referenced into every
+    // instantiated space (instantiate_template ensures the reference).
+    conn.execute(
+        "INSERT OR IGNORE INTO participant \
+         (id, scope, kind, label, notify_policy, role, created_at) \
+         VALUES (?1, 'global', 'human', 'You', 'explicit', 'owner', ?2)",
+        (
+            Value::Text(HUMAN_PARTICIPANT_ID.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+
+    // The seeded "Default" space template (must exist before its owned agent's
+    // owner FK resolves).
+    conn.execute(
+        "INSERT OR IGNORE INTO space_template \
+         (id, title, cascade_limit, created_at) \
+         VALUES (?1, 'Default', 4, ?2)",
+        (
+            Value::Text(crate::config::DEFAULT_TEMPLATE_ID.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+
+    // …owning a single template-scoped agent participant (label from the
+    // model's friendly name, model = the compiled DEFAULT_MODEL, a generic
+    // prompt, notify 'human').
+    conn.execute(
+        "INSERT OR IGNORE INTO participant \
+         (id, scope, owner_template_id, kind, label, model_ref, system_prompt, \
+          notify_policy, role, created_at) \
+         VALUES (?1, 'template', ?2, 'agent', ?3, ?4, ?5, 'human', 'member', ?6)",
+        (
+            Value::Text(DEFAULT_TEMPLATE_AGENT_ID.to_string()),
+            Value::Text(crate::config::DEFAULT_TEMPLATE_ID.to_string()),
+            Value::Text(default_agent_label(crate::config::DEFAULT_MODEL)),
+            Value::Text(crate::config::DEFAULT_MODEL.to_string()),
+            Value::Text(DEFAULT_AGENT_SYSTEM_PROMPT.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
 
     Ok(())
 }
@@ -73,19 +211,6 @@ async fn ensure_default_backends(conn: &Connection) -> Result<(), AppError> {
     )
     .await
     .map_err(AppError::db)?;
-    Ok(())
-}
-
-async fn migrate(conn: &Connection, current_version: i64) -> Result<(), AppError> {
-    if current_version < 1 {
-        conn.execute_batch(MIGRATION_1)
-            .await
-            .map_err(|e| AppError::Database {
-                message: format!("migration 1 failed: {e}"),
-            })?;
-        set_user_version(conn, 1).await?;
-    }
-
     Ok(())
 }
 
@@ -888,10 +1013,21 @@ fn opt_text(v: &Option<String>) -> Value {
     }
 }
 
+fn opt_str(v: Option<&str>) -> Value {
+    match v {
+        Some(s) => Value::Text(s.to_string()),
+        None => Value::Null,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Layer 2 — Semantic: Participant operations
 // ---------------------------------------------------------------------------
 
+/// Find-or-create a **global** participant deduped by (kind, label). Used for
+/// the shared library identities (and by tests). Scope-owned per-space and
+/// per-template participants are never created here — they are minted with an
+/// explicit owner via [`insert_participant`].
 pub async fn ensure_participant(
     conn: &Connection,
     kind: &str,
@@ -900,7 +1036,10 @@ pub async fn ensure_participant(
     created_at: i64,
 ) -> Result<String, AppError> {
     let mut stmt = conn
-        .prepare("SELECT id FROM participant WHERE kind = ?1 AND label = ?2 LIMIT 1")
+        .prepare(
+            "SELECT id FROM participant \
+             WHERE scope = 'global' AND kind = ?1 AND label = ?2 LIMIT 1",
+        )
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -917,23 +1056,22 @@ pub async fn ensure_participant(
     drop(stmt);
 
     let id = uuid::Uuid::now_v7().to_string();
-    conn.execute(
-        "INSERT INTO participant (id, kind, label, provider_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        (
-            Value::Text(id.clone()),
-            Value::Text(kind.to_string()),
-            Value::Text(label.to_string()),
-            match provider_id {
-                Some(p) => Value::Text(p.to_string()),
-                None => Value::Null,
-            },
-            Value::Integer(created_at),
-        ),
+    insert_participant(
+        conn,
+        &id,
+        "global",
+        None,
+        None,
+        kind,
+        label,
+        None,
+        None,
+        "explicit",
+        "member",
+        provider_id,
+        created_at,
     )
-    .await
-    .map_err(|e| AppError::Database {
-        message: format!("failed to insert participant: {e}"),
-    })?;
+    .await?;
     Ok(id)
 }
 
@@ -968,6 +1106,295 @@ pub async fn insert_space(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Layer 2 — Semantic: Participants (scope-owned) + space templates
+//
+// Every participant row has exactly one scope: 'global' (the shared library —
+// today "You"), 'space' (owned by one space), or 'template' (owned by one
+// template). The config columns live ONLY on `participant`. Reference tables
+// (space_participant / space_template_participant) point at globals only (the
+// pinned `participant_scope='global'` echo + composite FK make that
+// declarative) and carry per-membership overrides. A space's/template's
+// participant set = its owned rows ∪ its referenced globals; the effective
+// config of a referenced global is COALESCE(override, global config).
+// ---------------------------------------------------------------------------
+
+/// A participant's own row — the config lives here (scope-owned).
+#[derive(Clone, Debug)]
+pub struct ParticipantRow {
+    pub id: String,
+    pub scope: String,
+    pub owner_space_id: Option<String>,
+    pub owner_template_id: Option<String>,
+    pub kind: String,
+    pub label: String,
+    pub model_ref: Option<String>,
+    pub system_prompt: Option<String>,
+    pub notify_policy: String,
+    pub role: String,
+    pub removed_at: Option<i64>,
+}
+
+/// The effective (override-resolved) view of one member of a space or template:
+/// owned rows contribute their own config; referenced globals contribute
+/// `COALESCE(override, global config)`. `source` is "owned" | "referenced";
+/// `scope` is the underlying participant row's scope (needed for the composite
+/// echo when recording actions or copying references).
+#[derive(Clone, Debug)]
+pub struct EffectiveParticipantRow {
+    pub participant_id: String,
+    pub scope: String,
+    pub source: String,
+    pub kind: String,
+    pub label: String,
+    pub model_ref: Option<String>,
+    pub system_prompt: Option<String>,
+    pub notify_policy: String,
+    pub role: String,
+}
+
+/// One reference row (a membership pointing at a global), with its overrides —
+/// the unit the projections copy between spaces and templates.
+#[derive(Clone, Debug)]
+pub struct ParticipantRefRow {
+    pub participant_id: String,
+    pub role: String,
+    pub joined_at: i64,
+    pub override_label: Option<String>,
+    pub override_model_ref: Option<String>,
+    pub override_system_prompt: Option<String>,
+    pub override_notify_policy: Option<String>,
+}
+
+impl ParticipantRefRow {
+    fn from_row(row: &turso::Row) -> Result<Self, AppError> {
+        Ok(Self {
+            participant_id: row.get::<String>(0).map_err(AppError::db)?,
+            role: row.get::<String>(1).map_err(AppError::db)?,
+            joined_at: row.get::<i64>(2).map_err(AppError::db)?,
+            override_label: row.get::<Option<String>>(3).map_err(AppError::db)?,
+            override_model_ref: row.get::<Option<String>>(4).map_err(AppError::db)?,
+            override_system_prompt: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            override_notify_policy: row.get::<Option<String>>(6).map_err(AppError::db)?,
+        })
+    }
+}
+
+// --- participant table -----------------------------------------------------
+
+/// Insert a participant row with an explicit scope + owner. `provider_id` is
+/// transport/forensic linkage (not a mirrored config column); copied instances
+/// carry `None`.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_participant(
+    conn: &Connection,
+    id: &str,
+    scope: &str,
+    owner_space_id: Option<&str>,
+    owner_template_id: Option<&str>,
+    kind: &str,
+    label: &str,
+    model_ref: Option<&str>,
+    system_prompt: Option<&str>,
+    notify_policy: &str,
+    role: &str,
+    provider_id: Option<&str>,
+    created_at: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO participant \
+         (id, scope, owner_space_id, owner_template_id, kind, label, model_ref, \
+          system_prompt, notify_policy, role, provider_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        (
+            Value::Text(id.to_string()),
+            Value::Text(scope.to_string()),
+            opt_str(owner_space_id),
+            opt_str(owner_template_id),
+            Value::Text(kind.to_string()),
+            Value::Text(label.to_string()),
+            opt_str(model_ref),
+            opt_str(system_prompt),
+            Value::Text(notify_policy.to_string()),
+            Value::Text(role.to_string()),
+            opt_str(provider_id),
+            Value::Integer(created_at),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert participant: {e}"),
+    })?;
+    Ok(())
+}
+
+/// Fetch one participant's own row by id.
+pub async fn get_participant(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<ParticipantRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, scope, owner_space_id, owner_template_id, kind, label, \
+                    model_ref, system_prompt, notify_policy, role, removed_at \
+             FROM participant WHERE id = ?1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(ParticipantRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            scope: row.get::<String>(1).map_err(AppError::db)?,
+            owner_space_id: row.get::<Option<String>>(2).map_err(AppError::db)?,
+            owner_template_id: row.get::<Option<String>>(3).map_err(AppError::db)?,
+            kind: row.get::<String>(4).map_err(AppError::db)?,
+            label: row.get::<String>(5).map_err(AppError::db)?,
+            model_ref: row.get::<Option<String>>(6).map_err(AppError::db)?,
+            system_prompt: row.get::<Option<String>>(7).map_err(AppError::db)?,
+            notify_policy: row.get::<String>(8).map_err(AppError::db)?,
+            role: row.get::<String>(9).map_err(AppError::db)?,
+            removed_at: row.get::<Option<i64>>(10).map_err(AppError::db)?,
+        })),
+    }
+}
+
+/// Update a participant's own config columns (label, model_ref, system_prompt,
+/// notify_policy, role). Editing a global edits it everywhere; editing an owned
+/// row edits that space/template only. Each `Some` replaces; the inner `Option`
+/// clears/sets the two nullable columns.
+pub async fn update_participant_config(
+    conn: &Connection,
+    id: &str,
+    label: Option<&str>,
+    model_ref: Option<Option<&str>>,
+    system_prompt: Option<Option<&str>>,
+    notify_policy: Option<&str>,
+    role: Option<&str>,
+) -> Result<bool, AppError> {
+    let mut sets: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = vec![Value::Text(id.to_string())];
+    if let Some(l) = label {
+        params.push(Value::Text(l.to_string()));
+        sets.push(format!("label = ?{}", params.len()));
+    }
+    if let Some(m) = model_ref {
+        params.push(opt_str(m));
+        sets.push(format!("model_ref = ?{}", params.len()));
+    }
+    if let Some(s) = system_prompt {
+        params.push(opt_str(s));
+        sets.push(format!("system_prompt = ?{}", params.len()));
+    }
+    if let Some(n) = notify_policy {
+        params.push(Value::Text(n.to_string()));
+        sets.push(format!("notify_policy = ?{}", params.len()));
+    }
+    if let Some(r) = role {
+        params.push(Value::Text(r.to_string()));
+        sets.push(format!("role = ?{}", params.len()));
+    }
+    if sets.is_empty() {
+        return Ok(false);
+    }
+    let sql = format!("UPDATE participant SET {} WHERE id = ?1", sets.join(", "));
+    let n = conn.execute(&sql, params).await.map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
+/// Soft-remove a participant row (global: library soft-remove; owned:
+/// left/deactivated). The row survives so `action.participant_id` references
+/// stay resolvable.
+pub async fn soft_remove_participant(
+    conn: &Connection,
+    id: &str,
+    now: i64,
+) -> Result<bool, AppError> {
+    let n = conn
+        .execute(
+            "UPDATE participant SET removed_at = ?2 WHERE id = ?1 AND removed_at IS NULL",
+            (Value::Text(id.to_string()), Value::Integer(now)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
+/// Owned participants of a space (`scope='space'`, not removed).
+pub async fn list_space_owned_participants(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Vec<ParticipantRow>, AppError> {
+    owned_participants(conn, "owner_space_id", space_id).await
+}
+
+/// Owned participants of a template (`scope='template'`, not removed).
+pub async fn list_template_owned_participants(
+    conn: &Connection,
+    template_id: &str,
+) -> Result<Vec<ParticipantRow>, AppError> {
+    owned_participants(conn, "owner_template_id", template_id).await
+}
+
+async fn owned_participants(
+    conn: &Connection,
+    owner_col: &str,
+    owner_id: &str,
+) -> Result<Vec<ParticipantRow>, AppError> {
+    let sql = format!(
+        "SELECT id, scope, owner_space_id, owner_template_id, kind, label, \
+                model_ref, system_prompt, notify_policy, role, removed_at \
+         FROM participant WHERE {owner_col} = ?1 AND removed_at IS NULL \
+         ORDER BY created_at, id"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(owner_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(ParticipantRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            scope: row.get::<String>(1).map_err(AppError::db)?,
+            owner_space_id: row.get::<Option<String>>(2).map_err(AppError::db)?,
+            owner_template_id: row.get::<Option<String>>(3).map_err(AppError::db)?,
+            kind: row.get::<String>(4).map_err(AppError::db)?,
+            label: row.get::<String>(5).map_err(AppError::db)?,
+            model_ref: row.get::<Option<String>>(6).map_err(AppError::db)?,
+            system_prompt: row.get::<Option<String>>(7).map_err(AppError::db)?,
+            notify_policy: row.get::<String>(8).map_err(AppError::db)?,
+            role: row.get::<String>(9).map_err(AppError::db)?,
+            removed_at: row.get::<Option<i64>>(10).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Hard-delete a template's owned participants (used to replace the set on
+/// update). Safe: template-owned rows are never referenced (references point at
+/// globals only, and actions can't reference template scope).
+pub async fn delete_template_owned_participants(
+    conn: &Connection,
+    template_id: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        "DELETE FROM participant WHERE scope = 'template' AND owner_template_id = ?1",
+        (Value::Text(template_id.to_string()),),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+// --- reference tables (references to globals + overrides) -------------------
+
+/// Reference a global into a space (pinned `participant_scope='global'`, no
+/// overrides). The common membership-add.
 pub async fn insert_space_participant(
     conn: &Connection,
     space_id: &str,
@@ -975,23 +1402,614 @@ pub async fn insert_space_participant(
     role: &str,
     joined_at: i64,
 ) -> Result<(), AppError> {
+    insert_participant_ref(
+        conn,
+        "space_participant",
+        "space_id",
+        space_id,
+        participant_id,
+        role,
+        joined_at,
+        &ParticipantRefRow {
+            participant_id: participant_id.to_string(),
+            role: role.to_string(),
+            joined_at,
+            override_label: None,
+            override_model_ref: None,
+            override_system_prompt: None,
+            override_notify_policy: None,
+        },
+        false,
+    )
+    .await
+}
+
+/// Ensure a global is referenced into a space (idempotent — INSERT OR IGNORE on
+/// the PK). Used to guarantee "You" joins every instantiated space even if a
+/// copied template reference already added it.
+pub async fn ensure_space_participant(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    role: &str,
+    joined_at: i64,
+) -> Result<(), AppError> {
+    insert_participant_ref(
+        conn,
+        "space_participant",
+        "space_id",
+        space_id,
+        participant_id,
+        role,
+        joined_at,
+        &ParticipantRefRow {
+            participant_id: participant_id.to_string(),
+            role: role.to_string(),
+            joined_at,
+            override_label: None,
+            override_model_ref: None,
+            override_system_prompt: None,
+            override_notify_policy: None,
+        },
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_participant_ref(
+    conn: &Connection,
+    table: &str,
+    owner_col: &str,
+    owner_id: &str,
+    participant_id: &str,
+    role: &str,
+    joined_at: i64,
+    overrides: &ParticipantRefRow,
+    ignore: bool,
+) -> Result<(), AppError> {
+    let verb = if ignore { "INSERT OR IGNORE" } else { "INSERT" };
+    let sql = format!(
+        "{verb} INTO {table} \
+         ({owner_col}, participant_id, participant_scope, role, joined_at, \
+          override_label, override_model_ref, override_system_prompt, override_notify_policy) \
+         VALUES (?1, ?2, 'global', ?3, ?4, ?5, ?6, ?7, ?8)"
+    );
     conn.execute(
-        "INSERT INTO space_participant (space_id, participant_id, role, joined_at) \
-         VALUES (?1, ?2, ?3, ?4)",
+        &sql,
         (
-            Value::Text(space_id.to_string()),
+            Value::Text(owner_id.to_string()),
             Value::Text(participant_id.to_string()),
             Value::Text(role.to_string()),
             Value::Integer(joined_at),
+            opt_text(&overrides.override_label),
+            opt_text(&overrides.override_model_ref),
+            opt_text(&overrides.override_system_prompt),
+            opt_text(&overrides.override_notify_policy),
         ),
     )
     .await
     .map_err(|e| AppError::Database {
-        message: format!("failed to insert space_participant: {e}"),
+        message: format!("failed to insert {table}: {e}"),
     })?;
     Ok(())
 }
 
+/// Update a space membership's overrides (each `Some` replaces; inner `Option`
+/// clears/sets). Only meaningful for referenced globals ("override here").
+pub async fn update_space_participant_override(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    override_label: Option<Option<&str>>,
+    override_model_ref: Option<Option<&str>>,
+    override_system_prompt: Option<Option<&str>>,
+    override_notify_policy: Option<Option<&str>>,
+) -> Result<bool, AppError> {
+    let mut sets: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = vec![
+        Value::Text(space_id.to_string()),
+        Value::Text(participant_id.to_string()),
+    ];
+    for (col, val) in [
+        ("override_label", override_label),
+        ("override_model_ref", override_model_ref),
+        ("override_system_prompt", override_system_prompt),
+        ("override_notify_policy", override_notify_policy),
+    ] {
+        if let Some(inner) = val {
+            params.push(opt_str(inner));
+            sets.push(format!("{col} = ?{}", params.len()));
+        }
+    }
+    if sets.is_empty() {
+        return Ok(false);
+    }
+    let sql = format!(
+        "UPDATE space_participant SET {} WHERE space_id = ?1 AND participant_id = ?2",
+        sets.join(", ")
+    );
+    let n = conn.execute(&sql, params).await.map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
+/// Reference a global into a template, carrying overrides. Used by the
+/// space→template projection.
+pub async fn insert_template_participant(
+    conn: &Connection,
+    template_id: &str,
+    r: &ParticipantRefRow,
+) -> Result<(), AppError> {
+    insert_participant_ref(
+        conn,
+        "space_template_participant",
+        "template_id",
+        template_id,
+        &r.participant_id,
+        &r.role,
+        r.joined_at,
+        r,
+        false,
+    )
+    .await
+}
+
+/// End a space membership (reference) — set `left_at`. For a referenced global;
+/// owned participants are removed via [`soft_remove_participant`].
+pub async fn leave_space_participant(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    now: i64,
+) -> Result<bool, AppError> {
+    let n = conn
+        .execute(
+            "UPDATE space_participant SET left_at = ?3 \
+             WHERE space_id = ?1 AND participant_id = ?2 AND left_at IS NULL",
+            (
+                Value::Text(space_id.to_string()),
+                Value::Text(participant_id.to_string()),
+                Value::Integer(now),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
+/// The live reference rows (references to globals) of a space, for copying.
+pub async fn list_space_participant_refs(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Vec<ParticipantRefRow>, AppError> {
+    list_participant_refs(conn, "space_participant", "space_id", space_id).await
+}
+
+/// The live reference rows of a template, for copying.
+pub async fn list_template_participant_refs(
+    conn: &Connection,
+    template_id: &str,
+) -> Result<Vec<ParticipantRefRow>, AppError> {
+    list_participant_refs(
+        conn,
+        "space_template_participant",
+        "template_id",
+        template_id,
+    )
+    .await
+}
+
+async fn list_participant_refs(
+    conn: &Connection,
+    table: &str,
+    owner_col: &str,
+    owner_id: &str,
+) -> Result<Vec<ParticipantRefRow>, AppError> {
+    let sql = format!(
+        "SELECT participant_id, role, joined_at, override_label, override_model_ref, \
+                override_system_prompt, override_notify_policy \
+         FROM {table} WHERE {owner_col} = ?1 AND left_at IS NULL \
+         ORDER BY joined_at, participant_id"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(owner_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(ParticipantRefRow::from_row(&row)?);
+    }
+    Ok(out)
+}
+
+// --- unified effective membership view -------------------------------------
+
+/// The effective participants of a space: owned rows ∪ referenced globals, with
+/// referenced config resolved via `COALESCE(override, global config)`. Human
+/// members (the referenced "You") sort first, then others by id.
+pub async fn space_participants(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Vec<EffectiveParticipantRow>, AppError> {
+    effective_participants(
+        conn,
+        "space_participant",
+        "space_id",
+        "owner_space_id",
+        space_id,
+    )
+    .await
+}
+
+/// The effective participants of a template (same shape as [`space_participants`]).
+pub async fn template_participants(
+    conn: &Connection,
+    template_id: &str,
+) -> Result<Vec<EffectiveParticipantRow>, AppError> {
+    effective_participants(
+        conn,
+        "space_template_participant",
+        "template_id",
+        "owner_template_id",
+        template_id,
+    )
+    .await
+}
+
+async fn effective_participants(
+    conn: &Connection,
+    ref_table: &str,
+    owner_col: &str,
+    participant_owner_col: &str,
+    owner_id: &str,
+) -> Result<Vec<EffectiveParticipantRow>, AppError> {
+    // Two arms: owned rows (own config), then referenced globals
+    // (COALESCE(override, config)). Wrapped so ORDER BY can reference the
+    // unioned output columns cleanly. `?1`/`?2` are both the owner id.
+    let sql = format!(
+        "SELECT * FROM ( \
+            SELECT p.id AS participant_id, p.scope AS scope, 'owned' AS source, \
+                   p.kind AS kind, p.label AS label, p.model_ref AS model_ref, \
+                   p.system_prompt AS system_prompt, p.notify_policy AS notify_policy, \
+                   p.role AS role \
+            FROM participant p \
+            WHERE p.{participant_owner_col} = ?1 AND p.removed_at IS NULL \
+            UNION ALL \
+            SELECT p.id, p.scope, 'referenced', p.kind, \
+                   COALESCE(r.override_label, p.label), \
+                   COALESCE(r.override_model_ref, p.model_ref), \
+                   COALESCE(r.override_system_prompt, p.system_prompt), \
+                   COALESCE(r.override_notify_policy, p.notify_policy), \
+                   r.role \
+            FROM {ref_table} r \
+            JOIN participant p ON p.id = r.participant_id AND p.scope = r.participant_scope \
+            WHERE r.{owner_col} = ?2 AND r.left_at IS NULL AND p.removed_at IS NULL \
+        ) ORDER BY CASE kind WHEN 'human' THEN 0 ELSE 1 END, participant_id"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(owner_id.to_string()),
+            Value::Text(owner_id.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(EffectiveParticipantRow {
+            participant_id: row.get::<String>(0).map_err(AppError::db)?,
+            scope: row.get::<String>(1).map_err(AppError::db)?,
+            source: row.get::<String>(2).map_err(AppError::db)?,
+            kind: row.get::<String>(3).map_err(AppError::db)?,
+            label: row.get::<String>(4).map_err(AppError::db)?,
+            model_ref: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            system_prompt: row.get::<Option<String>>(6).map_err(AppError::db)?,
+            notify_policy: row.get::<String>(7).map_err(AppError::db)?,
+            role: row.get::<String>(8).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Resolve the space's agent participant whose **effective** model_ref matches,
+/// returning `(participant_id, scope)` for the composite echo an action needs.
+/// The wave-1 seam so an inference records a real per-space (or referenced
+/// global) agent while `run_turn` still takes a model string.
+pub async fn space_agent_participant_by_model(
+    conn: &Connection,
+    space_id: &str,
+    model_ref: &str,
+) -> Result<Option<(String, String)>, AppError> {
+    let members = space_participants(conn, space_id).await?;
+    Ok(members.into_iter().find_map(|m| {
+        if m.kind == "agent" && m.model_ref.as_deref() == Some(model_ref) {
+            Some((m.participant_id, m.scope))
+        } else {
+            None
+        }
+    }))
+}
+
+/// A space's `cascade_limit` (the copied-from-template setting).
+pub async fn space_cascade_limit(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<i64>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT cascade_limit FROM space WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(space_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<i64>(0).map_err(AppError::db)?)),
+    }
+}
+
+// --- space templates -------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct SpaceTemplateRow {
+    pub id: String,
+    pub title: String,
+    pub cascade_limit: i64,
+    pub created_at: i64,
+    pub removed_at: Option<i64>,
+}
+
+fn space_template_row_from(row: &turso::Row) -> Result<SpaceTemplateRow, AppError> {
+    Ok(SpaceTemplateRow {
+        id: row.get::<String>(0).map_err(AppError::db)?,
+        title: row.get::<String>(1).map_err(AppError::db)?,
+        cascade_limit: row.get::<i64>(2).map_err(AppError::db)?,
+        created_at: row.get::<i64>(3).map_err(AppError::db)?,
+        removed_at: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+    })
+}
+
+/// List live (non-removed) templates; the seeded default's id sorts first.
+pub async fn list_space_templates(conn: &Connection) -> Result<Vec<SpaceTemplateRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, cascade_limit, created_at, removed_at \
+             FROM space_template WHERE removed_at IS NULL \
+             ORDER BY created_at, id",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(space_template_row_from(&row)?);
+    }
+    Ok(out)
+}
+
+/// Fetch one template by id, including soft-removed rows.
+pub async fn get_space_template(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<SpaceTemplateRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, cascade_limit, created_at, removed_at \
+             FROM space_template WHERE id = ?1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(space_template_row_from(&row)?)),
+    }
+}
+
+pub async fn insert_space_template(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    cascade_limit: i64,
+    created_at: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO space_template (id, title, cascade_limit, created_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        (
+            Value::Text(id.to_string()),
+            Value::Text(title.to_string()),
+            Value::Integer(cascade_limit),
+            Value::Integer(created_at),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert space_template: {e}"),
+    })?;
+    Ok(())
+}
+
+/// Update a template's own settings (title / cascade_limit). Returns whether a
+/// live row was updated.
+pub async fn update_space_template(
+    conn: &Connection,
+    id: &str,
+    title: Option<&str>,
+    cascade_limit: Option<i64>,
+) -> Result<bool, AppError> {
+    let mut sets: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = vec![Value::Text(id.to_string())];
+    if let Some(t) = title {
+        params.push(Value::Text(t.to_string()));
+        sets.push(format!("title = ?{}", params.len()));
+    }
+    if let Some(c) = cascade_limit {
+        params.push(Value::Integer(c));
+        sets.push(format!("cascade_limit = ?{}", params.len()));
+    }
+    if sets.is_empty() {
+        return Ok(false);
+    }
+    let sql = format!(
+        "UPDATE space_template SET {} WHERE id = ?1 AND removed_at IS NULL",
+        sets.join(", ")
+    );
+    let n = conn.execute(&sql, params).await.map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
+/// Soft-remove a template. Returns whether a live row was removed.
+pub async fn soft_remove_space_template(
+    conn: &Connection,
+    id: &str,
+    now: i64,
+) -> Result<bool, AppError> {
+    let n = conn
+        .execute(
+            "UPDATE space_template SET removed_at = ?2 \
+             WHERE id = ?1 AND removed_at IS NULL",
+            (Value::Text(id.to_string()), Value::Integer(now)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
+// --- projections (INSERT … SELECT-style row copies) ------------------------
+
+/// Instantiate a template into a **new space**: create the space (copying
+/// `cascade_limit`); copy the template's OWNED participants into fresh
+/// SPACE-owned rows; copy its reference rows (with overrides) into space
+/// references; then ensure the shared human "You" is referenced (as owner).
+/// Errors if the template is missing or removed.
+pub async fn instantiate_template(
+    conn: &Connection,
+    template_id: &str,
+    new_space_id: &str,
+    title: Option<&str>,
+    linkability: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    let template = get_space_template(conn, template_id)
+        .await?
+        .ok_or_else(|| AppError::NotConfigured {
+            message: format!("space template not found: {template_id}"),
+        })?;
+    if template.removed_at.is_some() {
+        return Err(AppError::NotConfigured {
+            message: format!("space template `{template_id}` was removed"),
+        });
+    }
+
+    conn.execute(
+        "INSERT INTO space (id, parent_space_id, title, linkability, cascade_limit, created_at) \
+         VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+        (
+            Value::Text(new_space_id.to_string()),
+            opt_str(title),
+            Value::Text(linkability.to_string()),
+            Value::Integer(template.cascade_limit),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert space: {e}"),
+    })?;
+
+    // Template-owned participants → fresh space-owned rows.
+    for p in list_template_owned_participants(conn, template_id).await? {
+        insert_participant(
+            conn,
+            &uuid::Uuid::now_v7().to_string(),
+            "space",
+            Some(new_space_id),
+            None,
+            &p.kind,
+            &p.label,
+            p.model_ref.as_deref(),
+            p.system_prompt.as_deref(),
+            &p.notify_policy,
+            &p.role,
+            None,
+            now,
+        )
+        .await?;
+    }
+
+    // Template reference rows → space reference rows (overrides preserved).
+    for r in list_template_participant_refs(conn, template_id).await? {
+        insert_participant_ref(
+            conn,
+            "space_participant",
+            "space_id",
+            new_space_id,
+            &r.participant_id,
+            &r.role,
+            now,
+            &r,
+            true, // OR IGNORE — a template that already references "You" won't
+                  // collide with the ensure below.
+        )
+        .await?;
+    }
+
+    // The shared human "You" joins every instantiated space (idempotent).
+    ensure_space_participant(conn, new_space_id, HUMAN_PARTICIPANT_ID, "owner", now).await?;
+    Ok(())
+}
+
+/// Project a space's current participants + settings into a **new template**:
+/// copy `cascade_limit`; copy the space's OWNED participants into
+/// TEMPLATE-owned rows; copy its reference rows (with overrides) into template
+/// references.
+pub async fn template_from_space(
+    conn: &Connection,
+    space_id: &str,
+    title: &str,
+    new_template_id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    let cascade_limit =
+        space_cascade_limit(conn, space_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            })?;
+    insert_space_template(conn, new_template_id, title, cascade_limit, now).await?;
+
+    // Space-owned participants → fresh template-owned rows.
+    for p in list_space_owned_participants(conn, space_id).await? {
+        insert_participant(
+            conn,
+            &uuid::Uuid::now_v7().to_string(),
+            "template",
+            None,
+            Some(new_template_id),
+            &p.kind,
+            &p.label,
+            p.model_ref.as_deref(),
+            p.system_prompt.as_deref(),
+            &p.notify_policy,
+            &p.role,
+            None,
+            now,
+        )
+        .await?;
+    }
+
+    // Space reference rows → template reference rows (overrides preserved).
+    for r in list_space_participant_refs(conn, space_id).await? {
+        insert_template_participant(conn, new_template_id, &r).await?;
+    }
+    Ok(())
+}
 // ---------------------------------------------------------------------------
 // Layer 2 — Semantic: Action operations
 // ---------------------------------------------------------------------------
@@ -1000,6 +2018,11 @@ pub struct ActionEntry {
     pub id: String,
     pub space_id: String,
     pub participant_id: String,
+    /// The acting participant's scope — the pinned composite echo. Must be
+    /// `'global'` or `'space'` (an action can't be authored by a template-owned
+    /// participant); the tuple `(participant_id, participant_scope)` FK enforces
+    /// it against `participant(id, scope)`.
+    pub participant_scope: String,
     /// Stable identity shared by every generation of this item. For original
     /// (gen-0) work, mint a fresh UUIDv7; an edit/regeneration reuses the
     /// item_id of the action it supersedes.
@@ -1019,14 +2042,15 @@ pub struct ActionEntry {
 
 pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO action (id, space_id, participant_id, item_id, \
+        "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
          supersedes_action_id, supersedes_item_id, action_type, status, \
          intent, model, input_tokens, output_tokens, credits_consumed, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         (
             Value::Text(entry.id.clone()),
             Value::Text(entry.space_id.clone()),
             Value::Text(entry.participant_id.clone()),
+            Value::Text(entry.participant_scope.clone()),
             Value::Text(entry.item_id.clone()),
             opt_text(&entry.supersedes_action_id),
             // Denormalized supersedes item — always the row's own item (a
@@ -2175,18 +3199,6 @@ pub async fn list_credential_lifecycle(
 }
 
 // ---------------------------------------------------------------------------
-// Migrations
-// ---------------------------------------------------------------------------
-
-/// Migration 1 is the full current schema — the pre-release baseline (all
-/// earlier incremental migrations were collapsed while the app had no real
-/// users). Future migrations append as `MIGRATION_N` constants + version
-/// blocks in `migrate()`; see AGENTS.md ("Adding a migration") and the
-/// `migrations_match_schema` test, which structurally compares a
-/// fresh-from-schema database against a fully-migrated one.
-const MIGRATION_1: &str = include_str!("../schema/schema.sql");
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2196,15 +3208,29 @@ mod tests {
 
     async fn open_memory_fresh() -> Database {
         let db = Builder::new_local(":memory:").build().await.unwrap();
-        let conn = db.connect().unwrap();
+        // Mirror production: initialize (and seed) under FK enforcement, so a
+        // seed-order bug would surface here too.
+        let conn = connect(&db).await.unwrap();
         initialize(&conn).await.unwrap();
         db
     }
 
+    /// A test connection with FK enforcement on (the scope-owned schema's
+    /// constraints only fire with `foreign_keys = ON`).
+    async fn fk_conn(db: &Database) -> Connection {
+        connect(db).await.unwrap()
+    }
+
     async fn open_memory_migrated() -> Database {
+        // Post fresh-start reset there are no incremental migrations —
+        // `schema.sql` IS the baseline. Applying it directly must yield the
+        // same schema objects `initialize()` produces (initialize also applies
+        // schema.sql, then seeds rows; seeds add no schema objects), keeping
+        // `migrations_match_schema` a meaningful — if now trivially satisfied —
+        // structural check that the schema applies cleanly and consistently.
         let db = Builder::new_local(":memory:").build().await.unwrap();
         let conn = db.connect().unwrap();
-        migrate(&conn, 0).await.unwrap();
+        conn.execute_batch(SCHEMA).await.unwrap();
         set_user_version(&conn, LATEST_VERSION).await.unwrap();
         db
     }
@@ -2278,6 +3304,130 @@ mod tests {
             .unwrap()
     }
 
+    /// Enforcement smoke test — the whole scope-owned design leans on turso
+    /// actually enforcing FKs and CHECKs (its default is `foreign_keys = OFF`,
+    /// which turns every `REFERENCES` into unenforced documentation). Proves,
+    /// under this exact turso build: (a) single-column FK violations error;
+    /// (b) composite/tuple FK violations error; (c) MATCH-SIMPLE NULL-skip (a
+    /// NULL child column skips the composite FK — must NOT error); (d) CHECK
+    /// violations error. Also confirms the pragma is load-bearing (default-off
+    /// lets a dangling FK through).
+    #[tokio::test]
+    async fn turso_enforcement_smoke() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+
+        // --- default (foreign_keys OFF): a dangling single FK is accepted ----
+        let off = db.connect().unwrap();
+        off.execute_batch(
+            "CREATE TABLE p0 (id TEXT PRIMARY KEY);
+             CREATE TABLE c0 (id TEXT PRIMARY KEY, p TEXT REFERENCES p0(id));",
+        )
+        .await
+        .unwrap();
+        let dangling = off
+            .execute("INSERT INTO c0 (id, p) VALUES ('x', 'nope')", ())
+            .await;
+        assert!(
+            dangling.is_ok(),
+            "turso default is foreign_keys=OFF — a dangling FK should be \
+             accepted without the pragma (proving the pragma is load-bearing); \
+             got {dangling:?}"
+        );
+
+        // --- foreign_keys ON: enforcement is real -----------------------------
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parent (id TEXT PRIMARY KEY, scope TEXT NOT NULL);
+             CREATE UNIQUE INDEX ux_parent_id_scope ON parent(id, scope);
+             CREATE TABLE child_single (
+                 id TEXT PRIMARY KEY,
+                 parent_id TEXT NOT NULL REFERENCES parent(id));
+             CREATE TABLE child_comp (
+                 id TEXT PRIMARY KEY,
+                 parent_id TEXT,
+                 parent_scope TEXT,
+                 FOREIGN KEY (parent_id, parent_scope) REFERENCES parent(id, scope));
+             CREATE TABLE checked (
+                 id TEXT PRIMARY KEY,
+                 v TEXT NOT NULL CHECK (v IN ('a', 'b')));",
+        )
+        .await
+        .unwrap();
+        conn.execute("INSERT INTO parent (id, scope) VALUES ('p1', 'global')", ())
+            .await
+            .unwrap();
+
+        // (a) single-column FK
+        assert!(
+            conn.execute(
+                "INSERT INTO child_single (id, parent_id) VALUES ('c1', 'nope')",
+                ()
+            )
+            .await
+            .is_err(),
+            "(a) single-column FK violation must error under foreign_keys=ON"
+        );
+        conn.execute(
+            "INSERT INTO child_single (id, parent_id) VALUES ('c2', 'p1')",
+            (),
+        )
+        .await
+        .expect("(a) a satisfied single FK must be accepted");
+
+        // (b) composite FK — the id exists but the scope doesn't match the
+        // (id, scope) tuple, and a wholly-absent id; both must error.
+        assert!(
+            conn.execute(
+                "INSERT INTO child_comp (id, parent_id, parent_scope) VALUES ('cc1', 'p1', 'space')",
+                (),
+            )
+            .await
+            .is_err(),
+            "(b) composite FK violation (scope mismatch) must error"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO child_comp (id, parent_id, parent_scope) VALUES ('cc2', 'nope', 'global')",
+                (),
+            )
+            .await
+            .is_err(),
+            "(b) composite FK violation (missing id) must error"
+        );
+        conn.execute(
+            "INSERT INTO child_comp (id, parent_id, parent_scope) VALUES ('cc3', 'p1', 'global')",
+            (),
+        )
+        .await
+        .expect("(b) a satisfied composite FK must be accepted");
+
+        // (c) MATCH SIMPLE NULL-skip: either NULL half skips the composite FK.
+        conn.execute(
+            "INSERT INTO child_comp (id, parent_id, parent_scope) VALUES ('cc4', NULL, 'global')",
+            (),
+        )
+        .await
+        .expect("(c) NULL parent_id must skip the composite FK (MATCH SIMPLE)");
+        conn.execute(
+            "INSERT INTO child_comp (id, parent_id, parent_scope) VALUES ('cc5', 'nope', NULL)",
+            (),
+        )
+        .await
+        .expect("(c) NULL parent_scope must skip the composite FK (MATCH SIMPLE)");
+
+        // (d) CHECK
+        assert!(
+            conn.execute("INSERT INTO checked (id, v) VALUES ('k1', 'z')", ())
+                .await
+                .is_err(),
+            "(d) CHECK violation must error"
+        );
+        conn.execute("INSERT INTO checked (id, v) VALUES ('k2', 'a')", ())
+            .await
+            .expect("(d) a satisfied CHECK must be accepted");
+    }
+
     #[tokio::test]
     async fn fresh_install_creates_tables() {
         let db = open_memory_fresh().await;
@@ -2326,6 +3476,7 @@ mod tests {
                 id: action_id.clone(),
                 space_id: space_id.to_string(),
                 participant_id: participant_id.to_string(),
+                participant_scope: "global".to_string(),
                 item_id: uuid::Uuid::now_v7().to_string(),
                 supersedes_action_id: None,
                 action_type: "user_input".to_string(),
@@ -2458,6 +3609,7 @@ mod tests {
                     id: id.to_string(),
                     space_id: "space-t".to_string(),
                     participant_id: participant.to_string(),
+                    participant_scope: "global".to_string(),
                     item_id: item.to_string(),
                     supersedes_action_id: supersedes.map(String::from),
                     action_type: ty.to_string(),
@@ -2609,6 +3761,7 @@ mod tests {
             id: id.to_string(),
             space_id: "space-r".to_string(),
             participant_id: p.clone(),
+            participant_scope: "global".to_string(),
             item_id: "item-1".to_string(),
             supersedes_action_id: supersedes.map(String::from),
             action_type: "user_input".to_string(),
@@ -2699,6 +3852,7 @@ mod tests {
                 id: "act-1".into(),
                 space_id: "space-1".into(),
                 participant_id: agent,
+                participant_scope: "global".into(),
                 item_id: "item-1".into(),
                 supersedes_action_id: None,
                 action_type: "inference".into(),
@@ -2900,6 +4054,329 @@ mod tests {
         let lc = list_credential_lifecycle(&conn).await.unwrap();
         let exp = lc.iter().find(|r| r.nonce == "nonce-exp").unwrap();
         assert_eq!(exp.state, "expired");
+    }
+
+    #[tokio::test]
+    async fn seeds_human_and_default_template_idempotently() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+
+        // Run the seed again — well-known ids + INSERT OR IGNORE make it a
+        // no-op (no duplicate rows, no error).
+        ensure_default_participants(&conn).await.unwrap();
+
+        // "You" is a GLOBAL participant.
+        let you = get_participant(&conn, HUMAN_PARTICIPANT_ID)
+            .await
+            .unwrap()
+            .expect("You seeded");
+        assert_eq!(you.scope, "global");
+        assert_eq!(you.kind, "human");
+        assert_eq!(you.label, "You");
+        assert!(you.owner_space_id.is_none() && you.owner_template_id.is_none());
+
+        let templates = list_space_templates(&conn).await.unwrap();
+        assert_eq!(templates.len(), 1, "exactly one seeded template");
+        assert_eq!(templates[0].id, crate::config::DEFAULT_TEMPLATE_ID);
+        assert_eq!(templates[0].title, "Default");
+        assert_eq!(templates[0].cascade_limit, 4);
+
+        // The Default template OWNS its one agent (scope='template').
+        let owned = list_template_owned_participants(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+            .await
+            .unwrap();
+        assert_eq!(owned.len(), 1, "single owned agent, not duplicated");
+        assert_eq!(owned[0].scope, "template");
+        assert_eq!(
+            owned[0].owner_template_id.as_deref(),
+            Some(crate::config::DEFAULT_TEMPLATE_ID)
+        );
+        assert_eq!(owned[0].kind, "agent");
+        assert_eq!(
+            owned[0].model_ref.as_deref(),
+            Some(crate::config::DEFAULT_MODEL)
+        );
+        assert_eq!(owned[0].notify_policy, "human");
+    }
+
+    #[tokio::test]
+    async fn notify_policy_check_rejects_bad_value() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        // A value outside ('explicit','human','all') must violate the CHECK.
+        let bad = insert_participant(
+            &conn,
+            &uuid::Uuid::now_v7().to_string(),
+            "global",
+            None,
+            None,
+            "agent",
+            "Bad",
+            Some("gemma4-31b"),
+            None,
+            "sometimes",
+            "member",
+            None,
+            1_000,
+        )
+        .await;
+        assert!(bad.is_err(), "notify_policy CHECK must reject 'sometimes'");
+    }
+
+    /// The scope-owned model's central invariant, proven by the FK/CHECK
+    /// machinery rather than convention: a reference row (space_participant)
+    /// may point ONLY at a global. Referencing a SPACE-owned participant must
+    /// fail — its (id, scope='space') tuple has no (id, 'global') match, and the
+    /// pinned `participant_scope='global'` echo + composite FK reject it.
+    #[tokio::test]
+    async fn referencing_a_space_owned_participant_is_structurally_impossible() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        insert_space(&conn, "space-i", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        // A space-OWNED agent (scope='space').
+        let owned = uuid::Uuid::now_v7().to_string();
+        insert_participant(
+            &conn,
+            &owned,
+            "space",
+            Some("space-i"),
+            None,
+            "agent",
+            "Owned",
+            Some("m"),
+            None,
+            "explicit",
+            "member",
+            None,
+            1_000,
+        )
+        .await
+        .unwrap();
+        // Referencing it as a global membership must be rejected by the DB.
+        let smuggle = conn
+            .execute(
+                "INSERT INTO space_participant \
+                 (space_id, participant_id, participant_scope, role, joined_at) \
+                 VALUES ('space-i', ?1, 'global', 'member', 1000)",
+                (Value::Text(owned.clone()),),
+            )
+            .await;
+        assert!(
+            smuggle.is_err(),
+            "a space_participant referencing a space-owned participant must \
+             violate the composite FK (only globals are referenceable)"
+        );
+    }
+
+    #[tokio::test]
+    async fn instantiate_project_round_trip_preserves_owned_referenced_and_overrides() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+
+        // Instantiate the seeded default template into a fresh space.
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "space-x",
+            None,
+            "unlinked",
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            space_cascade_limit(&conn, "space-x").await.unwrap(),
+            Some(4)
+        );
+
+        // Effective members: You (referenced global, owner) + one owned agent.
+        let members = space_participants(&conn, "space-x").await.unwrap();
+        assert_eq!(members.len(), 2, "You + one owned agent");
+        let you = members.iter().find(|m| m.kind == "human").unwrap();
+        assert_eq!(you.participant_id, HUMAN_PARTICIPANT_ID);
+        assert_eq!(you.source, "referenced");
+        assert_eq!(you.scope, "global");
+        assert_eq!(you.role, "owner");
+        let agent = members.iter().find(|m| m.kind == "agent").unwrap();
+        assert_eq!(agent.source, "owned");
+        assert_eq!(agent.scope, "space");
+        assert_eq!(
+            agent.model_ref.as_deref(),
+            Some(crate::config::DEFAULT_MODEL)
+        );
+        assert_ne!(
+            agent.participant_id, DEFAULT_TEMPLATE_AGENT_ID,
+            "fresh copy"
+        );
+
+        // By-model resolution returns (id, scope) for the action echo.
+        assert_eq!(
+            space_agent_participant_by_model(&conn, "space-x", crate::config::DEFAULT_MODEL)
+                .await
+                .unwrap(),
+            Some((agent.participant_id.clone(), "space".to_string()))
+        );
+
+        // Override the referenced global (You) for this space only, and edit the
+        // owned agent's own config.
+        assert!(
+            update_space_participant_override(
+                &conn,
+                "space-x",
+                HUMAN_PARTICIPANT_ID,
+                Some(Some("Mike")),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+        );
+        update_participant_config(
+            &conn,
+            &agent.participant_id,
+            Some("Justin"),
+            Some(Some("kimi-k2-6")),
+            Some(Some("Be terse.")),
+            Some("all"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // COALESCE resolution: You now reads "Mike" (override), the agent its edit.
+        let members = space_participants(&conn, "space-x").await.unwrap();
+        let you = members.iter().find(|m| m.kind == "human").unwrap();
+        assert_eq!(you.label, "Mike", "override wins via COALESCE");
+        let agent = members.iter().find(|m| m.kind == "agent").unwrap();
+        assert_eq!(agent.label, "Justin");
+        assert_eq!(agent.model_ref.as_deref(), Some("kimi-k2-6"));
+
+        // Project back into a template: owned agent → template-owned; the You
+        // reference (with its override) → a template reference.
+        template_from_space(&conn, "space-x", "My Template", "tmpl-x", 2_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_space_template(&conn, "tmpl-x")
+                .await
+                .unwrap()
+                .unwrap()
+                .cascade_limit,
+            4
+        );
+
+        let owned = list_template_owned_participants(&conn, "tmpl-x")
+            .await
+            .unwrap();
+        assert_eq!(owned.len(), 1, "the edited agent, owned");
+        assert_eq!(owned[0].label, "Justin");
+        assert_eq!(owned[0].model_ref.as_deref(), Some("kimi-k2-6"));
+        assert_eq!(owned[0].system_prompt.as_deref(), Some("Be terse."));
+        assert_eq!(owned[0].notify_policy, "all");
+
+        let refs = list_template_participant_refs(&conn, "tmpl-x")
+            .await
+            .unwrap();
+        assert_eq!(refs.len(), 1, "the You reference carried across");
+        assert_eq!(refs[0].participant_id, HUMAN_PARTICIPANT_ID);
+        assert_eq!(
+            refs[0].override_label.as_deref(),
+            Some("Mike"),
+            "override preserved"
+        );
+
+        // Instantiate the projected template → the round-tripped space resolves
+        // You to "Mike" (override) and carries the owned edited agent.
+        instantiate_template(&conn, "tmpl-x", "space-y", None, "unlinked", 3_000)
+            .await
+            .unwrap();
+        let members = space_participants(&conn, "space-y").await.unwrap();
+        let you = members.iter().find(|m| m.kind == "human").unwrap();
+        assert_eq!(you.label, "Mike");
+        let agent = members.iter().find(|m| m.kind == "agent").unwrap();
+        assert_eq!(agent.source, "owned");
+        assert_eq!(agent.model_ref.as_deref(), Some("kimi-k2-6"));
+    }
+
+    /// Override-COALESCE edge cases: NULL inherits, '' overrides to empty.
+    #[tokio::test]
+    async fn override_coalesce_inherit_and_empty() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        insert_space(&conn, "space-o", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        ensure_space_participant(&conn, "space-o", HUMAN_PARTICIPANT_ID, "owner", 1_000)
+            .await
+            .unwrap();
+
+        // No override → inherits the global's label "You".
+        let m = space_participants(&conn, "space-o").await.unwrap();
+        assert_eq!(m[0].label, "You");
+
+        // '' override → effective empty (override to empty, not inherit).
+        update_space_participant_override(
+            &conn,
+            "space-o",
+            HUMAN_PARTICIPANT_ID,
+            Some(Some("")),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let m = space_participants(&conn, "space-o").await.unwrap();
+        assert_eq!(m[0].label, "", "empty-string override wins over inherit");
+
+        // NULL override → back to inherit.
+        update_space_participant_override(
+            &conn,
+            "space-o",
+            HUMAN_PARTICIPANT_ID,
+            Some(None),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let m = space_participants(&conn, "space-o").await.unwrap();
+        assert_eq!(m[0].label, "You", "NULL override inherits again");
+    }
+
+    #[tokio::test]
+    async fn instantiate_removed_template_fails() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        insert_space_template(&conn, "t-gone", "Gone", 4, 1_000)
+            .await
+            .unwrap();
+        assert!(
+            soft_remove_space_template(&conn, "t-gone", 2_000)
+                .await
+                .unwrap()
+        );
+        let r = instantiate_template(&conn, "t-gone", "space-z", None, "unlinked", 3_000).await;
+        assert!(r.is_err(), "instantiating a removed template must fail");
+    }
+
+    #[tokio::test]
+    async fn stale_user_version_is_refused() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        // Simulate a database from an older, incompatible schema version.
+        set_user_version(&conn, 1).await.unwrap();
+        let err = initialize(&conn).await.expect_err("stale version refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("incompatible") && msg.contains("delete"),
+            "stale-db error must be honest about deleting the dev database: {msg}"
+        );
     }
 
     #[tokio::test]

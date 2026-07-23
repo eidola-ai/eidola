@@ -17,9 +17,18 @@ pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidola:inference:production:2
 /// against via the Tinfoil ATC `POST /attestation` endpoint.
 pub const DEFAULT_ATTESTATION_REPO: &str = "eidola-ai/eidola";
 
-/// Embedded fallback for the inference model used when neither the user's
-/// config (`default_model`) nor the caller specifies one.
+/// Embedded fallback for the inference model. The `default_model` config key
+/// is gone (Participants v1); this is the model the seeded "Default" space
+/// template's agent participant carries, and the last-resort fallback when a
+/// space or template has no resolvable agent model.
 pub const DEFAULT_MODEL: &str = "gemma4-31b";
+
+/// Well-known id of the seeded "Default" space template — the compiled-in
+/// value [`Config::default_template`] resolves to when the user has set no
+/// `default_template` override. Stable across installs so the seed is
+/// idempotent (see `db::ensure_default_participants`) and the config resolver
+/// always has a live target.
+pub const DEFAULT_TEMPLATE_ID: &str = "00000000-0000-7000-8000-000000000010";
 
 /// The base type-scale factor (`1.0` = the app's designed sizes). Applied as a
 /// single multiplier over the whole type ramp — the theme's UI font size (which
@@ -145,12 +154,15 @@ pub fn default_data_dir() -> Option<PathBuf> {
 /// config-backed, resolvable without the database.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
+    /// The UUID of the `space_template` new spaces are instantiated from.
+    /// `None` = the seeded "Default" template ([`DEFAULT_TEMPLATE_ID`]).
+    /// Replaces the removed `default_model` key (Participants v1).
     #[serde(
-        rename = "default_model",
+        rename = "default_template",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub default_model_override: Option<String>,
+    pub default_template_override: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -231,13 +243,15 @@ impl Config {
             .unwrap_or(DEFAULT_ATTESTATION_REPO)
     }
 
-    /// The inference model to use when the caller doesn't specify one: the
-    /// user's `default_model` override if set, otherwise the embedded
-    /// fallback ([`DEFAULT_MODEL`]).
-    pub fn default_model(&self) -> &str {
-        self.default_model_override
+    /// The space template new spaces are instantiated from: the user's
+    /// `default_template` override if set, otherwise the seeded "Default"
+    /// template ([`DEFAULT_TEMPLATE_ID`]). Callers should still verify the
+    /// resolved id names a *live* (non-removed) template and fall back to the
+    /// seeded default if it doesn't (the resolver can't reach the DB).
+    pub fn default_template(&self) -> &str {
+        self.default_template_override
             .as_deref()
-            .unwrap_or(DEFAULT_MODEL)
+            .unwrap_or(DEFAULT_TEMPLATE_ID)
     }
 
     /// The circadian day/night axis: the user's `appearance` override if
@@ -418,29 +432,32 @@ mod tests {
     }
 
     #[test]
-    fn default_model_falls_back_to_embedded_value() {
+    fn default_template_falls_back_to_seeded_id() {
         let cfg = Config::default();
-        assert_eq!(cfg.default_model(), DEFAULT_MODEL);
+        assert_eq!(cfg.default_template(), DEFAULT_TEMPLATE_ID);
     }
 
     #[test]
-    fn default_model_round_trips_via_toml() {
+    fn default_template_round_trips_via_toml() {
         let original = Config {
-            default_model_override: Some("kimi-k2-6".into()),
+            default_template_override: Some("00000000-0000-7000-8000-0000000000ab".into()),
             ..Config::default()
         };
         let toml_text = toml::to_string_pretty(&original).expect("serialize");
         assert!(
-            toml_text.contains("default_model = \"kimi-k2-6\""),
-            "override must serialize under the public `default_model` key: {toml_text}"
+            toml_text.contains("default_template = \"00000000-0000-7000-8000-0000000000ab\""),
+            "override must serialize under the public `default_template` key: {toml_text}"
         );
         let parsed: Config = toml::from_str(&toml_text).expect("deserialize");
-        assert_eq!(parsed.default_model(), "kimi-k2-6");
+        assert_eq!(
+            parsed.default_template(),
+            "00000000-0000-7000-8000-0000000000ab"
+        );
 
         // Absent key → override stays None and the resolver falls back.
         let parsed: Config = toml::from_str("").expect("deserialize empty");
-        assert!(parsed.default_model_override.is_none());
-        assert_eq!(parsed.default_model(), DEFAULT_MODEL);
+        assert!(parsed.default_template_override.is_none());
+        assert_eq!(parsed.default_template(), DEFAULT_TEMPLATE_ID);
     }
 
     #[test]

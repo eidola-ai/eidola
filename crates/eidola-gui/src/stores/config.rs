@@ -200,10 +200,6 @@ impl ConfigStore {
         });
     }
 
-    pub fn set_default_model(&mut self, model: String, cx: &mut Context<Self>) {
-        self.write(cx, |c| c.set_default_model(model));
-    }
-
     /// Circadian day/night axis (`appearance`). The theme reacts via its
     /// config observation (`theme::wire_config`), not from here.
     pub fn set_appearance(

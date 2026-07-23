@@ -1873,6 +1873,7 @@ fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
 fn config_state(has_account: bool) -> ConfigState {
     ConfigState {
         default_model: "gemma4-31b".into(),
+        default_template: "00000000-0000-7000-8000-000000000010".into(),
         has_account,
         has_account_secret: has_account,
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
