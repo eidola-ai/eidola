@@ -238,6 +238,9 @@ pub struct PrepaintState {
     /// paint to draw the rounded background, clip content to the
     /// visible band, and overlay the horizontal scrollbar.
     code_block_paint: Option<CodeBlockPaint>,
+    /// `Some` only for `BlockKind::Table`. Horizontal-scroll geometry
+    /// (tables never soft-wrap) plus display mode's hairline rules.
+    table_paint: Option<TablePaint>,
     /// `Some` only for `BlockKind::DisplayMath` in *display* mode
     /// (cursor outside the math). Holds the typeset math + paint
     /// origin. Edit mode falls back to text shaping and uses the
@@ -703,6 +706,209 @@ fn measure_pad_advance(
     line.map(|l| l.width()).unwrap_or(em_px * 0.2)
 }
 
+/// Measure the shaped width of an arbitrary source slice of `block`
+/// (hidden ranges dropped, substitutions applied, inline styles
+/// driving the fonts) — the cell-measurement primitive for
+/// [`augment_block_with_table`].
+fn measure_block_slice_width(
+    source: &str,
+    range: &Range<usize>,
+    block: &RenderBlock,
+    style: &MarkdownStyle,
+    font_size: Pixels,
+    window: &mut Window,
+) -> Pixels {
+    if range.start >= range.end {
+        return px(0.0);
+    }
+    let (display, map) = build_display_line(source, range, block);
+    if display.is_empty() {
+        return px(0.0);
+    }
+    let runs = build_runs_for_line(&display, &map, block, style);
+    window
+        .text_system()
+        .shape_text(SharedString::from(display), font_size, &runs, None, None)
+        .ok()
+        .and_then(|mut v| v.drain(..).next())
+        .map(|l| l.width())
+        .unwrap_or(px(0.0))
+}
+
+/// Column-alignment pre-pass for `BlockKind::Table`.
+///
+/// Measures every cell's shaped width, derives per-column slot widths
+/// (widest cell wins), and substitutes each row's between-cell chrome
+/// with a display string that pads the columns into alignment:
+///
+/// * **Display mode** — the chrome bytes are already hidden by the
+///   render layer; the substitution replaces them with pad runs only
+///   (leading/trailing fills per the column's alignment colons, plus
+///   a fixed inter-column gutter).
+/// * **Edit mode** — the chrome stays visible (dimmed); the
+///   substitution re-emits the literal chrome text with the fills
+///   spliced around the pipe, so the source reads as an org-style
+///   aligned table while the buffer keeps its minimal canonical form.
+///
+/// Pads are [`MATH_PAD_CHAR`] runs (~⅙ em), sized against a running
+/// ideal-vs-measured error so rounding never accumulates across
+/// columns (±half a pad char per boundary, non-cumulative). All
+/// substitution display bytes map to the chrome range's start, so a
+/// click in the padding lands at the previous cell's content end —
+/// which the forbidden-position machinery then keeps.
+fn augment_block_with_table(
+    block: &RenderBlock,
+    source: &str,
+    font_size: Pixels,
+    style: &MarkdownStyle,
+    window: &mut Window,
+) -> RenderBlock {
+    let BlockKind::Table {
+        geometry,
+        edit_mode,
+        ..
+    } = &block.kind
+    else {
+        return block.clone();
+    };
+    let mut augmented = block.clone();
+    let pad_w = measure_pad_advance(font_size, style, &block.kind, window);
+    if pad_w <= px(0.0) {
+        return augmented;
+    }
+    let gutter = font_size * 1.25;
+    let edit = *edit_mode;
+
+    use crate::syntax::TableAlignment;
+    use crate::table::RowKind;
+
+    // Rows that participate in alignment: the delimiter row only in
+    // edit mode (it's hidden in display mode).
+    let rows: Vec<&crate::table::RowGeometry> = geometry
+        .rows
+        .iter()
+        .filter(|r| edit || r.kind != RowKind::Delimiter)
+        .collect();
+
+    // Per-column slot widths.
+    let n_cols = geometry.column_count();
+    let mut slot: Vec<Pixels> = vec![px(0.0); n_cols];
+    let mut cell_widths: Vec<Vec<Pixels>> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut widths = Vec::with_capacity(row.cells.len());
+        for (k, cell) in row.cells.iter().enumerate() {
+            let w = measure_block_slice_width(source, cell, block, style, font_size, window);
+            if k < n_cols && w > slot[k] {
+                slot[k] = w;
+            }
+            widths.push(w);
+        }
+        cell_widths.push(widths);
+    }
+
+    // Note on chrome glyphs in edit mode: the canonical chrome
+    // strings (`| `, ` | `, ` |`) are identical on every row, so
+    // they contribute equal width per boundary and columns align
+    // without measuring them — the running `err` only has to track
+    // pad-run rounding. A transient non-canonical chrome run on the
+    // caret's row shifts that one row until the normalize pass snaps
+    // it back; accepted.
+    let pad_run = |n: usize| -> String { MATH_PAD_CHAR.to_string().repeat(n) };
+    let fill_split = |k: usize, w: Pixels| -> (Pixels, Pixels) {
+        // (leading, trailing) fill for a cell of width `w` in column
+        // `k`, per the column's alignment.
+        let free = (slot.get(k).copied().unwrap_or(px(0.0)) - w).max(px(0.0));
+        match geometry.alignment(k) {
+            TableAlignment::Right => (free, px(0.0)),
+            TableAlignment::Center => (free * 0.5, free - free * 0.5),
+            TableAlignment::None | TableAlignment::Left => (px(0.0), free),
+        }
+    };
+
+    for (row, widths) in rows.iter().zip(cell_widths.iter()) {
+        // The delimiter row's cells are chrome, not aligned content —
+        // in edit mode just leave its literal text in place (it's
+        // dimmed); no pads. (Stretching its dashes to the column
+        // width is a possible future nicety.)
+        if row.kind == RowKind::Delimiter {
+            continue;
+        }
+        let mut err = px(0.0); // ideal minus measured, running
+        let mut prev_end = row.line.start;
+        for (k, cell) in row.cells.iter().enumerate() {
+            let chrome_range = prev_end..cell.start;
+            let chrome_text = &source[chrome_range.clone()];
+            let (lead, _) = fill_split(k, widths.get(k).copied().unwrap_or(px(0.0)));
+            let trail_prev = if k == 0 {
+                px(0.0)
+            } else {
+                let (_, t) = fill_split(k - 1, widths.get(k - 1).copied().unwrap_or(px(0.0)));
+                t
+            };
+            let inter_gutter = if k == 0 || edit { px(0.0) } else { gutter };
+            // Compose: [trail fill of prev cell][chrome glyphs (edit)
+            // or nothing (display)][gutter (display)][lead fill].
+            let mut display = String::new();
+            let mut want = trail_prev + err;
+            let n1 = ((want / pad_w).round() as i64).max(0) as usize;
+            display.push_str(&pad_run(n1));
+            err = want - pad_w * (n1 as f32);
+            if edit {
+                display.push_str(chrome_text);
+            }
+            want = inter_gutter + lead + err;
+            let n2 = ((want / pad_w).round() as i64).max(0) as usize;
+            display.push_str(&pad_run(n2));
+            err = want - pad_w * (n2 as f32);
+            if !display.is_empty() && chrome_range.start < chrome_range.end {
+                augmented.substitutions.push(Substitution {
+                    source_range: chrome_range,
+                    display,
+                });
+            }
+            prev_end = cell.end;
+        }
+        // Trailing chrome (` |`): in edit mode pad the last cell out
+        // to its slot so the closing pipes align column-style.
+        let trailing = prev_end..row.line.end;
+        if edit && trailing.start < trailing.end {
+            let k_last = row.cells.len().saturating_sub(1);
+            let trail = if row.cells.is_empty() {
+                px(0.0)
+            } else {
+                fill_split(k_last, widths.get(k_last).copied().unwrap_or(px(0.0))).1
+            };
+            let want = trail + err;
+            let n = ((want / pad_w).round() as i64).max(0) as usize;
+            if n > 0 {
+                let mut display = pad_run(n);
+                display.push_str(&source[trailing.clone()]);
+                augmented.substitutions.push(Substitution {
+                    source_range: trailing,
+                    display,
+                });
+            }
+        }
+    }
+
+    augmented
+}
+
+/// Paint state for a `BlockKind::Table` block: horizontal-scroll
+/// geometry (tables never soft-wrap; wide ones scroll like code
+/// blocks) plus the hairline rules of display mode.
+struct TablePaint {
+    /// Content clip when the table overflows the visible width.
+    clip: Bounds<Pixels>,
+    /// Widest shaped table line.
+    content_width: Pixels,
+    visible_width: Pixels,
+    scroll_x: Pixels,
+    /// Hairline rule quads (positioned, already scroll-translated).
+    /// `rules[0]` is the header rule when present.
+    rules: Vec<Bounds<Pixels>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CodeBlockPaint {
     /// Outer rounded fill (full block, fence rows + content strip).
@@ -759,6 +965,7 @@ impl Element for BlockElement {
         );
         let inner_pad = block_inner_padding(&self.block.kind, &self.style);
         let is_code = is_code_block(&self.block.kind);
+        let is_table = is_table_block(&self.block.kind);
         let container_indent = containers_left_indent(&self.block.containers, &self.style, window);
 
         let source = self.editor.read(cx).state.markdown.clone();
@@ -878,11 +1085,15 @@ impl Element for BlockElement {
                 // remaining width so soft-wrap lands at the visible
                 // right edge regardless of nesting depth.
                 let inner_w = (avail_w - container_indent).max(px(1.0));
-                // Code blocks don't soft-wrap — long lines extend off
-                // the right edge of the visible region and the user
-                // scrolls horizontally to see them. Other blocks wrap
-                // at the indented inner width.
-                let wrap_w = if is_code { None } else { Some(inner_w) };
+                // Code blocks and tables don't soft-wrap — long lines
+                // extend off the right edge of the visible region and
+                // the user scrolls horizontally to see them. Other
+                // blocks wrap at the indented inner width.
+                let wrap_w = if is_code || is_table {
+                    None
+                } else {
+                    Some(inner_w)
+                };
                 // Inline math: typeset each overlay and substitute a
                 // width-matched run of NBSPs so wrap math sees the
                 // math's pixel width. Paint specs flow through to
@@ -904,6 +1115,22 @@ impl Element for BlockElement {
                     &style_clone,
                     window,
                 );
+                // Tables: measure cells and substitute alignment pads
+                // so the shaped line count and widths here match
+                // prepaint's (an all-empty table row would otherwise
+                // shape to an empty display line and be dropped from
+                // the measure but kept in prepaint).
+                let augmented_block = if is_table {
+                    augment_block_with_table(
+                        &augmented_block,
+                        &source,
+                        font_size,
+                        &style_clone,
+                        window,
+                    )
+                } else {
+                    augmented_block
+                };
                 let (body_ascent, body_descent) =
                     body_metrics_for_block(&block_clone.kind, &style_clone, font_size, window);
                 let lines = shape_block_lines(
@@ -1027,6 +1254,9 @@ impl Element for BlockElement {
         // recomputes it for its own bounds.
         let inner_pad = block_inner_padding(&self.block.kind, &style);
         let is_code = is_code_block(&self.block.kind);
+        let is_table = is_table_block(&self.block.kind);
+        // Blocks that never soft-wrap and scroll horizontally instead.
+        let no_wrap = is_code || is_table;
         let container_indent = containers_left_indent(&self.block.containers, &style, window);
 
         let block_top = bounds.origin.y + extra_above + spacing_above;
@@ -1047,7 +1277,7 @@ impl Element for BlockElement {
         let block_width = (bounds.size.width - container_indent).max(px(1.0));
         let visible_content_width = (block_width - inner_pad * 2.).max(px(1.0));
 
-        let wrap_w = if is_code { None } else { Some(block_width) };
+        let wrap_w = if no_wrap { None } else { Some(block_width) };
         // Inline math: typeset overlays and substitute width-matched
         // NBSPs into a working clone of the block. Paint specs flow
         // through to the paint phase; the augmented block is what
@@ -1066,7 +1296,7 @@ impl Element for BlockElement {
             .iter()
             .map(|o| crate::image::load(&o.dest_url, window, cx))
             .collect();
-        let (mut augmented_block, inline_image_specs) = augment_block_with_images(
+        let (augmented_block, inline_image_specs) = augment_block_with_images(
             &augmented_block,
             &inline_image_loaded,
             font_size,
@@ -1074,6 +1304,14 @@ impl Element for BlockElement {
             &style,
             window,
         );
+        // Tables: the column-alignment pre-pass (cell measurement +
+        // pad substitutions). Mirrors the request_layout measure
+        // closure so heights and widths agree between the phases.
+        let mut augmented_block = if is_table {
+            augment_block_with_table(&augmented_block, &source, font_size, &style, window)
+        } else {
+            augmented_block
+        };
         // Block image in display mode: hide the source bytes when
         // we have a paintable image (Loaded) or a placeholder
         // (Loading) so the raw `![alt](url)` text doesn't shape
@@ -1227,7 +1465,7 @@ impl Element for BlockElement {
         // `visible_content_width`.
         let max_scroll = (max_content_line_width - visible_content_width).max(px(0.0));
         let scroll_x = scroll_offset.min(max_scroll).max(px(0.0));
-        if is_code && scroll_x != scroll_offset {
+        if no_wrap && scroll_x != scroll_offset {
             // Out-of-range cached scroll (e.g. content shrank) — clamp
             // it on the editor so subsequent frames see the corrected
             // value.
@@ -1238,8 +1476,9 @@ impl Element for BlockElement {
         }
         // Only *content* lines translate with horizontal scroll —
         // fence lines stay pinned at `content_left`. The fence rows
-        // are a stable frame around the scrolling code area.
-        if is_code && scroll_x > px(0.0) {
+        // are a stable frame around the scrolling code area. (Tables
+        // have no delimiter lines, so every row translates.)
+        if no_wrap && scroll_x > px(0.0) {
             for line in &mut lines {
                 if !line.is_delimiter {
                     line.origin.x -= scroll_x;
@@ -1306,6 +1545,46 @@ impl Element for BlockElement {
         // `max_scroll = max_content_line_width - visible_content_width`
         // already accounts for the symmetric trailing padding at
         // max scroll.
+        // Table paint state: scroll geometry plus display mode's
+        // hairline rules. Rules sit on the boundary between adjacent
+        // rows — the natural half-leading above and below the rule
+        // keeps the text breathing. `rules[0]` is the header rule
+        // (painted at full rule color; later ones lighter). Edit mode
+        // paints no rules — the dimmed delimiter row is the boundary.
+        let table_paint = if is_table {
+            let edit_mode = matches!(
+                &self.block.kind,
+                BlockKind::Table {
+                    edit_mode: true,
+                    ..
+                }
+            );
+            let mut rules = Vec::new();
+            if !edit_mode {
+                let rule_x = content_left - scroll_x;
+                let rule_w = max_content_line_width.max(px(1.0));
+                for i in 0..laid_out.lines.len().saturating_sub(1) {
+                    let y = laid_out.lines[i + 1].origin.y;
+                    rules.push(Bounds::new(
+                        point(rule_x, y - px(0.5)),
+                        size(rule_w, px(1.0)),
+                    ));
+                }
+            }
+            Some(TablePaint {
+                clip: Bounds::new(
+                    point(block_left, block_top),
+                    size(block_width, (block_bottom - block_top).max(px(0.0))),
+                ),
+                content_width: max_content_line_width,
+                visible_width: visible_content_width,
+                scroll_x,
+                rules,
+            })
+        } else {
+            None
+        };
+
         let code_block_paint = if is_code {
             let strip_top = strip_top.unwrap_or(block_top + inner_pad);
             let strip_bottom = strip_bottom.unwrap_or(block_bottom - inner_pad);
@@ -1383,6 +1662,7 @@ impl Element for BlockElement {
             cursor_quad,
             selection_quads,
             code_block_paint,
+            table_paint,
             math_paint,
             inline_math: inline_math_specs,
             image_paint,
@@ -1666,60 +1946,91 @@ impl Element for BlockElement {
                 }
             });
         } else {
-            // Non-code blocks: no mask, no split.
-            //
-            // Run backgrounds (the inline-code chip fill carried on
-            // `TextRun::background_color`) paint first so the
-            // selection wash and the glyphs layer on top of them.
-            // `WrappedLine::paint` itself only draws glyphs +
-            // underline/strikethrough — backgrounds need the explicit
-            // `paint_background` pass or the chip never shows.
-            for laid in &prepaint.laid_out.lines {
-                let _ = laid.line.paint_background(
-                    laid.origin,
-                    laid.row_height,
-                    gpui::TextAlign::Left,
-                    None,
+            // Non-code blocks: no fence split. Tables additionally
+            // clip to their visible band when wider than the content
+            // area (they never soft-wrap — the same horizontal-scroll
+            // treatment as code blocks, minus the background chrome)
+            // and paint their hairline rules under everything.
+            let table_mask = prepaint.table_paint.as_ref().and_then(|tp| {
+                (tp.content_width > tp.visible_width).then_some(ContentMask { bounds: tp.clip })
+            });
+            let table_rules: Vec<(Bounds<Pixels>, bool)> = prepaint
+                .table_paint
+                .as_ref()
+                .map(|tp| {
+                    tp.rules
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| (*r, i == 0))
+                        .collect()
+                })
+                .unwrap_or_default();
+            window.with_content_mask(table_mask, |window| {
+                // Table rules paint first — chrome under content.
+                for (rule, is_header_rule) in &table_rules {
+                    let mut color = self.style.table_rule_color;
+                    if !is_header_rule {
+                        color.a *= 0.45;
+                    }
+                    window.paint_quad(fill(*rule, color));
+                }
+                // Run backgrounds (the inline-code chip fill carried on
+                // `TextRun::background_color`) paint first so the
+                // selection wash and the glyphs layer on top of them.
+                // `WrappedLine::paint` itself only draws glyphs +
+                // underline/strikethrough — backgrounds need the explicit
+                // `paint_background` pass or the chip never shows.
+                for laid in &prepaint.laid_out.lines {
+                    let _ = laid.line.paint_background(
+                        laid.origin,
+                        laid.row_height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+                for tq in selection_quads {
+                    window.paint_quad(tq.quad);
+                }
+                for laid in &prepaint.laid_out.lines {
+                    let _ = laid.line.paint(
+                        laid.origin,
+                        laid.row_height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+                // Inline math overlays paint *after* the line text (so
+                // they sit on top of the NBSP placeholders that
+                // reserved the space) but *before* the cursor (so the
+                // caret remains visible above the math).
+                paint_inline_math_overlays(
+                    &prepaint.inline_math,
+                    &prepaint.laid_out.lines,
+                    &self.style,
+                    &self.block.kind,
                     window,
                     cx,
                 );
-            }
-            for tq in selection_quads {
-                window.paint_quad(tq.quad);
-            }
-            for laid in &prepaint.laid_out.lines {
-                let _ = laid.line.paint(
-                    laid.origin,
-                    laid.row_height,
-                    gpui::TextAlign::Left,
-                    None,
+                // Inline image overlays — same paint ordering as math
+                // (over the line text, under the cursor). Each spec
+                // paints exactly where its substitution placed pad
+                // glyphs in the shaped line.
+                paint_inline_image_overlays(
+                    &prepaint.inline_images,
+                    &prepaint.laid_out.lines,
                     window,
-                    cx,
                 );
-            }
-            // Inline math overlays paint *after* the line text (so
-            // they sit on top of the NBSP placeholders that
-            // reserved the space) but *before* the cursor (so the
-            // caret remains visible above the math).
-            paint_inline_math_overlays(
-                &prepaint.inline_math,
-                &prepaint.laid_out.lines,
-                &self.style,
-                &self.block.kind,
-                window,
-                cx,
-            );
-            // Inline image overlays — same paint ordering as math
-            // (over the line text, under the cursor). Each spec
-            // paints exactly where its substitution placed pad
-            // glyphs in the shaped line.
-            paint_inline_image_overlays(&prepaint.inline_images, &prepaint.laid_out.lines, window);
-            if focused
-                && !disabled
-                && let Some(tq) = cursor_quad
-            {
-                window.paint_quad(tq.quad);
-            }
+                if focused
+                    && !disabled
+                    && let Some(tq) = cursor_quad
+                {
+                    window.paint_quad(tq.quad);
+                }
+            });
         }
 
         // Horizontal scrollbar overlay — only when the code block has
@@ -1733,13 +2044,41 @@ impl Element for BlockElement {
         {
             paint_horizontal_scrollbar(window, cb, &self.style);
         }
+        // Table scrollbar: same overlay as code blocks, tracked along
+        // the block's bottom edge (tables have no fence seam to sit on).
+        if let Some(tp) = &prepaint.table_paint
+            && tp.content_width > tp.visible_width
+        {
+            paint_h_scrollbar_at(
+                window,
+                &self.style,
+                tp.clip.bottom() - px(3.0),
+                tp.clip.left(),
+                tp.clip.right(),
+                tp.content_width,
+                tp.visible_width,
+                tp.scroll_x,
+            );
+        }
 
-        if let Some(cb) = code_block_paint {
+        // Horizontal scroll-wheel routing for the no-wrap blocks
+        // (code + table): one listener over the block's scrollable
+        // area, writing the per-block scroll slot.
+        let scroll_wheel_area = if let Some(cb) = code_block_paint {
+            Some((
+                cb.bg_bounds,
+                (cb.content_width - cb.visible_width).max(px(0.0)),
+            ))
+        } else {
+            prepaint
+                .table_paint
+                .as_ref()
+                .map(|tp| (tp.clip, (tp.content_width - tp.visible_width).max(px(0.0))))
+        };
+        if let Some((bg_bounds, max_scroll)) = scroll_wheel_area {
             // Capture for the scroll-wheel listener.
             let editor = self.editor.clone();
             let block_index = self.block_index;
-            let max_scroll = (cb.content_width - cb.visible_width).max(px(0.0));
-            let bg_bounds = cb.bg_bounds;
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
                 if !phase.bubble() {
                     return;
@@ -2193,29 +2532,47 @@ fn paint_thematic_break(
 }
 
 fn paint_horizontal_scrollbar(window: &mut Window, cb: &CodeBlockPaint, style: &MarkdownStyle) {
-    let track_h = px(3.0);
     // Sit on the seam between the content strip and the closing fence
-    // row — `track_y` is the strip's bottom edge, so the bar occupies
-    // the top sliver of the closing fence row. This puts the
-    // scrollbar visually adjacent to the scrollable region without
-    // overlapping the content baseline above or floating loose at
-    // the bottom of the outer fill.
-    let track_y = cb.content_strip.bottom();
-    // Align the scrollbar with the content text (which paints inset
-    // by `inner_pad`), not the dark bg's edges. Without this the
-    // scrollbar would extend `inner_pad` further than the code on
-    // each side.
-    let track_left = cb.content_clip.left();
-    let track_right = cb.content_clip.right();
+    // row — the strip's bottom edge, so the bar occupies the top
+    // sliver of the closing fence row: visually adjacent to the
+    // scrollable region without overlapping the content baseline.
+    // Track alignment follows the content text (inset by
+    // `inner_pad`), not the dark bg's edges.
+    paint_h_scrollbar_at(
+        window,
+        style,
+        cb.content_strip.bottom(),
+        cb.content_clip.left(),
+        cb.content_clip.right(),
+        cb.content_width,
+        cb.visible_width,
+        cb.scroll_x,
+    );
+}
+
+/// Shared horizontal-scrollbar painter for the no-wrap blocks (code
+/// blocks and tables). `track_y` is the top edge of the 3px track.
+#[allow(clippy::too_many_arguments)]
+fn paint_h_scrollbar_at(
+    window: &mut Window,
+    style: &MarkdownStyle,
+    track_y: Pixels,
+    track_left: Pixels,
+    track_right: Pixels,
+    content_width: Pixels,
+    visible_width: Pixels,
+    scroll_x: Pixels,
+) {
+    let track_h = px(3.0);
     let track_w = (track_right - track_left).max(px(1.0));
 
     // Thumb: proportional to visible / content, offset by scroll
     // position. Minimum thumb width keeps it draggable-feeling at
     // very long content.
-    let ratio = (cb.visible_width / cb.content_width).clamp(0.05, 1.0);
+    let ratio = (visible_width / content_width).clamp(0.05, 1.0);
     let thumb_w = (track_w * ratio).max(px(24.0));
-    let scroll_ratio = if cb.content_width > cb.visible_width {
-        f32::from(cb.scroll_x) / f32::from(cb.content_width - cb.visible_width)
+    let scroll_ratio = if content_width > visible_width {
+        f32::from(scroll_x) / f32::from(content_width - visible_width)
     } else {
         0.0
     };
@@ -2259,9 +2616,10 @@ fn empty_shaped_line(font_size: Pixels, window: &mut Window) -> Option<Arc<Wrapp
 fn font_size_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
     match kind {
         BlockKind::Heading { level } => style.size_for_heading(*level),
-        BlockKind::Paragraph | BlockKind::ThematicBreak | BlockKind::Image { .. } => {
-            style.font_size
-        }
+        BlockKind::Paragraph
+        | BlockKind::ThematicBreak
+        | BlockKind::Image { .. }
+        | BlockKind::Table { .. } => style.font_size,
         BlockKind::CodeBlock { .. } => style.mono_font_size,
         // Display math: in edit mode shapes mono LaTeX; in display
         // mode the shaped-text path produces a single zero-width
@@ -2304,7 +2662,8 @@ fn spacing_above_for_block(
         | BlockKind::CodeBlock { .. }
         | BlockKind::ThematicBreak
         | BlockKind::DisplayMath { .. }
-        | BlockKind::Image { .. } => {
+        | BlockKind::Image { .. }
+        | BlockKind::Table { .. } => {
             if in_list_item {
                 style.paragraph_gap.0 * style.list_item_gap_factor
             } else {
@@ -2424,6 +2783,10 @@ fn block_inner_padding(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
 
 fn is_code_block(kind: &BlockKind) -> bool {
     matches!(kind, BlockKind::CodeBlock { .. })
+}
+
+fn is_table_block(kind: &BlockKind) -> bool {
+    matches!(kind, BlockKind::Table { .. })
 }
 
 /// Cumulative left indent contributed by every container (blockquote,
@@ -2921,7 +3284,27 @@ fn build_display_line(
             .map(|r| r.end)
             .max();
         if let Some(end) = cover_end {
-            pos = end.min(line.end);
+            let mut jump = end.min(line.end);
+            // A substitution whose start lies strictly inside the
+            // covered span must still get its chance to apply. This
+            // matters for table gap substitutions: the render layer's
+            // `merge_hidden_ranges` merges the gap's chrome hide with
+            // any *touching* construct-delimiter hide (a cell ending
+            // in `` ` `` / `**` / `~~`), so the merged range starts
+            // before the gap and a straight jump to its end would
+            // skip the substitution entirely — the alignment pads
+            // vanish exactly on styled cells. Clamp the jump to the
+            // earliest in-span substitution start instead.
+            if let Some(sub_start) = block
+                .substitutions
+                .iter()
+                .filter(|s| s.source_range.start > pos && s.source_range.start < jump)
+                .map(|s| s.source_range.start)
+                .min()
+            {
+                jump = sub_start;
+            }
+            pos = jump;
             continue;
         }
         let ch = source[pos..line.end]
@@ -2982,6 +3365,10 @@ fn build_runs_for_line(
         }
         if merged.bold || base_weight == FontWeight::BOLD {
             run_font.weight = FontWeight::BOLD;
+        } else if merged.table_header {
+            // Table header cells: the table-header weight (Medium by
+            // default) carries the emphasis; explicit bold above wins.
+            run_font.weight = style.table_header_weight;
         } else if base_weight != FontWeight::NORMAL {
             run_font.weight = base_weight;
         }

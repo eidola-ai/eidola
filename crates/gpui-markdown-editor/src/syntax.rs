@@ -176,9 +176,51 @@ pub enum NodeKind {
         delimiter_ranges: Vec<ByteRange>,
         content_range: ByteRange,
     },
+    /// GFM pipe table. `alignments` is the per-column alignment
+    /// parsed from the delimiter row (one entry per column; the
+    /// column count authority per the GFM spec). Children are one
+    /// `TableRow` per source row in order — the header row first,
+    /// then body rows. The delimiter row (`| --- | :-: |`) is *not*
+    /// a child (pulldown never emits it as an event); its line is
+    /// recoverable from the gap between the header row's range and
+    /// the first body row's (see `crate::table::TableGeometry`).
+    ///
+    /// The node's `range` matches pulldown's `Tag::Table` range —
+    /// the whole construct including the trailing `\n` when present.
+    Table {
+        alignments: Vec<TableAlignment>,
+    },
+    /// One table row (header or body). `is_header` is true for the
+    /// row pulldown emitted under `TableHead`. Children are one
+    /// `TableCell` per cell in order. Note pulldown synthesizes
+    /// *empty* trailing cells (with degenerate ranges past the row
+    /// line) for rows narrower than the column count — the parser
+    /// clamps those ranges to the row's line.
+    TableRow {
+        is_header: bool,
+    },
+    /// One table cell. The node `range` is pulldown's cell range —
+    /// the *untrimmed* bytes between the pipes (including the
+    /// padding spaces). Children are the cell's inline content
+    /// (text, strong, code, …), which carry trimmed ranges.
+    TableCell,
     SoftBreak,
     HardBreak,
     Text,
+}
+
+/// Per-column alignment of a GFM table, parsed from the delimiter
+/// row's colons. Mirrors `pulldown_cmark::Alignment`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAlignment {
+    /// No colons (`---`) — renderers left-align by convention.
+    None,
+    /// Leading colon (`:--`).
+    Left,
+    /// Both colons (`:-:`).
+    Center,
+    /// Trailing colon (`--:`).
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -466,7 +466,35 @@ pub fn is_forbidden_position(markdown: &str, p: usize) -> bool {
     if is_chain_pair_interior(markdown, p) && !in_verbatim {
         return true;
     }
+    if is_table_chrome_position(markdown, p) {
+        return true;
+    }
     false
+}
+
+/// Table flavor of forbidden: `p` sits inside a top-level table's
+/// between-cell chrome (`| ` / ` | ` / ` |` and the row's trailing
+/// newline position). The caret lives at cell-content edges only, so
+/// the standard snapping walks hop cell-to-cell in one step — the
+/// table analog of the hidden list-indent interior above. A cheap
+/// pipe-on-the-line prefilter skips the parse for the overwhelmingly
+/// common non-table case.
+fn is_table_chrome_position(markdown: &str, p: usize) -> bool {
+    let bytes = markdown.as_bytes();
+    let p_clamped = p.min(markdown.len());
+    let line_start = markdown[..p_clamped]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let line_end = markdown[p_clamped..]
+        .find('\n')
+        .map(|i| p_clamped + i)
+        .unwrap_or(markdown.len());
+    if !bytes[line_start..line_end].contains(&b'|') {
+        return false;
+    }
+    let tree = crate::parser::parse(markdown);
+    crate::table::is_table_chrome_interior(markdown, &tree, p)
 }
 
 /// Chain-aware analog of [`is_paragraph_break_interior`]: is byte `p`

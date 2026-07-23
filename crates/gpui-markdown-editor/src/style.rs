@@ -142,6 +142,15 @@ pub struct MarkdownStyle {
     pub thematic_break_color: Hsla,
     /// Thickness (in px) of the thematic-break rule line.
     pub thematic_break_thickness: Pixels,
+    /// Font weight for table header cells. Defaults to `MEDIUM` —
+    /// the same flat, quiet emphasis the app's prose headings use
+    /// (weight carries the header, never size), in the book idiom of
+    /// hairline-ruled tables.
+    pub table_header_weight: FontWeight,
+    /// Color of the table's hairline rules (under the header row and
+    /// between body rows). Defaults to the theme's `border`, like
+    /// the thematic break — table rules are chrome, not content.
+    pub table_rule_color: Hsla,
 }
 
 impl MarkdownStyle {
@@ -186,6 +195,8 @@ impl MarkdownStyle {
             link_color: theme.link,
             thematic_break_color: theme.border,
             thematic_break_thickness: px(1.0),
+            table_header_weight: FontWeight::MEDIUM,
+            table_rule_color: theme.border,
         }
     }
 
