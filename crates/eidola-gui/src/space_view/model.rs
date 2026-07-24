@@ -43,6 +43,9 @@ pub struct PostData {
     pub time: SharedString,
     /// The post body as markdown source.
     pub content: SharedString,
+    /// The model that produced an inference row (`None` for human rows).
+    /// Regenerate re-asks the post's own recorded model.
+    pub model: Option<SharedString>,
     /// Total generations of this item (`> 1` shows a `vN` badge).
     pub generation_count: i64,
     /// Captured reasoning for an assistant turn (ephemeral disclosure), if any.
@@ -57,8 +60,10 @@ pub enum NodeSrc {
     /// A persisted (or optimistic) transcript row, by index into the
     /// `Space`'s message slice.
     Msg(usize),
-    /// The live in-flight assistant reply (the `Space`'s streaming buffer).
-    Streaming,
+    /// One live in-flight response turn, by its `StreamingTurn::seq`. Several
+    /// can render at once (a notification fan-out), each attached at its own
+    /// target post.
+    Streaming(u64),
     /// The active composer draft (window-local).
     Draft,
 }
@@ -77,8 +82,13 @@ pub struct TreeNode {
     pub children: Vec<TreeNode>,
 }
 
-/// Sentinel id for the streaming overlay leaf.
-pub const STREAMING_ID: &str = "::streaming";
+/// Prefix of every streaming-overlay leaf id (see [`streaming_node_id`]).
+pub const STREAMING_ID_PREFIX: &str = "::streaming-";
+/// The stable node id for the in-flight turn `seq` — the key for its height
+/// cache entry and body editor.
+pub fn streaming_node_id(seq: u64) -> SharedString {
+    SharedString::from(format!("{STREAMING_ID_PREFIX}{seq}"))
+}
 /// Sentinel id for the active draft/composer overlay leaf.
 pub const DRAFT_ID: &str = "::draft";
 /// Synthetic id for the implicit top-level scroller over multiple thread roots.
@@ -245,6 +255,7 @@ mod tests {
             byline_backend: (kind == "agent").then(|| "Eidola".into()),
             time: "".into(),
             content: text.into(),
+            model: (kind == "agent").then(|| "kimi".into()),
             generation_count: 1,
             reasoning: None,
             reasoning_expanded: false,
@@ -260,6 +271,7 @@ mod tests {
             byline_backend: None,
             time: "".into(),
             content: text.into(),
+            model: None,
             generation_count: 1,
             reasoning: None,
             reasoning_expanded: false,
@@ -352,6 +364,25 @@ mod tests {
         let mut tree = build_tree(&msgs);
         let ok = attach_overlay(&mut tree, "a4", TreeNode::leaf(NodeSrc::Draft, DRAFT_ID));
         assert!(ok);
+        // A streaming turn attaches at its *target* post, so two concurrent
+        // turns replying to the same post land as ordered siblings.
+        let ok = attach_overlay(
+            &mut tree,
+            "a3",
+            TreeNode::leaf(NodeSrc::Streaming(1), streaming_node_id(1)),
+        );
+        assert!(ok);
+        let ok = attach_overlay(
+            &mut tree,
+            "a3",
+            TreeNode::leaf(NodeSrc::Streaming(2), streaming_node_id(2)),
+        );
+        assert!(ok);
+        let a3 = node_ref(&tree, "a3").unwrap();
+        // a4 (the persisted spine child) then the two turns, in start order.
+        assert_eq!(a3.children.len(), 3);
+        assert_eq!(a3.children[1].id, streaming_node_id(1));
+        assert_eq!(a3.children[2].id, streaming_node_id(2));
         let a4 = node_ref(&tree, "a4").unwrap();
         assert_eq!(a4.children.len(), 1);
         assert_eq!(a4.children[0].id, DRAFT_ID);

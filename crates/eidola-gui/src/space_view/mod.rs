@@ -11,10 +11,10 @@
 //! - [`layout`] — the cached layout/virtualization model (per-post heights,
 //!   doc-space positions, selection-aware heights).
 //! - [`nav`] — snap physics + scroll-gesture bookkeeping.
-//! - [`post`] — render one post + its separator band.
-//! - [`composer`] — the floating/docking draft composer + submit routing.
-//! - [`request`] — the composer's action gutter (Ask / Post / model) + the
-//!   request panel (model selection; the home of future per-request config).
+//! - [`post`] — render one post + its separator band (branch dots, the
+//!   Reply-or-Ask menu).
+//! - [`composer`] — the floating/docking draft composer, the Post routing,
+//!   and the action gutter (Post / ⌥ Post quietly).
 //! - [`minimap`] — the topology minimap.
 //!
 //! Performance: only posts intersecting the viewport render the real
@@ -27,7 +27,6 @@ pub mod minimap;
 pub mod model;
 pub mod nav;
 pub mod post;
-pub mod request;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -54,9 +53,9 @@ use layout::Layout;
 use model::{NodeSrc, PostData, TreeNode};
 use nav::{ScrollAxis, ScrollOwner, SnapAnim};
 
-// Re-export the composer actions (⌘↩ post & ask / ⌘⇧↩ post only, routed via
-// the editor's `PressEnter` event) and the ⌥⌘M request-panel toggle.
-pub use crate::actions::{PostOnly, Send, ToggleModelPicker};
+// Re-export the composer actions (⌘↩ Post / ⌘⇧↩ Post quietly, routed via
+// the editor's `PressEnter` event).
+pub use crate::actions::{PostOnly, Send};
 
 // ---------------------------------------------------------------------------
 // Layout constants — the book typography + the tree-navigation geometry.
@@ -182,6 +181,17 @@ pub(crate) struct Draft {
     pub(crate) _sub: Subscription,
 }
 
+/// The window-local cascade-paused notice: a submit's (or driven turn's)
+/// notification plan hit the space's cascade limit at `target_action_id`.
+/// Quiet and dismissible; its action is an explicit ask (which bypasses the
+/// guard), so the conversation is resumable in one click.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CascadeNotice {
+    pub(crate) depth: i64,
+    pub(crate) limit: i64,
+    pub(crate) target_action_id: String,
+}
+
 /// An in-progress inline edit of a persisted post: the post's own body editor
 /// is enabled in place, `⌘↩` commits a new generation via [`Space::edit`],
 /// Escape restores the original text. Window-local, like a draft.
@@ -233,10 +243,12 @@ pub struct SpaceView {
     /// is defense in depth: if a divergence ever reappears, it must not
     /// escalate into a frame loop.
     pub(crate) body_seeds: HashMap<SharedString, SharedString>,
-    /// A read-only editor synced to the live streaming partial each frame.
-    pub(crate) streaming_body: Entity<MarkdownEditorState>,
-    /// Last value pushed into `streaming_body`, to skip redundant re-parses.
-    pub(crate) streaming_synced: String,
+    /// One read-only editor per in-flight turn, synced to that turn's live
+    /// streaming partial each frame and pruned when the turn ends. Keyed by
+    /// [`StreamingTurn::seq`] so concurrent turns render side by side.
+    pub(crate) streaming_bodies: HashMap<u64, Entity<MarkdownEditorState>>,
+    /// Last value pushed into each turn's editor, to skip redundant re-parses.
+    pub(crate) streaming_synced: HashMap<u64, String>,
 
     /// The unsent **drafts** — local UI nodes (never in `posts` until sent),
     /// each its own editor that persists when deselected. A draft attaches to
@@ -273,17 +285,16 @@ pub struct SpaceView {
     pub(crate) slot_bounds: Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>,
     /// Owner of the current vertical scroll session.
     pub(crate) scroll_owner: Option<ScrollOwner>,
-    /// Whether the request panel (model selection; the future home of
-    /// per-request config) is open, anchored to the composer's action gutter.
-    pub(crate) request_panel_open: bool,
+    /// The separator band whose Reply-or-Ask menu is open (by node id), if
+    /// any. Window-local; dismissed by click-out, a choice, or Escape.
+    pub(crate) band_menu: Option<SharedString>,
+    /// The window-local cascade-paused notice, if showing.
+    pub(crate) cascade_notice: Option<CascadeNotice>,
     /// The post whose action gutter currently reveals its hover affordances
     /// (Edit / Regenerate), by node id.
     pub(crate) hovered_post: Option<SharedString>,
     /// The post currently being edited in place, if any.
     pub(crate) editing: Option<EditingPost>,
-    /// The composer bar's top `y` as of the last `render_active_draft`, so the
-    /// request panel (a later sibling) can anchor against it.
-    pub(crate) composer_anchor_top: Cell<f32>,
     /// Set when the active draft's editor emits a buffer [`Change`], consumed
     /// by the composer body's `caret_into_view` canvas on the next paint to
     /// scroll the new caret position into the composer's visible viewport
@@ -382,7 +393,6 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let streaming_body = cx.new(|cx| MarkdownEditorState::new(window, cx));
         let focus_handle = cx.focus_handle();
 
         // A brand-new (blank ⌘N) space opens with the composer ready — the
@@ -405,9 +415,10 @@ impl SpaceView {
             }),
             cx.subscribe_in(&space, window, Self::on_space_event),
             cx.observe(&window_input, |_, _, cx| cx.notify()),
-            // The request panel renders the model list + config default.
-            cx.observe(&stores.models, |_, _, cx| cx.notify()),
             cx.observe(&stores.config, |_, _, cx| cx.notify()),
+            // The space's participants feed the separator Ask menus, the
+            // streaming bylines, and the cascade notice's ask affordances.
+            cx.observe(&stores.participants, |_, _, cx| cx.notify()),
             // Local models feed the request panel (a load/unload while it's
             // open must re-render — offline, the models store is quiet, so
             // this is the *only* signal that would refresh it) *and* the
@@ -433,8 +444,8 @@ impl SpaceView {
             posts: Vec::new(),
             bodies: HashMap::new(),
             body_seeds: HashMap::new(),
-            streaming_body,
-            streaming_synced: String::new(),
+            streaming_bodies: HashMap::new(),
+            streaming_synced: HashMap::new(),
             drafts: Vec::new(),
             active_draft: None,
             next_draft_seq: 0,
@@ -446,10 +457,10 @@ impl SpaceView {
             composer_content_h: Rc::new(RefCell::new(px(0.))),
             slot_bounds: Rc::new(RefCell::new(HashMap::new())),
             scroll_owner: None,
-            request_panel_open: false,
+            band_menu: None,
+            cascade_notice: None,
             hovered_post: None,
             editing: None,
-            composer_anchor_top: Cell::new(0.0),
             composer_caret_scroll_pending: Cell::new(false),
             page_scroll: ScrollHandle::new(),
             scroll_min_y: Cell::new(0.0),
@@ -475,6 +486,7 @@ impl SpaceView {
             error: None,
         };
         this.rebuild(cx);
+        this.ensure_participants(cx);
         if is_blank {
             // The blank notebook: a root draft, focused and ready.
             this.create_draft(None, window, cx);
@@ -483,6 +495,17 @@ impl SpaceView {
             window.focus(&this.focus_handle, cx);
         }
         this
+    }
+
+    /// Lazily load this space's participant list (the Ask menus + streaming
+    /// bylines read it). A no-op until the space has a persisted id — called
+    /// again from `on_space_event` once a blank space adopts one.
+    fn ensure_participants(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.space.read(cx).id().map(str::to_string) {
+            self.stores
+                .participants
+                .update(cx, |p, cx| p.ensure(id, cx));
+        }
     }
 
     // -- Test seams --------------------------------------------------------
@@ -685,6 +708,28 @@ impl SpaceView {
         self.error.clone()
     }
 
+    /// The node id whose separator band menu is open, if any.
+    #[doc(hidden)]
+    pub fn band_menu_for_test(&self) -> Option<String> {
+        self.band_menu.as_ref().map(|s| s.to_string())
+    }
+
+    /// Open/close a band's Reply-or-Ask menu directly (tests can't synthesize
+    /// the "+" click).
+    #[doc(hidden)]
+    pub fn set_band_menu_for_test(&mut self, node_id: Option<&str>, cx: &mut Context<Self>) {
+        self.band_menu = node_id.map(|s| SharedString::from(s.to_string()));
+        cx.notify();
+    }
+
+    /// The cascade-paused notice `(depth, limit, target_action_id)`, if showing.
+    #[doc(hidden)]
+    pub fn cascade_notice_for_test(&self) -> Option<(i64, i64, String)> {
+        self.cascade_notice
+            .as_ref()
+            .map(|n| (n.depth, n.limit, n.target_action_id.clone()))
+    }
+
     /// The node id of the currently-selected leaf — where `effective_tree`
     /// attaches the synthetic streaming node. Drives the branched-retry
     /// regression (retry must select the failed post's branch).
@@ -806,18 +851,44 @@ impl SpaceView {
         }
     }
 
-    /// Resolve the model for a send: space selection → config default →
-    /// embedded fallback. (The ⌥ picker UI is deferred, but resolution is
-    /// needed now.)
-    pub(crate) fn current_model(&self, cx: &gpui::App) -> String {
-        if let Some(model) = self.space.read(cx).selected_model() {
-            return model.to_string();
-        }
-        self.stores.config.read(cx).default_model()
+    /// The space's **agent** participants — `(id, label)` pairs feeding the
+    /// separator Ask menus, the cascade notice's ask affordances, and the
+    /// streaming bylines. Empty until the space has a persisted id and its
+    /// participant list has loaded.
+    pub(crate) fn space_agents(&self, cx: &gpui::App) -> Vec<(String, String)> {
+        let Some(space_id) = self.space.read(cx).id() else {
+            return Vec::new();
+        };
+        self.stores
+            .participants
+            .read(cx)
+            .list(space_id)
+            .iter()
+            .filter(|p| p.kind == "agent")
+            .map(|p| (p.id.clone(), p.label.clone()))
+            .collect()
+    }
+
+    /// The display label for a streaming turn's responding participant.
+    /// `None` (a stub/synthetic turn) and unknown ids fall back honestly.
+    pub(crate) fn participant_label(
+        &self,
+        participant_id: Option<&str>,
+        cx: &gpui::App,
+    ) -> SharedString {
+        let Some(pid) = participant_id else {
+            return "Eidola".into();
+        };
+        self.space_agents(cx)
+            .into_iter()
+            .find(|(id, _)| id == pid)
+            .map(|(_, label)| SharedString::from(label))
+            .unwrap_or_else(|| "Eidola".into())
     }
 
     /// React to a semantic `SpaceEvent`: re-snapshot + re-render, surface a
-    /// typed failure as the minimal error band, and clear it on success.
+    /// typed failure as the recovery notice (and a paused cascade as its
+    /// quiet notice), and clear the error on success.
     fn on_space_event(
         &mut self,
         _space: &Entity<Space>,
@@ -830,12 +901,38 @@ impl SpaceView {
                 self.rebuild(cx);
             }
             SpaceEvent::StreamEnded => {
-                self.error = None;
+                // Clear the recovery notice only when the space has nothing left
+                // to recover. The notice's lifetime is owned by the Space's
+                // `failed_turn` record — NOT by whichever event fires last — so a
+                // *sibling* turn of a fan-out succeeding must never hide a still-
+                // recorded failed turn's Retry. Without this guard the sibling's
+                // `StreamEnded` blanked `self.error` while `failed_turn` survived,
+                // silently removing the user's only recovery path (the Retry
+                // renders inside the notice). It persists until that turn is
+                // retried or explicitly dismissed.
+                if self.space.read(cx).failed_turn().is_none() {
+                    self.error = None;
+                }
                 self.rebuild(cx);
+                // A blank space just adopted its id — its participants are
+                // loadable now (the Ask menus need them).
+                self.ensure_participants(cx);
             }
             SpaceEvent::Failed(e) => {
                 self.error = Some(error_copy(e));
                 self.rebuild(cx);
+                self.ensure_participants(cx);
+            }
+            SpaceEvent::CascadePaused {
+                depth,
+                limit,
+                target_action_id,
+            } => {
+                self.cascade_notice = Some(CascadeNotice {
+                    depth: *depth,
+                    limit: *limit,
+                    target_action_id: target_action_id.clone(),
+                });
             }
         }
         cx.notify();
@@ -889,10 +986,14 @@ impl SpaceView {
         {
             self.editing = None;
         }
-        // Keep height-cache entries for live posts, live drafts, and streaming.
+        // Keep height-cache entries for live posts, live drafts, and any
+        // in-flight streaming turn (their ids share the streaming prefix).
         let draft_ids: HashSet<SharedString> = self.drafts.iter().map(|d| d.id.clone()).collect();
-        self.layout
-            .retain(&|id| live.contains(id) || draft_ids.contains(id) || id == model::STREAMING_ID);
+        self.layout.retain(&|id| {
+            live.contains(id)
+                || draft_ids.contains(id)
+                || id.starts_with(model::STREAMING_ID_PREFIX)
+        });
     }
 
     /// Ensure a horizontal `ScrollHandle` exists for every node that has
@@ -913,20 +1014,45 @@ impl SpaceView {
         self.scrolls.retain(|id, _| live.contains(id));
     }
 
-    /// The effective render forest: the persisted post tree, plus the streaming
-    /// reply (while streaming) attached at the selected leaf, plus every draft
-    /// attached as a leaf of its parent post (`None` parent → a root draft).
-    /// Drafts attach after a node's persisted children, in `self.drafts` order,
-    /// so a draft's branch index is deterministic.
-    fn effective_tree(&self, page_width: Pixels, streaming: bool) -> Vec<TreeNode> {
+    /// The in-flight turns' render inputs: `(seq, target_action_id)` per turn,
+    /// in start order. Cheap clone of ids only.
+    pub(crate) fn stream_overlays(&self, cx: &gpui::App) -> Vec<(u64, Option<SharedString>)> {
+        self.space
+            .read(cx)
+            .streams()
+            .iter()
+            .map(|t| (t.seq, t.target_action_id.clone().map(SharedString::from)))
+            .collect()
+    }
+
+    /// The effective render forest: the persisted post tree, plus one
+    /// streaming leaf per in-flight turn attached at its **target** post (in
+    /// start order — concurrent replies to one post land as timestamp-ordered
+    /// siblings; a target-less synthetic turn falls back to the selected
+    /// leaf), plus every draft attached as a leaf of its parent post (`None`
+    /// parent → a root draft). Drafts attach after a node's persisted children
+    /// and after any streaming leaf, in `self.drafts` order, so a draft's
+    /// branch index is deterministic.
+    fn effective_tree(
+        &self,
+        page_width: Pixels,
+        turns: &[(u64, Option<SharedString>)],
+    ) -> Vec<TreeNode> {
         let mut roots = model::build_tree(&self.posts);
-        if streaming {
-            let overlay = TreeNode::leaf(NodeSrc::Streaming, model::STREAMING_ID);
-            match self.selected_leaf_id(&roots, page_width) {
-                Some(t) if model::node_ref(&roots, &t).is_some() => {
+        for (seq, target) in turns {
+            let overlay = TreeNode::leaf(NodeSrc::Streaming(*seq), model::streaming_node_id(*seq));
+            let attach_at = target
+                .clone()
+                .filter(|t| model::node_ref(&roots, t).is_some())
+                .or_else(|| {
+                    self.selected_leaf_id(&roots, page_width)
+                        .filter(|t| model::node_ref(&roots, t).is_some())
+                });
+            match attach_at {
+                Some(t) => {
                     model::attach_overlay(&mut roots, &t, overlay);
                 }
-                _ => roots.push(overlay),
+                None => roots.push(overlay),
             }
         }
         for d in &self.drafts {
@@ -982,6 +1108,7 @@ fn post_data_from(
         byline_backend,
         time: fmt_clock(m.created_at).into(),
         content: m.message.content.clone().into(),
+        model: m.model.clone().map(SharedString::from),
         generation_count: m.generation_count,
         reasoning: m.reasoning.clone().map(SharedString::from),
         reasoning_expanded: m.reasoning_expanded,
@@ -1065,8 +1192,9 @@ impl Render for SpaceView {
         // composer that replaces the leaf "+").
         self.sync_tail_drafts(window, cx);
 
-        let streaming = self.space.read(cx).is_streaming();
-        let tree = self.effective_tree(page_width, streaming);
+        let turns = self.stream_overlays(cx);
+        let streaming = !turns.is_empty();
+        let tree = self.effective_tree(page_width, &turns);
         self.sync_scrolls(&tree);
 
         // Warm the on-path posts: if any post the selected path renders is still
@@ -1090,19 +1218,34 @@ impl Render for SpaceView {
             self.dock_active_draft(&tree, page_width, window_h);
         }
 
-        // Sync the streaming editor to the live partial (skip if unchanged).
-        if streaming {
-            let content = self
+        // Sync one read-only editor per in-flight turn to its live partial
+        // (skip unchanged buffers), pruning editors whose turn has ended.
+        {
+            let live: Vec<(u64, String)> = self
                 .space
                 .read(cx)
-                .streaming()
-                .map(|s| s.content.clone())
-                .unwrap_or_default();
-            if content != self.streaming_synced {
-                self.streaming_synced = content.clone();
-                self.streaming_body
-                    .update(cx, |e, cx| e.set_value(content, cx));
+                .streams()
+                .iter()
+                .map(|t| (t.seq, t.response.content.clone()))
+                .collect();
+            for (seq, content) in &live {
+                let editor = match self.streaming_bodies.get(seq) {
+                    Some(e) => e.clone(),
+                    None => {
+                        let e = cx.new(|cx| MarkdownEditorState::new(window, cx));
+                        self.streaming_bodies.insert(*seq, e.clone());
+                        e
+                    }
+                };
+                if self.streaming_synced.get(seq) != Some(content) {
+                    self.streaming_synced.insert(*seq, content.clone());
+                    editor.update(cx, |e, cx| e.set_value(content.clone(), cx));
+                }
             }
+            self.streaming_bodies
+                .retain(|seq, _| live.iter().any(|(s, _)| s == seq));
+            self.streaming_synced
+                .retain(|seq, _| live.iter().any(|(s, _)| s == seq));
         }
 
         // Cap the scroll position the frame *positions content from* to the
@@ -1111,7 +1254,7 @@ impl Render for SpaceView {
         // every consumer reads `clamped_scroll_y()` (which clamps to
         // `[scroll_min_y, 0]`) so the docked composer / posts / minimap don't
         // drift past the end and flicker. Set before any consumer below.
-        let floating_pad = self.floating_pad(&tree, page_width, window_h, streaming);
+        let floating_pad = self.floating_pad(&tree, page_width, window_h);
         // Top headroom for the first post (zero for an empty notebook); see
         // `doc_reserve`. Used for the scroll range, the forest origin, and the
         // content's top padding so all three agree.
@@ -1130,7 +1273,7 @@ impl Render for SpaceView {
 
         // Schedule a single catch-up frame when the minimap's layout inputs
         // change, so it converges once the layout settles.
-        let sig = self.minimap_signature(page_width, window_h);
+        let sig = self.minimap_signature(page_width, window_h, &turns);
         if self.minimap_sig.to_bits() != sig.to_bits() {
             self.minimap_sig = sig;
             let entity = cx.entity();
@@ -1155,7 +1298,6 @@ impl Render for SpaceView {
             .key_context("SpaceView")
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::post_only))
-            .on_action(cx.listener(Self::toggle_request_panel_action))
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
             }))
@@ -1208,7 +1350,7 @@ impl Render for SpaceView {
                 scroll
             })
             .child(self.render_active_draft(&tree, page_width, window_h, window, cx))
-            .child(self.render_request_panel(page_width, window_h, cx))
+            .child(self.render_cascade_band(cx))
             .child(self.render_error_band(cx))
             // The minimap is the last sibling, so it paints after the composer
             // (an earlier sibling) and — overlapping it on the right edge — its
@@ -1226,8 +1368,12 @@ impl SpaceView {
     /// they float in their own scroll and route caret-into-view separately, so
     /// page autoscroll is only for the in-page readonly posts.
     fn selecting_editor(&self, cx: &gpui::App) -> Option<Entity<MarkdownEditorState>> {
-        if self.streaming_body.read(cx).is_selecting() {
-            return Some(self.streaming_body.clone());
+        if let Some(e) = self
+            .streaming_bodies
+            .values()
+            .find(|e| e.read(cx).is_selecting())
+        {
+            return Some(e.clone());
         }
         self.bodies
             .values()
@@ -1359,7 +1505,7 @@ impl SpaceView {
         if node.children.is_empty() {
             // A draft/streaming leaf simply ends; a normal leaf ends with a
             // separator band whose "+" starts a reply here.
-            if matches!(node.src, NodeSrc::Draft | NodeSrc::Streaming) {
+            if matches!(node.src, NodeSrc::Draft | NodeSrc::Streaming(_)) {
                 return column;
             }
             return column.child(self.render_band(node, page_width, cx));
@@ -1669,28 +1815,30 @@ impl SpaceView {
             .into_any_element()
     }
 
-    /// Dismiss the recovery notice (clears the view's error state only — the
-    /// space is already recovered).
+    /// Dismiss the recovery notice — the user's explicit "end this recovery".
+    /// Clears the view's message **and** the Space's recorded `failed_turn`, so
+    /// a later sibling turn finishing can't resurrect an orphaned notice and
+    /// `can_retry` reads honestly (`false`) afterward. The saved user post and
+    /// the composer are untouched — the space is already recovered.
     pub fn dismiss_error(&mut self, cx: &mut Context<Self>) {
         self.error = None;
+        self.space.update(cx, |s, cx| s.clear_failed_turn(cx));
         cx.notify();
     }
 
-    /// Re-request a response for the saved user post left behind by a failed
-    /// ask (the notice's Retry action). Clears the notice and routes through
-    /// [`Space::retry`] with the currently-resolved model; the streaming state
-    /// (and later `StreamEnded`/`Failed`) drives the rest.
+    /// Re-ask the failed turn's participant (the notice's Retry action).
+    /// Clears the notice and routes through [`Space::retry`] — the same
+    /// participant, the same target post, no re-posting; the streaming state
+    /// (and later `StreamEnded`/`Failed`) drives the rest. Sibling turns
+    /// still streaming are untouched.
     pub fn retry_failed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let model = self.current_model(cx);
         self.error = None;
-        let target = self.space.update(cx, |s, cx| s.retry(model, cx));
+        let target = self.space.update(cx, |s, cx| s.retry(cx));
         // Select the failed post's branch *before* the next render so the
-        // synthetic streaming node (attached at the selected leaf by
-        // `effective_tree`) appears under the post the reply will actually land
-        // on — not whatever branch the user navigated to after the failure (PR
-        // #218 review). `self.posts` still reflects the transcript (retry only
-        // adds the streaming overlay), and a persisted user-post retry target is
-        // a leaf, so selecting its path makes it the selected leaf.
+        // synthetic streaming node appears under the post the reply will
+        // actually land on — not whatever branch the user navigated to after
+        // the failure (PR #218 review). `self.posts` still reflects the
+        // transcript (retry only adds the streaming overlay).
         if let Some(target) = target {
             let page_width = crate::chrome::content_size(window).width;
             let roots = model::build_tree(&self.posts);
@@ -1698,6 +1846,119 @@ impl SpaceView {
         }
         self.scroll_to_tail(window, cx);
         cx.notify();
+    }
+
+    /// Dismiss the cascade-paused notice (window-local; the paused state is
+    /// re-announced if a later plan pauses again).
+    pub fn dismiss_cascade(&mut self, cx: &mut Context<Self>) {
+        self.cascade_notice = None;
+        cx.notify();
+    }
+
+    /// The quiet, dismissible cascade-paused notice: the conversation reached
+    /// its cascade limit; the way onward is an explicit ask (which bypasses
+    /// the guard). One "Ask <agent>" chip per agent participant. Muted, not
+    /// danger — nothing failed; the guard did its job.
+    fn render_cascade_band(&self, cx: &Context<Self>) -> AnyElement {
+        let Some(notice) = self.cascade_notice.clone() else {
+            return div().into_any_element();
+        };
+        // The failure notice takes precedence over the pause notice — both
+        // bottom-anchor, and an error is the more urgent state.
+        if self.error.is_some() {
+            return div().into_any_element();
+        }
+        let theme = cx.theme();
+        let agents = self.space_agents(cx);
+
+        let mut actions = h_flex().items_center().gap_1().flex_wrap();
+        for (i, (pid, label)) in agents.iter().enumerate() {
+            let fg = theme.muted_foreground;
+            let hover_fg = theme.foreground;
+            let hover_bg = theme.muted;
+            let pid = pid.clone();
+            let target = notice.target_action_id.clone();
+            actions = actions.child(
+                h_flex()
+                    .id(SharedString::from(format!("space-cascade-ask-{i}")))
+                    .probe(
+                        format!("space/cascade/ask/{i}"),
+                        Role::Button,
+                        SharedString::from(format!("Ask {label} to continue")),
+                    )
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(fg)
+                    .hover(move |s| s.text_color(hover_fg).bg(hover_bg))
+                    .child(SharedString::from(format!("Ask {label}")))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.ask_participant(pid.clone(), target.clone(), window, cx);
+                    })),
+            );
+        }
+
+        div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .p_3()
+            .child(
+                v_flex()
+                    .max_w(rems(34.))
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.muted)
+                    .child(
+                        h_flex()
+                            .items_start()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(SharedString::from(format!(
+                                        "Replies paused — the conversation reached its \
+                                         cascade limit ({}). Ask to continue.",
+                                        notice.limit
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .id("space-cascade-dismiss")
+                                    .probe("space/cascade/dismiss", Role::Button, "Dismiss")
+                                    .flex_none()
+                                    .size_5()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(theme.muted_foreground)
+                                    .hover(|s| {
+                                        s.text_color(cx.theme().foreground).bg(cx.theme().muted)
+                                    })
+                                    .child("×")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.dismiss_cascade(cx)),
+                                    ),
+                            ),
+                    )
+                    .child(actions),
+            )
+            .into_any_element()
     }
 
     /// Space → Participants…: open the Participants window for this space. A

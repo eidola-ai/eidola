@@ -76,22 +76,22 @@ impl SpaceView {
                     self.render_post_body(i, node, bw, editing_this, cx),
                 )
             }
-            NodeSrc::Streaming => {
-                // The in-flight turn's byline resolves live (the snapshot
-                // only carries persisted rows): the human model name over
-                // its backend, same as a finished post.
-                let (byline, byline_backend) = match self.space.read(cx).last_submitted_model() {
-                    Some(model) => {
-                        let (name, backend) = self.model_display(model, cx);
-                        (name, Some(backend))
-                    }
-                    None => (SharedString::from("Eidola"), None),
-                };
+            NodeSrc::Streaming(seq) => {
+                // The in-flight turn's byline resolves live (the snapshot only
+                // carries persisted rows): the responding participant's label.
+                let participant_id = self
+                    .space
+                    .read(cx)
+                    .streams()
+                    .iter()
+                    .find(|t| t.seq == seq)
+                    .and_then(|t| t.participant_id.clone());
+                let byline = self.participant_label(participant_id.as_deref(), cx);
                 (
                     byline,
-                    byline_backend,
+                    None,
                     SharedString::from("now"),
-                    self.render_streaming_body(bw, cx),
+                    self.render_streaming_body(seq, bw, cx),
                 )
             }
             // Draft never reaches here (it renders an in-flow slot placeholder).
@@ -373,7 +373,7 @@ impl SpaceView {
         };
 
         self.deactivate_active_draft(cx);
-        self.close_request_panel(cx);
+        self.band_menu = None;
 
         let original = editor.read(cx).value().to_string();
         let sub = cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
@@ -434,9 +434,17 @@ impl SpaceView {
     }
 
     /// Regenerate an assistant post — a new agent generation of its item via
-    /// the current model ([`Space::regenerate_post`]; refuses mid-stream).
+    /// the post's **own recorded model** (regenerating re-asks the model that
+    /// answered; the config default is the fallback for rows that carry none).
+    /// [`Space::regenerate_post`] refuses mid-stream.
     pub fn regenerate(&mut self, action_id: &SharedString, cx: &mut Context<Self>) {
-        let model = self.current_model(cx);
+        let model = self
+            .posts
+            .iter()
+            .find(|p| p.action_id.as_deref() == Some(action_id.as_ref()))
+            .and_then(|p| p.model.clone())
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| self.stores.config.read(cx).default_model());
         let id = action_id.to_string();
         self.space.update(cx, |s, cx| {
             s.regenerate_post(id, model, cx);
@@ -532,13 +540,21 @@ impl SpaceView {
             .into_any_element()
     }
 
-    /// The streaming reply body: a reasoning disclosure (clickable "Thinking…"
-    /// header + the reasoning text when open) above the partial answer, rendered
-    /// through the `streaming_body` editor (synced to the live content each
-    /// frame in `render`).
-    fn render_streaming_body(&self, bw: gpui::Pixels, cx: &Context<Self>) -> AnyElement {
+    /// One streaming turn's reply body: a reasoning disclosure (clickable
+    /// "Thinking…" header + the reasoning text when open) above the partial
+    /// answer, rendered through that turn's editor in `streaming_bodies`
+    /// (synced to the live content each frame in `render`). Several turns can
+    /// render at once, each with its own editor and disclosure.
+    fn render_streaming_body(&self, seq: u64, bw: gpui::Pixels, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let streaming = self.space.read(cx).streaming().cloned().unwrap_or_default();
+        let streaming = self
+            .space
+            .read(cx)
+            .streams()
+            .iter()
+            .find(|t| t.seq == seq)
+            .map(|t| t.response.clone())
+            .unwrap_or_default();
 
         let mut col = v_flex().w(bw).gap_2();
         if !streaming.reasoning.is_empty() {
@@ -549,9 +565,9 @@ impl SpaceView {
             };
             col = col.child(
                 div()
-                    .id("space-reasoning-toggle")
+                    .id(SharedString::from(format!("space-reasoning-toggle-{seq}")))
                     .probe(
-                        "space/reasoning/toggle",
+                        format!("space/reasoning/toggle/{seq}"),
                         gpui::Role::Button,
                         if streaming.expanded {
                             "Hide thinking"
@@ -564,9 +580,9 @@ impl SpaceView {
                     .text_color(theme.muted_foreground)
                     .cursor_pointer()
                     .child(label)
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         this.space
-                            .update(cx, |s, cx| s.toggle_streaming_reasoning(cx));
+                            .update(cx, |s, cx| s.toggle_streaming_reasoning(seq, cx));
                     })),
             );
             if streaming.expanded {
@@ -578,12 +594,14 @@ impl SpaceView {
                 );
             }
         }
-        col.child(
-            MarkdownEditor::new(&self.streaming_body)
-                .style(prose_style(cx))
-                .disabled(true),
-        )
-        .into_any_element()
+        if let Some(editor) = self.streaming_bodies.get(&seq) {
+            col = col.child(
+                MarkdownEditor::new(editor)
+                    .style(prose_style(cx))
+                    .disabled(true),
+            );
+        }
+        col.into_any_element()
     }
 
     /// Whether `node`'s subtree contains a draft **with content** — drives the
@@ -604,9 +622,12 @@ impl SpaceView {
     /// The faint full-bleed separator band between a post and what follows it.
     /// With more than one branch it carries clickable branch-indicator dots
     /// (glide to that branch; active one highlighted; a branch with an
-    /// in-progress draft tinted `info`). The "+" (start a new branch) shows only
-    /// on a post that already has a committed reply — a leaf's tail draft is its
-    /// own reply affordance.
+    /// in-progress draft tinted `info`). The "+" opens the band's quiet
+    /// **Reply-or-Ask menu** inline: **Reply** (start a new branch here — only
+    /// on a post that already has a committed reply; a leaf's tail draft is
+    /// its own reply affordance) and **Ask <agent>** per agent participant (an
+    /// explicit ask targeting this band's post). A tail band therefore offers
+    /// Ask only, and shows no "+" at all when the space has no agents.
     pub(crate) fn render_band(
         &self,
         node: &TreeNode,
@@ -622,14 +643,13 @@ impl SpaceView {
 
         let parent_id = node.id.clone();
         let info = theme.info;
-        // Dots are the navigable branches — persisted siblings *and* drafts
-        // (a draft is a branch you can navigate to). The streaming overlay isn't
-        // navigable, so it's excluded.
-        let dot_children: Vec<&TreeNode> = node
-            .children
-            .iter()
-            .filter(|c| !matches!(c.src, NodeSrc::Streaming))
-            .collect();
+        // Dots are the navigable branches — persisted siblings, drafts (a
+        // draft is a branch you can navigate to), *and* in-flight streaming
+        // turns: a fan-out lands concurrent replies as sibling branches, and
+        // without a dot the second stream would be invisible until it
+        // finalized. A streaming dot is tinted `info` (something is happening
+        // on that branch), same as a content-bearing draft.
+        let dot_children: Vec<&TreeNode> = node.children.iter().collect();
         let count = dot_children.len();
 
         let mut row = h_flex().items_center().gap_3();
@@ -638,9 +658,12 @@ impl SpaceView {
             let dots = h_flex()
                 .gap_1()
                 .children(dot_children.iter().enumerate().map(|(i, child)| {
-                    // A branch with an in-progress (non-empty) draft is tinted
-                    // `info`; the active one is full-strength, the rest dimmed.
-                    let base = if self.subtree_has_draft_content(child, cx) {
+                    // A branch with an in-progress (non-empty) draft or a
+                    // live streaming turn is tinted `info`; the active one is
+                    // full-strength, the rest dimmed.
+                    let base = if matches!(child.src, NodeSrc::Streaming(_))
+                        || self.subtree_has_draft_content(child, cx)
+                    {
                         info
                     } else {
                         active_color
@@ -676,19 +699,110 @@ impl SpaceView {
             row = row.child(dots);
         }
 
-        // The "+" forks a new branch — shown only on a post that already has a
-        // committed (persisted) reply. A leaf's only child is its tail draft (the
-        // docked composer), which is itself the reply affordance, so no "+".
+        // Only a persisted post can be replied to / asked about; overlay
+        // nodes (draft/streaming) carry no band affordances.
+        let is_persisted = matches!(node.src, NodeSrc::Msg(_))
+            && !parent_id.starts_with("idx-")
+            && self
+                .posts
+                .iter()
+                .any(|p| p.action_id.as_deref() == Some(parent_id.as_ref()));
+        // "Reply" (a new fork) is offered only on a post that already has a
+        // committed reply — a leaf's tail draft is its own reply affordance.
         let has_committed_reply = node
             .children
             .iter()
             .any(|c| matches!(c.src, NodeSrc::Msg(_)));
-        if has_committed_reply {
+        let agents = if is_persisted {
+            self.space_agents(cx)
+        } else {
+            Vec::new()
+        };
+        let offer_reply = is_persisted && has_committed_reply;
+        let offer_ask = !agents.is_empty();
+        let menu_open = self.band_menu.as_ref() == Some(&parent_id);
+
+        if menu_open {
+            // The inline menu, in the band's own quiet voice: Reply, then one
+            // Ask per agent. Click-out (or Escape via the composer's handler,
+            // or a choice) dismisses.
+            let mut menu = h_flex()
+                .id(SharedString::from(format!("space-band-menu-{parent_id}")))
+                .probe(
+                    "space/band/menu",
+                    gpui::Role::Group,
+                    "Reply or ask a participant",
+                )
+                .occlude()
+                .items_center()
+                .gap_1()
+                .px_1()
+                .rounded_md()
+                .bg(theme.background.opacity(0.7))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.band_menu = None;
+                    cx.notify();
+                }));
+            let chip_fg = theme.muted_foreground;
+            let chip_fg_hover = theme.foreground;
+            let chip_bg_hover = theme.background;
+            if offer_reply {
+                let add_id = parent_id.clone();
+                menu = menu.child(
+                    h_flex()
+                        .id(SharedString::from(format!("space-band-reply-{parent_id}")))
+                        .probe("space/band/menu/reply", gpui::Role::Button, "Reply here")
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(chip_fg)
+                        .hover(move |s| s.text_color(chip_fg_hover).bg(chip_bg_hover))
+                        .child("Reply")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.band_menu = None;
+                            this.create_draft(Some(add_id.clone()), window, cx);
+                        })),
+                );
+            }
+            for (i, (pid, label)) in agents.iter().enumerate() {
+                let pid = pid.clone();
+                let target = parent_id.clone();
+                menu = menu.child(
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "space-band-ask-{parent_id}-{i}"
+                        )))
+                        .probe(
+                            format!("space/band/menu/ask/{i}"),
+                            gpui::Role::Button,
+                            SharedString::from(format!("Ask {label} to respond here")),
+                        )
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(chip_fg)
+                        .hover(move |s| s.text_color(chip_fg_hover).bg(chip_bg_hover))
+                        .child(SharedString::from(format!("Ask {label}")))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.ask_participant(pid.clone(), target.to_string(), window, cx);
+                        })),
+                );
+            }
+            row = row.child(menu);
+        } else if offer_reply || offer_ask {
             let add_id = parent_id.clone();
             row = row.child(
                 div()
                     .id(SharedString::from(format!("space-add-{parent_id}")))
-                    .probe("space/band/add", gpui::Role::Button, "Reply here")
+                    .probe(
+                        "space/band/add",
+                        gpui::Role::Button,
+                        if offer_reply { "Reply or ask" } else { "Ask" },
+                    )
                     .size(px(20.))
                     .flex_none()
                     .rounded_full()
@@ -700,8 +814,9 @@ impl SpaceView {
                     .cursor_pointer()
                     .hover(move |s| s.bg(plus_bg_hover))
                     .child("+")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.create_draft(Some(add_id.clone()), window, cx);
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.band_menu = Some(add_id.clone());
+                        cx.notify();
                     })),
             );
         }
