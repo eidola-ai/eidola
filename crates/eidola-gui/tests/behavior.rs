@@ -22,7 +22,7 @@ use eidola_app_core::{
 };
 use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
-use eidola_gui::actions::{PostOnly, Send, ToggleModelPicker};
+use eidola_gui::actions::{PostOnly, Send};
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
 use eidola_gui::participants_view::{EditMode, ParticipantsView};
@@ -2650,75 +2650,339 @@ fn space_joins_shared_entity_for_same_id(cx: &mut TestAppContext) {
     v2.read_with(cx, |v, _| assert_eq!(v.post_count_for_test(), 1));
 }
 
-#[gpui::test]
-fn space_request_panel_toggles_only_with_composer(cx: &mut TestAppContext) {
-    // ⌥⌘M anchors the request panel to the composer's action gutter, so it is
-    // meaningful only while a draft is active.
-    let stores = stub_stores_with_config(cx);
+// ---------------------------------------------------------------------------
+// Separators — the band's Reply-or-Ask menu, and explicit asks (wave 3b).
+//
+// The composer's model picker + request panel are gone: who answers (and with
+// what model) is Participants configuration, and explicit asks live on the
+// separator bands. These tests drive the view's `set_band_menu_for_test` /
+// `ask_participant` seams directly (the "+" click is a probe-tested affordance).
+// ---------------------------------------------------------------------------
 
-    // An existing space opens with no active composer → the toggle no-ops.
-    let (w1, existing) = open_space(cx, &stores, Some("has-history".into()));
-    dispatch_space_action(&existing, w1, cx, ToggleModelPicker);
-    existing.read_with(cx, |v, _| {
-        assert!(
-            !v.request_panel_open(),
-            "no composer → no anchor → the panel must not open"
-        );
-    });
+/// A stub space-owned agent participant (the separator Ask menus + cascade
+/// notice read the space's agent set from `ParticipantsStore`).
+fn agent_participant(id: &str, label: &str) -> eidola_app_core::ParticipantInfo {
+    eidola_app_core::ParticipantInfo {
+        id: id.into(),
+        scope: "space".into(),
+        source: "owned".into(),
+        kind: "agent".into(),
+        label: label.into(),
+        model_ref: Some("kimi-k2-6".into()),
+        system_prompt: None,
+        notify_policy: "human".into(),
+        role: "member".into(),
+        reference: None,
+    }
+}
 
-    // A blank space opens with its root composer active → toggle round-trips.
-    let (w2, blank) = open_space(cx, &stores, None);
-    dispatch_space_action(&blank, w2, cx, ToggleModelPicker);
-    blank.read_with(cx, |v, _| assert!(v.request_panel_open()));
-    dispatch_space_action(&blank, w2, cx, ToggleModelPicker);
-    blank.read_with(cx, |v, _| assert!(!v.request_panel_open()));
+/// Stub stores with two agent participants seeded for `space_id`.
+fn stub_stores_with_agents(cx: &mut TestAppContext, space_id: &str) -> Stores {
+    let sid = space_id.to_string();
+    stub_stores(cx, move |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.participants = Some((
+            sid,
+            vec![
+                agent_participant("agent-b", "Ida"),
+                agent_participant("agent-c", "Sage"),
+            ],
+        ));
+    })
 }
 
 #[gpui::test]
-fn space_select_model_applies_to_next_submit_and_closes_panel(cx: &mut TestAppContext) {
-    // Selecting a model in the request panel closes it and routes the next
-    // submit through that model (the per-space selection on the shared Space).
-    let stores = stub_stores_with_config(cx);
-    let (window, view) = open_space(cx, &stores, None);
-
-    dispatch_space_action(&view, window, cx, ToggleModelPicker);
-    view.read_with(cx, |v, _| assert!(v.request_panel_open()));
+fn space_band_ask_targets_participant_and_closes_menu(cx: &mut TestAppContext) {
+    // Choosing "Ask <agent>" in a band's menu starts a streaming turn from
+    // that participant targeting the band's post, and closes the menu.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = fixture_assistant_post("a2", "an answer");
+    a2.parent_action_id = Some("a1".into());
     cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.select_model("gemma-test".into(), cx));
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "root"), a2], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.set_band_menu_for_test(Some("a1"), cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.band_menu_for_test().as_deref(), Some("a1"));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-b".into(), "a1".into(), window, cx)
+        });
     })
     .unwrap();
     view.read_with(cx, |v, cx| {
-        assert!(!v.request_panel_open(), "selection closes the panel");
-        assert_eq!(v.space().read(cx).selected_model(), Some("gemma-test"));
-    });
-
-    set_space_composer_text(&view, window, cx, "route me");
-    dispatch_space_action(&view, window, cx, Send);
-    view.read_with(cx, |v, cx| {
-        assert_eq!(
-            v.space().read(cx).last_submitted_model(),
-            Some("gemma-test"),
-            "the submit resolves the space's selection"
-        );
+        assert!(v.band_menu_for_test().is_none(), "a choice closes the menu");
+        let space = v.space().read(cx);
+        let streams = space.streams();
+        assert_eq!(streams.len(), 1, "the ask started one streaming turn");
+        assert_eq!(streams[0].participant_id.as_deref(), Some("agent-b"));
+        assert_eq!(streams[0].target_action_id.as_deref(), Some("a1"));
     });
 }
 
 #[gpui::test]
-fn space_request_panel_closes_when_draft_deactivates(cx: &mut TestAppContext) {
-    // The panel is anchored to the composer; retiring the draft (Escape) must
-    // take the panel with it rather than leaving it floating unanchored.
+fn space_band_menu_closes_when_draft_deactivates(cx: &mut TestAppContext) {
+    // The band menu belongs to the current interaction; retiring the draft
+    // (Escape) must take it with it rather than leaving it floating.
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, None);
-    dispatch_space_action(&view, window, cx, ToggleModelPicker);
-    view.read_with(cx, |v, _| assert!(v.request_panel_open()));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.set_band_menu_for_test(Some("a1"), cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| assert!(v.band_menu_for_test().is_some()));
 
     cx.update_window(window, |_, _, cx| {
         view.update(cx, |v, cx| v.deactivate_for_test(cx));
     })
     .unwrap();
     view.read_with(cx, |v, _| {
-        assert!(!v.request_panel_open(), "deactivating the draft closes it");
+        assert!(
+            v.band_menu_for_test().is_none(),
+            "deactivating the draft closes the band menu"
+        );
         assert!(!v.has_active_draft_for_test());
+    });
+}
+
+#[gpui::test]
+fn space_tail_ask_discards_empty_draft(cx: &mut TestAppContext) {
+    // The tail-draft rule, empty half: asking at the end of a branch discards
+    // an *empty* tail draft — the UI tracks the incoming response as the new
+    // tail (`sync_tail_drafts` docks a fresh composer under it once it lands).
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    // The leaf a1 grew its docked (empty) tail draft.
+    view.read_with(cx, |v, _| {
+        assert!(v.draft_parents_for_test().contains(&Some("a1".to_string())));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-b".into(), "a1".into(), window, cx)
+        });
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.draft_parents_for_test().contains(&Some("a1".to_string())),
+            "the empty tail draft is discarded — the response becomes the tail"
+        );
+        assert!(!v.has_active_draft_for_test());
+        assert_eq!(v.space().read(cx).streams().len(), 1);
+    });
+}
+
+#[gpui::test]
+fn space_tail_ask_keeps_nonempty_draft_as_its_own_branch(cx: &mut TestAppContext) {
+    // The tail-draft rule, non-empty half: a draft with content is kept
+    // exactly as it is — it becomes its own sibling branch beside the incoming
+    // response, and stays active in the composer.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    open_space_draft(&view, window, cx, Some("a1"));
+    set_space_composer_text(&view, window, cx, "a half-written thought");
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-b".into(), "a1".into(), window, cx)
+        });
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.draft_parents_for_test().contains(&Some("a1".to_string())),
+            "the non-empty draft is kept as its own branch"
+        );
+        assert!(
+            v.has_active_draft_for_test(),
+            "the draft stays active in the composer"
+        );
+        assert_eq!(v.space().read(cx).streams().len(), 1);
+    });
+}
+
+#[gpui::test]
+fn space_turn_failure_leaves_sibling_streams_untouched(cx: &mut TestAppContext) {
+    // Per-turn failure isolation: one turn of a fan-out failing surfaces the
+    // recovery notice for that turn without disturbing sibling streams, and
+    // the notice's Retry re-asks the same participant while siblings stream.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the question")], cx);
+            let _seq_b = s.push_streaming_turn_for_test(
+                Some("agent-b".into()),
+                Some("a1".into()),
+                Default::default(),
+                cx,
+            );
+            let seq_c = s.push_streaming_turn_for_test(
+                Some("agent-c".into()),
+                Some("a1".into()),
+                Default::default(),
+                cx,
+            );
+            s.push_content_delta_for_test(seq_c, "partial thoughts…", cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Fail agent-b's turn only.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::ChatFailed {
+                    space_id: "s".into(),
+                    source: Box::new(AppError::Network {
+                        message: "connection reset".into(),
+                    }),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, cx| {
+        let space = v.space().read(cx);
+        let streams = space.streams();
+        assert_eq!(streams.len(), 1, "the sibling turn keeps streaming");
+        assert_eq!(streams[0].participant_id.as_deref(), Some("agent-c"));
+        assert_eq!(
+            streams[0].response.content, "partial thoughts…",
+            "the sibling's live buffer is untouched"
+        );
+        let msg = v.error_for_test().expect("the failed turn shows a notice");
+        assert!(msg.contains("connection reset"));
+        assert!(space.can_retry());
+        let failed = space.failed_turn().expect("the failed turn is recorded");
+        assert_eq!(failed.participant_id, "agent-b");
+        assert_eq!(failed.target_action_id, "a1");
+    });
+
+    // Retry re-asks agent-b about the same post — the sibling still streams.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.retry_failed(window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(v.error_for_test().is_none(), "retry clears the notice");
+        let space = v.space().read(cx);
+        let streams = space.streams();
+        assert_eq!(streams.len(), 2, "retry streams beside the sibling");
+        assert!(
+            streams
+                .iter()
+                .any(|s| s.participant_id.as_deref() == Some("agent-b")
+                    && s.target_action_id.as_deref() == Some("a1")),
+            "retry re-asks the same participant about the same post"
+        );
+        assert!(
+            streams
+                .iter()
+                .any(|s| s.participant_id.as_deref() == Some("agent-c")),
+            "the sibling stream survived the retry"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_cascade_notice_renders_dismisses_and_asks_to_continue(cx: &mut TestAppContext) {
+    // A paused cascade surfaces the quiet, dismissible notice whose action is
+    // an explicit ask (which bypasses the guard by construction — asserted in
+    // app-core's orchestration tests; here we assert the render + routing).
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the question")], cx);
+            s.emit_cascade_paused_for_test(4, 4, "a1".into(), cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.cascade_notice_for_test(),
+            Some((4, 4, "a1".to_string())),
+            "the paused plan surfaces the notice"
+        );
+    });
+
+    // Dismissible (window-local; nothing else changes).
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.dismiss_cascade(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| assert!(v.cascade_notice_for_test().is_none()));
+
+    // Re-announced on a later pause; "Ask <agent>" continues the conversation.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.emit_cascade_paused_for_test(4, 4, "a1".into(), cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-c".into(), "a1".into(), window, cx)
+        });
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.cascade_notice_for_test().is_none(),
+            "asking clears the notice"
+        );
+        let space = v.space().read(cx);
+        assert_eq!(space.streams().len(), 1);
+        assert_eq!(
+            space.streams()[0].participant_id.as_deref(),
+            Some("agent-c")
+        );
     });
 }
 
@@ -3196,9 +3460,10 @@ fn space_edit_buffer_survives_transcript_sync(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 
 /// Seed a space with a single saved user post (a1, no reply) — exactly what a
-/// failed ask leaves behind — then drive a post-persist failure through the
-/// shared mutation-failure completion (as `spawn_stream`'s error arm does),
-/// so the view's recovery notice appears.
+/// failed ask leaves behind — then drive one **turn's** failure through the
+/// shared turn-failure completion (as a real turn runner's error arm does), so
+/// the view's recovery notice appears and the failed turn (who was asked,
+/// about what) is recorded for Retry.
 fn seed_failed_ask(view: &Entity<SpaceView>, window: AnyWindowHandle, cx: &mut TestAppContext) {
     let space = view.read_with(cx, |v, _| v.space().clone());
     cx.update_window(window, |_, _, cx| {
@@ -3217,7 +3482,9 @@ fn seed_failed_ask(view: &Entity<SpaceView>, window: AnyWindowHandle, cx: &mut T
         }),
     };
     cx.update_window(window, |_, _, cx| {
-        space.update(cx, |s, cx| s.apply_chat_failure_for_test(wrapped, cx));
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test("agent-b", "a1", wrapped, cx)
+        });
     })
     .unwrap();
     cx.update_window(window, |_, window, _| window.refresh())
@@ -3299,7 +3566,7 @@ fn space_failed_ask_can_re_request(cx: &mut TestAppContext) {
     view.read_with(cx, |v, cx| {
         assert!(
             v.space().read(cx).can_retry(),
-            "a saved user post with no reply can be re-requested"
+            "a recorded failed turn can be re-asked"
         );
     });
 
@@ -3309,9 +3576,15 @@ fn space_failed_ask_can_re_request(cx: &mut TestAppContext) {
     .unwrap();
     view.read_with(cx, |v, cx| {
         assert!(v.error_for_test().is_none(), "retry clears the notice");
+        let space = v.space().read(cx);
         assert!(
-            v.space().read(cx).is_streaming(),
+            space.is_streaming(),
             "retry re-enters the streaming state (a real send would request a response)"
+        );
+        assert_eq!(
+            space.streams()[0].participant_id.as_deref(),
+            Some("agent-b"),
+            "retry re-asks the same participant"
         );
     });
 }
@@ -3363,15 +3636,26 @@ fn space_failed_ask_retry_selects_the_failed_posts_branch(cx: &mut TestAppContex
     let space = view.read_with(cx, |v, _| v.space().clone());
 
     // a1 (user root) with two replies: a2 (assistant) is the default-selected
-    // spine leaf; a3 (user) is a second branch — a saved user post awaiting a
-    // reply (the failed ask). `retry_target` = last user post in DFS = a3.
+    // spine leaf; a3 (user) is a second branch — a saved user post whose ask
+    // failed (the recorded failed turn targets a3).
     let mut a2 = fixture_assistant_post("a2", "an answer");
     a2.parent_action_id = Some("a1".into());
     let mut a3 = fixture_user_post("a3", "the failed ask");
     a3.parent_action_id = Some("a1".into());
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, cx| {
-            s.set_post_tree_for_test(vec![fixture_user_post("a1", "root"), a2, a3], cx)
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "root"), a2, a3], cx);
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a3",
+                AppError::ChatFailed {
+                    space_id: "s".into(),
+                    source: Box::new(AppError::Network {
+                        message: "connection reset".into(),
+                    }),
+                },
+                cx,
+            );
         });
     })
     .unwrap();
@@ -3392,7 +3676,14 @@ fn space_failed_ask_retry_selects_the_failed_posts_branch(cx: &mut TestAppContex
     );
     view.read_with(cx, |v, cx| {
         assert!(v.space().read(cx).can_retry());
-        assert_eq!(v.space().read(cx).retry_target().as_deref(), Some("a3"));
+        assert_eq!(
+            v.space()
+                .read(cx)
+                .failed_turn()
+                .map(|f| f.target_action_id.clone())
+                .as_deref(),
+            Some("a3")
+        );
     });
 
     // Retry re-selects the failed post's branch, so the streaming node attaches
@@ -3415,14 +3706,15 @@ fn space_failed_ask_retry_selects_the_failed_posts_branch(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn space_regenerate_uses_selected_model(cx: &mut TestAppContext) {
+fn space_regenerate_uses_posts_own_model(cx: &mut TestAppContext) {
+    // With the composer's model picker gone, regenerating re-asks the model
+    // that answered — the post's own recorded model, not any global choice.
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, Some("s".into()));
     seed_space_pair(&view, window, cx);
 
     cx.update_window(window, |_, _, cx| {
         view.update(cx, |v, cx| {
-            v.select_model("gemma-test".into(), cx);
             v.regenerate(&"a2".into(), cx);
         });
     })
@@ -3430,8 +3722,8 @@ fn space_regenerate_uses_selected_model(cx: &mut TestAppContext) {
     view.read_with(cx, |v, cx| {
         assert_eq!(
             v.space().read(cx).last_submitted_model(),
-            Some("gemma-test"),
-            "regenerate resolves the space's model selection"
+            Some("kimi-k2"),
+            "regenerate resolves the post's own recorded model"
         );
     });
 }
@@ -4201,6 +4493,85 @@ fn spaces_store_create_from_template_surfaces_error(cx: &mut TestAppContext) {
         stores
             .spaces
             .read_with(cx, |s, _| s.new_space_error().is_some())
+    });
+
+    drain_runtime(&core);
+}
+
+#[gpui::test]
+fn space_post_fans_out_one_turn_per_planned_responder(cx: &mut TestAppContext) {
+    // The composer's Post drives app-core's notification plan: one concurrent
+    // streaming turn per planned responder (wave 3b). Two agents with notify
+    // "to people" → a human post starts two turns at once, each in its own
+    // keyed runner. With no account configured every turn fails (typed) — and
+    // each failure completes *independently*, leaving the saved post intact
+    // and the space recovered (never bricked).
+    let (stores, core, _dir, space_id) = participants_scene(cx);
+    core.runtime()
+        .block_on(core.add_space_participant(
+            space_id.clone(),
+            eidola_app_core::NewParticipant {
+                label: "Second Agent".into(),
+                model_ref: Some("kimi-k2-6".into()),
+                system_prompt: None,
+                notify_policy: "human".into(),
+            },
+        ))
+        .expect("add second agent");
+
+    let (window, view) = open_space(cx, &stores, Some(space_id.clone()));
+    wait_until(cx, "transcript load", |cx| {
+        view.read_with(cx, |v, cx| {
+            matches!(
+                v.space().read(cx).transcript(),
+                eidola_gui::loadable::Loadable::Loaded { .. }
+            )
+        })
+    });
+
+    // Observe the shared Space entity: record the maximum number of concurrent
+    // streams (both turns start inside the submit-completion update, so the
+    // observer deterministically sees 2), and count turn failures — each turn's
+    // independent completion emits one `Failed`.
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let max_streams = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let failures = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let (max2, fail2) = (max_streams.clone(), failures.clone());
+    let _subs = cx.update(|cx| {
+        [
+            cx.observe(&space, move |space, cx| {
+                let n = space.read(cx).streams().len();
+                if n > max2.get() {
+                    max2.set(n);
+                }
+            }),
+            cx.subscribe(&space, move |_, ev: &eidola_gui::space::SpaceEvent, _| {
+                if matches!(ev, eidola_gui::space::SpaceEvent::Failed(_)) {
+                    fail2.set(fail2.get() + 1);
+                }
+            }),
+        ]
+    });
+
+    open_space_draft(&view, window, cx, None);
+    set_space_composer_text(&view, window, cx, "hello everyone");
+    dispatch_space_action(&view, window, cx, Send);
+
+    wait_until(cx, "both turns complete", |_| failures.get() >= 2);
+    assert_eq!(
+        max_streams.get(),
+        2,
+        "the plan fanned out two concurrent streaming turns"
+    );
+    view.read_with(cx, |v, cx| {
+        let space = v.space().read(cx);
+        assert!(space.streams().is_empty(), "both failed turns collapsed");
+        assert_eq!(
+            space.messages().len(),
+            1,
+            "the saved post survives its failed turns"
+        );
+        assert!(space.can_retry(), "a failed turn is recorded for Retry");
     });
 
     drain_runtime(&core);
