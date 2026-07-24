@@ -1159,6 +1159,11 @@ impl Render for SpaceView {
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
             }))
+            // Space → Participants…: open the per-space Participants window for
+            // this conversation. Registered per-view (like CloseWindow) so the
+            // menu item targets the focused space and macOS greys it when no
+            // space window is open. A no-op on a not-yet-persisted blank space.
+            .on_action(cx.listener(Self::open_participants))
             // The window's single modifiers listener (see `WindowInput`): the
             // root is an ancestor of the focused composer, so it sees every
             // modifier transition and mirrors it into the shared entity for
@@ -1693,6 +1698,35 @@ impl SpaceView {
         }
         self.scroll_to_tail(window, cx);
         cx.notify();
+    }
+
+    /// Space → Participants…: open the Participants window for this space. A
+    /// no-op on a blank ⌘N space that hasn't been persisted yet (no id ⇒ no
+    /// per-space participants exist to manage). The space title (if any) rides
+    /// along for the window's subtitle.
+    pub fn open_participants(
+        &mut self,
+        _: &crate::actions::OpenParticipants,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(space_id) = self.space.read(cx).id().map(str::to_string) else {
+            return;
+        };
+        // Resolve the space's title from the Library index (the Space entity
+        // doesn't track it) for the Participants window subtitle.
+        let title = self
+            .stores
+            .spaces
+            .read(cx)
+            .list()
+            .iter()
+            .find(|s| s.id == space_id)
+            .and_then(|s| s.title.clone());
+        let stores = self.stores.clone();
+        cx.defer(move |cx: &mut gpui::App| {
+            crate::open_participants_window(cx, stores.clone(), space_id.clone(), title.clone());
+        });
     }
 }
 

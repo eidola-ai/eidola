@@ -2500,6 +2500,38 @@ impl Inner {
         })
     }
 
+    /// Instantiate a **specific** template into a new space (the Space menu's
+    /// "New Space from Template" path, and the Templates pane's "New space").
+    /// Unlike [`Self::create_space`] (which resolves the *default* template),
+    /// this takes an explicit template id; a missing/removed template is a
+    /// typed error rather than a silent fallback.
+    async fn create_space_from_template(
+        &self,
+        template_id: &str,
+        title: Option<&str>,
+    ) -> Result<SpaceInfo, AppError> {
+        let conn = self.db_conn().await?;
+        db::get_space_template(&conn, template_id)
+            .await?
+            .filter(|t| t.removed_at.is_none())
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space template not found or removed: {template_id}"),
+            })?;
+        let now = now_ms();
+        let space_id = Uuid::now_v7().to_string();
+        db::instantiate_template(&conn, template_id, &space_id, title, "unlinked", now).await?;
+        self.bus.emit(Change::SpaceIndex);
+        Ok(SpaceInfo {
+            id: space_id,
+            title: title.map(String::from),
+            snippet: None,
+            created_at: now,
+            last_activity_at: now,
+            message_count: 0,
+            archived_at: None,
+        })
+    }
+
     async fn archive_space(&self, space_id: &str) -> Result<bool, AppError> {
         let db_conn = self.db_conn().await?;
         let archived = db::archive_space(&db_conn, space_id, now_ms()).await?;
@@ -4943,6 +4975,24 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.archive_space(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Create a new space from a **specific** template (vs [`Self::create_space`],
+    /// which uses the default). A missing/removed template is a typed error.
+    pub async fn create_space_from_template(
+        &self,
+        template_id: String,
+        title: Option<String>,
+    ) -> Result<SpaceInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .create_space_from_template(&template_id, title.as_deref())
+                    .await
+            })
             .await
             .map_err(join_err)?
     }
