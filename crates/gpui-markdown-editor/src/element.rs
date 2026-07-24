@@ -778,108 +778,247 @@ fn augment_block_with_table(
     }
     let gutter = font_size * 1.25;
     let edit = *edit_mode;
+    let cursor_row = match &block.kind {
+        BlockKind::Table { cursor_row, .. } => *cursor_row,
+        _ => None,
+    };
 
     use crate::syntax::TableAlignment;
     use crate::table::RowKind;
 
     // Rows that participate in alignment: the delimiter row only in
     // edit mode (it's hidden in display mode).
-    let rows: Vec<&crate::table::RowGeometry> = geometry
+    let rows: Vec<(usize, &crate::table::RowGeometry)> = geometry
         .rows
         .iter()
-        .filter(|r| edit || r.kind != RowKind::Delimiter)
+        .enumerate()
+        .filter(|(_, r)| edit || r.kind != RowKind::Delimiter)
         .collect();
 
-    // Per-column slot widths.
-    let n_cols = geometry.column_count();
-    let mut slot: Vec<Pixels> = vec![px(0.0); n_cols];
-    let mut cell_widths: Vec<Vec<Pixels>> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let mut widths = Vec::with_capacity(row.cells.len());
-        for (k, cell) in row.cells.iter().enumerate() {
-            let w = measure_block_slice_width(source, cell, block, style, font_size, window);
-            if k < n_cols && w > slot[k] {
-                slot[k] = w;
-            }
-            widths.push(w);
+    // Canonical chrome glyph advances (edit mode): the pipe and the
+    // single padding space. Measured once; the walk below tracks the
+    // *actual* accumulated width per row, so non-canonical rows
+    // (typed trailing whitespace, a missing pipe) self-correct at the
+    // next boundary instead of shifting everything after them.
+    let text_w = |s: &str, window: &mut Window| -> Pixels {
+        if s.is_empty() {
+            return px(0.0);
         }
-        cell_widths.push(widths);
+        let runs = [TextRun {
+            len: s.len(),
+            font: base_font_for_block(&block.kind, style),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        window
+            .text_system()
+            .shape_text(
+                SharedString::from(s.to_string()),
+                font_size,
+                &runs,
+                None,
+                None,
+            )
+            .ok()
+            .and_then(|mut v| v.drain(..).next())
+            .map(|l| l.width())
+            .unwrap_or(px(0.0))
+    };
+    let w_pipe = text_w("|", window);
+    let w_sp = text_w(" ", window);
+    let w_dash = text_w("-", window);
+    let w_colon = text_w(":", window);
+
+    // Per-row, per-cell measured widths: (leading padding, trimmed
+    // content, trailing padding) — all through the block's real
+    // hides/substitutions, so a hidden padding byte (display mode)
+    // measures zero and a real one (edit mode) measures true.
+    let mut measured: Vec<Vec<(Pixels, Pixels, Pixels)>> = Vec::with_capacity(rows.len());
+    for (_, row) in &rows {
+        let mut per_cell = Vec::with_capacity(row.cells.len());
+        for (cell, seg) in row.cells.iter().zip(row.segments.iter()) {
+            let w_pre = measure_block_slice_width(
+                source,
+                &(seg.start..cell.start),
+                block,
+                style,
+                font_size,
+                window,
+            );
+            let w_cell = measure_block_slice_width(source, cell, block, style, font_size, window);
+            let w_post = measure_block_slice_width(
+                source,
+                &(cell.end..seg.end),
+                block,
+                style,
+                font_size,
+                window,
+            );
+            per_cell.push((w_pre, w_cell, w_post));
+        }
+        measured.push(per_cell);
     }
 
-    // Note on chrome glyphs in edit mode: the canonical chrome
-    // strings (`| `, ` | `, ` |`) are identical on every row, so
-    // they contribute equal width per boundary and columns align
-    // without measuring them — the running `err` only has to track
-    // pad-run rounding. A transient non-canonical chrome run on the
-    // caret's row shifts that one row until the normalize pass snaps
-    // it back; accepted.
-    let pad_run = |n: usize| -> String { MATH_PAD_CHAR.to_string().repeat(n) };
-    let fill_split = |k: usize, w: Pixels| -> (Pixels, Pixels) {
-        // (leading, trailing) fill for a cell of width `w` in column
-        // `k`, per the column's alignment.
-        let free = (slot.get(k).copied().unwrap_or(px(0.0)) - w).max(px(0.0));
-        match geometry.alignment(k) {
-            TableAlignment::Right => (free, px(0.0)),
-            TableAlignment::Center => (free * 0.5, free - free * 0.5),
-            TableAlignment::None | TableAlignment::Left => (px(0.0), free),
-        }
-    };
-
-    for (row, widths) in rows.iter().zip(cell_widths.iter()) {
-        // The delimiter row's cells are chrome, not aligned content —
-        // in edit mode just leave its literal text in place (it's
-        // dimmed); no pads. (Stretching its dashes to the column
-        // width is a possible future nicety.)
+    // Per-column slot widths: the widest *occupied* width — trimmed
+    // content, or content plus any padding beyond the canonical
+    // single space per side (a just-typed trailing space **counts as
+    // occupied**, so the whole column widens together and stays
+    // aligned while the user types; the canonicalizer trims the
+    // extra once the caret leaves the row and the column relaxes).
+    // The delimiter row's compact dash cells don't drive slots (they
+    // stretch to fit; including them would floor every column at
+    // ~three dashes).
+    let n_cols = geometry.column_count();
+    let mut slot: Vec<Pixels> = vec![px(0.0); n_cols];
+    for ((_, row), per_cell) in rows.iter().zip(measured.iter()) {
         if row.kind == RowKind::Delimiter {
             continue;
         }
-        let mut err = px(0.0); // ideal minus measured, running
-        let mut prev_end = row.line.start;
-        for (k, cell) in row.cells.iter().enumerate() {
-            let chrome_range = prev_end..cell.start;
-            let chrome_text = &source[chrome_range.clone()];
-            let (lead, _) = fill_split(k, widths.get(k).copied().unwrap_or(px(0.0)));
-            let trail_prev = if k == 0 {
-                px(0.0)
-            } else {
-                let (_, t) = fill_split(k - 1, widths.get(k - 1).copied().unwrap_or(px(0.0)));
-                t
-            };
-            let inter_gutter = if k == 0 || edit { px(0.0) } else { gutter };
-            // Compose: [trail fill of prev cell][chrome glyphs (edit)
-            // or nothing (display)][gutter (display)][lead fill].
-            let mut display = String::new();
-            let mut want = trail_prev + err;
-            let n1 = ((want / pad_w).round() as i64).max(0) as usize;
-            display.push_str(&pad_run(n1));
-            err = want - pad_w * (n1 as f32);
-            if edit {
-                display.push_str(chrome_text);
+        for (k, (w_pre, w_cell, w_post)) in per_cell.iter().enumerate() {
+            let canonical_pad = if edit { w_sp * 2.0 } else { px(0.0) };
+            let occupied = (*w_pre + *w_cell + *w_post - canonical_pad).max(*w_cell);
+            if k < n_cols && occupied > slot[k] {
+                slot[k] = occupied;
             }
-            want = inter_gutter + lead + err;
-            let n2 = ((want / pad_w).round() as i64).max(0) as usize;
-            display.push_str(&pad_run(n2));
-            err = want - pad_w * (n2 as f32);
-            if !display.is_empty() && chrome_range.start < chrome_range.end {
+        }
+    }
+
+    // Ideal column content-box start positions (line-local).
+    let mut col_x: Vec<Pixels> = Vec::with_capacity(n_cols + 1);
+    let mut acc = if edit { w_pipe + w_sp } else { px(0.0) };
+    for w in &slot {
+        col_x.push(acc);
+        acc += *w + if edit { w_sp + w_pipe + w_sp } else { gutter };
+    }
+    col_x.push(acc); // one-past-last: the trailing boundary target
+
+    let pad_run = |n: usize| -> String { MATH_PAD_CHAR.to_string().repeat(n) };
+    let pads_for = |want: Pixels| -> usize {
+        if want <= px(0.0) {
+            0
+        } else {
+            ((want / pad_w).round() as i64).max(0) as usize
+        }
+    };
+    let lead_fill = |k: usize, w: Pixels| -> Pixels {
+        let free = (slot.get(k).copied().unwrap_or(px(0.0)) - w).max(px(0.0));
+        match geometry.alignment(k) {
+            TableAlignment::Right => free,
+            TableAlignment::Center => free * 0.5,
+            TableAlignment::None | TableAlignment::Left => px(0.0),
+        }
+    };
+
+    for ((row_idx, row), per_cell) in rows.iter().zip(measured.iter()) {
+        let is_delimiter = row.kind == RowKind::Delimiter;
+        // Delimiter-row dash stretch (edit mode): each dash cell's
+        // display stretches to its column's slot width, alignment
+        // colons kept at the ends, so the row reads as the ruled
+        // boundary it is instead of a compact runt. Skipped when the
+        // caret is ON the row — the user is editing colons there and
+        // must see (and click into) the raw bytes.
+        let stretch = is_delimiter && cursor_row != Some(*row_idx);
+
+        // Walk the row's real bytes boundary-by-boundary, tracking
+        // measured x. Pads live inside substitutions over the
+        // boundary bytes (the pipes) only — a cell's padding
+        // whitespace stays *real shaped text*, so a caret parked in
+        // just-typed trailing whitespace renders at its true x
+        // inside the cell (it used to be swallowed by a
+        // whole-chrome substitution and paint past the next pipe),
+        // and typed extra whitespace absorbs into the next
+        // boundary's fill instead of shifting the rest of the row.
+        let mut x = px(0.0);
+        let mut prev_end = row.line.start;
+        for (k, (cell, seg)) in row.cells.iter().zip(row.segments.iter()).enumerate() {
+            let boundary = prev_end..seg.start;
+            let w_boundary =
+                measure_block_slice_width(source, &boundary, block, style, font_size, window);
+            let (w_pre, cached_cell, w_post) =
+                per_cell
+                    .get(k)
+                    .copied()
+                    .unwrap_or((px(0.0), px(0.0), px(0.0)));
+            let mut w_cell = cached_cell;
+
+            // Stretched delimiter cell: substitute the dash cell's
+            // display and use the substituted width downstream.
+            if stretch && cell.start < cell.end {
+                let cell_text = &source[cell.clone()];
+                let leading_colon = cell_text.starts_with(':');
+                let trailing_colon = cell_text.ends_with(':') && cell_text.len() > 1;
+                let colons =
+                    (leading_colon as usize as f32 + trailing_colon as usize as f32) * w_colon;
+                let target = slot.get(k).copied().unwrap_or(px(0.0));
+                let n_dashes = if w_dash > px(0.0) {
+                    (((target - colons) / w_dash).round() as i64).max(1) as usize
+                } else {
+                    3
+                };
+                let mut display = String::new();
+                if leading_colon {
+                    display.push(':');
+                }
+                for _ in 0..n_dashes {
+                    display.push('-');
+                }
+                if trailing_colon {
+                    display.push(':');
+                }
+                w_cell = text_w(&display, window);
                 augmented.substitutions.push(Substitution {
-                    source_range: chrome_range,
+                    source_range: cell.clone(),
                     display,
                 });
             }
-            prev_end = cell.end;
-        }
-        // Trailing chrome (` |`): in edit mode pad the last cell out
-        // to its slot so the closing pipes align column-style.
-        let trailing = prev_end..row.line.end;
-        if edit && trailing.start < trailing.end {
-            let k_last = row.cells.len().saturating_sub(1);
-            let trail = if row.cells.is_empty() {
-                px(0.0)
+
+            let target_content = col_x.get(k).copied().unwrap_or(acc)
+                + if is_delimiter {
+                    px(0.0)
+                } else {
+                    lead_fill(k, w_cell)
+                };
+            let (n1, n2);
+            if edit {
+                // Split pads around the pipe: n1 completes the
+                // previous column's box (ideal pipe position =
+                // col_x[k] − space − pipe), n2 supplies this cell's
+                // alignment lead.
+                let pipe_target = col_x.get(k).copied().unwrap_or(acc) - w_sp - w_pipe;
+                n1 = if k == 0 { 0 } else { pads_for(pipe_target - x) };
+                let after_boundary = x + pad_w * (n1 as f32) + w_boundary;
+                n2 = pads_for(target_content - after_boundary - w_pre);
             } else {
-                fill_split(k_last, widths.get(k_last).copied().unwrap_or(px(0.0))).1
-            };
-            let want = trail + err;
-            let n = ((want / pad_w).round() as i64).max(0) as usize;
+                n1 = 0;
+                n2 = pads_for(target_content - x - w_pre);
+            }
+            if (n1 > 0 || n2 > 0) && boundary.start < boundary.end {
+                let mut display = pad_run(n1);
+                display.push_str(&source[boundary.clone()]);
+                display.push_str(&pad_run(n2));
+                augmented.substitutions.push(Substitution {
+                    source_range: boundary,
+                    display,
+                });
+            }
+            // Advance measured x: pads + boundary text + the
+            // segment's real bytes (leading padding + content +
+            // trailing padding — hidden bytes measure zero in
+            // display mode, so this is content-only there).
+            x += pad_w * ((n1 + n2) as f32) + w_boundary + w_pre + w_cell + w_post;
+            prev_end = seg.end;
+        }
+        // Trailing boundary (` |`): in edit mode pad the last cell
+        // out to its slot so the closing pipes align column-style.
+        let trailing = prev_end..row.line.end;
+        if edit && trailing.start < trailing.end && !row.cells.is_empty() {
+            let k_last = row.cells.len() - 1;
+            let pipe_target = col_x.get(k_last).copied().unwrap_or(px(0.0))
+                + slot.get(k_last).copied().unwrap_or(px(0.0))
+                + w_sp;
+            let n = pads_for(pipe_target - x);
             if n > 0 {
                 let mut display = pad_run(n);
                 display.push_str(&source[trailing.clone()]);
@@ -3835,6 +3974,117 @@ mod tests {
             "trailing-space cursor x ({:?}) should be greater than no-trail ({:?})",
             trailing_x,
             plain_x,
+        );
+    }
+
+    /// Shape a table document's first row through the real table
+    /// augment pass (edit mode, caret at `cursor`) and return the
+    /// local x of each probe offset plus the shaped line's width.
+    fn table_line_x_positions(
+        cx: &mut TestAppContext,
+        src: &str,
+        cursor: usize,
+        probes: &[usize],
+    ) -> (Vec<Pixels>, Pixels) {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(cursor),
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let src_owned = src.to_string();
+        let probes = probes.to_vec();
+
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Table { .. }))
+                .expect("a table block");
+            let font_size = font_size_for_block(&block.kind, &style);
+            let line_height = font_size * style.line_height.0;
+            let augmented = augment_block_with_table(block, &src_owned, font_size, &style, window);
+            let shaped = shape_block_lines(&src_owned, &augmented, &style, font_size, None, window);
+            let mut out = Vec::new();
+            let mut width = px(0.0);
+            for probe in &probes {
+                let sl = shaped
+                    .iter()
+                    .find(|sl| sl.source_range.start <= *probe && *probe <= sl.source_range.end)
+                    .expect("a shaped line containing the probe");
+                let laid = LaidOutLine {
+                    line: sl.line.clone(),
+                    origin: point(px(0.0), px(0.0)),
+                    row_height: line_height,
+                    wrapped_height: line_height,
+                    source_range: sl.source_range.clone(),
+                    display_to_source: sl.display_to_source.clone(),
+                    is_delimiter: sl.is_delimiter,
+                };
+                if sl.line.width() > width {
+                    width = sl.line.width();
+                }
+                out.push(laid.local_position_for_source_offset(*probe).x);
+            }
+            (out, width)
+        })
+        .expect("update window")
+    }
+
+    #[gpui::test]
+    fn table_caret_after_trailing_space_renders_inside_its_cell(cx: &mut TestAppContext) {
+        // Type a trailing space at the end of a mid-row cell:
+        // `| ab  | cd |` with the caret after the space (offset 5).
+        // The caret must render inside the first cell's box — left of
+        // the second cell's content — and the second cell's x must
+        // not shift versus the canonical `| ab | cd |` (the space
+        // absorbs into the boundary fill). This was Mike's
+        // trailing-space bug: the whole-chrome substitution swallowed
+        // the typed space, painting the caret past the *next* pipe
+        // and shifting the rest of the row right.
+        let spaced = "| ab  | cd |\n| --- | --- |\n| x | y |\n";
+        let caret = 5; // after the typed trailing space
+        let cd = spaced.find("cd").unwrap();
+        let y = spaced.find("| y |").unwrap() + 2;
+        let (xs, _) = table_line_x_positions(cx, spaced, caret, &[caret, cd, y]);
+        let (caret_x, cd_x, y_x) = (xs[0], xs[1], xs[2]);
+        assert!(
+            caret_x < cd_x,
+            "caret after a trailing space must stay left of the next cell \
+             (caret {caret_x:?}, next cell {cd_x:?})",
+        );
+        // The typed space counts as occupied width, so the whole
+        // column widens *together*: the second column stays aligned
+        // across rows (within pad-glyph rounding) instead of only the
+        // caret's row shifting right.
+        let skew = (cd_x - y_x).abs();
+        assert!(
+            skew < px(4.0),
+            "the second column must stay aligned across rows while a \
+             trailing space is being typed (cd at {cd_x:?}, y at {y_x:?})",
+        );
+    }
+
+    #[gpui::test]
+    fn table_caret_after_trailing_space_in_last_cell_stays_inside_the_row(cx: &mut TestAppContext) {
+        // Same bug at the row's last cell: `| ab | cd  |` caret after
+        // the typed space (before the trailing pipe). The caret must
+        // render left of the shaped row's right edge (it used to
+        // paint past the trailing pipe, outside the table).
+        let spaced = "| ab | cd  |\n| --- | --- |\n| x | y |\n";
+        let caret = spaced.find("cd").unwrap() + 3; // after the typed space
+        let (xs, line_width) = table_line_x_positions(cx, spaced, caret, &[caret]);
+        assert!(
+            xs[0] < line_width,
+            "caret after a trailing space in the last cell must stay inside \
+             the row (caret {:?}, row width {line_width:?})",
+            xs[0],
         );
     }
 
