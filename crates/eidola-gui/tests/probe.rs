@@ -235,7 +235,20 @@ fn open_view<V: gpui::Render + 'static>(
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("open test window");
-        (window.into(), inner.expect("build closure produced a view"))
+        let handle: AnyWindowHandle = window.into();
+        // The probe registry is a process-global keyed by numeric window id
+        // (`probe::REGISTRY`), and fresh `TestAppContext`s recycle those ids —
+        // so a *previous* probe test's window may have left entries under this
+        // id (e.g. the ⌥-revealed `space/composer/post-quiet` recorded by
+        // `space_composer_alt_reveals_post_quiet_probe`). Drop them here so each
+        // test's window starts clean and `window_entries` reflects only what
+        // *this* scene renders — otherwise a scene asserting an affordance is
+        // *absent* could inherit it from an earlier test, a leak that surfaces
+        // only under a particular test-scheduling order (green on macOS locally,
+        // red on Linux CI). Every test draws (directly or via `fresh_names`)
+        // before reading, so this window's real probes are re-recorded after.
+        probe::clear_window(handle.window_id().as_u64());
+        (handle, inner.expect("build closure produced a view"))
     })
 }
 
