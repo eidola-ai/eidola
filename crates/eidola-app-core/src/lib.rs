@@ -339,6 +339,12 @@ pub struct ChatResult {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub credits_charged: i64,
+    /// The persisted inference action id this turn produced. Lets a caller
+    /// continue an auto-notify cascade by re-planning on the fresh post
+    /// (`plan_notifications(space_id, response_action_id)`). `None` only on
+    /// paths that produced no inference row (none today — every success path
+    /// persists one).
+    pub response_action_id: Option<String>,
 }
 
 /// Outcome of [`AppCore::post`] — saving a thought without requesting a
@@ -366,6 +372,59 @@ pub enum ResponseMode {
     /// A new *generation* of the target's item (regenerate / agent revise):
     /// shares the target's `item_id`, supersedes it, replicates its reply edge.
     Revise,
+}
+
+/// Which participant should respond in a turn — the Participants-v1 input that
+/// replaced the bare model string on the internal turn path.
+///
+/// * `Participant` — an explicit space participant id; its **effective** config
+///   (COALESCE(override, participant config)) supplies the model and system
+///   prompt. This is the `submit` → `plan_notifications` → drive path.
+/// * `Model` — a bare/qualified model string (the model-picker compatibility
+///   path the CLI/GUI still use until wave 3): resolved to the space's agent
+///   participant whose effective model matches, **minting** a fresh space-owned
+///   agent for the model when none matches (documented on
+///   `Inner::resolve_or_mint_agent_by_model`).
+#[derive(Clone, Debug)]
+enum TurnSelector {
+    Participant(String),
+    Model(String),
+}
+
+/// One planned auto-response turn produced by [`AppCore::plan_notifications`]:
+/// the participant that should respond and the post it responds to. Callers
+/// drive one streaming turn per entry (via [`AppCore::respond_stream_as`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedTurn {
+    /// The participant that should respond (an agent member of the space).
+    pub participant_id: String,
+    /// The post this turn replies to (the triggering post's action id).
+    pub target_action_id: String,
+    /// The cascade depth the resulting response will occupy (the triggering
+    /// post's derived depth + 1) — informational for the GUI's cascade
+    /// indicator. The guard itself re-derives depth from the data on the next
+    /// [`AppCore::plan_notifications`], so this value is never persisted.
+    pub cascade_depth: i64,
+}
+
+/// The outcome of planning notifications for a post.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotificationPlan {
+    /// The turns to drive (possibly empty — nobody's notify policy fired).
+    Turns(Vec<PlannedTurn>),
+    /// The space's `cascade_limit` was reached at this post: instead of turns,
+    /// a resumable paused marker the wave-3 GUI renders as "cascade limit
+    /// reached — ask to continue". Explicit asks ([`AppCore::respond_stream`] /
+    /// [`AppCore::respond_stream_as`]) bypass this guard entirely.
+    Paused { depth: i64, limit: i64 },
+}
+
+/// The result of [`AppCore::submit`]: the saved post plus the notification plan
+/// computed over the space's participants.
+#[derive(Clone, Debug)]
+pub struct SubmitResult {
+    pub post: PostResult,
+    pub plan: NotificationPlan,
 }
 
 #[derive(Clone, Debug)]
@@ -618,6 +677,16 @@ pub struct SpendTrailEntry {
 /// timing-correlatable operation) stays infrequent.
 pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
 
+/// How long the ACT provisioning queue waits for an in-flight credential
+/// refund (a concurrent turn's recovery) to free spendable balance before
+/// giving up with [`AppError::ProvisioningTimeout`]. Bounds the worst case
+/// where a sibling turn holds the only coverage mid-spend and its refund never
+/// lands.
+const PROVISION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Poll cadence while the provisioning queue waits on an in-flight refund.
+const PROVISION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Decide how many credits to auto-allocate, given the account's available
 /// balance and the credits required for the operation that triggered
 /// provisioning. Pure function so the decision logic is unit-testable
@@ -668,6 +737,15 @@ struct Inner {
     /// llama.cpp engines). `Arc` so core-owned transfer/supervisor tasks
     /// can hold it beyond the initiating call.
     local: Arc<local_models::LocalRuntime>,
+    /// The wallet-level ACT provisioning queue. Serializes the spend
+    /// credential-acquisition + spend-proof + pending-refund step across
+    /// concurrent turns, so two turns fired at once (multi-participant
+    /// fan-out) can never both grab the same active credential — the first
+    /// flips it to `spending` inside the lock, so the second either finds
+    /// another active credential, auto-allocates fresh from balance (the
+    /// pool), or waits bounded for an in-flight refund. Held only around the
+    /// provisioning step in `prepare_turn`; the HTTP request runs outside it.
+    spend_gate: tokio::sync::Mutex<()>,
     /// Test-only HTTP client override. When `Some`, [`Inner::build_client`]
     /// returns a clone of this client *instead of* constructing the
     /// attesting client, letting integration tests drive `chat`/`chat_stream`
@@ -1838,29 +1916,43 @@ impl Inner {
         Ok(space_id)
     }
 
-    /// Resolve the agent participant an inference should be recorded against —
-    /// the wave-1 seam between "the space's participants" and "`run_turn` takes
-    /// a model string". Reuses the space's existing per-space agent whose
-    /// `model_ref` matches (the one copied from the template on instantiation);
-    /// if the selected model isn't among the space's participants, mints a
-    /// fresh per-space agent instance for it and joins it. **Wave 2** makes
-    /// `run_turn` take the participant directly, retiring this by-model lookup.
-    async fn ensure_space_agent_participant(
+    /// Resolve the agent participant an inference should be recorded against
+    /// **from a model string** — the model-picker **compatibility path** for
+    /// `TurnSelector::Model` (the CLI/GUI flow until the wave-3 GUI selects
+    /// participants directly). Reuses the space's existing agent (a space-owned
+    /// instance from the template, or a referenced global) whose **effective**
+    /// `model_ref` matches the (canonicalized) selection, returning its
+    /// `(id, scope, effective system_prompt)`; if no member matches the picked
+    /// model, mints a fresh **space-owned** agent for it (scope `'space'`,
+    /// `owner_space_id` = this space; ownership implies membership, so no
+    /// reference row) with no system prompt and returns it.
+    ///
+    /// This is what keeps a plain model pick working while turns are
+    /// participant-aware: an explicit participant never routes here (its config
+    /// is read directly in `prepare_turn`); only `TurnSelector::Model` does.
+    async fn resolve_or_mint_agent_by_model(
         &self,
         conn: &turso::Connection,
         space_id: &str,
-        model_ref: &str,
+        canonical_model: &str,
         provider_id: &str,
         now: i64,
-    ) -> Result<(String, String), AppError> {
-        if let Some((id, scope)) =
-            db::space_agent_participant_by_model(conn, space_id, model_ref).await?
-        {
-            return Ok((id, scope));
+    ) -> Result<(String, String, Option<String>), AppError> {
+        for m in db::space_participants(conn, space_id).await? {
+            if m.kind != "agent" {
+                continue;
+            }
+            let matches = m
+                .model_ref
+                .as_deref()
+                .map(canonicalize_model_ref)
+                .as_deref()
+                == Some(canonical_model);
+            if matches {
+                return Ok((m.participant_id, m.scope, m.system_prompt));
+            }
         }
-        // No matching member — mint a fresh SPACE-OWNED agent (scope='space',
-        // owner_space_id = this space). Ownership implies membership, so no
-        // reference row is needed.
+        // No matching member — mint a fresh SPACE-OWNED agent for the model.
         let pid = Uuid::now_v7().to_string();
         db::insert_participant(
             conn,
@@ -1869,8 +1961,8 @@ impl Inner {
             Some(space_id),
             None,
             "agent",
-            &db::default_agent_label(model_ref),
-            Some(model_ref),
+            &db::default_agent_label(canonical_model),
+            Some(canonical_model),
             None,
             "explicit",
             "member",
@@ -1878,7 +1970,71 @@ impl Inner {
             now,
         )
         .await?;
-        Ok((pid, "space".to_string()))
+        Ok((pid, "space".to_string(), None))
+    }
+
+    /// Resolve the effective config of an **explicit** space participant
+    /// (`TurnSelector::Participant`) into the model + system prompt a turn
+    /// needs. Errors if the participant isn't a member of the space, isn't an
+    /// agent, or has no model configured (a participant that can't answer).
+    async fn resolve_explicit_participant(
+        &self,
+        conn: &turso::Connection,
+        space_id: &str,
+        participant_id: &str,
+    ) -> Result<db::EffectiveParticipantRow, AppError> {
+        let row = db::space_participants(conn, space_id)
+            .await?
+            .into_iter()
+            .find(|m| m.participant_id == participant_id)
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("participant `{participant_id}` is not a member of this space"),
+            })?;
+        if row.kind != "agent" {
+            return Err(AppError::NotConfigured {
+                message: format!(
+                    "participant `{}` is a {} — only agents can respond",
+                    row.label, row.kind
+                ),
+            });
+        }
+        if row
+            .model_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            return Err(AppError::NotConfigured {
+                message: format!("participant `{}` has no model configured", row.label),
+            });
+        }
+        Ok(row)
+    }
+
+    /// Verify `action_id` exists **and belongs to `space_id`**, returning its
+    /// item id. This is the app-layer guard against splicing one space's thread
+    /// into another: nothing in the schema constrains an `action_antecedent`
+    /// edge (or a turn's `target_action_id`) to a single space — the edge is
+    /// keyed on action ids only — so a caller supplying a mismatched
+    /// (space, action) pair could otherwise send space A's ancestry to space
+    /// B's agent and persist a cross-space reply edge. Typed
+    /// [`AppError::NotConfigured`] on a missing or foreign action.
+    async fn require_action_in_space(
+        &self,
+        conn: &turso::Connection,
+        action_id: &str,
+        space_id: &str,
+    ) -> Result<String, AppError> {
+        match db::action_item_and_space(conn, action_id).await? {
+            Some((item_id, sp)) if sp == space_id => Ok(item_id),
+            Some((_, sp)) => Err(AppError::NotConfigured {
+                message: format!("action {action_id} belongs to space {sp}, not {space_id}"),
+            }),
+            None => Err(AppError::NotConfigured {
+                message: format!("action not found: {action_id}"),
+            }),
+        }
     }
 
     // --- Participant CRUD (per-space) -----------------------------------
@@ -2288,6 +2444,17 @@ impl Inner {
         // DB open, joined into every space by the template instantiation).
         let user_participant_id = db::HUMAN_PARTICIPANT_ID.to_string();
 
+        // A `reply_to` branch antecedent must name an action in the SAME,
+        // existing space — replying into a brand-new space is meaningless, and a
+        // cross-space reply edge is not something the schema prevents. Validate
+        // before any write so a bad `reply_to` leaves no trace.
+        if let Some(rt) = reply_to {
+            let sid = space_id.ok_or_else(|| AppError::NotConfigured {
+                message: "reply_to requires an existing space".into(),
+            })?;
+            self.require_action_in_space(&db_conn, rt, sid).await?;
+        }
+
         let (space_id, space_title, is_new_space) = if let Some(sid) = space_id {
             let row =
                 db::get_space(&db_conn, sid)
@@ -2456,44 +2623,89 @@ impl Inner {
     }
 
     /// Find a credential that can cover `charge_credits`, auto-provisioning
-    /// one from the account balance when none exists.
+    /// one from the account balance when none exists — the pooled body of the
+    /// **ACT provisioning queue**.
     ///
-    /// Resolution order:
+    /// **The caller must hold [`Inner::spend_gate`]** across this call *and* the
+    /// spend-proof + `insert_pre_credential_refund` that follow, so the whole
+    /// acquire→spend→flip-to-`spending` step is atomic per wallet. Two
+    /// concurrent turns therefore never both grab the same active credential:
+    /// the first flips it to `spending` inside the lock; the second, entering
+    /// next, no longer sees it as spendable.
+    ///
+    /// Resolution order (retried in a bounded loop):
     /// 1. An active local credential with enough credits → use it.
     /// 2. No usable credential and no account configured →
     ///    [`AppError::NoAccount`] (the UI routes to account creation).
-    /// 3. Account exists: fetch balances; if the available balance cannot
-    ///    cover the charge → [`AppError::InsufficientBalance`] (the UI
-    ///    routes to purchase). Otherwise allocate
-    ///    `min(available, max(DEFAULT_ALLOCATION_CREDITS, charge))` and
-    ///    use the freshly issued credential.
-    ///
-    /// This keeps credential provisioning out of the happy path's UI: the
-    /// explicit `account_allocate` flow still works, but a chat never fails
-    /// just because the wallet is empty while the account is funded.
+    /// 3. Account exists and the available balance covers a fresh allocation →
+    ///    allocate `min(available, max(DEFAULT_ALLOCATION_CREDITS, charge))`
+    ///    (the pool) and retry.
+    /// 4. Balance can't cover another allocation but a mid-spend credential
+    ///    whose own `credits` cover the charge exists (a concurrent turn holds
+    ///    usable coverage) → wait bounded for its refund recovery to write a
+    ///    successor, then retry. A mid-spend credential *smaller* than the
+    ///    charge is ignored — its refund can never yield a covering successor
+    ///    (a successor is worth at most the original face value) and refunds
+    ///    don't top up balance, so waiting on it is futile.
+    /// 5. Bounded wait elapses with a covering credential still in flight →
+    ///    [`AppError::ProvisioningTimeout`]; no covering credential in flight
+    ///    (true shortfall) → [`AppError::InsufficientBalance`] *immediately*.
     async fn ensure_spendable_credential(
         &self,
         cfg: &Config,
         db_conn: &turso::Connection,
         charge_credits: i64,
     ) -> Result<db::SpendableCredential, AppError> {
-        if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
-            return Ok(cred);
+        let deadline = tokio::time::Instant::now() + PROVISION_WAIT_TIMEOUT;
+        loop {
+            if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
+                return Ok(cred);
+            }
+
+            if cfg.account_id.is_none() || cfg.account_secret.is_none() {
+                return Err(AppError::NoAccount);
+            }
+
+            let balances = self.account_balances().await?;
+            if balances.available >= charge_credits {
+                // Enough to allocate at least the charge — grow the pool.
+                let amount = auto_allocation_amount(balances.available, charge_credits)?;
+                self.account_allocate(amount).await?;
+                continue;
+            }
+
+            // Balance can't cover a fresh allocation. Waiting only helps if a
+            // concurrent turn holds coverage this turn could actually use once
+            // its refund lands. A refund recovers a *wallet successor* worth at
+            // most the original credential's face value (a full refund on a
+            // failed turn) — it never tops up the account balance, and a spend
+            // consumes one credential (no combining balance + a credential, or
+            // two credentials, to fund one turn). So an in-flight credential can
+            // only become spendable for THIS turn if its own `credits` already
+            // cover the charge; a smaller one — even fully refunded — never
+            // will, and no allocation is possible either. Wait only when such a
+            // credential exists; otherwise this is a true shortfall.
+            let recoverable = db::list_spending_credentials(db_conn)
+                .await?
+                .into_iter()
+                .any(|c| c.credits >= charge_credits);
+            if recoverable && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
+                continue;
+            }
+            if recoverable {
+                return Err(AppError::ProvisioningTimeout {
+                    message: format!(
+                        "timed out waiting for an in-flight credential refund to free \
+                         {charge_credits} credits for this turn"
+                    ),
+                });
+            }
+            return Err(AppError::InsufficientBalance {
+                available: balances.available,
+                required: charge_credits,
+            });
         }
-
-        if cfg.account_id.is_none() || cfg.account_secret.is_none() {
-            return Err(AppError::NoAccount);
-        }
-
-        let balances = self.account_balances().await?;
-        let amount = auto_allocation_amount(balances.available, charge_credits)?;
-        self.account_allocate(amount).await?;
-
-        db::find_spendable_credential(db_conn, charge_credits)
-            .await?
-            .ok_or_else(|| AppError::Credential {
-                message: "credential was allocated but is not spendable".into(),
-            })
     }
 
     async fn rename_space(&self, space_id: &str, title: &str) -> Result<(), AppError> {
@@ -2526,7 +2738,7 @@ impl Inner {
     async fn prepare_turn(
         &self,
         space_id: &str,
-        model: &str,
+        selector: TurnSelector,
         target_action_id: &str,
         mode: ResponseMode,
         budget: Option<i64>,
@@ -2538,6 +2750,28 @@ impl Inner {
 
         let attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
             Arc::new(Mutex::new(Vec::new()));
+
+        // Resolve the turn's participant. An explicit participant supplies its
+        // effective model + system prompt directly; a bare model string is the
+        // compatibility path resolved (or minted) against the space's agents
+        // *after* the backend is known (below). The model string drives the
+        // backend routing either way.
+        let explicit_participant = match &selector {
+            TurnSelector::Participant(pid) => Some(
+                self.resolve_explicit_participant(&db_conn, space_id, pid)
+                    .await?,
+            ),
+            TurnSelector::Model(_) => None,
+        };
+        let model: String = match (&selector, &explicit_participant) {
+            (_, Some(row)) => row
+                .model_ref
+                .clone()
+                .expect("resolve_explicit_participant guarantees a model"),
+            (TurnSelector::Model(m), None) => m.clone(),
+            (TurnSelector::Participant(_), None) => unreachable!("explicit resolves above"),
+        };
+        let model = model.as_str();
 
         // Resolve the selection to its backend, then route on the backend's
         // *kind*: `eidola` keeps the attested + credential-spend path;
@@ -2711,14 +2945,37 @@ impl Inner {
             .ok_or_else(|| AppError::NotConfigured {
                 message: format!("space not found: {space_id}"),
             })?;
-        // Record the inference against the space's agent participant matching
-        // this model (a space-owned instance from the template, a referenced
-        // global agent, or a fresh space-owned instance if the selected model
-        // isn't among the space's participants). The scope feeds the action's
-        // pinned composite echo.
-        let (model_participant_id, model_participant_scope) = self
-            .ensure_space_agent_participant(&db_conn, space_id, model, &provider_id, now)
+        // The target (the post being replied to / the generation being revised)
+        // must belong to this space — otherwise a caller could splice another
+        // space's thread into this turn (cross-space context + reply edge). This
+        // covers both modes and every entry point (`respond_stream_as` /
+        // `respond_stream`, and the same-space `chat` / `regenerate`). Wrapped
+        // by the caller's `into_chat_failed` like the space-existence check.
+        self.require_action_in_space(&db_conn, target_action_id, space_id)
             .await?;
+        // Record the inference against the responding agent participant, and
+        // capture its effective system prompt. An explicit participant supplies
+        // all three directly; a bare model resolves (or mints) the space's
+        // matching agent (`resolve_or_mint_agent_by_model`). The scope feeds the
+        // action's pinned composite echo.
+        let (model_participant_id, model_participant_scope, system_prompt) =
+            match &explicit_participant {
+                Some(row) => (
+                    row.participant_id.clone(),
+                    row.scope.clone(),
+                    row.system_prompt.clone(),
+                ),
+                None => {
+                    self.resolve_or_mint_agent_by_model(
+                        &db_conn,
+                        space_id,
+                        model,
+                        &provider_id,
+                        now,
+                    )
+                    .await?
+                }
+            };
         let space_id = space_id.to_string();
 
         // The space is always persisted here, so every error exit carries its id
@@ -2763,7 +3020,29 @@ impl Inner {
                 db::get_upstream_context(&db_conn, target_action_id, false).await?
             }
         };
-        let prior_messages = actions_to_messages(&context_rows);
+        let mut prior_messages = actions_to_messages(&context_rows);
+
+        // Prepend the responding participant's effective system prompt as a
+        // leading `system` message (Participants v1). It rides in the same
+        // `messages` array the charge estimate and the wire request both use,
+        // so the server recomputes the identical `chargeable_prompt_tokens`
+        // over the identical array and the hold still covers the charge by
+        // construction. It is deliberately NOT persisted as an action — the
+        // forensics doctrine keeps mutable participant config out of the trail
+        // (a later wave may snapshot its hash per turn).
+        if let Some(sp) = system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            prior_messages.insert(
+                0,
+                SpaceMessage {
+                    role: "system".to_string(),
+                    content: sp.to_string(),
+                },
+            );
+        }
 
         // The spend side runs only for eidola turns. Local and external
         // turns carry no charge estimate, no credential, and no ACT header
@@ -2811,6 +3090,13 @@ impl Inner {
                     }));
                 }
 
+                // ACT provisioning queue: serialize acquire → spend-proof →
+                // flip-to-`spending` across concurrent turns so two turns fired
+                // at once can never both spend the same credential. The gate is
+                // held only through `insert_pre_credential_refund` below (the
+                // point the credential becomes `spending`); the HTTP request
+                // runs after `prepare_turn` returns, outside the gate.
+                let _spend_guard = self.spend_gate.lock().await;
                 let cred = self
                     .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
                     .await
@@ -2935,7 +3221,7 @@ impl Inner {
     async fn run_turn(
         &self,
         space_id: &str,
-        model: &str,
+        selector: TurnSelector,
         target_action_id: &str,
         mode: ResponseMode,
         budget: Option<i64>,
@@ -2945,7 +3231,7 @@ impl Inner {
         // fetch, attestation flush, all *before* the turn's own `wrap` closure
         // — must still carry the space id for blank-space adoption / Retry.
         let mut prep = self
-            .prepare_turn(space_id, model, target_action_id, mode, budget)
+            .prepare_turn(space_id, selector, target_action_id, mode, budget)
             .await
             .map_err(|e| e.into_chat_failed(space_id))?;
 
@@ -3052,22 +3338,23 @@ impl Inner {
             .unwrap_or("")
             .to_string();
 
-        prep.persist_turn(
-            if status.is_success() {
-                "complete"
-            } else {
-                "error"
-            },
-            input_tokens,
-            output_tokens,
-            &response_content,
-            &request_body_json,
-            request_at,
-            response_at,
-            status.as_u16(),
-            response_text.as_bytes().to_vec(),
-        )
-        .await?;
+        let response_action_id = prep
+            .persist_turn(
+                if status.is_success() {
+                    "complete"
+                } else {
+                    "error"
+                },
+                input_tokens,
+                output_tokens,
+                &response_content,
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_text.as_bytes().to_vec(),
+            )
+            .await?;
 
         if !status.is_success() {
             // Inference (error status) + request rows committed; Wallet was
@@ -3097,6 +3384,7 @@ impl Inner {
             input_tokens,
             output_tokens,
             credits_charged: prep.charge_credits as i64,
+            response_action_id: Some(response_action_id),
         })
     }
 
@@ -3113,7 +3401,7 @@ impl Inner {
         let posted = self.post(space_id, prompt, None).await?;
         self.run_turn(
             &posted.space_id,
-            model,
+            TurnSelector::Model(model.to_string()),
             &posted.action_id,
             ResponseMode::Reply,
             None,
@@ -3122,7 +3410,9 @@ impl Inner {
     }
 
     /// Regenerate an inference: append a new generation of its item (agent
-    /// revise). `action_id` is any generation of the target item.
+    /// revise). `action_id` is any generation of the target item. Uses the
+    /// model-picker compat path (`TurnSelector::Model`), so the same agent
+    /// participant (matched by model) authors the new generation.
     async fn regenerate(&self, action_id: &str, model: &str) -> Result<ChatResult, AppError> {
         let db_conn = self.db_conn().await?;
         let (item_id, space_id) = db::action_item_and_space(&db_conn, action_id)
@@ -3136,8 +3426,14 @@ impl Inner {
                 message: format!("item has no current generation: {item_id}"),
             })?;
         drop(db_conn);
-        self.run_turn(&space_id, model, &tip, ResponseMode::Revise, None)
-            .await
+        self.run_turn(
+            &space_id,
+            TurnSelector::Model(model.to_string()),
+            &tip,
+            ResponseMode::Revise,
+            None,
+        )
+        .await
     }
 
     /// Streaming counterpart to `run_turn` — same shared preparation and
@@ -3160,7 +3456,7 @@ impl Inner {
     async fn run_turn_stream(
         &self,
         space_id: &str,
-        model: &str,
+        selector: TurnSelector,
         target_action_id: &str,
         mode: ResponseMode,
         budget: Option<i64>,
@@ -3172,7 +3468,7 @@ impl Inner {
         // flush) happen before the turn's inline `wrap` closure — carry the
         // already-persisted space id so they wrap like every later exit.
         let mut prep = self
-            .prepare_turn(space_id, model, target_action_id, mode, budget)
+            .prepare_turn(space_id, selector, target_action_id, mode, budget)
             .await
             .map_err(|e| e.into_chat_failed(space_id))?;
 
@@ -3373,18 +3669,19 @@ impl Inner {
         // (best-effort; the final Wallet emission below covers a successor).
         let _ = prep.try_refund_recovery().await;
 
-        prep.persist_turn(
-            "complete",
-            input_tokens,
-            output_tokens,
-            &full_content,
-            &request_body_json,
-            request_at,
-            response_at,
-            status.as_u16(),
-            response_buf,
-        )
-        .await?;
+        let response_action_id = prep
+            .persist_turn(
+                "complete",
+                input_tokens,
+                output_tokens,
+                &full_content,
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_buf,
+            )
+            .await?;
 
         // All durable writes succeeded — emit per affected domain. post owns the
         // SpaceIndex (new space / auto-title). Local turns touched no
@@ -3402,6 +3699,7 @@ impl Inner {
             input_tokens,
             output_tokens,
             credits_charged: prep.charge_credits as i64,
+            response_action_id: Some(response_action_id),
         })
     }
 
@@ -3418,13 +3716,98 @@ impl Inner {
         let posted = self.post(space_id, prompt, reply_to).await?;
         self.run_turn_stream(
             &posted.space_id,
-            model,
+            TurnSelector::Model(model.to_string()),
             &posted.action_id,
             ResponseMode::Reply,
             None,
             sender,
         )
         .await
+    }
+
+    // --- submit + notification planning (Participants v1) ----------------
+
+    /// Compute the auto-response notification plan for a post over the space's
+    /// participants (owned ∪ referenced globals, effective config). Applies the
+    /// data-derived cascade guard first: if the post's derived cascade depth has
+    /// reached the space's `cascade_limit`, returns [`NotificationPlan::Paused`]
+    /// instead of turns. Otherwise the notify set is every agent member (except
+    /// the post's author, and skipping model-less agents) whose `notify_policy`
+    /// fires: `all` → always; `human` → only when the post's author is human;
+    /// `explicit` → never (only an explicit ask reaches them).
+    async fn plan_notifications(
+        &self,
+        space_id: &str,
+        post_action_id: &str,
+    ) -> Result<NotificationPlan, AppError> {
+        let conn = self.db_conn().await?;
+
+        // The post must belong to this space: the notify set + cascade limit come
+        // from `space_id`, but depth + authorship come from `post_action_id`, so
+        // a mismatched pair would plan this space's participants against another
+        // space's post (and driving one would send that post's ancestry to this
+        // space's agent, persisting a cross-space reply edge). Reject up front.
+        self.require_action_in_space(&conn, post_action_id, space_id)
+            .await?;
+
+        let limit = db::space_cascade_limit(&conn, space_id).await?.unwrap_or(4);
+        let depth = db::agent_cascade_depth(&conn, post_action_id).await?;
+        if depth >= limit {
+            return Ok(NotificationPlan::Paused { depth, limit });
+        }
+
+        // The post's author (excluded from the notify set; its kind resolves the
+        // `human` predicate).
+        let (author_id, author_kind) = match db::action_author(&conn, post_action_id).await? {
+            Some((id, _scope, kind)) => (id, kind),
+            None => return Ok(NotificationPlan::Turns(Vec::new())),
+        };
+
+        let mut turns = Vec::new();
+        for m in db::space_participants(&conn, space_id).await? {
+            if m.kind != "agent" || m.participant_id == author_id {
+                continue;
+            }
+            // An agent with no model can't respond — never plan a turn for it.
+            if m.model_ref
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                continue;
+            }
+            let fires = match m.notify_policy.as_str() {
+                "all" => true,
+                "human" => author_kind == "human",
+                _ => false, // explicit
+            };
+            if fires {
+                turns.push(PlannedTurn {
+                    participant_id: m.participant_id,
+                    target_action_id: post_action_id.to_string(),
+                    cascade_depth: depth + 1,
+                });
+            }
+        }
+        Ok(NotificationPlan::Turns(turns))
+    }
+
+    /// The composer CTA path: save a post (`post`) then plan notifications over
+    /// it. The caller drives one turn per [`PlannedTurn`] (via
+    /// [`AppCore::respond_stream_as`]) and may re-plan on each resulting post to
+    /// continue an auto-notify cascade until the guard pauses it.
+    async fn submit(
+        &self,
+        space_id: Option<&str>,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> Result<SubmitResult, AppError> {
+        let post = self.post(space_id, text, reply_to).await?;
+        let plan = self
+            .plan_notifications(&post.space_id, &post.action_id)
+            .await?;
+        Ok(SubmitResult { post, plan })
     }
 }
 
@@ -3537,7 +3920,7 @@ impl AppCore {
                 inner
                     .run_turn_stream(
                         &space_id,
-                        &model,
+                        TurnSelector::Model(model),
                         &target_action_id,
                         ResponseMode::Reply,
                         None,
@@ -3545,6 +3928,75 @@ impl AppCore {
                     )
                     .await
             })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Drive a **planned auto-response turn** (participant-aware) — the wave-2
+    /// composer path. Streams a response to `target_action_id` **as** the given
+    /// `participant_id` (its effective model + system prompt), without posting a
+    /// new user turn. This is what a caller runs for each [`PlannedTurn`] a
+    /// [`Self::submit`] returned. Like [`Self::respond_stream`] it is an
+    /// explicit ask that bypasses the cascade guard (the guard lives in
+    /// [`Self::plan_notifications`]); failures wrap the space id the same way.
+    pub async fn respond_stream_as(
+        &self,
+        space_id: String,
+        participant_id: String,
+        target_action_id: String,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .run_turn_stream(
+                        &space_id,
+                        TurnSelector::Participant(participant_id),
+                        &target_action_id,
+                        ResponseMode::Reply,
+                        None,
+                        sender,
+                    )
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Save a post and plan notifications over the space's participants (the
+    /// composer CTA path). Returns the saved post plus a [`NotificationPlan`];
+    /// the caller drives one [`Self::respond_stream_as`] per planned turn (and
+    /// may re-plan on each resulting post via [`Self::plan_notifications`] to
+    /// continue a cascade until the guard pauses it).
+    pub async fn submit(
+        &self,
+        text: String,
+        space_id: Option<String>,
+        reply_to: Option<String>,
+    ) -> Result<SubmitResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .submit(space_id.as_deref(), &text, reply_to.as_deref())
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Compute the auto-response notification plan for an already-persisted post
+    /// (owned ∪ referenced participants, effective notify policy, data-derived
+    /// cascade guard). Used to continue a cascade after each driven turn.
+    pub async fn plan_notifications(
+        &self,
+        space_id: String,
+        post_action_id: String,
+    ) -> Result<NotificationPlan, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.plan_notifications(&space_id, &post_action_id).await })
             .await
             .map_err(join_err)?
     }
@@ -3609,6 +4061,7 @@ impl AppCore {
                 update_polling: std::sync::atomic::AtomicBool::new(false),
                 bus,
                 local: Arc::new(local_models::LocalRuntime::default()),
+                spend_gate: tokio::sync::Mutex::new(()),
                 http_override,
             }),
         }
@@ -5151,6 +5604,15 @@ async fn recover_refund(
 // ============================================================================
 // Free-standing helpers
 // ============================================================================
+
+/// Canonicalize a model reference to its `<model>@<backend-id>` form (the bare
+/// `eidola` default stays bare), so a participant's stored `model_ref` and a
+/// picked selection compare equal regardless of which sugar spelling either
+/// used. Mirrors `prepare_turn`'s own canonicalization.
+fn canonicalize_model_ref(model_ref: &str) -> String {
+    let mr = backends::parse_model_ref(model_ref);
+    backends::qualified_model_id(&mr.model, &mr.backend_id)
+}
 
 /// Convert space action rows into a sequence of role/content messages suitable
 /// for the OpenAI messages array and for UI display. Groups content blocks by

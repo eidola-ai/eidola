@@ -38,6 +38,16 @@ pub enum AppError {
     #[error("insufficient balance: {required} credits required, {available} available")]
     InsufficientBalance { available: i64, required: i64 },
 
+    /// The wallet-level ACT provisioning queue timed out waiting for an
+    /// in-flight credential refund to free spendable balance for a concurrent
+    /// turn. Distinct from [`AppError::InsufficientBalance`] (which is a true
+    /// shortfall the user must top up): here a concurrent turn holds the only
+    /// coverage mid-spend and its refund never landed within the bounded wait.
+    /// Routes through the same recoverable-failure UI as a network blip — the
+    /// user can simply retry once the other turn settles.
+    #[error("provisioning timed out: {message}")]
+    ProvisioningTimeout { message: String },
+
     /// The server requires acceptance of the current terms-of-service /
     /// privacy-policy versions before purchases or credential issuance can
     /// proceed (HTTP 428). UIs route to a review-and-accept step:
