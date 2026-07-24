@@ -107,10 +107,10 @@ Hygiene corollaries: Rust has no async-drop — `Drop`-guard cleanup in a cancel
 
 ### Space entities — shared, registried
 
-`Space` is a gpui entity owning everything about one conversation: the transcript (`Loadable<Vec<...>>`), streaming buffers, the pending submit task, the per-space model selection, and auto-title state. `SpacesStore` holds `HashMap<SpaceId, WeakEntity<Space>>`; opening a space goes through `SpacesStore::open(space_id)` which gets-or-creates. **Two windows on one space hold the same entity** — submits, streams, and edits appear in both, structurally (fixes wave-2 bug 4).
+`Space` is a gpui entity owning everything about one conversation: the transcript (`Loadable<Vec<...>>`), the in-flight streaming turns (a `Vec` of per-turn buffers plus a **keyed** `HashMap<seq, Task>` of turn runners — a post's notification plan can fan out to several concurrent responders, each turn independently owned and independently failing), the exclusive save-side mutation task (`post_runner`), and the recorded failed turn (Retry's target). `SpacesStore` holds `HashMap<SpaceId, WeakEntity<Space>>`; opening a space goes through `SpacesStore::open(space_id)` which gets-or-creates. **Two windows on one space hold the same entity** — posts, streams, and edits appear in both, structurally (fixes wave-2 bug 4). There is no per-space model selection: who responds (and with what model) is Participants configuration, resolved core-side per turn.
 
 - A blank ⌘N window holds a `Space` with `id: None`; the registry learns about it when the first exchange persists and assigns an id. The blank page stays instant.
-- `Space` is an `EventEmitter<SpaceEvent>` (`MessagesChanged`, `StreamDelta`, `StreamEnded`, `Failed`) so views can react semantically (e.g. tail-scroll only on `StreamDelta`), while plain `cx.observe` covers re-render.
+- `Space` is an `EventEmitter<SpaceEvent>` (`MessagesChanged`, `StreamDelta`, `StreamEnded`, `Failed`, `CascadePaused`) so views can react semantically (e.g. tail-scroll only on `StreamDelta`), while plain `cx.observe` covers re-render.
 - The composer draft is **not** in `Space` — it is window-local by design: two windows on one space are two cursors, and two drafts is the intuitive behavior. (Revisit only if real usage disagrees.)
 
 ### Window-scoped readers (the Record pattern)
@@ -156,7 +156,7 @@ Any list that can exceed roughly one screen renders through gpui's virtualized p
 | Balances, prices, account lifecycle | global | `AccountStore` |
 | Credential lifecycle | global | `WalletStore` |
 | Library index | global | `SpacesStore` |
-| Transcript, streaming, submit, per-space model choice | per-space, shared | `Space` entity (registry) |
+| Transcript, streaming turns (keyed fan-out), submit, failed-turn record | per-space, shared | `Space` entity (registry) |
 | Update check state | global | `UpdateStore` |
 | Record listings, cursors, detail | per-window | reader entity |
 | Checkout balance poll | per-window task | initiating view (dies with window; outcome lands in `AccountStore` via the bus) |

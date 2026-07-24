@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AppCore, AttestationDetail, AttestationInfo, ChatResult, ChatStreamEvent, PostNode, PostResult,
-    RequestDetail, RequestInfo, SpendTrailEntry,
+    AppCore, AttestationDetail, AttestationInfo, ChatResult, ChatStreamEvent, NotificationPlan,
+    PostNode, PostResult, RequestDetail, RequestInfo, SpendTrailEntry, SubmitResult,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -79,14 +79,16 @@ pub fn chat_stream(
     (event_rx, done_rx)
 }
 
-/// Streaming re-request: request a response to an **already-persisted** post
-/// (the retry entry point after a failed ask) without posting a new user turn.
-/// Same channels as [`chat_stream`]; drives `AppCore::respond_stream` targeting
-/// `target_action_id` (the saved user post awaiting a reply).
-pub fn respond_stream(
+/// Streaming turn **as a participant**: request a response to an
+/// already-persisted post from a specific space participant (its effective
+/// model + system prompt), without posting a new user turn. This is both the
+/// fan-out driver (one call per [`eidola_app_core::PlannedTurn`] a submit
+/// returned) and the explicit-ask / retry entry point — explicit asks bypass
+/// the cascade guard by construction. Same channels as [`chat_stream`].
+pub fn respond_stream_as(
     core: Arc<AppCore>,
     space_id: String,
-    model: String,
+    participant_id: String,
     target_action_id: String,
 ) -> (
     mpsc::UnboundedReceiver<ChatStreamEvent>,
@@ -96,11 +98,39 @@ pub fn respond_stream(
     let (done_tx, done_rx) = oneshot::channel();
     core.runtime().handle().clone().spawn(async move {
         let res = core
-            .respond_stream(space_id, model, target_action_id, event_tx)
+            .respond_stream_as(space_id, participant_id, target_action_id, event_tx)
             .await;
         let _ = done_tx.send(res);
     });
     (event_rx, done_rx)
+}
+
+/// Save a post **and** plan notifications over the space's participants — the
+/// composer's Post CTA. Returns the saved post plus the
+/// [`NotificationPlan`]; the caller drives one [`respond_stream_as`] per
+/// planned turn (and re-plans on each resulting post to continue a cascade
+/// until the guard pauses it).
+pub fn submit(
+    core: Arc<AppCore>,
+    text: String,
+    space_id: Option<String>,
+    reply_to: Option<String>,
+) -> oneshot::Receiver<Result<SubmitResult, AppError>> {
+    spawn_oneshot(core, move |core| async move {
+        core.submit(text, space_id, reply_to).await
+    })
+}
+
+/// Compute the auto-response plan for an already-persisted post (the cascade
+/// continuation after each driven turn). A pure read — commits nothing.
+pub fn plan_notifications(
+    core: Arc<AppCore>,
+    space_id: String,
+    post_action_id: String,
+) -> oneshot::Receiver<Result<NotificationPlan, AppError>> {
+    spawn_oneshot(core, move |core| async move {
+        core.plan_notifications(space_id, post_action_id).await
+    })
 }
 
 /// Save a post without requesting a response (the save side of save-vs-request:

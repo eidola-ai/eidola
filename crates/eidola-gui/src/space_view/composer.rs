@@ -11,8 +11,12 @@
 //! in-flow slot a placeholder. Focusing another draft (or Escape) retires the
 //! current one; a retired **empty** draft is deleted, leaving no trace.
 //!
-//! `⌘↩` (`Send`) persists the active draft and streams a reply; `⌘⇧↩`
-//! (`PostOnly`) persists it without asking. Both consume the draft.
+//! `⌘↩` (`Send`) **posts** the active draft — the space's participants decide
+//! who responds (notify policies drive one streaming turn per responder);
+//! `⌘⇧↩` (`PostOnly`, the ⌥-revealed "Post quietly") persists it without
+//! notifying anyone. Both consume the draft. The composer carries no model
+//! picker — who answers, and with what model, is Participants configuration
+//! (`Space > Participants…`); explicit asks live on the separators.
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, BoxShadow, Context, Element, Focusable, GlobalElementId,
@@ -212,8 +216,8 @@ impl SpaceView {
         let Some(id) = self.active_draft.take() else {
             return;
         };
-        // The request panel is anchored to the retiring composer.
-        self.request_panel_open = false;
+        // Any open band menu belongs to the retiring interaction.
+        self.band_menu = None;
         let Some(draft) = self.drafts.iter().find(|d| d.id == id) else {
             return;
         };
@@ -232,7 +236,7 @@ impl SpaceView {
         self.layout.retain(&|live| live != id);
     }
 
-    // -- Submit ------------------------------------------------------------
+    // -- Post --------------------------------------------------------------
 
     /// Route the composer's outward events when dispatched as actions (tests /
     /// menu). The editor's own subscription (see `create_draft`) is the
@@ -245,13 +249,13 @@ impl SpaceView {
         self.send_active_draft(true, window, cx);
     }
 
-    /// Persist the active draft (and stream a reply unless `post_only`),
-    /// consuming the draft. A no-op while streaming, with no active draft, or on
-    /// an empty draft.
-    fn send_active_draft(&mut self, post_only: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.space.read(cx).is_streaming() {
-            return;
-        }
+    /// Persist the active draft — **Post** drives the space's notification
+    /// plan (participants with matching notify policies respond, concurrently);
+    /// `quiet` skips the plan (nobody is asked). Consumes the draft **only when
+    /// the space accepts it**. A no-op with no active draft or on an empty
+    /// draft; a rejected submit (the space is busy) leaves the draft intact and
+    /// active.
+    fn send_active_draft(&mut self, quiet: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active) = self.active_draft.clone() else {
             return;
         };
@@ -276,25 +280,94 @@ impl SpaceView {
                 .map(|s| s.to_string())
         });
 
-        // Consume the draft (it's becoming a persisted post). Clearing the
-        // active slot before `Space::submit` avoids briefly showing the draft
-        // beside the optimistic post.
+        // Attempt the save/post FIRST, and consume the draft only if the space
+        // **accepts** it. `Space::submit`/`post_only` return `false` whenever
+        // the space is busy — a streaming turn *or* an in-flight save/plan whose
+        // `post_runner` is occupied but which isn't streaming yet. Consuming the
+        // draft up front (the previous behavior, which only checked
+        // `is_streaming`) permanently lost the typed content when a Post landed
+        // in that save window: the draft was deleted and the `false` ignored. A
+        // rejected submit must leave the draft intact and active. Both mutations
+        // and the consume below run in this one synchronous handler, so no frame
+        // ever renders the draft beside the optimistic post.
+        let accepted = self.space.update(cx, |s, cx| {
+            if quiet {
+                s.post_only(prompt, reply_to, cx)
+            } else {
+                s.submit(prompt, reply_to, cx)
+            }
+        });
+        if !accepted {
+            return;
+        }
+
+        // Consume the draft (it's becoming a persisted post).
         self.active_draft = None;
         self.delete_draft(&active);
         self.error = None;
-        self.request_panel_open = false;
+        self.band_menu = None;
+        self.cascade_notice = None;
 
-        if post_only {
-            self.space.update(cx, |s, cx| {
-                s.post_only(prompt, reply_to, cx);
-            });
-        } else {
-            let model = self.current_model(cx);
-            self.space.update(cx, |s, cx| {
-                s.submit(prompt, model, reply_to, cx);
-            });
-        }
         self.scroll_to_tail(window, cx);
+        cx.notify();
+    }
+
+    // -- Asks --------------------------------------------------------------
+
+    /// Route an explicit ask — a separator's `Ask ▸ <participant>`, the
+    /// cascade notice's "Ask to continue", or a retry — to the shared
+    /// [`Space::ask`]. Closes any open band menu + the cascade notice, applies
+    /// the tail-draft rule, selects the target's branch so the streaming node
+    /// renders where the reply will land, and scrolls it into view.
+    ///
+    /// **The tail-draft rule** (asking at the end of a branch): an **empty**
+    /// draft replying to the target is discarded — the UI tracks the new tail
+    /// (once the response lands, `sync_tail_drafts` docks a fresh composer
+    /// under it); a draft **with content** is kept exactly as it is — it
+    /// becomes its own sibling branch beside the incoming response and stays
+    /// active in the composer if it was.
+    pub fn ask_participant(
+        &mut self,
+        participant_id: String,
+        target_action_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.band_menu = None;
+        self.cascade_notice = None;
+        self.error = None;
+
+        // The tail-draft rule: discard an *empty* draft on the ask's target.
+        let empty_draft = self
+            .drafts
+            .iter()
+            .find(|d| {
+                d.parent.as_deref() == Some(target_action_id.as_str())
+                    && d.editor.read(cx).is_empty()
+            })
+            .map(|d| d.id.clone());
+        if let Some(id) = empty_draft {
+            if self.active_draft.as_ref() == Some(&id) {
+                self.active_draft = None;
+                window.focus(&self.focus_handle, cx);
+            }
+            self.delete_draft(&id);
+        }
+
+        let accepted = self.space.update(cx, |s, cx| {
+            s.ask(participant_id, target_action_id.clone(), cx)
+        });
+        if accepted {
+            // Select the target's branch *before* the next render so the
+            // streaming node attaches under the asked post, not whatever
+            // branch was selected (the PR #218 retry lesson).
+            let page_width = crate::chrome::content_size(window).width;
+            let roots = model::build_tree(&self.posts);
+            if model::node_ref(&roots, &target_action_id).is_some() {
+                self.select_path_to(&roots, &target_action_id, page_width);
+            }
+            self.scroll_to_tail(window, cx);
+        }
         cx.notify();
     }
 
@@ -304,8 +377,8 @@ impl SpaceView {
     /// streaming leaf) sits at the window bottom.
     pub(crate) fn scroll_to_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let viewport = crate::chrome::content_size(window);
-        let streaming = self.space.read(cx).is_streaming();
-        let tree = self.effective_tree(viewport.width, streaming);
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(viewport.width, &turns);
         let total = self.selected_total_height(&tree, viewport.width, viewport.height);
         let doc = self.doc_reserve() + total;
         let y = (viewport.height.as_f32() - doc).min(0.0);
@@ -331,8 +404,8 @@ impl SpaceView {
     /// "See in context": dock the active draft back at its place in the branch.
     pub(crate) fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let viewport = crate::chrome::content_size(window);
-        let streaming = self.space.read(cx).is_streaming();
-        let tree = self.effective_tree(viewport.width, streaming);
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(viewport.width, &turns);
         if let Some(active) = self.active_draft.clone()
             && model::node_ref(&tree, &active).is_some()
         {
@@ -400,10 +473,6 @@ impl SpaceView {
         let overlayed = top_y >= float_top - 0.5;
         let docked = !overlayed;
         self.composer_overlayed.set(overlayed);
-        // The request panel anchors to the composer's action gutter; record
-        // where the bar sits this frame so the panel (a later sibling in
-        // `render`) can position itself against it.
-        self.composer_anchor_top.set(top_y);
 
         let full_h = (content + chrome).max(win);
         let bar_h = if docked {
@@ -577,13 +646,14 @@ impl SpaceView {
             .bg(theme.background)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
-                    // An open request panel absorbs the first Escape; the next
+                    // An open band menu absorbs the first Escape; the next
                     // deactivates the draft (deleting it if an empty fork) and
                     // moves focus off the editor to the view root, so a kept
                     // draft reads as exited (no stray cursor) until it's
                     // clicked back into.
-                    if this.request_panel_open {
-                        this.close_request_panel(cx);
+                    if this.band_menu.is_some() {
+                        this.band_menu = None;
+                        cx.notify();
                     } else {
                         this.deactivate_active_draft(cx);
                         window.focus(&this.focus_handle, cx);
@@ -652,6 +722,91 @@ impl SpaceView {
         let reach = px(SHADOW_BLUR.as_f32() - SHADOW_OFFSET_Y.as_f32() + 3.0);
         layered(composer, reach).into_any_element()
     }
+
+    // -- The action gutter ---------------------------------------------------
+
+    /// The active composer's action gutter: **Post** (⌘↩ — save the thought;
+    /// the space's participants decide who responds) and, while ⌥ is held,
+    /// **Post quietly** (⌘⇧↩ — save without notifying anyone) plus the
+    /// keyboard hints. Renders as an empty (reserved) gutter until the draft
+    /// has content or ⌥ is held — the affordance appears the moment it's
+    /// actionable, and the blank page stays sacred. The composer carries no
+    /// model chrome: who answers (and with what model) is Participants
+    /// configuration, and explicit asks live on the separators.
+    pub(crate) fn render_composer_actions(
+        &self,
+        editor: &gpui::Entity<MarkdownEditorState>,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let theme = cx.theme();
+        let alt = self.window_input.read(cx).alt_held();
+        let revealed = !editor.read(cx).is_empty() || alt;
+
+        let mut col = super::post::action_gutter().gap_0p5();
+        if !revealed {
+            return col;
+        }
+
+        let fg = theme.muted_foreground;
+        let fg_hover = theme.foreground;
+        let bg_hover = theme.muted;
+        let hint_fg = theme.muted_foreground.opacity(0.7);
+
+        // Post — save the thought; notify policies drive who responds.
+        col = col.child(
+            h_flex()
+                .id("space-post")
+                .probe("space/composer/post", gpui::Role::Button, "Post")
+                .px_1()
+                .ml_neg_1()
+                .rounded_md()
+                .cursor_pointer()
+                .items_baseline()
+                .gap_1p5()
+                .text_sm()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(fg)
+                .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
+                .child("Post")
+                .when(alt, |d| d.child(kbd_hint("⌘↩", hint_fg)))
+                .on_click(cx.listener(|this, _, window, cx| this.submit(&Send, window, cx))),
+        );
+
+        // Post quietly — save without notifying anyone. ⌥-revealed: present
+        // when reached for, invisible in the common case.
+        if alt {
+            col = col.child(
+                h_flex()
+                    .id("space-post-quiet")
+                    .probe(
+                        "space/composer/post-quiet",
+                        gpui::Role::Button,
+                        "Post quietly — notify no one",
+                    )
+                    .px_1()
+                    .ml_neg_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .items_baseline()
+                    .gap_1p5()
+                    .text_sm()
+                    .text_color(fg)
+                    .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
+                    .child("Post quietly")
+                    .child(kbd_hint("⇧⌘↩", hint_fg))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.post_only(&PostOnly, window, cx)),
+                    ),
+            );
+        }
+
+        col
+    }
+}
+
+/// A small muted keyboard hint beside a verb (shown while ⌥ is held).
+fn kbd_hint(text: &'static str, color: gpui::Hsla) -> gpui::Div {
+    div().text_xs().text_color(color).child(text)
 }
 
 use crate::probe::Probe as _;

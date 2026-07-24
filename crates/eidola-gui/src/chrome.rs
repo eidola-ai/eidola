@@ -58,7 +58,7 @@
 use gpui::{
     AnyView, App, AppContext, Bounds, Context, CursorStyle, Decorations, Div, Edges, Hsla,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point, Render, ResizeEdge,
-    Size, Stateful, StatefulInteractiveElement, Styled, Tiling, Window, div, point,
+    SharedString, Size, Stateful, StatefulInteractiveElement, Styled, Tiling, Window, div, point,
     prelude::FluentBuilder, px, size,
 };
 use gpui_component::{ActiveTheme, Icon, IconName, Root, Sizable, StyledExt, h_flex};
@@ -602,12 +602,43 @@ impl ChromeRoot {
 
     fn render_menu_panel(&self, _window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         use crate::actions::{
-            About, ActualSize, CheckForUpdates, NewSpace, OpenLibrary, OpenRecord, OpenSettings,
-            Quit, ZoomIn, ZoomOut, primary_chord, primary_shift_chord,
+            About, ActualSize, CheckForUpdates, NewSpace, NewSpaceFromTemplate, OpenLibrary,
+            OpenParticipants, OpenRecord, OpenSettings, Quit, ZoomIn, ZoomOut, primary_chord,
+            primary_shift_chord,
         };
         let theme = cx.theme();
 
         let separator = || div().my_1().h(px(1.)).w_full().bg(theme.border);
+
+        // The live template registry (the macOS "New Space from Template ▸"
+        // submenu, flattened into the popover's space-scoped group). Read at
+        // render time: the popover re-renders on every open, so a template
+        // created/renamed/removed in Settings is reflected the next time the
+        // menu opens. Empty until the registry loads.
+        let template_rows: Vec<Stateful<Div>> = cx
+            .try_global::<crate::AppGlobal>()
+            .map(|g| g.stores.templates.read(cx).list().to_vec())
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let template_id = t.id.clone();
+                menu_item(
+                    SharedString::from(format!("template/{i}")),
+                    SharedString::from(format!("New Space from “{}”", t.title)),
+                    None,
+                    move |w, cx| {
+                        w.dispatch_action(
+                            Box::new(NewSpaceFromTemplate {
+                                template_id: template_id.clone(),
+                            }),
+                            cx,
+                        )
+                    },
+                    cx,
+                )
+            })
+            .collect();
 
         gpui_component::v_flex()
             .id("chrome-menu-panel")
@@ -623,16 +654,25 @@ impl ChromeRoot {
                 this.menu_open = false;
                 cx.notify();
             }))
-            // "New Space" is the sole space-scoped command (the macOS "Space"
-            // menu's item); it sits in its own group. The zoom trio is the
-            // macOS "View" menu, its own group next. Library/Record are
-            // app-level and group with Settings below — mirroring the macOS
-            // move of Library/Record up into the Eidola app menu.
+            // The space-scoped group (the macOS "Space" menu): New Space, the
+            // per-template creators, and Participants… (a no-op without a
+            // focused space window, matching the greyed macOS item). The zoom
+            // trio is the macOS "View" menu, its own group next. Library/Record
+            // are app-level and group with Settings below — mirroring the
+            // macOS move of Library/Record up into the Eidola app menu.
             .child(menu_item(
                 "new-space",
                 "New Space",
                 Some(primary_chord("N")),
                 |w, cx| w.dispatch_action(Box::new(NewSpace), cx),
+                cx,
+            ))
+            .children(template_rows)
+            .child(menu_item(
+                "participants",
+                "Participants…",
+                None,
+                |w, cx| w.dispatch_action(Box::new(OpenParticipants), cx),
                 cx,
             ))
             .child(separator())
@@ -708,16 +748,22 @@ impl ChromeRoot {
 /// Selecting an item dispatches its action from the window (reaching the
 /// global handlers in `lib.rs::install_action_handlers`) and closes the menu.
 fn menu_item(
-    slug: &'static str,
-    label: &'static str,
+    slug: impl Into<SharedString>,
+    label: impl Into<SharedString>,
     chord: Option<String>,
-    dispatch: fn(&mut Window, &mut App),
+    dispatch: impl Fn(&mut Window, &mut App) + 'static,
     cx: &Context<ChromeRoot>,
 ) -> Stateful<Div> {
     let theme = cx.theme();
+    let slug = slug.into();
+    let label = label.into();
     h_flex()
-        .id(slug)
-        .probe(format!("chrome/menu/{slug}"), gpui::Role::Button, label)
+        .id(slug.clone())
+        .probe(
+            format!("chrome/menu/{slug}"),
+            gpui::Role::Button,
+            label.clone(),
+        )
         .px_3()
         .py_1p5()
         .gap_6()

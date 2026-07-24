@@ -103,13 +103,14 @@ fn register_space(s: &mut Snapshots) {
         })
     });
 
-    // A draft with content: the action gutter reveals the discoverable
-    // submit — Ask beside the draft, the model chip (the addressee) below it.
+    // A draft with content: the action gutter reveals the composer's one
+    // CTA — **Post** (the model picker + request panel are gone; who answers
+    // is Participants configuration).
     s.add(
         "space_composer_actions",
         size(px(900.), px(680.)),
         |window, cx| {
-            let core = model_stores(cx);
+            let core = stub_stores_with_config(cx);
             cx.new(|cx| {
                 let view = SpaceView::new(core, None, WindowInput::new(cx), window, cx);
                 if let Some(editor) = view.composer_state_for_test() {
@@ -125,13 +126,13 @@ fn register_space(s: &mut Snapshots) {
         },
     );
 
-    // ⌥ held: the Post (save-without-asking) verb and the keyboard hints join
-    // the action gutter — the "Option reveals power" expansion.
+    // ⌥ held: the quiet verb (Post quietly — notify no one) and the keyboard
+    // hints join the action gutter — the "Option reveals power" expansion.
     s.add(
         "space_composer_alt",
         size(px(900.), px(680.)),
         |window, cx| {
-            let core = model_stores(cx);
+            let core = stub_stores_with_config(cx);
             let wi = WindowInput::new(cx);
             wi.update(cx, |w, cx| w.set_alt_for_test(true, cx));
             cx.new(|cx| {
@@ -149,24 +150,133 @@ fn register_space(s: &mut Snapshots) {
         },
     );
 
-    // The request panel open under the model chip: the model list with honest
-    // per-model info, current + default markers.
+    // A separator band's Reply-or-Ask menu open: Reply (this post has a
+    // committed reply) plus one quiet "Ask <agent>" chip per agent
+    // participant.
+    s.add("space_band_menu", size(px(900.), px(680.)), |window, cx| {
+        let core = participant_stores(cx, "demo");
+        cx.new(|cx| {
+            let mut view =
+                SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+            view.space().update(cx, |sp, cx| {
+                let q = fixture_post(
+                    "a1",
+                    "human",
+                    "user",
+                    "user_input",
+                    "What did Thrasymachus actually claim about justice?",
+                    0,
+                    false,
+                    1,
+                );
+                let mut a = fixture_post(
+                    "a2",
+                    "agent",
+                    "Ida",
+                    "inference",
+                    "His claim in Republic I is narrower than its reputation.",
+                    0,
+                    false,
+                    1,
+                );
+                a.parent_action_id = Some("a1".into());
+                sp.set_post_tree_for_test(vec![q, a], cx);
+            });
+            view.set_band_menu_for_test(Some("a1"), cx);
+            view
+        })
+    });
+
+    // Two participants answering the same post at once — a Post's notification
+    // fan-out: each in-flight turn streams as its own timestamp-ordered
+    // sibling branch, bylined with its participant.
     s.add(
-        "space_request_panel",
+        "space_concurrent_streams",
+        size(px(900.), px(720.)),
+        |window, cx| {
+            let core = participant_stores(cx, "demo");
+            cx.new(|cx| {
+                let view =
+                    SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+                view.space().update(cx, |sp, cx| {
+                    sp.set_post_tree_for_test(
+                        vec![fixture_post(
+                            "a1",
+                            "human",
+                            "user",
+                            "user_input",
+                            "What did Thrasymachus actually claim about justice?",
+                            0,
+                            false,
+                            1,
+                        )],
+                        cx,
+                    );
+                    let seq_b = sp.push_streaming_turn_for_test(
+                        Some("agent-b".into()),
+                        Some("a1".into()),
+                        Default::default(),
+                        cx,
+                    );
+                    sp.push_content_delta_for_test(
+                        seq_b,
+                        "The definition he offers at 338c — justice is the advantage of the \
+                         stronger — is less a theory than a provocation…",
+                        cx,
+                    );
+                    let seq_c = sp.push_streaming_turn_for_test(
+                        Some("agent-c".into()),
+                        Some("a1".into()),
+                        Default::default(),
+                        cx,
+                    );
+                    sp.push_content_delta_for_test(
+                        seq_c,
+                        "Start from the shepherd argument at 343b instead:",
+                        cx,
+                    );
+                });
+                view
+            })
+        },
+    );
+
+    // The cascade-paused notice: the conversation reached its cascade limit;
+    // quiet and dismissible, with an explicit "Ask <agent>" per agent as the
+    // way onward. Muted, not danger — nothing failed; the guard did its job.
+    s.add(
+        "space_cascade_paused",
         size(px(900.), px(680.)),
         |window, cx| {
-            let core = model_stores(cx);
+            let core = participant_stores(cx, "demo");
             cx.new(|cx| {
-                let mut view = SpaceView::new(core, None, WindowInput::new(cx), window, cx);
-                if let Some(editor) = view.composer_state_for_test() {
-                    editor.update(cx, |e, cx| {
-                        e.set_value(
-                            "What did Thrasymachus actually claim about justice?".to_string(),
-                            cx,
-                        )
-                    });
-                }
-                view.toggle_request_panel(cx);
+                let view =
+                    SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+                view.space().update(cx, |sp, cx| {
+                    let q = fixture_post(
+                        "a1",
+                        "human",
+                        "user",
+                        "user_input",
+                        "What did Thrasymachus actually claim about justice?",
+                        0,
+                        false,
+                        1,
+                    );
+                    let mut a = fixture_post(
+                        "a2",
+                        "agent",
+                        "Ida",
+                        "inference",
+                        "His claim in Republic I is narrower than its reputation.",
+                        0,
+                        false,
+                        1,
+                    );
+                    a.parent_action_id = Some("a1".into());
+                    sp.set_post_tree_for_test(vec![q, a], cx);
+                    sp.emit_cascade_paused_for_test(4, 4, "a2".into(), cx);
+                });
                 view
             })
         },
@@ -1161,6 +1271,38 @@ fn stub_stores(cx: &mut App, setup: impl FnOnce(&mut StoresStub)) -> Stores {
 
 fn stub_stores_with_config(cx: &mut App) -> Stores {
     stub_stores(cx, |s| s.config_state = Some(stub_config_state(true)))
+}
+
+/// A stub space-owned agent participant (the separator Ask menus, streaming
+/// bylines, and the cascade notice read the space's agent set).
+fn agent_participant(id: &str, label: &str) -> eidola_app_core::ParticipantInfo {
+    eidola_app_core::ParticipantInfo {
+        id: id.into(),
+        scope: "space".into(),
+        source: "owned".into(),
+        kind: "agent".into(),
+        label: label.into(),
+        model_ref: Some("kimi-k2-6".into()),
+        system_prompt: None,
+        notify_policy: "human".into(),
+        role: "member".into(),
+        reference: None,
+    }
+}
+
+/// Stub stores with two agent participants seeded for `space_id`.
+fn participant_stores(cx: &mut App, space_id: &str) -> Stores {
+    let sid = space_id.to_string();
+    stub_stores(cx, move |s| {
+        s.config_state = Some(stub_config_state(true));
+        s.participants = Some((
+            sid,
+            vec![
+                agent_participant("agent-b", "Ida"),
+                agent_participant("agent-c", "Sage"),
+            ],
+        ));
+    })
 }
 
 /// Stub stores with a model catalog, for the model-picker cases. Rates are

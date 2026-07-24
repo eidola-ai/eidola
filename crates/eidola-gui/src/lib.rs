@@ -390,23 +390,19 @@ pub fn install_keybindings(cx: &mut App) {
         KeyBinding::new("secondary-=", ZoomIn, None),
         KeyBinding::new("secondary-+", ZoomIn, None),
         KeyBinding::new("secondary--", ZoomOut, None),
-        // ⌘↩ (post & ask) and ⌘⇧↩ (post only) are *not* bound here. The
+        // ⌘↩ (Post) and ⌘⇧↩ (post quietly) are *not* bound here. The
         // composer owns those chords — `gpui_markdown_editor::init` binds them
         // in the `MarkdownEditor` context to `Enter { secondary: true, .. }`,
         // whose handler emits `PressEnter`; the draft's subscription (see
         // `space_view::composer::create_draft_node`) routes that to
         // `Send`/`PostOnly`. Binding them here too would shadow the editor
         // (the composer is the inner focus) and break the inversion.
-        // ⌥⌘M / Ctrl+Alt+M — the space view's request panel (the handler
-        // no-ops without a composer to anchor to). Scoped to SpaceView so the
-        // distinct keystroke never competes with the macOS-global ⌘M
-        // (Minimize). Esc routes through the composer's own key handler (panel
-        // first, then draft deactivation), so no Esc binding here.
-        KeyBinding::new(
-            "secondary-alt-m",
-            crate::actions::ToggleModelPicker,
-            Some("SpaceView"),
-        ),
+        // The former ⌥⌘M (`ToggleModelPicker`) is gone with the request
+        // panel: the composer no longer carries a model choice — who answers
+        // (and with what model) is Participants configuration (`Space >
+        // Participants…`), and explicit asks live on the separator bands. Esc
+        // routes through the composer's own key handler (band menu first, then
+        // draft deactivation), so no Esc binding here.
     ]);
 
     // macOS window/app management — no Linux analogue (hide is an AppKit

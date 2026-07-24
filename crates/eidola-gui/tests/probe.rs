@@ -17,7 +17,6 @@ use eidola_app_core::{
 use eidola_app_core::{
     ParticipantInfo, ParticipantReference, SpaceTemplateInfo, TemplateParticipantInfo,
 };
-use eidola_gui::actions::ToggleModelPicker;
 use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
@@ -236,7 +235,20 @@ fn open_view<V: gpui::Render + 'static>(
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("open test window");
-        (window.into(), inner.expect("build closure produced a view"))
+        let handle: AnyWindowHandle = window.into();
+        // The probe registry is a process-global keyed by numeric window id
+        // (`probe::REGISTRY`), and fresh `TestAppContext`s recycle those ids —
+        // so a *previous* probe test's window may have left entries under this
+        // id (e.g. the ⌥-revealed `space/composer/post-quiet` recorded by
+        // `space_composer_alt_reveals_post_quiet_probe`). Drop them here so each
+        // test's window starts clean and `window_entries` reflects only what
+        // *this* scene renders — otherwise a scene asserting an affordance is
+        // *absent* could inherit it from an earlier test, a leak that surfaces
+        // only under a particular test-scheduling order (green on macOS locally,
+        // red on Linux CI). Every test draws (directly or via `fresh_names`)
+        // before reading, so this window's real probes are re-recorded after.
+        probe::clear_window(handle.window_id().as_u64());
+        (handle, inner.expect("build closure produced a view"))
     })
 }
 
@@ -259,14 +271,12 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
             s.set_post_tree_for_test(vec![probe_post("a1", "a seeded root post"), a2], cx)
         });
     });
-    // Give the active draft content and open the request panel, so the action
-    // gutter (Ask / model chip) and the panel record their probes too.
+    // Give the active draft content so the action gutter's Post verb reveals.
     let editor = view
         .read_with(cx, |v, _| v.composer_state_for_test())
         .expect("blank space opens with the composer");
     cx.update(|cx| {
         editor.update(cx, |e, cx| e.set_value("a draft".to_string(), cx));
-        view.update(cx, |v, cx| v.toggle_request_panel(cx));
     });
     draw(cx, window);
 
@@ -280,25 +290,21 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
         names.contains(&"space/band/add"),
         "band reply affordance probe missing; recorded: {names:?}"
     );
-    // The action gutter: Ask (the discoverable submit) and the model chip.
+    // The action gutter: Post (the composer's one CTA — the model picker and
+    // request panel are gone; who answers is Participants configuration).
     assert!(
-        names.contains(&"space/composer/ask"),
-        "Ask affordance probe missing; recorded: {names:?}"
+        names.contains(&"space/composer/post"),
+        "Post affordance probe missing; recorded: {names:?}"
     );
     assert!(
-        names.contains(&"space/composer/model"),
-        "model chip probe missing; recorded: {names:?}"
-    );
-    // The request panel (opened above) with its model rows.
-    assert!(
-        names.contains(&"space/request-panel"),
-        "request panel probe missing; recorded: {names:?}"
+        !names.contains(&"space/composer/post-quiet"),
+        "Post quietly is ⌥-revealed only; recorded: {names:?}"
     );
     assert!(
-        names
+        !names
             .iter()
-            .any(|n| n.starts_with("space/request-panel/remote/eidola/")),
-        "request panel model rows missing; recorded: {names:?}"
+            .any(|n| n.starts_with("space/request-panel") || *n == "space/composer/model"),
+        "the retired model picker must record no probes; recorded: {names:?}"
     );
     // The minimap is a navigable table of contents: a labelled Group of
     // per-node Buttons.
@@ -325,6 +331,33 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_composer_alt_reveals_post_quiet_probe(cx: &mut TestAppContext) {
+    // Holding ⌥ reveals the quiet verb (post without notifying anyone) beside
+    // Post — the "Option reveals power" expansion, now model-free.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        let wi = WindowInput::new(cx);
+        wi.update(cx, |w, cx| w.set_alt_for_test(true, cx));
+        cx.new(|cx| SpaceView::new(stores, None, wi, window, cx))
+    });
+    draw(cx, window);
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/composer/post".to_string()),
+        "Post probe missing under ⌥; recorded: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/composer/post-quiet".to_string()),
+        "⌥ must reveal Post quietly; recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
 fn space_error_notice_exposes_recovery_probes(cx: &mut TestAppContext) {
     // After a failed ask, the recovery notice exposes its three affordances
     // (Retry / Copy / Dismiss) as probes — the driver click targets and the
@@ -336,16 +369,18 @@ fn space_error_notice_exposes_recovery_probes(cx: &mut TestAppContext) {
         cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
     });
 
-    // Seed a saved user post, then drive a wrapped post-persist failure (which
-    // adopts the space id, so the tail user post is re-requestable → Retry
-    // renders alongside Copy / Dismiss).
+    // Seed a saved user post, then drive one turn's failure (which records
+    // the failed turn — who was asked, about what — so Retry renders alongside
+    // Copy / Dismiss).
     let space = view.read_with(cx, |v, _| v.space().clone());
     cx.update(|cx| {
         space.update(cx, |s, cx| {
             s.set_post_tree_for_test(vec![probe_post("a1", "Hello, what is your name?")], cx)
         });
         space.update(cx, |s, cx| {
-            s.apply_chat_failure_for_test(
+            s.apply_turn_failure_for_test(
+                "agent-1",
+                "a1",
                 eidola_app_core::error::AppError::ChatFailed {
                     space_id: "s".into(),
                     source: Box::new(eidola_app_core::error::AppError::Network {
@@ -732,59 +767,132 @@ fn general_pane_probes_cover_appearance_only(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn request_panel_probes_appear_on_open_and_clear_on_dismiss(cx: &mut TestAppContext) {
+fn band_menu_probes_appear_on_open_and_clear_on_dismiss(cx: &mut TestAppContext) {
+    // The separator band's Reply-or-Ask menu (the request panel's successor):
+    // opening a band's "+" mounts the menu probes — Reply (a post with a
+    // committed reply) and one Ask per agent participant — and dismissing
+    // clears them (stale entries would be ghost click targets for the driver).
     let _guard = probes_on();
 
-    let stores = ready_stores(cx);
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.participants = Some(probe_participants());
+    });
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+        cx.new(|cx| {
+            SpaceView::new(
+                stores,
+                Some("demo".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    // a1 has a committed reply (a2), so its band offers Reply *and* Ask.
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = probe_post("a2", "a committed reply");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a seeded root post"), a2], cx)
+        });
     });
 
-    // Closed panel: no listbox probes.
+    // Closed: no menu probes; the band's "+" advertises both verbs.
     draw(cx, window);
     let names = fresh_names(cx, window);
     assert!(
-        !names.iter().any(|n| n.starts_with("space/request-panel")),
-        "panel probes before opening: {names:?}"
+        !names.iter().any(|n| n.starts_with("space/band/menu")),
+        "menu probes before opening: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/band/add".to_string()),
+        "band + affordance missing: {names:?}"
     );
 
-    // Open via the real action dispatch path (the blank space's root draft
-    // anchors the panel).
-    let focus = view.read_with(cx, |v, _| v.focus_handle());
-    cx.update_window(window, |_, window, cx| {
-        focus.dispatch_action(&ToggleModelPicker, window, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
+    // Open a1's menu.
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.set_band_menu_for_test(Some("a1"), cx));
+    });
     let names = fresh_names(cx, window);
     assert!(
-        names.contains(&"space/request-panel".to_string()),
-        "panel probe missing after open: {names:?}"
+        names.contains(&"space/band/menu".to_string()),
+        "menu probe missing after open: {names:?}"
     );
     assert!(
-        names.contains(&"space/request-panel/remote/eidola/0".to_string())
-            && names.contains(&"space/request-panel/remote/eidola/2".to_string()),
-        "per-model row probes missing: {names:?}"
+        names.contains(&"space/band/menu/reply".to_string()),
+        "Reply probe missing (a1 has a committed reply): {names:?}"
+    );
+    assert!(
+        names.contains(&"space/band/menu/ask/0".to_string()),
+        "per-agent Ask probe missing: {names:?}"
     );
 
-    // Dismiss: the clear-then-redraw dance must drop the unmounted panel —
-    // stale entries would be ghost click targets for the driver.
-    cx.update_window(window, |_, window, cx| {
-        focus.dispatch_action(&ToggleModelPicker, window, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
+    // Dismiss: the clear-then-redraw dance must drop the unmounted menu.
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.set_band_menu_for_test(None, cx));
+    });
     let names = fresh_names(cx, window);
     assert!(
-        !names.iter().any(|n| n.starts_with("space/request-panel")),
-        "panel probes must clear after dismiss: {names:?}"
+        !names.iter().any(|n| n.starts_with("space/band/menu")),
+        "menu probes must clear after dismiss: {names:?}"
     );
     assert!(
-        names.contains(&"space/composer".to_string()),
+        names.contains(&"space/band/add".to_string()),
         "still-mounted probes must survive the refresh: {names:?}"
     );
+}
+
+#[gpui::test]
+fn cascade_notice_probes_expose_ask_and_dismiss(cx: &mut TestAppContext) {
+    // The cascade-paused notice: quiet, dismissible, with one "Ask <agent>"
+    // chip per agent participant — all probed for the driver + AccessKit.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.participants = Some(probe_participants());
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores,
+                Some("demo".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the question")], cx);
+            s.emit_cascade_paused_for_test(4, 4, "a1".into(), cx);
+        });
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"space/cascade/dismiss"),
+        "cascade dismiss probe missing; recorded: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/cascade/ask/0"),
+        "cascade per-agent ask probe missing; recorded: {names:?}"
+    );
+    let ask = entries
+        .iter()
+        .find(|(n, _)| n == "space/cascade/ask/0")
+        .unwrap();
+    assert_eq!(ask.1.label.as_ref(), "Ask Assistant to continue");
+
+    probe::set_probes_enabled(false);
 }
 
 /// Linux window chrome: `ChromeRoot` wraps every production window and hosts
@@ -1481,247 +1589,6 @@ fn backends_pane_add_form_probes_appear_per_kind(cx: &mut TestAppContext) {
     assert!(
         !names.contains(&"settings/backends/add/url".to_string()),
         "url input must not linger on the llamacpp form: {names:?}"
-    );
-
-    probe::set_probes_enabled(false);
-}
-
-#[gpui::test]
-fn request_panel_lists_all_on_disk_local_models_first(cx: &mut TestAppContext) {
-    let _guard = probes_on();
-
-    let stores = stub_stores(cx, |s| {
-        s.config_state = None;
-        s.models = vec![ModelInfo {
-            id: "gemma4-31b".into(),
-            context_length: 131_072,
-            prompt_credits_per_token: 0.53,
-            completion_credits_per_token: 1.5,
-            request_credits: None,
-        }];
-        s.local_models = Some(local_models_fixture());
-    });
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
-    });
-    draw(cx, window);
-
-    let focus = view.read_with(cx, |v, _| v.focus_handle());
-    cx.update_window(window, |_, window, cx| {
-        focus.dispatch_action(&ToggleModelPicker, window, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
-    let names = fresh_names(cx, window);
-    // *Every* on-disk local model appears ahead of the remote rows — the
-    // merely-downloaded Tiny A included (a request loads it on demand).
-    assert!(
-        names.contains(&"space/request-panel/engine/local/0".to_string()),
-        "downloaded (unloaded) local model row missing: {names:?}"
-    );
-    assert!(
-        names.contains(&"space/request-panel/engine/local/1".to_string()),
-        "loaded local model row missing: {names:?}"
-    );
-    assert!(
-        names.contains(&"space/request-panel/remote/eidola/0".to_string()),
-        "remote model rows must still render below the local group: {names:?}"
-    );
-
-    probe::set_probes_enabled(false);
-}
-
-#[gpui::test]
-fn request_panel_offline_shows_local_models_and_retry(cx: &mut TestAppContext) {
-    let _guard = probes_on();
-
-    // Offline: no remote models, and the remote store forced into a failed
-    // state (the app-launch fetch couldn't reach the upstream).
-    let stores = stub_stores(cx, |s| {
-        s.config_state = None;
-        s.local_models = Some(local_models_fixture());
-    });
-    cx.update(|cx| {
-        stores
-            .models
-            .update(cx, |s, cx| s.set_failed_for_test("offline", cx));
-    });
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
-    });
-    draw(cx, window);
-
-    let focus = view.read_with(cx, |v, _| v.focus_handle());
-    cx.update_window(window, |_, window, cx| {
-        focus.dispatch_action(&ToggleModelPicker, window, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
-    let names = fresh_names(cx, window);
-    // The loaded local model stays selectable even though the remote fetch
-    // failed — the panel is never a dead end.
-    assert!(
-        names.contains(&"space/request-panel/engine/local/0".to_string()),
-        "loaded local model must show while offline: {names:?}"
-    );
-    // ...and the remote list offers a retry, not silent nothing.
-    assert!(
-        names.contains(&"space/request-panel/eidola/retry".to_string()),
-        "per-backend retry affordance missing on a failed eidola fetch: {names:?}"
-    );
-    assert!(
-        !names.contains(&"space/request-panel/eidola/refresh".to_string()),
-        "a failed fetch shows retry, not refresh: {names:?}"
-    );
-
-    probe::set_probes_enabled(false);
-}
-
-#[gpui::test]
-fn request_panel_shows_refresh_when_remote_loaded(cx: &mut TestAppContext) {
-    let _guard = probes_on();
-
-    let stores = stub_stores(cx, |s| {
-        s.config_state = None;
-        s.models = vec![ModelInfo {
-            id: "gemma4-31b".into(),
-            context_length: 131_072,
-            prompt_credits_per_token: 0.53,
-            completion_credits_per_token: 1.5,
-            request_credits: None,
-        }];
-    });
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
-    });
-    draw(cx, window);
-
-    let focus = view.read_with(cx, |v, _| v.focus_handle());
-    cx.update_window(window, |_, window, cx| {
-        focus.dispatch_action(&ToggleModelPicker, window, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
-    let names = fresh_names(cx, window);
-    // A refresh is offered even over a *successful* remote list.
-    assert!(
-        names.contains(&"space/request-panel/eidola/refresh".to_string()),
-        "per-backend refresh affordance must be available over a good list: {names:?}"
-    );
-    assert!(
-        !names.contains(&"space/request-panel/eidola/retry".to_string()),
-        "a good fetch shows refresh, not retry: {names:?}"
-    );
-
-    probe::set_probes_enabled(false);
-}
-
-#[gpui::test]
-fn request_panel_groups_per_backend_with_independent_health(cx: &mut TestAppContext) {
-    use eidola_gui::loadable::Loadable;
-    use eidola_gui::stores::BackendCatalog;
-
-    let _guard = probes_on();
-
-    // A full multi-backend scene: the local singleton with a loaded engine,
-    // a llamacpp backend with a loaded engine, a healthy eidola catalog,
-    // and an openai backend whose fetch failed.
-    let mut external_fixture = local_models_fixture();
-    if let Some(m) = external_fixture
-        .external
-        .get_mut(0)
-        .and_then(|b| b.models.get_mut(0))
-    {
-        m.status = eidola_app_core::LocalModelStatus::Loaded {
-            port: 4243,
-            context_tokens: 8192,
-            pinned: false,
-        };
-    }
-    let stores = stub_stores(cx, |s| {
-        s.config_state = None;
-        s.backends = backends_fixture();
-        s.local_models = Some(external_fixture);
-        s.backend_catalogs = Some(vec![
-            BackendCatalog {
-                backend: eidola_app_core::BackendInfo {
-                    id: "eidola".into(),
-                    kind: eidola_app_core::BackendKind::Eidola,
-                    display_name: "Eidola".into(),
-                    enabled: true,
-                    base_url: None,
-                    has_api_key: false,
-                    models_dir: None,
-                    model_overrides: None,
-                    engine_path: None,
-                    auto_start: true,
-                    created_at: 0,
-                },
-                models: Loadable::loaded(vec![ModelInfo {
-                    id: "gemma4-31b".into(),
-                    context_length: 131_072,
-                    prompt_credits_per_token: 0.53,
-                    completion_credits_per_token: 1.5,
-                    request_credits: None,
-                }]),
-            },
-            BackendCatalog {
-                backend: eidola_app_core::BackendInfo {
-                    id: "my-vllm".into(),
-                    kind: eidola_app_core::BackendKind::OpenAi,
-                    display_name: "My vLLM".into(),
-                    enabled: true,
-                    base_url: Some("http://10.0.0.2:8000".into()),
-                    has_api_key: true,
-                    models_dir: None,
-                    model_overrides: None,
-                    engine_path: None,
-                    auto_start: true,
-                    created_at: 1,
-                },
-                models: Loadable::Failed {
-                    error: eidola_app_core::error::AppError::Internal {
-                        message: "connection refused".into(),
-                    },
-                    prior: None,
-                },
-            },
-        ]);
-    });
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
-    });
-    draw(cx, window);
-
-    let focus = view.read_with(cx, |v, _| v.focus_handle());
-    cx.update_window(window, |_, window, cx| {
-        focus.dispatch_action(&ToggleModelPicker, window, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
-    let names = fresh_names(cx, window);
-    for expected in [
-        // Engine groups: the managed store and the llamacpp backend.
-        "space/request-panel/engine/local/0",
-        "space/request-panel/engine/my-box/0",
-        // The healthy eidola catalog: rows + refresh, no retry.
-        "space/request-panel/remote/eidola/0",
-        "space/request-panel/eidola/refresh",
-        // The dead openai backend: its own retry — nobody else's health.
-        "space/request-panel/my-vllm/retry",
-    ] {
-        assert!(
-            names.contains(&expected.to_string()),
-            "multi-backend panel probe {expected:?} missing: {names:?}"
-        );
-    }
-    assert!(
-        !names.contains(&"space/request-panel/eidola/retry".to_string()),
-        "one backend's failure must not mark another's group: {names:?}"
     );
 
     probe::set_probes_enabled(false);
