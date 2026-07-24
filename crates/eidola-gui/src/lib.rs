@@ -495,7 +495,7 @@ fn install_action_handlers(cx: &mut App) {
             })
             .await;
             if let Ok(space) = result {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     open_space_window(cx, stores.clone(), space.id);
                 });
             }

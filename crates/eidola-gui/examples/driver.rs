@@ -75,13 +75,16 @@ mod driver {
 
     use eidola_app_core::updates::{UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease};
     use eidola_app_core::{
-        BalancePoolInfo, BalancesResult, ConfigState, ModelInfo, PriceInfo, SpaceInfo, SpaceMessage,
+        BalancePoolInfo, BalancesResult, ConfigState, ModelInfo, ParticipantInfo,
+        ParticipantReference, PriceInfo, SpaceInfo, SpaceMessage, SpaceTemplateInfo,
+        TemplateParticipantInfo,
     };
     use eidola_gui::library::LibraryView;
     use eidola_gui::onboarding::OnboardingView;
+    use eidola_gui::participants_view::ParticipantsView;
     use eidola_gui::probe;
     use eidola_gui::record::RecordView;
-    use eidola_gui::settings::SettingsView;
+    use eidola_gui::settings::{SettingsPane, SettingsView};
     use eidola_gui::space_view::SpaceView;
     use eidola_gui::stores::{Stores, StoresStub};
     use eidola_gui::updates::UpdatesView;
@@ -345,6 +348,35 @@ mod driver {
                 },
             },
             Scene {
+                name: "participants",
+                description: "Participants view: a space's members (You + two owned agents), the add/edit affordances, Save-as-template",
+                default_size: size(px(520.), px(620.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        ParticipantsView::new(
+                            stores,
+                            "demo".into(),
+                            Some("Tides and the moon".into()),
+                            window,
+                            cx,
+                        )
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_templates",
+                description: "Settings → Space Templates pane: the template registry (Default + a saved multi-agent template)",
+                default_size: size(px(620.), px(520.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| v.select(SettingsPane::Templates, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "library",
                 description: "Library window with six spaces (hover/rename/archive)",
                 default_size: size(px(520.), px(620.)),
@@ -423,7 +455,101 @@ mod driver {
             s.models = models();
             s.backends = backends();
             s.local_models = Some(local_models_state());
+            s.participants = Some(participants_fixture());
+            s.templates = templates_fixture();
         })
+    }
+
+    /// Participants fixture for the Participants view: the referenced global
+    /// "You" (with its base/override detail so the fork renders) plus two owned
+    /// agents on different backends and notify policies.
+    fn participants_fixture() -> (String, Vec<ParticipantInfo>) {
+        let you = ParticipantInfo {
+            id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+            scope: "global".into(),
+            source: "referenced".into(),
+            kind: "human".into(),
+            label: "You".into(),
+            model_ref: None,
+            system_prompt: None,
+            notify_policy: "explicit".into(),
+            role: "member".into(),
+            reference: Some(ParticipantReference {
+                base_label: "You".into(),
+                base_model_ref: None,
+                base_system_prompt: None,
+                base_notify_policy: "explicit".into(),
+                override_label: None,
+                override_model_ref: None,
+                override_system_prompt: None,
+                override_notify_policy: None,
+            }),
+        };
+        let assistant = ParticipantInfo {
+            id: "agent-assistant".into(),
+            scope: "space".into(),
+            source: "owned".into(),
+            kind: "agent".into(),
+            label: "Assistant".into(),
+            model_ref: Some("gemma4-31b".into()),
+            system_prompt: Some("Be concise and cite sources.".into()),
+            notify_policy: "human".into(),
+            role: "member".into(),
+            reference: None,
+        };
+        let critic = ParticipantInfo {
+            id: "agent-critic".into(),
+            scope: "space".into(),
+            source: "owned".into(),
+            kind: "agent".into(),
+            label: "Critic".into(),
+            model_ref: Some("qwen3-8b@my-vllm".into()),
+            system_prompt: Some("Challenge assumptions and find weak points.".into()),
+            notify_policy: "all".into(),
+            role: "member".into(),
+            reference: None,
+        };
+        ("demo".into(), vec![you, assistant, critic])
+    }
+
+    /// Space-template fixture for the Templates settings pane: the built-in
+    /// Default plus a multi-agent saved template.
+    fn templates_fixture() -> Vec<SpaceTemplateInfo> {
+        vec![
+            SpaceTemplateInfo {
+                id: eidola_app_core::DEFAULT_TEMPLATE_ID.into(),
+                title: "Default".into(),
+                cascade_limit: 4,
+                participants: vec![TemplateParticipantInfo {
+                    id: "t-default-1".into(),
+                    label: "Assistant".into(),
+                    model_ref: Some("gemma4-31b".into()),
+                    system_prompt: None,
+                    notify_policy: "human".into(),
+                }],
+            },
+            SpaceTemplateInfo {
+                id: "tmpl-research".into(),
+                title: "Research panel".into(),
+                cascade_limit: 6,
+                participants: vec![
+                    TemplateParticipantInfo {
+                        id: "t-research-1".into(),
+                        label: "Analyst".into(),
+                        model_ref: Some("gemma4-31b".into()),
+                        system_prompt: Some("Lay out the evidence.".into()),
+                        notify_policy: "all".into(),
+                    },
+                    TemplateParticipantInfo {
+                        id: "t-research-2".into(),
+                        label: "Skeptic".into(),
+                        model_ref: Some("qwen3-8b@my-vllm".into()),
+                        system_prompt: Some("Push back hard.".into()),
+                        notify_policy: "human".into(),
+                    },
+                ],
+            },
+        ]
     }
 
     /// Backend-registry fixture: the two singletons plus one external

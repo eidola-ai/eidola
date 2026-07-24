@@ -14,14 +14,19 @@ use eidola_app_core::{
     AttestationInfo, BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
     PriceInfo, RequestInfo, SpendTrailEntry,
 };
+use eidola_app_core::{
+    ParticipantInfo, ParticipantReference, SpaceTemplateInfo, TemplateParticipantInfo,
+};
 use eidola_gui::actions::ToggleModelPicker;
 use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
+use eidola_gui::participants_view::{EditMode, ParticipantsView};
 use eidola_gui::probe;
 use eidola_gui::record::{RecordSection, RecordView};
 use eidola_gui::space_view::SpaceView;
 use eidola_gui::stores::{Stores, StoresStub};
+use eidola_gui::templates_settings::TemplatesSettingsView;
 use eidola_gui::wallet::WalletView;
 use eidola_gui::window_input::WindowInput;
 use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
@@ -1718,6 +1723,229 @@ fn request_panel_groups_per_backend_with_independent_health(cx: &mut TestAppCont
         !names.contains(&"space/request-panel/eidola/retry".to_string()),
         "one backend's failure must not mark another's group: {names:?}"
     );
+
+    probe::set_probes_enabled(false);
+}
+
+// ---------------------------------------------------------------------------
+// Participants view + Space Templates pane probes
+// ---------------------------------------------------------------------------
+
+fn probe_participants() -> (String, Vec<ParticipantInfo>) {
+    let you = ParticipantInfo {
+        id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+        scope: "global".into(),
+        source: "referenced".into(),
+        kind: "human".into(),
+        label: "You".into(),
+        model_ref: None,
+        system_prompt: None,
+        notify_policy: "explicit".into(),
+        role: "member".into(),
+        reference: Some(ParticipantReference {
+            base_label: "You".into(),
+            base_model_ref: None,
+            base_system_prompt: None,
+            base_notify_policy: "explicit".into(),
+            override_label: None,
+            override_model_ref: None,
+            override_system_prompt: None,
+            override_notify_policy: None,
+        }),
+    };
+    let agent = ParticipantInfo {
+        id: "agent-1".into(),
+        scope: "space".into(),
+        source: "owned".into(),
+        kind: "agent".into(),
+        label: "Assistant".into(),
+        model_ref: Some("gemma4-31b".into()),
+        system_prompt: Some("Be concise.".into()),
+        notify_policy: "human".into(),
+        role: "member".into(),
+        reference: None,
+    };
+    ("demo".into(), vec![you, agent])
+}
+
+#[gpui::test]
+fn participants_view_probes_cover_rows_editor_and_add(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some(probe_participants());
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            ParticipantsView::new(
+                stores.clone(),
+                "demo".into(),
+                Some("Demo".into()),
+                window,
+                cx,
+            )
+        })
+    });
+
+    // The resting rows: You is not removable; the agent is; plus the two links.
+    let names = fresh_names(cx, window);
+    let you = eidola_app_core::HUMAN_PARTICIPANT_ID;
+    for expected in [
+        format!("participants/{you}/edit"),
+        "participants/agent-1/edit".to_string(),
+        "participants/agent-1/remove".to_string(),
+        "participants/add".to_string(),
+        "participants/save-template".to_string(),
+    ] {
+        assert!(
+            names.contains(&expected),
+            "row probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&format!("participants/{you}/remove")),
+        "the shared human must not be removable: {names:?}"
+    );
+
+    // Editing You surfaces the edit-everywhere-vs-override-here fork.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit(you, window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "participants/editor/mode/everywhere",
+        "participants/editor/mode/override",
+        "participants/editor/label",
+        "participants/editor/cancel",
+        "participants/editor/save",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "editor probe {expected:?} missing: {names:?}"
+        );
+    }
+    // The human editor shows only the mode toggle + name (no model/prompt).
+    assert!(!names.contains(&"participants/editor/model".to_string()));
+
+    // Editing an agent adds the model field + notify chips.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_edit_mode(EditMode::Everywhere, window, cx)
+        });
+        view.update(cx, |v, cx| v.begin_edit("agent-1", window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "participants/editor/model",
+        "participants/editor/system-prompt",
+        "participants/editor/notify/human",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "agent editor probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    // The add form.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_add(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "participants/add/name",
+        "participants/add/model",
+        "participants/add/system-prompt",
+        "participants/add/notify/human",
+        "participants/add/submit",
+        "participants/add/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "add-form probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+fn probe_templates() -> Vec<SpaceTemplateInfo> {
+    vec![
+        SpaceTemplateInfo {
+            id: eidola_app_core::DEFAULT_TEMPLATE_ID.into(),
+            title: "Default".into(),
+            cascade_limit: 4,
+            participants: vec![TemplateParticipantInfo {
+                id: "t-1".into(),
+                label: "Assistant".into(),
+                model_ref: Some("gemma4-31b".into()),
+                system_prompt: None,
+                notify_policy: "human".into(),
+            }],
+        },
+        SpaceTemplateInfo {
+            id: "tmpl-research".into(),
+            title: "Research".into(),
+            cascade_limit: 6,
+            participants: Vec::new(),
+        },
+    ]
+}
+
+#[gpui::test]
+fn templates_pane_probes_cover_rows_and_editor(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.templates = probe_templates();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/templates/new",
+        "settings/templates/tmpl-research/edit",
+        "settings/templates/tmpl-research/set-default",
+        "settings/templates/tmpl-research/remove",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "template row probe {expected:?} missing: {names:?}"
+        );
+    }
+    // The built-in Default is the default → no set-default; it's built-in → no remove.
+    let default_id = eidola_app_core::DEFAULT_TEMPLATE_ID;
+    assert!(!names.contains(&format!("settings/templates/{default_id}/set-default")));
+    assert!(!names.contains(&format!("settings/templates/{default_id}/remove")));
+
+    // The create editor.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_create(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/templates/editor/title",
+        "settings/templates/editor/cascade/inc",
+        "settings/templates/editor/cascade/dec",
+        "settings/templates/editor/add-participant",
+        "settings/templates/editor/save",
+        "settings/templates/editor/cancel",
+        "settings/templates/participant/0/name",
+        "settings/templates/participant/0/model",
+        "settings/templates/participant/0/system-prompt",
+        "settings/templates/participant/0/notify/human",
+        "settings/templates/participant/0/remove",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "template editor probe {expected:?} missing: {names:?}"
+        );
+    }
 
     probe::set_probes_enabled(false);
 }
