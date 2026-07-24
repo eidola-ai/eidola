@@ -351,6 +351,11 @@ pub struct MarkdownEditorState {
     /// structural edit, a selection jump, or undo/redo itself) resets
     /// the anchor to `None`, breaking the run.
     coalesce_anchor: Option<usize>,
+    /// Session-scoped table-breakage recoverability state — see
+    /// [`update::TableGuard`]. Threaded into every editable dispatch
+    /// so a table broken by one event keeps its line structure across
+    /// the following events while the user repairs it in place.
+    table_guard: update::TableGuard,
     /// Focus/blur observers that translate gpui focus transitions into
     /// outward [`MarkdownEditorEvent::Focus`]/[`Blur`](MarkdownEditorEvent::Blur).
     /// Held so they live as long as the entity.
@@ -393,6 +398,7 @@ impl MarkdownEditorState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             coalesce_anchor: None,
+            table_guard: update::TableGuard::default(),
             _focus_subscriptions,
         }
     }
@@ -653,7 +659,7 @@ impl MarkdownEditorState {
         self.state = if self.disabled {
             update::update_readonly(before.clone(), event)
         } else {
-            update::update(before.clone(), event)
+            update::update_guarded(before.clone(), event, &mut self.table_guard)
         };
         self.marked_range = None;
         // Compare the buffer across the update so selection-only events
@@ -906,7 +912,7 @@ impl MarkdownEditorState {
                 self.intended_x = None;
                 self.wrap_affinity = WrapAffinity::Downstream;
                 let next = std::mem::take(&mut self.state);
-                self.state = update::update(next, fallback);
+                self.state = update::update_guarded(next, fallback, &mut self.table_guard);
                 self.marked_range = None;
                 cx.notify();
                 return;
@@ -931,7 +937,11 @@ impl MarkdownEditorState {
         // call here to preserve the anchor.
         let before_sel = self.state.selection;
         let next = std::mem::take(&mut self.state);
-        self.state = update::update(next, EditorEvent::SetSelection(new_sel));
+        self.state = update::update_guarded(
+            next,
+            EditorEvent::SetSelection(new_sel),
+            &mut self.table_guard,
+        );
         self.marked_range = None;
         // A vertical move changes the caret without touching the buffer — tell
         // a host that scrolls the caret into view (no `Change` is emitted).
@@ -1046,7 +1056,7 @@ impl MarkdownEditorState {
             Some(offset) => offset,
             None => {
                 let next = std::mem::take(&mut self.state);
-                self.state = update::update(next, fallback);
+                self.state = update::update_guarded(next, fallback, &mut self.table_guard);
                 self.marked_range = None;
                 cx.notify();
                 return;
@@ -1067,7 +1077,11 @@ impl MarkdownEditorState {
         };
         let before_sel = self.state.selection;
         let next = std::mem::take(&mut self.state);
-        self.state = update::update(next, EditorEvent::SetSelection(new_sel));
+        self.state = update::update_guarded(
+            next,
+            EditorEvent::SetSelection(new_sel),
+            &mut self.table_guard,
+        );
         self.marked_range = None;
         // Home/End move the caret without a buffer change — notify a
         // caret-into-view host (no `Change` is emitted).

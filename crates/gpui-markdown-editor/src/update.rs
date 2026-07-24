@@ -68,15 +68,106 @@ use crate::state::{EditorState, Selection};
 use crate::table;
 
 pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
+    update_guarded(state, event, &mut TableGuard::default())
+}
+
+/// Session-scoped recoverability state for a table broken mid-edit:
+/// the byte range of the block that **was a parser-confirmed table
+/// until an edit broke it**, carried forward by the editor entity
+/// across events. While the guard holds (and while the caret stays
+/// engaged with that block), the canonicalizer's soft-break promotion
+/// leaves the block's internal newlines alone — so a damaged table
+/// degrades to one multi-line text block whose lines are preserved,
+/// and repairing the shape restores the table in place.
+///
+/// The authority is always the **real parser**, never a shape
+/// heuristic: the guard activates when the pre-event parse had a
+/// table at the selection and the post-event parse doesn't (the
+/// breaking edit itself is protected by that same pre-event fact,
+/// even through the guard-less [`update`] wrapper), persists by
+/// block-range overlap while the caret stays in the block, and
+/// clears the moment the block parses as a table again — or the
+/// caret moves on, after which the block is ordinary text and the
+/// documented recovery is undo. Deliberately transient (a document
+/// saved broken reloads as ordinary text).
+#[derive(Debug, Clone, Default)]
+pub struct TableGuard {
+    /// The guarded block's range in the *current* buffer (refreshed
+    /// from the post-event parse each time the guard persists).
+    range: Option<std::ops::Range<usize>>,
+}
+
+impl TableGuard {
+    pub fn is_active(&self) -> bool {
+        self.range.is_some()
+    }
+}
+
+/// [`update`] with cross-event table-breakage protection — the
+/// production dispatch path (the editor entity owns the
+/// [`TableGuard`]). The guard-less [`update`] wrapper protects the
+/// breaking event itself (that protection derives from the pre-event
+/// parse, not the guard) but forgets by the next event; tests that
+/// model a whole editing session thread a guard through.
+pub fn update_guarded(
+    state: EditorState,
+    event: EditorEvent,
+    guard: &mut TableGuard,
+) -> EditorState {
     let prev_anchor = match state.selection {
         Selection::Cursor(p) => p,
         Selection::Range { anchor, .. } => anchor,
     };
     let prev_head = state.selection.head();
 
+    // Was the selection engaged with a parser-confirmed table before
+    // this event? (Cheap: `table_context` prefilters on a pipe near
+    // the caret before parsing.) This single pre-event fact is what
+    // makes the *breaking* edit itself non-destructive.
+    let lo = state.selection.lower_bound();
+    let hi = state.selection.upper_bound();
+    let was_table_pre = table_context(&state.markdown, lo).is_some()
+        || (hi != lo && table_context(&state.markdown, hi).is_some());
+
     let next = apply_event(state, event);
-    let next = enforce_invariants(next);
-    avoid_forbidden_positions(next, prev_anchor, prev_head)
+    let next = enforce_invariants_impl(next, was_table_pre || guard.is_active());
+    let out = avoid_forbidden_positions(next, prev_anchor, prev_head);
+    refresh_table_guard(&out, guard, was_table_pre);
+    out
+}
+
+/// Post-event guard maintenance. Runs off the **final** buffer +
+/// selection:
+///
+/// * caret in a parsing table → clear (healthy, or repaired);
+/// * `was_table_pre` and no table now → the table broke under this
+///   very event: guard the caret's enclosing top-level block;
+/// * guard active and the caret's block still overlaps the stored
+///   range → refresh the range from the fresh parse (block-range
+///   overlap, not exact offsets, so the block growing under typing
+///   never sheds its guard);
+/// * otherwise → clear (the caret moved on; the block is ordinary
+///   text from here and undo is the recovery story).
+fn refresh_table_guard(state: &EditorState, guard: &mut TableGuard, was_table_pre: bool) {
+    if !was_table_pre && !guard.is_active() {
+        return; // fast path: nothing to maintain
+    }
+    let caret = state.selection.head();
+    let tree = crate::parser::parse(&state.markdown);
+    if table::table_at(&state.markdown, &tree, caret).is_some() {
+        guard.range = None;
+        return;
+    }
+    let caret_block = tree
+        .iter()
+        .find(|n| caret >= n.range.start && caret <= n.range.end)
+        .map(|n| n.range.clone());
+    let keep = was_table_pre
+        || match (&guard.range, &caret_block) {
+            (Some(stored), Some(block)) => stored.start < block.end && block.start < stored.end,
+            _ => false,
+        };
+    guard.range = if keep { caret_block } else { None };
 }
 
 /// Like [`update`], but for a **read-only** (disabled) editor: selection and
@@ -169,6 +260,15 @@ fn apply_event(state: EditorState, event: EditorEvent) -> EditorState {
 /// collapse two consecutive hard breaks into a paragraph break.
 /// Idempotent and cheap on already-clean states.
 pub fn enforce_invariants(state: EditorState) -> EditorState {
+    enforce_invariants_impl(state, false)
+}
+
+/// [`enforce_invariants`] with the table-breakage protection flag:
+/// when `protect_caret_block` is set (the pre-event parse had a table
+/// at the selection, or the entity's [`TableGuard`] is active), the
+/// soft-break promotion pass leaves the internal newlines of the
+/// caret's enclosing top-level block alone. See [`TableGuard`].
+fn enforce_invariants_impl(state: EditorState, protect_caret_block: bool) -> EditorState {
     // Pass order:
     //
     // 1. `collapse_consecutive_hard_breaks` first, because a
@@ -208,7 +308,7 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
     let state = collapse_consecutive_hard_breaks(state); // doesn't parse
     let state = dedupe_orphan_fence_closer(state, &mut cache);
     let state = unify_fence_chain(state, &mut cache);
-    let state = promote_soft_breaks(state, &mut cache);
+    let state = promote_soft_breaks(state, &mut cache, protect_caret_block);
     let state = inject_unordered_marker_space(state, &mut cache);
     let state = normalize_lists(state, &mut cache);
     let state = normalize_tables(state, &mut cache);
@@ -870,7 +970,11 @@ fn collect_code_blocks<'a>(
     }
 }
 
-fn promote_soft_breaks(state: EditorState, cache: &mut ParseCache) -> EditorState {
+fn promote_soft_breaks(
+    state: EditorState,
+    cache: &mut ParseCache,
+    protect_caret_block: bool,
+) -> EditorState {
     let bytes = state.markdown.as_bytes();
     // Two scopes special-case the soft-break promotion rule:
     //
@@ -891,6 +995,22 @@ fn promote_soft_breaks(state: EditorState, cache: &mut ParseCache) -> EditorStat
     let math_ranges = analysis::display_math_block_ranges_in_tree(tree, bytes);
     let list_ranges = analysis::list_content_ranges_in_tree(tree, bytes);
     let table_ranges = table::table_ranges_in_tree(tree);
+    // Table-breakage protection (see `TableGuard`): when the
+    // selection was engaged with a parser-confirmed table one event
+    // ago (or the entity's guard is active), the caret's enclosing
+    // top-level block keeps its internal newlines. This is what lets
+    // a table broken mid-edit degrade to one multi-line text block —
+    // repairable in place — instead of exploding into paragraphs.
+    // The block is found in the *real* parse tree; there is no
+    // shape-based table recognition anywhere.
+    let protected_block: Option<std::ops::Range<usize>> = if protect_caret_block {
+        let caret = state.selection.head();
+        tree.iter()
+            .find(|n| caret >= n.range.start && caret <= n.range.end)
+            .map(|n| n.range.clone())
+    } else {
+        None
+    };
 
     // Each entry: (insertion_position, inserted_string). Computed in a
     // single forward scan over the *original* buffer so offsets line
@@ -909,6 +1029,15 @@ fn promote_soft_breaks(state: EditorState, cache: &mut ParseCache) -> EditorStat
         // is not internal and still promotes, mirroring the list
         // trailing-newline rule. Applies at any nesting depth.
         if bytes[p] == b'\n' && table::newline_is_table_internal(&table_ranges, p) {
+            continue;
+        }
+        // Table-breakage protection: internal newlines of the guarded
+        // block (see above) stay put.
+        if bytes[p] == b'\n'
+            && let Some(r) = &protected_block
+            && p >= r.start
+            && p + 1 < r.end
+        {
             continue;
         }
         // **Verbatim-opener-boundary exemption.** If `p` is a `\n`
@@ -1407,14 +1536,52 @@ fn insert_text(state: EditorState, text: &str) -> EditorState {
     // meaning and types a literal pipe, exactly as in raw GFM.
     // Backspace at the fresh cell's start is the exact inverse, so
     // `|` + Backspace round-trips.
-    if text == "|" && state.selection.is_collapsed() {
-        let cursor = state.selection.head();
-        let escaped = cursor > 0 && state.markdown.as_bytes()[cursor - 1] == b'\\';
-        if !escaped
-            && let Some(geo) = table_context(&state.markdown, cursor)
-            && let Some(te) = table::pipe_insert_edit(&geo, &state.markdown, cursor)
-        {
-            return apply_table_edit(state, te);
+    if text == "|" {
+        if state.selection.is_collapsed() {
+            let cursor = state.selection.head();
+            // Odd-parity escape test: `\|` is literal, `\\|` is a
+            // boundary (the backslashes escape each other) — must
+            // agree with the cell scanner's classification or the
+            // handler and the parse diverge and the table dissolves.
+            let escaped = table::is_escaped_at(state.markdown.as_bytes(), cursor);
+            if !escaped
+                && let Some(geo) = table_context(&state.markdown, cursor)
+                && let Some(te) = table::pipe_insert_edit(&geo, &state.markdown, cursor)
+            {
+                return apply_table_edit(state, te);
+            }
+        } else {
+            // Typing `|` over a selection that lives inside one table
+            // cell (the Tab-selected-cell case): a generic replace
+            // would splice an unescaped pipe into the cell, giving
+            // that row an extra boundary without the header/delimiter
+            // sync — a header selection dissolves the table. Route
+            // structurally: drop the selection first, then the same
+            // column-boundary insertion at the collapsed caret.
+            let lo = state.selection.lower_bound();
+            let hi = state.selection.upper_bound();
+            let same_cell = table_context(&state.markdown, lo)
+                .and_then(|geo| {
+                    let (r1, c1) = geo.cell_at(lo)?;
+                    let (r2, c2) = geo.cell_at(hi)?;
+                    let cell = &geo.rows[r1].cells[c1];
+                    Some((r1, c1) == (r2, c2) && lo >= cell.start && hi <= cell.end)
+                })
+                .unwrap_or(false);
+            if same_cell {
+                let (md, cursor) = delete_selection(&state);
+                let mid = EditorState {
+                    markdown: md,
+                    selection: Selection::Cursor(cursor),
+                };
+                if !table::is_escaped_at(mid.markdown.as_bytes(), cursor)
+                    && let Some(geo) = table_context(&mid.markdown, cursor)
+                    && let Some(te) = table::pipe_insert_edit(&geo, &mid.markdown, cursor)
+                {
+                    return apply_table_edit(mid, te);
+                }
+                return insert_text(mid, text);
+            }
         }
     }
     let (mut buf, cursor) = delete_selection(&state);
@@ -1943,10 +2110,20 @@ fn delete_backward(state: EditorState) -> EditorState {
     // return `None` and fall through to the generic grapheme delete;
     // the header row's first cell also falls through, so merging the
     // table into the preceding block stays an honest, ordinary edit.
-    if let Some(geo) = table_context(&state.markdown, cursor)
-        && let Some(te) = table::backspace_edit(&geo, &state.markdown, cursor)
-    {
-        return apply_table_edit(state, te);
+    if let Some(geo) = table_context(&state.markdown, cursor) {
+        if let Some(te) = table::backspace_edit(&geo, &state.markdown, cursor) {
+            return apply_table_edit(state, te);
+        }
+        // Delimiter dash floor: deleting the last hyphen of a
+        // delimiter cell would silently dissolve the whole table —
+        // refuse the grapheme delete (colons stay deletable, so
+        // alignment editing is unaffected). Dissolving a table is an
+        // explicit act (delete the delimiter row's line), never a
+        // keystroke accident.
+        let del_start = prev_grapheme_offset(&state.markdown, cursor);
+        if table::delimiter_dash_floor(&geo, &state.markdown, &(del_start..cursor)) {
+            return state;
+        }
     }
 
     // List-item depth decrease: Backspace right after a marker
@@ -2173,11 +2350,16 @@ fn delete_forward(state: EditorState) -> EditorState {
     // Table delete-forward at a cell's content end hops to the next
     // cell's start without deleting — the forward mirror of the
     // protected first-cell Backspace. Mid-cell falls through to the
-    // generic grapheme delete.
-    if let Some(geo) = table_context(&state.markdown, cursor)
-        && let Some(te) = table::delete_forward_hop(&geo, cursor)
-    {
-        return apply_table_edit(state, te);
+    // generic grapheme delete, except across the delimiter dash
+    // floor (see `delete_backward`).
+    if let Some(geo) = table_context(&state.markdown, cursor) {
+        if let Some(te) = table::delete_forward_hop(&geo, cursor) {
+            return apply_table_edit(state, te);
+        }
+        let del_end = next_grapheme_offset(&state.markdown, cursor);
+        if table::delimiter_dash_floor(&geo, &state.markdown, &(cursor..del_end)) {
+            return state;
+        }
     }
 
     let bytes = state.markdown.as_bytes();
@@ -2238,13 +2420,17 @@ fn delete_word_backward(state: EditorState) -> EditorState {
     }
     // Table floor: word-delete never crosses the cursor's cell —
     // the between-cell chrome is structure, not words (the cell
-    // analog of the chain-prefix floor above).
-    if let Some(geo) = table_context(&state.markdown, cursor)
-        && let Some((r, c)) = geo.cell_at(cursor)
-    {
-        let cell_start = geo.rows[r].cells[c].start;
-        if cursor >= cell_start && target < cell_start {
-            target = cell_start;
+    // analog of the chain-prefix floor above) — and never crosses
+    // the delimiter dash floor (see `delete_backward`).
+    if let Some(geo) = table_context(&state.markdown, cursor) {
+        if let Some((r, c)) = geo.cell_at(cursor) {
+            let cell_start = geo.rows[r].cells[c].start;
+            if cursor >= cell_start && target < cell_start {
+                target = cell_start;
+            }
+        }
+        if table::delimiter_dash_floor(&geo, &state.markdown, &(target..cursor)) {
+            return state;
         }
     }
     if target >= cursor {
@@ -2286,13 +2472,17 @@ fn delete_word_forward(state: EditorState) -> EditorState {
         }
     }
     // Table ceiling: word-delete never crosses the cursor's cell
-    // (forward mirror of the floor in `delete_word_backward`).
-    if let Some(geo) = table_context(&state.markdown, cursor)
-        && let Some((r, c)) = geo.cell_at(cursor)
-    {
-        let cell_end = geo.rows[r].cells[c].end;
-        if cursor <= cell_end && target > cell_end {
-            target = cell_end;
+    // (forward mirror of the floor in `delete_word_backward`), nor
+    // the delimiter dash floor.
+    if let Some(geo) = table_context(&state.markdown, cursor) {
+        if let Some((r, c)) = geo.cell_at(cursor) {
+            let cell_end = geo.rows[r].cells[c].end;
+            if cursor <= cell_end && target > cell_end {
+                target = cell_end;
+            }
+        }
+        if table::delimiter_dash_floor(&geo, &state.markdown, &(cursor..target)) {
+            return state;
         }
     }
     if target <= cursor {

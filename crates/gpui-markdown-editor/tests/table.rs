@@ -5,7 +5,7 @@
 //! (`enforce_invariants`, including `normalize_tables`) and the
 //! forbidden-position snapping exactly as a keystroke would.
 
-use gpui_markdown_editor::update::{update, update_readonly};
+use gpui_markdown_editor::update::{TableGuard, update, update_guarded, update_readonly};
 use gpui_markdown_editor::{EditorEvent, EditorState, Selection};
 
 fn state(md: &str, cursor: usize) -> EditorState {
@@ -354,6 +354,201 @@ fn table_internal_newlines_survive_but_the_boundary_still_promotes() {
         EditorEvent::SetSelection(Selection::Cursor(2)),
     );
     assert_eq!(s.markdown, "| a |\n| --- |\n| c |\n\n# heading");
+}
+
+// ---------------------------------------------------------------------------
+// Recoverability — a broken table never loses its line structure
+// ---------------------------------------------------------------------------
+
+#[test]
+fn breaking_the_delimiter_row_degrades_to_recoverable_lines() {
+    // Select and delete the delimiter row's whole content (Mike's
+    // repro: deleting all hyphens). The table stops parsing — but the
+    // rows must stay `\n`-separated lines, never explode into
+    // `\n\n`-delimited paragraphs, while the user repairs the shape.
+    //
+    // The recoverability authority is **parser history**, not shape
+    // heuristics: the breaking event is protected because the
+    // pre-event parse had a table at the selection, and the following
+    // events are protected by the entity's `TableGuard` (threaded
+    // here exactly as the production dispatch threads it).
+    let mut guard = TableGuard::default();
+    let dashes_start = CANONICAL.find("--- | ---").unwrap();
+    let dashes_end = dashes_start + "--- | ---".len();
+    let s = update_guarded(
+        state(CANONICAL, dashes_end),
+        EditorEvent::SetSelection(Selection::Range {
+            anchor: dashes_start,
+            head: dashes_end,
+        }),
+        &mut guard,
+    );
+    let s = update_guarded(s, EditorEvent::DeleteBackward, &mut guard);
+    assert_eq!(s.markdown, "| a | b |\n|  |\n| c1 | c2 |\n");
+    assert!(guard.is_active(), "the break must arm the guard");
+    // Further events keep the lines intact (this used to be the
+    // explosion point — the next enforce_invariants pass promoted
+    // every internal newline).
+    let bar = s.markdown.find("|  |").unwrap() + 2;
+    let s = update_guarded(
+        s,
+        EditorEvent::SetSelection(Selection::Cursor(bar)),
+        &mut guard,
+    );
+    assert_eq!(s.markdown, "| a | b |\n|  |\n| c1 | c2 |\n");
+    // …and repairing the shape (retyping the dashes, one keystroke at
+    // a time under the guard) restores a live table in place.
+    let mut s = s;
+    for ch in "--- | ---".chars() {
+        s = update_guarded(s, EditorEvent::InsertText(ch.to_string()), &mut guard);
+    }
+    assert!(!guard.is_active(), "a parsing table releases the guard");
+    // Leaving the row canonicalizes it — the original table again.
+    let s = update_guarded(
+        s,
+        EditorEvent::SetSelection(Selection::Cursor(2)),
+        &mut guard,
+    );
+    assert_eq!(s.markdown, CANONICAL);
+}
+
+#[test]
+fn guard_releases_when_the_caret_moves_on() {
+    // Break the table, then click far away: the guard drops (the
+    // block is ordinary text from here — the documented recovery for
+    // the long tail is undo, which the editor entity provides).
+    let src = format!("{CANONICAL}\nclosing prose well below the table.");
+    let mut guard = TableGuard::default();
+    let dashes_start = src.find("--- | ---").unwrap();
+    let dashes_end = dashes_start + "--- | ---".len();
+    let s = update_guarded(
+        state(&src, dashes_end),
+        EditorEvent::SetSelection(Selection::Range {
+            anchor: dashes_start,
+            head: dashes_end,
+        }),
+        &mut guard,
+    );
+    let s = update_guarded(s, EditorEvent::DeleteBackward, &mut guard);
+    assert!(guard.is_active());
+    let prose = s.markdown.find("closing").unwrap();
+    let _ = update_guarded(
+        s,
+        EditorEvent::SetSelection(Selection::Cursor(prose)),
+        &mut guard,
+    );
+    assert!(
+        !guard.is_active(),
+        "moving on releases the guard (undo is the recovery from here)"
+    );
+}
+
+#[test]
+fn plain_prose_soft_breaks_still_promote() {
+    // The recoverability exemption is pipe-shape-scoped: an ordinary
+    // soft break in prose still promotes to a paragraph break (Mike
+    // is explicit that the paragraph normalization behavior must be
+    // preserved everywhere else).
+    let s = update(
+        state("line one\nline two", 0),
+        EditorEvent::SetSelection(Selection::Cursor(2)),
+    );
+    assert_eq!(s.markdown, "line one\n\nline two");
+    // Mixed boundary: pipe line → prose line still promotes.
+    let s = update(
+        state("| a |\nprose", 0),
+        EditorEvent::SetSelection(Selection::Cursor(2)),
+    );
+    assert_eq!(s.markdown, "| a |\n\nprose");
+}
+
+#[test]
+fn deleting_the_last_dash_of_a_delimiter_cell_is_refused() {
+    // Backspace can shave a delimiter cell down but never through its
+    // last dash — that would silently dissolve the whole table.
+    let src = "| a | b |\n| - | --- |\n| c | d |\n";
+    let dash = src.find('-').unwrap();
+    let s = update(state(src, dash + 1), EditorEvent::DeleteBackward);
+    assert_eq!(s.markdown, src, "the last dash is the floor");
+    // Delete-forward is refused symmetrically.
+    let s = update(state(src, dash), EditorEvent::DeleteForward);
+    assert_eq!(s.markdown, src);
+    // Word-delete is refused too.
+    let s = update(state(src, dash + 1), EditorEvent::DeleteWordBackward);
+    assert_eq!(s.markdown, src);
+}
+
+#[test]
+fn delimiter_colons_stay_editable_under_the_dash_floor() {
+    // The floor protects dashes only — deleting an alignment colon is
+    // normal alignment editing.
+    let src = "| a | b |\n| :-- | --- |\n| c | d |\n";
+    let colon = src.find(':').unwrap();
+    let s = update(state(src, colon + 1), EditorEvent::DeleteBackward);
+    assert!(
+        s.markdown.contains("| -- | --- |") || s.markdown.contains("| --- | --- |"),
+        "colon deletion must go through, got {:?}",
+        s.markdown
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Structural `|` over selections and escapes (the Codex P2 family)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn typing_pipe_over_a_tab_selected_cell_stays_structural() {
+    // Tab selects the next cell's content; typing `|` used to bypass
+    // the structural handler (selection not collapsed) and splice a
+    // bare pipe over the header cell — width mismatch, table gone.
+    // Now: the selection is consumed and the same table-wide column
+    // insertion applies.
+    let s = update(state(CANONICAL, 2), EditorEvent::IncreaseListDepth); // selects header `b`
+    let s = update(s, EditorEvent::InsertText("|".into()));
+    assert_eq!(
+        s.markdown,
+        "| a |  |  |\n| --- | --- | --- |\n| c1 | c2 |  |\n"
+    );
+}
+
+#[test]
+fn escape_classification_uses_backslash_run_parity() {
+    // `\\` before the caret is an escaped backslash — the typed `|`
+    // is a real boundary (even-parity), not a literal pipe. The old
+    // any-preceding-backslash test inserted it as text, desyncing the
+    // handler from the cell scanner and dissolving the table.
+    let s = update(state(CANONICAL, 3), EditorEvent::InsertText("\\".into()));
+    let s = update(s, EditorEvent::InsertText("\\".into()));
+    let s = update(s, EditorEvent::InsertText("|".into()));
+    // Structural: a fresh column threads through the whole table and
+    // the `\\` stays in the original cell.
+    assert!(
+        s.markdown
+            .starts_with("| a\\\\ |  | b |\n| --- | --- | --- |"),
+        "even-parity backslashes must not suppress the structural pipe, got {:?}",
+        s.markdown
+    );
+}
+
+#[test]
+fn typing_pipe_on_the_delimiter_row_splits_into_valid_cells() {
+    // The table-wide column insert with the caret ON the delimiter
+    // row used to splice a literal ` | ` into the dash cell — an
+    // empty/colon-only fragment at cell edges dissolved the table.
+    // Now the dash cell is replaced by two canonical cells that
+    // distribute its alignment colons.
+    let src = "| a | b |\n| :-: | --- |\n| c | d |\n";
+    let cell = src.find(":-:").unwrap();
+    // Caret at the dash cell's start — the worst case for a literal
+    // split (an empty left fragment).
+    let s = update(state(src, cell), EditorEvent::InsertText("|".into()));
+    assert_eq!(
+        s.markdown,
+        "| a |  | b |\n| :-- | --: | --- |\n| c |  | d |\n"
+    );
+    // Still a live table: navigation events leave it untouched.
+    let after = update(s.clone(), EditorEvent::SetSelection(Selection::Cursor(2)));
+    assert_eq!(after.markdown, s.markdown);
 }
 
 // ---------------------------------------------------------------------------

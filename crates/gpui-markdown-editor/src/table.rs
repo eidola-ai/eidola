@@ -393,6 +393,53 @@ pub fn newline_is_table_internal(ranges: &[Range<usize>], p: usize) -> bool {
     ranges.iter().any(|r| p >= r.start && p + 1 < r.end)
 }
 
+/// Is the byte at `pos` escaped by a backslash? Escaping is the
+/// **odd-parity** of the run of consecutive backslashes immediately
+/// before `pos` — `\|` escapes the pipe, `\\|` does not (the two
+/// backslashes escape each other), `\\\|` does again, and so on.
+/// This must agree with [`scan_line_cells`]' pipe classification
+/// (which consumes backslash-escaped pairs), or a typed `|` could be
+/// treated as literal by the keystroke handler while the scanner
+/// sees a cell boundary.
+pub fn is_escaped_at(bytes: &[u8], pos: usize) -> bool {
+    let mut run = 0usize;
+    while run < pos && bytes[pos - 1 - run] == b'\\' {
+        run += 1;
+    }
+    run % 2 == 1
+}
+
+/// Delimiter-row dash floor: would deleting `del` leave the caret's
+/// delimiter cell without a single dash? Deleting the last hyphen of
+/// a delimiter cell silently dissolves the whole table (an empty or
+/// colon-only delimiter cell fails the GFM shape), so grapheme- and
+/// word-level deletion refuse to cross the floor — dissolving a
+/// table is an explicit act (delete the delimiter row's line), never
+/// a keystroke accident. Colons remain freely deletable (alignment
+/// editing).
+pub fn delimiter_dash_floor(geo: &TableGeometry, source: &str, del: &Range<usize>) -> bool {
+    let Some(row_idx) = geo.row_at(del.start) else {
+        return false;
+    };
+    let row = &geo.rows[row_idx];
+    if row.kind != RowKind::Delimiter {
+        return false;
+    }
+    // Find the cell the deletion intersects.
+    for cell in &row.cells {
+        if del.start < cell.end && del.end > cell.start {
+            let text = &source[cell.clone()];
+            let deleted_dashes = source[del.start.max(cell.start)..del.end.min(cell.end)]
+                .bytes()
+                .filter(|&b| b == b'-')
+                .count();
+            let total_dashes = text.bytes().filter(|&b| b == b'-').count();
+            return deleted_dashes >= total_dashes;
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Forbidden positions (between-cell chrome)
 // ---------------------------------------------------------------------------
@@ -717,7 +764,7 @@ pub fn delete_forward_hop(geo: &TableGeometry, pos: usize) -> Option<TableEdit> 
 /// count mismatch would dissolve the whole construct before the
 /// canonicalizer could repair it). Other body rows are left to the
 /// canonicalizer, which pads them on the same keystroke.
-pub fn pipe_insert_edit(geo: &TableGeometry, _source: &str, pos: usize) -> Option<TableEdit> {
+pub fn pipe_insert_edit(geo: &TableGeometry, source: &str, pos: usize) -> Option<TableEdit> {
     let (row_idx, cell_idx) = geo.cell_at(pos)?;
     let row = &geo.rows[row_idx];
     let cell = row.cells.get(cell_idx)?;
@@ -754,7 +801,33 @@ pub fn pipe_insert_edit(geo: &TableGeometry, _source: &str, pos: usize) -> Optio
             replacement: new_cell.to_string(),
         });
     }
-    // The caret row's split.
+    // The caret row's split. On header/body rows a literal ` | ` at
+    // the caret splits the cell cleanly; on the **delimiter row** a
+    // literal split can produce an invalid cell (an empty left half
+    // at the cell's start, a colon-only fragment after a leading
+    // `:`), which dissolves the whole table — so the dash cell is
+    // replaced wholesale with two canonical cells that distribute
+    // its alignment colons (`:-:` → `:-- | --:`, `:--` → `:-- | ---`,
+    // `--:` → `--- | --:`).
+    if row.kind == RowKind::Delimiter {
+        let align = parse_alignment(&source[cell.clone()]);
+        let (left, right) = match align {
+            TableAlignment::None => (TableAlignment::None, TableAlignment::None),
+            TableAlignment::Left => (TableAlignment::Left, TableAlignment::None),
+            TableAlignment::Right => (TableAlignment::None, TableAlignment::Right),
+            TableAlignment::Center => (TableAlignment::Left, TableAlignment::Right),
+        };
+        edits.push(SourceEdit {
+            range: cell.clone(),
+            replacement: format!("{} | {}", alignment_cell(left), alignment_cell(right)),
+        });
+        edits.sort_by_key(|e| e.range.start);
+        // Land the caret at the start of the right-hand cell: the
+        // replacement pins an interior offset to its end, so walk
+        // back over the right cell's text.
+        let cursor = map_offset(&edits, cell.end) - alignment_cell(right).len();
+        return Some(TableEdit::caret(edits, cursor));
+    }
     edits.push(SourceEdit {
         range: pos..pos,
         replacement: " | ".to_string(),
