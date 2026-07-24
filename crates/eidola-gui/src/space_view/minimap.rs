@@ -149,9 +149,11 @@ impl SpaceView {
         &self,
         page_width: gpui::Pixels,
         viewport_h: gpui::Pixels,
+        turns: &[(u64, Option<gpui::SharedString>)],
     ) -> f32 {
-        let streaming = false; // the structure (not the live partial) drives the map
-        let tree = self.effective_tree(page_width, streaming);
+        // The turns' structure (count + targets, not the live partials) drives
+        // the map — a fan-out adding a second streaming leaf must reshape it.
+        let tree = self.effective_tree(page_width, turns);
         let selected = self.selected_total_height(&tree, page_width, viewport_h);
         // Use the *clamped* scroll position (see `clamped_scroll_y`) so transient
         // momentum overshoot past the ends doesn't schedule a catch-up frame
@@ -162,14 +164,27 @@ impl SpaceView {
             + scroll_y * 19.0
             + selected * 3.0
             + self.posts.len() as f32
+            + turns.len() as f32 * 7.0
     }
 
     /// A screen-reader / table-of-contents label for a map column: the post's
     /// byline plus a short snippet ("You: I keep circling back to…"), or "Draft"
     /// / "Eidola, responding" for the overlays.
-    fn node_label(&self, node: &TreeNode) -> String {
+    fn node_label(&self, node: &TreeNode, cx: &gpui::App) -> String {
         match node.src {
-            NodeSrc::Streaming => "Eidola, responding".to_string(),
+            NodeSrc::Streaming(seq) => {
+                // The responding participant's label, resolved live like the
+                // streaming post's byline ("Eidola" fallback for synthetic
+                // turns).
+                let pid = self
+                    .space
+                    .read(cx)
+                    .streams()
+                    .iter()
+                    .find(|t| t.seq == seq)
+                    .and_then(|t| t.participant_id.clone());
+                format!("{}, responding", self.participant_label(pid.as_deref(), cx))
+            }
             NodeSrc::Draft => "Draft".to_string(),
             NodeSrc::Msg(i) => {
                 let Some(p) = self.posts.get(i) else {
@@ -238,7 +253,7 @@ impl SpaceView {
         // A floating, off-branch draft pads the page bottom (item 4); fold it
         // into the denominator + a trailing spacer so the scroll indicator maps
         // 1:1 to the real scrollable height on every branch.
-        let pad = self.floating_pad(roots, page_width, viewport_h, false);
+        let pad = self.floating_pad(roots, page_width, viewport_h);
         let total_h = reserve + selected_h + pad;
         // The indicator reflects the *clamped* scroll position (the page
         // hard-stops at the ends; the raw offset transiently overshoots during
@@ -302,7 +317,7 @@ impl SpaceView {
                         .probe(
                             SharedString::from(format!("space/minimap/cell/{level}/{i}")),
                             gpui::Role::Button,
-                            self.node_label(sib),
+                            self.node_label(sib, cx),
                         )
                         .aria_selected(is_active)
                         .flex_1()
@@ -470,8 +485,8 @@ impl SpaceView {
             // Different branch: navigate + complete. Position so the pressed
             // document point lands under the cursor on the new page.
             let fraction = cell_fraction(m, scale, cell_doc_top, cell_height);
-            let streaming = self.space.read(cx).is_streaming();
-            let tree = self.effective_tree(page_width, streaming);
+            let turns = self.stream_overlays(cx);
+            let tree = self.effective_tree(page_width, &turns);
             if super::model::node_ref(&tree, &node_id).is_none() {
                 return;
             }
@@ -488,7 +503,7 @@ impl SpaceView {
                 // changed with the switch).
                 let total = self.doc_reserve()
                     + self.selected_total_height(&tree, page_width, window_h)
-                    + self.floating_pad(&tree, page_width, window_h, streaming);
+                    + self.floating_pad(&tree, page_width, window_h);
                 let floor = (window_h.as_f32() - total).min(0.0);
                 let y = scroll_for_press(m, doc_click, floor);
                 let off = self.page_scroll.offset();

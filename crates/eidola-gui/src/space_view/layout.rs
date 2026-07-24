@@ -256,7 +256,7 @@ impl SpaceView {
                 .measured(&node.id)
                 .unwrap_or(0.0)
                 .max(window_h.as_f32()),
-            NodeSrc::Streaming => self
+            NodeSrc::Streaming(_) => self
                 .layout
                 .measured(&node.id)
                 .unwrap_or_else(|| window_h.as_f32() * 0.3),
@@ -319,7 +319,7 @@ impl SpaceView {
             // A draft/streaming leaf is the editing/streaming surface (its slot
             // already reserves the runway); a normal leaf ends with a trailing
             // separator band.
-            if matches!(node.src, NodeSrc::Draft | NodeSrc::Streaming) {
+            if matches!(node.src, NodeSrc::Draft | NodeSrc::Streaming(_)) {
                 return h;
             }
             return h + BAND_HEIGHT.as_f32();
@@ -452,7 +452,6 @@ impl SpaceView {
         roots: &[TreeNode],
         page_width: Pixels,
         window_h: Pixels,
-        _streaming: bool,
     ) -> f32 {
         let Some(active) = self.active_draft.as_deref() else {
             return 0.0;
