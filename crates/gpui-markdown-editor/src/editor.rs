@@ -445,6 +445,31 @@ impl MarkdownEditorState {
         self.extend_selection_to(offset, cx);
     }
 
+    /// Test seam: every laid-out line's source range + geometry, flat
+    /// across blocks — `(src_start, src_end, x, y, width, wrapped_height)`.
+    /// Lets integration tests locate a table cell's box (source range →
+    /// pixel rectangle) to aim real clicks and assert wrapped-cell
+    /// navigation geometry.
+    #[doc(hidden)]
+    pub fn debug_line_source_geometry(&self) -> Vec<(usize, usize, f32, f32, f32, f32)> {
+        let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
+        keys.sort();
+        let mut out = Vec::new();
+        for k in keys {
+            for l in &self.last_blocks[&k].lines {
+                out.push((
+                    l.source_range.start,
+                    l.source_range.end,
+                    l.origin.x.as_f32(),
+                    l.origin.y.as_f32(),
+                    l.line.width().as_f32(),
+                    l.wrapped_height.as_f32(),
+                ));
+            }
+        }
+        out
+    }
+
     /// Diagnostic seam: the recorded (window-coordinate) line geometry from
     /// the last paint — `(block_index, [(origin_x, origin_y, wrapped_height)])`
     /// per block, sorted by block index.
@@ -828,8 +853,13 @@ impl MarkdownEditorState {
             } else {
                 // The current line is filtered out (behind us) and lines on the
                 // wrong side of the motion are filtered out; among the rest pick
-                // the one whose vertical bounds are closest to `target_global_y`.
-                let mut best: Option<(&crate::element::LaidOutLine, Pixels)> = None;
+                // the one whose vertical bounds are closest to `target_global_y`
+                // — and at equal vertical distance, the one horizontally
+                // closest to `target_x`. The x tie-break matters for table
+                // rows, whose side-by-side cell boxes all sit at the same y
+                // (see `element::layout_table`): Down from column 2 must land
+                // in the next row's column-2 box, not its first cell.
+                let mut best: Option<(&crate::element::LaidOutLine, Pixels, Pixels)> = None;
                 for k in &keys {
                     let block = &self.last_blocks[k];
                     for cand in &block.lines {
@@ -849,13 +879,25 @@ impl MarkdownEditorState {
                         } else {
                             px(0.)
                         };
-                        match best {
-                            Some((_, d)) if d <= dist => {}
-                            _ => best = Some((cand, dist)),
+                        let left = cand.origin.x;
+                        let right = left + cand.line.width();
+                        let x_dist = if target_x < left {
+                            left - target_x
+                        } else if target_x > right {
+                            target_x - right
+                        } else {
+                            px(0.)
+                        };
+                        let better = match best {
+                            None => true,
+                            Some((_, bd, bx)) => dist < bd || (dist == bd && x_dist < bx),
+                        };
+                        if better {
+                            best = Some((cand, dist, x_dist));
                         }
                     }
                 }
-                let best = best.map(|(l, _)| l)?;
+                let best = best.map(|(l, _, _)| l)?;
                 let edge = if direction > 0 {
                     0
                 } else {
@@ -1414,8 +1456,14 @@ impl MarkdownEditorState {
             return self.state.markdown.len();
         }
 
-        // First pass: direct hit. If `position.y` falls in any line's
-        // vertical extent, hit-test inside that line.
+        // First pass: direct hit. If `position.y` falls in a line's
+        // vertical extent, hit-test inside that line. Multiple lines
+        // can share a y-band — a table row is several side-by-side
+        // cell boxes (see `element::layout_table`) — so among y-hits
+        // the pick is by **horizontal** proximity: a line whose x
+        // span contains the point wins outright; otherwise the
+        // nearest by x. Ordinary blocks have one line per band, so
+        // this degenerates to the old first-hit behavior.
         //
         // Second pass: nearest line. Lines don't tile vertically — there's
         // a `paragraph_gap` between blocks — so a mouse drag whose y
@@ -1425,6 +1473,7 @@ impl MarkdownEditorState {
         // crossed a gap. Snap to the closest line by vertical distance,
         // then clamp the local y to that line's bounds so the x
         // coordinate still picks the right column.
+        let mut y_hit: Option<(&crate::element::LaidOutLine, Pixels)> = None;
         let mut best: Option<&crate::element::LaidOutLine> = None;
         let mut best_distance: Pixels = px(f32::INFINITY);
         for key in &keys {
@@ -1433,8 +1482,20 @@ impl MarkdownEditorState {
                 let line_top = line.origin.y;
                 let line_bottom = line_top + line.wrapped_height;
                 if position.y >= line_top && position.y < line_bottom {
-                    let local = Point::new(position.x - line.origin.x, position.y - line.origin.y);
-                    return line.source_offset_for_local_point(local);
+                    let left = line.origin.x;
+                    let right = left + line.line.width();
+                    let x_dist = if position.x < left {
+                        left - position.x
+                    } else if position.x > right {
+                        position.x - right
+                    } else {
+                        px(0.0)
+                    };
+                    match y_hit {
+                        Some((_, d)) if d <= x_dist => {}
+                        _ => y_hit = Some((line, x_dist)),
+                    }
+                    continue;
                 }
                 let distance = if position.y < line_top {
                     line_top - position.y
@@ -1446,6 +1507,10 @@ impl MarkdownEditorState {
                     best = Some(line);
                 }
             }
+        }
+        if let Some((line, _)) = y_hit {
+            let local = Point::new(position.x - line.origin.x, position.y - line.origin.y);
+            return line.source_offset_for_local_point(local);
         }
 
         if let Some(line) = best {

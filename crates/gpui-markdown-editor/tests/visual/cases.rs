@@ -589,9 +589,10 @@ pub fn register(s: &mut Snapshots) {
         )
     });
 
-    // Wide table — overflows 720px and triggers the horizontal
-    // scrollbar (the code-block treatment, minus the chrome).
-    s.add("table_overflow_scrollbar", win, |window, cx| {
+    // Wide table — its columns shrink toward min-content and the
+    // cells wrap internally (the HTML-auto model), so it fits the
+    // 720px measure instead of overflowing.
+    s.add("table_wrapped_cells", win, |window, cx| {
         editor_with_cursor(
             window,
             cx,
@@ -602,6 +603,40 @@ pub fn register(s: &mut Snapshots) {
             "after",
         )
     });
+
+    // The same wrapping table in edit mode — pipes render in the
+    // gutters between the wrapped cell boxes, the delimiter row
+    // stretches, and every chrome byte keeps a true caret position.
+    s.add("table_wrapped_cells_edit", win, |window, cx| {
+        editor_with_cursor(
+            window,
+            cx,
+            "| Topic | Detail |\n\
+             | :-- | :-- |\n\
+             | Attestation | Every new TLS handshake re-verifies the enclave measurement against the pinned trust root before any request bytes flow |\n\
+             | Refunds | Unspent holds return to the wallet through the recovery endpoint |\n",
+            "recovery",
+        )
+    });
+
+    // Degenerate narrow measure: even min-content columns overflow,
+    // so the table floors at min and takes the shared horizontal
+    // scroll treatment.
+    s.add(
+        "table_min_content_overflow_scrollbar",
+        size(px(240.), px(480.)),
+        |window, cx| {
+            editor_with_cursor(
+                window,
+                cx,
+                "| Unbreakable-header-atom-one | Another-unbreakable-atom |\n\
+                 | --- | --- |\n\
+                 | word | word |\n\n\
+                 after",
+                "after",
+            )
+        },
+    );
 
     // Ordered list with an empty intermediate item that hosts a
     // nested sublist (`2. ` followed by `   1. Two, One`). The empty
