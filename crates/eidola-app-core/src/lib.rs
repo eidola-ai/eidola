@@ -29,6 +29,8 @@ pub use backends::{
 };
 use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
+pub use config::DEFAULT_TEMPLATE_ID;
+pub use db::HUMAN_PARTICIPANT_ID;
 use error::AppError;
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
@@ -136,6 +138,32 @@ pub struct ParticipantInfo {
     pub notify_policy: String,
     /// `owner`/`member`/`observer`.
     pub role: String,
+    /// For a **referenced global** (`source == "referenced"`), the global's own
+    /// config plus the raw per-membership overrides, so a GUI can render and
+    /// edit the "edit everywhere" vs "override here" fork honestly. `None` for
+    /// owned (`space`-scoped) participants, which have no override layer.
+    pub reference: Option<ParticipantReference>,
+}
+
+/// The "edit everywhere vs override here" detail for a referenced global
+/// participant (see [`ParticipantInfo::reference`]).
+///
+/// The `base_*` fields are the shared global's own config — what "edit
+/// everywhere" ([`AppCore::update_space_participant`]) writes. Each `override_*`
+/// field is the raw membership override: `None` = inherit the base; `Some(s)`
+/// (including `Some("")`) = overridden (the doctrine's NULL = inherit,
+/// `''` = cleared). What "override here"
+/// ([`AppCore::set_space_participant_override`]) writes.
+#[derive(Clone, Debug)]
+pub struct ParticipantReference {
+    pub base_label: String,
+    pub base_model_ref: Option<String>,
+    pub base_system_prompt: Option<String>,
+    pub base_notify_policy: String,
+    pub override_label: Option<String>,
+    pub override_model_ref: Option<String>,
+    pub override_system_prompt: Option<String>,
+    pub override_notify_policy: Option<String>,
 }
 
 impl ParticipantInfo {
@@ -150,6 +178,7 @@ impl ParticipantInfo {
             system_prompt: r.system_prompt,
             notify_policy: r.notify_policy,
             role: r.role,
+            reference: None,
         }
     }
 
@@ -164,6 +193,7 @@ impl ParticipantInfo {
             system_prompt: r.system_prompt,
             notify_policy: r.notify_policy,
             role: r.role,
+            reference: None,
         }
     }
 }
@@ -186,6 +216,20 @@ pub struct ParticipantUpdate {
     pub model_ref: Option<Option<String>>,
     pub system_prompt: Option<Option<String>>,
     pub notify_policy: Option<String>,
+}
+
+/// A per-membership override edit for a **referenced global** participant
+/// ("override here", this space only — vs [`ParticipantUpdate`]'s "edit
+/// everywhere"). Each `Some` outer writes that override column; the inner
+/// `Option` sets it (`Some(value)`, including `Some("")` to clear a field to
+/// empty) or reverts it to inherited (`None` = SQL NULL). Untouched columns
+/// (`None` outer) are left as-is.
+#[derive(Clone, Debug, Default)]
+pub struct ParticipantOverride {
+    pub label: Option<Option<String>>,
+    pub model_ref: Option<Option<String>>,
+    pub system_prompt: Option<Option<String>>,
+    pub notify_policy: Option<Option<String>>,
 }
 
 /// A space template (its settings + agent participants).
@@ -2044,11 +2088,67 @@ impl Inner {
         space_id: &str,
     ) -> Result<Vec<ParticipantInfo>, AppError> {
         let conn = self.db_conn().await?;
-        Ok(db::space_participants(&conn, space_id)
-            .await?
-            .into_iter()
-            .map(ParticipantInfo::from_effective)
-            .collect())
+        let rows = db::space_participants(&conn, space_id).await?;
+        // Reference detail (base config + raw overrides) for referenced globals,
+        // so the GUI can render the edit-everywhere-vs-override-here fork.
+        let refs = db::list_space_participant_refs(&conn, space_id).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let mut info = ParticipantInfo::from_effective(r);
+            if info.source == "referenced"
+                && let Some(base) = db::get_participant(&conn, &info.id).await?
+            {
+                let ov = refs.iter().find(|x| x.participant_id == info.id);
+                info.reference = Some(ParticipantReference {
+                    base_label: base.label,
+                    base_model_ref: base.model_ref,
+                    base_system_prompt: base.system_prompt,
+                    base_notify_policy: base.notify_policy,
+                    override_label: ov.and_then(|o| o.override_label.clone()),
+                    override_model_ref: ov.and_then(|o| o.override_model_ref.clone()),
+                    override_system_prompt: ov.and_then(|o| o.override_system_prompt.clone()),
+                    override_notify_policy: ov.and_then(|o| o.override_notify_policy.clone()),
+                });
+            }
+            out.push(info);
+        }
+        Ok(out)
+    }
+
+    /// "Override here": write per-membership overrides for a **referenced
+    /// global** participant (this space only; the global's own config is
+    /// untouched). `None` inner = revert to inherited. Emits
+    /// [`Change::Participants`] when anything changed.
+    async fn set_space_participant_override(
+        &self,
+        space_id: &str,
+        participant_id: &str,
+        ov: ParticipantOverride,
+    ) -> Result<(), AppError> {
+        // A notify-policy override, when set to a value, must be a valid enum
+        // member (the effective config = COALESCE(override, base) must satisfy
+        // the schema CHECK on the base column).
+        if let Some(Some(p)) = &ov.notify_policy {
+            validate_notify_policy(p.trim())?;
+        }
+        let conn = self.db_conn().await?;
+        fn to_ref(o: &Option<Option<String>>) -> Option<Option<&str>> {
+            o.as_ref().map(|inner| inner.as_deref())
+        }
+        let changed = db::update_space_participant_override(
+            &conn,
+            space_id,
+            participant_id,
+            to_ref(&ov.label),
+            to_ref(&ov.model_ref),
+            to_ref(&ov.system_prompt),
+            to_ref(&ov.notify_policy),
+        )
+        .await?;
+        if changed {
+            self.bus.emit(Change::Participants);
+        }
+        Ok(())
     }
 
     async fn add_space_participant(
@@ -4975,6 +5075,28 @@ impl AppCore {
             .spawn(async move {
                 inner
                     .update_space_participant(&participant_id, update)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// "Override here": set per-membership overrides for a **referenced global**
+    /// participant — this space only, leaving the shared global's own config
+    /// untouched (vs [`Self::update_space_participant`]'s "edit everywhere").
+    /// Each field's inner `None` reverts it to inherited. Emits
+    /// [`Change::Participants`].
+    pub async fn set_space_participant_override(
+        &self,
+        space_id: String,
+        participant_id: String,
+        override_: ParticipantOverride,
+    ) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .set_space_participant_override(&space_id, &participant_id, override_)
                     .await
             })
             .await

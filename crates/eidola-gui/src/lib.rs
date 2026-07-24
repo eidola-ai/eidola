@@ -120,6 +120,7 @@ pub fn run() {
         stores.models.update(cx, |s, cx| s.refresh(cx));
         stores.local_models.update(cx, |s, cx| s.refresh(cx));
         stores.spaces.update(cx, |s, cx| s.refresh(cx));
+        stores.templates.update(cx, |s, cx| s.refresh(cx));
 
         // Best-effort recovery of any in-flight credentials left over from a
         // previous run that crashed mid-spend. Owned by the WalletStore; the
