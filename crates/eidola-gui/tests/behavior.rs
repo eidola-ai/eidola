@@ -924,10 +924,11 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
             vec![
                 SettingsPane::General,
                 SettingsPane::Backends,
+                SettingsPane::Templates,
                 SettingsPane::Account,
                 SettingsPane::Wallet,
             ],
-            "eidola enabled shows all four panes"
+            "eidola enabled shows all panes"
         );
     });
 
@@ -942,7 +943,11 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
     view2.read_with(cx, |v, cx| {
         assert_eq!(
             v.visible_panes(cx),
-            vec![SettingsPane::General, SettingsPane::Backends],
+            vec![
+                SettingsPane::General,
+                SettingsPane::Backends,
+                SettingsPane::Templates,
+            ],
             "eidola disabled hides Account and Wallet"
         );
     });
