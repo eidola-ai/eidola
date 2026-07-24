@@ -292,7 +292,7 @@ mod driver {
             },
             Scene {
                 name: "markdown_table",
-                description: "Space view: an assistant reply carrying GFM tables (aligned columns, styled cells, a wide overflow table) — the table display-mode QA scene; the tail composer is live for edit-mode QA",
+                description: "Space view: an assistant reply carrying GFM tables (aligned columns, styled cells, a wide table whose cells wrap) — the table display-mode QA scene; the tail composer is live for edit-mode QA",
                 default_size: size(px(760.), px(680.)),
                 build: |window, cx| {
                     let stores = ready_stores(cx);
@@ -653,8 +653,8 @@ mod driver {
                     | :-- | :-- |\n\
                     | **Bold** and `inline code` | ~~cut~~ kept |\n\
                     | a\\|b literal pipe | plain text |\n\n\
-                    And a deliberately wide table that overflows the reading column \
-                    and scrolls horizontally:\n\n\
+                    And a deliberately wide table whose columns shrink and wrap \
+                    within the reading column:\n\n\
                     | A rather long header cell one | Header two with more words | Third header column | Fourth column header | Fifth and final header |\n\
                     | --- | --- | --- | --- | --- |\n\
                     | some content here | more cell content | further content | yet more words | the last cell |\n\n\

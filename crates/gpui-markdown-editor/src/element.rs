@@ -706,100 +706,142 @@ fn measure_pad_advance(
     line.map(|l| l.width()).unwrap_or(em_px * 0.2)
 }
 
-/// Measure the shaped width of an arbitrary source slice of `block`
-/// (hidden ranges dropped, substitutions applied, inline styles
-/// driving the fonts) — the cell-measurement primitive for
-/// [`augment_block_with_table`].
-fn measure_block_slice_width(
-    source: &str,
+/// The min-content width of a cell: the widest whitespace-delimited
+/// token of its display text, shaped with the token's real styles.
+/// This is the floor a column can shrink to before words would have
+/// to break mid-word (HTML's min-content).
+fn min_content_width(
     range: &Range<usize>,
     block: &RenderBlock,
+    source: &str,
     style: &MarkdownStyle,
     font_size: Pixels,
     window: &mut Window,
 ) -> Pixels {
-    if range.start >= range.end {
-        return px(0.0);
-    }
     let (display, map) = build_display_line(source, range, block);
     if display.is_empty() {
         return px(0.0);
     }
-    let runs = build_runs_for_line(&display, &map, block, style);
-    window
-        .text_system()
-        .shape_text(SharedString::from(display), font_size, &runs, None, None)
-        .ok()
-        .and_then(|mut v| v.drain(..).next())
-        .map(|l| l.width())
-        .unwrap_or(px(0.0))
+    let mut widest = px(0.0);
+    let bytes = display.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let token = &display[start..i];
+        let token_map = &map[start..=i];
+        // `build_runs_for_line` expects `map.len() == text.len() + 1`.
+        debug_assert_eq!(token_map.len(), token.len() + 1);
+        let runs = build_runs_for_line(token, token_map, block, style);
+        let w = window
+            .text_system()
+            .shape_text(
+                SharedString::from(token.to_string()),
+                font_size,
+                &runs,
+                None,
+                None,
+            )
+            .ok()
+            .and_then(|mut v| v.drain(..).next())
+            .map(|l| l.width())
+            .unwrap_or(px(0.0));
+        if w > widest {
+            widest = w;
+        }
+    }
+    widest
 }
 
-/// Column-alignment pre-pass for `BlockKind::Table`.
+/// One shaped piece of a laid-out table: a cell (independently
+/// wrapped at its column's width) or a chrome fragment (the real
+/// `| ` / ` | ` / ` |` bytes, single-row, positioned in the gutter
+/// between column boxes). Origins are relative to the table's
+/// content origin; prepaint re-bases them into window coordinates.
+struct TablePiece {
+    line: Arc<WrappedLine>,
+    rel_origin: Point<Pixels>,
+    source_range: Range<usize>,
+    display_to_source: Vec<usize>,
+    wrapped_height: Pixels,
+}
+
+/// The box-model layout of one table.
+struct TableLayoutOut {
+    pieces: Vec<TablePiece>,
+    size: Size<Pixels>,
+    /// Relative y of each inter-row boundary (display mode only —
+    /// the hairline rules; `[0]` is the header rule).
+    rule_ys: Vec<Pixels>,
+}
+
+/// Lay a `BlockKind::Table` out as a grid of **cell boxes**: every
+/// cell is its own shaped line, wrapped independently at its
+/// column's width, positioned side by side — the HTML-auto-inspired
+/// model Mike asked for, unified across display and edit mode (and
+/// across fitting and overflowing tables, so there is exactly one
+/// table layout path).
 ///
-/// Measures every cell's shaped width, derives per-column slot widths
-/// (widest cell wins), and substitutes each row's between-cell chrome
-/// with a display string that pads the columns into alignment:
+/// **Column sizing:** per column, min-content (the widest unbreakable
+/// atom — measured by shaping at a 1px wrap width) and max-content
+/// (unwrapped) widths. If Σmax + chrome fits the available measure,
+/// every column sits at max-content and nothing wraps (the original
+/// behavior, now with exact alignment and no pad glyphs). Otherwise
+/// columns shrink proportionally to their `(max − min)` excess,
+/// flooring at min-content; if even Σmin overflows, columns floor at
+/// min and the table overflows into the shared horizontal-scroll
+/// treatment (degenerate narrow window).
 ///
-/// * **Display mode** — the chrome bytes are already hidden by the
-///   render layer; the substitution replaces them with pad runs only
-///   (leading/trailing fills per the column's alignment colons, plus
-///   a fixed inter-column gutter).
-/// * **Edit mode** — the chrome stays visible (dimmed); the
-///   substitution re-emits the literal chrome text with the fills
-///   spliced around the pipe, so the source reads as an org-style
-///   aligned table while the buffer keeps its minimal canonical form.
-///
-/// Pads are [`MATH_PAD_CHAR`] runs (~⅙ em), sized against a running
-/// ideal-vs-measured error so rounding never accumulates across
-/// columns (±half a pad char per boundary, non-cumulative). All
-/// substitution display bytes map to the chrome range's start, so a
-/// click in the padding lands at the previous cell's content end —
-/// which the forbidden-position machinery then keeps.
-fn augment_block_with_table(
+/// **Rows:** one physical GFM line each, always — wrapping is purely
+/// visual. Row height = the tallest wrapped cell. In edit mode the
+/// chrome bytes (pipes + padding, including any just-typed trailing
+/// whitespace) shape as real single-row fragments in the gutters
+/// between boxes, so every byte keeps a true caret position; in
+/// display mode the chrome is hidden and fragments shape empty
+/// (kept for source coverage). The delimiter row renders only in
+/// edit mode, its dash cells stretched to the column width (raw on
+/// the caret's row for colon editing). Alignment colons shift a
+/// non-wrapped cell inside its box; wrapped cells left-align.
+fn layout_table(
     block: &RenderBlock,
     source: &str,
     font_size: Pixels,
     style: &MarkdownStyle,
+    avail_w: Pixels,
     window: &mut Window,
-) -> RenderBlock {
+) -> Option<TableLayoutOut> {
     let BlockKind::Table {
         geometry,
         edit_mode,
-        ..
+        cursor_row,
     } = &block.kind
     else {
-        return block.clone();
+        return None;
     };
-    let mut augmented = block.clone();
-    let pad_w = measure_pad_advance(font_size, style, &block.kind, window);
-    if pad_w <= px(0.0) {
-        return augmented;
-    }
-    let gutter = font_size * 1.25;
     let edit = *edit_mode;
-    let cursor_row = match &block.kind {
-        BlockKind::Table { cursor_row, .. } => *cursor_row,
-        _ => None,
-    };
+    let cursor_row = *cursor_row;
+    let line_height = font_size * style.line_height.0;
 
     use crate::syntax::TableAlignment;
     use crate::table::RowKind;
 
-    // Rows that participate in alignment: the delimiter row only in
-    // edit mode (it's hidden in display mode).
     let rows: Vec<(usize, &crate::table::RowGeometry)> = geometry
         .rows
         .iter()
         .enumerate()
         .filter(|(_, r)| edit || r.kind != RowKind::Delimiter)
         .collect();
+    if rows.is_empty() {
+        return None;
+    }
 
-    // Canonical chrome glyph advances (edit mode): the pipe and the
-    // single padding space. Measured once; the walk below tracks the
-    // *actual* accumulated width per row, so non-canonical rows
-    // (typed trailing whitespace, a missing pipe) self-correct at the
-    // next boundary instead of shifting everything after them.
+    // Chrome glyph advances.
     let text_w = |s: &str, window: &mut Window| -> Pixels {
         if s.is_empty() {
             return px(0.0);
@@ -830,207 +872,248 @@ fn augment_block_with_table(
     let w_sp = text_w(" ", window);
     let w_dash = text_w("-", window);
     let w_colon = text_w(":", window);
+    let gutter = font_size * 1.25;
 
-    // Per-row, per-cell measured widths: (leading padding, trimmed
-    // content, trailing padding) — all through the block's real
-    // hides/substitutions, so a hidden padding byte (display mode)
-    // measures zero and a real one (edit mode) measures true.
-    let mut measured: Vec<Vec<(Pixels, Pixels, Pixels)>> = Vec::with_capacity(rows.len());
+    // Shape helper over a source slice of the block (hides +
+    // substitutions + inline styles apply).
+    let shape_slice = |range: &Range<usize>,
+                       wrap: Option<Pixels>,
+                       window: &mut Window|
+     -> Option<(Arc<WrappedLine>, Vec<usize>)> {
+        let (display, map) = build_display_line(source, range, block);
+        let runs = build_runs_for_line(&display, &map, block, style);
+        let line = window
+            .text_system()
+            .shape_text(SharedString::from(display), font_size, &runs, wrap, None)
+            .ok()
+            .and_then(|mut v| v.drain(..).next())
+            .map(Arc::new)
+            .or_else(|| empty_shaped_line(font_size, window))?;
+        Some((line, map))
+    };
+
+    // Column min/max content widths (delimiter rows excluded — their
+    // dash cells stretch to fit). Min-content is the widest
+    // *unbreakable atom* — the longest whitespace-delimited token,
+    // measured with its real styles (gpui's wrapper falls back to
+    // mid-word breaking below a word's width, so shaping at a tiny
+    // wrap width would report ~one glyph and let columns squeeze
+    // into vertical letter-stacks).
+    let n_cols = geometry.column_count().max(1);
+    let mut min_w: Vec<Pixels> = vec![px(0.0); n_cols];
+    let mut max_w: Vec<Pixels> = vec![px(0.0); n_cols];
     for (_, row) in &rows {
-        let mut per_cell = Vec::with_capacity(row.cells.len());
-        for (cell, seg) in row.cells.iter().zip(row.segments.iter()) {
-            let w_pre = measure_block_slice_width(
-                source,
-                &(seg.start..cell.start),
-                block,
-                style,
-                font_size,
-                window,
-            );
-            let w_cell = measure_block_slice_width(source, cell, block, style, font_size, window);
-            let w_post = measure_block_slice_width(
-                source,
-                &(cell.end..seg.end),
-                block,
-                style,
-                font_size,
-                window,
-            );
-            per_cell.push((w_pre, w_cell, w_post));
-        }
-        measured.push(per_cell);
-    }
-
-    // Per-column slot widths: the widest *occupied* width — trimmed
-    // content, or content plus any padding beyond the canonical
-    // single space per side (a just-typed trailing space **counts as
-    // occupied**, so the whole column widens together and stays
-    // aligned while the user types; the canonicalizer trims the
-    // extra once the caret leaves the row and the column relaxes).
-    // The delimiter row's compact dash cells don't drive slots (they
-    // stretch to fit; including them would floor every column at
-    // ~three dashes).
-    let n_cols = geometry.column_count();
-    let mut slot: Vec<Pixels> = vec![px(0.0); n_cols];
-    for ((_, row), per_cell) in rows.iter().zip(measured.iter()) {
         if row.kind == RowKind::Delimiter {
             continue;
         }
-        for (k, (w_pre, w_cell, w_post)) in per_cell.iter().enumerate() {
-            let canonical_pad = if edit { w_sp * 2.0 } else { px(0.0) };
-            let occupied = (*w_pre + *w_cell + *w_post - canonical_pad).max(*w_cell);
-            if k < n_cols && occupied > slot[k] {
-                slot[k] = occupied;
+        for (k, cell) in row.cells.iter().enumerate() {
+            if k >= n_cols {
+                break;
+            }
+            let (unwrapped, _) = shape_slice(cell, None, window)?;
+            if unwrapped.width() > max_w[k] {
+                max_w[k] = unwrapped.width();
+            }
+            let atom_w = min_content_width(cell, block, source, style, font_size, window);
+            if atom_w > min_w[k] {
+                min_w[k] = atom_w;
             }
         }
     }
 
-    // Ideal column content-box start positions (line-local).
-    let mut col_x: Vec<Pixels> = Vec::with_capacity(n_cols + 1);
+    // Available width for the column boxes.
+    let chrome_total = if edit {
+        // `| ` + per-inner-boundary ` | ` + trailing ` |`.
+        (w_pipe + w_sp) + (w_sp + w_pipe + w_sp) * ((n_cols - 1) as f32) + (w_sp + w_pipe)
+    } else {
+        gutter * (n_cols.saturating_sub(1) as f32)
+    };
+    let w_avail = (avail_w - chrome_total).max(px(0.0));
+    let sum_max: Pixels = max_w.iter().fold(px(0.0), |a, w| a + *w);
+    let sum_min: Pixels = min_w.iter().fold(px(0.0), |a, w| a + *w);
+    let col_w: Vec<Pixels> = if sum_max <= w_avail || !f32::from(avail_w).is_finite() {
+        max_w.clone()
+    } else if sum_min <= w_avail {
+        // Shrink proportionally to each column's (max − min) excess.
+        let excess: Pixels = sum_max - w_avail;
+        let flex: Pixels = sum_max - sum_min;
+        max_w
+            .iter()
+            .zip(min_w.iter())
+            .map(|(mx, mn)| {
+                let share = if flex > px(0.0) {
+                    (*mx - *mn) * (f32::from(excess) / f32::from(flex))
+                } else {
+                    px(0.0)
+                };
+                (*mx - share).max(*mn)
+            })
+            .collect()
+    } else {
+        min_w.clone()
+    };
+    let col_w: Vec<Pixels> = col_w.into_iter().map(|w| w.max(px(1.0))).collect();
+
+    // Column box x positions.
+    let mut col_x: Vec<Pixels> = Vec::with_capacity(n_cols);
     let mut acc = if edit { w_pipe + w_sp } else { px(0.0) };
-    for w in &slot {
+    for w in &col_w {
         col_x.push(acc);
         acc += *w + if edit { w_sp + w_pipe + w_sp } else { gutter };
     }
-    col_x.push(acc); // one-past-last: the trailing boundary target
-
-    let pad_run = |n: usize| -> String { MATH_PAD_CHAR.to_string().repeat(n) };
-    let pads_for = |want: Pixels| -> usize {
-        if want <= px(0.0) {
-            0
+    // Total content width: last box end + trailing chrome.
+    let total_w = if n_cols > 0 {
+        let last_end = col_x[n_cols - 1] + col_w[n_cols - 1];
+        if edit {
+            last_end + w_sp + w_pipe
         } else {
-            ((want / pad_w).round() as i64).max(0) as usize
+            last_end
         }
-    };
-    let lead_fill = |k: usize, w: Pixels| -> Pixels {
-        let free = (slot.get(k).copied().unwrap_or(px(0.0)) - w).max(px(0.0));
-        match geometry.alignment(k) {
-            TableAlignment::Right => free,
-            TableAlignment::Center => free * 0.5,
-            TableAlignment::None | TableAlignment::Left => px(0.0),
-        }
+    } else {
+        px(0.0)
     };
 
-    for ((row_idx, row), per_cell) in rows.iter().zip(measured.iter()) {
+    let mut pieces: Vec<TablePiece> = Vec::new();
+    let mut rule_ys: Vec<Pixels> = Vec::new();
+    let mut y = px(0.0);
+    let last_row_idx = rows.len() - 1;
+    for (i, (row_geo_idx, row)) in rows.iter().enumerate() {
         let is_delimiter = row.kind == RowKind::Delimiter;
-        // Delimiter-row dash stretch (edit mode): each dash cell's
-        // display stretches to its column's slot width, alignment
-        // colons kept at the ends, so the row reads as the ruled
-        // boundary it is instead of a compact runt. Skipped when the
-        // caret is ON the row — the user is editing colons there and
-        // must see (and click into) the raw bytes.
-        let stretch = is_delimiter && cursor_row != Some(*row_idx);
+        let stretch = is_delimiter && cursor_row != Some(*row_geo_idx);
+        let mut row_h = line_height;
 
-        // Walk the row's real bytes boundary-by-boundary, tracking
-        // measured x. Pads live inside substitutions over the
-        // boundary bytes (the pipes) only — a cell's padding
-        // whitespace stays *real shaped text*, so a caret parked in
-        // just-typed trailing whitespace renders at its true x
-        // inside the cell (it used to be swallowed by a
-        // whole-chrome substitution and paint past the next pipe),
-        // and typed extra whitespace absorbs into the next
-        // boundary's fill instead of shifting the rest of the row.
-        let mut x = px(0.0);
-        let mut prev_end = row.line.start;
-        for (k, (cell, seg)) in row.cells.iter().zip(row.segments.iter()).enumerate() {
-            let boundary = prev_end..seg.start;
-            let w_boundary =
-                measure_block_slice_width(source, &boundary, block, style, font_size, window);
-            let (w_pre, cached_cell, w_post) =
-                per_cell
-                    .get(k)
-                    .copied()
-                    .unwrap_or((px(0.0), px(0.0), px(0.0)));
-            let mut w_cell = cached_cell;
-
-            // Stretched delimiter cell: substitute the dash cell's
-            // display and use the substituted width downstream.
-            if stretch && cell.start < cell.end {
+        // Cell boxes.
+        for (k, cell) in row.cells.iter().enumerate() {
+            let bw = col_w.get(k).copied().unwrap_or(px(64.0));
+            let bx = col_x.get(k).copied().unwrap_or(px(0.0));
+            let (line, map, ox) = if stretch && cell.start < cell.end {
+                // Stretched delimiter cell: dash run sized to the box.
                 let cell_text = &source[cell.clone()];
-                let leading_colon = cell_text.starts_with(':');
-                let trailing_colon = cell_text.ends_with(':') && cell_text.len() > 1;
-                let colons =
-                    (leading_colon as usize as f32 + trailing_colon as usize as f32) * w_colon;
-                let target = slot.get(k).copied().unwrap_or(px(0.0));
+                let leading = cell_text.starts_with(':');
+                let trailing = cell_text.ends_with(':') && cell_text.len() > 1;
+                let colons = ((leading as usize + trailing as usize) as f32) * w_colon;
                 let n_dashes = if w_dash > px(0.0) {
-                    (((target - colons) / w_dash).round() as i64).max(1) as usize
+                    (((bw - colons) / w_dash).floor() as i64).max(1) as usize
                 } else {
                     3
                 };
                 let mut display = String::new();
-                if leading_colon {
+                if leading {
                     display.push(':');
                 }
-                for _ in 0..n_dashes {
-                    display.push('-');
-                }
-                if trailing_colon {
+                display.extend(std::iter::repeat_n('-', n_dashes));
+                if trailing {
                     display.push(':');
                 }
-                w_cell = text_w(&display, window);
-                augmented.substitutions.push(Substitution {
-                    source_range: cell.clone(),
-                    display,
-                });
-            }
-
-            let target_content = col_x.get(k).copied().unwrap_or(acc)
-                + if is_delimiter {
-                    px(0.0)
-                } else {
-                    lead_fill(k, w_cell)
-                };
-            let (n1, n2);
-            if edit {
-                // Split pads around the pipe: n1 completes the
-                // previous column's box (ideal pipe position =
-                // col_x[k] − space − pipe), n2 supplies this cell's
-                // alignment lead.
-                let pipe_target = col_x.get(k).copied().unwrap_or(acc) - w_sp - w_pipe;
-                n1 = if k == 0 { 0 } else { pads_for(pipe_target - x) };
-                let after_boundary = x + pad_w * (n1 as f32) + w_boundary;
-                n2 = pads_for(target_content - after_boundary - w_pre);
+                let map = vec![cell.start; display.len() + 1];
+                let runs = [TextRun {
+                    len: display.len(),
+                    font: base_font_for_block(&block.kind, style),
+                    color: style.delimiter_color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }];
+                let line = window
+                    .text_system()
+                    .shape_text(SharedString::from(display), font_size, &runs, None, None)
+                    .ok()
+                    .and_then(|mut v| v.drain(..).next())
+                    .map(Arc::new)
+                    .or_else(|| empty_shaped_line(font_size, window))?;
+                (line, map, bx)
             } else {
-                n1 = 0;
-                n2 = pads_for(target_content - x - w_pre);
+                // Measure unwrapped; wrap only when it doesn't fit.
+                let (unwrapped, map) = shape_slice(cell, None, window)?;
+                if unwrapped.width() <= bw + px(0.5) {
+                    // Alignment shift inside the box (single-row
+                    // cells only; wrapped cells left-align).
+                    let free = (bw - unwrapped.width()).max(px(0.0));
+                    let fill = if is_delimiter {
+                        px(0.0)
+                    } else {
+                        match geometry.alignment(k) {
+                            TableAlignment::Right => free,
+                            TableAlignment::Center => free * 0.5,
+                            TableAlignment::None | TableAlignment::Left => px(0.0),
+                        }
+                    };
+                    (unwrapped, map, bx + fill)
+                } else {
+                    let (wrapped, map) = shape_slice(cell, Some(bw), window)?;
+                    (wrapped, map, bx)
+                }
+            };
+            let h = line_height * (line.wrap_boundaries().len() as f32 + 1.0);
+            if h > row_h {
+                row_h = h;
             }
-            if (n1 > 0 || n2 > 0) && boundary.start < boundary.end {
-                let mut display = pad_run(n1);
-                display.push_str(&source[boundary.clone()]);
-                display.push_str(&pad_run(n2));
-                augmented.substitutions.push(Substitution {
-                    source_range: boundary,
-                    display,
-                });
-            }
-            // Advance measured x: pads + boundary text + the
-            // segment's real bytes (leading padding + content +
-            // trailing padding — hidden bytes measure zero in
-            // display mode, so this is content-only there).
-            x += pad_w * ((n1 + n2) as f32) + w_boundary + w_pre + w_cell + w_post;
-            prev_end = seg.end;
+            // The cell claims one byte past its content end, and cell
+            // pieces precede the row's chrome fragments in the vec:
+            // the caret at a cell's content end (the typing position,
+            // shared with the following fragment's start) therefore
+            // resolves to the CELL and paints at its text end — not at
+            // the column box's far edge where the fragment starts.
+            // Offsets strictly inside the padding still resolve to the
+            // fragment (true x in the gutter).
+            let claim_end = (cell.end + 1).min(source.len());
+            pieces.push(TablePiece {
+                line,
+                rel_origin: point(ox, y),
+                source_range: cell.start..claim_end,
+                display_to_source: map,
+                wrapped_height: h,
+            });
         }
-        // Trailing boundary (` |`): in edit mode pad the last cell
-        // out to its slot so the closing pipes align column-style.
-        let trailing = prev_end..row.line.end;
-        if edit && trailing.start < trailing.end && !row.cells.is_empty() {
-            let k_last = row.cells.len() - 1;
-            let pipe_target = col_x.get(k_last).copied().unwrap_or(px(0.0))
-                + slot.get(k_last).copied().unwrap_or(px(0.0))
-                + w_sp;
-            let n = pads_for(pipe_target - x);
-            if n > 0 {
-                let mut display = pad_run(n);
-                display.push_str(&source[trailing.clone()]);
-                augmented.substitutions.push(Substitution {
-                    source_range: trailing,
-                    display,
-                });
+
+        // Chrome fragments: [line start .. cell0 start], each
+        // inter-cell gap, and the trailing chunk (which swallows the
+        // row's `\n` so end-of-line offsets stay covered).
+        let mut frag_ranges: Vec<(Range<usize>, Pixels)> = Vec::new();
+        if let Some(first) = row.cells.first() {
+            frag_ranges.push((row.line.start..first.start, px(0.0)));
+            for k in 1..row.cells.len() {
+                let x = col_x.get(k - 1).copied().unwrap_or(px(0.0))
+                    + col_w.get(k - 1).copied().unwrap_or(px(0.0));
+                frag_ranges.push((row.cells[k - 1].end..row.cells[k].start, x));
             }
+            let k_last = row.cells.len() - 1;
+            let trail_x = col_x.get(k_last).copied().unwrap_or(px(0.0))
+                + col_w.get(k_last).copied().unwrap_or(px(0.0));
+            let mut trail_end = row.line.end;
+            if source.as_bytes().get(trail_end) == Some(&b'\n') {
+                trail_end += 1;
+            }
+            frag_ranges.push((row.cells[k_last].end..trail_end, trail_x));
+        }
+        for (range, x) in frag_ranges {
+            if range.start >= range.end {
+                continue;
+            }
+            let (line, map) = shape_slice(&range, None, window)?;
+            pieces.push(TablePiece {
+                line,
+                rel_origin: point(x, y),
+                source_range: range,
+                display_to_source: map,
+                wrapped_height: line_height,
+            });
+        }
+
+        // The row's pieces all share the row top; the row advances by
+        // its tallest piece. (Fragments keep `line_height` — they
+        // never wrap.)
+        y += row_h;
+        if !edit && i < last_row_idx {
+            rule_ys.push(y);
         }
     }
 
-    augmented
+    Some(TableLayoutOut {
+        pieces,
+        size: size(total_w, y),
+        rule_ys,
+    })
 }
 
 /// Paint state for a `BlockKind::Table` block: horizontal-scroll
@@ -1254,22 +1337,27 @@ impl Element for BlockElement {
                     &style_clone,
                     window,
                 );
-                // Tables: measure cells and substitute alignment pads
-                // so the shaped line count and widths here match
-                // prepaint's (an all-empty table row would otherwise
-                // shape to an empty display line and be dropped from
-                // the measure but kept in prepaint).
-                let augmented_block = if is_table {
-                    augment_block_with_table(
+                // Tables: the box-model layout computes its own
+                // height (rows of independently wrapped cell boxes);
+                // it must run against the same inner width prepaint
+                // will use so the two phases agree.
+                if is_table
+                    && let Some(layout) = layout_table(
                         &augmented_block,
                         &source,
                         font_size,
                         &style_clone,
+                        inner_w,
                         window,
                     )
-                } else {
-                    augmented_block
-                };
+                {
+                    let content_h = inner_pad * 2. + layout.size.height.max(line_height);
+                    let h = extra_above + spacing_above + content_h + spacing_below + extra_below;
+                    return Size {
+                        width: avail_w,
+                        height: h,
+                    };
+                }
                 let (body_ascent, body_descent) =
                     body_metrics_for_block(&block_clone.kind, &style_clone, font_size, window);
                 let lines = shape_block_lines(
@@ -1443,14 +1531,7 @@ impl Element for BlockElement {
             &style,
             window,
         );
-        // Tables: the column-alignment pre-pass (cell measurement +
-        // pad substitutions). Mirrors the request_layout measure
-        // closure so heights and widths agree between the phases.
-        let mut augmented_block = if is_table {
-            augment_block_with_table(&augmented_block, &source, font_size, &style, window)
-        } else {
-            augmented_block
-        };
+        let mut augmented_block = augmented_block;
         // Block image in display mode: hide the source bytes when
         // we have a paintable image (Loaded) or a placeholder
         // (Loading) so the raw `![alt](url)` text doesn't shape
@@ -1477,8 +1558,26 @@ impl Element for BlockElement {
         }
         let (body_ascent, body_descent) =
             body_metrics_for_block(&self.block.kind, &style, font_size, window);
-        let shaped =
-            shape_block_lines(&source, &augmented_block, &style, font_size, wrap_w, window);
+        // Tables take the box-model layout (rows of independently
+        // wrapped cell boxes — see `layout_table`) instead of the
+        // per-source-line shape pass.
+        let table_layout = if is_table {
+            layout_table(
+                &augmented_block,
+                &source,
+                font_size,
+                &style,
+                block_width,
+                window,
+            )
+        } else {
+            None
+        };
+        let shaped = if table_layout.is_some() {
+            Vec::new()
+        } else {
+            shape_block_lines(&source, &augmented_block, &style, font_size, wrap_w, window)
+        };
 
         let mut lines: Vec<LaidOutLine> = Vec::new();
         let mut content_cursor_y = content_top;
@@ -1548,6 +1647,30 @@ impl Element for BlockElement {
             });
             content_cursor_y += wrapped_h;
             last_was_delim = sl.is_delimiter;
+        }
+        // Table pieces: re-base the layout's relative origins into
+        // window coordinates. All pieces of one table row share the
+        // row's top y; the layout already advanced rows by their
+        // tallest cell.
+        let mut table_rule_ys: Vec<Pixels> = Vec::new();
+        if let Some(layout) = table_layout {
+            for piece in layout.pieces {
+                lines.push(LaidOutLine {
+                    line: piece.line,
+                    origin: point(
+                        content_left + piece.rel_origin.x,
+                        content_top + piece.rel_origin.y,
+                    ),
+                    row_height: line_height,
+                    wrapped_height: piece.wrapped_height,
+                    source_range: piece.source_range,
+                    display_to_source: piece.display_to_source,
+                    is_delimiter: false,
+                });
+            }
+            max_content_line_width = layout.size.width;
+            content_cursor_y = content_top + layout.size.height;
+            table_rule_ys = layout.rule_ys.iter().map(|ry| content_top + *ry).collect();
         }
         // Trailing content (no closing fence) — extend the strip to
         // cover the trailing breathing room and advance the layout
@@ -1691,24 +1814,14 @@ impl Element for BlockElement {
         // (painted at full rule color; later ones lighter). Edit mode
         // paints no rules — the dimmed delimiter row is the boundary.
         let table_paint = if is_table {
-            let edit_mode = matches!(
-                &self.block.kind,
-                BlockKind::Table {
-                    edit_mode: true,
-                    ..
-                }
-            );
             let mut rules = Vec::new();
-            if !edit_mode {
-                let rule_x = content_left - scroll_x;
-                let rule_w = max_content_line_width.max(px(1.0));
-                for i in 0..laid_out.lines.len().saturating_sub(1) {
-                    let y = laid_out.lines[i + 1].origin.y;
-                    rules.push(Bounds::new(
-                        point(rule_x, y - px(0.5)),
-                        size(rule_w, px(1.0)),
-                    ));
-                }
+            let rule_x = content_left - scroll_x;
+            let rule_w = max_content_line_width.max(px(1.0));
+            for ry in &table_rule_ys {
+                rules.push(Bounds::new(
+                    point(rule_x, *ry - px(0.5)),
+                    size(rule_w, px(1.0)),
+                ));
             }
             Some(TablePaint {
                 clip: Bounds::new(
@@ -4009,30 +4122,28 @@ mod tests {
                 .expect("a table block");
             let font_size = font_size_for_block(&block.kind, &style);
             let line_height = font_size * style.line_height.0;
-            let augmented = augment_block_with_table(block, &src_owned, font_size, &style, window);
-            let shaped = shape_block_lines(&src_owned, &augmented, &style, font_size, None, window);
+            let layout = layout_table(block, &src_owned, font_size, &style, px(720.0), window)
+                .expect("a table layout");
             let mut out = Vec::new();
-            let mut width = px(0.0);
             for probe in &probes {
-                let sl = shaped
+                let piece = layout
+                    .pieces
                     .iter()
-                    .find(|sl| sl.source_range.start <= *probe && *probe <= sl.source_range.end)
-                    .expect("a shaped line containing the probe");
+                    .find(|p| p.source_range.start <= *probe && *probe <= p.source_range.end)
+                    .expect("a table piece containing the probe");
                 let laid = LaidOutLine {
-                    line: sl.line.clone(),
-                    origin: point(px(0.0), px(0.0)),
+                    line: piece.line.clone(),
+                    origin: point(piece.rel_origin.x, piece.rel_origin.y),
                     row_height: line_height,
-                    wrapped_height: line_height,
-                    source_range: sl.source_range.clone(),
-                    display_to_source: sl.display_to_source.clone(),
-                    is_delimiter: sl.is_delimiter,
+                    wrapped_height: piece.wrapped_height,
+                    source_range: piece.source_range.clone(),
+                    display_to_source: piece.display_to_source.clone(),
+                    is_delimiter: false,
                 };
-                if sl.line.width() > width {
-                    width = sl.line.width();
-                }
-                out.push(laid.local_position_for_source_offset(*probe).x);
+                let local = laid.local_position_for_source_offset(*probe);
+                out.push(laid.origin.x + local.x);
             }
-            (out, width)
+            (out, layout.size.width)
         })
         .expect("update window")
     }
