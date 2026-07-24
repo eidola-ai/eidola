@@ -26,6 +26,7 @@ pub mod render_spec;
 pub mod state;
 pub mod style;
 pub mod syntax;
+pub mod table;
 pub mod update;
 
 pub use editor::{
@@ -44,5 +45,5 @@ pub use render_spec::{
 };
 pub use state::{EditorState, Selection};
 pub use style::MarkdownStyle;
-pub use syntax::{NodeKind, SyntaxNode};
+pub use syntax::{NodeKind, SyntaxNode, TableAlignment};
 pub use update::update;
