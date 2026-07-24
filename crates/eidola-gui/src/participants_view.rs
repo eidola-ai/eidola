@@ -40,13 +40,13 @@ const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
 /// The three notify-policy values with their human labels. The stored value is
 /// the schema enum (`explicit`/`human`/`all`); the label is what a person reads
 /// ("Responds: …").
-const NOTIFY_POLICIES: [(&str, &str); 3] = [
+pub(crate) const NOTIFY_POLICIES: [(&str, &str); 3] = [
     ("explicit", "when asked"),
     ("human", "to people"),
     ("all", "to everything"),
 ];
 
-fn notify_label(policy: &str) -> &'static str {
+pub(crate) fn notify_label(policy: &str) -> &'static str {
     NOTIFY_POLICIES
         .iter()
         .find(|(v, _)| *v == policy)
@@ -477,87 +477,222 @@ impl ParticipantsView {
 
     /// The human display for a model selection id: `(model name, backend name)`.
     fn model_display(&self, selection: &str, cx: &gpui::App) -> (SharedString, SharedString) {
-        let mref = eidola_app_core::parse_model_ref(selection);
-        let backend_name = self
-            .stores
-            .backends
-            .read(cx)
-            .get(&mref.backend_id)
-            .map(|b| b.display_name.clone())
-            .unwrap_or_else(|| match mref.backend_id.as_str() {
-                eidola_app_core::EIDOLA_BACKEND_ID => "Eidola".to_string(),
-                eidola_app_core::LOCAL_BACKEND_ID => "Local".to_string(),
-                other => other.to_string(),
-            });
-        let local = self.stores.local_models.read(cx);
-        let model_name = local
-            .models()
-            .iter()
-            .chain(local.external().iter().flat_map(|b| b.models.iter()))
-            .find(|m| m.id == selection)
-            .map(|m| m.display_name.clone())
-            .unwrap_or_else(|| mref.model.clone());
-        (model_name.into(), backend_name.into())
+        model_display(&self.stores, selection, cx)
     }
+}
 
-    /// The grouped list of selectable models — engine groups first, then the
-    /// fetch-based catalogs. Mirrors the request panel's data sources so a
-    /// participant's model field offers exactly what an ask can route to.
-    fn model_groups(&self, cx: &gpui::App) -> Vec<(String, Vec<(String, String)>)> {
-        let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
-        let local = self.stores.local_models.read(cx);
-        let backends = self.stores.backends.read(cx);
-        if backends.is_enabled(eidola_app_core::LOCAL_BACKEND_ID) {
-            let selectable = local.selectable_models();
-            if !selectable.is_empty() {
-                let header = backends
-                    .get(eidola_app_core::LOCAL_BACKEND_ID)
-                    .map(|b| b.display_name.clone())
-                    .unwrap_or_else(|| "Local".into());
-                groups.push((
-                    header,
-                    selectable
-                        .into_iter()
-                        .map(|m| (m.id, m.display_name))
-                        .collect(),
-                ));
-            }
+/// The human display for a model selection id: `(model name, backend name)`.
+/// Shared by the Participants view and the Space Templates pane.
+pub(crate) fn model_display(
+    stores: &Stores,
+    selection: &str,
+    cx: &gpui::App,
+) -> (SharedString, SharedString) {
+    let mref = eidola_app_core::parse_model_ref(selection);
+    let backend_name = stores
+        .backends
+        .read(cx)
+        .get(&mref.backend_id)
+        .map(|b| b.display_name.clone())
+        .unwrap_or_else(|| match mref.backend_id.as_str() {
+            eidola_app_core::EIDOLA_BACKEND_ID => "Eidola".to_string(),
+            eidola_app_core::LOCAL_BACKEND_ID => "Local".to_string(),
+            other => other.to_string(),
+        });
+    let local = stores.local_models.read(cx);
+    let model_name = local
+        .models()
+        .iter()
+        .chain(local.external().iter().flat_map(|b| b.models.iter()))
+        .find(|m| m.id == selection)
+        .map(|m| m.display_name.clone())
+        .unwrap_or_else(|| mref.model.clone());
+    (model_name.into(), backend_name.into())
+}
+
+/// The grouped list of selectable models — engine groups first, then the
+/// fetch-based catalogs. Mirrors the request panel's data sources so a
+/// participant's model field offers exactly what an ask can route to. Shared by
+/// the Participants view and the Space Templates pane.
+pub(crate) fn model_groups(
+    stores: &Stores,
+    cx: &gpui::App,
+) -> Vec<(String, Vec<(String, String)>)> {
+    let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    let local = stores.local_models.read(cx);
+    let backends = stores.backends.read(cx);
+    if backends.is_enabled(eidola_app_core::LOCAL_BACKEND_ID) {
+        let selectable = local.selectable_models();
+        if !selectable.is_empty() {
+            let header = backends
+                .get(eidola_app_core::LOCAL_BACKEND_ID)
+                .map(|b| b.display_name.clone())
+                .unwrap_or_else(|| "Local".into());
+            groups.push((
+                header,
+                selectable
+                    .into_iter()
+                    .map(|m| (m.id, m.display_name))
+                    .collect(),
+            ));
         }
-        for ext in local.external() {
-            if !ext.enabled {
-                continue;
-            }
-            let selectable = local.external_selectable_models(&ext.backend_id);
-            if !selectable.is_empty() {
-                groups.push((
-                    ext.display_name.clone(),
-                    selectable
-                        .into_iter()
-                        .map(|m| (m.id, m.display_name))
-                        .collect(),
-                ));
-            }
-        }
-        for catalog in self.stores.models.read(cx).catalogs() {
-            let header = if catalog.backend.kind == eidola_app_core::BackendKind::Eidola {
-                "Via Eidola".to_string()
-            } else {
-                catalog.backend.display_name.clone()
-            };
-            if let Some(models) = catalog.models.value()
-                && !models.is_empty()
-            {
-                groups.push((
-                    header,
-                    models
-                        .iter()
-                        .map(|m| (m.id.clone(), m.id.clone()))
-                        .collect(),
-                ));
-            }
-        }
-        groups
     }
+    for ext in local.external() {
+        if !ext.enabled {
+            continue;
+        }
+        let selectable = local.external_selectable_models(&ext.backend_id);
+        if !selectable.is_empty() {
+            groups.push((
+                ext.display_name.clone(),
+                selectable
+                    .into_iter()
+                    .map(|m| (m.id, m.display_name))
+                    .collect(),
+            ));
+        }
+    }
+    for catalog in stores.models.read(cx).catalogs() {
+        let header = if catalog.backend.kind == eidola_app_core::BackendKind::Eidola {
+            "Via Eidola".to_string()
+        } else {
+            catalog.backend.display_name.clone()
+        };
+        if let Some(models) = catalog.models.value()
+            && !models.is_empty()
+        {
+            groups.push((
+                header,
+                models
+                    .iter()
+                    .map(|m| (m.id.clone(), m.id.clone()))
+                    .collect(),
+            ));
+        }
+    }
+    groups
+}
+
+/// A model-picker dropdown field shared by the Participants view and Templates
+/// pane: a button showing the current model, plus (when `open`) a grouped list
+/// of selectable models. `on_pick` receives the chosen model id.
+pub(crate) fn model_field<V: 'static>(
+    stores: &Stores,
+    current: Option<&str>,
+    open: bool,
+    probe_prefix: SharedString,
+    cx: &Context<V>,
+    on_toggle: impl Fn(&mut V, &gpui::ClickEvent, &mut Window, &mut Context<V>) + 'static,
+    on_pick: impl Fn(&str, &mut V, &mut Context<V>) + Clone + 'static,
+) -> gpui::AnyElement {
+    let theme = cx.theme();
+    let (name, backend) = match current {
+        Some(sel) if !sel.is_empty() => {
+            let (n, b) = model_display(stores, sel, cx);
+            (n, Some(b))
+        }
+        _ => ("Choose a model…".into(), None),
+    };
+    let button = h_flex()
+        .id(SharedString::from(format!("{probe_prefix}-button")))
+        .probe(probe_prefix.clone(), gpui::Role::Button, "Model")
+        .w_full()
+        .px_2()
+        .py_1()
+        .gap_2()
+        .items_center()
+        .justify_between()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+        .child(
+            h_flex()
+                .gap_1p5()
+                .items_baseline()
+                .child(div().text_sm().child(name))
+                .when_some(backend, |el, b| {
+                    el.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(format!("· {b}"))),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("▾"),
+        )
+        .on_click(cx.listener(on_toggle));
+
+    let mut col = v_flex().w_full().gap_1().child(button);
+    if open {
+        let groups = model_groups(stores, cx);
+        let mut menu = v_flex()
+            .id(SharedString::from(format!("{probe_prefix}-menu")))
+            .probe(
+                format!("{probe_prefix}/menu"),
+                gpui::Role::ListBox,
+                "Models",
+            )
+            .w_full()
+            .max_h(px(220.))
+            .overflow_y_scroll()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background);
+        if groups.is_empty() {
+            menu = menu.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("No models available."),
+            );
+        }
+        for (gi, (header, models)) in groups.into_iter().enumerate() {
+            menu = menu.child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(header)),
+            );
+            for (mi, (id, display)) in models.into_iter().enumerate() {
+                let selected = current == Some(id.as_str());
+                let pick_id = id.clone();
+                let on_pick = on_pick.clone();
+                menu = menu.child(
+                    div()
+                        .id(SharedString::from(format!("{probe_prefix}-opt-{gi}-{mi}")))
+                        .probe(
+                            format!("{probe_prefix}/option/{gi}/{mi}"),
+                            gpui::Role::Button,
+                            display.clone(),
+                        )
+                        .px_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .text_sm()
+                        .hover(|s| s.bg(theme.secondary.opacity(0.6)))
+                        .when(selected, |el| el.text_color(theme.link))
+                        .child(SharedString::from(display))
+                        .on_click(cx.listener(move |this, _, _, cx| on_pick(&pick_id, this, cx))),
+                );
+            }
+        }
+        col = col.child(menu);
+    }
+    col.into_any_element()
 }
 
 impl Render for ParticipantsView {
@@ -1033,130 +1168,27 @@ impl ParticipantsView {
             )
     }
 
-    /// The model field: a button showing the current model, and (when this
-    /// field's picker is open) a dropdown of grouped selectable models.
+    /// The model field, delegating to the shared [`model_field`] widget.
     fn render_model_field(
         &self,
         current: Option<&str>,
         target: PickerTarget,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.theme();
-        let (name, backend) = match current {
-            Some(sel) if !sel.is_empty() => {
-                let (n, b) = self.model_display(sel, cx);
-                (n, Some(b))
-            }
-            _ => ("Choose a model…".into(), None),
-        };
         let open = self.picker == Some(target);
-        let probe_prefix = match target {
-            PickerTarget::Edit => "participants/editor/model",
-            PickerTarget::Add => "participants/add/model",
+        let probe_prefix: SharedString = match target {
+            PickerTarget::Edit => "participants/editor/model".into(),
+            PickerTarget::Add => "participants/add/model".into(),
         };
-
-        let button = h_flex()
-            .id(SharedString::from(format!("{probe_prefix}-button")))
-            .probe(probe_prefix.to_string(), gpui::Role::Button, "Model")
-            .w_full()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .items_center()
-            .justify_between()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.secondary.opacity(0.5)))
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .items_baseline()
-                    .child(div().text_sm().child(name))
-                    .when_some(backend, |el, b| {
-                        el.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(SharedString::from(format!("· {b}"))),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("▾"),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_picker(target, cx)));
-
-        let mut col = v_flex().w_full().gap_1().child(button);
-
-        if open {
-            let groups = self.model_groups(cx);
-            let mut menu = v_flex()
-                .id(SharedString::from(format!("{probe_prefix}-menu")))
-                .probe(
-                    format!("{probe_prefix}/menu"),
-                    gpui::Role::ListBox,
-                    "Models",
-                )
-                .w_full()
-                .max_h(px(220.))
-                .overflow_y_scroll()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.background);
-            if groups.is_empty() {
-                menu = menu.child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("No models available."),
-                );
-            }
-            for (gi, (header, models)) in groups.into_iter().enumerate() {
-                menu = menu.child(
-                    div()
-                        .px_3()
-                        .pt_2()
-                        .pb_1()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(SharedString::from(header)),
-                );
-                for (mi, (id, display)) in models.into_iter().enumerate() {
-                    let selected = current == Some(id.as_str());
-                    let pick_id = id.clone();
-                    menu = menu.child(
-                        div()
-                            .id(SharedString::from(format!("{probe_prefix}-opt-{gi}-{mi}")))
-                            .probe(
-                                format!("{probe_prefix}/option/{gi}/{mi}"),
-                                gpui::Role::Button,
-                                display.clone(),
-                            )
-                            .px_3()
-                            .py_1()
-                            .cursor_pointer()
-                            .text_sm()
-                            .hover(|s| s.bg(theme.secondary.opacity(0.6)))
-                            .when(selected, |el| el.text_color(theme.link))
-                            .child(SharedString::from(display))
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.select_model(&pick_id, cx)),
-                            ),
-                    );
-                }
-            }
-            col = col.child(menu);
-        }
-        col
+        model_field(
+            &self.stores,
+            current,
+            open,
+            probe_prefix,
+            cx,
+            move |this, _, _, cx| this.toggle_picker(target, cx),
+            |id, this, cx| this.select_model(id, cx),
+        )
     }
 
     /// A three-option notify-policy row ("Responds: when asked / to people / to
@@ -1190,7 +1222,7 @@ impl ParticipantsView {
     }
 }
 
-fn field_label(label: &str, cx: &gpui::App) -> impl IntoElement {
+pub(crate) fn field_label(label: &str, cx: &gpui::App) -> impl IntoElement {
     let theme = cx.theme();
     div()
         .text_xs()
@@ -1200,7 +1232,7 @@ fn field_label(label: &str, cx: &gpui::App) -> impl IntoElement {
 
 /// A small selectable chip (mode toggle / notify option), styled like the
 /// General pane's `choice_chip` — active gets the sidebar-accent pill.
-fn mode_chip(
+pub(crate) fn mode_chip(
     id: SharedString,
     probe_name: SharedString,
     label: SharedString,
@@ -1232,7 +1264,7 @@ fn mode_chip(
 /// as a probed styled `div` — `.probe` doesn't apply to gpui-component's
 /// `Button`, and this keeps the calm, book-like voice. `primary` fills it with
 /// the accent (Save / Add); otherwise it's a quiet ghost.
-fn ghost_button(
+pub(crate) fn ghost_button(
     id: SharedString,
     probe_name: SharedString,
     label: &'static str,
@@ -1262,7 +1294,7 @@ fn ghost_button(
     el.child(label).on_click(on_click)
 }
 
-fn error_banner(message: &str, cx: &gpui::App) -> impl IntoElement {
+pub(crate) fn error_banner(message: &str, cx: &gpui::App) -> impl IntoElement {
     let theme = cx.theme();
     h_flex()
         .gap_2()

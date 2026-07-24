@@ -20,6 +20,7 @@ pub mod solar;
 pub mod space;
 pub mod space_view;
 pub mod stores;
+pub mod templates_settings;
 pub mod theme;
 pub mod titlebar;
 pub mod updates;
