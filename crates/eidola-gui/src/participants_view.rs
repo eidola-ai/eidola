@@ -887,15 +887,16 @@ impl ParticipantsView {
         let pid2 = p.id.clone();
         let label = p.label.clone();
 
-        // Secondary line: for an agent, "model (via backend)"; for the human,
-        // "You". A referenced global also shows a quiet "shared" tag.
-        let detail: SharedString = if is_human {
-            "You".into()
+        // Secondary line: for an agent, "model · backend"; for the human, the
+        // model line is meaningless (people don't have a model), so it is
+        // suppressed. A referenced global also shows a quiet "shared" tag.
+        let detail: Option<SharedString> = if is_human {
+            None
         } else if let Some(model) = p.model_ref.as_deref() {
             let (name, backend) = self.model_display(model, cx);
-            format!("{name} · {backend}").into()
+            Some(format!("{name} · {backend}").into())
         } else {
-            "no model set".into()
+            Some("no model set".into())
         };
 
         let responds = format!("Responds {}", notify_label(&p.notify_policy));
@@ -930,12 +931,14 @@ impl ParticipantsView {
                                 )
                             }),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(detail),
-                    )
+                    .when_some(detail, |el, detail| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(detail),
+                        )
+                    })
                     .when(!is_human, |el| {
                         el.child(
                             div()
