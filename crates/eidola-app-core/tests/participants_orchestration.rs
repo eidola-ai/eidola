@@ -604,3 +604,97 @@ fn default_agent_label() -> String {
     // `gemma4-31b` → `Gemma4 31b` (see db::default_agent_label).
     "Gemma4 31b".to_string()
 }
+
+// ===========================================================================
+// Override-here vs edit-everywhere (the wave-3 GUI fork's app-core surface)
+// ===========================================================================
+
+#[test]
+fn referenced_global_override_and_edit_everywhere_fork() {
+    run(|| {
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig::default());
+        let space = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+
+        // "You" is a REFERENCED global; its `reference` detail is populated with
+        // the shared base config and (initially) no overrides.
+        let you = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == eidola_app_core::HUMAN_PARTICIPANT_ID)
+            .expect("You is a member");
+        assert_eq!(you.source, "referenced");
+        let reference = you.reference.clone().expect("referenced detail present");
+        assert_eq!(reference.base_label, you.label, "no override yet");
+        assert!(reference.override_label.is_none(), "no override yet");
+
+        // Override-here: this space only. Effective label changes; base does not.
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                space.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                eidola_app_core::ParticipantOverride {
+                    label: Some(Some("Me".to_string())),
+                    ..Default::default()
+                },
+            ))
+            .expect("override");
+        let you = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == eidola_app_core::HUMAN_PARTICIPANT_ID)
+            .unwrap();
+        assert_eq!(you.label, "Me", "effective label is the override");
+        let reference = you.reference.clone().unwrap();
+        assert_eq!(reference.override_label.as_deref(), Some("Me"));
+        assert_ne!(reference.base_label, "Me", "the shared global is untouched");
+
+        // Revert the override (inner None) → back to inherited.
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                space.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                eidola_app_core::ParticipantOverride {
+                    label: Some(None),
+                    ..Default::default()
+                },
+            ))
+            .expect("revert override");
+        let you = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == eidola_app_core::HUMAN_PARTICIPANT_ID)
+            .unwrap();
+        assert_eq!(you.label, reference.base_label, "reverted to the base");
+        assert!(you.reference.unwrap().override_label.is_none());
+
+        // Edit-everywhere: writes the shared global's own config.
+        core.runtime()
+            .block_on(core.update_space_participant(
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                ParticipantUpdate {
+                    label: Some("Myself".to_string()),
+                    ..Default::default()
+                },
+            ))
+            .expect("edit everywhere");
+        let you = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == eidola_app_core::HUMAN_PARTICIPANT_ID)
+            .unwrap();
+        assert_eq!(you.label, "Myself", "the shared base changed");
+        assert_eq!(you.reference.unwrap().base_label, "Myself");
+    });
+}

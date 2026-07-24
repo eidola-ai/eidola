@@ -434,6 +434,10 @@ impl Render for LibraryView {
             crate::titlebar::drag_band("library-titlebar", TITLE_BAR_RESERVE, window, cx);
         let theme = cx.theme();
         let count = self.spaces.read(cx).list().len();
+        // A "New Space from Template" failure is surfaced here (the natural home
+        // for a failed new-space) rather than silently discarded by its owning
+        // store task.
+        let new_space_error = self.spaces.read(cx).new_space_error().map(str::to_string);
 
         let mut root = crate::chrome::round_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)
@@ -474,6 +478,50 @@ impl Render for LibraryView {
                 )
                 .child(div().h(px(1.)).flex_1().bg(theme.border)),
         );
+
+        // A failed "New Space from Template" — a dismissible danger strip.
+        if let Some(err) = new_space_error {
+            root = root.child(
+                h_flex()
+                    .id("library-new-space-error")
+                    .probe("library/new-space-error", gpui::Role::Alert, err.clone())
+                    .mx_10()
+                    .mb_2()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .rounded_md()
+                    .bg(theme.danger.opacity(0.08))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(theme.danger)
+                            .child(SharedString::from(format!(
+                                "Couldn't create the space: {err}"
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .id("library-new-space-error-dismiss")
+                            .probe(
+                                "library/new-space-error/dismiss",
+                                gpui::Role::Button,
+                                "Dismiss",
+                            )
+                            .cursor_pointer()
+                            .text_color(theme.muted_foreground)
+                            .hover(|s| s.text_color(theme.foreground))
+                            .child("×")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.spaces.update(cx, |s, cx| s.clear_new_space_error(cx));
+                            })),
+                    ),
+            );
+        }
 
         if count == 0 {
             return root.child(
