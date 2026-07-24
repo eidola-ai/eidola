@@ -284,6 +284,18 @@ impl ConfigStore {
         self.set_font_scale(eidola_app_core::config::FONT_SCALE_DEFAULT, cx);
     }
 
+    /// Set the default space template (the `default_template` config key) — the
+    /// template `New Space` / ⌘N instantiates. `AppCore::set_default_template`
+    /// emits both `Change::Config` and `Change::Templates`.
+    pub fn set_default_template(&mut self, template_id: String, cx: &mut Context<Self>) {
+        self.write(cx, |c| c.set_default_template(template_id));
+    }
+
+    /// The current default template id (from the config snapshot).
+    pub fn default_template(&self) -> Option<String> {
+        self.state.as_ref().map(|s| s.default_template.clone())
+    }
+
     #[allow(dead_code)]
     pub fn set_attestation_url(&mut self, url: String, cx: &mut Context<Self>) {
         self.write(cx, |c| c.set_attestation_url(url));

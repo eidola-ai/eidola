@@ -29,6 +29,7 @@ use crate::backends_settings::BackendsSettingsView;
 use crate::general::GeneralView;
 use crate::probe::Probe as _;
 use crate::stores::{BackendsStore, Stores};
+use crate::templates_settings::TemplatesSettingsView;
 use crate::wallet::WalletView;
 
 /// Vertical reserve at the top of the nav band so the macOS traffic lights
@@ -43,6 +44,7 @@ const NAV_WIDTH: gpui::Pixels = gpui::px(132.);
 pub enum SettingsPane {
     General,
     Backends,
+    Templates,
     Account,
     Wallet,
 }
@@ -52,6 +54,7 @@ impl SettingsPane {
         match self {
             SettingsPane::General => "General",
             SettingsPane::Backends => "Backends",
+            SettingsPane::Templates => "Templates",
             SettingsPane::Account => "Account",
             SettingsPane::Wallet => "Wallet",
         }
@@ -68,6 +71,7 @@ pub struct SettingsView {
     selected: SettingsPane,
     general: Entity<GeneralView>,
     backends: Entity<BackendsSettingsView>,
+    templates: Entity<TemplatesSettingsView>,
     account: Entity<AccountView>,
     wallet: Entity<WalletView>,
     /// The backend registry — read to gate the Account/Wallet nav items on
@@ -85,6 +89,7 @@ impl SettingsView {
     pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let general = cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx));
         let backends = cx.new(|cx| BackendsSettingsView::new(stores.clone(), window, cx));
+        let templates = cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx));
         let account = cx.new(|cx| AccountView::new(stores.clone(), window, cx));
         let wallet = cx.new(|cx| WalletView::new(stores.clone(), window, cx));
         let backends_store = stores.backends.clone();
@@ -105,6 +110,7 @@ impl SettingsView {
             selected: SettingsPane::General,
             general,
             backends,
+            templates,
             account,
             wallet,
             backends_store,
@@ -135,7 +141,11 @@ impl SettingsView {
     /// Account and Wallet while the eidola backend is enabled. The one source
     /// of truth for both the rendered nav and the gating behavior tests.
     pub fn visible_panes(&self, cx: &gpui::App) -> Vec<SettingsPane> {
-        let mut panes = vec![SettingsPane::General, SettingsPane::Backends];
+        let mut panes = vec![
+            SettingsPane::General,
+            SettingsPane::Backends,
+            SettingsPane::Templates,
+        ];
         if self.eidola_enabled(cx) {
             panes.push(SettingsPane::Account);
             panes.push(SettingsPane::Wallet);
@@ -178,6 +188,12 @@ impl SettingsView {
     /// asserting the reset-confirm / checkout flows.
     pub fn account_pane(&self) -> Entity<AccountView> {
         self.account.clone()
+    }
+
+    /// The Space Templates pane entity — exposed for behavior tests asserting
+    /// the template CRUD + set-default flows.
+    pub fn templates_pane(&self) -> Entity<TemplatesSettingsView> {
+        self.templates.clone()
     }
 
     fn nav_item(
@@ -227,6 +243,7 @@ impl Render for SettingsView {
         let body: gpui::AnyElement = match effective {
             SettingsPane::General => self.general.clone().into_any_element(),
             SettingsPane::Backends => self.backends.clone().into_any_element(),
+            SettingsPane::Templates => self.templates.clone().into_any_element(),
             SettingsPane::Account => self.account.clone().into_any_element(),
             SettingsPane::Wallet => self.wallet.clone().into_any_element(),
         };

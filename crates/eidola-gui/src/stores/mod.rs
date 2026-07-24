@@ -24,8 +24,10 @@ pub mod backends;
 pub mod config;
 pub mod local_models;
 pub mod models;
+pub mod participants;
 pub mod record;
 pub mod spaces;
+pub mod templates;
 pub mod update;
 pub mod wallet;
 
@@ -40,8 +42,10 @@ pub use backends::BackendsStore;
 pub use config::ConfigStore;
 pub use local_models::LocalModelsStore;
 pub use models::{BackendCatalog, ModelsStore};
+pub use participants::ParticipantsStore;
 pub use record::RecordStore;
 pub use spaces::SpacesStore;
+pub use templates::TemplatesStore;
 pub use update::UpdateStore;
 pub use wallet::WalletStore;
 
@@ -65,6 +69,12 @@ pub struct Stores {
     pub wallet: Entity<WalletStore>,
     pub spaces: Entity<SpacesStore>,
     pub update: Entity<UpdateStore>,
+    /// Per-space participant membership (the Participants view's data source);
+    /// refreshed on `Change::Participants`.
+    pub participants: Entity<ParticipantsStore>,
+    /// The space-template registry (the Space Templates settings pane);
+    /// refreshed on `Change::Templates`.
+    pub templates: Entity<TemplatesStore>,
     /// Bus-relay only — owns no rows. Record listings live in window-scoped
     /// reader entities (`RecordView`), which observe this store to learn
     /// that the local trail grew (see `stores/record.rs`).
@@ -116,6 +126,8 @@ impl Stores {
             cx.new(|_| WalletStore::stub(fixture.credential_lifecycle, fixture.credentials));
         let spaces = cx.new(|_| SpacesStore::stub(fixture.spaces));
         let update = cx.new(|_| UpdateStore::stub(fixture.update_check, fixture.update_checking));
+        let participants = cx.new(|_| ParticipantsStore::stub(fixture.participants));
+        let templates = cx.new(|_| TemplatesStore::stub(fixture.templates));
         let record = cx.new(|_| RecordStore::new());
         Self {
             app_core: None,
@@ -127,6 +139,8 @@ impl Stores {
             wallet,
             spaces,
             update,
+            participants,
+            templates,
             record,
         }
     }
@@ -148,6 +162,8 @@ impl Stores {
         let wallet = cx.new(|_| WalletStore::new(app_core.clone()));
         let spaces = cx.new(|_| SpacesStore::new(app_core.clone()));
         let update = cx.new(|_| UpdateStore::new(app_core.clone()));
+        let participants = cx.new(|_| ParticipantsStore::new(app_core.clone()));
+        let templates = cx.new(|_| TemplatesStore::new(app_core.clone()));
         let record = cx.new(|_| RecordStore::new());
         Self {
             app_core,
@@ -159,6 +175,8 @@ impl Stores {
             wallet,
             spaces,
             update,
+            participants,
+            templates,
             record,
         }
     }
@@ -197,6 +215,10 @@ pub struct StoresStub {
     pub spaces: Vec<eidola_app_core::SpaceInfo>,
     pub update_check: Option<eidola_app_core::updates::UpdateCheckSnapshot>,
     pub update_checking: bool,
+    /// One space's fixture participant list (the Participants view's scene).
+    pub participants: Option<(String, Vec<eidola_app_core::ParticipantInfo>)>,
+    /// Fixture space templates (the Space Templates settings pane's scene).
+    pub templates: Vec<eidola_app_core::SpaceTemplateInfo>,
 }
 
 /// Install the single app-lifetime bus bridge: a task on `AppCore`'s tokio
@@ -327,14 +349,18 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
             stores.models.update(cx, |s, cx| s.refresh(cx));
             stores.local_models.update(cx, |s, cx| s.refresh(cx));
         }
-        // Participants v1 domains. No GUI store consumes per-space
-        // participants yet (that view lands in wave 3). A template change,
-        // though, can move the resolved default model (the default template's
-        // agent), so refresh the config store's cached `default_model`.
+        // Participants v1 domains. A template change can also move the resolved
+        // default model (the default template's agent), so refresh the config
+        // store's cached `default_model` alongside the templates registry.
         Change::Templates => {
             stores.config.update(cx, |s, cx| s.refresh(cx));
+            stores.templates.update(cx, |s, cx| s.refresh(cx));
         }
-        Change::Participants => {}
+        // A per-space participant change carries no id, so re-read every cached
+        // space's membership.
+        Change::Participants => {
+            stores.participants.update(cx, |s, cx| s.refresh_all(cx));
+        }
     }
 }
 
@@ -352,6 +378,8 @@ fn refresh_everything(stores: &Stores, cx: &mut App) {
     stores.wallet.update(cx, |s, cx| s.refresh(cx));
     stores.spaces.update(cx, |s, cx| s.refresh(cx));
     stores.update.update(cx, |s, cx| s.refresh(cx));
+    stores.templates.update(cx, |s, cx| s.refresh(cx));
+    stores.participants.update(cx, |s, cx| s.refresh_all(cx));
     // A dropped change may have been a Record write — let open Record
     // windows mark themselves stale.
     stores.record.update(cx, |s, cx| s.notify_changed(cx));
