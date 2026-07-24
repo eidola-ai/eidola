@@ -433,6 +433,19 @@ fn fmt_block_kind(kind: &BlockKind) -> String {
                 "Image".to_string()
             }
         }
+        BlockKind::Table {
+            geometry,
+            edit_mode,
+            ..
+        } => {
+            let rows = geometry.rows.len();
+            let cols = geometry.column_count();
+            if *edit_mode {
+                format!("Table(edit,{rows}x{cols})")
+            } else {
+                format!("Table({rows}x{cols})")
+            }
+        }
     }
 }
 

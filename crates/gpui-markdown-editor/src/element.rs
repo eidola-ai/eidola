@@ -238,6 +238,9 @@ pub struct PrepaintState {
     /// paint to draw the rounded background, clip content to the
     /// visible band, and overlay the horizontal scrollbar.
     code_block_paint: Option<CodeBlockPaint>,
+    /// `Some` only for `BlockKind::Table`. Horizontal-scroll geometry
+    /// (tables never soft-wrap) plus display mode's hairline rules.
+    table_paint: Option<TablePaint>,
     /// `Some` only for `BlockKind::DisplayMath` in *display* mode
     /// (cursor outside the math). Holds the typeset math + paint
     /// origin. Edit mode falls back to text shaping and uses the
@@ -703,6 +706,431 @@ fn measure_pad_advance(
     line.map(|l| l.width()).unwrap_or(em_px * 0.2)
 }
 
+/// The min-content width of a cell: the widest whitespace-delimited
+/// token of its display text, shaped with the token's real styles.
+/// This is the floor a column can shrink to before words would have
+/// to break mid-word (HTML's min-content).
+fn min_content_width(
+    range: &Range<usize>,
+    block: &RenderBlock,
+    source: &str,
+    style: &MarkdownStyle,
+    font_size: Pixels,
+    window: &mut Window,
+) -> Pixels {
+    let (display, map) = build_display_line(source, range, block);
+    if display.is_empty() {
+        return px(0.0);
+    }
+    let mut widest = px(0.0);
+    let bytes = display.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let token = &display[start..i];
+        let token_map = &map[start..=i];
+        // `build_runs_for_line` expects `map.len() == text.len() + 1`.
+        debug_assert_eq!(token_map.len(), token.len() + 1);
+        let runs = build_runs_for_line(token, token_map, block, style);
+        let w = window
+            .text_system()
+            .shape_text(
+                SharedString::from(token.to_string()),
+                font_size,
+                &runs,
+                None,
+                None,
+            )
+            .ok()
+            .and_then(|mut v| v.drain(..).next())
+            .map(|l| l.width())
+            .unwrap_or(px(0.0));
+        if w > widest {
+            widest = w;
+        }
+    }
+    widest
+}
+
+/// One shaped piece of a laid-out table: a cell (independently
+/// wrapped at its column's width) or a chrome fragment (the real
+/// `| ` / ` | ` / ` |` bytes, single-row, positioned in the gutter
+/// between column boxes). Origins are relative to the table's
+/// content origin; prepaint re-bases them into window coordinates.
+struct TablePiece {
+    line: Arc<WrappedLine>,
+    rel_origin: Point<Pixels>,
+    source_range: Range<usize>,
+    display_to_source: Vec<usize>,
+    wrapped_height: Pixels,
+}
+
+/// The box-model layout of one table.
+struct TableLayoutOut {
+    pieces: Vec<TablePiece>,
+    size: Size<Pixels>,
+    /// Relative y of each inter-row boundary (display mode only —
+    /// the hairline rules; `[0]` is the header rule).
+    rule_ys: Vec<Pixels>,
+}
+
+/// Lay a `BlockKind::Table` out as a grid of **cell boxes**: every
+/// cell is its own shaped line, wrapped independently at its
+/// column's width, positioned side by side — the HTML-auto-inspired
+/// model Mike asked for, unified across display and edit mode (and
+/// across fitting and overflowing tables, so there is exactly one
+/// table layout path).
+///
+/// **Column sizing:** per column, min-content (the widest unbreakable
+/// atom — measured by shaping at a 1px wrap width) and max-content
+/// (unwrapped) widths. If Σmax + chrome fits the available measure,
+/// every column sits at max-content and nothing wraps (the original
+/// behavior, now with exact alignment and no pad glyphs). Otherwise
+/// columns shrink proportionally to their `(max − min)` excess,
+/// flooring at min-content; if even Σmin overflows, columns floor at
+/// min and the table overflows into the shared horizontal-scroll
+/// treatment (degenerate narrow window).
+///
+/// **Rows:** one physical GFM line each, always — wrapping is purely
+/// visual. Row height = the tallest wrapped cell. In edit mode the
+/// chrome bytes (pipes + padding, including any just-typed trailing
+/// whitespace) shape as real single-row fragments in the gutters
+/// between boxes, so every byte keeps a true caret position; in
+/// display mode the chrome is hidden and fragments shape empty
+/// (kept for source coverage). The delimiter row renders only in
+/// edit mode, its dash cells stretched to the column width (raw on
+/// the caret's row for colon editing). Alignment colons shift a
+/// non-wrapped cell inside its box; wrapped cells left-align.
+fn layout_table(
+    block: &RenderBlock,
+    source: &str,
+    font_size: Pixels,
+    style: &MarkdownStyle,
+    avail_w: Pixels,
+    window: &mut Window,
+) -> Option<TableLayoutOut> {
+    let BlockKind::Table {
+        geometry,
+        edit_mode,
+        cursor_row,
+    } = &block.kind
+    else {
+        return None;
+    };
+    let edit = *edit_mode;
+    let cursor_row = *cursor_row;
+    let line_height = font_size * style.line_height.0;
+
+    use crate::syntax::TableAlignment;
+    use crate::table::RowKind;
+
+    let rows: Vec<(usize, &crate::table::RowGeometry)> = geometry
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| edit || r.kind != RowKind::Delimiter)
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+
+    // Chrome glyph advances.
+    let text_w = |s: &str, window: &mut Window| -> Pixels {
+        if s.is_empty() {
+            return px(0.0);
+        }
+        let runs = [TextRun {
+            len: s.len(),
+            font: base_font_for_block(&block.kind, style),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        window
+            .text_system()
+            .shape_text(
+                SharedString::from(s.to_string()),
+                font_size,
+                &runs,
+                None,
+                None,
+            )
+            .ok()
+            .and_then(|mut v| v.drain(..).next())
+            .map(|l| l.width())
+            .unwrap_or(px(0.0))
+    };
+    let w_pipe = text_w("|", window);
+    let w_sp = text_w(" ", window);
+    let w_dash = text_w("-", window);
+    let w_colon = text_w(":", window);
+    let gutter = font_size * 1.25;
+
+    // Shape helper over a source slice of the block (hides +
+    // substitutions + inline styles apply).
+    let shape_slice = |range: &Range<usize>,
+                       wrap: Option<Pixels>,
+                       window: &mut Window|
+     -> Option<(Arc<WrappedLine>, Vec<usize>)> {
+        let (display, map) = build_display_line(source, range, block);
+        let runs = build_runs_for_line(&display, &map, block, style);
+        let line = window
+            .text_system()
+            .shape_text(SharedString::from(display), font_size, &runs, wrap, None)
+            .ok()
+            .and_then(|mut v| v.drain(..).next())
+            .map(Arc::new)
+            .or_else(|| empty_shaped_line(font_size, window))?;
+        Some((line, map))
+    };
+
+    // Column min/max content widths (delimiter rows excluded — their
+    // dash cells stretch to fit). Min-content is the widest
+    // *unbreakable atom* — the longest whitespace-delimited token,
+    // measured with its real styles (gpui's wrapper falls back to
+    // mid-word breaking below a word's width, so shaping at a tiny
+    // wrap width would report ~one glyph and let columns squeeze
+    // into vertical letter-stacks).
+    let n_cols = geometry.column_count().max(1);
+    let mut min_w: Vec<Pixels> = vec![px(0.0); n_cols];
+    let mut max_w: Vec<Pixels> = vec![px(0.0); n_cols];
+    for (_, row) in &rows {
+        if row.kind == RowKind::Delimiter {
+            continue;
+        }
+        for (k, cell) in row.cells.iter().enumerate() {
+            if k >= n_cols {
+                break;
+            }
+            let (unwrapped, _) = shape_slice(cell, None, window)?;
+            if unwrapped.width() > max_w[k] {
+                max_w[k] = unwrapped.width();
+            }
+            let atom_w = min_content_width(cell, block, source, style, font_size, window);
+            if atom_w > min_w[k] {
+                min_w[k] = atom_w;
+            }
+        }
+    }
+
+    // Available width for the column boxes.
+    let chrome_total = if edit {
+        // `| ` + per-inner-boundary ` | ` + trailing ` |`.
+        (w_pipe + w_sp) + (w_sp + w_pipe + w_sp) * ((n_cols - 1) as f32) + (w_sp + w_pipe)
+    } else {
+        gutter * (n_cols.saturating_sub(1) as f32)
+    };
+    let w_avail = (avail_w - chrome_total).max(px(0.0));
+    let sum_max: Pixels = max_w.iter().fold(px(0.0), |a, w| a + *w);
+    let sum_min: Pixels = min_w.iter().fold(px(0.0), |a, w| a + *w);
+    let col_w: Vec<Pixels> = if sum_max <= w_avail || !f32::from(avail_w).is_finite() {
+        max_w.clone()
+    } else if sum_min <= w_avail {
+        // Shrink proportionally to each column's (max − min) excess.
+        let excess: Pixels = sum_max - w_avail;
+        let flex: Pixels = sum_max - sum_min;
+        max_w
+            .iter()
+            .zip(min_w.iter())
+            .map(|(mx, mn)| {
+                let share = if flex > px(0.0) {
+                    (*mx - *mn) * (f32::from(excess) / f32::from(flex))
+                } else {
+                    px(0.0)
+                };
+                (*mx - share).max(*mn)
+            })
+            .collect()
+    } else {
+        min_w.clone()
+    };
+    let col_w: Vec<Pixels> = col_w.into_iter().map(|w| w.max(px(1.0))).collect();
+
+    // Column box x positions.
+    let mut col_x: Vec<Pixels> = Vec::with_capacity(n_cols);
+    let mut acc = if edit { w_pipe + w_sp } else { px(0.0) };
+    for w in &col_w {
+        col_x.push(acc);
+        acc += *w + if edit { w_sp + w_pipe + w_sp } else { gutter };
+    }
+    // Total content width: last box end + trailing chrome.
+    let total_w = if n_cols > 0 {
+        let last_end = col_x[n_cols - 1] + col_w[n_cols - 1];
+        if edit {
+            last_end + w_sp + w_pipe
+        } else {
+            last_end
+        }
+    } else {
+        px(0.0)
+    };
+
+    let mut pieces: Vec<TablePiece> = Vec::new();
+    let mut rule_ys: Vec<Pixels> = Vec::new();
+    let mut y = px(0.0);
+    let last_row_idx = rows.len() - 1;
+    for (i, (row_geo_idx, row)) in rows.iter().enumerate() {
+        let is_delimiter = row.kind == RowKind::Delimiter;
+        let stretch = is_delimiter && cursor_row != Some(*row_geo_idx);
+        let mut row_h = line_height;
+
+        // Cell boxes.
+        for (k, cell) in row.cells.iter().enumerate() {
+            let bw = col_w.get(k).copied().unwrap_or(px(64.0));
+            let bx = col_x.get(k).copied().unwrap_or(px(0.0));
+            let (line, map, ox) = if stretch && cell.start < cell.end {
+                // Stretched delimiter cell: dash run sized to the box.
+                let cell_text = &source[cell.clone()];
+                let leading = cell_text.starts_with(':');
+                let trailing = cell_text.ends_with(':') && cell_text.len() > 1;
+                let colons = ((leading as usize + trailing as usize) as f32) * w_colon;
+                let n_dashes = if w_dash > px(0.0) {
+                    (((bw - colons) / w_dash).floor() as i64).max(1) as usize
+                } else {
+                    3
+                };
+                let mut display = String::new();
+                if leading {
+                    display.push(':');
+                }
+                display.extend(std::iter::repeat_n('-', n_dashes));
+                if trailing {
+                    display.push(':');
+                }
+                let map = vec![cell.start; display.len() + 1];
+                let runs = [TextRun {
+                    len: display.len(),
+                    font: base_font_for_block(&block.kind, style),
+                    color: style.delimiter_color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }];
+                let line = window
+                    .text_system()
+                    .shape_text(SharedString::from(display), font_size, &runs, None, None)
+                    .ok()
+                    .and_then(|mut v| v.drain(..).next())
+                    .map(Arc::new)
+                    .or_else(|| empty_shaped_line(font_size, window))?;
+                (line, map, bx)
+            } else {
+                // Measure unwrapped; wrap only when it doesn't fit.
+                let (unwrapped, map) = shape_slice(cell, None, window)?;
+                if unwrapped.width() <= bw + px(0.5) {
+                    // Alignment shift inside the box (single-row
+                    // cells only; wrapped cells left-align).
+                    let free = (bw - unwrapped.width()).max(px(0.0));
+                    let fill = if is_delimiter {
+                        px(0.0)
+                    } else {
+                        match geometry.alignment(k) {
+                            TableAlignment::Right => free,
+                            TableAlignment::Center => free * 0.5,
+                            TableAlignment::None | TableAlignment::Left => px(0.0),
+                        }
+                    };
+                    (unwrapped, map, bx + fill)
+                } else {
+                    let (wrapped, map) = shape_slice(cell, Some(bw), window)?;
+                    (wrapped, map, bx)
+                }
+            };
+            let h = line_height * (line.wrap_boundaries().len() as f32 + 1.0);
+            if h > row_h {
+                row_h = h;
+            }
+            // The cell claims one byte past its content end, and cell
+            // pieces precede the row's chrome fragments in the vec:
+            // the caret at a cell's content end (the typing position,
+            // shared with the following fragment's start) therefore
+            // resolves to the CELL and paints at its text end — not at
+            // the column box's far edge where the fragment starts.
+            // Offsets strictly inside the padding still resolve to the
+            // fragment (true x in the gutter).
+            let claim_end = (cell.end + 1).min(source.len());
+            pieces.push(TablePiece {
+                line,
+                rel_origin: point(ox, y),
+                source_range: cell.start..claim_end,
+                display_to_source: map,
+                wrapped_height: h,
+            });
+        }
+
+        // Chrome fragments: [line start .. cell0 start], each
+        // inter-cell gap, and the trailing chunk (which swallows the
+        // row's `\n` so end-of-line offsets stay covered).
+        let mut frag_ranges: Vec<(Range<usize>, Pixels)> = Vec::new();
+        if let Some(first) = row.cells.first() {
+            frag_ranges.push((row.line.start..first.start, px(0.0)));
+            for k in 1..row.cells.len() {
+                let x = col_x.get(k - 1).copied().unwrap_or(px(0.0))
+                    + col_w.get(k - 1).copied().unwrap_or(px(0.0));
+                frag_ranges.push((row.cells[k - 1].end..row.cells[k].start, x));
+            }
+            let k_last = row.cells.len() - 1;
+            let trail_x = col_x.get(k_last).copied().unwrap_or(px(0.0))
+                + col_w.get(k_last).copied().unwrap_or(px(0.0));
+            let mut trail_end = row.line.end;
+            if source.as_bytes().get(trail_end) == Some(&b'\n') {
+                trail_end += 1;
+            }
+            frag_ranges.push((row.cells[k_last].end..trail_end, trail_x));
+        }
+        for (range, x) in frag_ranges {
+            if range.start >= range.end {
+                continue;
+            }
+            let (line, map) = shape_slice(&range, None, window)?;
+            pieces.push(TablePiece {
+                line,
+                rel_origin: point(x, y),
+                source_range: range,
+                display_to_source: map,
+                wrapped_height: line_height,
+            });
+        }
+
+        // The row's pieces all share the row top; the row advances by
+        // its tallest piece. (Fragments keep `line_height` — they
+        // never wrap.)
+        y += row_h;
+        if !edit && i < last_row_idx {
+            rule_ys.push(y);
+        }
+    }
+
+    Some(TableLayoutOut {
+        pieces,
+        size: size(total_w, y),
+        rule_ys,
+    })
+}
+
+/// Paint state for a `BlockKind::Table` block: horizontal-scroll
+/// geometry (tables never soft-wrap; wide ones scroll like code
+/// blocks) plus the hairline rules of display mode.
+struct TablePaint {
+    /// Content clip when the table overflows the visible width.
+    clip: Bounds<Pixels>,
+    /// Widest shaped table line.
+    content_width: Pixels,
+    visible_width: Pixels,
+    scroll_x: Pixels,
+    /// Hairline rule quads (positioned, already scroll-translated).
+    /// `rules[0]` is the header rule when present.
+    rules: Vec<Bounds<Pixels>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CodeBlockPaint {
     /// Outer rounded fill (full block, fence rows + content strip).
@@ -759,6 +1187,7 @@ impl Element for BlockElement {
         );
         let inner_pad = block_inner_padding(&self.block.kind, &self.style);
         let is_code = is_code_block(&self.block.kind);
+        let is_table = is_table_block(&self.block.kind);
         let container_indent = containers_left_indent(&self.block.containers, &self.style, window);
 
         let source = self.editor.read(cx).state.markdown.clone();
@@ -878,11 +1307,15 @@ impl Element for BlockElement {
                 // remaining width so soft-wrap lands at the visible
                 // right edge regardless of nesting depth.
                 let inner_w = (avail_w - container_indent).max(px(1.0));
-                // Code blocks don't soft-wrap — long lines extend off
-                // the right edge of the visible region and the user
-                // scrolls horizontally to see them. Other blocks wrap
-                // at the indented inner width.
-                let wrap_w = if is_code { None } else { Some(inner_w) };
+                // Code blocks and tables don't soft-wrap — long lines
+                // extend off the right edge of the visible region and
+                // the user scrolls horizontally to see them. Other
+                // blocks wrap at the indented inner width.
+                let wrap_w = if is_code || is_table {
+                    None
+                } else {
+                    Some(inner_w)
+                };
                 // Inline math: typeset each overlay and substitute a
                 // width-matched run of NBSPs so wrap math sees the
                 // math's pixel width. Paint specs flow through to
@@ -904,6 +1337,27 @@ impl Element for BlockElement {
                     &style_clone,
                     window,
                 );
+                // Tables: the box-model layout computes its own
+                // height (rows of independently wrapped cell boxes);
+                // it must run against the same inner width prepaint
+                // will use so the two phases agree.
+                if is_table
+                    && let Some(layout) = layout_table(
+                        &augmented_block,
+                        &source,
+                        font_size,
+                        &style_clone,
+                        inner_w,
+                        window,
+                    )
+                {
+                    let content_h = inner_pad * 2. + layout.size.height.max(line_height);
+                    let h = extra_above + spacing_above + content_h + spacing_below + extra_below;
+                    return Size {
+                        width: avail_w,
+                        height: h,
+                    };
+                }
                 let (body_ascent, body_descent) =
                     body_metrics_for_block(&block_clone.kind, &style_clone, font_size, window);
                 let lines = shape_block_lines(
@@ -1027,6 +1481,9 @@ impl Element for BlockElement {
         // recomputes it for its own bounds.
         let inner_pad = block_inner_padding(&self.block.kind, &style);
         let is_code = is_code_block(&self.block.kind);
+        let is_table = is_table_block(&self.block.kind);
+        // Blocks that never soft-wrap and scroll horizontally instead.
+        let no_wrap = is_code || is_table;
         let container_indent = containers_left_indent(&self.block.containers, &style, window);
 
         let block_top = bounds.origin.y + extra_above + spacing_above;
@@ -1047,7 +1504,7 @@ impl Element for BlockElement {
         let block_width = (bounds.size.width - container_indent).max(px(1.0));
         let visible_content_width = (block_width - inner_pad * 2.).max(px(1.0));
 
-        let wrap_w = if is_code { None } else { Some(block_width) };
+        let wrap_w = if no_wrap { None } else { Some(block_width) };
         // Inline math: typeset overlays and substitute width-matched
         // NBSPs into a working clone of the block. Paint specs flow
         // through to the paint phase; the augmented block is what
@@ -1066,7 +1523,7 @@ impl Element for BlockElement {
             .iter()
             .map(|o| crate::image::load(&o.dest_url, window, cx))
             .collect();
-        let (mut augmented_block, inline_image_specs) = augment_block_with_images(
+        let (augmented_block, inline_image_specs) = augment_block_with_images(
             &augmented_block,
             &inline_image_loaded,
             font_size,
@@ -1074,6 +1531,7 @@ impl Element for BlockElement {
             &style,
             window,
         );
+        let mut augmented_block = augmented_block;
         // Block image in display mode: hide the source bytes when
         // we have a paintable image (Loaded) or a placeholder
         // (Loading) so the raw `![alt](url)` text doesn't shape
@@ -1100,8 +1558,26 @@ impl Element for BlockElement {
         }
         let (body_ascent, body_descent) =
             body_metrics_for_block(&self.block.kind, &style, font_size, window);
-        let shaped =
-            shape_block_lines(&source, &augmented_block, &style, font_size, wrap_w, window);
+        // Tables take the box-model layout (rows of independently
+        // wrapped cell boxes — see `layout_table`) instead of the
+        // per-source-line shape pass.
+        let table_layout = if is_table {
+            layout_table(
+                &augmented_block,
+                &source,
+                font_size,
+                &style,
+                block_width,
+                window,
+            )
+        } else {
+            None
+        };
+        let shaped = if table_layout.is_some() {
+            Vec::new()
+        } else {
+            shape_block_lines(&source, &augmented_block, &style, font_size, wrap_w, window)
+        };
 
         let mut lines: Vec<LaidOutLine> = Vec::new();
         let mut content_cursor_y = content_top;
@@ -1172,6 +1648,30 @@ impl Element for BlockElement {
             content_cursor_y += wrapped_h;
             last_was_delim = sl.is_delimiter;
         }
+        // Table pieces: re-base the layout's relative origins into
+        // window coordinates. All pieces of one table row share the
+        // row's top y; the layout already advanced rows by their
+        // tallest cell.
+        let mut table_rule_ys: Vec<Pixels> = Vec::new();
+        if let Some(layout) = table_layout {
+            for piece in layout.pieces {
+                lines.push(LaidOutLine {
+                    line: piece.line,
+                    origin: point(
+                        content_left + piece.rel_origin.x,
+                        content_top + piece.rel_origin.y,
+                    ),
+                    row_height: line_height,
+                    wrapped_height: piece.wrapped_height,
+                    source_range: piece.source_range,
+                    display_to_source: piece.display_to_source,
+                    is_delimiter: false,
+                });
+            }
+            max_content_line_width = layout.size.width;
+            content_cursor_y = content_top + layout.size.height;
+            table_rule_ys = layout.rule_ys.iter().map(|ry| content_top + *ry).collect();
+        }
         // Trailing content (no closing fence) — extend the strip to
         // cover the trailing breathing room and advance the layout
         // cursor so the block reserves the space.
@@ -1227,7 +1727,7 @@ impl Element for BlockElement {
         // `visible_content_width`.
         let max_scroll = (max_content_line_width - visible_content_width).max(px(0.0));
         let scroll_x = scroll_offset.min(max_scroll).max(px(0.0));
-        if is_code && scroll_x != scroll_offset {
+        if no_wrap && scroll_x != scroll_offset {
             // Out-of-range cached scroll (e.g. content shrank) — clamp
             // it on the editor so subsequent frames see the corrected
             // value.
@@ -1238,8 +1738,9 @@ impl Element for BlockElement {
         }
         // Only *content* lines translate with horizontal scroll —
         // fence lines stay pinned at `content_left`. The fence rows
-        // are a stable frame around the scrolling code area.
-        if is_code && scroll_x > px(0.0) {
+        // are a stable frame around the scrolling code area. (Tables
+        // have no delimiter lines, so every row translates.)
+        if no_wrap && scroll_x > px(0.0) {
             for line in &mut lines {
                 if !line.is_delimiter {
                     line.origin.x -= scroll_x;
@@ -1306,6 +1807,36 @@ impl Element for BlockElement {
         // `max_scroll = max_content_line_width - visible_content_width`
         // already accounts for the symmetric trailing padding at
         // max scroll.
+        // Table paint state: scroll geometry plus display mode's
+        // hairline rules. Rules sit on the boundary between adjacent
+        // rows — the natural half-leading above and below the rule
+        // keeps the text breathing. `rules[0]` is the header rule
+        // (painted at full rule color; later ones lighter). Edit mode
+        // paints no rules — the dimmed delimiter row is the boundary.
+        let table_paint = if is_table {
+            let mut rules = Vec::new();
+            let rule_x = content_left - scroll_x;
+            let rule_w = max_content_line_width.max(px(1.0));
+            for ry in &table_rule_ys {
+                rules.push(Bounds::new(
+                    point(rule_x, *ry - px(0.5)),
+                    size(rule_w, px(1.0)),
+                ));
+            }
+            Some(TablePaint {
+                clip: Bounds::new(
+                    point(block_left, block_top),
+                    size(block_width, (block_bottom - block_top).max(px(0.0))),
+                ),
+                content_width: max_content_line_width,
+                visible_width: visible_content_width,
+                scroll_x,
+                rules,
+            })
+        } else {
+            None
+        };
+
         let code_block_paint = if is_code {
             let strip_top = strip_top.unwrap_or(block_top + inner_pad);
             let strip_bottom = strip_bottom.unwrap_or(block_bottom - inner_pad);
@@ -1383,6 +1914,7 @@ impl Element for BlockElement {
             cursor_quad,
             selection_quads,
             code_block_paint,
+            table_paint,
             math_paint,
             inline_math: inline_math_specs,
             image_paint,
@@ -1666,60 +2198,91 @@ impl Element for BlockElement {
                 }
             });
         } else {
-            // Non-code blocks: no mask, no split.
-            //
-            // Run backgrounds (the inline-code chip fill carried on
-            // `TextRun::background_color`) paint first so the
-            // selection wash and the glyphs layer on top of them.
-            // `WrappedLine::paint` itself only draws glyphs +
-            // underline/strikethrough — backgrounds need the explicit
-            // `paint_background` pass or the chip never shows.
-            for laid in &prepaint.laid_out.lines {
-                let _ = laid.line.paint_background(
-                    laid.origin,
-                    laid.row_height,
-                    gpui::TextAlign::Left,
-                    None,
+            // Non-code blocks: no fence split. Tables additionally
+            // clip to their visible band when wider than the content
+            // area (they never soft-wrap — the same horizontal-scroll
+            // treatment as code blocks, minus the background chrome)
+            // and paint their hairline rules under everything.
+            let table_mask = prepaint.table_paint.as_ref().and_then(|tp| {
+                (tp.content_width > tp.visible_width).then_some(ContentMask { bounds: tp.clip })
+            });
+            let table_rules: Vec<(Bounds<Pixels>, bool)> = prepaint
+                .table_paint
+                .as_ref()
+                .map(|tp| {
+                    tp.rules
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| (*r, i == 0))
+                        .collect()
+                })
+                .unwrap_or_default();
+            window.with_content_mask(table_mask, |window| {
+                // Table rules paint first — chrome under content.
+                for (rule, is_header_rule) in &table_rules {
+                    let mut color = self.style.table_rule_color;
+                    if !is_header_rule {
+                        color.a *= 0.45;
+                    }
+                    window.paint_quad(fill(*rule, color));
+                }
+                // Run backgrounds (the inline-code chip fill carried on
+                // `TextRun::background_color`) paint first so the
+                // selection wash and the glyphs layer on top of them.
+                // `WrappedLine::paint` itself only draws glyphs +
+                // underline/strikethrough — backgrounds need the explicit
+                // `paint_background` pass or the chip never shows.
+                for laid in &prepaint.laid_out.lines {
+                    let _ = laid.line.paint_background(
+                        laid.origin,
+                        laid.row_height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+                for tq in selection_quads {
+                    window.paint_quad(tq.quad);
+                }
+                for laid in &prepaint.laid_out.lines {
+                    let _ = laid.line.paint(
+                        laid.origin,
+                        laid.row_height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+                // Inline math overlays paint *after* the line text (so
+                // they sit on top of the NBSP placeholders that
+                // reserved the space) but *before* the cursor (so the
+                // caret remains visible above the math).
+                paint_inline_math_overlays(
+                    &prepaint.inline_math,
+                    &prepaint.laid_out.lines,
+                    &self.style,
+                    &self.block.kind,
                     window,
                     cx,
                 );
-            }
-            for tq in selection_quads {
-                window.paint_quad(tq.quad);
-            }
-            for laid in &prepaint.laid_out.lines {
-                let _ = laid.line.paint(
-                    laid.origin,
-                    laid.row_height,
-                    gpui::TextAlign::Left,
-                    None,
+                // Inline image overlays — same paint ordering as math
+                // (over the line text, under the cursor). Each spec
+                // paints exactly where its substitution placed pad
+                // glyphs in the shaped line.
+                paint_inline_image_overlays(
+                    &prepaint.inline_images,
+                    &prepaint.laid_out.lines,
                     window,
-                    cx,
                 );
-            }
-            // Inline math overlays paint *after* the line text (so
-            // they sit on top of the NBSP placeholders that
-            // reserved the space) but *before* the cursor (so the
-            // caret remains visible above the math).
-            paint_inline_math_overlays(
-                &prepaint.inline_math,
-                &prepaint.laid_out.lines,
-                &self.style,
-                &self.block.kind,
-                window,
-                cx,
-            );
-            // Inline image overlays — same paint ordering as math
-            // (over the line text, under the cursor). Each spec
-            // paints exactly where its substitution placed pad
-            // glyphs in the shaped line.
-            paint_inline_image_overlays(&prepaint.inline_images, &prepaint.laid_out.lines, window);
-            if focused
-                && !disabled
-                && let Some(tq) = cursor_quad
-            {
-                window.paint_quad(tq.quad);
-            }
+                if focused
+                    && !disabled
+                    && let Some(tq) = cursor_quad
+                {
+                    window.paint_quad(tq.quad);
+                }
+            });
         }
 
         // Horizontal scrollbar overlay — only when the code block has
@@ -1733,13 +2296,41 @@ impl Element for BlockElement {
         {
             paint_horizontal_scrollbar(window, cb, &self.style);
         }
+        // Table scrollbar: same overlay as code blocks, tracked along
+        // the block's bottom edge (tables have no fence seam to sit on).
+        if let Some(tp) = &prepaint.table_paint
+            && tp.content_width > tp.visible_width
+        {
+            paint_h_scrollbar_at(
+                window,
+                &self.style,
+                tp.clip.bottom() - px(3.0),
+                tp.clip.left(),
+                tp.clip.right(),
+                tp.content_width,
+                tp.visible_width,
+                tp.scroll_x,
+            );
+        }
 
-        if let Some(cb) = code_block_paint {
+        // Horizontal scroll-wheel routing for the no-wrap blocks
+        // (code + table): one listener over the block's scrollable
+        // area, writing the per-block scroll slot.
+        let scroll_wheel_area = if let Some(cb) = code_block_paint {
+            Some((
+                cb.bg_bounds,
+                (cb.content_width - cb.visible_width).max(px(0.0)),
+            ))
+        } else {
+            prepaint
+                .table_paint
+                .as_ref()
+                .map(|tp| (tp.clip, (tp.content_width - tp.visible_width).max(px(0.0))))
+        };
+        if let Some((bg_bounds, max_scroll)) = scroll_wheel_area {
             // Capture for the scroll-wheel listener.
             let editor = self.editor.clone();
             let block_index = self.block_index;
-            let max_scroll = (cb.content_width - cb.visible_width).max(px(0.0));
-            let bg_bounds = cb.bg_bounds;
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
                 if !phase.bubble() {
                     return;
@@ -2193,29 +2784,47 @@ fn paint_thematic_break(
 }
 
 fn paint_horizontal_scrollbar(window: &mut Window, cb: &CodeBlockPaint, style: &MarkdownStyle) {
-    let track_h = px(3.0);
     // Sit on the seam between the content strip and the closing fence
-    // row — `track_y` is the strip's bottom edge, so the bar occupies
-    // the top sliver of the closing fence row. This puts the
-    // scrollbar visually adjacent to the scrollable region without
-    // overlapping the content baseline above or floating loose at
-    // the bottom of the outer fill.
-    let track_y = cb.content_strip.bottom();
-    // Align the scrollbar with the content text (which paints inset
-    // by `inner_pad`), not the dark bg's edges. Without this the
-    // scrollbar would extend `inner_pad` further than the code on
-    // each side.
-    let track_left = cb.content_clip.left();
-    let track_right = cb.content_clip.right();
+    // row — the strip's bottom edge, so the bar occupies the top
+    // sliver of the closing fence row: visually adjacent to the
+    // scrollable region without overlapping the content baseline.
+    // Track alignment follows the content text (inset by
+    // `inner_pad`), not the dark bg's edges.
+    paint_h_scrollbar_at(
+        window,
+        style,
+        cb.content_strip.bottom(),
+        cb.content_clip.left(),
+        cb.content_clip.right(),
+        cb.content_width,
+        cb.visible_width,
+        cb.scroll_x,
+    );
+}
+
+/// Shared horizontal-scrollbar painter for the no-wrap blocks (code
+/// blocks and tables). `track_y` is the top edge of the 3px track.
+#[allow(clippy::too_many_arguments)]
+fn paint_h_scrollbar_at(
+    window: &mut Window,
+    style: &MarkdownStyle,
+    track_y: Pixels,
+    track_left: Pixels,
+    track_right: Pixels,
+    content_width: Pixels,
+    visible_width: Pixels,
+    scroll_x: Pixels,
+) {
+    let track_h = px(3.0);
     let track_w = (track_right - track_left).max(px(1.0));
 
     // Thumb: proportional to visible / content, offset by scroll
     // position. Minimum thumb width keeps it draggable-feeling at
     // very long content.
-    let ratio = (cb.visible_width / cb.content_width).clamp(0.05, 1.0);
+    let ratio = (visible_width / content_width).clamp(0.05, 1.0);
     let thumb_w = (track_w * ratio).max(px(24.0));
-    let scroll_ratio = if cb.content_width > cb.visible_width {
-        f32::from(cb.scroll_x) / f32::from(cb.content_width - cb.visible_width)
+    let scroll_ratio = if content_width > visible_width {
+        f32::from(scroll_x) / f32::from(content_width - visible_width)
     } else {
         0.0
     };
@@ -2259,9 +2868,10 @@ fn empty_shaped_line(font_size: Pixels, window: &mut Window) -> Option<Arc<Wrapp
 fn font_size_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
     match kind {
         BlockKind::Heading { level } => style.size_for_heading(*level),
-        BlockKind::Paragraph | BlockKind::ThematicBreak | BlockKind::Image { .. } => {
-            style.font_size
-        }
+        BlockKind::Paragraph
+        | BlockKind::ThematicBreak
+        | BlockKind::Image { .. }
+        | BlockKind::Table { .. } => style.font_size,
         BlockKind::CodeBlock { .. } => style.mono_font_size,
         // Display math: in edit mode shapes mono LaTeX; in display
         // mode the shaped-text path produces a single zero-width
@@ -2304,7 +2914,8 @@ fn spacing_above_for_block(
         | BlockKind::CodeBlock { .. }
         | BlockKind::ThematicBreak
         | BlockKind::DisplayMath { .. }
-        | BlockKind::Image { .. } => {
+        | BlockKind::Image { .. }
+        | BlockKind::Table { .. } => {
             if in_list_item {
                 style.paragraph_gap.0 * style.list_item_gap_factor
             } else {
@@ -2424,6 +3035,10 @@ fn block_inner_padding(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
 
 fn is_code_block(kind: &BlockKind) -> bool {
     matches!(kind, BlockKind::CodeBlock { .. })
+}
+
+fn is_table_block(kind: &BlockKind) -> bool {
+    matches!(kind, BlockKind::Table { .. })
 }
 
 /// Cumulative left indent contributed by every container (blockquote,
@@ -2921,7 +3536,27 @@ fn build_display_line(
             .map(|r| r.end)
             .max();
         if let Some(end) = cover_end {
-            pos = end.min(line.end);
+            let mut jump = end.min(line.end);
+            // A substitution whose start lies strictly inside the
+            // covered span must still get its chance to apply. This
+            // matters for table gap substitutions: the render layer's
+            // `merge_hidden_ranges` merges the gap's chrome hide with
+            // any *touching* construct-delimiter hide (a cell ending
+            // in `` ` `` / `**` / `~~`), so the merged range starts
+            // before the gap and a straight jump to its end would
+            // skip the substitution entirely — the alignment pads
+            // vanish exactly on styled cells. Clamp the jump to the
+            // earliest in-span substitution start instead.
+            if let Some(sub_start) = block
+                .substitutions
+                .iter()
+                .filter(|s| s.source_range.start > pos && s.source_range.start < jump)
+                .map(|s| s.source_range.start)
+                .min()
+            {
+                jump = sub_start;
+            }
+            pos = jump;
             continue;
         }
         let ch = source[pos..line.end]
@@ -2982,6 +3617,10 @@ fn build_runs_for_line(
         }
         if merged.bold || base_weight == FontWeight::BOLD {
             run_font.weight = FontWeight::BOLD;
+        } else if merged.table_header {
+            // Table header cells: the table-header weight (Medium by
+            // default) carries the emphasis; explicit bold above wins.
+            run_font.weight = style.table_header_weight;
         } else if base_weight != FontWeight::NORMAL {
             run_font.weight = base_weight;
         }
@@ -3448,6 +4087,115 @@ mod tests {
             "trailing-space cursor x ({:?}) should be greater than no-trail ({:?})",
             trailing_x,
             plain_x,
+        );
+    }
+
+    /// Shape a table document's first row through the real table
+    /// augment pass (edit mode, caret at `cursor`) and return the
+    /// local x of each probe offset plus the shaped line's width.
+    fn table_line_x_positions(
+        cx: &mut TestAppContext,
+        src: &str,
+        cursor: usize,
+        probes: &[usize],
+    ) -> (Vec<Pixels>, Pixels) {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(cursor),
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let src_owned = src.to_string();
+        let probes = probes.to_vec();
+
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Table { .. }))
+                .expect("a table block");
+            let font_size = font_size_for_block(&block.kind, &style);
+            let line_height = font_size * style.line_height.0;
+            let layout = layout_table(block, &src_owned, font_size, &style, px(720.0), window)
+                .expect("a table layout");
+            let mut out = Vec::new();
+            for probe in &probes {
+                let piece = layout
+                    .pieces
+                    .iter()
+                    .find(|p| p.source_range.start <= *probe && *probe <= p.source_range.end)
+                    .expect("a table piece containing the probe");
+                let laid = LaidOutLine {
+                    line: piece.line.clone(),
+                    origin: point(piece.rel_origin.x, piece.rel_origin.y),
+                    row_height: line_height,
+                    wrapped_height: piece.wrapped_height,
+                    source_range: piece.source_range.clone(),
+                    display_to_source: piece.display_to_source.clone(),
+                    is_delimiter: false,
+                };
+                let local = laid.local_position_for_source_offset(*probe);
+                out.push(laid.origin.x + local.x);
+            }
+            (out, layout.size.width)
+        })
+        .expect("update window")
+    }
+
+    #[gpui::test]
+    fn table_caret_after_trailing_space_renders_inside_its_cell(cx: &mut TestAppContext) {
+        // Type a trailing space at the end of a mid-row cell:
+        // `| ab  | cd |` with the caret after the space (offset 5).
+        // The caret must render inside the first cell's box — left of
+        // the second cell's content — and the second cell's x must
+        // not shift versus the canonical `| ab | cd |` (the space
+        // absorbs into the boundary fill). This was Mike's
+        // trailing-space bug: the whole-chrome substitution swallowed
+        // the typed space, painting the caret past the *next* pipe
+        // and shifting the rest of the row right.
+        let spaced = "| ab  | cd |\n| --- | --- |\n| x | y |\n";
+        let caret = 5; // after the typed trailing space
+        let cd = spaced.find("cd").unwrap();
+        let y = spaced.find("| y |").unwrap() + 2;
+        let (xs, _) = table_line_x_positions(cx, spaced, caret, &[caret, cd, y]);
+        let (caret_x, cd_x, y_x) = (xs[0], xs[1], xs[2]);
+        assert!(
+            caret_x < cd_x,
+            "caret after a trailing space must stay left of the next cell \
+             (caret {caret_x:?}, next cell {cd_x:?})",
+        );
+        // The typed space counts as occupied width, so the whole
+        // column widens *together*: the second column stays aligned
+        // across rows (within pad-glyph rounding) instead of only the
+        // caret's row shifting right.
+        let skew = (cd_x - y_x).abs();
+        assert!(
+            skew < px(4.0),
+            "the second column must stay aligned across rows while a \
+             trailing space is being typed (cd at {cd_x:?}, y at {y_x:?})",
+        );
+    }
+
+    #[gpui::test]
+    fn table_caret_after_trailing_space_in_last_cell_stays_inside_the_row(cx: &mut TestAppContext) {
+        // Same bug at the row's last cell: `| ab | cd  |` caret after
+        // the typed space (before the trailing pipe). The caret must
+        // render left of the shaped row's right edge (it used to
+        // paint past the trailing pipe, outside the table).
+        let spaced = "| ab | cd  |\n| --- | --- |\n| x | y |\n";
+        let caret = spaced.find("cd").unwrap() + 3; // after the typed space
+        let (xs, line_width) = table_line_x_positions(cx, spaced, caret, &[caret]);
+        assert!(
+            xs[0] < line_width,
+            "caret after a trailing space in the last cell must stay inside \
+             the row (caret {:?}, row width {line_width:?})",
+            xs[0],
         );
     }
 

@@ -9,9 +9,9 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
-use crate::syntax::{ListKind, NodeKind, SyntaxNode};
+use crate::syntax::{ListKind, NodeKind, SyntaxNode, TableAlignment};
 
 pub fn parse(markdown: &str) -> Vec<SyntaxNode> {
     let mut opts = Options::empty();
@@ -36,6 +36,13 @@ pub fn parse(markdown: &str) -> Vec<SyntaxNode> {
     // full `$` / `$$`-delimited construct; we project to
     // `NodeKind::InlineMath` / `NodeKind::DisplayMath`.
     opts.insert(Options::ENABLE_MATH);
+    // Recognize GFM pipe tables (`| a | b |` + delimiter row). The
+    // walker projects `Tag::Table` / `TableHead` / `TableRow` /
+    // `TableCell` into `NodeKind::Table` / `TableRow` / `TableCell`
+    // nodes; the render layer promotes a top-level table to
+    // `BlockKind::Table` and `crate::table` owns the line/cell
+    // geometry the editing rules operate on.
+    opts.insert(Options::ENABLE_TABLES);
 
     let mut walker = Walker::new(markdown);
     for (event, range) in Parser::new_ext(markdown, opts).into_offset_iter() {
@@ -157,6 +164,41 @@ impl<'a> Walker<'a> {
                     range,
                 ));
             }
+            Tag::Table(alignments) => {
+                let alignments = alignments
+                    .into_iter()
+                    .map(|a| match a {
+                        Alignment::None => TableAlignment::None,
+                        Alignment::Left => TableAlignment::Left,
+                        Alignment::Center => TableAlignment::Center,
+                        Alignment::Right => TableAlignment::Right,
+                    })
+                    .collect();
+                self.push_frame(SyntaxNode::new(NodeKind::Table { alignments }, range));
+            }
+            Tag::TableHead => {
+                self.push_frame(SyntaxNode::new(
+                    NodeKind::TableRow { is_header: true },
+                    range,
+                ));
+            }
+            Tag::TableRow => {
+                self.push_frame(SyntaxNode::new(
+                    NodeKind::TableRow { is_header: false },
+                    range,
+                ));
+            }
+            Tag::TableCell => {
+                // Pulldown synthesizes empty trailing cells for rows
+                // narrower than the column count, giving them
+                // degenerate ranges *past* the row's trailing `\n`
+                // (e.g. cell `31..31` on a row spanning `24..31`).
+                // Clamp such a range back to the enclosing row's end
+                // (minus its trailing newline) so every cell range
+                // stays inside the row's line.
+                let clamped = self.clamp_cell_range_to_row(range);
+                self.push_frame(SyntaxNode::new(NodeKind::TableCell, clamped));
+            }
             Tag::Emphasis => {
                 let (delim, content) = self.symmetric_delimiters(&range, 1);
                 self.push_frame(SyntaxNode::new(
@@ -213,6 +255,30 @@ impl<'a> Walker<'a> {
         } else {
             self.output.push(node);
         }
+    }
+
+    /// Clamp a `TableCell` range into its enclosing `TableRow`'s
+    /// line (the row range minus its trailing newline). Pulldown's
+    /// synthesized empty cells for short rows carry ranges past the
+    /// row's `\n`; a degenerate range clamps to the row content end.
+    fn clamp_cell_range_to_row(&self, range: Range<usize>) -> Range<usize> {
+        let Some(row) = self
+            .stack
+            .iter()
+            .rev()
+            .find(|f| matches!(f.node.kind, NodeKind::TableRow { .. }))
+        else {
+            return range;
+        };
+        let mut row_content_end = row.node.range.end;
+        if row_content_end > row.node.range.start
+            && self.source.as_bytes().get(row_content_end - 1) == Some(&b'\n')
+        {
+            row_content_end -= 1;
+        }
+        let end = range.end.min(row_content_end);
+        let start = range.start.min(end);
+        start..end
     }
 
     fn slice(&self, r: &Range<usize>) -> &str {

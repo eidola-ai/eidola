@@ -337,6 +337,36 @@ pub enum BlockKind {
         dest_url: String,
         edit_mode: bool,
     },
+    /// GFM pipe table (top-level only — nested tables render as raw
+    /// source lines). A structural leaf like `CodeBlock`: lines never
+    /// soft-wrap (a wrapped grid row is meaningless), wide tables
+    /// scroll horizontally through the same per-block scroll slot
+    /// code blocks use.
+    ///
+    /// Two cursor-driven modes:
+    ///
+    /// * **Display mode** (`edit_mode == false`) — pipes, padding and
+    ///   the whole delimiter row are hidden; the element layer
+    ///   measures every cell, inserts width-matched pad substitutions
+    ///   so columns align on the shaped lines, honors the alignment
+    ///   colons, sets the header row in the table-header weight, and
+    ///   paints hairline rules (under the header; between body rows).
+    /// * **Edit mode** (`edit_mode == true`) — every byte shapes; the
+    ///   pipes and the delimiter row dim into view (the standard
+    ///   cursor-inside reveal). The same pad substitutions keep the
+    ///   columns visually aligned while the user edits — org-mode's
+    ///   aligned-table feel without ever writing pad spaces into the
+    ///   buffer.
+    ///
+    /// `geometry` is the line/cell map (see [`crate::table`]);
+    /// `cursor_row` is the geometry row index the caret sits on in
+    /// edit mode (that row's cells shape raw so measurement pads
+    /// can't fight in-progress typing at the caret).
+    Table {
+        geometry: crate::table::TableGeometry,
+        edit_mode: bool,
+        cursor_row: Option<usize>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -357,6 +387,11 @@ pub struct InlineStyle {
     /// Inline link text — render with the link color and an
     /// underline. Set on the content of a `[text](url)` span.
     pub link: bool,
+    /// Table header cell content — render at the table-header weight
+    /// (`MarkdownStyle::table_header_weight`, Medium by default: size
+    /// stays the body size, the weight alone carries the header
+    /// emphasis, matching the app's flat heading discipline).
+    pub table_header: bool,
 }
 
 impl InlineStyle {
@@ -395,6 +430,13 @@ impl InlineStyle {
         }
     }
 
+    pub fn table_header() -> Self {
+        Self {
+            table_header: true,
+            ..Self::default()
+        }
+    }
+
     pub fn merge(mut self, other: InlineStyle) -> Self {
         self.bold |= other.bold;
         self.italic |= other.italic;
@@ -402,6 +444,7 @@ impl InlineStyle {
         self.dimmed |= other.dimmed;
         self.code |= other.code;
         self.link |= other.link;
+        self.table_header |= other.table_header;
         self
     }
 
@@ -412,5 +455,6 @@ impl InlineStyle {
             && !self.dimmed
             && !self.code
             && !self.link
+            && !self.table_header
     }
 }
