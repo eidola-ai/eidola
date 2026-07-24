@@ -251,12 +251,11 @@ impl SpaceView {
 
     /// Persist the active draft — **Post** drives the space's notification
     /// plan (participants with matching notify policies respond, concurrently);
-    /// `quiet` skips the plan (nobody is asked). Consumes the draft. A no-op
-    /// while streaming, with no active draft, or on an empty draft.
+    /// `quiet` skips the plan (nobody is asked). Consumes the draft **only when
+    /// the space accepts it**. A no-op with no active draft or on an empty
+    /// draft; a rejected submit (the space is busy) leaves the draft intact and
+    /// active.
     fn send_active_draft(&mut self, quiet: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.space.read(cx).is_streaming() {
-            return;
-        }
         let Some(active) = self.active_draft.clone() else {
             return;
         };
@@ -281,24 +280,34 @@ impl SpaceView {
                 .map(|s| s.to_string())
         });
 
-        // Consume the draft (it's becoming a persisted post). Clearing the
-        // active slot before `Space::submit` avoids briefly showing the draft
-        // beside the optimistic post.
+        // Attempt the save/post FIRST, and consume the draft only if the space
+        // **accepts** it. `Space::submit`/`post_only` return `false` whenever
+        // the space is busy — a streaming turn *or* an in-flight save/plan whose
+        // `post_runner` is occupied but which isn't streaming yet. Consuming the
+        // draft up front (the previous behavior, which only checked
+        // `is_streaming`) permanently lost the typed content when a Post landed
+        // in that save window: the draft was deleted and the `false` ignored. A
+        // rejected submit must leave the draft intact and active. Both mutations
+        // and the consume below run in this one synchronous handler, so no frame
+        // ever renders the draft beside the optimistic post.
+        let accepted = self.space.update(cx, |s, cx| {
+            if quiet {
+                s.post_only(prompt, reply_to, cx)
+            } else {
+                s.submit(prompt, reply_to, cx)
+            }
+        });
+        if !accepted {
+            return;
+        }
+
+        // Consume the draft (it's becoming a persisted post).
         self.active_draft = None;
         self.delete_draft(&active);
         self.error = None;
         self.band_menu = None;
         self.cascade_notice = None;
 
-        if quiet {
-            self.space.update(cx, |s, cx| {
-                s.post_only(prompt, reply_to, cx);
-            });
-        } else {
-            self.space.update(cx, |s, cx| {
-                s.submit(prompt, reply_to, cx);
-            });
-        }
         self.scroll_to_tail(window, cx);
         cx.notify();
     }

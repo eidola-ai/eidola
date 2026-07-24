@@ -2471,6 +2471,57 @@ fn space_submit_appends_user_streams_and_consumes_draft(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+fn space_post_during_save_window_preserves_draft(cx: &mut TestAppContext) {
+    // A Post landing while a prior Post's save/plan is still in flight (the
+    // `post_runner` is busy but nothing is streaming yet) must be rejected with
+    // the draft left intact and active — never consumed-then-dropped. The
+    // composer consumes the draft only after the space *accepts* the submit.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // Simulate the in-flight save window: the exclusive mutation slot is
+    // occupied, but no turn is streaming (the exact window the old
+    // `is_streaming`-only guard let a post through in).
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.space().read(cx).is_streaming(),
+            "the save window is not streaming"
+        );
+    });
+
+    // Type into the active draft and try to Post it during that window.
+    set_space_composer_text(&view, window, cx, "don't lose me");
+    dispatch_space_action(&view, window, cx, Send);
+
+    // The submit was rejected (space busy) — the draft survives, still active,
+    // still carrying its content.
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.post_count_for_test(),
+            0,
+            "no optimistic post — the submit was rejected"
+        );
+        assert!(
+            v.has_active_draft_for_test(),
+            "the rejected draft stays active"
+        );
+        let editor = v
+            .composer_state_for_test()
+            .expect("the draft is still the active composer");
+        assert_eq!(
+            editor.read(cx).value().trim(),
+            "don't lose me",
+            "the typed content survives a rejected Post"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_post_only_appends_user_without_streaming(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, None);
@@ -2924,6 +2975,97 @@ fn space_turn_failure_leaves_sibling_streams_untouched(cx: &mut TestAppContext) 
                 .iter()
                 .any(|s| s.participant_id.as_deref() == Some("agent-c")),
             "the sibling stream survived the retry"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_sibling_success_keeps_failed_turn_notice(cx: &mut TestAppContext) {
+    // A fan-out where one turn fails and a sibling *succeeds afterward*: the
+    // sibling's StreamEnded must NOT hide the failed turn's recovery notice.
+    // The notice's lifetime is owned by the Space's `failed_turn` record, so it
+    // persists (with Retry) until that turn is retried or explicitly dismissed.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let seq_c = cx
+        .update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.set_post_tree_for_test(vec![fixture_user_post("a1", "the question")], cx);
+                s.push_streaming_turn_for_test(
+                    Some("agent-b".into()),
+                    Some("a1".into()),
+                    Default::default(),
+                    cx,
+                );
+                s.push_streaming_turn_for_test(
+                    Some("agent-c".into()),
+                    Some("a1".into()),
+                    Default::default(),
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // agent-b's turn fails: the recovery notice + Retry appear.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::ChatFailed {
+                    space_id: "s".into(),
+                    source: Box::new(AppError::Network {
+                        message: "connection reset".into(),
+                    }),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test().is_some(),
+            "the failed turn shows a notice"
+        );
+        assert!(v.space().read(cx).can_retry(), "Retry is available");
+    });
+
+    // agent-c's sibling turn now *succeeds* (StreamEnded) — the notice must
+    // survive (the bug: the sibling's success silently removed the Retry path).
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.finish_streaming_turn_for_test(seq_c, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test().is_some(),
+            "a sibling's success must not hide the failed turn's notice"
+        );
+        let space = v.space().read(cx);
+        assert!(space.can_retry(), "Retry survives the sibling success");
+        let failed = space
+            .failed_turn()
+            .expect("the failed turn is still recorded");
+        assert_eq!(failed.participant_id, "agent-b");
+        assert_eq!(failed.target_action_id, "a1");
+    });
+
+    // Dismiss ends the recovery: the notice is gone and nothing is retryable.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.dismiss_error(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(v.error_for_test().is_none(), "dismiss clears the notice");
+        assert!(
+            !v.space().read(cx).can_retry(),
+            "dismiss ends the recovery — nothing left to retry"
         );
     });
 }
@@ -3703,6 +3845,83 @@ fn space_failed_ask_retry_selects_the_failed_posts_branch(cx: &mut TestAppContex
         "retry selects the failed post's branch so streaming attaches under it"
     );
     view.read_with(cx, |v, cx| assert!(v.space().read(cx).is_streaming()));
+}
+
+#[gpui::test]
+fn space_ask_other_post_keeps_unrelated_failed_turn(cx: &mut TestAppContext) {
+    // An explicit ask of participant P about post B must NOT clear a failed turn
+    // recorded for P about post A — the clearing requires BOTH the participant
+    // and the target to match (only a real Retry re-asks P@A). Matching P alone
+    // orphaned A's Retry.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // Two user posts; agent-b's ask about a1 failed.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![
+                    fixture_user_post("a1", "first question"),
+                    fixture_user_post("a2", "second question"),
+                ],
+                cx,
+            );
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::ChatFailed {
+                    space_id: "s".into(),
+                    source: Box::new(AppError::Network {
+                        message: "connection reset".into(),
+                    }),
+                },
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, cx| {
+        let f = v
+            .space()
+            .read(cx)
+            .failed_turn()
+            .expect("a1's failed turn recorded");
+        assert_eq!(f.target_action_id, "a1");
+    });
+
+    // Explicitly ask agent-b about a DIFFERENT post (a2). This starts a turn on
+    // a2 but must leave a1's recorded failure intact.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-b".into(), "a2".into(), window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, cx| {
+        let space = v.space().read(cx);
+        assert!(
+            space.can_retry(),
+            "asking P about another post keeps P@A's Retry"
+        );
+        let f = space
+            .failed_turn()
+            .expect("a1's failed turn survives the unrelated ask");
+        assert_eq!(f.participant_id, "agent-b");
+        assert_eq!(
+            f.target_action_id, "a1",
+            "the surviving failure still targets the originally-failed post"
+        );
+        assert!(
+            space
+                .streams()
+                .iter()
+                .any(|s| s.target_action_id.as_deref() == Some("a2")),
+            "the new ask started a streaming turn against a2"
+        );
+    });
 }
 
 #[gpui::test]

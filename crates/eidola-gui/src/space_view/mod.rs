@@ -901,7 +901,18 @@ impl SpaceView {
                 self.rebuild(cx);
             }
             SpaceEvent::StreamEnded => {
-                self.error = None;
+                // Clear the recovery notice only when the space has nothing left
+                // to recover. The notice's lifetime is owned by the Space's
+                // `failed_turn` record — NOT by whichever event fires last — so a
+                // *sibling* turn of a fan-out succeeding must never hide a still-
+                // recorded failed turn's Retry. Without this guard the sibling's
+                // `StreamEnded` blanked `self.error` while `failed_turn` survived,
+                // silently removing the user's only recovery path (the Retry
+                // renders inside the notice). It persists until that turn is
+                // retried or explicitly dismissed.
+                if self.space.read(cx).failed_turn().is_none() {
+                    self.error = None;
+                }
                 self.rebuild(cx);
                 // A blank space just adopted its id — its participants are
                 // loadable now (the Ask menus need them).
@@ -1804,10 +1815,14 @@ impl SpaceView {
             .into_any_element()
     }
 
-    /// Dismiss the recovery notice (clears the view's error state only — the
-    /// space is already recovered).
+    /// Dismiss the recovery notice — the user's explicit "end this recovery".
+    /// Clears the view's message **and** the Space's recorded `failed_turn`, so
+    /// a later sibling turn finishing can't resurrect an orphaned notice and
+    /// `can_retry` reads honestly (`false`) afterward. The saved user post and
+    /// the composer are untouched — the space is already recovered.
     pub fn dismiss_error(&mut self, cx: &mut Context<Self>) {
         self.error = None;
+        self.space.update(cx, |s, cx| s.clear_failed_turn(cx));
         cx.notify();
     }
 

@@ -938,13 +938,14 @@ impl Space {
         if duplicate {
             return false;
         }
-        // Re-asking the failed turn's participant is the Retry; clear the
-        // recorded failure so `can_retry` reads honestly while it streams.
-        if self
-            .failed_turn
-            .as_ref()
-            .is_some_and(|f| f.participant_id == participant_id)
-        {
+        // Re-asking the *failed turn itself* (same participant **and** same
+        // target) is the Retry; clear the recorded failure so `can_retry` reads
+        // honestly while it streams. Matching the participant alone would let an
+        // explicit ask of P about a *different* post orphan a failure recorded
+        // for P about the post that actually failed — so both must match.
+        if self.failed_turn.as_ref().is_some_and(|f| {
+            f.participant_id == participant_id && f.target_action_id == target_action_id
+        }) {
             self.failed_turn = None;
         }
         self.supersede_load_for_mutation();
@@ -1150,6 +1151,18 @@ impl Space {
         self.failed_turn.is_some() && self.post_runner.is_none()
     }
 
+    /// Forget the recorded failed turn (the recovery notice was **explicitly
+    /// dismissed**). The recovery notice's lifetime is owned by this record —
+    /// it persists across sibling turns finishing until the turn is retried or
+    /// the user dismisses it — so ending the recovery clears the record here,
+    /// after which [`Self::can_retry`] reads `false`. The saved user post is
+    /// untouched (Edit / a fresh ask remain available).
+    pub fn clear_failed_turn(&mut self, cx: &mut Context<Self>) {
+        if self.failed_turn.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// Re-ask the failed turn's participant about the same post — **without**
     /// re-posting anything (the post is already durable; the ask bypasses the
     /// cascade guard). Returns the **target action id** the retry ran against
@@ -1271,6 +1284,33 @@ impl Space {
     #[doc(hidden)]
     pub fn arm_load_for_test(&mut self, cx: &mut Context<Self>) {
         self.load_task = Some(cx.spawn(async move |_, _| std::future::pending::<()>().await));
+    }
+
+    /// Test-only: occupy the **exclusive mutation slot** with a never-completing
+    /// task, standing in for an in-flight save/plan (`submit`/`post_only`/edit/
+    /// regenerate) whose `post_runner` is busy but which is **not yet
+    /// streaming**. That is the window a second Post must be rejected in (so its
+    /// draft is preserved, not consumed-then-dropped) — the composer's
+    /// accept-before-consume gate. While armed, `is_busy` is `true` and
+    /// `submit`/`post_only` return `false`.
+    #[doc(hidden)]
+    pub fn arm_post_runner_for_test(&mut self, cx: &mut Context<Self>) {
+        self.post_runner = Some(cx.spawn(async move |_, _| std::future::pending::<()>().await));
+    }
+
+    /// Test-only: complete one streaming turn **successfully** — drop its stream
+    /// entry and emit `MessagesChanged` + `StreamEnded`, exactly as a real turn
+    /// runner's success arm does (minus the DB reload a stub can't perform).
+    /// Drives the sibling-success-keeps-the-failed-turn-notice regression: a
+    /// sibling of a fan-out finishing must not hide a still-recorded failed
+    /// turn's recovery notice.
+    #[doc(hidden)]
+    pub fn finish_streaming_turn_for_test(&mut self, seq: u64, cx: &mut Context<Self>) {
+        self.streams.retain(|s| s.seq != seq);
+        self.turn_runners.remove(&seq);
+        cx.emit(SpaceEvent::MessagesChanged);
+        cx.emit(SpaceEvent::StreamEnded);
+        cx.notify();
     }
 
     /// Test-only: whether a transcript load is in flight (the load slot is
