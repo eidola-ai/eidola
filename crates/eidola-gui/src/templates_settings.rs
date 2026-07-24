@@ -27,7 +27,8 @@ use gpui_component::{
 };
 
 use crate::participants_view::{
-    NOTIFY_POLICIES, error_banner, field_label, ghost_button, mode_chip, model_field,
+    NOTIFY_POLICIES, error_banner, field_label, ghost_button, load_error_panel, mode_chip,
+    model_field,
 };
 use crate::probe::Probe as _;
 use crate::stores::{ConfigStore, Stores, TemplatesStore};
@@ -86,6 +87,12 @@ impl TemplatesSettingsView {
 
     fn default_template_id(&self, cx: &gpui::App) -> Option<String> {
         self.config.read(cx).default_template()
+    }
+
+    /// Re-fetch the template registry (the Retry affordance on a failed load).
+    pub fn retry_load(&mut self, cx: &mut Context<Self>) {
+        self.templates_store.update(cx, |s, cx| s.refresh(cx));
+        cx.notify();
     }
 
     // --- Test seams ------------------------------------------------------
@@ -305,6 +312,13 @@ impl Render for TemplatesSettingsView {
         let templates = self.templates(cx);
         let default_id = self.default_template_id(cx);
         let op_error = self.templates_store.read(cx).op_error().map(str::to_string);
+        // A failed initial registry load must not read as a plausible-empty
+        // registry (Default "missing") — `op_error` only covers writes.
+        let (load_error, has_value) = {
+            let cell = self.templates_store.read(cx).templates();
+            (cell.error().map(|e| e.to_string()), cell.has_value())
+        };
+        let load_failed_blank = load_error.is_some() && !has_value && self.draft.is_none();
 
         let mut col = v_flex()
             .id("templates-pane")
@@ -329,7 +343,19 @@ impl Render for TemplatesSettingsView {
                     ),
             );
 
-        if let Some(_draft) = self.draft.as_ref() {
+        if load_failed_blank {
+            let err = load_error.clone().unwrap_or_default();
+            col = col.child(load_error_panel(
+                "settings/templates/retry",
+                "Couldn't load your space templates.",
+                &err,
+                cx,
+                cx.listener(|this, _, _, cx| this.retry_load(cx)),
+            ));
+            return col;
+        }
+
+        if self.draft.is_some() {
             col = col.child(self.render_editor(cx));
         } else {
             for t in &templates {
@@ -355,6 +381,22 @@ impl Render for TemplatesSettingsView {
                     .id("templates-error")
                     .probe("settings/templates/error", gpui::Role::Alert, err.clone())
                     .child(error_banner(&err, cx)),
+            );
+        }
+
+        // A refresh failure over existing data: keep the list, offer a quiet retry.
+        if load_error.is_some() && has_value {
+            col = col.child(
+                div()
+                    .id("templates-retry")
+                    .probe("settings/templates/retry", gpui::Role::Button, "Retry")
+                    .mt_1()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(theme.link)
+                    .hover(|s| s.text_color(theme.foreground))
+                    .child("Couldn't refresh — retry")
+                    .on_click(cx.listener(|this, _, _, cx| this.retry_load(cx))),
             );
         }
 

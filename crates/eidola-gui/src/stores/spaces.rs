@@ -19,6 +19,7 @@ use gpui::{AppContext, Context, Entity, Subscription, Task, WeakEntity};
 use crate::bridge::bridge;
 use crate::loadable::Loadable;
 use crate::space::{Space, SpaceEvent};
+use crate::stores::Stores;
 
 pub struct SpacesStore {
     app_core: Option<Arc<AppCore>>,
@@ -34,6 +35,16 @@ pub struct SpacesStore {
     /// for its first id assignment. On `StreamEnded` the space's now-present
     /// id is read and the entity is moved into `registry`.
     pending_blanks: Vec<(WeakEntity<Space>, Subscription)>,
+    /// In-flight "New Space from Template" ops, keyed by a monotonic id so each
+    /// activation is **independent** and runs to completion (STATE.md "keyed
+    /// per-key work") — a supersede slot would let a superseded result, whose
+    /// core-side space is already committed, strand an empty space with no
+    /// window. Each task removes its own key when it finishes.
+    create_ops: HashMap<u64, Task<()>>,
+    next_create_op: u64,
+    /// The last "New Space from Template" failure, surfaced in the Library (the
+    /// natural home for a failed new-space) rather than silently discarded.
+    new_space_error: Option<String>,
 }
 
 impl SpacesStore {
@@ -44,6 +55,9 @@ impl SpacesStore {
             task: None,
             registry: HashMap::new(),
             pending_blanks: Vec::new(),
+            create_ops: HashMap::new(),
+            next_create_op: 0,
+            new_space_error: None,
         }
     }
 
@@ -59,6 +73,9 @@ impl SpacesStore {
             task: None,
             registry: HashMap::new(),
             pending_blanks: Vec::new(),
+            create_ops: HashMap::new(),
+            next_create_op: 0,
+            new_space_error: None,
         }
     }
 
@@ -141,6 +158,71 @@ impl SpacesStore {
         {
             entity.update(cx, |space, cx| space.on_space_changed(id, cx));
         }
+    }
+
+    // -- New Space from Template ------------------------------------------
+
+    /// The last "New Space from Template" failure, if any (surfaced in the
+    /// Library).
+    pub fn new_space_error(&self) -> Option<&str> {
+        self.new_space_error.as_deref()
+    }
+
+    pub fn clear_new_space_error(&mut self, cx: &mut Context<Self>) {
+        if self.new_space_error.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Instantiate a **specific** template into a new space and open its window.
+    /// The op is **owned** here in a keyed task slot (never `.detach()`ed) so it
+    /// runs to completion regardless of any window, and each activation is
+    /// independent (no supersede) so a committed space always gets its window —
+    /// no stranding. A failure is surfaced in `new_space_error` (Library banner),
+    /// not silently discarded. `stores` is passed through only to open the
+    /// resulting window (`open_space_window` needs the bundle); it is not
+    /// retained.
+    pub fn create_from_template(
+        &mut self,
+        template_id: String,
+        stores: Stores,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(core) = self.app_core.clone() else {
+            return;
+        };
+        self.new_space_error = None;
+        let key = self.next_create_op;
+        self.next_create_op += 1;
+        self.create_ops.insert(
+            key,
+            cx.spawn(async move |this, cx| {
+                let result = bridge(core, move |c| async move {
+                    c.create_space_from_template(template_id, None).await
+                })
+                .await;
+                match result {
+                    Ok(space) => {
+                        // Open the window in the App context; the durable space
+                        // already committed (and emitted `Change::SpaceIndex`),
+                        // so even if this update is missed the Library reflects it.
+                        cx.update(|cx| {
+                            crate::open_space_window(cx, stores.clone(), space.id);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.new_space_error = Some(e.to_string());
+                            cx.notify();
+                        });
+                    }
+                }
+                let _ = this.update(cx, |this, _| {
+                    this.create_ops.remove(&key);
+                });
+            }),
+        );
+        cx.notify();
     }
 
     // -- The Library index ------------------------------------------------

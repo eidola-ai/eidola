@@ -1949,3 +1949,66 @@ fn templates_pane_probes_cover_rows_and_editor(cx: &mut TestAppContext) {
 
     probe::set_probes_enabled(false);
 }
+
+#[gpui::test]
+fn participants_view_failed_load_shows_retry_not_controls(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            ParticipantsView::new(
+                stores.clone(),
+                "demo".into(),
+                Some("Demo".into()),
+                window,
+                cx,
+            )
+        })
+    });
+    // A failed *initial* load: no prior data, no live roster.
+    stores
+        .participants
+        .update(cx, |s, _| s.set_failed_for_test("demo", "boom"));
+    let _ = view;
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"participants/retry".to_string()),
+        "failed load must offer Retry: {names:?}"
+    );
+    for absent in ["participants/add", "participants/save-template"] {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "a failed load must not show live controls ({absent:?}): {names:?}"
+        );
+    }
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn templates_pane_failed_load_shows_retry(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    stores
+        .templates
+        .update(cx, |s, _| s.set_failed_for_test("boom"));
+    let _ = view;
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/templates/retry".to_string()),
+        "failed template load must offer Retry: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/templates/new".to_string()),
+        "a failed registry load must not read as an empty registry with New: {names:?}"
+    );
+    probe::set_probes_enabled(false);
+}

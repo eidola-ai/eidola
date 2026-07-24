@@ -478,29 +478,18 @@ fn install_action_handlers(cx: &mut App) {
         open_main_window(cx);
     });
 
-    // New Space from a specific template (Space menu submenu). Instantiate the
-    // template into a fresh space core-side, then open it. The instantiate is
-    // owned by a startup-scoped one-shot (the sanctioned app-lifetime detach) —
-    // it must run to completion regardless of any window, and its result opens
-    // the window.
+    // New Space from a specific template (Space menu submenu). Routed through
+    // `SpacesStore` so the create-and-open op is **owned** in an entity task
+    // slot (STATE.md — never `.detach()` domain work): the store keys each
+    // activation independently so a committed space always gets its window, and
+    // surfaces a failure in `new_space_error` (Library banner) instead of
+    // silently discarding it.
     cx.on_action(|action: &NewSpaceFromTemplate, cx: &mut App| {
         let stores = cx.global::<AppGlobal>().stores.clone();
-        let Some(core) = stores.app_core() else {
-            return;
-        };
         let template_id = action.template_id.clone();
-        let task: gpui::Task<()> = cx.spawn(async move |cx: &mut gpui::AsyncApp| {
-            let result = crate::bridge::bridge(core, move |c| async move {
-                c.create_space_from_template(template_id, None).await
-            })
-            .await;
-            if let Ok(space) = result {
-                cx.update(|cx| {
-                    open_space_window(cx, stores.clone(), space.id);
-                });
-            }
+        stores.spaces.clone().update(cx, |s, cx| {
+            s.create_from_template(template_id, stores.clone(), cx);
         });
-        task.detach();
     });
 
     cx.on_action(|_: &GetStarted, cx: &mut App| {
