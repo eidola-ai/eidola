@@ -25,10 +25,12 @@ use eidola_gui::account::AccountView;
 use eidola_gui::actions::{PostOnly, Send, ToggleModelPicker};
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
+use eidola_gui::participants_view::{EditMode, ParticipantsView};
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
 use eidola_gui::space_view::SpaceView;
 use eidola_gui::stores::{self, Stores, StoresStub};
+use eidola_gui::templates_settings::TemplatesSettingsView;
 use eidola_gui::updates::{UpdatesDisplay, UpdatesView, relative_time};
 use eidola_gui::wallet::WalletView;
 use eidola_gui::window_input::WindowInput;
@@ -3850,4 +3852,258 @@ fn space_readonly_selection_sticks_on_noncanonical_post(cx: &mut TestAppContext)
              frames, got {sel:?}"
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Participants v1 — the Participants view + Space Templates pane (real core)
+// ---------------------------------------------------------------------------
+//
+// These drive the views against a *real* tempdir-backed `AppCore` (the CRUD is
+// local-DB work, so an unreachable base URL is fine) and `run_until_parked` to
+// let each write-then-relist land — the established real-core idiom (see
+// `record_refresh_supersedes_in_flight_fetch` and `tests/stores.rs`). Each
+// joins the runtime's live tasks before returning so the last `Arc<AppCore>`
+// always drops on the test thread.
+
+/// A real, tempdir-backed core with an unreachable base URL, plus a freshly
+/// created space (born from the default template: "You" + the seeded agent).
+fn participants_scene(
+    cx: &mut TestAppContext,
+) -> (Stores, std::sync::Arc<AppCore>, tempfile::TempDir, String) {
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(AppCore::new(
+        dir.path().to_path_buf(),
+        dir.path().join("data"),
+    ));
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
+        .unwrap();
+    let space = core
+        .runtime()
+        .block_on(core.create_space(None))
+        .expect("create space")
+        .id;
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    (stores, core, dir, space)
+}
+
+fn drain_runtime(core: &std::sync::Arc<AppCore>) {
+    while core.runtime().metrics().num_alive_tasks() > 0 {
+        std::thread::yield_now();
+    }
+}
+
+/// Poll `run_until_parked` until `pred` holds — a write-then-relist round-trips
+/// through the tokio runtime, which `run_until_parked` alone can return before
+/// (the tokio result lands after the gpui task parks). The DB op settles in
+/// milliseconds; ~10s ceiling. (Mirrors `tests/stores.rs::wait_for_backends`.)
+fn wait_until(
+    cx: &mut TestAppContext,
+    what: &str,
+    mut pred: impl FnMut(&mut TestAppContext) -> bool,
+) {
+    for _ in 0..400 {
+        cx.run_until_parked();
+        if pred(cx) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("timed out waiting until {what}");
+}
+
+fn participant_labels(stores: &Stores, space: &str, cx: &mut TestAppContext) -> Vec<String> {
+    stores.participants.read_with(cx, |s, _| {
+        s.list(space).iter().map(|p| p.label.clone()).collect()
+    })
+}
+
+#[gpui::test]
+fn participants_view_add_and_remove(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ParticipantsView::new(stores.clone(), space.clone(), None, window, cx))
+    });
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    // Add a participant: open the form, set its name, save.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_add(window, cx));
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.adding_label_state())
+        .expect("add form open");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Reviewer", window, cx));
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.save_add(cx));
+    wait_until(cx, "participant added", |cx| {
+        participant_labels(&stores, &space, cx).contains(&"Reviewer".to_string())
+    });
+    assert_eq!(participant_labels(&stores, &space, cx).len(), 3);
+
+    // Remove it.
+    let reviewer_id = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.label == "Reviewer")
+            .unwrap()
+            .id
+            .clone()
+    });
+    view.update(cx, |v, cx| v.remove(&reviewer_id, cx));
+    wait_until(cx, "participant removed", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    drain_runtime(&core);
+}
+
+/// The headline fork: editing a **referenced global** ("You") writes either the
+/// shared config (edit everywhere) or a per-space override (override here). The
+/// view routes to the right store method per its mode.
+#[gpui::test]
+fn participants_view_override_vs_edit_everywhere(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ParticipantsView::new(stores.clone(), space.clone(), None, window, cx))
+    });
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    let you = eidola_app_core::HUMAN_PARTICIPANT_ID;
+
+    // Override here: a referenced global defaults to the this-space-only mode.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit(you, window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.editing_mode()),
+        Some(EditMode::OverrideHere)
+    );
+    let label = view.read_with(cx, |v, _| v.editing_label_state()).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Me", window, cx));
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.save_edit(cx));
+    wait_until(cx, "override applied", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .find(|p| p.id == you)
+                .map(|p| p.label == "Me")
+                .unwrap_or(false)
+        })
+    });
+
+    let (eff, base) = stores.participants.read_with(cx, |s, _| {
+        let p = s.list(&space).iter().find(|p| p.id == you).unwrap().clone();
+        (p.label.clone(), p.reference.unwrap().base_label)
+    });
+    assert_eq!(eff, "Me", "override changed the effective label");
+    assert_ne!(base, "Me", "the shared global is untouched by an override");
+
+    // Edit everywhere: switch mode, change the name, save — now the base moves.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit(you, window, cx));
+        view.update(cx, |v, cx| {
+            v.set_edit_mode(EditMode::Everywhere, window, cx)
+        });
+    })
+    .unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.editing_mode()),
+        Some(EditMode::Everywhere)
+    );
+    let label = view.read_with(cx, |v, _| v.editing_label_state()).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Myself", window, cx));
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.save_edit(cx));
+    wait_until(cx, "edit-everywhere applied", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .find(|p| p.id == you)
+                .and_then(|p| p.reference.as_ref())
+                .map(|r| r.base_label == "Myself")
+                .unwrap_or(false)
+        })
+    });
+
+    drain_runtime(&core);
+}
+
+#[gpui::test]
+fn templates_pane_crud_and_set_default(cx: &mut TestAppContext) {
+    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    wait_until(cx, "templates load", |cx| {
+        stores.templates.read_with(cx, |s, _| !s.list().is_empty())
+    });
+
+    // Seeded with the built-in "Default", which is the default.
+    let titles = stores.templates.read_with(cx, |s, _| {
+        s.list().iter().map(|t| t.title.clone()).collect::<Vec<_>>()
+    });
+    assert!(
+        titles.iter().any(|t| t == "Default"),
+        "seeded Default: {titles:?}"
+    );
+
+    // Create a template.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_create(window, cx));
+    })
+    .unwrap();
+    assert_eq!(view.read_with(cx, |v, _| v.draft_cascade()), Some(4));
+    let title = view.read_with(cx, |v, _| v.draft_title_state()).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        title.update(cx, |s, cx| s.set_value("Research", window, cx));
+        view.update(cx, |v, cx| v.cascade_inc(1, cx));
+    })
+    .unwrap();
+    assert_eq!(view.read_with(cx, |v, _| v.draft_cascade()), Some(5));
+    view.update(cx, |v, cx| v.save(cx));
+    wait_until(cx, "template created", |cx| {
+        stores
+            .templates
+            .read_with(cx, |s, _| s.list().iter().any(|t| t.title == "Research"))
+    });
+
+    let research = stores
+        .templates
+        .read_with(cx, |s, _| {
+            s.list().iter().find(|t| t.title == "Research").cloned()
+        })
+        .expect("Research template created");
+    assert_eq!(research.cascade_limit, 5, "cascade limit persisted");
+
+    // Set it as default (config write-through).
+    view.update(cx, |v, cx| v.set_default(&research.id, cx));
+    wait_until(cx, "default set", |cx| {
+        stores.config.read_with(cx, |c, _| c.default_template()) == Some(research.id.clone())
+    });
+
+    // Remove it (soft — leaves the listing).
+    view.update(cx, |v, cx| v.remove_template(&research.id, cx));
+    wait_until(cx, "template removed", |cx| {
+        stores
+            .templates
+            .read_with(cx, |s, _| !s.list().iter().any(|t| t.title == "Research"))
+    });
+
+    drain_runtime(&core);
 }

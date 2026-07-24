@@ -55,7 +55,7 @@ pub(crate) fn notify_label(policy: &str) -> &'static str {
 }
 
 /// Which editor writes a referenced global's fields.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EditMode {
     /// Edit the shared global's own config (edits everywhere).
     Everywhere,
@@ -156,6 +156,38 @@ impl ParticipantsView {
 
     fn list(&self, cx: &gpui::App) -> Vec<ParticipantInfo> {
         self.participants.read(cx).list(&self.space_id).to_vec()
+    }
+
+    // --- Test seams ------------------------------------------------------
+
+    #[doc(hidden)]
+    pub fn editing_participant_id(&self) -> Option<&str> {
+        self.editing.as_ref().map(|e| e.participant_id.as_str())
+    }
+
+    #[doc(hidden)]
+    pub fn editing_mode(&self) -> Option<EditMode> {
+        self.editing.as_ref().map(|e| e.mode)
+    }
+
+    #[doc(hidden)]
+    pub fn editing_label_state(&self) -> Option<Entity<InputState>> {
+        self.editing.as_ref().map(|e| e.label.clone())
+    }
+
+    #[doc(hidden)]
+    pub fn is_adding(&self) -> bool {
+        self.adding.is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn adding_label_state(&self) -> Option<Entity<InputState>> {
+        self.adding.as_ref().map(|a| a.label.clone())
+    }
+
+    #[doc(hidden)]
+    pub fn is_saving_template(&self) -> bool {
+        self.template_form.is_some()
     }
 
     // --- Editing ---------------------------------------------------------

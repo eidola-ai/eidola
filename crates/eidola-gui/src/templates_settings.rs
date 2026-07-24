@@ -88,6 +88,33 @@ impl TemplatesSettingsView {
         self.config.read(cx).default_template()
     }
 
+    // --- Test seams ------------------------------------------------------
+
+    #[doc(hidden)]
+    pub fn is_editing(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn editing_template_id(&self) -> Option<Option<String>> {
+        self.draft.as_ref().map(|d| d.id.clone())
+    }
+
+    #[doc(hidden)]
+    pub fn draft_title_state(&self) -> Option<Entity<InputState>> {
+        self.draft.as_ref().map(|d| d.title.clone())
+    }
+
+    #[doc(hidden)]
+    pub fn draft_cascade(&self) -> Option<i64> {
+        self.draft.as_ref().map(|d| d.cascade_limit)
+    }
+
+    #[doc(hidden)]
+    pub fn draft_participant_count(&self) -> Option<usize> {
+        self.draft.as_ref().map(|d| d.participants.len())
+    }
+
     // --- Editing ---------------------------------------------------------
 
     fn new_participant_draft(
