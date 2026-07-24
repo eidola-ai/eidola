@@ -2693,6 +2693,22 @@ impl Inner {
                 tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
                 continue;
             }
+
+            // Before any terminal verdict, re-check for a spendable credential.
+            // A concurrent turn's in-flight credential can *settle*
+            // (spending → spent, atomically writing an active successor) in the
+            // window between the `find_spendable_credential` check at the top of
+            // this iteration and the `list_spending_credentials` check above.
+            // In that window both snapshots are stale — the successor is not yet
+            // visible as active, and the original is no longer visible as
+            // spending — so `recoverable` reads false even though funding just
+            // became available. Re-reading here (the settle is a single atomic
+            // insert, so a spent original guarantees a queryable active
+            // successor) picks up that successor instead of falsely reporting a
+            // shortfall.
+            if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
+                return Ok(cred);
+            }
             if recoverable {
                 return Err(AppError::ProvisioningTimeout {
                     message: format!(
