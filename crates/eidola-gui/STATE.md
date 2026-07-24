@@ -33,6 +33,8 @@ enum Loadable<T> {
 
 Stores expose `Loadable<T>` snapshots; views match on it exhaustively. A refresh over existing data keeps `Loaded { stale: true }` visible rather than flashing through `Loading` — re-fetches must never blank a page.
 
+**A view must render `Failed`, not just `Loading`/value — "Failed is not empty."** A failed *initial* load (`Failed { prior: None }`) whose `list()` returns an empty slice must **not** read as a plausible-empty surface with live controls (an empty roster with a live Add, an empty registry that reads as "Default missing") — that hides a real error behind a normal-looking UI, and any load-once cell (`ensure`-style, which declines to re-fetch once a `Failed` exists) then stays blank forever with no way back. Render the error **plus an explicit Retry** that re-fetches (the shared `participants_view::load_error_panel` helper is the house pattern; the Participants view and Space Templates pane both use it). A failed *refresh* over existing data (`Failed { prior: Some }`) keeps the stale value shown and adds a quiet retry — never a blank. Per-operation state (a write's `op_error`) must be **keyed the same way its snapshots are** (per-space for a space-keyed store), or two windows cross-contaminate each other's banners.
+
 ### Domain stores (app-global)
 
 One gpui entity per domain, created at startup, held by `AppGlobal`, observed by any view that renders the domain. Each store owns: its `Loadable` snapshots, its in-flight `Task` fields, its subscription to the invalidation bus, and *all* mutations of its domain. Views call store methods; views never call `AppCore` directly.

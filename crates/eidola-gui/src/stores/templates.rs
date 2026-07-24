@@ -55,6 +55,18 @@ impl TemplatesStore {
         &self.templates
     }
 
+    /// Test-only: force the registry into `Failed` (no prior) to exercise the
+    /// failed-initial-load rendering.
+    #[doc(hidden)]
+    pub fn set_failed_for_test(&mut self, error: &str) {
+        self.templates = Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: error.to_string(),
+            },
+            prior: None,
+        };
+    }
+
     pub fn list(&self) -> &[SpaceTemplateInfo] {
         self.templates.value().map(|v| v.as_slice()).unwrap_or(&[])
     }

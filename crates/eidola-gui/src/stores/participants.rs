@@ -33,8 +33,11 @@ pub struct ParticipantsStore {
     spaces: HashMap<String, Loadable<Vec<ParticipantInfo>>>,
     /// One supersede task slot per space (list refresh + CRUD compose).
     tasks: HashMap<String, Task<()>>,
-    /// The last write error, surfaced by the view's op-error banner.
-    op_error: Option<String>,
+    /// The last write error, **keyed per space** — snapshots and task slots are
+    /// space-keyed, so a store-wide error would cross-contaminate two open
+    /// Participants windows (one space's failure banner appearing under another,
+    /// and either op start clearing the other's). Each view reads only its own.
+    op_errors: HashMap<String, String>,
 }
 
 const NOT_LOADED: Loadable<Vec<ParticipantInfo>> = Loadable::NotLoaded;
@@ -45,7 +48,7 @@ impl ParticipantsStore {
             app_core,
             spaces: HashMap::new(),
             tasks: HashMap::new(),
-            op_error: None,
+            op_errors: HashMap::new(),
         }
     }
 
@@ -59,13 +62,28 @@ impl ParticipantsStore {
             app_core: None,
             spaces,
             tasks: HashMap::new(),
-            op_error: None,
+            op_errors: HashMap::new(),
         }
     }
 
     /// The participants of `space_id` (`NotLoaded` if never opened).
     pub fn participants(&self, space_id: &str) -> &Loadable<Vec<ParticipantInfo>> {
         self.spaces.get(space_id).unwrap_or(&NOT_LOADED)
+    }
+
+    /// Test-only: force a space's cell into `Failed` (no prior) to exercise the
+    /// failed-initial-load rendering.
+    #[doc(hidden)]
+    pub fn set_failed_for_test(&mut self, space_id: &str, error: &str) {
+        self.spaces.insert(
+            space_id.to_string(),
+            Loadable::Failed {
+                error: eidola_app_core::error::AppError::Config {
+                    message: error.to_string(),
+                },
+                prior: None,
+            },
+        );
     }
 
     pub fn list(&self, space_id: &str) -> &[ParticipantInfo] {
@@ -75,12 +93,13 @@ impl ParticipantsStore {
             .unwrap_or(&[])
     }
 
-    pub fn op_error(&self) -> Option<&str> {
-        self.op_error.as_deref()
+    /// The last write error for `space_id`, if any (per-space, not store-wide).
+    pub fn op_error(&self, space_id: &str) -> Option<&str> {
+        self.op_errors.get(space_id).map(String::as_str)
     }
 
-    pub fn clear_op_error(&mut self, cx: &mut Context<Self>) {
-        if self.op_error.take().is_some() {
+    pub fn clear_op_error(&mut self, space_id: &str, cx: &mut Context<Self>) {
+        if self.op_errors.remove(space_id).is_some() {
             cx.notify();
         }
     }
@@ -147,7 +166,7 @@ impl ParticipantsStore {
         let Some(core) = self.app_core.clone() else {
             return;
         };
-        self.op_error = None;
+        self.op_errors.remove(&space_id);
         let relist_core = core.clone();
         let key = space_id.clone();
         self.tasks.insert(
@@ -173,7 +192,9 @@ impl ParticipantsStore {
                                 this.spaces.insert(key.clone(), Loadable::loaded(list));
                             }
                         }
-                        Err(e) => this.op_error = Some(e),
+                        Err(e) => {
+                            this.op_errors.insert(key.clone(), e);
+                        }
                     }
                     this.tasks.remove(&key);
                     cx.notify();

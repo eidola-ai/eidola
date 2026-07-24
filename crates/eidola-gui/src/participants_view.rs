@@ -158,6 +158,16 @@ impl ParticipantsView {
         self.participants.read(cx).list(&self.space_id).to_vec()
     }
 
+    /// Re-fetch this space's participants (the Retry affordance on a failed
+    /// load — `ensure` declines once a `Failed` cell exists, so retry is the
+    /// only path back).
+    pub fn retry_load(&mut self, cx: &mut Context<Self>) {
+        let space_id = self.space_id.clone();
+        self.participants
+            .update(cx, |s, cx| s.refresh(space_id, cx));
+        cx.notify();
+    }
+
     // --- Test seams ------------------------------------------------------
 
     #[doc(hidden)]
@@ -733,12 +743,24 @@ impl Render for ParticipantsView {
             crate::titlebar::drag_band("participants-titlebar", TITLE_BAR_RESERVE, window, cx);
         let theme = cx.theme();
         let participants = self.list(cx);
-        let loading = self
+        let (loading, load_error, has_value) = {
+            let cell = self.participants.read(cx).participants(&self.space_id);
+            (
+                cell.is_loading(),
+                cell.error().map(|e| e.to_string()),
+                cell.has_value(),
+            )
+        };
+        // A failed *initial* load (no prior data) must not read as an empty
+        // membership with live Add/Save controls — render the error + a Retry
+        // instead. A failed *refresh* over existing data keeps the list (stale)
+        // and surfaces a quiet retry alongside it.
+        let load_failed_blank = load_error.is_some() && !has_value;
+        let op_error = self
             .participants
             .read(cx)
-            .participants(&self.space_id)
-            .is_loading();
-        let op_error = self.participants.read(cx).op_error().map(str::to_string);
+            .op_error(&self.space_id)
+            .map(str::to_string);
 
         let mut root = crate::chrome::round_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)
@@ -799,6 +821,20 @@ impl Render for ParticipantsView {
             .px_10()
             .py_4()
             .gap_2();
+
+        // A failed initial load owns the whole body: the honest error + Retry,
+        // no phantom-empty roster with live controls.
+        if load_failed_blank {
+            let err = load_error.clone().unwrap_or_default();
+            body = body.child(load_error_panel(
+                "participants/retry",
+                "Couldn't load this space's participants.",
+                &err,
+                cx,
+                cx.listener(|this, _, _, cx| this.retry_load(cx)),
+            ));
+            return root.child(body);
+        }
 
         if participants.is_empty() && loading {
             body = body.child(
@@ -869,6 +905,23 @@ impl Render for ParticipantsView {
                     .probe("participants/error", gpui::Role::Alert, err.clone())
                     .mt_2()
                     .child(error_banner(&err, cx)),
+            );
+        }
+
+        // A refresh that failed *over* existing data: keep the (stale) list but
+        // offer a quiet retry so the staleness isn't silent.
+        if load_error.is_some() && has_value {
+            body = body.child(
+                div()
+                    .id("participants-retry")
+                    .probe("participants/retry", gpui::Role::Button, "Retry")
+                    .mt_1()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(theme.link)
+                    .hover(|s| s.text_color(theme.foreground))
+                    .child("Couldn't refresh — retry")
+                    .on_click(cx.listener(|this, _, _, cx| this.retry_load(cx))),
             );
         }
 
@@ -1327,6 +1380,47 @@ pub(crate) fn ghost_button(
         })
     };
     el.child(label).on_click(on_click)
+}
+
+/// A centered "couldn't load — retry" panel for a failed *initial* store load
+/// (vs `error_banner`, the inline write-error strip). Shared by the Participants
+/// view and the Templates pane so a `Loadable::Failed` never renders as a
+/// plausible-empty surface. `retry_probe` is the button's probe name.
+pub(crate) fn load_error_panel(
+    retry_probe: &'static str,
+    headline: &'static str,
+    detail: &str,
+    cx: &gpui::App,
+    on_retry: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    v_flex()
+        .w_full()
+        .py_8()
+        .gap_2()
+        .items_center()
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(SharedString::from(headline.to_string())),
+        )
+        .child(
+            div()
+                .max_w(px(360.))
+                .text_center()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(SharedString::from(detail.to_string())),
+        )
+        .child(ghost_button(
+            "load-retry".into(),
+            SharedString::from(retry_probe),
+            "Retry",
+            true,
+            cx,
+            on_retry,
+        ))
 }
 
 pub(crate) fn error_banner(message: &str, cx: &gpui::App) -> impl IntoElement {

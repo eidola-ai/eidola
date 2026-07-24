@@ -4107,3 +4107,101 @@ fn templates_pane_crud_and_set_default(cx: &mut TestAppContext) {
 
     drain_runtime(&core);
 }
+
+/// A failed initial participant load must render Retry (not a phantom-empty
+/// roster), and Retry must actually re-fetch. `ensure` declines once a `Failed`
+/// cell exists, so `retry_load` is the only path back.
+#[gpui::test]
+fn participants_view_retry_refetches_after_failed_load(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ParticipantsView::new(stores.clone(), space.clone(), None, window, cx))
+    });
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    // Simulate a failed refresh: the cell goes Failed with no prior.
+    let space_for_fail = space.clone();
+    stores.participants.update(cx, move |s, _| {
+        s.set_failed_for_test(&space_for_fail, "boom")
+    });
+    stores.participants.read_with(cx, |s, _| {
+        let cell = s.participants(&space);
+        assert!(cell.error().is_some() && !cell.has_value(), "failed, blank");
+    });
+
+    // Retry re-fetches; the real list lands again.
+    view.update(cx, |v, cx| v.retry_load(cx));
+    wait_until(cx, "retry reloads", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    drain_runtime(&core);
+}
+
+/// The per-space error keying: a failure on space A must not surface under
+/// space B, and starting B's op must not clear A's error.
+#[gpui::test]
+fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space_a) = participants_scene(cx);
+    let space_b = core
+        .runtime()
+        .block_on(core.create_space(None))
+        .expect("space b")
+        .id;
+
+    // An empty label is rejected by app-core → a per-space op_error.
+    let bad = || eidola_app_core::NewParticipant {
+        label: "".into(),
+        ..Default::default()
+    };
+    let a = space_a.clone();
+    stores
+        .participants
+        .update(cx, move |s, cx| s.add(a, bad(), cx));
+    wait_until(cx, "A op_error", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_error(&space_a).is_some())
+    });
+    stores.participants.read_with(cx, |s, _| {
+        assert!(s.op_error(&space_b).is_none(), "B must not see A's error");
+    });
+
+    let b = space_b.clone();
+    stores
+        .participants
+        .update(cx, move |s, cx| s.add(b, bad(), cx));
+    wait_until(cx, "B op_error", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_error(&space_b).is_some())
+    });
+    stores.participants.read_with(cx, |s, _| {
+        assert!(
+            s.op_error(&space_a).is_some(),
+            "starting B's op must not clear A's error (per-space keying)"
+        );
+    });
+
+    drain_runtime(&core);
+}
+
+/// P1: a "New Space from Template" failure is owned by the store (not detached)
+/// and surfaced in `new_space_error`, not silently discarded.
+#[gpui::test]
+fn spaces_store_create_from_template_surfaces_error(cx: &mut TestAppContext) {
+    let (stores, core, _dir, _space) = participants_scene(cx);
+    let stores_clone = stores.clone();
+    stores.spaces.update(cx, move |s, cx| {
+        s.create_from_template("does-not-exist".into(), stores_clone, cx);
+    });
+    wait_until(cx, "create error surfaced", |cx| {
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.new_space_error().is_some())
+    });
+
+    drain_runtime(&core);
+}
