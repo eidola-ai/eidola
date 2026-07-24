@@ -1,4 +1,16 @@
-use gpui::actions;
+use gpui::{Action, actions};
+
+/// Create a new space from a **specific** space template (the Space menu's
+/// "New Space from Template ▸" submenu). Data-carrying (the template id), so the
+/// submenu — rebuilt from the live template registry on `Change::Templates` —
+/// dispatches one per template. `no_json`: dispatched only from
+/// programmatically-built menu items (never a keybinding or JSON keymap), so it
+/// needs no deserialization.
+#[derive(Action, Clone, PartialEq, Eq)]
+#[action(namespace = eidola, no_json)]
+pub struct NewSpaceFromTemplate {
+    pub template_id: String,
+}
 
 actions!(
     eidola,
@@ -34,6 +46,13 @@ actions!(
         /// menu, and opens automatically at launch when no account is
         /// configured. Singleton, like Settings.
         GetStarted,
+        /// Open the Participants window for the focused space (Space menu). The
+        /// listener is registered per-`SpaceView` (like `CloseWindow`), so the
+        /// menu item targets the focused conversation and macOS greys it when
+        /// no space window is open; it is a no-op on a blank ⌘N space that has
+        /// not been persisted yet (there are no per-space participants until a
+        /// first post assigns the space an id).
+        OpenParticipants,
         /// Show the Updates window (singleton, like Settings) and run a
         /// manual update check. Lives in the Eidola menu directly under
         /// "About Eidola" — the standard macOS placement.

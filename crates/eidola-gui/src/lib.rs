@@ -11,6 +11,7 @@ pub mod general;
 pub mod library;
 pub mod loadable;
 pub mod onboarding;
+pub mod participants_view;
 mod plans;
 pub mod probe;
 pub mod record;
@@ -35,8 +36,8 @@ use gpui_component_assets::Assets;
 use crate::about::AboutView;
 use crate::actions::{
     About, ActualSize, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize,
-    NewSpace, OpenLibrary, OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom, ZoomIn,
-    ZoomOut,
+    NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenParticipants, OpenRecord, OpenSettings, Quit,
+    ShowAll, ToggleInspector, Zoom, ZoomIn, ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::onboarding::OnboardingView;
@@ -160,6 +161,13 @@ pub fn run() {
         install_menus(cx);
         install_action_handlers(cx);
 
+        // Rebuild the menus whenever the template registry changes, so the
+        // Space → "New Space from Template ▸" submenu tracks templates
+        // created / renamed / removed in Settings. App-lifetime observation
+        // (the sanctioned detach); `install_menus` is idempotent.
+        cx.observe(&stores.templates, |_, cx| install_menus(cx))
+            .detach();
+
         // Bring the app to the foreground at launch. Mirrors Zed; ensures
         // macOS treats us as the active app from frame 0 so the menu bar
         // / key-equivalent dispatch is fully wired before the user
@@ -258,6 +266,9 @@ fn install_menus(cx: &mut App) {
             name: "Space".into(),
             items: vec![
                 MenuItem::action("New Space", NewSpace),
+                new_space_from_template_submenu(cx),
+                MenuItem::Separator,
+                MenuItem::action("Participants…", OpenParticipants),
                 MenuItem::Separator,
                 MenuItem::action("Close Window", CloseWindow),
             ],
@@ -322,6 +333,36 @@ fn install_menus(cx: &mut App) {
         MenuItem::action("New Space", NewSpace),
         MenuItem::action("Library…", OpenLibrary),
     ]);
+}
+
+/// The "New Space from Template ▸" submenu, built from the live template
+/// registry (`TemplatesStore` snapshot). `New Space` (⌘N) already instantiates
+/// the *default* template; this submenu lets a user pick a specific one. It is
+/// rebuilt whenever `Change::Templates` fires (see the observer in `run()`), so
+/// a template created/renamed/removed in Settings is reflected here. Empty until
+/// the registry loads (it re-lists at launch), at which point the seeded
+/// "Default" always appears.
+fn new_space_from_template_submenu(cx: &App) -> MenuItem {
+    let templates = cx
+        .try_global::<AppGlobal>()
+        .map(|g| g.stores.templates.read(cx).list().to_vec())
+        .unwrap_or_default();
+    let items: Vec<MenuItem> = templates
+        .into_iter()
+        .map(|t| {
+            MenuItem::action(
+                t.title.clone(),
+                NewSpaceFromTemplate {
+                    template_id: t.id.clone(),
+                },
+            )
+        })
+        .collect();
+    MenuItem::Submenu(Menu {
+        name: "New Space from Template".into(),
+        items,
+        disabled: false,
+    })
 }
 
 /// Public because the UI driver (`examples/driver.rs`) installs the same
@@ -434,6 +475,31 @@ fn install_action_handlers(cx: &mut App) {
 
     cx.on_action(|_: &NewSpace, cx: &mut App| {
         open_main_window(cx);
+    });
+
+    // New Space from a specific template (Space menu submenu). Instantiate the
+    // template into a fresh space core-side, then open it. The instantiate is
+    // owned by a startup-scoped one-shot (the sanctioned app-lifetime detach) —
+    // it must run to completion regardless of any window, and its result opens
+    // the window.
+    cx.on_action(|action: &NewSpaceFromTemplate, cx: &mut App| {
+        let stores = cx.global::<AppGlobal>().stores.clone();
+        let Some(core) = stores.app_core() else {
+            return;
+        };
+        let template_id = action.template_id.clone();
+        let task: gpui::Task<()> = cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            let result = crate::bridge::bridge(core, move |c| async move {
+                c.create_space_from_template(template_id, None).await
+            })
+            .await;
+            if let Ok(space) = result {
+                let _ = cx.update(|cx| {
+                    open_space_window(cx, stores.clone(), space.id);
+                });
+            }
+        });
+        task.detach();
     });
 
     cx.on_action(|_: &GetStarted, cx: &mut App| {
@@ -814,6 +880,36 @@ fn open_onboarding_window(cx: &mut App) {
     if let Ok(handle) = handle {
         cx.global_mut::<AppGlobal>().onboarding_window = Some(handle);
     }
+    cx.activate(true);
+}
+
+/// Open the Participants window for a space — a window-local lens over the
+/// space's participant membership. Non-singleton (per-space; two spaces each
+/// get their own), taking the stores explicitly so `SpaceView` and tests can
+/// open it without `AppGlobal`. Sized as a tall, narrow page like the Library.
+pub fn open_participants_window(
+    cx: &mut App,
+    stores: Stores,
+    space_id: String,
+    space_title: Option<String>,
+) {
+    let bounds = centered_window_bounds(cx, 520., 620.);
+    let opts = base_window_options(bounds, 400., 340.);
+
+    let _ = cx.open_window(opts, |window, cx| {
+        theme::observe_window_appearance(window);
+        let view = cx.new(|cx| {
+            participants_view::ParticipantsView::new(
+                stores.clone(),
+                space_id.clone(),
+                space_title.clone(),
+                window,
+                cx,
+            )
+        });
+        let view = chrome::ChromeRoot::wrap(view.into(), cx);
+        cx.new(|cx| chrome::themed_root(view, window, cx))
+    });
     cx.activate(true);
 }
 
