@@ -3,21 +3,23 @@
 //! Per `crates/eidola-gui/STATE.md` ("Space entities — shared, registried"),
 //! a `Space` is a long-lived gpui entity owning *everything* about one
 //! conversation: the transcript (`Loadable<Vec<ChatMessageView>>`), the live
-//! streaming buffers + reasoning disclosure, the per-space model selection,
-//! and the space id (`None` until the first exchange persists and assigns
-//! one). It is created and shared through [`crate::stores::SpacesStore`]'s
-//! registry, so **two windows on the same space hold the same entity** —
-//! a submit/stream in one window appears in the other, structurally (the
-//! wave-2 bug-4 fix).
+//! streaming turns, and the space id (`None` until the first exchange persists
+//! and assigns one). It is created and shared through
+//! [`crate::stores::SpacesStore`]'s registry, so **two windows on the same
+//! space hold the same entity** — a submit/stream in one window appears in the
+//! other, structurally (the wave-2 bug-4 fix).
 //!
 //! Tasks-as-fields, per the doctrine:
 //!
-//! - `submit_runner` is the **single runner slot** (`Option<Task<()>>`). The
-//!   current UX is preserved: a submit while one is in flight is a no-op (the
-//!   runner just makes the ordering of the load-vs-submit race structural,
-//!   retiring the old `transcript_generation` counter — the entity owns both
-//!   the initial transcript load and every submit, so they serialize on
-//!   `&mut self` between awaits and can never clobber each other).
+//! - `post_runner` is the **exclusive mutation slot** (`Option<Task<()>>`) for
+//!   the save-side operations — submit (post + notification plan), post-only,
+//!   edit, regenerate. A mutation while one is in flight is a no-op.
+//! - `turn_runners` is the **keyed slot map** (`HashMap<u64, Task<()>>`) for
+//!   streaming response turns — STATE.md's "independent per-key work" pattern.
+//!   A submit's notification plan can fan out to several participants at once
+//!   (Participants v1), and each turn owns its own runner + streaming buffers,
+//!   so concurrent turns stream side by side and one turn's failure never
+//!   disturbs its siblings.
 //! - `load_task` owns the reopened-space initial transcript load (supersede
 //!   slot).
 //!
@@ -28,11 +30,12 @@
 //! react *semantically* (e.g. tail-scroll only on `StreamDelta`) on top of the
 //! plain `cx.observe` re-render path.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AppCore, ChatResult, ChatStreamEvent, PostNode, PostReference, SpaceMessage,
+    AppCore, ChatResult, ChatStreamEvent, NotificationPlan, PostNode, PostReference, SpaceMessage,
 };
 use gpui::{Context, EventEmitter, Task};
 use tokio::sync::{mpsc, oneshot};
@@ -40,11 +43,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::bridge;
 use crate::loadable::Loadable;
 
-/// In-flight assistant response. While this is `Some(...)`, the space is
-/// streaming — `reasoning` and `content` grow as deltas arrive. On
-/// completion the streaming response is dropped; the captured reasoning is
-/// moved onto the just-finalized assistant entry in the transcript so the
-/// disclosure remains available after the stream ends.
+/// One in-flight assistant response's buffers. `reasoning` and `content` grow
+/// as deltas arrive; on completion the captured reasoning is moved onto the
+/// just-finalized assistant entry in the transcript so the disclosure remains
+/// available after the stream ends.
 #[derive(Default, Clone)]
 pub struct StreamingResponse {
     pub reasoning: String,
@@ -57,29 +59,58 @@ pub struct StreamingResponse {
     pub error: Option<String>,
 }
 
+/// One in-flight **turn** — a streaming response from one participant to one
+/// post. Several can run concurrently (a submit's notification fan-out); each
+/// renders as its own synthetic streaming leaf attached at its target, in
+/// `seq` (start-time) order, so concurrent replies land as timestamp-ordered
+/// sibling branches.
+#[derive(Clone)]
+pub struct StreamingTurn {
+    /// Monotonic per-space turn sequence — the stable render key.
+    pub seq: u64,
+    /// The responding participant (`None` for a stub-mode synthetic turn,
+    /// where no plan was computable).
+    pub participant_id: Option<String>,
+    /// The post being answered (`None` for a stub-mode synthetic turn on a
+    /// not-yet-persisted post — the view attaches it at the selected leaf).
+    pub target_action_id: Option<String>,
+    /// The live buffers.
+    pub response: StreamingResponse,
+}
+
+/// The turn a failed ask leaves behind — who was asked, about what — so the
+/// recovery notice's Retry can re-ask the *same* participant without
+/// disturbing any sibling turns still streaming.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedTurn {
+    pub participant_id: String,
+    pub target_action_id: String,
+}
+
 /// A single rendered chat row: the persisted post plus the byline identity
 /// shown in its gutter, and any reasoning captured for it during streaming.
 ///
 /// The post-tree redesign (wave 5.3) feeds this from [`PostNode`]
 /// (`AppCore::get_space_tree`): the `byline` is the post's gutter label (the
-/// model name for an assistant turn, "You" for the human), and `action_id` /
-/// `item_id` carry the stable post identity the 5.4 hover affordances
-/// (reply / edit / regenerate) will wire to. `message` (role + concatenated
-/// text) is retained for the body render and the test API. Synthetic rows (the
-/// optimistic user turn, test fixtures) come through [`Self::new`], which
-/// derives the byline from the role and leaves the ids `None`.
+/// responding participant's label for an agent turn, "You" for the human), and
+/// `action_id` / `item_id` carry the stable post identity the hover
+/// affordances (reply / edit / regenerate) wire to. `message` (role +
+/// concatenated text) is retained for the body render and the test API.
+/// Synthetic rows (the optimistic user turn, test fixtures) come through
+/// [`Self::new`], which derives the byline from the role and leaves the ids
+/// `None`.
 ///
 /// Reasoning is ephemeral session state — the local DB stores only the
 /// assistant's final content — so older posts from a re-loaded space carry
 /// `reasoning = None`. New assistant posts adopt whatever reasoning was
-/// streaming at finalize.
+/// captured for their action id at finalize.
 #[derive(Clone)]
 pub struct ChatMessageView {
     pub message: SpaceMessage,
-    /// The gutter byline ("You" / a model name / "Eidola" / "Error").
+    /// The gutter byline ("You" / a participant label / "Eidola" / "Error").
     pub byline: String,
     /// The post's current-generation action id, when this row came from the
-    /// post tree (`None` for synthetic/optimistic/test rows). The 5.4 hover
+    /// post tree (`None` for synthetic/optimistic/test rows). The hover
     /// affordances key off this.
     pub action_id: Option<String>,
     /// The post's stable item id (see `action_id`).
@@ -88,6 +119,9 @@ pub struct ChatMessageView {
     /// (`None` for a root). The space-tree view relinks the flat transcript
     /// into a navigable tree through this edge.
     pub parent_action_id: Option<String>,
+    /// The model that produced an inference row (`None` for human/synthetic
+    /// rows). Regenerate re-uses the post's own recorded model.
+    pub model: Option<String>,
     /// Wall-clock creation time (unix seconds) of the post, for the gutter
     /// time byline. `0` for synthetic rows with no persisted timestamp.
     pub created_at: i64,
@@ -118,6 +152,7 @@ impl ChatMessageView {
             action_id: None,
             item_id: None,
             parent_action_id: None,
+            model: None,
             created_at: 0,
             depth: 0,
             is_branch: false,
@@ -152,6 +187,7 @@ impl ChatMessageView {
             action_id: Some(node.action_id),
             item_id: Some(node.item_id),
             parent_action_id: node.parent_action_id,
+            model: node.model,
             created_at: node.created_at,
             depth: node.depth,
             is_branch: node.is_branch,
@@ -175,8 +211,7 @@ fn byline_for_role(role: &str) -> &'static str {
 
 /// The gutter byline for a post-tree row, from its participant identity. The
 /// *local* human (the generic "user" participant) reads as "You"; any other
-/// human reads by name (multi-party spaces); an agent's byline is its model
-/// label.
+/// human reads by name (multi-party spaces); an agent's byline is its label.
 fn byline_for_participant(kind: &str, label: &str) -> String {
     match kind {
         "human" if label.is_empty() || label.eq_ignore_ascii_case("user") => "You".to_string(),
@@ -200,17 +235,31 @@ fn views_from_nodes(nodes: Vec<PostNode>) -> Vec<ChatMessageView> {
 #[derive(Clone, Debug)]
 pub enum SpaceEvent {
     /// The transcript message list changed (a reload landed, or a submit
-    /// appended the user's turn / finalized the assistant's).
+    /// appended the user's turn / finalized an assistant's).
     MessagesChanged,
     /// A streaming delta arrived (reasoning or content). The tail-scroll
     /// policy keys off this.
     StreamDelta,
-    /// The stream finished (success): the assistant turn is finalized into
-    /// the transcript and `streaming` has been cleared.
+    /// A turn finished (success): its response is finalized into the
+    /// transcript and its streaming buffers have been cleared. Also emitted
+    /// when a plain post persists — either way the space now has a durable id,
+    /// which is what the registry's blank-space adoption keys off.
     StreamEnded,
-    /// A submit failed with a typed error. The view routes onboarding-degraded
-    /// states (`InsufficientBalance`) off this.
+    /// A mutation or turn failed with a typed error. The view routes
+    /// onboarding-degraded states (`InsufficientBalance`) off this; a failed
+    /// *turn* additionally records [`Space::failed_turn`] so the notice's
+    /// Retry can re-ask the same participant.
     Failed(AppError),
+    /// A submit's (or a driven turn's) notification plan hit the space's
+    /// cascade limit at `target_action_id` — the resumable paused state. The
+    /// view renders a quiet, dismissible "cascade limit reached — ask to
+    /// continue" notice whose action is an explicit ask (which bypasses the
+    /// guard by construction).
+    CascadePaused {
+        depth: i64,
+        limit: i64,
+        target_action_id: String,
+    },
 }
 
 pub struct Space {
@@ -221,21 +270,23 @@ pub struct Space {
     id: Option<String>,
     /// The conversation transcript.
     transcript: Loadable<Vec<ChatMessageView>>,
-    /// In-flight streaming assistant response, or `None` when idle.
-    streaming: Option<StreamingResponse>,
-    /// The window-independent model choice for this space's sends. `None`
-    /// means "follow the config default". A switch mid-stream applies to the
-    /// next send — the in-flight request is never hot-swapped (the model is
-    /// captured into the runner at submit time).
-    selected_model: Option<String>,
-    /// The model id handed to the most recent submit (set on every submit,
-    /// including stub-core submits, before the backend guard). Behavior tests
-    /// assert against this to prove what a real send would use.
+    /// The in-flight streaming turns, in start order (`seq` ascending) — the
+    /// timestamp order concurrent sibling replies land in.
+    streams: Vec<StreamingTurn>,
+    /// Monotonic source for [`StreamingTurn::seq`].
+    next_turn_seq: u64,
+    /// The model handed to the most recent regenerate (set before the backend
+    /// guard). Behavior tests assert against this to prove what a real
+    /// regenerate would use.
     last_submitted_model: Option<String>,
-    /// The single submit runner slot. Replace-cancels; while `Some`, a submit
-    /// is in flight and a new submit is a no-op (the current UX). The runner
-    /// owns the streaming pump and the post-stream transcript reload.
-    submit_runner: Option<Task<()>>,
+    /// The exclusive mutation slot: submit's post phase, post-only, edit,
+    /// regenerate. While `Some`, another mutation is a no-op.
+    post_runner: Option<Task<()>>,
+    /// One runner per in-flight streaming turn, keyed by `seq` — the doctrine's
+    /// keyed-slot pattern. Removing an entry cancels that turn only.
+    turn_runners: HashMap<u64, Task<()>>,
+    /// The turn a failed ask leaves behind (who + what), for Retry.
+    failed_turn: Option<FailedTurn>,
     /// Supersede slot for the reopened-space initial transcript load.
     load_task: Option<Task<()>>,
 }
@@ -250,10 +301,12 @@ impl Space {
             app_core,
             id: None,
             transcript: Loadable::loaded(Vec::new()),
-            streaming: None,
-            selected_model: None,
+            streams: Vec::new(),
+            next_turn_seq: 0,
             last_submitted_model: None,
-            submit_runner: None,
+            post_runner: None,
+            turn_runners: HashMap::new(),
+            failed_turn: None,
             load_task: None,
         }
     }
@@ -266,10 +319,12 @@ impl Space {
             app_core: app_core.clone(),
             id: Some(id.clone()),
             transcript: Loadable::NotLoaded,
-            streaming: None,
-            selected_model: None,
+            streams: Vec::new(),
+            next_turn_seq: 0,
             last_submitted_model: None,
-            submit_runner: None,
+            post_runner: None,
+            turn_runners: HashMap::new(),
+            failed_turn: None,
             load_task: None,
         };
         space.load_transcript(cx);
@@ -283,10 +338,12 @@ impl Space {
             app_core: None,
             id,
             transcript: Loadable::loaded(messages),
-            streaming: None,
-            selected_model: None,
+            streams: Vec::new(),
+            next_turn_seq: 0,
             last_submitted_model: None,
-            submit_runner: None,
+            post_runner: None,
+            turn_runners: HashMap::new(),
+            failed_turn: None,
             load_task: None,
         }
     }
@@ -308,42 +365,42 @@ impl Space {
         self.transcript.value().map(|v| v.as_slice()).unwrap_or(&[])
     }
 
-    /// The in-flight streaming response, if any.
-    pub fn streaming(&self) -> Option<&StreamingResponse> {
-        self.streaming.as_ref()
+    /// The in-flight streaming turns, in start (`seq`) order.
+    pub fn streams(&self) -> &[StreamingTurn] {
+        &self.streams
     }
 
-    /// Whether a submit is currently in flight (the runner slot is occupied).
+    /// Whether any response turn is currently streaming.
     pub fn is_streaming(&self) -> bool {
-        self.streaming.is_some()
+        !self.streams.is_empty()
     }
 
-    /// This space's explicit model selection, if any.
-    pub fn selected_model(&self) -> Option<&str> {
-        self.selected_model.as_deref()
+    /// Whether any operation that will re-establish the transcript itself is
+    /// in flight (the exclusive mutation, or any turn). While busy, a
+    /// completed transcript load is stale by construction — the in-flight
+    /// operation's own reload is authoritative — so
+    /// [`Self::apply_loaded_transcript`] drops it and
+    /// [`Self::on_space_changed`] defers to the operation's reload.
+    fn is_busy(&self) -> bool {
+        self.post_runner.is_some() || !self.streams.is_empty() || !self.turn_runners.is_empty()
     }
 
-    /// The model id handed to the most recent submit (see field docs).
+    /// The model id handed to the most recent regenerate (see field docs).
     pub fn last_submitted_model(&self) -> Option<&str> {
         self.last_submitted_model.as_deref()
     }
 
-    // -- Model selection ---------------------------------------------------
-
-    /// Choose the model for this space's subsequent sends. A switch while a
-    /// response is streaming applies to the *next* send — the in-flight
-    /// request is never hot-swapped (the runner captured its model at submit).
-    pub fn select_model(&mut self, id: String, cx: &mut Context<Self>) {
-        self.selected_model = Some(id);
-        cx.notify();
+    /// The turn a failed ask left behind, if any (drives the notice's Retry).
+    pub fn failed_turn(&self) -> Option<&FailedTurn> {
+        self.failed_turn.as_ref()
     }
 
     // -- Streaming disclosure ----------------------------------------------
 
-    /// Toggle the streaming reasoning disclosure.
-    pub fn toggle_streaming_reasoning(&mut self, cx: &mut Context<Self>) {
-        if let Some(s) = self.streaming.as_mut() {
-            s.expanded = !s.expanded;
+    /// Toggle the reasoning disclosure on the in-flight turn `seq`.
+    pub fn toggle_streaming_reasoning(&mut self, seq: u64, cx: &mut Context<Self>) {
+        if let Some(s) = self.streams.iter_mut().find(|s| s.seq == seq) {
+            s.response.expanded = !s.response.expanded;
             cx.notify();
         }
     }
@@ -362,16 +419,15 @@ impl Space {
 
     /// React to a `Change::Space(id)` for *this* space's id — refresh the
     /// transcript (this is how a CLI write to the same space appears, in
-    /// process). A no-op if the id doesn't match or no exchange is in flight
-    /// to clobber. Routed through the bus-bridge dispatch in
-    /// `stores::dispatch_change`.
+    /// process). A no-op if the id doesn't match or an operation owning the
+    /// transcript's truth is in flight (each turn/mutation reloads on its own
+    /// completion, so nothing is lost). Routed through the bus-bridge dispatch
+    /// in `stores::dispatch_change`.
     pub fn on_space_changed(&mut self, changed_id: &str, cx: &mut Context<Self>) {
         if self.id.as_deref() != Some(changed_id) {
             return;
         }
-        // A submit currently streaming already owns the transcript's truth and
-        // will reload on finalize; don't race it with a bus-driven reload.
-        if self.submit_runner.is_some() {
+        if self.is_busy() {
             return;
         }
         self.load_transcript(cx);
@@ -413,12 +469,12 @@ impl Space {
     /// transcript (preserving reasoning by position); on failure, retain the
     /// prior snapshot via `Loadable::Failed { prior }`.
     ///
-    /// **The load-vs-submit race is serialized here**, which retires the old
-    /// `transcript_generation` counter: if a mutation has moved the transcript
-    /// ahead since this load started (`streaming` or the runner slot is
-    /// occupied), the load result is *stale* and dropped — the mutation's own
-    /// post-commit reload is the authoritative truth and would clobber the
-    /// just-appended user turn. (Every mutation also cancels the load task via
+    /// **The load-vs-mutation race is serialized here**: if an operation that
+    /// owns the transcript's truth is in flight ([`Self::is_busy`] — the
+    /// exclusive mutation, or any streaming turn), the load result is *stale*
+    /// and dropped — the operation's own post-commit reload is authoritative
+    /// and would otherwise be clobbered (e.g. the just-appended optimistic
+    /// user turn). (Every mutation also cancels the load task via
     /// [`Self::supersede_load_for_mutation`], so this guard is defense in
     /// depth.) Returns whether the load was applied.
     fn apply_loaded_transcript(
@@ -426,8 +482,8 @@ impl Space {
         result: Result<Vec<ChatMessageView>, AppError>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.streaming.is_some() || self.submit_runner.is_some() {
-            // A mutation raced ahead of this load; its reload wins.
+        if self.is_busy() {
+            // An operation raced ahead of this load; its reload wins.
             return false;
         }
         match result {
@@ -445,11 +501,18 @@ impl Space {
 
     /// Merge a fresh post-tree render list into the transcript, preserving any
     /// previously-attached reasoning by index (we only ever append, so
-    /// positions are stable) and attaching the just-captured streaming
-    /// reasoning to the new last assistant entry if non-empty. The incoming
-    /// rows carry the byline + post ids from the tree; only the ephemeral
-    /// reasoning state is carried forward from the prior snapshot.
-    fn merge_from_db(&mut self, mut next: Vec<ChatMessageView>, new_reasoning: Option<String>) {
+    /// positions are stable) and attaching just-captured streaming reasoning
+    /// to its finalized post. `new_reasoning` is `(action_id, reasoning)` —
+    /// attached to the row with that action id (the turn's persisted
+    /// response), falling back to the last assistant entry when the id is
+    /// unknown. The incoming rows carry the byline + post ids from the tree;
+    /// only the ephemeral reasoning state is carried forward from the prior
+    /// snapshot.
+    fn merge_from_db(
+        &mut self,
+        mut next: Vec<ChatMessageView>,
+        new_reasoning: Option<(Option<String>, String)>,
+    ) {
         let prior = self.transcript.value().cloned();
         for (idx, entry) in next.iter_mut().enumerate() {
             let prior_entry = prior.as_ref().and_then(|p| p.get(idx));
@@ -462,39 +525,46 @@ impl Space {
             }
         }
 
-        if let Some(reasoning) = new_reasoning
+        if let Some((action_id, reasoning)) = new_reasoning
             && !reasoning.is_empty()
-            && let Some(entry) = next
-                .iter_mut()
-                .rev()
-                .find(|e| e.message.role == "assistant")
         {
-            entry.reasoning = Some(reasoning);
+            let target = match action_id {
+                Some(aid) => next
+                    .iter_mut()
+                    .find(|e| e.action_id.as_deref() == Some(aid.as_str())),
+                None => next
+                    .iter_mut()
+                    .rev()
+                    .find(|e| e.message.role == "assistant"),
+            };
+            if let Some(entry) = target {
+                entry.reasoning = Some(reasoning);
+            }
         }
 
         self.transcript = Loadable::loaded(next);
     }
 
-    // -- Submit ------------------------------------------------------------
+    // -- Mutations ---------------------------------------------------------
 
     /// Prologue shared by every transcript-mutating operation (submit /
-    /// post-only / edit / regenerate), called at the moment the operation is
-    /// accepted: cancel any in-flight transcript load by dropping its task.
-    /// The mutation's own post-commit reload is now the authoritative truth,
-    /// and a superseded load must never land late around it — the same
-    /// stale-fetch class as the Record listing race from PR #179; the fix is
-    /// the same replace-cancels idiom (`crates/eidola-gui/STATE.md` →
-    /// "Concurrency patterns"). If the cancelled load was an *initial* one
-    /// (`Loading`, nothing kept visible), the cell steps back to `NotLoaded`
-    /// so no spinner outlives its task ("every spinner maps to a live task");
-    /// a re-fetch over data stays `Loaded { stale: true }` until the
-    /// mutation's reload resolves it.
+    /// post-only / edit / regenerate / ask), called at the moment the
+    /// operation is accepted: cancel any in-flight transcript load by dropping
+    /// its task. The operation's own post-commit reload is now the
+    /// authoritative truth, and a superseded load must never land late around
+    /// it — the same stale-fetch class as the Record listing race from PR
+    /// #179; the fix is the same replace-cancels idiom
+    /// (`crates/eidola-gui/STATE.md` → "Concurrency patterns"). If the
+    /// cancelled load was an *initial* one (`Loading`, nothing kept visible),
+    /// the cell steps back to `NotLoaded` so no spinner outlives its task
+    /// ("every spinner maps to a live task"); a re-fetch over data stays
+    /// `Loaded { stale: true }` until the operation's reload resolves it.
     ///
     /// **Cancelling here creates a debt**: the cancelled load may have carried
-    /// another writer's change (a bus-driven refresh), so the mutation must
+    /// another writer's change (a bus-driven refresh), so the operation must
     /// re-establish the durable truth at *every* exit — the success arms
     /// reload inline, and every failure arm goes through
-    /// [`Self::fail_mutation`], which restarts the load.
+    /// [`Self::fail_mutation`] / [`Self::fail_turn`], which restart the load.
     fn supersede_load_for_mutation(&mut self) {
         self.load_task = None;
         if self.transcript.is_loading() {
@@ -502,12 +572,12 @@ impl Space {
         }
     }
 
-    /// Shared failure completion for every mutation runner (submit /
-    /// post-only / edit / regenerate): clear the streaming state and the
-    /// runner slot, adopt the id a `ChatFailed` wrapper carries (blank-space
-    /// adoption on failure), **restart the transcript load**, and emit
-    /// `Failed` with the unwrapped source so the view's error routing sees
-    /// the real variant.
+    /// Shared failure completion for the exclusive mutation runner (submit's
+    /// post phase / post-only / edit / regenerate): clear the runner slot,
+    /// drop any synthetic streams, adopt the id a `ChatFailed` wrapper carries
+    /// (blank-space adoption on failure), **restart the transcript load**, and
+    /// emit `Failed` with the unwrapped source so the view's error routing
+    /// sees the real variant.
     ///
     /// The reload is load-bearing, not defensive: accepting the mutation
     /// cancelled any in-flight transcript load
@@ -517,13 +587,13 @@ impl Space {
     /// failure — otherwise a cancelled bus-driven refresh (another writer's
     /// change) is silently lost, and durable rows committed by the failed
     /// mutation itself (whose `Change::Space` the [`Self::on_space_changed`]
-    /// guard dropped while the runner slot was occupied) never render until
+    /// guard dropped while the operation was in flight) never render until
     /// the next unrelated invalidation (the codex finding on PR #206). A
     /// pre-persist failure on a blank space has no id, so `load_transcript`
     /// no-ops — nothing durable exists to reload.
     fn fail_mutation(&mut self, e: AppError, cx: &mut Context<Self>) {
-        self.streaming = None;
-        self.submit_runner = None;
+        self.streams.clear();
+        self.post_runner = None;
         if self.id.is_none()
             && let Some(id) = e.chat_space_id()
         {
@@ -534,23 +604,56 @@ impl Space {
         cx.notify();
     }
 
-    /// Submit a prompt with an explicitly-resolved model. The model is
-    /// resolved by the caller (window selection → config default → fallback)
-    /// because the config snapshot lives in `ConfigStore`, which the view
-    /// observes — keeping `Space` free of a config dependency.
+    /// Failure completion for one streaming **turn**: remove that turn's
+    /// buffers + runner (sibling turns keep streaming untouched), record the
+    /// [`FailedTurn`] so Retry can re-ask the same participant, adopt a
+    /// `ChatFailed` id, restart the transcript load (the same cancelled-load
+    /// debt as [`Self::fail_mutation`]; while siblings still stream the
+    /// restarted load is dropped as stale and their completions re-establish
+    /// the truth instead), and emit `Failed` with the unwrapped source.
+    fn fail_turn(
+        &mut self,
+        seq: u64,
+        participant_id: Option<String>,
+        target_action_id: Option<String>,
+        e: AppError,
+        cx: &mut Context<Self>,
+    ) {
+        self.streams.retain(|s| s.seq != seq);
+        self.turn_runners.remove(&seq);
+        if let (Some(p), Some(t)) = (participant_id, target_action_id) {
+            self.failed_turn = Some(FailedTurn {
+                participant_id: p,
+                target_action_id: t,
+            });
+        }
+        if self.id.is_none()
+            && let Some(id) = e.chat_space_id()
+        {
+            self.id = Some(id.to_string());
+        }
+        self.load_transcript(cx);
+        cx.emit(SpaceEvent::Failed(e.root().clone()));
+        cx.notify();
+    }
+
+    /// **Post** — save the prompt and drive its notification plan (the
+    /// composer CTA). The post itself needs no credential and no model; the
+    /// space's participants decide who responds (notify policies), and one
+    /// streaming turn per planned responder is driven concurrently via
+    /// [`Self::start_turn`]. When the plan pauses at the cascade limit,
+    /// [`SpaceEvent::CascadePaused`] surfaces the resumable state instead.
     ///
-    /// Submit-during-streaming is a no-op (the current UX): the runner slot is
-    /// the honest "in flight" signal. Returns `true` if the submit was
-    /// accepted (a turn was appended), `false` if it was a no-op (empty prompt
-    /// or already streaming).
+    /// A mutation while anything is in flight is a no-op (the current UX).
+    /// Returns `true` if accepted (a turn was appended), `false` if a no-op
+    /// (empty prompt or busy).
     pub fn submit(
         &mut self,
         prompt: String,
-        model: String,
         reply_to: Option<String>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.submit_runner.is_some() || self.streaming.is_some() {
+        if self.is_busy() {
             return false;
         }
         let prompt = prompt.trim().to_string();
@@ -558,55 +661,116 @@ impl Space {
             return false;
         }
 
-        // Record the resolved model before the backend guard so stub-core
-        // tests observe exactly what a real send would use. This is also the
-        // value app-core persists on the action row.
-        self.last_submitted_model = Some(model.clone());
-
-        // Cancel any in-flight transcript load: the submit's own post-stream
+        // Cancel any in-flight transcript load: the submit's own post-commit
         // reload is now the authoritative truth (the `apply_loaded_transcript`
         // guard also enforces this, but dropping the task frees the slot
         // eagerly).
         self.supersede_load_for_mutation();
 
-        // Append the user's turn locally and enter the streaming state. This
-        // mutation is what a submit-vs-load race must not clobber; since the
-        // same entity owns the load, the merge preserves it by position.
+        // Append the user's turn locally. This mutation is what a
+        // submit-vs-load race must not clobber; since the same entity owns the
+        // load, the guard drops the stale result.
         let mut messages = self.transcript.value().cloned().unwrap_or_default();
         messages.push(ChatMessageView::new(SpaceMessage {
             role: "user".to_string(),
             content: prompt.clone(),
         }));
         self.transcript = Loadable::loaded(messages);
-        self.streaming = Some(StreamingResponse::default());
         cx.emit(SpaceEvent::MessagesChanged);
         cx.notify();
 
         let Some(app_core) = self.app_core.clone() else {
-            // Stub stores (behavior tests): the local state update above has
-            // happened; without a backend there is nothing more to drive. We
-            // intentionally leave `streaming = Some(...)` (the current UX:
-            // tests assert the view entered the streaming state) and do NOT
-            // occupy the runner slot — a stub has no task to own.
+            // Stub stores (behavior tests): the local append above has
+            // happened; without a backend no plan is computable. Enter a
+            // synthetic streaming turn (the observable "a response was
+            // requested" state, and the busy guard the stale-load replay
+            // asserts) without occupying any runner slot.
+            let seq = self.mint_turn_seq();
+            self.streams.push(StreamingTurn {
+                seq,
+                participant_id: None,
+                target_action_id: None,
+                response: StreamingResponse::default(),
+            });
             return true;
         };
+
         let space_id = self.id.clone();
-        self.spawn_stream(app_core, prompt, model, space_id, reply_to, cx);
+        let rx = bridge::submit(app_core.clone(), prompt, space_id, reply_to);
+        self.post_runner = Some(cx.spawn(async move |this, cx| {
+            let outcome = rx.await.unwrap_or_else(|_| {
+                Err(AppError::Internal {
+                    message: "submit task cancelled".into(),
+                })
+            });
+            match outcome {
+                Ok(result) => {
+                    let space_id = result.post.space_id.clone();
+                    let msgs = bridge::get_space_tree(app_core, space_id.clone())
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(AppError::Internal {
+                                message: "fetch space tree task cancelled".into(),
+                            })
+                        })
+                        .map(views_from_nodes);
+                    let _ = this.update(cx, |this, cx| {
+                        this.id = Some(space_id);
+                        this.post_runner = None;
+                        match msgs {
+                            Ok(messages) => {
+                                this.merge_from_db(messages, None);
+                                cx.emit(SpaceEvent::MessagesChanged);
+                                // StreamEnded drives the registry's blank-space
+                                // adoption (it reads id()); the saved post
+                                // earned the id whether or not anyone responds.
+                                cx.emit(SpaceEvent::StreamEnded);
+                            }
+                            Err(e) => {
+                                this.transcript =
+                                    std::mem::take(&mut this.transcript).resolve(Err(e.clone()));
+                                cx.emit(SpaceEvent::Failed(e));
+                            }
+                        }
+                        // Drive the plan: one concurrent turn per planned
+                        // responder, or surface the paused cascade.
+                        match result.plan {
+                            NotificationPlan::Turns(turns) => {
+                                for t in turns {
+                                    this.start_turn(t.participant_id, t.target_action_id, cx);
+                                }
+                            }
+                            NotificationPlan::Paused { depth, limit } => {
+                                cx.emit(SpaceEvent::CascadePaused {
+                                    depth,
+                                    limit,
+                                    target_action_id: result.post.action_id.clone(),
+                                });
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+                Err(e) => {
+                    let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
+                }
+            }
+        }));
         true
     }
 
-    /// Save a post **without requesting a response** — the save side of the
-    /// save-vs-request split (`⌘⇧↩`). Appends the user's turn and persists it
-    /// via `AppCore::post` (no credential, no model call); on completion the
-    /// transcript reloads from the tree and a blank space adopts its new id.
-    /// Returns `true` if accepted, `false` if a no-op (empty / busy).
+    /// Save a post **quietly** — no notification plan, nobody is asked to
+    /// respond (`⌘⇧↩` / the ⌥-revealed "Post quietly"). Appends the user's
+    /// turn and persists it via `AppCore::post`; on completion the transcript
+    /// reloads from the tree and a blank space adopts its new id. Returns
+    /// `true` if accepted, `false` if a no-op (empty / busy).
     pub fn post_only(
         &mut self,
         prompt: String,
         reply_to: Option<String>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.submit_runner.is_some() || self.streaming.is_some() {
+        if self.is_busy() {
             return false;
         }
         let prompt = prompt.trim().to_string();
@@ -634,48 +798,13 @@ impl Space {
         };
         let space_id = self.id.clone();
         let rx = bridge::post(app_core.clone(), prompt, space_id, reply_to);
-        self.submit_runner = Some(cx.spawn(async move |this, cx| {
+        self.post_runner = Some(cx.spawn(async move |this, cx| {
             let outcome = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
                     message: "post task cancelled".into(),
                 })
             });
-            match outcome {
-                Ok(result) => {
-                    let msgs_rx = bridge::get_space_tree(app_core, result.space_id.clone());
-                    let msgs = msgs_rx
-                        .await
-                        .unwrap_or_else(|_| {
-                            Err(AppError::Internal {
-                                message: "fetch space tree task cancelled".into(),
-                            })
-                        })
-                        .map(views_from_nodes);
-                    let _ = this.update(cx, |this, cx| {
-                        this.id = Some(result.space_id.clone());
-                        this.submit_runner = None;
-                        match msgs {
-                            Ok(messages) => {
-                                this.merge_from_db(messages, None);
-                                cx.emit(SpaceEvent::MessagesChanged);
-                                // StreamEnded drives the registry's blank-space
-                                // adoption (it reads id()); a post earns an id
-                                // too, so reuse the same signal.
-                                cx.emit(SpaceEvent::StreamEnded);
-                            }
-                            Err(e) => {
-                                this.transcript =
-                                    std::mem::take(&mut this.transcript).resolve(Err(e.clone()));
-                                cx.emit(SpaceEvent::Failed(e));
-                            }
-                        }
-                        cx.notify();
-                    });
-                }
-                Err(e) => {
-                    let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
-                }
-            }
+            Self::finish_reload(this, cx, app_core, outcome.map(|r| r.space_id)).await;
         }));
         true
     }
@@ -684,7 +813,7 @@ impl Space {
     /// item via `AppCore::edit_post`, then reload the tree (the edited post
     /// replaces its prior generation in place). No credential, no model call.
     pub fn edit(&mut self, action_id: String, new_prompt: String, cx: &mut Context<Self>) -> bool {
-        if self.submit_runner.is_some() || self.streaming.is_some() {
+        if self.is_busy() {
             return false;
         }
         let new_prompt = new_prompt.trim().to_string();
@@ -696,7 +825,7 @@ impl Space {
             return true; // stub: no backend
         };
         let rx = bridge::edit_post(app_core.clone(), action_id, new_prompt);
-        self.submit_runner = Some(cx.spawn(async move |this, cx| {
+        self.post_runner = Some(cx.spawn(async move |this, cx| {
             let outcome = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
                     message: "edit task cancelled".into(),
@@ -709,13 +838,16 @@ impl Space {
 
     /// Regenerate an inference — append a new agent generation of `action_id`'s
     /// item via `AppCore::regenerate` (spends credits), then reload the tree.
+    /// `model` is resolved by the caller from the post's own recorded model
+    /// (regenerating re-asks the model that answered), falling back to the
+    /// configured default.
     pub fn regenerate_post(
         &mut self,
         action_id: String,
         model: String,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.submit_runner.is_some() || self.streaming.is_some() {
+        if self.is_busy() {
             return false;
         }
         self.last_submitted_model = Some(model.clone());
@@ -724,7 +856,7 @@ impl Space {
             return true; // stub: no backend
         };
         let rx = bridge::regenerate(app_core.clone(), action_id, model);
-        self.submit_runner = Some(cx.spawn(async move |this, cx| {
+        self.post_runner = Some(cx.spawn(async move |this, cx| {
             let outcome = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
                     message: "regenerate task cancelled".into(),
@@ -735,10 +867,11 @@ impl Space {
         true
     }
 
-    /// Shared completion for edit/regenerate: on success reload the tree from
-    /// the resulting space id (adopting it if the space was blank) and emit
-    /// `StreamEnded`; on failure [`Self::fail_mutation`] surfaces `Failed`
-    /// and restarts the transcript load. Clears the runner slot either way.
+    /// Shared completion for post-only/edit/regenerate: on success reload the
+    /// tree from the resulting space id (adopting it if the space was blank)
+    /// and emit `StreamEnded`; on failure [`Self::fail_mutation`] surfaces
+    /// `Failed` and restarts the transcript load. Clears the runner slot
+    /// either way.
     async fn finish_reload(
         this: gpui::WeakEntity<Self>,
         cx: &mut gpui::AsyncApp,
@@ -757,7 +890,7 @@ impl Space {
                     .map(views_from_nodes);
                 let _ = this.update(cx, |this, cx| {
                     this.id = Some(space_id);
-                    this.submit_runner = None;
+                    this.post_runner = None;
                     match msgs {
                         Ok(messages) => {
                             this.merge_from_db(messages, None);
@@ -779,100 +912,139 @@ impl Space {
         }
     }
 
-    /// Drive a streaming chat request inside the single runner slot. On
-    /// completion the transcript is reloaded from the DB and the captured
-    /// (ephemeral) reasoning is attached to the new last assistant entry.
-    fn spawn_stream(
+    // -- Asks (streaming turns) --------------------------------------------
+
+    /// **Explicit ask** — request a streaming response from `participant_id`
+    /// to the persisted post `target_action_id` (a separator's Ask, the
+    /// cascade-paused "ask to continue", and the failure notice's Retry all
+    /// route here). Explicit asks bypass the cascade guard by construction
+    /// (`AppCore::respond_stream_as`). Runs as an independent keyed turn, so
+    /// asking is legal while other turns still stream; a duplicate ask (same
+    /// participant, same target, already in flight) and an ask during the
+    /// exclusive mutation are no-ops. Returns whether the ask was accepted.
+    pub fn ask(
         &mut self,
-        app_core: Arc<AppCore>,
-        prompt: String,
-        model: String,
-        space_id: Option<String>,
-        reply_to: Option<String>,
+        participant_id: String,
+        target_action_id: String,
         cx: &mut Context<Self>,
-    ) {
-        let (event_rx, done_rx) =
-            bridge::chat_stream(app_core.clone(), prompt, model, space_id, reply_to);
-        self.drive_stream(app_core, event_rx, done_rx, cx);
-    }
-
-    /// Whether the failed ask can be **re-requested**: the space is persisted,
-    /// nothing is in flight, and its tail post is a user turn still awaiting a
-    /// response (exactly the state a failed ask leaves — a saved user post with
-    /// no reply). The view gates its "Retry" affordance on this.
-    pub fn can_retry(&self) -> bool {
-        !self.is_streaming() && self.submit_runner.is_none() && self.retry_target().is_some()
-    }
-
-    /// The action id of the retry target — the last post carrying a real id,
-    /// but only when it is a **user** turn (a reply already exists otherwise,
-    /// so there is nothing to re-request). Requires a persisted space id. Public
-    /// so the view can select the target's path before the retry stream begins
-    /// (so the streaming node attaches under the *failed* post, not whatever
-    /// branch the user has since navigated to — PR #218 review).
-    pub fn retry_target(&self) -> Option<String> {
-        self.id.as_ref()?;
-        let msgs = self.transcript.value()?;
-        let last = msgs.iter().rev().find(|m| m.action_id.is_some())?;
-        if last.message.role == "user" {
-            last.action_id.clone()
-        } else {
-            None
+    ) -> bool {
+        if self.post_runner.is_some() {
+            return false;
         }
-    }
-
-    /// Re-request a streaming response for the saved user post left behind by a
-    /// failed ask — **without** re-posting the prompt (the post is already
-    /// durable; app-core's [`AppCore::respond_stream`] runs a fresh turn
-    /// replying to it). Enters the streaming state exactly like [`Self::submit`]
-    /// and shares its runner ([`Self::drive_stream`]). Returns the **target
-    /// action id** the retry ran against (so the view can select its branch),
-    /// or `None` if nothing is retryable or an exchange is already in flight.
-    pub fn retry(&mut self, model: String, cx: &mut Context<Self>) -> Option<String> {
-        if self.submit_runner.is_some() || self.streaming.is_some() {
-            return None;
+        let duplicate = self.streams.iter().any(|s| {
+            s.participant_id.as_deref() == Some(participant_id.as_str())
+                && s.target_action_id.as_deref() == Some(target_action_id.as_str())
+        });
+        if duplicate {
+            return false;
         }
-        let (space_id, target) = (self.id.clone()?, self.retry_target()?);
-
-        self.last_submitted_model = Some(model.clone());
+        // Re-asking the failed turn's participant is the Retry; clear the
+        // recorded failure so `can_retry` reads honestly while it streams.
+        if self
+            .failed_turn
+            .as_ref()
+            .is_some_and(|f| f.participant_id == participant_id)
+        {
+            self.failed_turn = None;
+        }
         self.supersede_load_for_mutation();
-        // Enter the streaming state (mirrors submit); the reply attaches to the
-        // saved user post. The optimistic user turn is already in the transcript.
-        self.streaming = Some(StreamingResponse::default());
+
+        if self.app_core.is_none() {
+            // Stub stores (behavior tests): the observable effect is the
+            // synthetic streaming turn carrying who was asked about what.
+            let seq = self.mint_turn_seq();
+            self.streams.push(StreamingTurn {
+                seq,
+                participant_id: Some(participant_id),
+                target_action_id: Some(target_action_id),
+                response: StreamingResponse::default(),
+            });
+            cx.emit(SpaceEvent::MessagesChanged);
+            cx.notify();
+            return true;
+        }
+        self.start_turn(participant_id, target_action_id, cx);
         cx.emit(SpaceEvent::MessagesChanged);
         cx.notify();
-
-        let Some(app_core) = self.app_core.clone() else {
-            // Stub stores (behavior tests): the streaming-state entry above is
-            // the observable effect; no backend to drive.
-            return Some(target);
-        };
-        let (event_rx, done_rx) =
-            bridge::respond_stream(app_core.clone(), space_id, model, target.clone());
-        self.drive_stream(app_core, event_rx, done_rx, cx);
-        Some(target)
+        true
     }
 
-    /// Install the streaming runner shared by [`Self::submit`] (post + request)
-    /// and [`Self::retry`] (request a response to an existing post). Pumps SSE
-    /// deltas into the streaming buffers, then on completion reloads the
-    /// transcript from the tree (adopting a blank space's new id) or routes the
-    /// failure through [`Self::fail_mutation`]. The two producers differ only in
-    /// which bridge call fills the channels; the terminal handling is identical.
-    fn drive_stream(
+    fn mint_turn_seq(&mut self) -> u64 {
+        self.next_turn_seq += 1;
+        self.next_turn_seq
+    }
+
+    /// Start one streaming response turn (`respond_stream_as`) inside its own
+    /// keyed runner slot. Each turn owns its buffers and its completion:
+    /// pump deltas → reload the tree (attaching the captured reasoning to the
+    /// persisted response) → **re-plan the cascade** on the fresh post
+    /// (`plan_notifications`), driving any follow-on turns or surfacing the
+    /// paused state. A turn failure routes through [`Self::fail_turn`],
+    /// leaving sibling turns untouched.
+    fn start_turn(
         &mut self,
+        participant_id: String,
+        target_action_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(app_core) = self.app_core.clone() else {
+            return;
+        };
+        let Some(space_id) = self.id.clone() else {
+            return;
+        };
+        let seq = self.mint_turn_seq();
+        self.streams.push(StreamingTurn {
+            seq,
+            participant_id: Some(participant_id.clone()),
+            target_action_id: Some(target_action_id.clone()),
+            response: StreamingResponse::default(),
+        });
+
+        let (event_rx, done_rx) = bridge::respond_stream_as(
+            app_core.clone(),
+            space_id.clone(),
+            participant_id.clone(),
+            target_action_id.clone(),
+        );
+        let runner = self.spawn_turn_runner(
+            seq,
+            participant_id,
+            target_action_id,
+            app_core,
+            space_id,
+            event_rx,
+            done_rx,
+            cx,
+        );
+        self.turn_runners.insert(seq, runner);
+        cx.notify();
+    }
+
+    /// The keyed turn runner: pump this turn's deltas, then finalize —
+    /// success reloads the tree and continues the cascade; failure routes
+    /// through [`Self::fail_turn`]. The runner's own map entry is removed only
+    /// at the very end (removing it earlier would drop — and cancel — the
+    /// running task at its next await).
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_turn_runner(
+        &mut self,
+        seq: u64,
+        participant_id: String,
+        target_action_id: String,
         app_core: Arc<AppCore>,
+        space_id: String,
         mut event_rx: mpsc::UnboundedReceiver<ChatStreamEvent>,
         done_rx: oneshot::Receiver<Result<ChatResult, AppError>>,
         cx: &mut Context<Self>,
-    ) {
-        self.submit_runner = Some(cx.spawn(async move |this, cx| {
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
             while let Some(event) = event_rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
-                    if let Some(s) = this.streaming.as_mut() {
+                    if let Some(s) = this.streams.iter_mut().find(|s| s.seq == seq) {
                         match event {
-                            ChatStreamEvent::ReasoningDelta(d) => s.reasoning.push_str(&d),
-                            ChatStreamEvent::ContentDelta(d) => s.content.push_str(&d),
+                            ChatStreamEvent::ReasoningDelta(d) => s.response.reasoning.push_str(&d),
+                            ChatStreamEvent::ContentDelta(d) => s.response.content.push_str(&d),
                         }
                         cx.emit(SpaceEvent::StreamDelta);
                         cx.notify();
@@ -882,14 +1054,13 @@ impl Space {
 
             let outcome = done_rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
-                    message: "chat task cancelled".into(),
+                    message: "turn task cancelled".into(),
                 })
             });
 
             match outcome {
                 Ok(result) => {
-                    let msgs_rx = bridge::get_space_tree(app_core, result.space_id.clone());
-                    let msgs = msgs_rx
+                    let msgs = bridge::get_space_tree(app_core.clone(), result.space_id.clone())
                         .await
                         .unwrap_or_else(|_| {
                             Err(AppError::Internal {
@@ -898,19 +1069,19 @@ impl Space {
                         })
                         .map(views_from_nodes);
                     let _ = this.update(cx, |this, cx| {
-                        let captured_reasoning =
-                            this.streaming.as_ref().map(|s| s.reasoning.clone());
-                        this.streaming = None;
-                        // Assigning the id (a blank space earning its first
-                        // persisted id) is what lets the registry adopt this
-                        // entity: a `SpacesStore` subscriber reads `id()` on
-                        // `StreamEnded` and keys the entity under it, so a
-                        // later open of the same id shares this same `Space`.
+                        let captured = this
+                            .streams
+                            .iter()
+                            .find(|s| s.seq == seq)
+                            .map(|s| s.response.reasoning.clone());
+                        this.streams.retain(|s| s.seq != seq);
                         this.id = Some(result.space_id.clone());
-                        this.submit_runner = None;
                         match msgs {
                             Ok(messages) => {
-                                this.merge_from_db(messages, captured_reasoning);
+                                let attach = captured
+                                    .filter(|r| !r.is_empty())
+                                    .map(|r| (result.response_action_id.clone(), r));
+                                this.merge_from_db(messages, attach);
                                 cx.emit(SpaceEvent::MessagesChanged);
                                 cx.emit(SpaceEvent::StreamEnded);
                             }
@@ -922,15 +1093,78 @@ impl Space {
                         }
                         cx.notify();
                     });
+
+                    // Continue the cascade on the fresh post: the responding
+                    // participant's reply may itself notify others (`all`
+                    // policies), bounded by the data-derived cascade guard.
+                    // Best-effort — a failed *plan* read is not a failed turn.
+                    if let Some(response_id) = result.response_action_id.clone() {
+                        let plan =
+                            bridge::plan_notifications(app_core, space_id, response_id.clone())
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(AppError::Internal {
+                                        message: "plan task cancelled".into(),
+                                    })
+                                });
+                        let _ = this.update(cx, |this, cx| {
+                            match plan {
+                                Ok(NotificationPlan::Turns(turns)) => {
+                                    for t in turns {
+                                        this.start_turn(t.participant_id, t.target_action_id, cx);
+                                    }
+                                }
+                                Ok(NotificationPlan::Paused { depth, limit }) => {
+                                    cx.emit(SpaceEvent::CascadePaused {
+                                        depth,
+                                        limit,
+                                        target_action_id: response_id,
+                                    });
+                                }
+                                Err(_) => {}
+                            }
+                            this.turn_runners.remove(&seq);
+                            cx.notify();
+                        });
+                    } else {
+                        let _ = this.update(cx, |this, cx| {
+                            this.turn_runners.remove(&seq);
+                            cx.notify();
+                        });
+                    }
                 }
                 Err(e) => {
-                    // Blank-space id adoption, the transcript-load restart,
-                    // and the unwrapped `Failed` emission all live in the
-                    // shared failure completion.
-                    let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
+                    let _ = this.update(cx, |this, cx| {
+                        this.fail_turn(seq, Some(participant_id), Some(target_action_id), e, cx)
+                    });
                 }
             }
-        }));
+        })
+    }
+
+    /// Whether the failed turn can be **re-asked**: a failure is recorded and
+    /// nothing exclusive is in flight ([`Self::ask`] itself refuses a
+    /// duplicate of a turn already streaming). Sibling turns streaming do
+    /// *not* block a retry — per-turn recovery is independent by design.
+    pub fn can_retry(&self) -> bool {
+        self.failed_turn.is_some() && self.post_runner.is_none()
+    }
+
+    /// Re-ask the failed turn's participant about the same post — **without**
+    /// re-posting anything (the post is already durable; the ask bypasses the
+    /// cascade guard). Returns the **target action id** the retry ran against
+    /// (so the view can select its branch before the streaming node renders —
+    /// PR #218 review), or `None` if nothing is retryable.
+    pub fn retry(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let failed = self.failed_turn.clone()?;
+        if !self.ask(
+            failed.participant_id.clone(),
+            failed.target_action_id.clone(),
+            cx,
+        ) {
+            return None;
+        }
+        Some(failed.target_action_id)
     }
 
     // -- Test seams --------------------------------------------------------
@@ -970,28 +1204,64 @@ impl Space {
         cx.notify();
     }
 
-    /// Test-only: set the streaming response directly (snapshot tests).
+    /// Test-only: replace the streaming state with zero or one synthetic
+    /// turn (snapshot tests that render a single in-flight response).
     #[doc(hidden)]
     pub fn set_streaming_for_test(
         &mut self,
         streaming: Option<StreamingResponse>,
         cx: &mut Context<Self>,
     ) {
-        self.streaming = streaming;
+        self.streams.clear();
+        if let Some(response) = streaming {
+            let seq = self.mint_turn_seq();
+            self.streams.push(StreamingTurn {
+                seq,
+                participant_id: None,
+                target_action_id: None,
+                response,
+            });
+        }
         cx.notify();
     }
 
-    /// Test-only: push a content delta into the live streaming buffer and emit
-    /// `StreamDelta`, exactly as the real streaming runner does. Drives the
+    /// Test-only: push one synthetic in-flight turn (multi-stream scenes).
+    #[doc(hidden)]
+    pub fn push_streaming_turn_for_test(
+        &mut self,
+        participant_id: Option<String>,
+        target_action_id: Option<String>,
+        response: StreamingResponse,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let seq = self.mint_turn_seq();
+        self.streams.push(StreamingTurn {
+            seq,
+            participant_id,
+            target_action_id,
+            response,
+        });
+        cx.notify();
+        seq
+    }
+
+    /// Test-only: push a content delta into turn `seq`'s live buffer and emit
+    /// `StreamDelta`, exactly as the real turn runner does. Drives the
     /// two-window sync test (both lenses observe the same entity, so both see
     /// the delta) without a backend.
     #[doc(hidden)]
-    pub fn push_content_delta_for_test(&mut self, delta: &str, cx: &mut Context<Self>) {
-        if let Some(s) = self.streaming.as_mut() {
-            s.content.push_str(delta);
+    pub fn push_content_delta_for_test(&mut self, seq: u64, delta: &str, cx: &mut Context<Self>) {
+        if let Some(s) = self.streams.iter_mut().find(|s| s.seq == seq) {
+            s.response.content.push_str(delta);
             cx.emit(SpaceEvent::StreamDelta);
             cx.notify();
         }
+    }
+
+    /// Test-only: the first in-flight turn's seq (single-stream tests).
+    #[doc(hidden)]
+    pub fn first_stream_seq_for_test(&self) -> Option<u64> {
+        self.streams.first().map(|s| s.seq)
     }
 
     /// Test-only: arm a never-completing task in the load slot, standing in
@@ -1011,8 +1281,8 @@ impl Space {
     }
 
     /// Test-only: simulate completion of a transcript load (the race-replay
-    /// test). Returns whether the load was applied — `false` when a submit has
-    /// raced ahead (`streaming.is_some()`), proving a slow initial load that
+    /// test). Returns whether the load was applied — `false` when a mutation
+    /// has raced ahead (a turn is streaming), proving a slow initial load that
     /// finishes after a local submit cannot clobber the submitted prompt.
     #[doc(hidden)]
     pub fn apply_loaded_transcript_for_test(
@@ -1024,14 +1294,64 @@ impl Space {
         self.apply_loaded_transcript(Ok(views), cx)
     }
 
-    /// Test-only: drive the shared mutation-failure completion exactly as
-    /// every runner's error arm does (it delegates to the same
-    /// [`Self::fail_mutation`]): adopt the id from a `ChatFailed` wrapper if
-    /// the space is still blank, clear streaming, restart the transcript
-    /// load, and emit `Failed` with the unwrapped source. Drives the
-    /// blank-space id-adoption and failure-restarts-load regression tests.
+    /// Test-only: drive the exclusive-mutation failure completion exactly as
+    /// the post/edit/regenerate runners' error arms do (they delegate to the
+    /// same [`Self::fail_mutation`]): adopt the id from a `ChatFailed` wrapper
+    /// if the space is still blank, clear synthetic streams, restart the
+    /// transcript load, and emit `Failed` with the unwrapped source. Drives
+    /// the blank-space id-adoption and failure-restarts-load regressions.
     #[doc(hidden)]
     pub fn apply_chat_failure_for_test(&mut self, error: AppError, cx: &mut Context<Self>) {
         self.fail_mutation(error, cx);
+    }
+
+    /// Test-only: drive one turn's failure completion exactly as a real turn
+    /// runner's error arm does ([`Self::fail_turn`]): the failed turn's
+    /// buffers are dropped (siblings untouched), the participant + target are
+    /// recorded for Retry, and `Failed` is emitted with the unwrapped source.
+    /// When a synthetic turn matching the pair is in flight its seq is used;
+    /// otherwise a fresh seq stands in for an already-collapsed turn.
+    #[doc(hidden)]
+    pub fn apply_turn_failure_for_test(
+        &mut self,
+        participant_id: &str,
+        target_action_id: &str,
+        error: AppError,
+        cx: &mut Context<Self>,
+    ) {
+        let seq = self
+            .streams
+            .iter()
+            .find(|s| {
+                s.participant_id.as_deref() == Some(participant_id)
+                    && s.target_action_id.as_deref() == Some(target_action_id)
+            })
+            .map(|s| s.seq)
+            .unwrap_or_else(|| self.mint_turn_seq());
+        self.fail_turn(
+            seq,
+            Some(participant_id.to_string()),
+            Some(target_action_id.to_string()),
+            error,
+            cx,
+        );
+    }
+
+    /// Test-only: emit the cascade-paused event (stub scenes can't compute a
+    /// real plan).
+    #[doc(hidden)]
+    pub fn emit_cascade_paused_for_test(
+        &mut self,
+        depth: i64,
+        limit: i64,
+        target_action_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(SpaceEvent::CascadePaused {
+            depth,
+            limit,
+            target_action_id,
+        });
+        cx.notify();
     }
 }
