@@ -20,6 +20,11 @@ use eidola_app_core::changes::Change;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{AppCore, ChatStreamEvent};
 
+/// The generic system prompt the seeded default template agent carries (mirrors
+/// `db::DEFAULT_AGENT_SYSTEM_PROMPT`). Participant-aware turns prepend it as the
+/// leading `system` message, so context assertions include it (Participants v1).
+const SEEDED_SYSTEM_PROMPT: &str = "You are a helpful assistant. Answer clearly and concisely.";
+
 // ---------------------------------------------------------------------------
 // Harness: run an async test body on a dedicated OS thread.
 //
@@ -471,17 +476,24 @@ fn regenerate_sends_only_upstream_context_at_current_versions() {
             .collect();
         assert_eq!(
             flat,
-            vec![(
-                "user".to_string(),
-                "How do tides work? Explain it for a sailor.".to_string()
-            )],
-            "regenerate context = upstream only, most-recent versions"
+            vec![
+                ("system".to_string(), SEEDED_SYSTEM_PROMPT.to_string()),
+                (
+                    "user".to_string(),
+                    "How do tides work? Explain it for a sailor.".to_string()
+                )
+            ],
+            "regenerate context = system prompt + upstream only, most-recent versions"
         );
 
         // Sanity: the second chat (a Reply on the linear spine) saw the full
-        // thread — its target's inclusive ancestry is the whole conversation.
+        // thread — its target's inclusive ancestry is the whole conversation —
+        // plus the leading system message (u1, i1, u2 + system = 4).
         let second_messages = bodies[1]["messages"].as_array().expect("messages").len();
-        assert_eq!(second_messages, 3, "a linear reply sees the full thread");
+        assert_eq!(
+            second_messages, 4,
+            "a linear reply sees the full thread + system prompt"
+        );
     });
 }
 
@@ -549,6 +561,7 @@ fn branch_reply_sends_only_its_branch_context() {
         assert_eq!(
             flat,
             vec![
+                ("system".to_string(), SEEDED_SYSTEM_PROMPT.to_string()),
                 ("user".to_string(), "How do tides work?".to_string()),
                 (
                     "assistant".to_string(),
@@ -556,7 +569,7 @@ fn branch_reply_sends_only_its_branch_context() {
                 ),
                 ("user".to_string(), "What about spring tides?".to_string()),
             ],
-            "branch reply context = the branch's ancestry only"
+            "branch reply context = system prompt + the branch's ancestry only"
         );
     });
 }

@@ -96,6 +96,23 @@
 //! Covered by the `*_emit_participants` / `*_emits_templates` /
 //! `space_born_with_template_participants` tests below.
 //!
+//! **Orchestration (Participants v1, wave 2).** `submit` = `post` +
+//! `plan_notifications`; `plan_notifications` is a **pure read** (participant +
+//! cascade-depth SELECTs) — **it commits nothing and emits nothing**, so
+//! `submit`'s only emissions are `post`'s (`Space(id)` + `SpaceIndex` on a new
+//! space / auto-title). Driving a planned turn (`respond_stream_as`) is exactly
+//! the `run_turn_stream(Reply)` half of `chat_stream` with **no leading
+//! `post`** — it hits every `run_turn`/`chat_stream` emission row above except
+//! the post-owned `SpaceIndex` (identical to `respond_stream`, differing only
+//! in that the responder is chosen by participant id rather than model). The
+//! turn is participant-aware: the responding participant's effective system
+//! prompt is prepended to the upstream `messages` (not persisted — forensics
+//! never resolve mutable participant config), so no new durable exit point and
+//! no new emission. The ACT provisioning queue (`Inner::spend_gate`) serializes
+//! only the credential acquire→spend→flip step; the `Wallet` "spending" emission
+//! still fires once per turn at that point, unchanged. Executed in
+//! `tests/participants_orchestration.rs`.
+//!
 //! The happy-path tests below confirm the success-path emissions remain intact
 //! and that the shared infrastructure (bus capacity, multi-subscriber delivery)
 //! works. The full chat HTTP paths — happy-path persistence/emission and the
