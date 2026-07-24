@@ -1,10 +1,82 @@
 use std::path::Path;
 
-use turso::{Builder, Connection, Database, Value};
+use turso::{Builder, Connection, Database, Statement, Value};
 
 use crate::error::AppError;
 
 const SCHEMA: &str = include_str!("../schema/schema.sql");
+
+/// Max retries papering over an upstream turso statement-compilation race on
+/// shared views (see [`ConnPrepareRetry`]). The window is a single statement's
+/// translation (microseconds), so one retry almost always clears it; the bound
+/// exists only so a *genuinely* self-referential view (never the case in our
+/// schema) still surfaces its honest error instead of looping forever.
+const VIEW_COMPILE_RACE_RETRIES: usize = 32;
+
+/// True for the exact translate-time parse error turso raises when it (wrongly,
+/// see [`ConnPrepareRetry`]) judges a view circular. Deliberately narrow — one
+/// message, never a broader class of "database is locked"/parse errors.
+fn is_view_compile_race(e: &turso::Error) -> bool {
+    e.to_string().contains("is circularly defined")
+}
+
+/// Bounded-retry wrapper around statement *compilation* — the fix for an
+/// upstream turso concurrency bug.
+///
+/// **Root cause (turso 0.7.0-pre.18).** `Database::connect` hands every
+/// connection a *clone of the same `Arc<Schema>`* (`lib.rs`), so all
+/// connections of one database share the very same `Arc<View>` per
+/// non-materialized view. View expansion during statement translation
+/// (`translate/planner.rs` → `View::process()` / `View::done()` in `schema.rs`)
+/// toggles a **shared mutable** re-entrancy flag on that `View` — `process()`
+/// flips `Ready → InProgress`, `done()` flips it back — purely to catch a view
+/// that references itself. But the flag is neither connection- nor plan-scoped:
+/// when two connections COMPILE (`prepare`) statements that expand the same view
+/// at the same instant, the second observes `InProgress` and bails with a
+/// spurious `Parse error: view <name> is circularly defined`. Participants-v1
+/// wave-2 drives concurrent turns (a fan-out prepares view-touching reads —
+/// `item_current`, `credential_lifecycle` — on separate connections), which is
+/// exactly the trigger profile, so it fires intermittently under load.
+///
+/// **Why a retry (not a structural client fix).** The flag is private,
+/// per-`Database`-shared engine state with no client-reachable knob to make it
+/// per-connection or to serialize only translation; the only alternative,
+/// serializing *all* statement compilation process-wide behind a mutex, would
+/// throttle every concurrent read to remove a ~0.2%-collision transient. The
+/// race is genuinely transient — it lives for one statement's translation and
+/// resets on `done()` a beat later — so a bounded retry converges immediately
+/// while preserving real concurrency. **Only `prepare` is wrapped**: the repro
+/// showed every hit is at compile time (zero at row iteration), and in this
+/// crate every view-referencing statement is a *read* compiled via
+/// `conn.prepare` — writes (`conn.execute`) and one-shots touch base tables
+/// only, so they never expand a view.
+///
+/// Upstream-reportable minimal repro (for filing against turso): two
+/// connections of one file-backed `Database`, each in a tight loop
+/// `conn.prepare("SELECT … FROM <view>")`, deterministically raises
+/// "circularly defined" within a few thousand iterations.
+trait ConnPrepareRetry {
+    async fn prepare_retry(&self, sql: impl AsRef<str>) -> turso::Result<Statement>;
+}
+
+impl ConnPrepareRetry for Connection {
+    async fn prepare_retry(&self, sql: impl AsRef<str>) -> turso::Result<Statement> {
+        let sql = sql.as_ref();
+        let mut attempt = 0usize;
+        loop {
+            match self.prepare(sql).await {
+                Err(e) if is_view_compile_race(&e) && attempt < VIEW_COMPILE_RACE_RETRIES => {
+                    attempt += 1;
+                    // A brief backoff lets the racing connection's `View::done()`
+                    // reset the shared flag (a bare `yield_now` can miss it when
+                    // the compile is mid-flight on another worker thread).
+                    tokio::time::sleep(std::time::Duration::from_micros(250)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+}
 
 /// Current schema version. `schema.sql` is the whole baseline — there are no
 /// incremental migrations (the pre-release history was collapsed for the
@@ -227,7 +299,7 @@ async fn ensure_default_backends(conn: &Connection) -> Result<(), AppError> {
 
 async fn get_user_version(conn: &Connection) -> Result<i64, AppError> {
     let mut stmt = conn
-        .prepare("PRAGMA user_version")
+        .prepare_retry("PRAGMA user_version")
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt.query(()).await.map_err(AppError::db)?;
@@ -390,7 +462,7 @@ pub async fn find_spendable_credential(
     min_credits: i64,
 ) -> Result<Option<SpendableCredential>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT c.nonce, c.issuer_key_id, c.data, c.credits, c.generation, ik.public_key_data \
              FROM credential_lifecycle cl \
              JOIN credential c ON c.nonce = cl.nonce \
@@ -425,7 +497,7 @@ pub struct CredentialRow {
 
 pub async fn list_active_credentials(conn: &Connection) -> Result<Vec<CredentialRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT nonce, credits, generation, created_at, state \
              FROM credential_lifecycle WHERE state = 'active' \
              ORDER BY created_at",
@@ -463,7 +535,7 @@ pub async fn list_spending_credentials(
     conn: &Connection,
 ) -> Result<Vec<SpendingCredentialRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT c.nonce, c.credits, c.generation, c.created_at, \
                     pc.spend_amount, pc.id, pc.data, pc.spend_proof_data, \
                     pc.issuer_key_id, ik.public_key_data \
@@ -506,7 +578,7 @@ pub async fn ensure_provider(
     created_at: i64,
 ) -> Result<String, AppError> {
     let mut stmt = conn
-        .prepare("SELECT id FROM provider WHERE name = ?1 AND kind = ?2 LIMIT 1")
+        .prepare_retry("SELECT id FROM provider WHERE name = ?1 AND kind = ?2 LIMIT 1")
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -599,7 +671,7 @@ const BACKEND_COLUMNS: &str = "id, kind, display_name, enabled, base_url, api_ke
 /// order both UIs use.
 pub async fn list_backends(conn: &Connection) -> Result<Vec<BackendRow>, AppError> {
     let mut stmt = conn
-        .prepare(&format!(
+        .prepare_retry(&format!(
             "SELECT {BACKEND_COLUMNS} FROM backend WHERE removed_at IS NULL \
              ORDER BY CASE kind WHEN 'eidola' THEN 0 WHEN 'local' THEN 1 ELSE 2 END, \
              created_at, id"
@@ -619,7 +691,7 @@ pub async fn list_backends(conn: &Connection) -> Result<Vec<BackendRow>, AppErro
 /// while `insert_backend` uses the row to revive).
 pub async fn get_backend(conn: &Connection, id: &str) -> Result<Option<BackendRow>, AppError> {
     let mut stmt = conn
-        .prepare(&format!(
+        .prepare_retry(&format!(
             "SELECT {BACKEND_COLUMNS} FROM backend WHERE id = ?1"
         ))
         .await
@@ -1047,7 +1119,7 @@ pub async fn ensure_participant(
     created_at: i64,
 ) -> Result<String, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT id FROM participant \
              WHERE scope = 'global' AND kind = ?1 AND label = ?2 LIMIT 1",
         )
@@ -1245,7 +1317,7 @@ pub async fn get_participant(
     id: &str,
 ) -> Result<Option<ParticipantRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT id, scope, owner_space_id, owner_template_id, kind, label, \
                     model_ref, system_prompt, notify_policy, role, removed_at \
              FROM participant WHERE id = ?1",
@@ -1362,7 +1434,7 @@ async fn owned_participants(
          FROM participant WHERE {owner_col} = ?1 AND removed_at IS NULL \
          ORDER BY created_at, id"
     );
-    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut stmt = conn.prepare_retry(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt
         .query((Value::Text(owner_id.to_string()),))
         .await
@@ -1622,7 +1694,7 @@ async fn list_participant_refs(
          FROM {table} WHERE {owner_col} = ?1 AND left_at IS NULL \
          ORDER BY joined_at, participant_id"
     );
-    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut stmt = conn.prepare_retry(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt
         .query((Value::Text(owner_id.to_string()),))
         .await
@@ -1698,7 +1770,7 @@ async fn effective_participants(
             WHERE r.{owner_col} = ?2 AND r.left_at IS NULL AND p.removed_at IS NULL \
         ) ORDER BY CASE kind WHEN 'human' THEN 0 ELSE 1 END, participant_id"
     );
-    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut stmt = conn.prepare_retry(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt
         .query((
             Value::Text(owner_id.to_string()),
@@ -1748,7 +1820,7 @@ pub async fn space_cascade_limit(
     space_id: &str,
 ) -> Result<Option<i64>, AppError> {
     let mut stmt = conn
-        .prepare("SELECT cascade_limit FROM space WHERE id = ?1")
+        .prepare_retry("SELECT cascade_limit FROM space WHERE id = ?1")
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -1785,7 +1857,7 @@ fn space_template_row_from(row: &turso::Row) -> Result<SpaceTemplateRow, AppErro
 /// List live (non-removed) templates; the seeded default's id sorts first.
 pub async fn list_space_templates(conn: &Connection) -> Result<Vec<SpaceTemplateRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT id, title, cascade_limit, created_at, removed_at \
              FROM space_template WHERE removed_at IS NULL \
              ORDER BY created_at, id",
@@ -1806,7 +1878,7 @@ pub async fn get_space_template(
     id: &str,
 ) -> Result<Option<SpaceTemplateRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT id, title, cascade_limit, created_at, removed_at \
              FROM space_template WHERE id = ?1",
         )
@@ -2353,7 +2425,7 @@ pub async fn list_spaces(
          GROUP BY s.id, s.title, s.created_at, s.archived_at \
          ORDER BY last_activity_at DESC"
     );
-    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut stmt = conn.prepare_retry(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt.query(()).await.map_err(AppError::db)?;
     let mut results = Vec::new();
     while let Some(row) = rows.next().await.map_err(AppError::db)? {
@@ -2378,7 +2450,7 @@ pub async fn first_user_text(
     space_id: &str,
 ) -> Result<Option<String>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT cb.text_content \
              FROM action a \
              JOIN content_block cb ON cb.action_id = a.id \
@@ -2404,7 +2476,7 @@ pub async fn first_user_text(
 
 pub async fn get_space(conn: &Connection, space_id: &str) -> Result<Option<SpaceRow>, AppError> {
     let mut stmt = conn
-        .prepare("SELECT id, title, created_at FROM space WHERE id = ?1")
+        .prepare_retry("SELECT id, title, created_at FROM space WHERE id = ?1")
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -2445,7 +2517,7 @@ pub async fn get_space_actions_for_context(
     // the model's context, not jump to the end (same rule as the render
     // order in `get_space_tree_data`).
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT a.id, a.action_type, p.kind, a.status, \
                     cb.text_content, cb.ordinal \
              FROM action a \
@@ -2525,7 +2597,7 @@ pub async fn get_upstream_context(
     let mut results = Vec::new();
     for id in &chain {
         let mut stmt = conn
-            .prepare(
+            .prepare_retry(
                 "SELECT a.id, a.action_type, p.kind, a.status, \
                         cb.text_content, cb.ordinal \
                  FROM action a \
@@ -2562,7 +2634,7 @@ async fn item_tip_of_action(
     action_id: &str,
 ) -> Result<Option<String>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT ic.current_action_id \
              FROM action a \
              JOIN item_current ic \
@@ -2590,7 +2662,7 @@ async fn reply_antecedent_tip(
     action_id: &str,
 ) -> Result<Option<String>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT ic.current_action_id \
              FROM action_antecedent aa \
              JOIN action ant ON ant.id = aa.antecedent_action_id \
@@ -2707,7 +2779,10 @@ pub async fn get_space_tree_data(
            AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
          ORDER BY origin.born_at ASC, origin.first_action_id ASC"
     );
-    let mut stmt = conn.prepare(&action_sql).await.map_err(AppError::db)?;
+    let mut stmt = conn
+        .prepare_retry(&action_sql)
+        .await
+        .map_err(AppError::db)?;
     let mut rows = stmt
         .query([Value::Text(space_id.to_string())])
         .await
@@ -2739,7 +2814,7 @@ pub async fn get_space_tree_data(
            AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
          ORDER BY cb.action_id ASC, cb.ordinal ASC"
     );
-    let mut stmt = conn.prepare(&block_sql).await.map_err(AppError::db)?;
+    let mut stmt = conn.prepare_retry(&block_sql).await.map_err(AppError::db)?;
     let mut rows = stmt
         .query([Value::Text(space_id.to_string())])
         .await
@@ -2779,7 +2854,7 @@ pub async fn get_space_tree_data(
            AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
          ORDER BY aa.action_id ASC, aa.ordinal ASC"
     );
-    let mut stmt = conn.prepare(&edge_sql).await.map_err(AppError::db)?;
+    let mut stmt = conn.prepare_retry(&edge_sql).await.map_err(AppError::db)?;
     let mut rows = stmt
         .query([Value::Text(space_id.to_string())])
         .await
@@ -2811,7 +2886,7 @@ pub async fn last_action_in_space(
     space_id: &str,
 ) -> Result<Option<String>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT id FROM action \
              WHERE space_id = ?1 AND status IN ('complete', 'cancelled') \
              ORDER BY created_at DESC LIMIT 1",
@@ -2836,7 +2911,7 @@ pub async fn action_item_and_space(
     action_id: &str,
 ) -> Result<Option<(String, String)>, AppError> {
     let mut stmt = conn
-        .prepare("SELECT item_id, space_id FROM action WHERE id = ?1")
+        .prepare_retry("SELECT item_id, space_id FROM action WHERE id = ?1")
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -2859,7 +2934,7 @@ pub async fn current_tip_of_item(
     item_id: &str,
 ) -> Result<Option<String>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT current_action_id FROM item_current \
              WHERE space_id = ?1 AND item_id = ?2",
         )
@@ -2886,7 +2961,7 @@ pub async fn reply_antecedent(
     action_id: &str,
 ) -> Result<Option<String>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT antecedent_action_id FROM action_antecedent \
              WHERE action_id = ?1 AND relation = 'reply' LIMIT 1",
         )
@@ -2911,7 +2986,7 @@ pub async fn action_author(
     action_id: &str,
 ) -> Result<Option<(String, String, String)>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT a.participant_id, a.participant_scope, p.kind \
              FROM action a JOIN participant p ON p.id = a.participant_id \
              WHERE a.id = ?1",
@@ -2936,7 +3011,7 @@ pub async fn action_author(
 /// `None` if the action doesn't exist.
 async fn action_kind(conn: &Connection, action_id: &str) -> Result<Option<String>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT p.kind FROM action a \
              JOIN participant p ON p.id = a.participant_id WHERE a.id = ?1",
         )
@@ -2993,7 +3068,7 @@ pub async fn agent_cascade_depth(conn: &Connection, action_id: &str) -> Result<i
 /// Returns all action IDs in a space with terminal status, ordered by created_at.
 pub async fn space_action_ids(conn: &Connection, space_id: &str) -> Result<Vec<String>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT id FROM action \
              WHERE space_id = ?1 AND status IN ('complete', 'cancelled') \
              ORDER BY created_at ASC",
@@ -3074,7 +3149,7 @@ pub async fn list_attestations(
     offset: i64,
 ) -> Result<Vec<AttestationListRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT a.hash, a.pcr_digest, a.created_at, length(a.doc), COUNT(c.id) \
              FROM attestation a \
              LEFT JOIN connection c ON c.attestation_hash = a.hash \
@@ -3111,7 +3186,7 @@ pub async fn get_attestation(
     hash: &str,
 ) -> Result<Option<AttestationDocRow>, AppError> {
     let mut stmt = conn
-        .prepare("SELECT hash, pcr_digest, created_at, doc FROM attestation WHERE hash = ?1")
+        .prepare_retry("SELECT hash, pcr_digest, created_at, doc FROM attestation WHERE hash = ?1")
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -3153,7 +3228,7 @@ pub async fn list_requests(
     offset: i64,
 ) -> Result<Vec<RequestListRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT r.id, r.method, r.path, r.response_status, r.duration_ms, \
                     r.request_at, r.error, r.attempt_number, r.credential_nonce, \
                     c.transport, c.base_url, c.attestation_hash \
@@ -3219,7 +3294,7 @@ pub async fn get_request(
     id: &str,
 ) -> Result<Option<RequestDetailRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT r.id, r.method, r.path, r.request_headers, r.request_body, \
                     r.response_status, r.response_headers, r.response_body, \
                     r.request_at, r.response_at, r.duration_ms, r.error, \
@@ -3296,7 +3371,7 @@ pub async fn list_spend_trail(
     offset: i64,
 ) -> Result<Vec<SpendTrailRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT credential_nonce, spend_amount, credential_state, request_id, \
                     method, path, request_at, duration_ms, attempt_number, \
                     action_id, action_type, model, credits_consumed, intent, \
@@ -3348,7 +3423,7 @@ pub async fn list_credential_lifecycle(
     conn: &Connection,
 ) -> Result<Vec<CredentialLifecycleRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_retry(
             "SELECT nonce, credits, generation, created_at, state, spend_amount \
              FROM credential_lifecycle \
              ORDER BY created_at DESC, nonce",
@@ -3409,7 +3484,7 @@ mod tests {
 
     async fn list_objects(conn: &Connection) -> Vec<(String, String)> {
         let mut stmt = conn
-            .prepare(
+            .prepare_retry(
                 "SELECT type, name FROM sqlite_master \
                  WHERE type IN ('table', 'view', 'index') \
                  AND name NOT LIKE 'sqlite_%' \
@@ -3430,7 +3505,7 @@ mod tests {
         table: &str,
     ) -> Vec<(String, String, bool, Option<String>, bool)> {
         let mut stmt = conn
-            .prepare(&format!("PRAGMA table_info('{table}')"))
+            .prepare_retry(&format!("PRAGMA table_info('{table}')"))
             .await
             .unwrap();
         let mut rows = stmt.query(()).await.unwrap();
@@ -3450,7 +3525,7 @@ mod tests {
 
     async fn index_columns(conn: &Connection, index: &str) -> Vec<String> {
         let mut stmt = conn
-            .prepare(&format!("PRAGMA index_info('{index}')"))
+            .prepare_retry(&format!("PRAGMA index_info('{index}')"))
             .await
             .unwrap();
         let mut rows = stmt.query(()).await.unwrap();
@@ -3464,7 +3539,7 @@ mod tests {
 
     async fn view_sql(conn: &Connection, name: &str) -> String {
         let mut stmt = conn
-            .prepare("SELECT sql FROM sqlite_master WHERE type='view' AND name=?1")
+            .prepare_retry("SELECT sql FROM sqlite_master WHERE type='view' AND name=?1")
             .await
             .unwrap();
         let mut rows = stmt.query([name]).await.unwrap();
@@ -3484,6 +3559,40 @@ mod tests {
     /// NULL child column skips the composite FK — must NOT error); (d) CHECK
     /// violations error. Also confirms the pragma is load-bearing (default-off
     /// lets a dangling FK through).
+    /// Regression for the shared-view compilation race (see [`ConnPrepareRetry`]):
+    /// many connections of one `Database` concurrently *compile* a statement
+    /// that expands the `item_current` view. With bare `conn.prepare` this
+    /// deterministically raises "view item_current is circularly defined" within
+    /// a few thousand overlapping compiles (a multi-thread runtime is required —
+    /// the flag race needs two translations literally in flight at once);
+    /// `prepare_retry` must clear it every time. Kept high-volume so a
+    /// regression (reverting to bare `prepare`) trips it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_view_compile_never_spuriously_circular() {
+        let db = std::sync::Arc::new(open_memory_fresh().await);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..3000 {
+                    // Each iteration opens a fresh connection (they share the
+                    // one `Arc<Schema>`/`Arc<View>`) and compiles a
+                    // view-expanding read — the exact concurrent-turn profile.
+                    let conn = connect(&db).await.unwrap();
+                    let mut stmt = conn
+                        .prepare_retry("SELECT current_action_id FROM item_current")
+                        .await
+                        .expect("prepare_retry must clear the transient view-compile race");
+                    let mut rows = stmt.query(()).await.unwrap();
+                    let _ = rows.next().await.unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn turso_enforcement_smoke() {
         let db = Builder::new_local(":memory:").build().await.unwrap();
