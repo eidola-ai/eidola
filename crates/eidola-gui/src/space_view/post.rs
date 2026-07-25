@@ -436,6 +436,15 @@ impl SpaceView {
         // only; the prior generation keeps them (history is append-only), and
         // ordinal 0 — the reply edge — can never be here.
         let removals = ed.removed_references.clone();
+        // A removed footnote takes its marker with it: the edge is gone, so a
+        // surviving `{{ embed N }}` would render as literal wire syntax on
+        // reload and go upstream literally. Stripped from the *submitted*
+        // string only — the buffer is untouched, so Cancel still restores the
+        // original and a rejected (busy) submit loses nothing.
+        let value = super::references::strip_removed_markers(&value, &removals);
+        if value.is_empty() {
+            return;
+        }
         let accepted = self
             .space
             .update(cx, |s, cx| s.edit(action_id, value, removals, cx));

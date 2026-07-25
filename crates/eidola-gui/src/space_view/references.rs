@@ -185,6 +185,66 @@ fn strip_embed_blocks(content: &str, references: &[eidola_app_core::PostReferenc
     out
 }
 
+/// Drop the recognized `{{ embed N }}` blocks for `removed` ordinals from an
+/// edited body, closing the paragraph gap each one leaves behind.
+///
+/// A footnote removed in an Edit session drops its *edge*; the marker that
+/// addressed it must go with it, or the reloaded post renders the bare wire
+/// syntax as literal text — and, worse, sends it upstream literally, since
+/// `expand_embed_strings` has no edge to expand it against. Recognition is the
+/// editor's own `embed_blocks` over a map of just the removed ordinals, so a
+/// marker the author defused (fenced) or one belonging to a *surviving*
+/// reference is left exactly where it is.
+///
+/// Pure over the submitted string — the live buffer is never touched, so Cancel
+/// still restores the stashed original and a submit the space *rejects* (busy)
+/// leaves the user's text intact.
+pub(crate) fn strip_removed_markers(content: &str, removed: &[i64]) -> String {
+    let map = gpui_markdown_editor::EmbedMap::new(
+        removed
+            .iter()
+            .filter_map(|&o| Some((u64::try_from(o).ok()?, String::new()))),
+    );
+    if map.is_empty() {
+        return content.to_string();
+    }
+    let mut out = content.to_string();
+    for block in gpui_markdown_editor::embed::embed_blocks(content, &map)
+        .into_iter()
+        .rev()
+    {
+        let seam = block.range.start;
+        out.replace_range(block.range, "");
+        close_paragraph_gap(&mut out, seam);
+    }
+    out.trim().to_string()
+}
+
+/// Collapse the blank-line run spanning `seam` to a single paragraph break —
+/// the marker's own blank-line delimiters would otherwise stack into a gap.
+/// A run that reaches either end of the document is trimmed away entirely.
+fn close_paragraph_gap(text: &mut String, seam: usize) {
+    let is_gap = |b: u8| b == b'\n' || b == b' ' || b == b'\t' || b == b'\r';
+    let bytes = text.as_bytes();
+    let mut start = seam.min(bytes.len());
+    while start > 0 && is_gap(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = seam.min(bytes.len());
+    while end < bytes.len() && is_gap(bytes[end]) {
+        end += 1;
+    }
+    if start == end {
+        return;
+    }
+    let replacement = if start == 0 || end == bytes.len() {
+        ""
+    } else {
+        "\n\n"
+    };
+    text.replace_range(start..end, replacement);
+}
+
 /// Collapse a quoted passage to one quiet line: whitespace runs folded, then
 /// truncated on a word boundary with an ellipsis. The rail is an index, not a
 /// second copy of the quote — the body's embed block is where you read it.
@@ -778,27 +838,84 @@ impl SpaceView {
             cx.notify();
             return;
         }
-        self.open_action_in_its_space(action_id, cx);
+        self.navigate_to_absent_action(action_id, window, cx);
     }
 
-    /// A post outside this space: resolve its home space id, then open that
-    /// space's window. The resolve is a pure read owned in the view's own
-    /// slot (it dies with the window, per STATE.md's owner-is-blast-radius
-    /// rule — a cancelled navigation strands nothing).
-    fn open_action_in_its_space(&mut self, action_id: String, cx: &mut Context<Self>) {
+    /// A quoted post that isn't in the current-tip tree. It is **not**
+    /// necessarily foreign: references name a *concrete generation*, so a post
+    /// quoted and later edited or regenerated leaves the tree even though it
+    /// still lives here — its item does not. So resolve the action's
+    /// `(item, space)` and try the item's current tip in this tree first;
+    /// only a genuinely cross-space post falls through to opening its own
+    /// window (for a same-space edit that fallback would open a *duplicate*
+    /// window on this space with nothing selected).
+    ///
+    /// The resolve is a pure read owned in the view's own slot (it dies with
+    /// the window, per STATE.md's owner-is-blast-radius rule — a cancelled
+    /// navigation strands nothing).
+    fn navigate_to_absent_action(
+        &mut self,
+        action_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(app_core) = self.stores.app_core() else {
             return;
         };
-        let rx = crate::bridge::action_space(app_core, action_id);
+        let rx = crate::bridge::action_location(app_core, action_id);
         let stores = self.stores.clone();
-        self.navigate_task = Some(cx.spawn(async move |_, cx| {
-            let Ok(Ok(Some(space_id))) = rx.await else {
+        self.navigate_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some((item_id, space_id)))) = rx.await else {
                 return;
             };
-            cx.update(|cx| {
+            let selected = this
+                .update_in(cx, |this, window, cx| {
+                    this.select_item_tip(&item_id, window, cx)
+                })
+                .unwrap_or(false);
+            if selected {
+                return;
+            }
+            let _ = cx.update(|_, cx| {
                 crate::open_space_window(cx, stores.clone(), space_id);
             });
         }));
+    }
+
+    /// Select the post now carrying `item_id`'s current generation, if this
+    /// space renders it — how a reference to a since-edited post still lands
+    /// on the content it quoted. Returns whether it found one.
+    ///
+    /// The stored range is **not** remapped onto the new generation (the
+    /// footnote already says "quoted an earlier version" when it no longer
+    /// resolves); this only takes the reader to where that post now lives.
+    #[doc(hidden)]
+    pub fn select_item_tip(
+        &mut self,
+        item_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(tip) = self
+            .space
+            .read(cx)
+            .messages()
+            .iter()
+            .find(|m| m.item_id.as_deref() == Some(item_id))
+            .and_then(|m| m.action_id.clone())
+        else {
+            return false;
+        };
+        let page_width = crate::chrome::content_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        if super::model::node_ref(&tree, &tip).is_none() {
+            return false;
+        }
+        self.select_path_to(&tree, &tip, page_width);
+        self.scroll_node_into_view(&tree, &tip, window);
+        cx.notify();
+        true
     }
 
     /// Scroll the page so `node_id` rests near the top of the reading area —
@@ -1041,6 +1158,50 @@ mod tests {
         let (id, r) = block_range_for(&spans(), &(0..10)).expect("resolves");
         assert_eq!(id, "a");
         assert_eq!(r, 0..10);
+    }
+
+    #[test]
+    fn strip_removed_markers_drops_only_the_removed_ordinals_and_closes_the_gap() {
+        let doc = "Before.\n\n{{ embed 1 }}\n\nBetween.\n\n{{ embed 2 }}\n\nAfter.";
+
+        // The removed ordinal's marker goes, its paragraph gap closes, and the
+        // surviving reference's marker is untouched — its footnote still
+        // addresses it.
+        let out = strip_removed_markers(doc, &[1]);
+        assert_eq!(out, "Before.\n\nBetween.\n\n{{ embed 2 }}\n\nAfter.");
+
+        // Removing every reference leaves clean prose, not a run of blanks.
+        assert_eq!(
+            strip_removed_markers(doc, &[1, 2]),
+            "Before.\n\nBetween.\n\nAfter."
+        );
+
+        // Nothing removed is a verbatim pass-through.
+        assert_eq!(strip_removed_markers(doc, &[]), doc);
+
+        // A marker the author defused by fencing it is literal text, not a
+        // block — the editor renders it literally, so removal must not touch
+        // it either (the UI and the wire never disagree).
+        let fenced = "Before.\n\n```\n{{ embed 1 }}\n```\n\nAfter.";
+        assert_eq!(strip_removed_markers(fenced, &[1]), fenced);
+    }
+
+    #[test]
+    fn strip_removed_markers_handles_document_edges() {
+        // Leading marker: the gap it leaves is trimmed rather than left as an
+        // opening blank line.
+        assert_eq!(
+            strip_removed_markers("{{ embed 1 }}\n\nBody.", &[1]),
+            "Body."
+        );
+        // Trailing marker: likewise at the end.
+        assert_eq!(
+            strip_removed_markers("Body.\n\n{{ embed 1 }}", &[1]),
+            "Body."
+        );
+        // A body that is *only* a marker empties out — `commit_edit` treats an
+        // empty submission as a no-op rather than persisting a blank post.
+        assert_eq!(strip_removed_markers("{{ embed 1 }}", &[1]), "");
     }
 
     #[test]

@@ -955,7 +955,7 @@ fn submit_with_invalid_reference_errors_with_zero_trace_and_no_plan() {
 }
 
 #[test]
-fn action_space_resolves_a_posts_home_space_without_emitting() {
+fn action_location_resolves_a_posts_item_and_space_without_emitting() {
     run_in_thread(|| {
         let (core, _dir) = make_core();
         let posted = core
@@ -964,19 +964,38 @@ fn action_space_resolves_a_posts_home_space_without_emitting() {
             .unwrap();
 
         let mut rx = core.subscribe_changes();
-        let home = core
+        let (item_id, space_id) = core
             .runtime()
-            .block_on(core.action_space(posted.action_id.clone()))
-            .unwrap();
-        assert_eq!(home.as_deref(), Some(posted.space_id.as_str()));
+            .block_on(core.action_location(posted.action_id.clone()))
+            .unwrap()
+            .expect("a persisted post resolves");
+        assert_eq!(space_id, posted.space_id);
+        assert!(!item_id.is_empty());
         let unknown = core
             .runtime()
-            .block_on(core.action_space("no-such-action".into()))
+            .block_on(core.action_location("no-such-action".into()))
             .unwrap();
         assert_eq!(unknown, None);
         assert!(
             drain(&mut rx).is_empty(),
-            "action_space is a pure read and must not emit"
+            "action_location is a pure read and must not emit"
+        );
+
+        // The item is what survives an edit: the quoted generation leaves the
+        // current-tip tree, but both generations still resolve to one item, so
+        // a reference to the old one can find where its content now lives.
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(posted.action_id.clone(), "hello, again".into()))
+            .unwrap();
+        let (edited_item, _) = core
+            .runtime()
+            .block_on(core.action_location(edited.action_id.clone()))
+            .unwrap()
+            .expect("the edit resolves");
+        assert_eq!(
+            edited_item, item_id,
+            "an edit is a new generation of the same item"
         );
     });
 }

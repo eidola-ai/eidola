@@ -315,6 +315,7 @@ pub struct Space {
     /// or edit would carry without a live core.
     last_submitted_references: Vec<ReferenceSpec>,
     last_edit_removals: Vec<i64>,
+    last_edit_text: String,
     /// The exclusive mutation slot: submit's post phase, post-only, edit,
     /// regenerate. While `Some`, another mutation is a no-op.
     post_runner: Option<Task<()>>,
@@ -359,6 +360,7 @@ impl Space {
             last_submitted_model: None,
             last_submitted_references: Vec::new(),
             last_edit_removals: Vec::new(),
+            last_edit_text: String::new(),
             post_runner: None,
             turn_runners: HashMap::new(),
             failed_turn: None,
@@ -381,6 +383,7 @@ impl Space {
             last_submitted_model: None,
             last_submitted_references: Vec::new(),
             last_edit_removals: Vec::new(),
+            last_edit_text: String::new(),
             post_runner: None,
             turn_runners: HashMap::new(),
             failed_turn: None,
@@ -404,6 +407,7 @@ impl Space {
             last_submitted_model: None,
             last_submitted_references: Vec::new(),
             last_edit_removals: Vec::new(),
+            last_edit_text: String::new(),
             post_runner: None,
             turn_runners: HashMap::new(),
             failed_turn: None,
@@ -542,6 +546,13 @@ impl Space {
     /// The reference ordinals the most recent accepted edit asked to remove.
     pub fn last_edit_removals(&self) -> &[i64] {
         &self.last_edit_removals
+    }
+
+    /// The body text the most recent accepted edit submitted. The view strips
+    /// a removed reference's `{{ embed N }}` marker out of the submission, so
+    /// this is what proves the marker left with its edge.
+    pub fn last_edit_text(&self) -> &str {
+        &self.last_edit_text
     }
 
     /// The turn a failed ask left behind, if any (drives the notice's Retry).
@@ -993,6 +1004,7 @@ impl Space {
             return false;
         }
         self.last_edit_removals = remove_references.clone();
+        self.last_edit_text = new_prompt.clone();
         self.supersede_load_for_mutation();
         let Some(app_core) = self.app_core.clone() else {
             return true; // stub: no backend
