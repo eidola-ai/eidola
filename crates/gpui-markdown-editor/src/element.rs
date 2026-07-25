@@ -228,6 +228,15 @@ pub struct LaidOutBlock {
     pub block_bounds: Bounds<Pixels>,
     pub lines: Vec<LaidOutLine>,
     pub source_range: Range<usize>,
+    /// `Some(ordinal)` when this block is a rendered `BlockKind::Embed` —
+    /// recorded **at render time** so the mouse hit-test resolves a click on
+    /// the embed container directly, instead of re-deriving embed ranges
+    /// from source and matching them against block ranges by equality. That
+    /// equality happens to hold today only because `inject_empty_paragraphs`
+    /// strips the folded trailing `\n` the same way `embed_blocks` trims it
+    /// — an incidental cross-module invariant no test owned; recording the
+    /// ordinal at render removes the coupling (and the per-click parse).
+    pub embed_ordinal: Option<u64>,
 }
 
 pub struct PrepaintState {
@@ -2051,6 +2060,10 @@ impl Element for BlockElement {
             block_bounds,
             lines,
             source_range: self.block.source_range.clone(),
+            embed_ordinal: match &self.block.kind {
+                BlockKind::Embed { ordinal } => Some(*ordinal),
+                _ => None,
+            },
         };
 
         // Marker-overlay cursor: when the cursor is inside a task
@@ -2784,6 +2797,7 @@ impl Element for BlockElement {
                 block_bounds: Bounds::default(),
                 lines: Vec::new(),
                 source_range: 0..0,
+                embed_ordinal: None,
             },
         );
         let block_index = self.block_index;

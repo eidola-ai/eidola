@@ -560,6 +560,27 @@ impl MarkdownEditorState {
         cx: &mut Context<Self>,
     ) {
         self.state.embeds = crate::embed::EmbedMap::new(entries);
+        // Installing a map can turn a position the caret legally occupied (a
+        // literal, unmapped marker's interior) into a forbidden embed
+        // interior. Re-snap the selection against the new map immediately —
+        // otherwise the next insertion would splice into the hidden marker
+        // bytes of a block that renders as an embed.
+        let md = &self.state.markdown;
+        let em = &self.state.embeds;
+        self.state.selection = match self.state.selection {
+            Selection::Cursor(p) => {
+                Selection::Cursor(crate::analysis::nearest_allowed_position_with(md, em, p))
+            }
+            Selection::Range { anchor, head } => {
+                let a = crate::analysis::nearest_allowed_position_with(md, em, anchor);
+                let h = crate::analysis::nearest_allowed_position_with(md, em, head);
+                if a == h {
+                    Selection::Cursor(h)
+                } else {
+                    Selection::Range { anchor: a, head: h }
+                }
+            }
+        };
         cx.notify();
     }
 
@@ -1380,26 +1401,18 @@ impl MarkdownEditorState {
         self.begin_selection(offset, event.click_count, event.modifiers.shift, cx);
     }
 
-    /// The mapped embed block under `position` (window coordinates), if any:
-    /// the painted block whose bounds contain the point and whose source
-    /// range is a recognized embed marker.
-    fn embed_ordinal_at_position(&self, position: Point<Pixels>) -> Option<u64> {
-        if self.state.embeds.is_empty() {
-            return None;
-        }
-        let blocks = crate::embed::embed_blocks(&self.state.markdown, &self.state.embeds);
-        if blocks.is_empty() {
-            return None;
-        }
-        self.last_blocks.values().find_map(|b| {
-            if !b.block_bounds.contains(&position) {
-                return None;
-            }
-            blocks
-                .iter()
-                .find(|e| e.range == b.source_range)
-                .map(|e| e.ordinal)
-        })
+    /// The rendered embed block under `position` (window coordinates), if
+    /// any. Reads the ordinal the render recorded on the painted block
+    /// (`LaidOutBlock::embed_ordinal`) — never re-derived from source, so
+    /// range conventions (the parser's folded trailing newline vs the
+    /// scan's trimmed ranges) can't desynchronize the hit-test from what
+    /// actually painted, and a mousedown never re-parses the buffer.
+    #[doc(hidden)]
+    pub fn embed_ordinal_at_position(&self, position: Point<Pixels>) -> Option<u64> {
+        self.last_blocks
+            .values()
+            .find(|b| b.block_bounds.contains(&position))
+            .and_then(|b| b.embed_ordinal)
     }
 
     /// Start (or, with `shift`, extend) a pointer selection at `offset`, keyed

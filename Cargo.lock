@@ -2703,6 +2703,7 @@ name = "eidola-gui"
 version = "0.1.0"
 dependencies = [
  "eidola-app-core",
+ "eidola-common",
  "gpui",
  "gpui-component",
  "gpui-component-assets",

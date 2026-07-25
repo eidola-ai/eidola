@@ -6190,52 +6190,42 @@ fn canonicalize_model_ref(model_ref: &str) -> String {
     backends::qualified_model_id(&mr.model, &mr.backend_id)
 }
 
-/// Parse an embed marker line: the entire (whitespace-trimmed) line must be
-/// `{{` WS* `embed` WS+ decimal-digits WS* `}}` (WS = space/tab), yielding the
-/// ordinal. This is the same lexical rule the `gpui-markdown-editor` embed
-/// plugin recognizes (`embed::parse_embed_text` there — the two are
-/// deliberately duplicated, like the www/theme palette port, because app-core
-/// must not depend on gpui; keep them in lockstep and their tests pin the same
-/// cases). Canonical spelling: `{{ embed N }}`.
-fn parse_embed_marker(line: &str) -> Option<u64> {
-    const WS: [char; 2] = [' ', '\t'];
-    let s = line.trim_matches(WS);
-    let inner = s.strip_prefix("{{")?.strip_suffix("}}")?;
-    let inner = inner.trim_matches(WS);
-    let digits = inner.strip_prefix("embed")?;
-    if !digits.starts_with(WS) {
-        return None;
-    }
-    let digits = digits.trim_matches(WS);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse::<u64>().ok()
-}
-
-/// Replace whole-line `{{ embed N }}` markers in a post's markdown with the
-/// referenced quote rendered as a markdown blockquote — what upstream models
-/// read in place of the marker. Ordinals absent from `snippets` stay literal
-/// (the same honest degradation the editor renders for unmapped markers).
+/// Replace **structurally recognized** `{{ embed N }}` markers in a post's
+/// markdown with the referenced quote rendered as a markdown blockquote —
+/// what upstream models read in place of the marker.
+///
+/// Recognition is `eidola_common::embed::embed_marker_spans` — the shared
+/// structural contract with the editor's embed plugin: only a marker
+/// standing as its own top-level paragraph expands, exactly the set the
+/// editor renders as embed blocks. A marker the author "defused" — inline,
+/// inside a fenced/indented code block, in a blockquote/list, escaped —
+/// renders literal in the UI and therefore goes upstream literal too (the UI
+/// and the wire must never disagree). Ordinals absent from `snippets` also
+/// stay literal (the editor's unmapped-marker degradation). The lockstep
+/// proof between the scanner and the editor's parser-driven recognition is
+/// `crates/eidola-gui/tests/embed_lockstep.rs`.
 fn expand_embed_strings(text: &str, snippets: &std::collections::BTreeMap<u64, String>) -> String {
-    let mut out = String::with_capacity(text.len());
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        match parse_embed_marker(line).and_then(|n| snippets.get(&n)) {
-            Some(snippet) => {
-                for (j, ql) in snippet.split('\n').enumerate() {
-                    if j > 0 {
-                        out.push('\n');
-                    }
-                    out.push_str("> ");
-                    out.push_str(ql);
-                }
-            }
-            None => out.push_str(line),
-        }
+    let spans = eidola_common::embed::embed_marker_spans(text);
+    if spans.is_empty() {
+        return text.to_string();
     }
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    for span in spans {
+        let Some(snippet) = snippets.get(&span.ordinal) else {
+            continue;
+        };
+        out.push_str(&text[pos..span.start]);
+        for (j, ql) in snippet.split('\n').enumerate() {
+            if j > 0 {
+                out.push('\n');
+            }
+            out.push_str("> ");
+            out.push_str(ql);
+        }
+        pos = span.end;
+    }
+    out.push_str(&text[pos..]);
     out
 }
 
@@ -7357,10 +7347,12 @@ mod tests {
         assert_eq!(quote_snippet("éx", 0, 2), Some("é"));
     }
 
-    /// The embed-marker lexical rule (kept in lockstep with the editor
-    /// plugin's `embed::parse_embed_text` — same cases pinned there).
+    /// The embed-marker lexical rule (the shared `eidola-common` contract,
+    /// kept in lockstep with the editor plugin's `embed::parse_embed_text` —
+    /// same cases pinned there and in eidola-common itself).
     #[test]
     fn parse_embed_marker_lexical_rules() {
+        use eidola_common::embed::parse_embed_marker;
         // Canonical + whitespace tolerance (spaces/tabs).
         assert_eq!(parse_embed_marker("{{ embed 0 }}"), Some(0));
         assert_eq!(parse_embed_marker("{{embed 12}}"), Some(12));
@@ -7380,8 +7372,10 @@ mod tests {
         assert_eq!(parse_embed_marker("\\{{ embed 0 }}"), None);
     }
 
-    /// `expand_embed_strings` — mapped whole-line markers become blockquotes;
-    /// unmapped markers and inline occurrences stay literal.
+    /// `expand_embed_strings` — structurally recognized mapped markers become
+    /// blockquotes; unmapped markers, inline occurrences, and markers inside
+    /// fenced code (defused by the author — the editor renders them literal)
+    /// stay literal, so the UI and the wire agree.
     #[test]
     fn expand_embed_strings_quotes_mapped_markers() {
         let mut map = std::collections::BTreeMap::new();
@@ -7391,6 +7385,15 @@ mod tests {
         assert_eq!(
             out,
             "intro\n\n> quoted line one\n> quoted line two\n\n{{ embed 2 }}\n\nsee {{ embed 1 }} inline"
+        );
+
+        // Fence-defused markers do NOT expand, even when mapped — the editor
+        // shows them literal, so upstream must see them literal.
+        let fenced = "```\n\n{{ embed 1 }}\n\n```\n\n{{ embed 1 }}";
+        let out = expand_embed_strings(fenced, &map);
+        assert_eq!(
+            out,
+            "```\n\n{{ embed 1 }}\n\n```\n\n> quoted line one\n> quoted line two"
         );
     }
 
