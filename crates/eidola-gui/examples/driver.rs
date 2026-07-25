@@ -75,7 +75,7 @@ mod driver {
 
     use eidola_app_core::updates::{UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease};
     use eidola_app_core::{
-        BalancePoolInfo, BalancesResult, ConfigState, ModelInfo, ParticipantInfo,
+        AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState, ModelInfo, ParticipantInfo,
         ParticipantReference, PriceInfo, SpaceInfo, SpaceMessage, SpaceTemplateInfo,
         TemplateParticipantInfo,
     };
@@ -427,11 +427,26 @@ mod driver {
             },
             Scene {
                 name: "record",
-                description: "Record window (stub data: empty listings, live section strip)",
+                description: "Record window (seeded attestation rows, live section strip)",
                 default_size: size(px(860.), px(640.)),
                 build: |window, cx| {
                     let stores = stub_stores(cx, |_| {});
                     let view = cx.new(|cx| RecordView::new(stores, window, cx));
+                    // Seed a full listing so the section scrolls (the stub has no
+                    // backend, so the fetch is a no-op) — lets the scroll
+                    // indicator be exercised in the driver.
+                    view.update(cx, |v, _| {
+                        let rows: Vec<AttestationInfo> = (0..40)
+                            .map(|i| AttestationInfo {
+                                hash: format!("{i:064x}"),
+                                pcr_digest: None,
+                                created_at: 1_700_000_000_000 - (i as i64) * 3_600_000,
+                                doc_bytes: 4096 + i as i64,
+                                connection_count: 1 + (i as i64 % 3),
+                            })
+                            .collect();
+                        v.set_attestations_for_test(rows, true);
+                    });
                     root(view, window, cx)
                 },
             },
