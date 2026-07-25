@@ -497,6 +497,95 @@ fn regenerate_sends_only_upstream_context_at_current_versions() {
     });
 }
 
+/// Quoted references (wave 1): a post carrying a `{{ embed N }}` marker sends
+/// the referenced passage upstream as a markdown blockquote in that post's
+/// message — the model reads what was quoted, never the opaque marker.
+/// Unmapped markers stay literal (honest degradation, mirroring the editor).
+#[test]
+fn upstream_context_expands_embed_markers_into_quotes() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // A source post, then a post quoting a range of its text block.
+        let source = core
+            .runtime()
+            .block_on(core.post(
+                "The mitochondria is the powerhouse of the cell".into(),
+                None,
+            ))
+            .expect("source post");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .expect("tree");
+        let block_id = tree[0].blocks[0].id.clone();
+        // The body carries a structural marker (expands), an unmapped marker
+        // (stays literal), and a fence-defused marker of the SAME mapped
+        // ordinal (stays literal — the editor renders it literal, so the
+        // wire must too; expansion is structural, not line-based).
+        let posted = core
+            .runtime()
+            .block_on(
+                core.post_with_references(
+                    "What does this mean?\n\n{{ embed 1 }}\n\nAnd {{ embed 9 }} is unmapped.\n\n\
+                 ```\n\n{{ embed 1 }}\n\n```"
+                        .into(),
+                    Some(source.space_id.clone()),
+                    None,
+                    vec![eidola_app_core::ReferenceSpec {
+                        antecedent_action_id: source.action_id.clone(),
+                        content_block_id: Some(block_id),
+                        range_start: Some(24),
+                        range_end: Some(34), // "powerhouse"
+                        annotation: None,
+                    }],
+                ),
+            )
+            .expect("post with reference");
+
+        // Request a response to the quoting post.
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(async {
+                let collector = async { while events_rx.recv().await.is_some() {} };
+                let respond = core.respond_stream(
+                    posted.space_id.clone(),
+                    MODEL.into(),
+                    posted.action_id.clone(),
+                    tx,
+                );
+                let (res, ()) = tokio::join!(respond, collector);
+                res
+            })
+            .expect("respond_stream should succeed");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 1);
+        let contents: Vec<String> = bodies[0]["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+            .collect();
+        // system + u1 + u2 (the quoting post, expanded).
+        assert_eq!(
+            contents.len(),
+            3,
+            "system + two user turns; got {contents:?}"
+        );
+        assert_eq!(
+            contents[2],
+            "What does this mean?\n\n> powerhouse\n\nAnd {{ embed 9 }} is unmapped.\n\n\
+             ```\n\n{{ embed 1 }}\n\n```",
+            "structural marker expands; unmapped and fence-defused markers go upstream literal"
+        );
+    });
+}
+
 #[test]
 fn branch_reply_sends_only_its_branch_context() {
     run(|| {

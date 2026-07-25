@@ -16,6 +16,7 @@
 pub mod analysis;
 pub mod editor;
 pub mod element;
+pub mod embed;
 pub mod escapes;
 pub mod event;
 pub mod image;
@@ -36,6 +37,7 @@ pub use editor::{
     ShiftDocumentStart, ShiftDown, ShiftEnd, ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp,
     ShiftWordLeft, ShiftWordRight, Tab, Undo, Up, WordLeft, WordRight, init,
 };
+pub use embed::{EmbedMap, embed_marker, parse_embed_text};
 pub use event::{EditorEvent, MarkdownEditorEvent};
 pub use parser::parse;
 pub use render::render;

@@ -450,6 +450,22 @@ pub fn is_in_verbatim_region_blocks(
 ///    navigation skip over the indent in one step instead of
 ///    pausing at invisible byte positions.
 pub fn is_forbidden_position(markdown: &str, p: usize) -> bool {
+    is_forbidden_position_with(markdown, &crate::embed::EmbedMap::default(), p)
+}
+
+/// [`is_forbidden_position`] with the host's embed map: positions strictly
+/// inside a **mapped** `{{ embed N }}` block are forbidden too (the block is
+/// atomic — see [`crate::embed`]). The map-less wrapper above serves tests
+/// and embed-free contexts; **editable-pipeline code must call this variant
+/// with `state.embeds`** so mapped embeds stay atomic under every event.
+pub fn is_forbidden_position_with(
+    markdown: &str,
+    embeds: &crate::embed::EmbedMap,
+    p: usize,
+) -> bool {
+    if crate::embed::embed_interior_at(markdown, embeds, p).is_some() {
+        return true;
+    }
     let bytes = markdown.as_bytes();
     // Compute verbatim membership once and reuse it across the two
     // exemption checks below — each predicate call re-parses the
@@ -859,16 +875,34 @@ pub fn is_paragraph_break_interior(bytes: &[u8], p: usize) -> bool {
 // Allowed-position snapping
 // ---------------------------------------------------------------------------
 
-pub fn next_allowed_position(markdown: &str, mut p: usize) -> usize {
+pub fn next_allowed_position(markdown: &str, p: usize) -> usize {
+    next_allowed_position_with(markdown, &crate::embed::EmbedMap::default(), p)
+}
+
+/// Embed-aware [`next_allowed_position`] — see [`is_forbidden_position_with`].
+pub fn next_allowed_position_with(
+    markdown: &str,
+    embeds: &crate::embed::EmbedMap,
+    mut p: usize,
+) -> usize {
     let len = markdown.len();
-    while p < len && is_forbidden_position(markdown, p) {
+    while p < len && is_forbidden_position_with(markdown, embeds, p) {
         p += 1;
     }
     p
 }
 
-pub fn prev_allowed_position(markdown: &str, mut p: usize) -> usize {
-    while p > 0 && is_forbidden_position(markdown, p) {
+pub fn prev_allowed_position(markdown: &str, p: usize) -> usize {
+    prev_allowed_position_with(markdown, &crate::embed::EmbedMap::default(), p)
+}
+
+/// Embed-aware [`prev_allowed_position`] — see [`is_forbidden_position_with`].
+pub fn prev_allowed_position_with(
+    markdown: &str,
+    embeds: &crate::embed::EmbedMap,
+    mut p: usize,
+) -> usize {
+    while p > 0 && is_forbidden_position_with(markdown, embeds, p) {
         p -= 1;
     }
     p
@@ -894,19 +928,30 @@ pub fn prev_allowed_position(markdown: &str, mut p: usize) -> usize {
 ///    drop it if still forbidden; if both are unavailable, return
 ///    `p` (degenerate buffer where every position is forbidden).
 pub fn nearest_allowed_position(markdown: &str, p: usize) -> usize {
-    if !is_forbidden_position(markdown, p) {
+    nearest_allowed_position_with(markdown, &crate::embed::EmbedMap::default(), p)
+}
+
+/// Embed-aware [`nearest_allowed_position`] — see
+/// [`is_forbidden_position_with`]. A click inside a mapped embed block snaps
+/// to whichever marker edge is closer in source bytes.
+pub fn nearest_allowed_position_with(
+    markdown: &str,
+    embeds: &crate::embed::EmbedMap,
+    p: usize,
+) -> usize {
+    if !is_forbidden_position_with(markdown, embeds, p) {
         return p;
     }
     if is_list_indent_interior(markdown, p) {
-        let next = next_allowed_position(markdown, p);
-        if !is_forbidden_position(markdown, next) {
+        let next = next_allowed_position_with(markdown, embeds, p);
+        if !is_forbidden_position_with(markdown, embeds, next) {
             return next;
         }
     }
-    let next = next_allowed_position(markdown, p);
-    let prev = prev_allowed_position(markdown, p);
-    let prev_ok = !is_forbidden_position(markdown, prev);
-    let next_ok = !is_forbidden_position(markdown, next);
+    let next = next_allowed_position_with(markdown, embeds, p);
+    let prev = prev_allowed_position_with(markdown, embeds, p);
+    let prev_ok = !is_forbidden_position_with(markdown, embeds, prev);
+    let next_ok = !is_forbidden_position_with(markdown, embeds, next);
     match (prev_ok, next_ok) {
         (true, true) => {
             if next.saturating_sub(p) <= p.saturating_sub(prev) {

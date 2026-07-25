@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
     Action, App, Bounds, ClipboardItem, Context, CursorStyle, Entity, EntityInputHandler,
@@ -32,6 +33,11 @@ use crate::render_spec::RenderSpec;
 use crate::state::{EditorState, Selection};
 use crate::style::MarkdownStyle;
 use crate::update;
+
+/// Host callback for a click on a rendered embed block: `(ordinal, window,
+/// app)`. See [`crate::embed`] for the plugin contract; the ordinal is the
+/// shared key into the host's own bookkeeping.
+pub type EmbedClickHandler = Rc<dyn Fn(u64, &mut Window, &mut App)>;
 
 /// Submit-intent action carrying the modifier state at the time Enter was
 /// pressed (mirrors gpui-component's `input::Enter`). The host binds the
@@ -298,6 +304,11 @@ pub struct MarkdownEditorState {
     /// and select-all handlers are still registered, so the text can be selected
     /// and copied. Synced from the element's `.disabled(..)` prop each frame.
     pub(crate) disabled: bool,
+    /// Host callback invoked when the user clicks a rendered embed block
+    /// (see [`crate::embed`]) — the wave-2 click-to-navigate seam. Synced
+    /// from the element's `.on_embed_click(..)` prop each frame; the editor
+    /// only reports the ordinal, never interprets it.
+    pub(crate) on_embed_click: Option<EmbedClickHandler>,
     is_selecting: bool,
     /// Granularity the active pointer drag extends by (set from the mouse-down
     /// click count — see [`SelectMode`]).
@@ -385,6 +396,7 @@ impl MarkdownEditorState {
             state,
             focus_handle,
             disabled: false,
+            on_embed_click: None,
             is_selecting: false,
             select_mode: SelectMode::Char,
             select_anchor_range: 0..0,
@@ -515,7 +527,11 @@ impl MarkdownEditorState {
     /// can't `cmd-z` their way back into a document the host swapped out
     /// from under them. Typed edits after the swap build a fresh history.
     pub fn set_value(&mut self, markdown: impl Into<String>, cx: &mut Context<Self>) {
+        // The embed map is render-time state supplied by the host, not
+        // document content — a buffer swap keeps it.
+        let embeds = std::mem::take(&mut self.state.embeds);
         self.state = EditorState::with_markdown(markdown);
+        self.state.embeds = embeds;
         self.marked_range = None;
         self.intended_x = None;
         self.wrap_affinity = WrapAffinity::Downstream;
@@ -529,6 +545,48 @@ impl MarkdownEditorState {
     /// Clear the buffer. Convenience for `set_value("")`.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.set_value("", cx);
+    }
+
+    /// Supply the embed map — ordinals → markdown content (see
+    /// [`crate::embed`] for the plugin contract and lexical rules). A buffer
+    /// marker `{{ embed N }}` renders as an atomic embed block exactly when
+    /// `N` is mapped; unmapped markers stay literal text. The map is
+    /// **render-time state**, not document content: the buffer is untouched,
+    /// so no [`MarkdownEditorEvent::Change`] is emitted — the view just
+    /// re-renders.
+    pub fn set_embeds(
+        &mut self,
+        entries: impl IntoIterator<Item = (u64, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.embeds = crate::embed::EmbedMap::new(entries);
+        // Installing a map can turn a position the caret legally occupied (a
+        // literal, unmapped marker's interior) into a forbidden embed
+        // interior. Re-snap the selection against the new map immediately —
+        // otherwise the next insertion would splice into the hidden marker
+        // bytes of a block that renders as an embed.
+        let md = &self.state.markdown;
+        let em = &self.state.embeds;
+        self.state.selection = match self.state.selection {
+            Selection::Cursor(p) => {
+                Selection::Cursor(crate::analysis::nearest_allowed_position_with(md, em, p))
+            }
+            Selection::Range { anchor, head } => {
+                let a = crate::analysis::nearest_allowed_position_with(md, em, anchor);
+                let h = crate::analysis::nearest_allowed_position_with(md, em, head);
+                if a == h {
+                    Selection::Cursor(h)
+                } else {
+                    Selection::Range { anchor: a, head: h }
+                }
+            }
+        };
+        cx.notify();
+    }
+
+    /// The current embed map.
+    pub fn embeds(&self) -> &crate::embed::EmbedMap {
+        &self.state.embeds
     }
 
     /// Drive the internal update pipeline with a raw [`EditorEvent`], the way
@@ -1324,9 +1382,37 @@ impl MarkdownEditorState {
         self.dispatch(EditorEvent::PastePlain { text }, cx);
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A click on a rendered embed block invokes the host's callback (the
+        // wave-2 click-to-navigate seam). The click still places the caret
+        // through the normal path below — the snap machinery resolves it to
+        // the marker's edge, since the interior is forbidden.
+        if let Some(ordinal) = self.embed_ordinal_at_position(event.position)
+            && let Some(cb) = self.on_embed_click.clone()
+        {
+            cb(ordinal, window, cx);
+        }
         let offset = self.offset_for_position(event.position);
         self.begin_selection(offset, event.click_count, event.modifiers.shift, cx);
+    }
+
+    /// The rendered embed block under `position` (window coordinates), if
+    /// any. Reads the ordinal the render recorded on the painted block
+    /// (`LaidOutBlock::embed_ordinal`) — never re-derived from source, so
+    /// range conventions (the parser's folded trailing newline vs the
+    /// scan's trimmed ranges) can't desynchronize the hit-test from what
+    /// actually painted, and a mousedown never re-parses the buffer.
+    #[doc(hidden)]
+    pub fn embed_ordinal_at_position(&self, position: Point<Pixels>) -> Option<u64> {
+        self.last_blocks
+            .values()
+            .find(|b| b.block_bounds.contains(&position))
+            .and_then(|b| b.embed_ordinal)
     }
 
     /// Start (or, with `shift`, extend) a pointer selection at `offset`, keyed
@@ -1731,6 +1817,7 @@ pub struct MarkdownEditor {
     style: Option<MarkdownStyle>,
     disabled: bool,
     min_height: Option<Pixels>,
+    on_embed_click: Option<EmbedClickHandler>,
 }
 
 impl MarkdownEditor {
@@ -1741,6 +1828,7 @@ impl MarkdownEditor {
             style: None,
             disabled: false,
             min_height: None,
+            on_embed_click: None,
         }
     }
 
@@ -1773,6 +1861,18 @@ impl MarkdownEditor {
         self.min_height = Some(height);
         self
     }
+
+    /// Host callback for a click on a rendered embed block: receives the
+    /// embed's ordinal (the shared key into the host's own bookkeeping — see
+    /// [`crate::embed`]). Registered on both editable and read-only editors;
+    /// the editor never interprets the ordinal.
+    pub fn on_embed_click(
+        mut self,
+        callback: impl Fn(u64, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_embed_click = Some(Rc::new(callback));
+        self
+    }
 }
 
 impl RenderOnce for MarkdownEditor {
@@ -1780,8 +1880,10 @@ impl RenderOnce for MarkdownEditor {
         // Per-frame reset + sync the disabled prop onto the state (so the
         // IME handler can honor it). Block elements re-populate `last_blocks`
         // during paint; `frame_input_handler_set` re-arms IME registration.
+        let embed_cb = self.on_embed_click.clone();
         self.state.update(cx, |st, _| {
             st.disabled = self.disabled;
+            st.on_embed_click = embed_cb;
             st.last_blocks.clear();
             st.frame_input_handler_set = false;
             st.last_bounds = None;

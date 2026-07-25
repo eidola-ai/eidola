@@ -428,6 +428,7 @@ fn probe_post(action_id: &str, text: &str) -> PostNode {
         depth: 0,
         is_branch: false,
         blocks: vec![PostBlock {
+            id: String::new(),
             block_type: "text".into(),
             text: Some(text.into()),
             tool_name: None,

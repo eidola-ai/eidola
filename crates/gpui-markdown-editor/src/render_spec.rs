@@ -337,6 +337,17 @@ pub enum BlockKind {
         dest_url: String,
         edit_mode: bool,
     },
+    /// Atomic embed block — a **top-level** paragraph whose entire content
+    /// is a mapped `{{ embed N }}` marker (see [`crate::embed`] for the
+    /// lexical rules and atomicity contract). The marker's source bytes are
+    /// fully hidden (one hide over the block range, like display math in
+    /// display mode); the element layer lays out and paints the mapped
+    /// markdown read-only inside a quiet quote-like container. There is no
+    /// edit mode: the block is atomic — the caret can only sit at its
+    /// edges, and deleting it deletes the marker text as one unit.
+    Embed {
+        ordinal: u64,
+    },
     /// GFM pipe table (top-level only — nested tables render as raw
     /// source lines). A structural leaf like `CodeBlock`: lines never
     /// soft-wrap (a wrapped grid row is meaningless), wide tables

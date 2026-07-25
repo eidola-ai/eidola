@@ -125,6 +125,7 @@ fn render_with_cursor(state: &EditorState, tree: &[SyntaxNode], cursor: CursorRa
     for node in tree {
         render_node(node, tree, &state.markdown, cursor, &[], &mut real_blocks);
     }
+    promote_embeds(&mut real_blocks, &state.markdown, &state.embeds);
     let mut blocks = inject_empty_paragraphs(&state.markdown, tree, cursor, real_blocks);
     let bytes = state.markdown.as_bytes();
     merge_hard_break_continuations(&mut blocks, bytes);
@@ -135,6 +136,43 @@ fn render_with_cursor(state: &EditorState, tree: &[SyntaxNode], cursor: CursorRa
         merge_hidden_ranges(&mut block.hidden_ranges);
     }
     RenderSpec { blocks }
+}
+
+/// Promote each **top-level** `Paragraph` block whose entire source is a
+/// mapped `{{ embed N }}` marker into an atomic [`BlockKind::Embed`] block:
+/// the marker bytes are fully hidden (no inline runs survive — the mapped
+/// content paints instead) regardless of cursor position — an embed has no
+/// edit mode; its atomicity lives in the caret-forbidden interior
+/// (`analysis::is_forbidden_position_with`) and the delete-as-unit rules.
+/// Unmapped / non-sole / nested / escaped markers stay ordinary paragraphs —
+/// the honest-degradation and escaping story (see [`crate::embed`]).
+fn promote_embeds(blocks: &mut [RenderBlock], source: &str, embeds: &crate::embed::EmbedMap) {
+    if embeds.is_empty() || !source.contains("{{") {
+        return;
+    }
+    for block in blocks.iter_mut() {
+        if !matches!(block.kind, BlockKind::Paragraph) || !block.containers.is_empty() {
+            continue;
+        }
+        let Some(slice) = source.get(block.source_range.clone()) else {
+            continue;
+        };
+        // This pass runs on the raw walk output, BEFORE `inject_empty_paragraphs`
+        // strips the trailing `\n` pulldown folds into a non-final paragraph's
+        // range — so trim it here; the marker itself never contains newlines.
+        let slice = slice.trim_end_matches('\n');
+        if let Some(ordinal) = crate::embed::parse_embed_text(slice)
+            && embeds.contains(ordinal)
+        {
+            block.kind = BlockKind::Embed { ordinal };
+            block.inlines.clear();
+            block.substitutions.clear();
+            block.marker_overlays.clear();
+            block.math_overlays.clear();
+            block.image_overlays.clear();
+            block.hidden_ranges = vec![block.source_range.clone()];
+        }
+    }
 }
 
 /// Collect every byte range in which CommonMark §2.4 backslash escapes
@@ -2561,6 +2599,7 @@ mod tests {
         let state = EditorState {
             markdown: src.into(),
             selection: Selection::Cursor(cursor),
+            ..Default::default()
         };
         let tree = parse(src);
         render(&state, &tree)
@@ -2681,6 +2720,7 @@ mod tests {
         let state = EditorState {
             markdown: "**bold**".into(),
             selection: Selection::Range { anchor: 1, head: 6 },
+            ..Default::default()
         };
         let tree = parse(&state.markdown);
         let spec = render(&state, &tree);

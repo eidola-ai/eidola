@@ -172,6 +172,7 @@ fn fixture_user_post(action_id: &str, text: &str) -> PostNode {
         depth: 0,
         is_branch: false,
         blocks: vec![PostBlock {
+            id: String::new(),
             block_type: "text".into(),
             text: Some(text.into()),
             tool_name: None,
@@ -2381,6 +2382,7 @@ fn space_composer_dock_shadow_is_stable_cold(cx: &mut TestAppContext) {
         depth: 0,
         is_branch: false,
         blocks: vec![PostBlock {
+            id: String::new(),
             block_type: "text".into(),
             text: Some(text.into()),
             tool_name: None,
@@ -2467,6 +2469,7 @@ fn space_resize_above_column_cap_does_not_churn_height_cache(cx: &mut TestAppCon
         depth: 0,
         is_branch: false,
         blocks: vec![PostBlock {
+            id: String::new(),
             block_type: "text".into(),
             text: Some(text.into()),
             tool_name: None,
@@ -3370,6 +3373,7 @@ fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
         depth: 0,
         is_branch: false,
         blocks: vec![PostBlock {
+            id: String::new(),
             block_type: "text".into(),
             text: Some(
                 "A few sentences of body text so each post has a realistic \

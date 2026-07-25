@@ -137,6 +137,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "before **bold** after".into(),
                 selection: Selection::range(0, 21),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -151,6 +152,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "paragraph 1\n\n\n\n\n\nparagraph 2".into(),
                 selection: Selection::Cursor(0),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -165,6 +167,7 @@ pub fn register(s: &mut Snapshots) {
                 // Byte 14 is in the middle empty paragraph (range 14..16).
                 markdown: "paragraph 1\n\n\n\n\n\nparagraph 2".into(),
                 selection: Selection::Cursor(14),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -179,6 +182,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "paragraph 1\n\n".into(),
                 selection: Selection::Cursor(13),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -191,6 +195,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "Some intro.\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\nTrailing prose.".into(),
                 // Cursor in trailing prose.
                 selection: Selection::Cursor(60),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -203,6 +208,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "```rust\nfn main() {\n    println!(\"hi\");\n}\n```".into(),
                 // Inside content.
                 selection: Selection::Cursor(20),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -217,6 +223,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: md,
                 selection: Selection::Cursor(0),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -230,6 +237,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "Some intro.\n\n> A short quote.\n\nTrailing prose.".into(),
                 // Cursor in trailing prose.
                 selection: Selection::Cursor(34),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -242,6 +250,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "> A short quote.\nfollowing line.".into(),
                 // Cursor inside "quote".
                 selection: Selection::Cursor(8),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -254,6 +263,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "Intro.\n\n> > Deep wisdom here.\n\nBody.".into(),
                 selection: Selection::Cursor(33),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -282,6 +292,7 @@ pub fn register(s: &mut Snapshots) {
                 )
                 .into(),
                 selection: Selection::Cursor(0),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -294,6 +305,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "> # Quoted heading\n\nBody.".into(),
                 selection: Selection::Cursor(22),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -308,6 +320,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "paragraph\n\n> ".into(),
                 selection: Selection::Cursor(13),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -320,6 +333,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "> hello\n> \n> ".into(),
                 selection: Selection::Cursor(13),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -331,6 +345,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "> > deep\n> > \n> > ".into(),
                 selection: Selection::Cursor(18),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -343,6 +358,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "> hello  \n> ".into(),
                 selection: Selection::Cursor(12),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -355,6 +371,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "> ```rust\n> let x = 1;\n> ```\n\nBody.".into(),
                 selection: Selection::Cursor(31),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -370,6 +387,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "paragraph 1  \n".into(),
                 selection: Selection::Cursor(14),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -385,6 +403,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "- foo\n- bar\n- baz\n\nbody".into(),
                 // Cursor outside the list.
                 selection: Selection::Cursor(20),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -398,6 +417,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "- foo\n- bar\n- baz".into(),
                 selection: Selection::Cursor(8),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -428,6 +448,7 @@ pub fn register(s: &mut Snapshots) {
                 // Cursor at end of doc (outside any item, so all
                 // markers paint as their digit form).
                 selection: Selection::Cursor(0),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -441,6 +462,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "- outer\n  - inner one\n  - inner two\n- outer two".into(),
                 selection: Selection::Cursor(0),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -453,6 +475,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "- a\n  - b\n    - c".into(),
                 selection: Selection::Cursor(0),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -466,6 +489,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "- first paragraph\n\n  second paragraph at the same column\n".into(),
                 selection: Selection::Cursor(0),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -477,6 +501,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "Intro paragraph.\n\n$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n$$\n\nOutro paragraph.".into(),
                 selection: Selection::Cursor(0), // Cursor at start of document (outside the math block).
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -488,6 +513,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "Intro paragraph.\n\n$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n$$\n\nOutro paragraph.".into(),
                 selection: Selection::Cursor(25), // Cursor inside the math block.
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -499,6 +525,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "> $$\n> \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n> $$\n\nBody paragraph.".into(),
                 selection: Selection::Cursor(65), // Cursor on "Body paragraph" (outside blockquote and math).
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -510,6 +537,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "> $$\n> \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n> $$\n\nBody paragraph.".into(),
                 selection: Selection::Cursor(25), // Cursor inside the math block.
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -521,6 +549,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "- Item one\n  $$\n  \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n  $$\n- Item two".into(),
                 selection: Selection::Cursor(0), // Cursor at start (outside the math block).
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -532,6 +561,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: "- Item one\n  $$\n  \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n  $$\n- Item two".into(),
                 selection: Selection::Cursor(35), // Cursor inside the math block.
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -569,6 +599,7 @@ pub fn register(s: &mut Snapshots) {
             let state = EditorState {
                 markdown: TABLE_DOC.into(),
                 selection: Selection::range(start, end),
+                ..Default::default()
             };
             EditorHarness::with_state(state, window, cx)
         })
@@ -651,6 +682,7 @@ pub fn register(s: &mut Snapshots) {
                 let state = EditorState {
                     markdown: "1. One\n2. \n   1. Two, One".into(),
                     selection: Selection::Cursor(0),
+                    ..Default::default()
                 };
                 EditorHarness::with_state(state, window, cx)
             })
@@ -668,6 +700,7 @@ pub fn register(s: &mut Snapshots) {
                 let state = EditorState {
                     markdown: "1. One\n2. \n   1. Two, One".into(),
                     selection: Selection::Cursor(10), // `\n` ending the `2. ` row
+                    ..Default::default()
                 };
                 EditorHarness::with_state(state, window, cx)
             })
@@ -690,6 +723,7 @@ fn editor_with_cursor(
     let state = EditorState {
         markdown: markdown.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     cx.new(|cx| EditorHarness::with_state(state, window, cx))
 }
