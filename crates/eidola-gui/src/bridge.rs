@@ -177,14 +177,16 @@ pub fn references_to(
     })
 }
 
-/// The home space of a persisted action (`None` if unknown) — resolves where
-/// a quoted post lives before navigating a footnote (cross-space references).
-pub fn action_space(
+/// The `(item_id, space_id)` of a persisted action (`None` if unknown) —
+/// resolves where a quoted post lives before navigating a footnote: its item
+/// finds the tip that superseded an edited generation in *this* space, its
+/// space opens the window for a genuinely cross-space reference.
+pub fn action_location(
     core: Arc<AppCore>,
     action_id: String,
-) -> oneshot::Receiver<Result<Option<String>, AppError>> {
+) -> oneshot::Receiver<Result<Option<(String, String)>, AppError>> {
     spawn_oneshot(core, move |core| async move {
-        core.action_space(action_id).await
+        core.action_location(action_id).await
     })
 }
 

@@ -4473,17 +4473,25 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// The space a persisted action belongs to (`None` for an unknown action).
-    /// A pure read (no emissions) — the wave-2 GUI resolves a quoted post's
-    /// home space with this before navigating a cross-space reference.
-    pub async fn action_space(&self, action_id: String) -> Result<Option<String>, AppError> {
+    /// The `(item_id, space_id)` a persisted action belongs to (`None` for an
+    /// unknown action). A pure read (no emissions) — the wave-2 GUI resolves a
+    /// quoted post's location before navigating to it.
+    ///
+    /// Both halves are load-bearing: references name a **concrete generation**
+    /// (they never remap to a tip), so a quoted post that was later edited or
+    /// regenerated is absent from its space's current-tip tree. The *item* is
+    /// what survives that, letting the GUI select the tip that superseded the
+    /// quoted generation instead of mistaking a same-space post for a foreign
+    /// one and opening a duplicate window.
+    pub async fn action_location(
+        &self,
+        action_id: String,
+    ) -> Result<Option<(String, String)>, AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move {
                 let conn = inner.db_conn().await?;
-                Ok(db::action_item_and_space(&conn, &action_id)
-                    .await?
-                    .map(|(_, space_id)| space_id))
+                db::action_item_and_space(&conn, &action_id).await
             })
             .await
             .map_err(join_err)?

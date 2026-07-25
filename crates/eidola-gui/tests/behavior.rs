@@ -5362,7 +5362,12 @@ fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
     // `edit_post_with_removals`. Ordinal 0 — the reply edge — is refused.
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, Some("s".into()));
-    let mut post = fixture_post_with_block("a1", "b1", "body text");
+    // The body addresses both references by marker, as a real quoted post does.
+    let mut post = fixture_post_with_block(
+        "a1",
+        "b1",
+        "body text\n\n{{ embed 1 }}\n\nmore\n\n{{ embed 2 }}",
+    );
     post.references = vec![
         eidola_app_core::PostReference {
             antecedent_action_id: "x1".into(),
@@ -5422,7 +5427,77 @@ fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
             &[1],
             "the marked ordinals reach edit_post_with_removals"
         );
+        // The marker leaves with its edge. Left behind it would render as
+        // literal wire syntax on reload — and go upstream literally, since
+        // there is no edge left to expand it against.
+        let text = s.last_edit_text();
+        assert!(
+            !text.contains("{{ embed 1 }}"),
+            "the removed reference's marker is stripped from the submission: {text:?}"
+        );
+        assert!(
+            text.contains("{{ embed 2 }}"),
+            "a surviving reference keeps the marker that addresses it: {text:?}"
+        );
+        assert!(
+            text.contains("body text") && text.contains("more"),
+            "the prose around the removed marker survives: {text:?}"
+        );
     });
+}
+
+#[gpui::test]
+fn space_navigating_to_an_edited_generation_selects_its_tip_in_place(cx: &mut TestAppContext) {
+    // A reference names a *concrete generation*, so once the quoted post is
+    // edited that action is gone from the current-tip tree. Navigation must
+    // still land on it via its item — resolving to the tip that superseded it
+    // — rather than treating it as foreign and opening a duplicate window on
+    // the space we are already looking at.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    // A branched space: a2 is the spine (selected by default), a3 a sibling —
+    // so resolving onto a3's item is observable as a selection move.
+    let mut a2 = fixture_assistant_post("a2", "the reply");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_post_with_block("a3", "b3", "the quoted post");
+    a3.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "root"), a2, a3],
+    );
+
+    // A reference to a *superseded* generation of a3's item resolves through
+    // the item to the tip that replaced it (fixtures key items `item-<id>`).
+    let found = cx
+        .update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.select_item_tip("item-a3", window, cx))
+        })
+        .unwrap();
+    assert!(
+        found,
+        "the item's current generation is in this tree, so navigation stays in this window"
+    );
+    let selected = cx
+        .update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, _| v.selected_leaf_for_test(window))
+        })
+        .unwrap();
+    assert_eq!(
+        selected.as_deref(),
+        Some("a3"),
+        "the tip that superseded the quoted generation is selected, not the spine"
+    );
+
+    // An item this space doesn't render is honestly not found — that is what
+    // falls through to opening the reference's own space.
+    let missing = cx
+        .update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.select_item_tip("item-elsewhere", window, cx))
+        })
+        .unwrap();
+    assert!(!missing, "a foreign item does not resolve in this tree");
 }
 
 #[gpui::test]

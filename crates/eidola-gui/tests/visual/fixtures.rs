@@ -312,6 +312,10 @@ pub fn quoted_reference_source() -> String {
 
 /// The passage the composing scene quotes ("the care is real"), as a byte
 /// range into [`quoted_reference_source`].
+///
+/// This module is `include!`d by both the visual cases and the driver example;
+/// only the former needs the range, so the example's build sees it as dead.
+#[allow(dead_code)]
 pub fn quoted_reference_selection() -> std::ops::Range<usize> {
     let src = quoted_reference_source();
     let (s, e) = byte_range(&src, "the care is real");
