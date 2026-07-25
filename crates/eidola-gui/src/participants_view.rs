@@ -21,8 +21,8 @@ use eidola_app_core::{
 };
 use gpui::{
     AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
-    prelude::FluentBuilder, px,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     ActiveTheme, StyledExt, h_flex,
@@ -112,6 +112,9 @@ pub struct ParticipantsView {
     /// When `Some`, the model picker dropdown is open, targeting the edit or add
     /// form.
     picker: Option<PickerTarget>,
+    /// Tracks the roster body scroll so the right-edge overlay indicator can
+    /// bind to it (shown only while scrolling).
+    body_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -146,12 +149,30 @@ impl ParticipantsView {
             adding: None,
             template_form: None,
             picker: None,
+            body_scroll: ScrollHandle::new(),
             _subscriptions: subs,
         }
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    /// Wrap the roster scroll container in a `relative` column that also holds
+    /// the right-edge overlay scroll indicator as a sibling (never a child of
+    /// the scrolling element, or it scrolls away with the content).
+    fn wrap_body(&self, body: impl IntoElement, window: &Window) -> impl IntoElement {
+        v_flex()
+            .relative()
+            .flex_1()
+            .w_full()
+            .min_h_0()
+            .child(body)
+            .child(crate::scrollbar::vertical(
+                "participants-scrollbar",
+                &self.body_scroll,
+                window,
+            ))
     }
 
     fn list(&self, cx: &gpui::App) -> Vec<ParticipantInfo> {
@@ -818,6 +839,7 @@ impl Render for ParticipantsView {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.body_scroll)
             .px_10()
             .py_4()
             .gap_2();
@@ -833,7 +855,7 @@ impl Render for ParticipantsView {
                 cx,
                 cx.listener(|this, _, _, cx| this.retry_load(cx)),
             ));
-            return root.child(body);
+            return root.child(self.wrap_body(body, window));
         }
 
         if participants.is_empty() && loading {
@@ -925,7 +947,7 @@ impl Render for ParticipantsView {
             );
         }
 
-        root.child(body)
+        root.child(self.wrap_body(body, window))
     }
 }
 
