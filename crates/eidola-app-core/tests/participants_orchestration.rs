@@ -698,3 +698,84 @@ fn referenced_global_override_and_edit_everywhere_fork() {
         assert_eq!(you.reference.unwrap().base_label, "Myself");
     });
 }
+
+// ===========================================================================
+// Quoted references through the composer CTA path (wave 2)
+// ===========================================================================
+
+/// The GUI's Post-with-pending-references path end-to-end:
+/// `submit_with_references` saves the post with its reference edges and plans
+/// notifications; driving the planned turn sends the quoting post upstream
+/// with its `{{ embed N }}` marker expanded into the quoted passage — so a
+/// quote created in the composer reaches the model as real context.
+#[test]
+fn submit_with_references_carries_the_quote_to_the_wire() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let source = core
+            .runtime()
+            .block_on(core.post(
+                "The mitochondria is the powerhouse of the cell".into(),
+                None,
+            ))
+            .expect("source post");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .expect("tree");
+        let block_id = tree[0].blocks[0].id.clone();
+
+        let result = core
+            .runtime()
+            .block_on(core.submit_with_references(
+                "What does this mean?\n\n{{ embed 1 }}".into(),
+                Some(source.space_id.clone()),
+                None,
+                vec![eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: source.action_id.clone(),
+                    content_block_id: Some(block_id),
+                    range_start: Some(24),
+                    range_end: Some(34), // "powerhouse"
+                    annotation: None,
+                }],
+            ))
+            .expect("submit with references");
+
+        // The seeded default agent (policy 'human') planned a turn on the post.
+        let turns = match result.plan {
+            NotificationPlan::Turns(t) => t,
+            other => panic!("expected Turns, got {other:?}"),
+        };
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].target_action_id, result.post.action_id);
+        drive_as(
+            &core,
+            &source.space_id,
+            &turns[0].participant_id,
+            &turns[0].target_action_id,
+        )
+        .expect("driven turn");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 1);
+        let contents: Vec<String> = bodies[0]["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let quoting = contents
+            .iter()
+            .find(|c| c.starts_with("What does this mean?"))
+            .expect("the quoting post reaches the wire");
+        assert_eq!(
+            quoting, "What does this mean?\n\n> powerhouse",
+            "the marker expands into the quoted passage"
+        );
+    });
+}

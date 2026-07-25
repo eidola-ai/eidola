@@ -4270,8 +4270,9 @@ impl Inner {
         space_id: Option<&str>,
         text: &str,
         reply_to: Option<&str>,
+        references: &[ReferenceSpec],
     ) -> Result<SubmitResult, AppError> {
-        let post = self.post(space_id, text, reply_to, &[]).await?;
+        let post = self.post(space_id, text, reply_to, references).await?;
         let plan = self
             .plan_notifications(&post.space_id, &post.action_id)
             .await?;
@@ -4443,12 +4444,46 @@ impl AppCore {
         space_id: Option<String>,
         reply_to: Option<String>,
     ) -> Result<SubmitResult, AppError> {
+        self.submit_with_references(text, space_id, reply_to, Vec::new())
+            .await
+    }
+
+    /// [`submit`](Self::submit) carrying **quoted references**: the post half
+    /// is exactly [`post_with_references`](Self::post_with_references) (each
+    /// [`ReferenceSpec`] becomes a `relation='reference'` edge at ordinal
+    /// `1..=N` in supplied order, validated before any write so a bad spec
+    /// leaves zero trace and no plan), then notifications are planned over the
+    /// saved post as in `submit`. The composer's Post CTA routes here when the
+    /// draft carries pending references.
+    pub async fn submit_with_references(
+        &self,
+        text: String,
+        space_id: Option<String>,
+        reply_to: Option<String>,
+        references: Vec<ReferenceSpec>,
+    ) -> Result<SubmitResult, AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move {
                 inner
-                    .submit(space_id.as_deref(), &text, reply_to.as_deref())
+                    .submit(space_id.as_deref(), &text, reply_to.as_deref(), &references)
                     .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The space a persisted action belongs to (`None` for an unknown action).
+    /// A pure read (no emissions) — the wave-2 GUI resolves a quoted post's
+    /// home space with this before navigating a cross-space reference.
+    pub async fn action_space(&self, action_id: String) -> Result<Option<String>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                Ok(db::action_item_and_space(&conn, &action_id)
+                    .await?
+                    .map(|(_, space_id)| space_id))
             })
             .await
             .map_err(join_err)?
