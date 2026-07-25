@@ -519,9 +519,24 @@ impl RenderOnce for Purchase {
 
 // -- Shared layout + primitives ------------------------------------------------
 
-/// The shared full-window slide layout: the prose body (with any `extras`
-/// below it) vertically centered in a left-aligned reading column, and the
-/// CTA group centered on the window at the bottom.
+/// Breathing room below a slide's content block (and, symmetrically-ish, the
+/// gap the top title-bar reserve leaves above it) so a short slide's centered
+/// block never crowds the window edges.
+const SLIDE_BOTTOM_PAD: Pixels = px(56.);
+
+/// The shared slide layout: a left-aligned reading column (prose + any
+/// `extras`) with its call-to-action group in **normal flow beneath it**, the
+/// whole block centered — horizontally always, and vertically when the slide is
+/// shorter than the window.
+///
+/// The slide's height is its **content**, floored at one window
+/// (`min_h(content_size)`), never fixed to the window: a short slide reads as a
+/// full page and centers, while a long one grows past the window and the outer
+/// page simply scrolls to it — so content is never clipped and the CTAs, being
+/// after the prose in flow, can never overlap it. (The old layout fixed each
+/// slide to exactly the window height and vertically-centered an overflowing
+/// prose region, which spilled onto the CTAs and — under mandatory whole-window
+/// snapping — left the spill unreachable.)
 fn slide_frame(
     key: &'static str,
     markdown: &'static str,
@@ -535,7 +550,7 @@ fn slide_frame(
     // frame after the slide stops rendering (a branch truncation) — the
     // lifecycle the view's `bodies` map used to hand-roll. This is safe
     // *only because* every revealed slide paints every frame (a plain
-    // v_flex stack, no virtualization); if the slides ever render
+    // `flex_col` stack, no virtualization); if the slides ever render
     // conditionally or through `list()`, lift this state back onto the view
     // (the retired chat view's `text_states` map, which died with an
     // unmounted `list()` item, was the lesson here).
@@ -552,41 +567,41 @@ fn slide_frame(
         .style(prose_style(cx))
         .disabled(true)
         .into_any_element();
-    let column = v_flex()
-        .w(COLUMN_WIDTH)
-        .max_w_full()
-        .gap_4()
-        .child(prose)
-        .child(extras.unwrap_or_else(|| div().into_any_element()));
+
+    // The narrative reading column: prose then extras, left-aligned, capped to
+    // a comfortable measure and centered as a unit; the CTA group sits below it
+    // in flow, centered on its own axis.
+    let content = v_flex()
+        .w_full()
+        .items_center()
+        .gap_8()
+        .child(
+            v_flex()
+                .w(COLUMN_WIDTH)
+                .max_w_full()
+                .gap_4()
+                .child(prose)
+                .child(extras.unwrap_or_else(|| div().into_any_element())),
+        )
+        .child(v_flex().items_center().gap_3().child(ctas));
 
     v_flex()
         .w_full()
-        // The content box, not the raw surface: on Linux CSD `viewport_size`
-        // includes the shadow padding, and the reveal/snap stride is measured
-        // as `chrome::content_size().height` (see `glide_to_index`), so each
-        // slide must be exactly that tall or snaps land between slides. Equal
-        // to `viewport_size` off Linux CSD, so macOS/tests are unchanged.
-        .h(crate::chrome::content_size(window).height)
-        .child(
-            // The prose region: fills the space above the CTAs, centering
-            // the reading column vertically; horizontally centered as a unit.
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .justify_center()
-                .pt(TITLE_BAR_RESERVE)
-                .child(h_flex().w_full().justify_center().px_8().child(column)),
-        )
-        .child(
-            // The CTAs are centered on the window (unlike the left-aligned
-            // narrative), stacked and centered as a group.
-            h_flex()
-                .w_full()
-                .justify_center()
-                .px_8()
-                .pb(px(72.))
-                .child(v_flex().items_center().gap_3().child(ctas)),
-        )
+        .flex_none()
+        // At least one screenful — the content box, not the raw surface: on
+        // Linux CSD `viewport_size` includes the shadow padding. A short slide
+        // fills exactly this and centers; a tall one grows past it (min, not
+        // fixed) and the page scrolls.
+        .min_h(crate::chrome::content_size(window).height)
+        // Clear the titlebar drag band when this slide sits at the viewport top,
+        // and leave matching room at the bottom.
+        .pt(TITLE_BAR_RESERVE)
+        .pb(SLIDE_BOTTOM_PAD)
+        .px_8()
+        // Center the content block vertically while there is slack; once the
+        // content exceeds the min height the block simply flows from the top.
+        .justify_center()
+        .child(content)
         .into_any_element()
 }
 

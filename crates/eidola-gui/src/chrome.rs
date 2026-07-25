@@ -165,6 +165,13 @@ pub(crate) fn content_size(window: &Window) -> Size<Pixels> {
     )
 }
 
+/// The window content-box height — the same value onboarding's `min_h` slide
+/// floor is measured against. Test seam for the size-to-content contract.
+#[doc(hidden)]
+pub fn content_height_for_test(window: &Window) -> f32 {
+    content_size(window).height.as_f32()
+}
+
 /// Whether a window-coordinate position falls in the resize hit band (the
 /// shadow margin plus [`RESIZE_INNER_REACH`] inside the frame). Drag bands
 /// check this on mouse-down so a press at the very edge starts a *resize*,
