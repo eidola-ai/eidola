@@ -45,6 +45,7 @@ fn open_editor(
     let state = EditorState {
         markdown: markdown.to_string(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = cx.update(|cx| {
         gpui_component::init(cx);

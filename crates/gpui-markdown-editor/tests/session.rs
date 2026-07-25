@@ -76,6 +76,7 @@ impl Session {
         let editor_state = EditorState {
             markdown: String::new(),
             selection: Selection::Cursor(0),
+            ..Default::default()
         };
 
         let (handle, editor) = cx.update(|cx| {
@@ -419,6 +420,7 @@ fn fmt_block_kind(kind: &BlockKind) -> String {
             _ => "CodeBlock".to_string(),
         },
         BlockKind::ThematicBreak => "ThematicBreak".to_string(),
+        BlockKind::Embed { ordinal } => format!("Embed({ordinal})"),
         BlockKind::DisplayMath { edit_mode, .. } => {
             if *edit_mode {
                 "DisplayMath(edit)".to_string()
