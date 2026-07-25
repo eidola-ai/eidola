@@ -2,18 +2,32 @@
 //! zero to a usable, funded account.
 //!
 //! Unlike the retired chat-window empty states (which this replaces), onboarding
-//! is its own window: a vertical stack of **full-window slides**. Only the first
-//! slide is present initially; each slide's call-to-action reveals the next slide
-//! and animate-scrolls to it. Already-revealed slides can be scrolled back and
-//! forth, and the page **snaps** to whole slides. While the finger is down the
-//! page scrolls freely; at finger-lift we take over with our **own** decaying
-//! glide (an ease-out from the release position, reusing the space view's easing
-//! from [`crate::space_view::nav`]) to the target slide, and **suppress** the OS
-//! momentum that follows so the whole motion is one continuous curve that lands
-//! exactly on a slide. (This mirrors the space view's horizontal branch snap; in
-//! this gpui pin macOS momentum arrives as `Moved` events with no end signal, so
-//! we re-assert our glide position on each trailing step rather than letting it
-//! drift the page — the same `reassert` trick.)
+//! is its own window: **one continuous scrolling page** of stacked slides. Only
+//! the first slide is present initially; each slide's call-to-action reveals the
+//! next slide and animate-scrolls to it. Already-revealed slides can be scrolled
+//! back and forth freely.
+//!
+//! Each slide is sized **by its content**, with a `min_h` of one window so a
+//! short slide still reads as a full page and a long one grows and scrolls
+//! rather than clipping — its call-to-action sits in normal flow *after* the
+//! prose, so it can never overlap the narrative on a small window. (This
+//! replaced the previous fixed-window-height slides, whose vertically-centered
+//! prose overflowed onto the CTAs and whose mandatory whole-window snap made the
+//! overflow unreachable.)
+//!
+//! **Snapping is proximity, not mandatory** — the behavior of CSS
+//! `scroll-snap-type: y proximity`. A *user* gesture that comes to rest **near**
+//! a slide boundary glides onto it; one that ends **mid-content** (reading a
+//! long slide) stays exactly where the reader left it. The decision is made at
+//! finger-lift by [`crate::space_view::nav::proximity_snap_target`] over the
+//! live slide-top offsets: a "near" (or a flick beside a boundary) result is
+//! driven home by our **own** decaying ease-out glide with the trailing OS
+//! momentum **suppressed** (in this gpui pin macOS momentum arrives as `Moved`
+//! events with no end signal, so — as in the space view's horizontal branch
+//! snap — we re-assert our glide position on each trailing step); a "far" result
+//! simply **releases** to the native momentum so the page rests in the content.
+//! Programmatic **reveal** and **back** glides always land exactly on their
+//! target slide (proximity governs only user gestures).
 //!
 //! The flow **branches** at "Get started": a new-account path (create → show the
 //! id/secret → add credit) or an existing-account path (enter id/secret → verify
@@ -23,7 +37,7 @@
 //! Styling borrows heavily from the space view: the same Newsreader prose column
 //! ([`crate::space_view::prose_style`]) rendered through a disabled
 //! `MarkdownEditor`, left-aligned in a centered reading column, with ghost-button
-//! CTAs at the bottom of each slide.
+//! CTAs in normal flow beneath the prose.
 //!
 //! Structure: this module owns the *state* — the reveal machine, the scroll/snap
 //! physics, and the async account operations. Each slide's *presentation* (its
@@ -47,17 +61,23 @@ use gpui_component::{
     ActiveTheme,
     input::InputState,
     scroll::{Scrollbar, ScrollbarShow},
-    v_flex,
 };
 
 use crate::actions::CloseWindow;
 use crate::plans;
 use crate::space_view::TITLE_BAR_RESERVE;
-use crate::space_view::nav::{ease_out_cubic, snap_duration, snap_target_index};
+use crate::space_view::nav::{ease_out_cubic, proximity_snap_target, snap_duration};
 use crate::stores::Stores;
 use crate::titlebar;
 
 mod slides;
+
+/// Fraction of the window's content height within which a *released* scroll
+/// gesture counts as "near" a slide boundary and snaps onto it (proximity
+/// snapping). Beyond this band the page stays where the reader left it, so a
+/// long slide can be read without being yanked to the next one. Scales with the
+/// window so the feel is consistent across sizes.
+const SNAP_PROXIMITY_FRACTION: f32 = 0.25;
 
 /// One page of the onboarding flow. The set that is *visible* is
 /// [`OnboardingView::revealed`]; conditional slides only appear once the
@@ -217,6 +237,14 @@ impl OnboardingView {
         self.pinned_y
     }
 
+    /// The measured content-space top of each revealed slide (test seam for the
+    /// size-to-content / min-height-and-grow contract). Requires a prior paint
+    /// so the child bounds are populated.
+    #[doc(hidden)]
+    pub fn slide_tops_for_test(&self, window: &Window) -> Vec<f32> {
+        self.slide_tops(window)
+    }
+
     /// The freshly-created account id + secret, if account creation succeeded.
     #[doc(hidden)]
     pub fn created_for_test(&self) -> Option<(String, String)> {
@@ -257,16 +285,45 @@ impl OnboardingView {
         cx.notify();
     }
 
+    /// The content-space y of each revealed slide's top (ascending, `[0] == 0`),
+    /// read from the live child bounds of the scroll container — so it copes
+    /// with slides taller than the window and with variable heights. Falls back
+    /// per-slide to the previous slide's bottom (a just-revealed slide whose own
+    /// bounds haven't painted yet inherits its predecessor's measured bottom),
+    /// and finally to a one-window stride before the first paint.
+    fn slide_tops(&self, window: &Window) -> Vec<f32> {
+        let content_h = crate::chrome::content_size(window).height.as_f32();
+        let base = self.page_scroll.bounds().top().as_f32();
+        let mut tops = Vec::with_capacity(self.revealed.len());
+        for i in 0..self.revealed.len() {
+            let t = if let Some(b) = self.page_scroll.bounds_for_item(i) {
+                b.top().as_f32() - base
+            } else if i == 0 {
+                0.0
+            } else {
+                // Not yet painted (freshly revealed): its top is the previous
+                // slide's bottom, or one stride past the previous top.
+                self.page_scroll
+                    .bounds_for_item(i - 1)
+                    .map(|b| b.bottom().as_f32() - base)
+                    .unwrap_or_else(|| tops[i - 1] + content_h)
+            };
+            tops.push(t);
+        }
+        tops
+    }
+
     /// Take over the scroll and drive our own decaying glide to slide `index`:
     /// mark ownership (so trailing OS momentum is suppressed), pin the resting
-    /// offset, and start the ease-out. Used both for a reveal and for the
-    /// finger-lift settle.
+    /// offset, and start the ease-out. Used for a reveal and for the back arrow
+    /// (programmatic, always exact), and for a proximity finger-lift settle.
     fn glide_to_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let stride = crate::chrome::content_size(window).height.as_f32();
-        if stride <= 0.0 {
+        let content_h = crate::chrome::content_size(window).height.as_f32();
+        if content_h <= 0.0 {
             return;
         }
-        let to_y = -(index as f32) * stride;
+        let tops = self.slide_tops(window);
+        let to_y = -tops.get(index).copied().unwrap_or(index as f32 * content_h);
         let from_y = self.page_scroll.offset().y.as_f32();
         self.owning = true;
         self.pinned_y = Some(to_y);
@@ -282,7 +339,7 @@ impl OnboardingView {
             from_y,
             to_y,
             start: Instant::now(),
-            duration: snap_duration(dist, stride),
+            duration: snap_duration(dist, content_h),
         });
         self.drive_snap(window, cx);
     }
@@ -508,30 +565,28 @@ impl Render for OnboardingView {
         }
 
         let revealed = self.revealed.clone();
-        let body = v_flex()
-            .w_full()
-            .children(revealed.into_iter().enumerate().map(|(idx, slide)| {
-                let inner = self.render_slide(slide, cx);
-                // Every slide past the first carries a visible up-chevron "back"
-                // affordance (a discoverable alternative to the scroll-back
-                // gesture) that glides to the previous slide. Flow sequencing —
-                // forward *and* back — lives with the parent, so the back wiring
-                // is here rather than on the stateless slide components.
-                if idx == 0 {
-                    inner
-                } else {
-                    let on_back: slides::OnClick =
-                        Box::new(cx.listener(move |this, _, window, cx| {
-                            this.glide_to_index(idx - 1, window, cx);
-                        }));
-                    div()
-                        .relative()
-                        .w_full()
-                        .child(inner)
-                        .child(slides::back_button(idx, on_back, cx))
-                        .into_any_element()
-                }
-            }));
+        let slides = revealed.into_iter().enumerate().map(|(idx, slide)| {
+            let inner = self.render_slide(slide, cx);
+            // Every slide past the first carries a visible up-chevron "back"
+            // affordance (a discoverable alternative to the scroll-back
+            // gesture) that glides to the previous slide. Flow sequencing —
+            // forward *and* back — lives with the parent, so the back wiring
+            // is here rather than on the stateless slide components.
+            if idx == 0 {
+                inner
+            } else {
+                let on_back: slides::OnClick = Box::new(cx.listener(move |this, _, window, cx| {
+                    this.glide_to_index(idx - 1, window, cx);
+                }));
+                div()
+                    .relative()
+                    .w_full()
+                    .flex_none()
+                    .child(inner)
+                    .child(slides::back_button(idx, on_back, cx))
+                    .into_any_element()
+            }
+        });
 
         // Round all four corners to the CSD frame on Linux (no-op on
         // macOS/SSD) — the same treatment every other window root gets.
@@ -547,17 +602,25 @@ impl Render for OnboardingView {
             .font_family(font_family)
             .text_color(fg)
             .child(
+                // The scroll container *is* the slide column: the slides are its
+                // direct children so `page_scroll` tracks a per-slide child
+                // bound (the boundary offsets the proximity snap reads).
                 div()
                     .id("onboarding-scroll")
                     .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_stretch()
                     .overflow_y_scroll()
                     .track_scroll(&self.page_scroll)
                     // While the finger is down the page scrolls natively; at
-                    // lift we take over with our own decaying glide (a computed
-                    // momentum curve) to the target slide, and *suppress* the OS
-                    // momentum that follows — each trailing momentum `Moved` is
-                    // re-asserted back onto our glide so it can't drift the page
-                    // off the slide. A fresh `Started` releases ownership.
+                    // lift we make a *proximity* decision: a rest near a slide
+                    // boundary (or a flick beside one) is driven home by our own
+                    // decaying glide with the trailing OS momentum suppressed
+                    // (each momentum `Moved` re-asserted back onto the glide so
+                    // it can't drift the page); a rest deep in a slide's content
+                    // simply releases to the native momentum so the reader keeps
+                    // their place. A fresh `Started` releases ownership.
                     .on_scroll_wheel(cx.listener(
                         |this, ev: &gpui::ScrollWheelEvent, window, cx| match ev.touch_phase {
                             TouchPhase::Started => {
@@ -568,13 +631,14 @@ impl Render for OnboardingView {
                             }
                             TouchPhase::Moved => {
                                 if this.owning {
-                                    // Post-lift momentum — keep the page on our
-                                    // glide/pin instead of letting it drift.
+                                    // Post-lift momentum after a *snap* — keep the
+                                    // page on our glide/pin instead of drifting.
                                     cx.stop_propagation();
                                     this.reassert_scroll();
                                 } else {
-                                    // Active finger drag — remember the release
-                                    // velocity for the flick decision.
+                                    // Active finger drag (or momentum after a
+                                    // *release*): let it scroll, and remember the
+                                    // release velocity for the flick decision.
                                     let dy = ev.delta.pixel_delta(window.line_height()).y;
                                     if !dy.is_zero() {
                                         this.last_dy = dy;
@@ -582,25 +646,36 @@ impl Render for OnboardingView {
                                 }
                             }
                             TouchPhase::Ended => {
-                                // Finger lifted: pick the target slide from the
-                                // release velocity (nearest, or ±1 on a flick)
-                                // and glide there, owning the scroll so the OS
-                                // momentum that follows is suppressed.
-                                let stride = crate::chrome::content_size(window).height.as_f32();
-                                if stride > 0.0 {
-                                    let from_y = this.page_scroll.offset().y.as_f32();
-                                    let target = snap_target_index(
-                                        from_y,
-                                        stride,
+                                // Finger lifted: proximity decision. Near a
+                                // boundary (or a flick beside one) → glide onto
+                                // it, owning the scroll to suppress OS momentum;
+                                // deep in content → release, leaving the page to
+                                // rest under native momentum where the reader is.
+                                let content_h = crate::chrome::content_size(window).height.as_f32();
+                                if content_h > 0.0 {
+                                    let tops = this.slide_tops(window);
+                                    let viewport_top = -this.page_scroll.offset().y.as_f32();
+                                    let proximity = content_h * SNAP_PROXIMITY_FRACTION;
+                                    match proximity_snap_target(
+                                        &tops,
+                                        viewport_top,
                                         this.last_dy.as_f32(),
-                                        this.revealed.len(),
-                                    );
-                                    this.glide_to_index(target, window, cx);
+                                        proximity,
+                                    ) {
+                                        Some(idx) => this.glide_to_index(idx, window, cx),
+                                        None => {
+                                            // Stay put — release to native momentum.
+                                            this.owning = false;
+                                            this.pinned_y = None;
+                                            this.snap = None;
+                                            cx.notify();
+                                        }
+                                    }
                                 }
                             }
                         },
                     ))
-                    .child(body),
+                    .children(slides),
             )
             // A right-edge scroll indicator that appears only while scrolling
             // (`ScrollbarShow::Scrolling`) — the built-in gpui-component

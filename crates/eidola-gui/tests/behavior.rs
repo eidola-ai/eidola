@@ -2001,6 +2001,13 @@ fn open_view<V: gpui::Render + 'static>(
     })
 }
 
+/// Force a paint so element bounds (child scroll bounds, probe rects) populate.
+fn draw_window(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+}
+
 // ---------------------------------------------------------------------------
 // SpaceView — the tree-navigation conversation surface (wave-6).
 // ---------------------------------------------------------------------------
@@ -4119,15 +4126,18 @@ fn onboarding_back_arrow_glides_to_previous_slide(cx: &mut TestAppContext) {
     // Each slide past the first shows an up-arrow that glides to the previous
     // slide — the same `scroll_to_slide` path the arrow's click drives. The
     // resting offset (`pinned_y`) is set synchronously, so no frame-pumping.
+    // A prior paint populates the per-slide child bounds the glide measures.
     let stores = stub_stores(cx, |_| {});
     let (window, view) = open_onboarding(cx, &stores);
     reveal(&view, cx, Slide::Pause, Slide::Tool);
     reveal(&view, cx, Slide::Tool, Slide::Control);
+    draw_window(cx, window);
 
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
             // Back from the Control slide (index 2) to the Tool slide (index 1):
-            // the page pins above the top (a negative offset).
+            // the page pins above the top (a negative offset = the height of
+            // slide 0, whatever it measured to).
             v.scroll_to_slide(1, window, cx);
             let one_up = v
                 .pinned_y_for_test()
@@ -4143,6 +4153,81 @@ fn onboarding_back_arrow_glides_to_previous_slide(cx: &mut TestAppContext) {
                 v.pinned_y_for_test(),
                 Some(0.0),
                 "gliding to the first slide must pin at the top"
+            );
+        });
+    })
+    .unwrap();
+}
+
+#[gpui::test]
+fn onboarding_slides_size_to_content_and_grow_on_small_windows(cx: &mut TestAppContext) {
+    // The construction contract that replaced the old fixed-window-height
+    // slides: each slide is *at least* one window tall (short slides read as a
+    // full page) but **grows** past the window when its content is longer than
+    // the window — so a long slide's prose and its trailing CTA are laid out in
+    // full and reachable by scrolling, never clipped or overlapped. On a small
+    // window the long narrative slides must therefore be taller than the window
+    // while the short opening slide is exactly one window tall.
+    let stores = stub_stores(cx, |_| {});
+    // A deliberately small window so the long narrative slides overflow it (the
+    // default test window is far taller than any slide's content).
+    let stores2 = stores.clone();
+    let (window, view) = cx.update(|cx| {
+        gpui_component::init(cx);
+        eidola_gui::theme::install(cx);
+        let mut inner: Option<Entity<OnboardingView>> = None;
+        let bounds = gpui::Bounds {
+            origin: gpui::point(px(0.), px(0.)),
+            size: gpui::size(px(680.), px(440.)),
+        };
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let view = cx.new(|cx| OnboardingView::new(stores2.clone(), window, cx));
+                    inner = Some(view.clone());
+                    cx.new(|cx| Root::new(view, window, cx))
+                },
+            )
+            .expect("open small onboarding window");
+        (window.into(), inner.expect("view"))
+    });
+    reveal(&view, cx, Slide::Pause, Slide::Tool);
+    reveal(&view, cx, Slide::Tool, Slide::Control);
+    reveal(&view, cx, Slide::Control, Slide::Responsibility);
+    draw_window(cx, window);
+
+    cx.update_window(window, |_, window, cx| {
+        view.read_with(cx, |v, _| {
+            let content_h = eidola_gui::chrome::content_height_for_test(window);
+            let tops = v.slide_tops_for_test(window);
+            assert_eq!(tops.len(), 4, "four slides revealed");
+            assert_eq!(tops[0], 0.0, "the first slide starts at the content top");
+
+            let height = |i: usize| tops[i + 1] - tops[i];
+            // The short opening slide is exactly one window tall (min-height, no
+            // growth).
+            assert!(
+                (height(0) - content_h).abs() < 1.0,
+                "the short Pause slide should be exactly one window tall: \
+                 height {} vs window {content_h}",
+                height(0),
+            );
+            // The long narrative slides grow past the small window.
+            assert!(
+                height(1) > content_h + 1.0,
+                "the long Tool slide should grow past the small window: \
+                 height {} vs window {content_h}",
+                height(1),
+            );
+            assert!(
+                height(2) > content_h + 1.0,
+                "the long Control slide should grow past the small window: \
+                 height {} vs window {content_h}",
+                height(2),
             );
         });
     })
