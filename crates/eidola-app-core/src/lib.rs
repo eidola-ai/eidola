@@ -2827,17 +2827,31 @@ impl Inner {
             }
 
             // Before any terminal verdict, re-check for a spendable credential.
-            // A concurrent turn's in-flight credential can *settle*
-            // (spending → spent, atomically writing an active successor) in the
-            // window between the `find_spendable_credential` check at the top of
-            // this iteration and the `list_spending_credentials` check above.
-            // In that window both snapshots are stale — the successor is not yet
-            // visible as active, and the original is no longer visible as
-            // spending — so `recoverable` reads false even though funding just
-            // became available. Re-reading here (the settle is a single atomic
-            // insert, so a spent original guarantees a queryable active
-            // successor) picks up that successor instead of falsely reporting a
-            // shortfall.
+            // This closes the split-read window between the top-of-iteration
+            // `find_spendable_credential` and the `list_spending_credentials`
+            // above: a sibling credential can *settle* (spending → spent) in
+            // that gap, and settlement is a single atomic insert that flips the
+            // original out of `spending` AND makes an active successor
+            // queryable at the same instant — so mid-settle both prior reads
+            // are stale (successor not yet active, original no longer spending)
+            // and `recoverable` reads false even though funding just landed.
+            // The re-read observes the successor.
+            //
+            // This makes the terminal verdict *instant-consistent*. We hold
+            // `spend_gate` across this whole function, and the only active →
+            // `spending` flip (`insert_pre_credential_refund`) is under that
+            // same gate, so no credential can enter `spending` while we run:
+            // the covering-`spending` set only shrinks (via settlement) from
+            // the `list_spending` read to this re-read. Hence a terminal
+            // `InsufficientBalance`/`ProvisioningTimeout` reflects a real
+            // instant with no covering credential in any state — it can NOT be
+            // a false negative from an in-flight sibling refund (the property
+            // the original bug violated). It does NOT promise to see funding
+            // that arrives *after* this re-read from a write exogenous to the
+            // turn machinery (an explicit `account_allocate`, startup
+            // recovery); that is an ordinary post-read TOCTOU no non-serialized
+            // check can exclude, and the recoverable error routes the caller to
+            // retry, which finds it.
             if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
                 return Ok(cred);
             }
