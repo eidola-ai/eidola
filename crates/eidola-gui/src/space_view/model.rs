@@ -17,7 +17,10 @@
 //! (which sibling a scroller rests on, measured heights) live in
 //! [`super::layout`] and the view, which thread a selection/height accessor in.
 
+use eidola_app_core::PostReference;
 use gpui::SharedString;
+
+use crate::space::PostBlockSpan;
 
 /// A per-row render snapshot — the minimal, UI-shaped projection of one
 /// transcript row. Built once when the transcript changes (not per frame), so
@@ -52,6 +55,12 @@ pub struct PostData {
     pub reasoning: Option<SharedString>,
     /// Whether the reasoning disclosure is open.
     pub reasoning_expanded: bool,
+    /// The post's quoted references (`reference` edges, ordinals `1..`) — the
+    /// embed map's source and the footnote rail's rows.
+    pub references: Vec<PostReference>,
+    /// Content-block spans within `content` (the selection→quote mapping and
+    /// the incoming-highlight range mapping).
+    pub blocks: Vec<PostBlockSpan>,
 }
 
 /// What a [`TreeNode`] renders from.
@@ -259,6 +268,8 @@ mod tests {
             generation_count: 1,
             reasoning: None,
             reasoning_expanded: false,
+            references: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -275,6 +286,8 @@ mod tests {
             generation_count: 1,
             reasoning: None,
             reasoning_expanded: false,
+            references: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 

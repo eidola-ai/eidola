@@ -35,7 +35,8 @@ use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AppCore, ChatResult, ChatStreamEvent, NotificationPlan, PostNode, PostReference, SpaceMessage,
+    AppCore, ChatResult, ChatStreamEvent, IncomingReference, NotificationPlan, PostNode,
+    PostReference, ReferenceSpec, SpaceMessage,
 };
 use gpui::{Context, EventEmitter, Task};
 use tokio::sync::{mpsc, oneshot};
@@ -87,6 +88,20 @@ pub struct FailedTurn {
     pub target_action_id: String,
 }
 
+/// One content block's span within a post's concatenated body text — the
+/// mapping a selection quote needs. The body a post's editor renders is the
+/// blocks' texts joined with no separator, so a selection's editor-buffer
+/// byte range maps to (`block_id`, block-relative range) by subtracting the
+/// span start; a selection crossing block boundaries names no single block
+/// and is not quotable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostBlockSpan {
+    /// The content block's id (`PostBlock.id`) — what a `ReferenceSpec` names.
+    pub block_id: String,
+    /// This block's byte range within the concatenated content.
+    pub range: std::ops::Range<usize>,
+}
+
 /// A single rendered chat row: the persisted post plus the byline identity
 /// shown in its gutter, and any reasoning captured for it during streaming.
 ///
@@ -133,9 +148,13 @@ pub struct ChatMessageView {
     /// Total generations of this item (`>= 1`); `> 1` means the post has been
     /// edited/regenerated and a generation switcher applies.
     pub generation_count: i64,
-    /// Non-structural antecedent links (`reference` edges) — inline quotes /
-    /// backlinks, rendered as `❝ quote ❞ — re: X` chips at the top of the post.
+    /// Non-structural antecedent links (`reference` edges) — the post's quoted
+    /// references. The body's `{{ embed N }}` markers materialize from these
+    /// (via the embed map) and the footnote rail lists them below the body.
     pub references: Vec<PostReference>,
+    /// The content blocks' spans within `message.content` (see
+    /// [`PostBlockSpan`]) — what maps a selection to a quotable block range.
+    pub blocks: Vec<PostBlockSpan>,
     pub reasoning: Option<String>,
     pub reasoning_expanded: bool,
 }
@@ -158,6 +177,7 @@ impl ChatMessageView {
             is_branch: false,
             generation_count: 1,
             references: Vec::new(),
+            blocks: Vec::new(),
             reasoning: None,
             reasoning_expanded: false,
         }
@@ -174,12 +194,20 @@ impl ChatMessageView {
             _ => "assistant",
         }
         .to_string();
-        let content = node
-            .blocks
-            .iter()
-            .filter_map(|b| b.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("");
+        // Concatenate the text blocks, recording each block's span within the
+        // joined content (the selection→quote mapping).
+        let mut content = String::new();
+        let mut blocks = Vec::new();
+        for b in &node.blocks {
+            if let Some(text) = b.text.as_deref() {
+                let start = content.len();
+                content.push_str(text);
+                blocks.push(PostBlockSpan {
+                    block_id: b.id.clone(),
+                    range: start..content.len(),
+                });
+            }
+        }
         let byline = byline_for_participant(&node.participant.kind, &node.participant.label);
         Self {
             message: SpaceMessage { role, content },
@@ -193,6 +221,7 @@ impl ChatMessageView {
             is_branch: node.is_branch,
             generation_count: node.generation_count,
             references: node.references,
+            blocks,
             reasoning: None,
             reasoning_expanded: false,
         }
@@ -279,6 +308,13 @@ pub struct Space {
     /// guard). Behavior tests assert against this to prove what a real
     /// regenerate would use.
     last_submitted_model: Option<String>,
+    /// The quoted references handed to the most recent accepted post, and the
+    /// reference ordinals handed to the most recent accepted edit — both
+    /// recorded **before** the backend guard, exactly like
+    /// `last_submitted_model`, so behavior tests can assert what a real post
+    /// or edit would carry without a live core.
+    last_submitted_references: Vec<ReferenceSpec>,
+    last_edit_removals: Vec<i64>,
     /// The exclusive mutation slot: submit's post phase, post-only, edit,
     /// regenerate. While `Some`, another mutation is a no-op.
     post_runner: Option<Task<()>>,
@@ -289,6 +325,23 @@ pub struct Space {
     failed_turn: Option<FailedTurn>,
     /// Supersede slot for the reopened-space initial transcript load.
     load_task: Option<Task<()>>,
+    /// **Incoming references**, keyed by the quoted post's action id: every
+    /// current-generation post quoting a range of that post
+    /// (`AppCore::references_to`). This is the data behind the source-post
+    /// highlights ("this passage was quoted") and their click-to-navigate.
+    ///
+    /// It lives here, on the shared per-space entity, rather than in a window:
+    /// it is durable, queryable, per-space domain data, so two windows on one
+    /// space must paint identical highlights and a `Change::Space` must
+    /// refresh both (STATE.md — "views never own domain data"). It is loaded
+    /// **lazily per post** (`ensure_incoming_references`, keyed fetch slots —
+    /// STATE.md's "independent per-key work") rather than eagerly with the
+    /// transcript, so the cost is one query per *rendered* post, not one per
+    /// transcript row.
+    incoming_refs: HashMap<String, Loadable<Vec<IncomingReference>>>,
+    /// Per-key fetch slots for `incoming_refs`. Replacing an entry cancels
+    /// that post's in-flight fetch and nothing else.
+    incoming_ref_tasks: HashMap<String, Task<()>>,
 }
 
 impl EventEmitter<SpaceEvent> for Space {}
@@ -304,10 +357,14 @@ impl Space {
             streams: Vec::new(),
             next_turn_seq: 0,
             last_submitted_model: None,
+            last_submitted_references: Vec::new(),
+            last_edit_removals: Vec::new(),
             post_runner: None,
             turn_runners: HashMap::new(),
             failed_turn: None,
             load_task: None,
+            incoming_refs: HashMap::new(),
+            incoming_ref_tasks: HashMap::new(),
         }
     }
 
@@ -322,10 +379,14 @@ impl Space {
             streams: Vec::new(),
             next_turn_seq: 0,
             last_submitted_model: None,
+            last_submitted_references: Vec::new(),
+            last_edit_removals: Vec::new(),
             post_runner: None,
             turn_runners: HashMap::new(),
             failed_turn: None,
             load_task: None,
+            incoming_refs: HashMap::new(),
+            incoming_ref_tasks: HashMap::new(),
         };
         space.load_transcript(cx);
         space
@@ -341,10 +402,14 @@ impl Space {
             streams: Vec::new(),
             next_turn_seq: 0,
             last_submitted_model: None,
+            last_submitted_references: Vec::new(),
+            last_edit_removals: Vec::new(),
             post_runner: None,
             turn_runners: HashMap::new(),
             failed_turn: None,
             load_task: None,
+            incoming_refs: HashMap::new(),
+            incoming_ref_tasks: HashMap::new(),
         }
     }
 
@@ -370,6 +435,84 @@ impl Space {
         &self.streams
     }
 
+    // -- Incoming references (source highlights) ---------------------------
+
+    /// The posts quoting `action_id`, if that post's reverse index has been
+    /// loaded. Empty slice while it hasn't — highlights are decoration, so a
+    /// not-yet-loaded index simply paints nothing rather than a spinner.
+    pub fn incoming_references(&self, action_id: &str) -> &[IncomingReference] {
+        self.incoming_refs
+            .get(action_id)
+            .and_then(|l| l.value())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Load `action_id`'s reverse index if it hasn't been requested yet — the
+    /// lazy, per-post fetch the view calls for each post it actually renders.
+    /// Idempotent: a cell that is loading, loaded, or failed is left alone (a
+    /// failed decoration must not re-request every frame).
+    pub fn ensure_incoming_references(&mut self, action_id: &str, cx: &mut Context<Self>) {
+        if self.incoming_refs.contains_key(action_id) {
+            return;
+        }
+        let Some(app_core) = self.app_core.clone() else {
+            // Stub mode: record an empty cell so we don't re-enter each frame.
+            self.incoming_refs
+                .insert(action_id.to_string(), Loadable::loaded(Vec::new()));
+            return;
+        };
+        self.incoming_refs
+            .insert(action_id.to_string(), Loadable::Loading);
+        let key = action_id.to_string();
+        let rx = bridge::references_to(app_core, key.clone());
+        let task = cx.spawn(async move |this, cx| {
+            let result = rx.await.unwrap_or_else(|_| {
+                Err(AppError::Internal {
+                    message: "reference lookup cancelled".into(),
+                })
+            });
+            this.update(cx, |this, cx| {
+                let prior = this.incoming_refs.remove(&key).unwrap_or(Loadable::Loading);
+                this.incoming_refs
+                    .insert(key.clone(), prior.resolve(result));
+                this.incoming_ref_tasks.remove(&key);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.incoming_ref_tasks.insert(action_id.to_string(), task);
+    }
+
+    /// Drop every cached reverse index (and cancel its in-flight fetch), so
+    /// the next render re-requests the ones it still needs.
+    ///
+    /// Called for **any** `Change::Space`, not just this space's: a reference
+    /// created in space B changes what space A's posts should highlight, and
+    /// the bus carries only the *written* space's id. Since the fetch is lazy
+    /// per rendered post, a blanket invalidation costs at most one query per
+    /// visible post rather than a whole-transcript sweep.
+    pub fn invalidate_incoming_references(&mut self, cx: &mut Context<Self>) {
+        if self.incoming_refs.is_empty() {
+            return;
+        }
+        self.incoming_refs.clear();
+        self.incoming_ref_tasks.clear();
+        cx.notify();
+    }
+
+    /// Test seam: seed a post's reverse index without a backend, so behavior
+    /// tests can drive the highlight surfaces against stub stores.
+    #[doc(hidden)]
+    pub fn seed_incoming_references_for_test(
+        &mut self,
+        action_id: impl Into<String>,
+        refs: Vec<IncomingReference>,
+    ) {
+        self.incoming_refs
+            .insert(action_id.into(), Loadable::loaded(refs));
+    }
+
     /// Whether any response turn is currently streaming.
     pub fn is_streaming(&self) -> bool {
         !self.streams.is_empty()
@@ -388,6 +531,17 @@ impl Space {
     /// The model id handed to the most recent regenerate (see field docs).
     pub fn last_submitted_model(&self) -> Option<&str> {
         self.last_submitted_model.as_deref()
+    }
+
+    /// The quoted references the most recent accepted post carried (see the
+    /// field docs).
+    pub fn last_submitted_references(&self) -> &[ReferenceSpec] {
+        &self.last_submitted_references
+    }
+
+    /// The reference ordinals the most recent accepted edit asked to remove.
+    pub fn last_edit_removals(&self) -> &[i64] {
+        &self.last_edit_removals
     }
 
     /// The turn a failed ask left behind, if any (drives the notice's Retry).
@@ -647,10 +801,14 @@ impl Space {
     /// A mutation while anything is in flight is a no-op (the current UX).
     /// Returns `true` if accepted (a turn was appended), `false` if a no-op
     /// (empty prompt or busy).
+    /// `references` are the draft's pending quoted references (specs in
+    /// ordinal order, matching the body's `{{ embed N }}` markers); empty for
+    /// a plain post.
     pub fn submit(
         &mut self,
         prompt: String,
         reply_to: Option<String>,
+        references: Vec<ReferenceSpec>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.is_busy() {
@@ -660,6 +818,8 @@ impl Space {
         if prompt.is_empty() {
             return false;
         }
+
+        self.last_submitted_references = references.clone();
 
         // Cancel any in-flight transcript load: the submit's own post-commit
         // reload is now the authoritative truth (the `apply_loaded_transcript`
@@ -696,7 +856,7 @@ impl Space {
         };
 
         let space_id = self.id.clone();
-        let rx = bridge::submit(app_core.clone(), prompt, space_id, reply_to);
+        let rx = bridge::submit(app_core.clone(), prompt, space_id, reply_to, references);
         self.post_runner = Some(cx.spawn(async move |this, cx| {
             let outcome = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
@@ -764,10 +924,12 @@ impl Space {
     /// turn and persists it via `AppCore::post`; on completion the transcript
     /// reloads from the tree and a blank space adopts its new id. Returns
     /// `true` if accepted, `false` if a no-op (empty / busy).
+    /// `references`: see [`Self::submit`].
     pub fn post_only(
         &mut self,
         prompt: String,
         reply_to: Option<String>,
+        references: Vec<ReferenceSpec>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.is_busy() {
@@ -778,6 +940,7 @@ impl Space {
             return false;
         }
 
+        self.last_submitted_references = references.clone();
         self.supersede_load_for_mutation();
 
         // Optimistically append the user's turn (no streaming state — this path
@@ -797,7 +960,7 @@ impl Space {
             return true;
         };
         let space_id = self.id.clone();
-        let rx = bridge::post(app_core.clone(), prompt, space_id, reply_to);
+        let rx = bridge::post(app_core.clone(), prompt, space_id, reply_to, references);
         self.post_runner = Some(cx.spawn(async move |this, cx| {
             let outcome = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
@@ -812,7 +975,16 @@ impl Space {
     /// Commit an inline edit — append a new human generation of `action_id`'s
     /// item via `AppCore::edit_post`, then reload the tree (the edited post
     /// replaces its prior generation in place). No credential, no model call.
-    pub fn edit(&mut self, action_id: String, new_prompt: String, cx: &mut Context<Self>) -> bool {
+    /// `remove_references` names reference **ordinals** to drop from the new
+    /// generation (`edit_post_with_removals`; ordinal 0 — the reply edge — is
+    /// never removable and is refused core-side). Empty = a plain edit.
+    pub fn edit(
+        &mut self,
+        action_id: String,
+        new_prompt: String,
+        remove_references: Vec<i64>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.is_busy() {
             return false;
         }
@@ -820,11 +992,12 @@ impl Space {
         if new_prompt.is_empty() {
             return false;
         }
+        self.last_edit_removals = remove_references.clone();
         self.supersede_load_for_mutation();
         let Some(app_core) = self.app_core.clone() else {
             return true; // stub: no backend
         };
-        let rx = bridge::edit_post(app_core.clone(), action_id, new_prompt);
+        let rx = bridge::edit_post(app_core.clone(), action_id, new_prompt, remove_references);
         self.post_runner = Some(cx.spawn(async move |this, cx| {
             let outcome = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
@@ -1296,6 +1469,14 @@ impl Space {
     #[doc(hidden)]
     pub fn arm_post_runner_for_test(&mut self, cx: &mut Context<Self>) {
         self.post_runner = Some(cx.spawn(async move |_, _| std::future::pending::<()>().await));
+    }
+
+    /// Test-only: release the exclusive mutation slot armed above, so the next
+    /// mutation is accepted.
+    #[doc(hidden)]
+    pub fn clear_post_runner_for_test(&mut self, cx: &mut Context<Self>) {
+        self.post_runner = None;
+        cx.notify();
     }
 
     /// Test-only: complete one streaming turn **successfully** — drop its stream

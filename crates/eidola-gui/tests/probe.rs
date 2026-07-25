@@ -1880,3 +1880,120 @@ fn templates_pane_failed_load_shows_retry(cx: &mut TestAppContext) {
     );
     probe::set_probes_enabled(false);
 }
+
+#[gpui::test]
+fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContext) {
+    // Every quoted-reference affordance is a probe target: the footnote rows
+    // on a post and on a draft, their removal chips, and the multi-referencer
+    // picker. (The highlight *wash* itself is a decoration, not an
+    // affordance — the editor owns its hit-test, so it carries no probe.)
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut post = probe_post("a1", "the quick brown fox");
+    post.blocks[0].id = "b1".into();
+    post.references = vec![
+        eidola_app_core::PostReference {
+            antecedent_action_id: "x1".into(),
+            ordinal: 1,
+            content_block_id: Some("bx".into()),
+            range_start: Some(0),
+            range_end: Some(4),
+            annotation: None,
+            snippet: Some("an earlier passage".into()),
+        },
+        eidola_app_core::PostReference {
+            antecedent_action_id: "x2".into(),
+            ordinal: 2,
+            content_block_id: Some("by".into()),
+            range_start: Some(0),
+            range_end: Some(4),
+            annotation: None,
+            snippet: None, // the honest "quoted an earlier version" row
+        },
+    ];
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+    draw(cx, window);
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/0/footnote/1".to_string()),
+        "the post's footnote rows are probed: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/post/0/footnote/2".to_string()),
+        "including the unresolvable-range row: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/post/0/footnote/1/remove".to_string()),
+        "removal chips appear only inside an Edit session: {names:?}"
+    );
+
+    // Inside an Edit session each row grows its removal chip.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/0/footnote/1/remove".to_string()),
+        "the edit session reveals removal chips: {names:?}"
+    );
+
+    // Cancel out, then quote into the tail draft: the draft rail probes.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_edit(window, cx));
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| v.quote(&eidola_gui::actions::Quote, window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/draft/footnote/1".to_string()),
+        "the draft's pending quote is a footnote row: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/draft/footnote/1/remove".to_string()),
+        "a pending quote is always removable: {names:?}"
+    );
+
+    // The multi-referencer picker.
+    let incoming = |action: &str| eidola_app_core::IncomingReference {
+        action_id: action.into(),
+        space_id: "s".into(),
+        ordinal: 1,
+        content_block_id: Some("b1".into()),
+        range_start: Some(4),
+        range_end: Some(15),
+        annotation: None,
+        created_at: 0,
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test("a1", vec![incoming("z1"), incoming("z2")]);
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test("a1", &[0, 1], window, cx)
+        });
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/highlight/picker".to_string()),
+        "the picker group is probed: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/highlight/picker/0".to_string())
+            && names.contains(&"space/highlight/picker/1".to_string()),
+        "each candidate is a probed choice: {names:?}"
+    );
+}

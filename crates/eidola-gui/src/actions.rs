@@ -53,6 +53,18 @@ actions!(
         /// not been persisted yet (there are no per-space participants until a
         /// first post assigns the space an id).
         OpenParticipants,
+        /// **Quote** the current selection inside a post into the active
+        /// draft: attach a reference edge and inject its `{{ embed N }}`
+        /// marker at the caret, so the passage renders as a quote block while
+        /// composing. Lives in the Edit menu; registered per-`SpaceView` and
+        /// only while a quotable post selection exists, so the menu item greys
+        /// out with nothing selected (the `CloseWindow`/`OpenParticipants`
+        /// pattern, with the extra selection condition).
+        Quote,
+        /// **Quote in Reply** — the same quote, but into a *new* reply draft
+        /// on the quoted post, so the answer branches where the passage is.
+        /// Same registration and greying as [`Quote`].
+        QuoteInReply,
         /// Show the Updates window (singleton, like Settings) and run a
         /// manual update check. Lives in the Eidola menu directly under
         /// "About Eidola" — the standard macOS placement.
