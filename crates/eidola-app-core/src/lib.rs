@@ -509,6 +509,9 @@ pub struct PostParticipant {
 /// tool fields are carried faithfully for the later tool render.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostBlock {
+    /// The content block's id — what a [`ReferenceSpec`] quoting a selection
+    /// of this block names as its `content_block_id`.
+    pub id: String,
     /// `text` | `thinking` | `code` | `tool_use` | `tool_result` | `image` | …
     pub block_type: String,
     pub text: Option<String>,
@@ -519,17 +522,74 @@ pub struct PostBlock {
 }
 
 /// A non-structural antecedent edge (relation `reference`) of a post: a plain
-/// backlink, an inline quote (carries a `range`), or an embed. Rendered as the
-/// `❝ quote ❞ — re: X` chip at the top of a reply.
+/// backlink, an inline quote (carries a `range`), or an embed. The post's
+/// markdown refers to it by ordinal via the `{{ embed N }}` marker (see the
+/// **ordinal convention** on [`ReferenceSpec`]); wave-2 GUI renders these as a
+/// footnote-style reference list and builds the editor's embed map from them
+/// via [`PostNode::embed_map`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostReference {
-    /// The action this post references.
+    /// The action this post references — the **concrete generation** quoted
+    /// (references record causality and never remap to an item's current tip).
     pub antecedent_action_id: String,
+    /// The edge's ordinal — the shared key: `action_antecedent.ordinal` ↔ the
+    /// post body's `{{ embed N }}` ↔ the embed-map key ↔ the footnote index.
     pub ordinal: i64,
-    /// Quoted character range within the antecedent's content, if a quote.
+    /// The quoted content block of the antecedent, if a quote.
+    pub content_block_id: Option<String>,
+    /// Quoted byte range within that block's `text_content`, if a quote.
     pub range_start: Option<i64>,
     pub range_end: Option<i64>,
     pub annotation: Option<String>,
+    /// The quoted markdown, resolved from the referenced block's text by
+    /// [`quote_snippet`]. `None` for range-less backlinks or when the stored
+    /// range no longer maps honestly onto the block (never truncated or
+    /// remapped heuristically).
+    pub snippet: Option<String>,
+}
+
+/// A reference to attach to a new post (the write-side twin of
+/// [`PostReference`]): quote `range_start..range_end` (byte offsets) of the
+/// antecedent's `content_block_id`. Range-less specs record a plain backlink.
+///
+/// **Ordinal convention.** `action_antecedent.ordinal` 0 is reserved for the
+/// structural `reply` edge (whether or not one exists); reference edges take
+/// ordinals `1..=N` in the order the specs are supplied. The post's markdown
+/// embeds a reference by that same ordinal — `{{ embed 1 }}` is the first
+/// reference — and ordinals stay stable across generations (`edit_post`
+/// replicates surviving references at their original ordinals, so embed
+/// markers in an edited body remain valid; gaps after a removal are fine, the
+/// embed map is a map).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceSpec {
+    /// The concrete generation being referenced.
+    pub antecedent_action_id: String,
+    /// The quoted content block (must belong to the antecedent action).
+    /// Required when a range is given.
+    pub content_block_id: Option<String>,
+    /// Byte range into the block's `text_content` (UTF-8 char-boundary
+    /// aligned; `0 <= start < end <= len`). Both present or both absent.
+    pub range_start: Option<i64>,
+    pub range_end: Option<i64>,
+    pub annotation: Option<String>,
+}
+
+/// An incoming reference: some current-generation post quoting a range of the
+/// queried action's content. The reverse index behind the wave-2 source-post
+/// highlights ("this passage was quoted") and click-to-navigate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncomingReference {
+    /// The referring post (a current generation).
+    pub action_id: String,
+    /// The referring post's space (references may cross spaces).
+    pub space_id: String,
+    /// The edge's ordinal within the referring post.
+    pub ordinal: i64,
+    pub content_block_id: Option<String>,
+    pub range_start: Option<i64>,
+    pub range_end: Option<i64>,
+    pub annotation: Option<String>,
+    pub created_at: i64,
 }
 
 /// One render-row of the threaded space — an item's current generation,
@@ -572,6 +632,43 @@ pub struct PostNode {
     pub blocks: Vec<PostBlock>,
     pub references: Vec<PostReference>,
     pub created_at: i64,
+}
+
+impl PostNode {
+    /// The post's embed map — ordinal → quoted markdown — for every reference
+    /// with a resolvable snippet. This is exactly what the wave-2 GUI hands to
+    /// `MarkdownEditorState::set_embeds` so the body's `{{ embed N }}` markers
+    /// materialize as quote blocks; references without a snippet (backlinks,
+    /// unresolvable ranges) are omitted and their markers degrade to plain
+    /// text in the editor (its documented honest-degradation behavior).
+    pub fn embed_map(&self) -> std::collections::BTreeMap<u64, String> {
+        self.references
+            .iter()
+            .filter_map(|r| {
+                let ordinal = u64::try_from(r.ordinal).ok()?;
+                Some((ordinal, r.snippet.clone()?))
+            })
+            .collect()
+    }
+}
+
+/// Extract the quoted markdown of a reference: the `range_start..range_end`
+/// byte slice of a content block's text. The shared validation both the write
+/// path (`post_with_references`) and every snippet resolution use — a range is
+/// honest only if `0 <= start < end <= len` and both ends sit on UTF-8
+/// character boundaries. Returns `None` for a dishonest range (stored ranges
+/// are never remapped or truncated heuristically; an edit that invalidated a
+/// range simply stops resolving).
+pub fn quote_snippet(block_text: &str, range_start: i64, range_end: i64) -> Option<&str> {
+    let start = usize::try_from(range_start).ok()?;
+    let end = usize::try_from(range_end).ok()?;
+    if start >= end || end > block_text.len() {
+        return None;
+    }
+    if !block_text.is_char_boundary(start) || !block_text.is_char_boundary(end) {
+        return None;
+    }
+    Some(&block_text[start..end])
 }
 
 #[derive(Clone, Debug)]
@@ -1943,6 +2040,27 @@ impl Inner {
         Ok(build_post_tree(data))
     }
 
+    /// Every current-generation post referencing `action_id` (the concrete
+    /// generation — references never remap to tips), with the quoted ranges.
+    /// Pure read; the reverse index behind the wave-2 source highlights.
+    async fn references_to(&self, action_id: &str) -> Result<Vec<IncomingReference>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::references_to(&db_conn, action_id).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| IncomingReference {
+                action_id: r.action_id,
+                space_id: r.space_id,
+                ordinal: r.ordinal,
+                content_block_id: r.content_block_id,
+                range_start: r.range_start,
+                range_end: r.range_end,
+                annotation: r.annotation,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
     /// Create a new space by instantiating the (live) default space template:
     /// the space copies the template's `cascade_limit`, the shared human "You"
     /// joins as owner, and each template agent participant is copied into a
@@ -2079,6 +2197,111 @@ impl Inner {
                 message: format!("action not found: {action_id}"),
             }),
         }
+    }
+
+    /// Validate a [`ReferenceSpec`] against the database — the pre-write gate
+    /// for `post(..., references)` and `edit_post` replication. Checks, in
+    /// order: the antecedent action exists (any space — references are the
+    /// schema's cross-space knowledge mechanism); range/`content_block_id`
+    /// pairing (a range requires a block, both range ends together); the
+    /// block belongs to the antecedent action; and the byte range maps
+    /// honestly onto the block's text ([`quote_snippet`]). Typed
+    /// [`AppError::NotConfigured`] on every violation.
+    async fn validate_reference_spec(
+        &self,
+        conn: &turso::Connection,
+        spec: &ReferenceSpec,
+    ) -> Result<(), AppError> {
+        if db::action_item_and_space(conn, &spec.antecedent_action_id)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::NotConfigured {
+                message: format!("referenced action not found: {}", spec.antecedent_action_id),
+            });
+        }
+        if spec.range_start.is_some() != spec.range_end.is_some() {
+            return Err(AppError::NotConfigured {
+                message: "reference range_start/range_end must be given together".into(),
+            });
+        }
+        let Some(block_id) = spec.content_block_id.as_deref() else {
+            if spec.range_start.is_some() {
+                return Err(AppError::NotConfigured {
+                    message: "a reference range requires a content_block_id".into(),
+                });
+            }
+            return Ok(());
+        };
+        let Some((owner_action, text)) = db::content_block_owner_text(conn, block_id).await? else {
+            return Err(AppError::NotConfigured {
+                message: format!("referenced content block not found: {block_id}"),
+            });
+        };
+        if owner_action != spec.antecedent_action_id {
+            return Err(AppError::NotConfigured {
+                message: format!(
+                    "content block {block_id} belongs to action {owner_action}, not {}",
+                    spec.antecedent_action_id
+                ),
+            });
+        }
+        if let (Some(rs), Some(re)) = (spec.range_start, spec.range_end) {
+            let text = text.unwrap_or_default();
+            if quote_snippet(&text, rs, re).is_none() {
+                return Err(AppError::NotConfigured {
+                    message: format!(
+                        "reference range {rs}..{re} does not map onto content block {block_id} \
+                         ({} bytes)",
+                        text.len()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Expand `{{ embed N }}` quote markers in upstream-context rows into the
+    /// referenced passages (see [`expand_embed_strings`]). One reference query
+    /// per distinct marker-bearing action; rows without a `{{` pass through
+    /// untouched.
+    async fn expand_context_embeds(
+        &self,
+        conn: &turso::Connection,
+        mut rows: Vec<db::SpaceActionRow>,
+    ) -> Result<Vec<db::SpaceActionRow>, AppError> {
+        let mut cache: std::collections::HashMap<String, std::collections::BTreeMap<u64, String>> =
+            std::collections::HashMap::new();
+        for row in &mut rows {
+            let Some(text) = row.text_content.as_deref() else {
+                continue;
+            };
+            if !text.contains("{{") {
+                continue;
+            }
+            if !cache.contains_key(&row.action_id) {
+                let refs = db::reference_antecedents(conn, &row.action_id).await?;
+                let mut map = std::collections::BTreeMap::new();
+                for r in refs {
+                    let (Some(rs), Some(re), Some(block_text)) =
+                        (r.range_start, r.range_end, r.block_text.as_deref())
+                    else {
+                        continue;
+                    };
+                    if let (Ok(ordinal), Some(snippet)) =
+                        (u64::try_from(r.ordinal), quote_snippet(block_text, rs, re))
+                    {
+                        map.insert(ordinal, snippet.to_string());
+                    }
+                }
+                cache.insert(row.action_id.clone(), map);
+            }
+            let map = &cache[&row.action_id];
+            if !map.is_empty() {
+                row.text_content = Some(expand_embed_strings(text, map));
+            }
+        }
+        Ok(rows)
     }
 
     // --- Participant CRUD (per-space) -----------------------------------
@@ -2556,11 +2779,18 @@ impl Inner {
     /// replies to (its structural thread parent) — a reply to a non-tail post
     /// **branches** the thread there; when `None` the post links to the space's
     /// current tail (the linear-continuation default).
+    ///
+    /// `references` are the post's quoted references (see [`ReferenceSpec`]):
+    /// each becomes a `relation='reference'` antecedent edge at ordinal
+    /// `1..=N` in supplied order (ordinal 0 stays reserved for the reply
+    /// edge). Every spec is validated **before any write** — a bad reference
+    /// leaves zero durable trace, mirroring the `reply_to` rule.
     async fn post(
         &self,
         space_id: Option<&str>,
         prompt: &str,
         reply_to: Option<&str>,
+        references: &[ReferenceSpec],
     ) -> Result<PostResult, AppError> {
         let prompt = prompt.trim();
         if prompt.is_empty() {
@@ -2585,6 +2815,13 @@ impl Inner {
                 message: "reply_to requires an existing space".into(),
             })?;
             self.require_action_in_space(&db_conn, rt, sid).await?;
+        }
+
+        // Validate every reference before any write (pure error, no
+        // emission). Unlike `reply_to`, a reference may point at an action in
+        // ANY space (the schema's cross-space knowledge mechanism).
+        for spec in references {
+            self.validate_reference_spec(&db_conn, spec).await?;
         }
 
         let (space_id, space_title, is_new_space) = if let Some(sid) = space_id {
@@ -2650,12 +2887,30 @@ impl Inner {
 
         // Link the structural `reply` edge: to the explicit `reply_to` target
         // (branching there) when given, otherwise to the space's tail (linear
-        // continuation). A first post in a space has neither.
+        // continuation). A first post in a space has neither. Ordinal 0 is the
+        // reply edge's reserved slot (see `ReferenceSpec`).
         let reply_ante = reply_to
             .map(str::to_string)
             .or_else(|| last_action_id.clone());
         if let Some(ref ante_id) = reply_ante {
             db::insert_action_antecedent(&db_conn, &action_id, ante_id, 0, "reply").await?;
+        }
+
+        // Reference edges at ordinals 1..=N in supplied order — the post's
+        // `{{ embed N }}` numbering. These ride the post's existing
+        // emissions below (no new exit point).
+        for (i, spec) in references.iter().enumerate() {
+            db::insert_reference_antecedent(
+                &db_conn,
+                &action_id,
+                &spec.antecedent_action_id,
+                (i + 1) as i64,
+                spec.content_block_id.as_deref(),
+                spec.range_start,
+                spec.range_end,
+                spec.annotation.as_deref(),
+            )
+            .await?;
         }
 
         self.bus.emit(Change::Space(space_id.clone()));
@@ -2678,7 +2933,20 @@ impl Inner {
     /// replicates the item's structural `reply` edge so it keeps its place in
     /// the thread. No credential, no HTTP. `action_id` may be any generation of
     /// the target item; the new generation supersedes the item's current tip.
-    async fn edit_post(&self, action_id: &str, new_prompt: &str) -> Result<PostResult, AppError> {
+    ///
+    /// **Reference replication.** The tip's `reference` edges replicate onto
+    /// the new generation **at their original ordinals** (so `{{ embed N }}`
+    /// markers in the edited body stay valid), minus any ordinal listed in
+    /// `remove_references` — the "possible to remove references" half of the
+    /// edit surface. The reply edge is NOT removable through this surface:
+    /// naming ordinal 0 (or any ordinal that isn't a current reference) is a
+    /// typed error before any write.
+    async fn edit_post(
+        &self,
+        action_id: &str,
+        new_prompt: &str,
+        remove_references: &[i64],
+    ) -> Result<PostResult, AppError> {
         let new_prompt = new_prompt.trim();
         if new_prompt.is_empty() {
             return Err(AppError::Internal {
@@ -2700,6 +2968,21 @@ impl Inner {
                 message: format!("item has no current generation: {item_id}"),
             })?;
         let reply_parent = db::reply_antecedent(&db_conn, &tip).await?;
+        let tip_references = db::reference_antecedents(&db_conn, &tip).await?;
+
+        // Validate removals before any write: each named ordinal must be a
+        // current reference edge. Ordinal 0 (the reply slot) and unknown
+        // ordinals are refused — removing the reply is impossible here.
+        for ord in remove_references {
+            if !tip_references.iter().any(|r| r.ordinal == *ord) {
+                return Err(AppError::NotConfigured {
+                    message: format!(
+                        "cannot remove reference ordinal {ord}: not a reference edge of this post \
+                         (the reply edge is not removable)"
+                    ),
+                });
+            }
+        }
 
         // Edits are the human's — recorded against the shared "You" participant.
         let user_participant_id = db::HUMAN_PARTICIPANT_ID.to_string();
@@ -2737,6 +3020,24 @@ impl Inner {
         .await?;
         if let Some(ref ante) = reply_parent {
             db::insert_action_antecedent(&db_conn, &new_action_id, ante, 0, "reply").await?;
+        }
+        // Replicate surviving references at their original ordinals (stable
+        // across generations — see `ReferenceSpec`'s ordinal convention).
+        for r in &tip_references {
+            if remove_references.contains(&r.ordinal) {
+                continue;
+            }
+            db::insert_reference_antecedent(
+                &db_conn,
+                &new_action_id,
+                &r.antecedent_action_id,
+                r.ordinal,
+                r.content_block_id.as_deref(),
+                r.range_start,
+                r.range_end,
+                r.annotation.as_deref(),
+            )
+            .await?;
         }
 
         // Content changed (Space), and the listing's snippet / last-activity may
@@ -3182,6 +3483,11 @@ impl Inner {
                 db::get_upstream_context(&db_conn, target_action_id, false).await?
             }
         };
+        // Expand each post's `{{ embed N }}` quote markers into the referenced
+        // passages (as markdown blockquotes) so the model reads what the
+        // author quoted, not an opaque marker. Charge estimation below runs on
+        // the expanded array, so the hold covers the expanded bytes.
+        let context_rows = self.expand_context_embeds(&db_conn, context_rows).await?;
         let mut prior_messages = actions_to_messages(&context_rows);
 
         // Prepend the responding participant's effective system prompt as a
@@ -3560,7 +3866,7 @@ impl Inner {
         model: &str,
         space_id: Option<&str>,
     ) -> Result<ChatResult, AppError> {
-        let posted = self.post(space_id, prompt, None).await?;
+        let posted = self.post(space_id, prompt, None, &[]).await?;
         self.run_turn(
             &posted.space_id,
             TurnSelector::Model(model.to_string()),
@@ -3875,7 +4181,7 @@ impl Inner {
         reply_to: Option<&str>,
         sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> Result<ChatResult, AppError> {
-        let posted = self.post(space_id, prompt, reply_to).await?;
+        let posted = self.post(space_id, prompt, reply_to, &[]).await?;
         self.run_turn_stream(
             &posted.space_id,
             TurnSelector::Model(model.to_string()),
@@ -3965,7 +4271,7 @@ impl Inner {
         text: &str,
         reply_to: Option<&str>,
     ) -> Result<SubmitResult, AppError> {
-        let post = self.post(space_id, text, reply_to).await?;
+        let post = self.post(space_id, text, reply_to, &[]).await?;
         let plan = self
             .plan_notifications(&post.space_id, &post.action_id)
             .await?;
@@ -5037,7 +5343,7 @@ impl AppCore {
     ) -> Result<PostResult, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.post(space_id.as_deref(), &prompt, None).await })
+            .spawn(async move { inner.post(space_id.as_deref(), &prompt, None, &[]).await })
             .await
             .map_err(join_err)?
     }
@@ -5055,7 +5361,37 @@ impl AppCore {
         self.runtime
             .spawn(async move {
                 inner
-                    .post(space_id.as_deref(), &prompt, reply_to.as_deref())
+                    .post(space_id.as_deref(), &prompt, reply_to.as_deref(), &[])
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Save a post carrying **quoted references**: each [`ReferenceSpec`]
+    /// becomes a `relation='reference'` antecedent edge at ordinal `1..=N` in
+    /// supplied order (ordinal 0 is the reply edge's reserved slot), matching
+    /// the body's `{{ embed N }}` markers. `reply_to` behaves exactly as in
+    /// [`post_reply`](Self::post_reply). Validation failures (unknown
+    /// antecedent, foreign/missing content block, dishonest range) are typed
+    /// errors before any write — no space, no rows, no emissions.
+    pub async fn post_with_references(
+        &self,
+        prompt: String,
+        space_id: Option<String>,
+        reply_to: Option<String>,
+        references: Vec<ReferenceSpec>,
+    ) -> Result<PostResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .post(
+                        space_id.as_deref(),
+                        &prompt,
+                        reply_to.as_deref(),
+                        &references,
+                    )
                     .await
             })
             .await
@@ -5064,7 +5400,8 @@ impl AppCore {
 
     /// Edit a post by appending a new generation (append-only; the prior
     /// version is preserved and resolvable). `action_id` is any generation of
-    /// the target item.
+    /// the target item. The tip's references replicate onto the new
+    /// generation at their original ordinals; the reply edge always does.
     pub async fn edit_post(
         &self,
         action_id: String,
@@ -5072,7 +5409,44 @@ impl AppCore {
     ) -> Result<PostResult, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.edit_post(&action_id, &new_prompt).await })
+            .spawn(async move { inner.edit_post(&action_id, &new_prompt, &[]).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// [`edit_post`](Self::edit_post) that also **removes** the references at
+    /// the given ordinals from the new generation (they remain on the prior
+    /// generation — append-only history). Naming ordinal 0 or an ordinal that
+    /// isn't a current reference is a typed error: the reply edge cannot be
+    /// removed through this surface.
+    pub async fn edit_post_with_removals(
+        &self,
+        action_id: String,
+        new_prompt: String,
+        remove_references: Vec<i64>,
+    ) -> Result<PostResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .edit_post(&action_id, &new_prompt, &remove_references)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Every current-generation post referencing `action_id` (the concrete
+    /// generation quoted), with the quoted ranges of this action's content —
+    /// the reverse index behind wave-2 source highlights and
+    /// click-to-navigate. Pure read; emits nothing.
+    pub async fn references_to(
+        &self,
+        action_id: String,
+    ) -> Result<Vec<IncomingReference>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.references_to(&action_id).await })
             .await
             .map_err(join_err)?
     }
@@ -5816,6 +6190,55 @@ fn canonicalize_model_ref(model_ref: &str) -> String {
     backends::qualified_model_id(&mr.model, &mr.backend_id)
 }
 
+/// Parse an embed marker line: the entire (whitespace-trimmed) line must be
+/// `{{` WS* `embed` WS+ decimal-digits WS* `}}` (WS = space/tab), yielding the
+/// ordinal. This is the same lexical rule the `gpui-markdown-editor` embed
+/// plugin recognizes (`embed::parse_embed_text` there — the two are
+/// deliberately duplicated, like the www/theme palette port, because app-core
+/// must not depend on gpui; keep them in lockstep and their tests pin the same
+/// cases). Canonical spelling: `{{ embed N }}`.
+fn parse_embed_marker(line: &str) -> Option<u64> {
+    const WS: [char; 2] = [' ', '\t'];
+    let s = line.trim_matches(WS);
+    let inner = s.strip_prefix("{{")?.strip_suffix("}}")?;
+    let inner = inner.trim_matches(WS);
+    let digits = inner.strip_prefix("embed")?;
+    if !digits.starts_with(WS) {
+        return None;
+    }
+    let digits = digits.trim_matches(WS);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+/// Replace whole-line `{{ embed N }}` markers in a post's markdown with the
+/// referenced quote rendered as a markdown blockquote — what upstream models
+/// read in place of the marker. Ordinals absent from `snippets` stay literal
+/// (the same honest degradation the editor renders for unmapped markers).
+fn expand_embed_strings(text: &str, snippets: &std::collections::BTreeMap<u64, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match parse_embed_marker(line).and_then(|n| snippets.get(&n)) {
+            Some(snippet) => {
+                for (j, ql) in snippet.split('\n').enumerate() {
+                    if j > 0 {
+                        out.push('\n');
+                    }
+                    out.push_str("> ");
+                    out.push_str(ql);
+                }
+            }
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
 /// Convert space action rows into a sequence of role/content messages suitable
 /// for the OpenAI messages array and for UI display. Groups content blocks by
 /// action and concatenates text.
@@ -5884,6 +6307,7 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
             .entry(b.action_id)
             .or_default()
             .push(PostBlock {
+                id: b.id,
                 block_type: b.block_type,
                 text: b.text_content,
                 tool_name: b.tool_name,
@@ -5921,15 +6345,25 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
                 reply_parent.entry(e.action_id).or_insert(target);
             }
         } else {
+            // Snippet resolution: the quoted block's text was joined into the
+            // edge row; slice it by the stored byte range. A range that no
+            // longer maps honestly resolves to `None` — never truncated or
+            // remapped.
+            let snippet = match (e.range_start, e.range_end, e.block_text.as_deref()) {
+                (Some(rs), Some(re), Some(text)) => quote_snippet(text, rs, re).map(str::to_string),
+                _ => None,
+            };
             references_by_action
                 .entry(e.action_id)
                 .or_default()
                 .push(PostReference {
                     antecedent_action_id: e.antecedent_action_id,
                     ordinal: e.ordinal,
+                    content_block_id: e.content_block_id,
                     range_start: e.range_start,
                     range_end: e.range_end,
                     annotation: e.annotation,
+                    snippet,
                 });
         }
     }
@@ -6684,14 +7118,17 @@ mod tests {
             antecedent_current_action_id: Some(antecedent.into()),
             ordinal: 0,
             relation: "reply".into(),
+            content_block_id: None,
             range_start: None,
             range_end: None,
             annotation: None,
+            block_text: None,
         }
     }
 
     fn text_block(action_id: &str, text: &str) -> db::PostBlockRow {
         db::PostBlockRow {
+            id: format!("cb-{action_id}"),
             action_id: action_id.into(),
             ordinal: 0,
             block_type: "text".into(),
@@ -6741,7 +7178,7 @@ mod tests {
         let root = &tree[0];
         assert_eq!(root.parent_action_id, None);
         assert_eq!(root.relation, None);
-        assert_eq!(root.blocks, vec![text_block_dto("hello")]);
+        assert_eq!(root.blocks, vec![text_block_dto("u1", "hello")]);
 
         let inf = &tree[1];
         assert_eq!(inf.parent_action_id.as_deref(), Some("u1"));
@@ -6750,8 +7187,9 @@ mod tests {
         assert_eq!(inf.model.as_deref(), Some("kimi"));
     }
 
-    fn text_block_dto(text: &str) -> PostBlock {
+    fn text_block_dto(action_id: &str, text: &str) -> PostBlock {
         PostBlock {
+            id: format!("cb-{action_id}"),
             block_type: "text".into(),
             text: Some(text.into()),
             tool_name: None,
@@ -6880,9 +7318,11 @@ mod tests {
                     antecedent_current_action_id: Some("r".into()),
                     ordinal: 1,
                     relation: "reference".into(),
+                    content_block_id: Some("cb-r".into()),
                     range_start: Some(0),
                     range_end: Some(5),
                     annotation: Some("see here".into()),
+                    block_text: Some("hello world".into()),
                 },
             ],
         };
@@ -6894,6 +7334,64 @@ mod tests {
         assert_eq!(a.references[0].antecedent_action_id, "r");
         assert_eq!(a.references[0].range_start, Some(0));
         assert_eq!(a.references[0].annotation.as_deref(), Some("see here"));
+        // Snippet resolves from the joined block text by byte range, and the
+        // embed map keys it by ordinal.
+        assert_eq!(a.references[0].snippet.as_deref(), Some("hello"));
+        assert_eq!(a.embed_map().get(&1).map(String::as_str), Some("hello"));
+    }
+
+    /// `quote_snippet` — the shared range-honesty gate: in-bounds
+    /// char-boundary ranges slice; everything else is `None` (never remapped
+    /// or truncated).
+    #[test]
+    fn quote_snippet_validates_ranges() {
+        assert_eq!(quote_snippet("hello world", 0, 5), Some("hello"));
+        assert_eq!(quote_snippet("hello world", 6, 11), Some("world"));
+        // Degenerate / inverted / out-of-bounds / negative.
+        assert_eq!(quote_snippet("hello", 2, 2), None);
+        assert_eq!(quote_snippet("hello", 3, 2), None);
+        assert_eq!(quote_snippet("hello", 0, 6), None);
+        assert_eq!(quote_snippet("hello", -1, 2), None);
+        // Mid-char boundaries are dishonest: "é" is 2 bytes.
+        assert_eq!(quote_snippet("éx", 1, 3), None);
+        assert_eq!(quote_snippet("éx", 0, 2), Some("é"));
+    }
+
+    /// The embed-marker lexical rule (kept in lockstep with the editor
+    /// plugin's `embed::parse_embed_text` — same cases pinned there).
+    #[test]
+    fn parse_embed_marker_lexical_rules() {
+        // Canonical + whitespace tolerance (spaces/tabs).
+        assert_eq!(parse_embed_marker("{{ embed 0 }}"), Some(0));
+        assert_eq!(parse_embed_marker("{{embed 12}}"), Some(12));
+        assert_eq!(parse_embed_marker("{{\tembed\t7\t}}"), Some(7));
+        assert_eq!(parse_embed_marker("  {{ embed 3 }}  "), Some(3));
+        assert_eq!(parse_embed_marker("{{ embed 007 }}"), Some(7));
+        // Rejections: no separating WS, negative/signed/non-decimal, missing
+        // braces, trailing content, escaped opener, empty ordinal.
+        assert_eq!(parse_embed_marker("{{ embed0 }}"), None);
+        assert_eq!(parse_embed_marker("{{ embed -1 }}"), None);
+        assert_eq!(parse_embed_marker("{{ embed +1 }}"), None);
+        assert_eq!(parse_embed_marker("{{ embed 0x1 }}"), None);
+        assert_eq!(parse_embed_marker("{{ embed }}"), None);
+        assert_eq!(parse_embed_marker("{ embed 0 }"), None);
+        assert_eq!(parse_embed_marker("{{ embed 0 }} tail"), None);
+        assert_eq!(parse_embed_marker("x {{ embed 0 }}"), None);
+        assert_eq!(parse_embed_marker("\\{{ embed 0 }}"), None);
+    }
+
+    /// `expand_embed_strings` — mapped whole-line markers become blockquotes;
+    /// unmapped markers and inline occurrences stay literal.
+    #[test]
+    fn expand_embed_strings_quotes_mapped_markers() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(1u64, "quoted line one\nquoted line two".to_string());
+        let text = "intro\n\n{{ embed 1 }}\n\n{{ embed 2 }}\n\nsee {{ embed 1 }} inline";
+        let out = expand_embed_strings(text, &map);
+        assert_eq!(
+            out,
+            "intro\n\n> quoted line one\n> quoted line two\n\n{{ embed 2 }}\n\nsee {{ embed 1 }} inline"
+        );
     }
 
     /// A reply edge whose target isn't a resolved post (e.g. a non-tip

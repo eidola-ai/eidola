@@ -2,10 +2,19 @@
 
 use std::ops::Range;
 
+use crate::embed::EmbedMap;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorState {
     pub markdown: String,
     pub selection: Selection,
+    /// Host-supplied embed map (see [`crate::embed`]). Render-time state, not
+    /// document content: the buffer always holds the plain `{{ embed N }}`
+    /// marker text, and the map decides which markers materialize as atomic
+    /// embed blocks (mapped) vs stay literal text (unmapped). It rides on the
+    /// state so the pure `update`/`render` pipeline can apply the atomicity
+    /// and promotion rules without a side channel.
+    pub embeds: EmbedMap,
 }
 
 impl EditorState {
@@ -17,6 +26,7 @@ impl EditorState {
         Self {
             markdown: markdown.into(),
             selection: Selection::Cursor(0),
+            embeds: EmbedMap::default(),
         }
     }
 }
@@ -26,6 +36,7 @@ impl Default for EditorState {
         Self {
             markdown: String::new(),
             selection: Selection::Cursor(0),
+            embeds: EmbedMap::default(),
         }
     }
 }

@@ -12,6 +12,7 @@ fn state(md: &str, cursor: usize) -> EditorState {
     EditorState {
         markdown: md.to_string(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     }
 }
 
@@ -597,6 +598,7 @@ mod spec {
         let state = EditorState {
             markdown: src.clone(),
             selection: Selection::Cursor(cursor),
+            ..Default::default()
         };
         let spec = render(&state, &parse(&src));
         let block = table_block(&spec);
@@ -626,6 +628,7 @@ mod spec {
         let state = EditorState {
             markdown: CANONICAL.to_string(),
             selection: Selection::Cursor(2),
+            ..Default::default()
         };
         let spec = render(&state, &parse(CANONICAL));
         let block = table_block(&spec);
@@ -647,6 +650,7 @@ mod spec {
         let state = EditorState {
             markdown: CANONICAL.to_string(),
             selection: Selection::Cursor(2), // even with a caret inside
+            ..Default::default()
         };
         let spec = render_readonly(&state, &parse(CANONICAL));
         let block = table_block(&spec);
@@ -663,6 +667,7 @@ mod spec {
         let state = EditorState {
             markdown: src.to_string(),
             selection: Selection::Cursor(src.len()),
+            ..Default::default()
         };
         let spec = render(&state, &parse(src));
         let block = table_block(&spec);
@@ -688,6 +693,7 @@ mod spec {
         let state = EditorState {
             markdown: src.to_string(),
             selection: Selection::Cursor(src.len()),
+            ..Default::default()
         };
         let spec = render(&state, &parse(src));
         assert!(

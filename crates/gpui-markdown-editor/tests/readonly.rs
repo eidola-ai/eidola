@@ -173,6 +173,7 @@ fn update_readonly_preserves_the_buffer_where_update_normalizes() {
     let state = EditorState {
         markdown: raw.to_string(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let editable = update(
         state.clone(),
@@ -200,6 +201,7 @@ fn editable_pipeline_no_longer_rewrites_tables() {
     let state = EditorState {
         markdown: raw.to_string(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let editable = update(
         state.clone(),
@@ -217,6 +219,7 @@ fn update_readonly_refuses_document_mutations_wholesale() {
     let state = EditorState {
         markdown: raw.to_string(),
         selection: Selection::Range { anchor: 0, head: 4 },
+        ..Default::default()
     };
     let next = update_readonly(state, EditorEvent::DeleteBackward);
     assert_eq!(next.markdown, raw);

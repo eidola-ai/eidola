@@ -59,9 +59,8 @@
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::analysis::{
-    self, count_line_markers, is_forbidden_position, is_in_ranges, is_soft_break,
-    line_depth_ending_at, nearest_allowed_position, next_allowed_position, pair_at_end,
-    pair_at_start, prev_allowed_position,
+    self, count_line_markers, is_in_ranges, is_soft_break, line_depth_ending_at, pair_at_end,
+    pair_at_start,
 };
 use crate::event::EditorEvent;
 use crate::state::{EditorState, Selection};
@@ -200,6 +199,7 @@ pub fn update_readonly(state: EditorState, event: EditorEvent) -> EditorState {
         return EditorState {
             markdown: before_markdown,
             selection: before_selection,
+            embeds: next.embeds,
         };
     }
     avoid_forbidden_positions(next, prev_anchor, prev_head)
@@ -365,6 +365,7 @@ fn apply_table_edit(state: EditorState, te: table::TableEdit) -> EditorState {
     EditorState {
         markdown: state.markdown,
         selection,
+        embeds: state.embeds,
     }
 }
 
@@ -505,6 +506,7 @@ fn inject_unordered_marker_space(state: EditorState, cache: &mut ParseCache) -> 
     EditorState {
         markdown: new_md,
         selection: new_sel,
+        embeds: state.embeds,
     }
 }
 
@@ -648,6 +650,7 @@ fn unify_fence_chain(state: EditorState, cache: &mut ParseCache) -> EditorState 
     EditorState {
         markdown: new_md,
         selection: new_sel,
+        embeds: state.embeds,
     }
 }
 
@@ -837,6 +840,7 @@ fn dedupe_orphan_fence_closer(state: EditorState, cache: &mut ParseCache) -> Edi
     EditorState {
         markdown: new_md,
         selection: new_sel,
+        embeds: state.embeds,
     }
 }
 
@@ -942,6 +946,7 @@ fn apply_edits(state: EditorState, edits: &[analysis::SourceEdit]) -> EditorStat
     EditorState {
         markdown: new_md,
         selection: new_sel,
+        embeds: state.embeds,
     }
 }
 
@@ -1249,6 +1254,7 @@ fn promote_soft_breaks(
     EditorState {
         markdown: new_md,
         selection: new_sel,
+        embeds: state.embeds,
     }
 }
 
@@ -1336,6 +1342,7 @@ fn normalize_blockquote_prefixes(state: EditorState, cache: &mut ParseCache) -> 
     EditorState {
         markdown: new_md,
         selection: new_sel,
+        embeds: state.embeds,
     }
 }
 
@@ -1349,11 +1356,14 @@ fn avoid_forbidden_positions(
     prev_head: usize,
 ) -> EditorState {
     let markdown = state.markdown.clone();
+    let embeds = state.embeds.clone();
     let new_sel = match state.selection {
-        Selection::Cursor(p) => Selection::Cursor(snap_off_forbidden(&markdown, p, prev_head)),
+        Selection::Cursor(p) => {
+            Selection::Cursor(snap_off_forbidden(&markdown, &embeds, p, prev_head))
+        }
         Selection::Range { anchor, head } => {
-            let a = snap_off_forbidden(&markdown, anchor, prev_anchor);
-            let h = snap_off_forbidden(&markdown, head, prev_head);
+            let a = snap_off_forbidden(&markdown, &embeds, anchor, prev_anchor);
+            let h = snap_off_forbidden(&markdown, &embeds, head, prev_head);
             if a == h {
                 Selection::Cursor(h)
             } else {
@@ -1367,14 +1377,19 @@ fn avoid_forbidden_positions(
     }
 }
 
-fn snap_off_forbidden(markdown: &str, pos: usize, prev: usize) -> usize {
-    if !is_forbidden_position(markdown, pos) {
+fn snap_off_forbidden(
+    markdown: &str,
+    embeds: &crate::embed::EmbedMap,
+    pos: usize,
+    prev: usize,
+) -> usize {
+    if !analysis::is_forbidden_position_with(markdown, embeds, pos) {
         return pos;
     }
     if pos < prev {
-        prev_allowed_position(markdown, pos)
+        analysis::prev_allowed_position_with(markdown, embeds, pos)
     } else {
-        next_allowed_position(markdown, pos)
+        analysis::next_allowed_position_with(markdown, embeds, pos)
     }
 }
 
@@ -1417,14 +1432,14 @@ fn insert_newline(state: EditorState) -> EditorState {
     // (analogous to blockquote outdent). This subsumes the
     // "double-Enter exits a list" UX without a dedicated state flag.
     if let Some(edit) = analysis::empty_item_exit_edit(&state.markdown, cursor) {
-        return apply_replace(&state.markdown, edit);
+        return apply_replace(&state, edit);
     }
     // Empty-BQ-paragraph Enter is the analog for blockquotes — drops
     // the innermost BQ scope on the trailing row. Without this, every
     // Enter on an empty `> ` row just adds another empty `> ` pair,
     // and the user has no Enter-only gesture to leave a BQ.
     if let Some(edit) = analysis::empty_bq_paragraph_exit_edit(&state.markdown, cursor) {
-        return apply_replace(&state.markdown, edit);
+        return apply_replace(&state, edit);
     }
     // Auto-close-fence: any Enter inside an unterminated fenced code
     // block injects a matching closer below the cursor, with the
@@ -1433,7 +1448,7 @@ fn insert_newline(state: EditorState) -> EditorState {
     // continuation, BQ-prefix normalize, soft-break exemption) have a
     // single unambiguous truth to read off `is_in_fenced_code`.
     if let Some(edit) = analysis::auto_close_fence_edit(&state.markdown, cursor) {
-        return apply_replace(&state.markdown, edit);
+        return apply_replace(&state, edit);
     }
     // Auto-close-math: same shape as auto-close-fence but for an
     // unterminated block-level `$$..$$` construct. Fires on the first
@@ -1442,7 +1457,7 @@ fn insert_newline(state: EditorState) -> EditorState {
     // can rely on the math block being terminated and verbatim from
     // here on.
     if let Some(edit) = analysis::auto_close_math_edit(&state.markdown, cursor) {
-        return apply_replace(&state.markdown, edit);
+        return apply_replace(&state, edit);
     }
     let insertion = analysis::enter_insertion(&state.markdown, cursor);
     insert_text(state, &insertion)
@@ -1494,7 +1509,8 @@ fn decrease_list_depth(state: EditorState) -> EditorState {
     apply_edits(state, &edits)
 }
 
-fn apply_replace(markdown: &str, edit: analysis::DepthDecreaseEdit) -> EditorState {
+fn apply_replace(state: &EditorState, edit: analysis::DepthDecreaseEdit) -> EditorState {
+    let markdown = &state.markdown;
     let mut buf = String::with_capacity(
         markdown.len() - (edit.range.end - edit.range.start) + edit.replacement.len(),
     );
@@ -1504,6 +1520,7 @@ fn apply_replace(markdown: &str, edit: analysis::DepthDecreaseEdit) -> EditorSta
     EditorState {
         markdown: buf,
         selection: Selection::Cursor(edit.cursor),
+        embeds: state.embeds.clone(),
     }
 }
 
@@ -1573,6 +1590,7 @@ fn insert_text(state: EditorState, text: &str) -> EditorState {
                 let mid = EditorState {
                     markdown: md,
                     selection: Selection::Cursor(cursor),
+                    embeds: state.embeds.clone(),
                 };
                 if !table::is_escaped_at(mid.markdown.as_bytes(), cursor)
                     && let Some(geo) = table_context(&mid.markdown, cursor)
@@ -1589,6 +1607,7 @@ fn insert_text(state: EditorState, text: &str) -> EditorState {
     EditorState {
         markdown: buf,
         selection: Selection::Cursor(cursor + text.len()),
+        embeds: state.embeds,
     }
 }
 
@@ -1619,6 +1638,7 @@ fn paste(state: EditorState, text: &str, internal: bool) -> EditorState {
     let mid = EditorState {
         markdown: md,
         selection: Selection::Cursor(cursor),
+        embeds: state.embeds.clone(),
     };
     if table_context(&mid.markdown, cursor).is_some() {
         return insert_text(mid, &table_cell_paste_text(text));
@@ -1686,6 +1706,7 @@ fn plain_paste(state: EditorState, text: &str) -> EditorState {
     let mid = EditorState {
         markdown: md,
         selection: Selection::Cursor(cursor),
+        embeds: state.embeds.clone(),
     };
     if table_context(&mid.markdown, cursor).is_some() {
         // Inside a table cell "plain" still means "stay one cell" —
@@ -2094,11 +2115,20 @@ fn delete_backward(state: EditorState) -> EditorState {
         return EditorState {
             markdown: buf,
             selection: Selection::Cursor(cursor),
+            embeds: state.embeds,
         };
     }
     let cursor = state.selection.head();
     if cursor == 0 {
         return state;
+    }
+
+    // Embed delete-as-unit: the caret at a mapped `{{ embed N }}` block's
+    // trailing edge deletes the whole marker in one step — the block is
+    // atomic (its interior is caret-forbidden), so the edge is the only place
+    // a delete can address it. Word-delete takes the same one-unit rule.
+    if let Some(block) = crate::embed::embed_ending_at(&state.markdown, &state.embeds, cursor) {
+        return splice(&state, cursor, block.range.start, block.range.end);
     }
 
     // Table Backspace at a structural point: an empty body row is
@@ -2159,7 +2189,7 @@ fn delete_backward(state: EditorState) -> EditorState {
     // path instead.
     let bytes = state.markdown.as_bytes();
     if !analysis::is_in_verbatim_region(&state.markdown, cursor) {
-        let snapped = next_allowed_position(&state.markdown, cursor);
+        let snapped = analysis::next_allowed_position_with(&state.markdown, &state.embeds, cursor);
         // Blockquote outdent: at the start of a non-first paragraph
         // inside a BQ, Backspace pops one level of nesting from
         // *both halves* of the preceding `\n[prefix]\n[prefix]` pair
@@ -2175,9 +2205,9 @@ fn delete_backward(state: EditorState) -> EditorState {
         if let Some((above, below)) = analysis::bq_paragraph_outdent(bytes, snapped) {
             // Apply right-to-left so the earlier range's offsets
             // don't need to be remapped.
-            let after_below = splice(&state.markdown, cursor, below.start, below.end);
+            let after_below = splice(&state, cursor, below.start, below.end);
             return splice(
-                &after_below.markdown,
+                &after_below,
                 after_below.selection.head(),
                 above.start,
                 above.end,
@@ -2187,7 +2217,7 @@ fn delete_backward(state: EditorState) -> EditorState {
         // top-level `\n\n` paragraph break, Backspace removes the
         // whole pair in one step, merging the two paragraphs.
         if let Some(pair_start) = pair_at_end(bytes, snapped) {
-            return splice(&state.markdown, cursor, pair_start, snapped);
+            return splice(&state, cursor, pair_start, snapped);
         }
         // Chain-aware BQ outdent: the BQ-only walker above
         // (`bq_paragraph_outdent`) doesn't see pairs whose prefix
@@ -2235,6 +2265,7 @@ fn delete_backward(state: EditorState) -> EditorState {
             return EditorState {
                 markdown: buf,
                 selection: Selection::Cursor(new_cursor),
+                embeds: state.embeds,
             };
         }
         // LI-trailing pair (no BQ at the chain's end but possibly BQs
@@ -2249,7 +2280,7 @@ fn delete_backward(state: EditorState) -> EditorState {
             Some(analysis::EnclosingContainer::ListItem(_))
         ) && let Some(pair_start) = analysis::pair_at_end_for_chain(bytes, snapped, &chain)
         {
-            return splice(&state.markdown, cursor, pair_start, snapped);
+            return splice(&state, cursor, pair_start, snapped);
         }
     }
 
@@ -2283,7 +2314,7 @@ fn delete_backward(state: EditorState) -> EditorState {
             prev_line_start -= 1;
         }
         if is_prefix_only_line(bytes, prev_line_start, cursor_line_end) {
-            return splice(&state.markdown, cursor, prev_line_start, cursor);
+            return splice(&state, cursor, prev_line_start, cursor);
         }
     }
 
@@ -2311,12 +2342,12 @@ fn delete_backward(state: EditorState) -> EditorState {
             && line_start < line_end
             && is_prefix_only_line(bytes, line_start, line_end)
         {
-            return splice(&state.markdown, cursor, line_start - 1, cursor);
+            return splice(&state, cursor, line_start - 1, cursor);
         }
     }
 
     let prev = prev_grapheme_offset(&state.markdown, cursor);
-    splice(&state.markdown, cursor, prev, cursor)
+    splice(&state, cursor, prev, cursor)
 }
 
 /// `true` when the byte range `[start, end)` consists only of BQ
@@ -2340,11 +2371,16 @@ fn delete_forward(state: EditorState) -> EditorState {
         return EditorState {
             markdown: buf,
             selection: Selection::Cursor(cursor),
+            embeds: state.embeds,
         };
     }
     let cursor = state.selection.head();
     if cursor >= state.markdown.len() {
         return state;
+    }
+    // Embed delete-as-unit (forward twin — see delete_backward).
+    if let Some(block) = crate::embed::embed_starting_at(&state.markdown, &state.embeds, cursor) {
+        return splice(&state, cursor, block.range.start, block.range.end);
     }
 
     // Table delete-forward at a cell's content end hops to the next
@@ -2364,9 +2400,9 @@ fn delete_forward(state: EditorState) -> EditorState {
 
     let bytes = state.markdown.as_bytes();
     if !analysis::is_in_verbatim_region(&state.markdown, cursor) {
-        let snapped = prev_allowed_position(&state.markdown, cursor);
+        let snapped = analysis::prev_allowed_position_with(&state.markdown, &state.embeds, cursor);
         if let Some(pair_end) = pair_at_start(bytes, snapped) {
-            return splice(&state.markdown, cursor, snapped, pair_end);
+            return splice(&state, cursor, snapped, pair_end);
         }
         // Chain-aware atomic pair delete (forward analog of the
         // backward path in `delete_backward`). See the comment there
@@ -2376,12 +2412,12 @@ fn delete_forward(state: EditorState) -> EditorState {
         if !chain.is_empty()
             && let Some(pair_end) = analysis::pair_at_start_for_chain(bytes, snapped, &chain)
         {
-            return splice(&state.markdown, cursor, snapped, pair_end);
+            return splice(&state, cursor, snapped, pair_end);
         }
     }
 
     let next = next_grapheme_offset(&state.markdown, cursor);
-    splice(&state.markdown, cursor, cursor, next)
+    splice(&state, cursor, cursor, next)
 }
 
 /// Delete from the start of the previous word through the cursor.
@@ -2406,11 +2442,19 @@ fn delete_word_backward(state: EditorState) -> EditorState {
         return EditorState {
             markdown: buf,
             selection: Selection::Cursor(cursor),
+            embeds: state.embeds,
         };
     }
     let cursor = state.selection.head();
     if cursor == 0 {
         return state;
+    }
+    // Embed delete-as-unit: the caret at a mapped `{{ embed N }}` block's
+    // trailing edge deletes the whole marker in one step — the block is
+    // atomic (its interior is caret-forbidden), so the edge is the only place
+    // a delete can address it. Word-delete takes the same one-unit rule.
+    if let Some(block) = crate::embed::embed_ending_at(&state.markdown, &state.embeds, cursor) {
+        return splice(&state, cursor, block.range.start, block.range.end);
     }
     let mut target = prev_word_offset(&state.markdown, cursor);
     let prefix_end = analysis::line_chain_prefix_end(&state.markdown, cursor);
@@ -2436,7 +2480,7 @@ fn delete_word_backward(state: EditorState) -> EditorState {
     if target >= cursor {
         return state;
     }
-    splice(&state.markdown, cursor, target, cursor)
+    splice(&state, cursor, target, cursor)
 }
 
 /// Forward analog of [`delete_word_backward`] — delete from the cursor
@@ -2454,11 +2498,16 @@ fn delete_word_forward(state: EditorState) -> EditorState {
         return EditorState {
             markdown: buf,
             selection: Selection::Cursor(cursor),
+            embeds: state.embeds,
         };
     }
     let cursor = state.selection.head();
     if cursor >= state.markdown.len() {
         return state;
+    }
+    // Embed delete-as-unit (forward twin — see delete_backward).
+    if let Some(block) = crate::embed::embed_starting_at(&state.markdown, &state.embeds, cursor) {
+        return splice(&state, cursor, block.range.start, block.range.end);
     }
     let mut target = next_word_offset(&state.markdown, cursor);
     let cursor_line_end = line_end_offset(&state.markdown, cursor);
@@ -2488,7 +2537,7 @@ fn delete_word_forward(state: EditorState) -> EditorState {
     if target <= cursor {
         return state;
     }
-    splice(&state.markdown, cursor, cursor, target)
+    splice(&state, cursor, cursor, target)
 }
 
 /// Delete from the cursor back to the *visible content edge* of the
@@ -2510,6 +2559,7 @@ fn delete_to_line_start(state: EditorState) -> EditorState {
         return EditorState {
             markdown: buf,
             selection: Selection::Cursor(cursor),
+            embeds: state.embeds,
         };
     }
     let cursor = state.selection.head();
@@ -2517,7 +2567,7 @@ fn delete_to_line_start(state: EditorState) -> EditorState {
     if prefix_end >= cursor {
         return state;
     }
-    splice(&state.markdown, cursor, prefix_end, cursor)
+    splice(&state, cursor, prefix_end, cursor)
 }
 
 /// Delete from the cursor forward to the end of the current line
@@ -2533,6 +2583,7 @@ fn delete_to_line_end(state: EditorState) -> EditorState {
         return EditorState {
             markdown: buf,
             selection: Selection::Cursor(cursor),
+            embeds: state.embeds,
         };
     }
     let cursor = state.selection.head();
@@ -2540,7 +2591,7 @@ fn delete_to_line_end(state: EditorState) -> EditorState {
     if target <= cursor {
         return state;
     }
-    splice(&state.markdown, cursor, cursor, target)
+    splice(&state, cursor, cursor, target)
 }
 
 /// Splice out `[del_start, del_end)` from `markdown` and re-anchor the
@@ -2548,7 +2599,8 @@ fn delete_to_line_end(state: EditorState) -> EditorState {
 /// current head; the returned state collapses any range selection to a
 /// cursor (which is fine for our delete callers — they all operate on
 /// collapsed selections after the range-delete-and-return early exit).
-fn splice(markdown: &str, cursor: usize, del_start: usize, del_end: usize) -> EditorState {
+fn splice(state: &EditorState, cursor: usize, del_start: usize, del_end: usize) -> EditorState {
+    let markdown = &state.markdown;
     let mut buf = String::with_capacity(markdown.len() - (del_end - del_start));
     buf.push_str(&markdown[..del_start]);
     buf.push_str(&markdown[del_end..]);
@@ -2562,6 +2614,7 @@ fn splice(markdown: &str, cursor: usize, del_start: usize, del_end: usize) -> Ed
     EditorState {
         markdown: buf,
         selection: Selection::Cursor(new_cursor),
+        embeds: state.embeds.clone(),
     }
 }
 
@@ -2590,10 +2643,14 @@ fn set_selection(state: EditorState, sel: Selection) -> EditorState {
     // sees the previously-snapped position as `prev`. Nearest-allowed
     // is idempotent: same input → same output.
     let final_sel = match on_boundaries {
-        Selection::Cursor(p) => Selection::Cursor(nearest_allowed_position(&state.markdown, p)),
+        Selection::Cursor(p) => Selection::Cursor(analysis::nearest_allowed_position_with(
+            &state.markdown,
+            &state.embeds,
+            p,
+        )),
         Selection::Range { anchor, head } => {
-            let a = nearest_allowed_position(&state.markdown, anchor);
-            let h = nearest_allowed_position(&state.markdown, head);
+            let a = analysis::nearest_allowed_position_with(&state.markdown, &state.embeds, anchor);
+            let h = analysis::nearest_allowed_position_with(&state.markdown, &state.embeds, head);
             if a == h {
                 Selection::Cursor(h)
             } else {
@@ -2642,9 +2699,11 @@ fn move_(state: EditorState, direction: Move, extending: bool) -> EditorState {
         // `line_end` (line-end is always allowed); so a line composed
         // entirely of hidden prefix bytes lands at the line terminus
         // and Home never crosses a `\n`.
-        Move::LineStart => {
-            next_allowed_position(&state.markdown, line_start_offset(&state.markdown, head))
-        }
+        Move::LineStart => analysis::next_allowed_position_with(
+            &state.markdown,
+            &state.embeds,
+            line_start_offset(&state.markdown, head),
+        ),
         Move::LineEnd => line_end_offset(&state.markdown, head),
         Move::DocStart => 0,
         Move::DocEnd => state.markdown.len(),
@@ -2923,6 +2982,7 @@ mod tests {
         EditorState {
             markdown: s.into(),
             selection: Selection::Cursor(cursor),
+            ..Default::default()
         }
     }
 
@@ -2949,6 +3009,7 @@ mod tests {
         let initial = EditorState {
             markdown: "abcdef".into(),
             selection: Selection::range(1, 4),
+            ..Default::default()
         };
         let s = update(initial, EditorEvent::InsertText("XX".into()));
         assert_eq!(s.markdown, "aXXef");
@@ -3000,6 +3061,7 @@ mod tests {
         let initial = EditorState {
             markdown: "abcdef".into(),
             selection: Selection::range(1, 4),
+            ..Default::default()
         };
         let s = update(initial, EditorEvent::MoveLeft);
         assert_eq!(s.selection, Selection::Cursor(1));
@@ -3067,6 +3129,7 @@ mod invariant_tests {
         EditorState {
             markdown: s.into(),
             selection: Selection::Cursor(cursor),
+            ..Default::default()
         }
     }
 
@@ -3160,6 +3223,7 @@ mod invariant_tests {
         let s = enforce_invariants(EditorState {
             markdown: "ab\ncd".into(),
             selection: Selection::range(0, 5),
+            ..Default::default()
         });
         assert_eq!(s.markdown, "ab\n\ncd");
         assert_eq!(s.selection, Selection::range(0, 6));
@@ -3244,6 +3308,7 @@ mod invariant_tests {
         let init = EditorState {
             markdown: "```\nABCD\n```".into(),
             selection: Selection::range(5, 7),
+            ..Default::default()
         };
         let s = update(init, paste("X\nY"));
         assert_eq!(s.markdown, "```\nAX\nYD\n```");
@@ -3332,6 +3397,7 @@ mod invariant_tests {
         let init = EditorState {
             markdown: "- ```\n  \n  ```".into(),
             selection: Selection::Cursor(8),
+            ..Default::default()
         };
         let s = update(init, paste("a\nb"));
         assert_eq!(s.markdown, "- ```\n  a\n  b\n  ```");
@@ -3407,6 +3473,7 @@ mod invariant_tests {
         let init = EditorState {
             markdown: "> existing".into(),
             selection: Selection::Cursor(10),
+            ..Default::default()
         };
         let s = update(init, paste("more"));
         assert_eq!(s.markdown, "> existingmore");
@@ -3422,6 +3489,7 @@ mod invariant_tests {
         let init = EditorState {
             markdown: "> outer".into(),
             selection: Selection::Cursor(7),
+            ..Default::default()
         };
         let s = update(init, paste("> quoted"));
         assert_eq!(s.markdown, "> outer\n> \n> > quoted");
@@ -3435,6 +3503,7 @@ mod invariant_tests {
         let init = EditorState {
             markdown: "- outer".into(),
             selection: Selection::Cursor(7),
+            ..Default::default()
         };
         let s = update(init, paste("- inner"));
         assert_eq!(s.markdown, "- outer\n\n  - inner");
@@ -3578,6 +3647,7 @@ mod invariant_tests {
         let init = EditorState {
             markdown: "> existing".into(),
             selection: Selection::Cursor(10),
+            ..Default::default()
         };
         let s = update(init, paste_plain("\nmore"));
         assert_eq!(s.markdown, "> existing\n> \n> more");
@@ -3631,6 +3701,7 @@ mod invariant_tests {
         let init = EditorState {
             markdown: "before MIDDLE after".into(),
             selection: Selection::range(7, 13),
+            ..Default::default()
         };
         let s = update(init, paste_plain("X\nY"));
         assert_eq!(s.markdown, "before X\n\nY after");
@@ -3840,6 +3911,7 @@ mod invariant_tests {
         let initial = EditorState {
             markdown: "ab\n\ncd".into(),
             selection: Selection::range(1, 5),
+            ..Default::default()
         };
         let s = update(initial, EditorEvent::InsertText("X".into()));
         assert_eq!(s.markdown, "aXd");
@@ -3855,6 +3927,7 @@ mod invariant_tests {
         let initial = EditorState {
             markdown: "ab\n\ncd".into(),
             selection: Selection::range(2, 3),
+            ..Default::default()
         };
         let s = update(initial, EditorEvent::DeleteForward);
         assert_eq!(s.markdown, "ab\n\ncd");
@@ -3963,11 +4036,13 @@ mod invariant_tests {
 #[cfg(test)]
 mod forbidden_position_tests {
     use super::*;
+    use crate::analysis::is_forbidden_position;
 
     fn st(s: &str, cursor: usize) -> EditorState {
         EditorState {
             markdown: s.into(),
             selection: Selection::Cursor(cursor),
+            embeds: crate::embed::EmbedMap::default(),
         }
     }
 
@@ -4246,6 +4321,7 @@ mod forbidden_position_tests {
         let initial = EditorState {
             markdown: "p1\n\n\n\np2".into(),
             selection: Selection::Cursor(0),
+            ..Default::default()
         };
         let s = update(
             initial,
