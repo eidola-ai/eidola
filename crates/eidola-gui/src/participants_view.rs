@@ -115,6 +115,11 @@ pub struct ParticipantsView {
     /// Tracks the roster body scroll so the right-edge overlay indicator can
     /// bind to it (shown only while scrolling).
     body_scroll: ScrollHandle,
+    /// Tracks the open model-picker dropdown's own (nested) scroll, so its
+    /// overlay indicator binds independently of the roster body. One handle
+    /// suffices — at most one picker is open at a time; it's reset to the top
+    /// on each open.
+    picker_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -150,6 +155,7 @@ impl ParticipantsView {
             template_form: None,
             picker: None,
             body_scroll: ScrollHandle::new(),
+            picker_scroll: ScrollHandle::new(),
             _subscriptions: subs,
         }
     }
@@ -509,9 +515,20 @@ impl ParticipantsView {
         self.picker = if self.picker == Some(target) {
             None
         } else {
+            // A freshly opened picker starts at the top.
+            self.picker_scroll = ScrollHandle::new();
             Some(target)
         };
         cx.notify();
+    }
+
+    /// Test seam: open the add form's model picker (the nested dropdown), so a
+    /// render-smoke can draw the picker with its overlay indicator bound.
+    #[doc(hidden)]
+    pub fn open_add_picker_for_test(&mut self, cx: &mut Context<Self>) {
+        if self.picker != Some(PickerTarget::Add) {
+            self.toggle_picker(PickerTarget::Add, cx);
+        }
     }
 
     /// Test seam: select a model into the active form (edit or add).
@@ -639,11 +656,15 @@ pub(crate) fn model_groups(
 /// A model-picker dropdown field shared by the Participants view and Templates
 /// pane: a button showing the current model, plus (when `open`) a grouped list
 /// of selectable models. `on_pick` receives the chosen model id.
+// Distinct, non-groupable params (data, open-state, the picker's scroll handle,
+// two callbacks) — a config struct would obscure more than it'd tidy.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn model_field<V: 'static>(
     stores: &Stores,
     current: Option<&str>,
     open: bool,
     probe_prefix: SharedString,
+    picker_scroll: &ScrollHandle,
     cx: &Context<V>,
     on_toggle: impl Fn(&mut V, &gpui::ClickEvent, &mut Window, &mut Context<V>) + 'static,
     on_pick: impl Fn(&str, &mut V, &mut Context<V>) + Clone + 'static,
@@ -705,6 +726,7 @@ pub(crate) fn model_field<V: 'static>(
             .w_full()
             .max_h(px(220.))
             .overflow_y_scroll()
+            .track_scroll(picker_scroll)
             .py_1()
             .rounded_md()
             .border_1()
@@ -753,7 +775,13 @@ pub(crate) fn model_field<V: 'static>(
                 );
             }
         }
-        col = col.child(menu);
+        // The dropdown overflows its max-height with enough models, scrolling
+        // independently of the roster body — so it carries its own overlay
+        // indicator, a sibling of the scroll container inside a `relative`
+        // wrapper (a bounded popover, so no window-corner clearance).
+        col = col.child(div().relative().w_full().child(menu).child(
+            crate::scrollbar::vertical_floating("model-picker-scrollbar", picker_scroll),
+        ));
     }
     col.into_any_element()
 }
@@ -1295,6 +1323,7 @@ impl ParticipantsView {
             current,
             open,
             probe_prefix,
+            &self.picker_scroll,
             cx,
             move |this, _, _, cx| this.toggle_picker(target, cx),
             |id, this, cx| this.select_model(id, cx),

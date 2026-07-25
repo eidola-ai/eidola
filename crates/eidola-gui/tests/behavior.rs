@@ -2028,8 +2028,24 @@ fn updates_renders_with_scroll_indicator(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn participants_renders_with_scroll_indicator(cx: &mut TestAppContext) {
-    let stores = stub_stores_with_config(cx);
-    let (window, _view) = open_view(cx, |window, cx| {
+    // Seed enough eidola-catalog models that the model-picker dropdown
+    // overflows its 220px max-height — the nested scroller whose own overlay
+    // indicator this exercises (a Codex P1 on PR #232). The draw below opens
+    // the add form + picker; a mis-bound picker handle would panic here.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.models = (0..12)
+            .map(|i| eidola_app_core::ModelInfo {
+                id: format!("model-{i:02}"),
+                context_length: 131_072,
+                prompt_credits_per_token: 1.0,
+                completion_credits_per_token: 2.0,
+                request_credits: None,
+            })
+            .collect();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| {
             ParticipantsView::new(
                 stores.clone(),
@@ -2040,6 +2056,17 @@ fn participants_renders_with_scroll_indicator(cx: &mut TestAppContext) {
             )
         })
     });
+    // Roster body indicator.
+    draw_frame(cx, window);
+    // Open the add form + its overflowing model picker; the picker's own
+    // overlay indicator binds to `picker_scroll`.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.begin_add(window, cx);
+            v.open_add_picker_for_test(cx);
+        });
+    })
+    .unwrap();
     draw_frame(cx, window);
 }
 
