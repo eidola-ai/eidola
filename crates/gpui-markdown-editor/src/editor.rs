@@ -39,6 +39,11 @@ use crate::update;
 /// shared key into the host's own bookkeeping.
 pub type EmbedClickHandler = Rc<dyn Fn(u64, &mut Window, &mut App)>;
 
+/// Host callback for a click on host-supplied highlighted text (see
+/// [`crate::highlight`]): receives the keys of every highlight range
+/// containing the clicked offset. The editor never interprets the keys.
+pub type HighlightClickHandler = Rc<dyn Fn(&[u64], &mut Window, &mut App)>;
+
 /// Submit-intent action carrying the modifier state at the time Enter was
 /// pressed (mirrors gpui-component's `input::Enter`). The host binds the
 /// modified chords — `cmd-enter`, `cmd-shift-enter` — to this with the
@@ -309,6 +314,20 @@ pub struct MarkdownEditorState {
     /// from the element's `.on_embed_click(..)` prop each frame; the editor
     /// only reports the ordinal, never interprets it.
     pub(crate) on_embed_click: Option<EmbedClickHandler>,
+    /// Host-supplied highlight ranges (see [`crate::highlight`]) — inert
+    /// decorations painted as a quiet wash behind the covered text. Entity
+    /// state (not [`EditorState`]): the pure update/render pipeline never
+    /// consults them, only the element's paint (and the click hit-test) do.
+    pub(crate) highlights: crate::highlight::HighlightSet,
+    /// Host callback for a plain click on highlighted text. Synced from the
+    /// element's `.on_highlight_click(..)` prop each frame.
+    pub(crate) on_highlight_click: Option<HighlightClickHandler>,
+    /// The source offset of an in-progress press that started on highlighted
+    /// text (single click, no shift). Consumed on mouse-up: if the press
+    /// resolved as a plain click (the selection is still collapsed — no drag
+    /// created a range), the highlight click callback fires. A drag across a
+    /// highlight therefore selects normally and never navigates.
+    highlight_press: Option<usize>,
     is_selecting: bool,
     /// Granularity the active pointer drag extends by (set from the mouse-down
     /// click count — see [`SelectMode`]).
@@ -397,6 +416,9 @@ impl MarkdownEditorState {
             focus_handle,
             disabled: false,
             on_embed_click: None,
+            highlights: crate::highlight::HighlightSet::default(),
+            on_highlight_click: None,
+            highlight_press: None,
             is_selecting: false,
             select_mode: SelectMode::Char,
             select_anchor_range: 0..0,
@@ -587,6 +609,132 @@ impl MarkdownEditorState {
     /// The current embed map.
     pub fn embeds(&self) -> &crate::embed::EmbedMap {
         &self.state.embeds
+    }
+
+    /// Supply the highlight ranges — `(source-byte range, opaque key)` pairs
+    /// (see [`crate::highlight`] for the plugin contract). Render-time
+    /// decoration only: the buffer is untouched (no
+    /// [`MarkdownEditorEvent::Change`]), no caret position becomes forbidden,
+    /// and editing/selection are unaffected — the view just re-renders with
+    /// the wash. Overlapping ranges merge visually at paint time.
+    pub fn set_highlights(
+        &mut self,
+        entries: impl IntoIterator<Item = (std::ops::Range<usize>, u64)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.highlights = crate::highlight::HighlightSet::new(entries);
+        cx.notify();
+    }
+
+    /// The current highlight set.
+    pub fn highlights(&self) -> &crate::highlight::HighlightSet {
+        &self.highlights
+    }
+
+    /// Insert the canonical `{{ embed N }}` marker as its **own top-level
+    /// paragraph** at the caret (host API — the quote-creation seam). The
+    /// marker only renders as an embed block when it stands as a
+    /// blank-line-delimited paragraph, so the insertion pads with the blank
+    /// lines the surrounding bytes are missing. Routed through the normal
+    /// update pipeline ([`EditorEvent::InsertText`]), so it replaces any
+    /// active selection, records one undo step, and emits
+    /// [`MarkdownEditorEvent::Change`]. (Inside a verbatim region the marker
+    /// lands as literal text — the documented honest degradation.)
+    pub fn insert_embed_marker(&mut self, ordinal: u64, cx: &mut Context<Self>) {
+        let md = &self.state.markdown;
+        let mut sel = self.state.selection.selection_range();
+        sel.start = sel.start.min(md.len());
+        sel.end = sel.end.min(md.len());
+        // Swallow spaces/tabs adjacent to the splice on any side that gets
+        // structural padding, so the neighboring paragraphs come out clean
+        // (no trailing-space paragraph before the marker, no leading-space
+        // one after it).
+        let pad_before = {
+            let before = &md[..sel.start];
+            let trimmed = before.trim_end_matches([' ', '\t']);
+            if trimmed.is_empty() || trimmed.ends_with("\n\n") {
+                None
+            } else if trimmed.ends_with('\n') {
+                Some("\n")
+            } else {
+                Some("\n\n")
+            }
+        };
+        let pad_after = {
+            let after = &md[sel.end..];
+            let trimmed = after.trim_start_matches([' ', '\t']);
+            if trimmed.is_empty() || trimmed.starts_with("\n\n") {
+                None
+            } else if trimmed.starts_with('\n') {
+                Some("\n")
+            } else {
+                Some("\n\n")
+            }
+        };
+        let ws = |b: u8| b == b' ' || b == b'\t';
+        while sel.start > 0 && ws(md.as_bytes()[sel.start - 1]) {
+            sel.start -= 1;
+        }
+        while sel.end < md.len() && ws(md.as_bytes()[sel.end]) {
+            sel.end += 1;
+        }
+        self.state.selection = if sel.start == sel.end {
+            Selection::Cursor(sel.start)
+        } else {
+            Selection::range(sel.start, sel.end)
+        };
+
+        let mut text = String::new();
+        if let Some(pad) = pad_before {
+            text.push_str(pad);
+        }
+        text.push_str(&crate::embed::embed_marker(ordinal));
+        if let Some(pad) = pad_after {
+            text.push_str(pad);
+        }
+        self.dispatch(EditorEvent::InsertText(text), cx);
+    }
+
+    /// Remove the `{{ embed N }}` marker for `ordinal` — the symmetric twin of
+    /// [`Self::insert_embed_marker`], and the host's only way to un-place an
+    /// embed without rewriting the whole buffer.
+    ///
+    /// Only a **recognized** embed block is removed (the marker must be mapped
+    /// in the current embed set and stand as its own top-level paragraph), so
+    /// the ordinal must still be in the map when this is called — clear it
+    /// from the map afterwards, not before. The marker's paragraph goes, along
+    /// with the blank line that separated it from a neighbour, leaving the
+    /// surrounding prose joined as if the embed had never been placed. Routed
+    /// through the normal update pipeline, so it is one undo step and emits
+    /// [`MarkdownEditorEvent::Change`]. A no-op when no such block exists.
+    pub fn remove_embed_marker(&mut self, ordinal: u64, cx: &mut Context<Self>) {
+        let md = &self.state.markdown;
+        let Some(block) = crate::embed::embed_blocks(md, &self.state.embeds)
+            .into_iter()
+            .find(|b| b.ordinal == ordinal)
+        else {
+            return;
+        };
+        let (mut start, mut end) = (block.range.start, block.range.end);
+        // Swallow exactly one paragraph separator so the neighbours rejoin as
+        // they were: the **trailing** blank-line run when there is one (the
+        // leading run then separates the surviving neighbours), otherwise the
+        // leading run (a trailing embed must not leave the body ending in
+        // blank lines).
+        let bytes = md.as_bytes();
+        let mut after = end;
+        while after < md.len() && (bytes[after] == b'\n' || bytes[after] == b'\r') {
+            after += 1;
+        }
+        if after > end {
+            end = after;
+        } else {
+            while start > 0 && (bytes[start - 1] == b'\n' || bytes[start - 1] == b'\r') {
+                start -= 1;
+            }
+        }
+        self.state.selection = Selection::range(start, end);
+        self.dispatch(EditorEvent::InsertText(String::new()), cx);
     }
 
     /// Drive the internal update pipeline with a raw [`EditorEvent`], the way
@@ -1398,6 +1546,14 @@ impl MarkdownEditorState {
             cb(ordinal, window, cx);
         }
         let offset = self.offset_for_position(event.position);
+        // A single unmodified press on highlighted text arms the highlight
+        // click; the callback fires on mouse-up only if no drag created a
+        // selection range in between (see `highlight_press`).
+        self.highlight_press = (event.click_count == 1
+            && !event.modifiers.shift
+            && self.on_highlight_click.is_some()
+            && !self.highlights.keys_at(offset).is_empty())
+        .then_some(offset);
         self.begin_selection(offset, event.click_count, event.modifiers.shift, cx);
     }
 
@@ -1473,8 +1629,19 @@ impl MarkdownEditorState {
         self.dispatch(EditorEvent::SetSelection(new_sel), cx);
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.is_selecting = false;
+        // Resolve an armed highlight press: a plain click (no drag range)
+        // reports the keys of every range containing the pressed offset.
+        if let Some(offset) = self.highlight_press.take()
+            && self.state.selection.is_collapsed()
+            && let Some(cb) = self.on_highlight_click.clone()
+        {
+            let keys = self.highlights.keys_at(offset);
+            if !keys.is_empty() {
+                cb(&keys, window, cx);
+            }
+        }
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1818,6 +1985,7 @@ pub struct MarkdownEditor {
     disabled: bool,
     min_height: Option<Pixels>,
     on_embed_click: Option<EmbedClickHandler>,
+    on_highlight_click: Option<HighlightClickHandler>,
 }
 
 impl MarkdownEditor {
@@ -1829,6 +1997,7 @@ impl MarkdownEditor {
             disabled: false,
             min_height: None,
             on_embed_click: None,
+            on_highlight_click: None,
         }
     }
 
@@ -1873,6 +2042,19 @@ impl MarkdownEditor {
         self.on_embed_click = Some(Rc::new(callback));
         self
     }
+
+    /// Host callback for a plain click on host-supplied highlighted text (see
+    /// [`crate::highlight`]): receives the keys of every highlight range
+    /// containing the clicked offset. A drag over a highlight selects text
+    /// normally and never fires this. Registered on both editable and
+    /// read-only editors; the editor never interprets the keys.
+    pub fn on_highlight_click(
+        mut self,
+        callback: impl Fn(&[u64], &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_highlight_click = Some(Rc::new(callback));
+        self
+    }
 }
 
 impl RenderOnce for MarkdownEditor {
@@ -1881,9 +2063,11 @@ impl RenderOnce for MarkdownEditor {
         // IME handler can honor it). Block elements re-populate `last_blocks`
         // during paint; `frame_input_handler_set` re-arms IME registration.
         let embed_cb = self.on_embed_click.clone();
+        let highlight_cb = self.on_highlight_click.clone();
         self.state.update(cx, |st, _| {
             st.disabled = self.disabled;
             st.on_embed_click = embed_cb;
+            st.on_highlight_click = highlight_cb;
             st.last_blocks.clear();
             st.frame_input_handler_set = false;
             st.last_bounds = None;
