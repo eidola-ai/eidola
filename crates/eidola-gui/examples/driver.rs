@@ -722,6 +722,65 @@ mod driver {
                 completion_credits_per_token: 5.25,
                 request_credits: None,
             },
+            // Enough further models that the picker dropdown overflows its
+            // max-height and scrolls independently of the roster body — the QA
+            // fixture for the picker's own scroll indicator.
+            ModelInfo {
+                id: "llama4-scout".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 0.8,
+                completion_credits_per_token: 2.4,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "deepseek-v3".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 1.2,
+                completion_credits_per_token: 3.0,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "mistral-large-3".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 1.5,
+                completion_credits_per_token: 4.5,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "gpt-oss-120b".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 1.1,
+                completion_credits_per_token: 3.3,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "phi5-moe".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 0.4,
+                completion_credits_per_token: 1.2,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "command-r-plus-2".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 1.3,
+                completion_credits_per_token: 3.9,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "yi-large-2".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 0.9,
+                completion_credits_per_token: 2.7,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "glm-5-air".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 0.6,
+                completion_credits_per_token: 1.8,
+                request_credits: None,
+            },
         ]
     }
 
