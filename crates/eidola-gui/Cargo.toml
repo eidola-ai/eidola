@@ -57,6 +57,11 @@ gpui = { git = "https://github.com/zed-industries/zed", features = ["test-suppor
 # The driver example's JSON-lines protocol.
 serde = { version = "1", features = ["derive"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support", "font-kit", "wayland"] }
+# The embed-marker recognition lockstep test (tests/embed_lockstep.rs): this
+# crate is the one place that sees both the editor's parser-driven embed
+# recognition and eidola-common's structural scanner, so the corpus test
+# proving they agree lives here.
+eidola-common = { path = "../eidola-common" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Store-level tests (tests/stores.rs) build a real `AppCore` over tempdirs and
 # install the crypto provider (mirrors app-core's own test setup).

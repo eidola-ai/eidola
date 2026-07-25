@@ -7,7 +7,13 @@
 //! non-destruction, and the readonly render. Rendering geometry (the quote
 //! container's pixels) is the visual tier's business, not asserted here.
 
-use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use gpui::{
+    AnyWindowHandle, AppContext, Bounds, Entity, Modifiers, MouseButton, MouseDownEvent,
+    MouseUpEvent, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, point, px, size,
+};
 use gpui_markdown_editor::{
     BlockKind, EditorEvent, EditorState, EmbedMap, MarkdownEditor, MarkdownEditorState, Selection,
     embed_marker,
@@ -429,4 +435,158 @@ fn readonly_editor_promotes_embeds_and_refuses_mutation(_cx: &mut TestAppContext
     let s4 = update_readonly(s3, EditorEvent::SetSelection(Selection::Cursor(4 + 3)));
     let p = s4.selection.head();
     assert!(p == 4 || p == end, "readonly interior snap; got {p}");
+}
+
+// ---------------------------------------------------------------------------
+// Host click callback — real layout (the table_wrapped harness pattern)
+// ---------------------------------------------------------------------------
+
+/// Harness whose render attaches `on_embed_click`, recording the clicked
+/// ordinal into a shared cell.
+struct ClickHarness {
+    state: Entity<MarkdownEditorState>,
+    clicked: Rc<Cell<Option<u64>>>,
+}
+
+impl gpui::Render for ClickHarness {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        let clicked = self.clicked.clone();
+        MarkdownEditor::new(&self.state)
+            .on_embed_click(move |ordinal, _, _| clicked.set(Some(ordinal)))
+    }
+}
+
+/// A **non-final** embed's rendered container must fire the host callback
+/// with its ordinal, under real layout. The hit-test reads the ordinal the
+/// render recorded on the painted block (`LaidOutBlock::embed_ordinal`) —
+/// the earlier implementation re-derived embed ranges from source per click
+/// and matched them against painted block ranges by equality, which held
+/// only via an incidental cross-module invariant (`inject_empty_paragraphs`
+/// strips the parser's folded trailing newline exactly the way
+/// `embed_blocks` trims it). This pins the behavior structurally instead.
+#[gpui::test]
+fn click_on_a_non_final_embed_fires_the_host_callback(cx: &mut TestAppContext) {
+    let src = format!("{MARKER}\n\n{{{{ embed 2 }}}}\n\nafter");
+    let state = EditorState {
+        markdown: src.clone(),
+        selection: Selection::Cursor(0),
+        embeds: EmbedMap::new([
+            (1u64, "first quote".to_string()),
+            (2u64, "second quote".to_string()),
+        ]),
+    };
+    let clicked: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+    let clicked_in = clicked.clone();
+    let (handle, editor) = cx.update(|cx| {
+        gpui_component::init(cx);
+        let mut inner: Option<Entity<MarkdownEditorState>> = None;
+        let bounds = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(560.), px(600.)),
+        };
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let editor = cx.new(|cx| MarkdownEditorState::with_state(state, window, cx));
+                    inner = Some(editor.clone());
+                    let harness = cx.new(|_| ClickHarness {
+                        state: editor.clone(),
+                        clicked: clicked_in,
+                    });
+                    cx.new(|cx| gpui_component::Root::new(harness, window, cx))
+                },
+            )
+            .expect("open window");
+        (window.into(), inner.expect("editor built"))
+    });
+    let mut vcx = VisualTestContext::from_window(handle, cx);
+    vcx.run_until_parked();
+
+    // Locate the FIRST embed's painted line (its fully-hidden marker line —
+    // the block anchor) and aim a click just inside its container.
+    let (x, y) = editor
+        .read_with(&vcx, |e, _| {
+            e.debug_line_source_geometry()
+                .into_iter()
+                .find(|(s, en, ..)| *s == 0 && *en >= MARKER.len())
+                .map(|(_, _, x, y, ..)| (x, y))
+        })
+        .expect("the first embed's laid-out line");
+    let target = point(px(x + 4.0), px(y + 4.0));
+
+    // The painted block resolves by its render-time ordinal.
+    editor.read_with(&vcx, |e, _| {
+        assert_eq!(
+            e.embed_ordinal_at_position(target),
+            Some(1),
+            "the painted non-final embed must resolve by render-time ordinal"
+        );
+    });
+
+    vcx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position: target,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(MouseUpEvent {
+        button: MouseButton::Left,
+        position: target,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+
+    assert_eq!(
+        clicked.get(),
+        Some(1),
+        "clicking the first (non-final) embed fires the host callback with its ordinal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// set_embeds re-snaps a selection that the new map makes forbidden
+// ---------------------------------------------------------------------------
+
+/// A caret legally parked inside a *literal* (unmapped) marker must not stay
+/// inside once `set_embeds` maps that ordinal — the interior turns
+/// caret-forbidden, and typing from the stale position would splice into the
+/// hidden marker bytes of a block now rendering as an embed.
+#[gpui::test]
+fn set_embeds_snaps_a_selection_inside_a_newly_mapped_marker(cx: &mut TestAppContext) {
+    // Unmapped: the marker is plain text and the interior is a legal caret.
+    let (_, editor) = open_editor(cx, EditorState::with_markdown(MARKER));
+    apply(cx, &editor, EditorEvent::SetSelection(Selection::Cursor(5)));
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 5));
+
+    // Mapping the ordinal must re-snap the caret to a marker edge.
+    editor.update(cx, |e, cx| e.set_embeds([(1u64, "quote".to_string())], cx));
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        let p = e.cursor_offset();
+        assert!(
+            p == 0 || p == MARKER.len(),
+            "set_embeds must snap an interior caret to an edge; got {p}"
+        );
+    });
+
+    // Typing now lands at the snapped edge — the marker bytes stay intact
+    // (the trailing-edge type degrades the block honestly, never corrupts it).
+    type_str(cx, &editor, "x");
+    editor.read_with(cx, |e, _| {
+        let v = e.value();
+        assert!(
+            v == format!("x{MARKER}") || v == format!("{MARKER}x"),
+            "typed text must not splice into the marker; got {v:?}"
+        );
+    });
 }

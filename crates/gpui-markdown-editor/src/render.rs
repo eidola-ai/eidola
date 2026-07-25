@@ -157,8 +157,9 @@ fn promote_embeds(blocks: &mut [RenderBlock], source: &str, embeds: &crate::embe
         let Some(slice) = source.get(block.source_range.clone()) else {
             continue;
         };
-        // A mid-document paragraph's range can carry the trailing `\n`
-        // pulldown folds in; the marker itself never contains newlines.
+        // This pass runs on the raw walk output, BEFORE `inject_empty_paragraphs`
+        // strips the trailing `\n` pulldown folds into a non-final paragraph's
+        // range — so trim it here; the marker itself never contains newlines.
         let slice = slice.trim_end_matches('\n');
         if let Some(ordinal) = crate::embed::parse_embed_text(slice)
             && embeds.contains(ordinal)
