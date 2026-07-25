@@ -44,7 +44,7 @@ tokio = { version = "1", features = [
     "macros",
 ] }
 toml = "1"
-turso = { version = "0.7.0-pre.18", default-features = false, features = ["pure-rust-crypto"] }
+turso = { git = "https://github.com/eidola-ai/turso", branch = "fix-concurrent-view-expansion-guard", default-features = false, features = ["pure-rust-crypto"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 x509-cert = "0.2"
 
