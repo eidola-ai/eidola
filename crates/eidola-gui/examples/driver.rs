@@ -338,6 +338,82 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_quotes",
+                description: "Space view: quoted references — a source post with highlighted quoted passages (single + overlapping), two replies carrying embed quote blocks and their footnote rails",
+                default_size: size(px(860.), px(760.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    let (posts, incoming) = fixtures::quoted_reference_posts();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(posts, cx);
+                        for (action_id, refs) in incoming {
+                            s.seed_incoming_references_for_test(
+                                action_id.clone(),
+                                refs.iter()
+                                    .map(|r| eidola_app_core::IncomingReference {
+                                        action_id: r.action_id.clone(),
+                                        space_id: "demo".into(),
+                                        ordinal: 1,
+                                        content_block_id: Some(r.block_id.clone()),
+                                        range_start: Some(r.range.0),
+                                        range_end: Some(r.range.1),
+                                        annotation: None,
+                                        created_at: 0,
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_quote_draft",
+                description: "Space view: composing with a quote — a pending reference in the active draft (the embed block in the body, the footnote below it with its remove affordance)",
+                default_size: size(px(860.), px(760.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    let (posts, _) = fixtures::quoted_reference_posts();
+                    // Just the source post: the composing draft under it is
+                    // what this scene is about.
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(posts.into_iter().take(1).collect(), cx)
+                    });
+                    view.update(cx, |v, cx| {
+                        v.seed_draft_quote_for_test(
+                            Some("q1"),
+                            "That's the sentence I keep snagging on:\n\n{{ embed 1 }}\n\nIf \
+                             the care is real, doesn't the shepherd analogy quietly concede \
+                             Socrates' point?",
+                            vec![(1, "kimi-k2", "the care is real")],
+                            window,
+                            cx,
+                        )
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "onboarding",
                 description: "Onboarding window: the first-run 'Get Started' slide flow (scroll-snap, branching CTAs)",
                 default_size: size(px(640.), px(760.)),

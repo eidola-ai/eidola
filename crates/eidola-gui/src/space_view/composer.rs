@@ -110,9 +110,61 @@ impl SpaceView {
             id: id.clone(),
             parent,
             editor,
+            references: Vec::new(),
             _sub: sub,
         });
         id
+    }
+
+    /// Test/scene seam: mint an **active** draft already carrying a body and
+    /// pending quoted references, without replaying the selection gesture.
+    ///
+    /// The gesture itself (`Edit > Quote`) is covered by the behavior tests;
+    /// this exists for the driver's composing scene, which cannot perform it —
+    /// a real quote needs the post's body editor and the branch's tail draft,
+    /// both minted during `render`, and the driver's headless dispatcher does
+    /// not pump `on_next_frame`. Seeding declaratively (like every other
+    /// scene's `set_post_tree_for_test`) renders the same state.
+    ///
+    /// `quotes` are `(ordinal, byline, snippet)` triples; the body is expected
+    /// to carry the matching `{{ embed N }}` markers.
+    #[doc(hidden)]
+    pub fn seed_draft_quote_for_test(
+        &mut self,
+        parent: Option<&str>,
+        body: &str,
+        quotes: Vec<(u64, &str, &str)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.create_draft_node(parent.map(gpui::SharedString::from), window, cx);
+        let Some(draft) = self.drafts.iter_mut().find(|d| d.id == id) else {
+            return;
+        };
+        for (ordinal, byline, snippet) in quotes {
+            draft.references.push(super::PendingReference {
+                ordinal,
+                spec: eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: parent.unwrap_or_default().to_string(),
+                    content_block_id: Some("blk-1".into()),
+                    range_start: Some(0),
+                    range_end: Some(snippet.len() as i64),
+                    annotation: None,
+                },
+                byline: byline.into(),
+                snippet: snippet.into(),
+            });
+        }
+        let embeds = draft.embed_map();
+        let editor = draft.editor.clone();
+        let body = body.to_string();
+        editor.update(cx, |e, cx| {
+            e.set_embeds(embeds, cx);
+            e.set_value(body, cx);
+        });
+        self.activate_draft(id, cx);
+        let focus = editor.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
     }
 
     /// Open a draft replying to `parent` (a band's "+" / ⌘N): make it the active
@@ -264,7 +316,16 @@ impl SpaceView {
         };
         let editor = draft.editor.clone();
         let parent = draft.parent.clone();
-        let prompt = editor.read(cx).value().trim().to_string();
+        let mut pending = draft.references.clone();
+        pending.sort_by_key(|r| r.ordinal);
+        // Compact the draft's ordinals onto `1..=N` at the durability
+        // boundary. Draft ordinals may gap (removing a pending reference must
+        // never renumber the survivors, whose markers already address them),
+        // but app-core assigns edge ordinals `1..=N` **in supplied order** —
+        // so the body's markers are rewritten to match in the same move. See
+        // `compact_draft_references`.
+        let (prompt, references) = compact_draft_references(editor.read(cx).value(), &pending);
+        let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
             return;
         }
@@ -290,11 +351,16 @@ impl SpaceView {
         // rejected submit must leave the draft intact and active. Both mutations
         // and the consume below run in this one synchronous handler, so no frame
         // ever renders the draft beside the optimistic post.
+        //
+        // The draft's pending references ride the same accept-before-consume
+        // contract: a rejected post leaves the draft **and its references**
+        // exactly as they were (the compaction above is computed, never
+        // written back), so nothing about the quote is lost.
         let accepted = self.space.update(cx, |s, cx| {
             if quiet {
-                s.post_only(prompt, reply_to, cx)
+                s.post_only(prompt, reply_to, references, cx)
             } else {
-                s.submit(prompt, reply_to, cx)
+                s.submit(prompt, reply_to, references, cx)
             }
         });
         if !accepted {
@@ -433,14 +499,16 @@ impl SpaceView {
         let Some(active) = self.active_draft.clone() else {
             return div().into_any_element();
         };
-        let Some(editor) = self
-            .drafts
-            .iter()
-            .find(|d| d.id == active)
-            .map(|d| d.editor.clone())
-        else {
+        let Some(draft) = self.drafts.iter().find(|d| d.id == active) else {
             return div().into_any_element();
         };
+        let editor = draft.editor.clone();
+        let draft_id = draft.id.clone();
+        // Height the pending-reference rail claims from the composer bar (see
+        // `references::rail_height`) — subtracted from the editor's runway
+        // floor below so the two share the bar instead of the rail hanging
+        // below the fold.
+        let draft_rail_h = super::references::rail_height(draft.references.len());
         let theme = cx.theme();
         let bw = px(body_width(page_width));
 
@@ -594,9 +662,16 @@ impl SpaceView {
             // right under the last line — no dead strip.
             .child(
                 MarkdownEditor::new(&editor)
+                    // The footnote rail below shares the bar's height, so the
+                    // editor's runway floor is the bar minus the rail — the
+                    // rows are single-line by construction (`truncate`), so
+                    // the reservation is exact rather than a guess.
                     .style(prose_style(cx))
-                    .min_height(px(body_h)),
+                    .min_height(px((body_h - draft_rail_h).max(0.0))),
             )
+            // The draft's pending quotes, as footnotes — the same rail a
+            // posted exchange carries, right where it will be once posted.
+            .children(self.render_draft_footnotes(&draft_id, cx))
             // Measure the editor's *natural* text height (decoupled from the
             // `min_height` floor) and fold in the half-pad breath, so the bar
             // sizes to the content without a feedback loop against its own floor.
@@ -1155,6 +1230,65 @@ impl IntoElement for Layered {
     fn into_element(self) -> Self::Element {
         self
     }
+}
+
+/// Compact a draft's pending references onto app-core's `1..=N` ordinals at
+/// the moment of posting, rewriting the body's `{{ embed N }}` markers to
+/// match. Pure — the caller posts the returned pair and writes neither back,
+/// so a **rejected** post leaves the draft untouched.
+///
+/// Why this exists: draft ordinals may gap. Removing a pending reference must
+/// not renumber the survivors — their markers already address them, and the
+/// wave-1 seam's rule is that ordinals are stable and gaps are fine. But
+/// `AppCore::post_with_references` assigns edge ordinals `1..=N` **in supplied
+/// order**, so the durable ordinals and the body's markers would disagree
+/// after any removal. Compacting here reconciles the two exactly once, at the
+/// boundary where the ordinals become durable.
+///
+/// Only **recognized** markers are rewritten — the editor's own
+/// `embed_blocks` scan over the draft's embed map, i.e. exactly the markers
+/// the composer is rendering as quote blocks (and, by the crate's lockstep
+/// corpus test, exactly the set app-core expands upstream). A marker the
+/// author defused inside a fence, or one addressing an ordinal the draft
+/// carries no reference for, is left verbatim — it is literal text on every
+/// other surface too.
+fn compact_draft_references(
+    body: &str,
+    references: &[super::PendingReference],
+) -> (String, Vec<eidola_app_core::ReferenceSpec>) {
+    if references.is_empty() {
+        return (body.to_string(), Vec::new());
+    }
+    // `references` arrives in ordinal order; position `i` becomes ordinal
+    // `i + 1`.
+    let remap: std::collections::HashMap<u64, u64> = references
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.ordinal, i as u64 + 1))
+        .collect();
+    let specs = references.iter().map(|r| r.spec.clone()).collect();
+
+    let embeds = gpui_markdown_editor::EmbedMap::new(
+        references
+            .iter()
+            .map(|r| (r.ordinal, r.snippet.to_string())),
+    );
+    let mut out = body.to_string();
+    // Rewrite back-to-front so earlier spans keep their offsets as later ones
+    // change length (`{{ embed 10 }}` → `{{ embed 2 }}`).
+    for block in gpui_markdown_editor::embed::embed_blocks(body, &embeds)
+        .into_iter()
+        .rev()
+    {
+        let Some(&new) = remap.get(&block.ordinal) else {
+            continue; // unmapped marker — literal text everywhere, left alone
+        };
+        if new == block.ordinal {
+            continue;
+        }
+        out.replace_range(block.range, &gpui_markdown_editor::embed_marker(new));
+    }
+    (out, specs)
 }
 
 #[cfg(test)]

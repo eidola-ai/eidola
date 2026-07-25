@@ -27,6 +27,7 @@ pub mod minimap;
 pub mod model;
 pub mod nav;
 pub mod post;
+pub mod references;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -37,7 +38,7 @@ use gpui::{
     AnyElement, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
     FontWeight, InteractiveElement, IntoElement, IsZero, Overflow, ParentElement, Pixels, Render,
     Role, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, TouchPhase, Window, div, px, rems,
+    Subscription, Task, TouchPhase, Window, div, prelude::FluentBuilder as _, px, rems,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditorState, MarkdownStyle};
@@ -140,9 +141,28 @@ pub(crate) fn prose_style(cx: &gpui::App) -> MarkdownStyle {
             _ => base * 1.125,
         })
         .heading_weight(|_| FontWeight::MEDIUM)
+        .highlight_color(quoted_passage_wash(cx))
         .inline_code_font_family("Courier New");
     style.font_family = theme::FONT_FAMILY.into();
     style
+}
+
+/// The wash behind a passage someone has quoted (the editor's opaque
+/// highlight plugin, driven by `references::highlight_ranges`).
+///
+/// It reads as a **reader's pencil mark, not a UI selection**: the brand's own
+/// warm amber at a very low alpha, so the text on top is untouched and the
+/// mark is something you notice rather than something that interrupts. It is
+/// deliberately fainter than `theme.selection` in both palettes, so selecting
+/// across a quoted passage still reads as a selection; day carries a touch
+/// less alpha than night because the near-white paper shows a wash more
+/// readily than the blue-grey dark ground does.
+pub(crate) fn quoted_passage_wash(cx: &gpui::App) -> gpui::Hsla {
+    if cx.theme().mode.is_dark() {
+        gpui::hsla(0.09, 0.50, 0.60, 0.16)
+    } else {
+        gpui::hsla(0.09, 0.70, 0.52, 0.13)
+    }
 }
 
 /// Format a unix-millis timestamp to a clock time ("10:03 AM") for the gutter
@@ -163,6 +183,34 @@ pub(crate) fn fmt_clock(ms: i64) -> String {
     format!("{h}:{m:02} {}", if am { "AM" } else { "PM" })
 }
 
+/// A quoted reference the user has attached to a draft but not yet posted —
+/// the window-local, pre-durable twin of `eidola_app_core::PostReference`.
+///
+/// **The ordinal is the shared key** (see the workspace `AGENTS.md`, "Quoted
+/// references — the ordinal seam"): it addresses this reference in the draft
+/// body's `{{ embed N }}` marker, in the editor's embed map (so the marker
+/// renders as a real quote block while composing), in the footnote rail, and —
+/// once posted — in the `action_antecedent` row app-core writes. Ordinals run
+/// `1..` in add order and **never renumber**: removing one leaves a gap, which
+/// is correct, because the embed map is a map and the surviving markers must
+/// keep addressing the same references.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingReference {
+    /// This reference's ordinal within the draft (`1..`; 0 is app-core's
+    /// reserved `reply` edge and is never minted here).
+    pub(crate) ordinal: u64,
+    /// The write-side spec handed to app-core at post time. Names the
+    /// **concrete generation** quoted — references never remap to an item's
+    /// current tip.
+    pub(crate) spec: eidola_app_core::ReferenceSpec,
+    /// The quoted post's byline ("You", an agent's label) — the footnote row's
+    /// attribution.
+    pub(crate) byline: SharedString,
+    /// The quoted markdown itself — the embed map's value (what the marker
+    /// renders as) and the footnote row's snippet.
+    pub(crate) snippet: SharedString,
+}
+
 /// An unsent draft reply — a local UI node with its own editor. It renders
 /// inline like any post (a "Draft" byline + an editable body) when inactive,
 /// and floats as the composer when it is the [`SpaceView::active_draft`].
@@ -176,9 +224,34 @@ pub(crate) struct Draft {
     pub(crate) parent: Option<SharedString>,
     /// This draft's editable editor (retains its content while deselected).
     pub(crate) editor: Entity<MarkdownEditorState>,
+    /// The draft's pending quoted references, in ordinal order — the footnote
+    /// rail's rows and the editor's embed map while composing. Handed to
+    /// app-core as `Vec<ReferenceSpec>` when the draft is posted; a **rejected**
+    /// post leaves them (and the draft) exactly as they were.
+    pub(crate) references: Vec<PendingReference>,
     /// Focus → activate; `PressEnter` → submit/post-only. Held so it outlives
     /// the closure and is dropped with the draft.
     pub(crate) _sub: Subscription,
+}
+
+impl Draft {
+    /// The next free ordinal: one past the highest in use, so removing a
+    /// reference leaves a gap rather than renumbering the survivors (whose
+    /// markers already address them).
+    pub(crate) fn next_ordinal(&self) -> u64 {
+        self.references.iter().map(|r| r.ordinal).max().unwrap_or(0) + 1
+    }
+
+    /// The draft's embed map — ordinal → quoted markdown — fed straight to
+    /// `MarkdownEditorState::set_embeds` so each `{{ embed N }}` marker
+    /// materializes as a quote block while composing. The composing twin of
+    /// `PostNode::embed_map()`.
+    pub(crate) fn embed_map(&self) -> Vec<(u64, String)> {
+        self.references
+            .iter()
+            .map(|r| (r.ordinal, r.snippet.to_string()))
+            .collect()
+    }
 }
 
 /// The window-local cascade-paused notice: a submit's (or driven turn's)
@@ -192,6 +265,16 @@ pub(crate) struct CascadeNotice {
     pub(crate) target_action_id: String,
 }
 
+/// The open source-highlight picker: a quoted passage that **several** posts
+/// reference, so a click can't disambiguate on its own. Anchored to the post
+/// whose text was clicked, listing each referencing post (byline + snippet) as
+/// a choice — the band-menu pattern, one open at a time.
+#[derive(Clone, Debug)]
+pub(crate) struct HighlightPicker {
+    /// The candidates: `(referencing action id, its space, the row's label)`.
+    pub(crate) choices: Vec<(String, String, SharedString)>,
+}
+
 /// An in-progress inline edit of a persisted post: the post's own body editor
 /// is enabled in place, `⌘↩` commits a new generation via [`Space::edit`],
 /// Escape restores the original text. Window-local, like a draft.
@@ -203,6 +286,13 @@ pub(crate) struct EditingPost {
     pub(crate) node_id: SharedString,
     /// The pre-edit markdown, restored on Escape.
     pub(crate) original: String,
+    /// Reference **ordinals** the user has marked for removal in this session
+    /// (the footnote rail's chips). Handed to `edit_post_with_removals` on
+    /// commit: the new generation drops them, the prior generation keeps them
+    /// (history is append-only). Ordinal 0 — the structural `reply` edge — is
+    /// never removable and can never enter this list (the rail renders only
+    /// `reference` edges, and app-core refuses 0 besides).
+    pub(crate) removed_references: Vec<i64>,
     /// `PressEnter` (⌘↩) on the post's editor commits the edit. Held so it
     /// dies with the edit session.
     pub(crate) _sub: Subscription,
@@ -243,6 +333,36 @@ pub struct SpaceView {
     /// is defense in depth: if a divergence ever reappears, it must not
     /// escalate into a frame loop.
     pub(crate) body_seeds: HashMap<SharedString, SharedString>,
+    /// One subscription per body editor, keyed like [`Self::bodies`]. It
+    /// carries the read-only editors' `SelectionChanged` into
+    /// [`Self::note_body_selection`] — the only way this view learns that a
+    /// passage is quotable, and therefore what gates the Edit menu's Quote
+    /// items. Dropped with the editor when the post leaves the transcript.
+    pub(crate) body_subs: HashMap<SharedString, Subscription>,
+    /// The live quotable selection inside some post's read-only body, if any
+    /// (the most recent one made — editors don't clear each other's
+    /// selections, so "the last passage you selected" is the honest reading).
+    /// `None` means the Quote actions are unregistered and their menu items
+    /// grey out. Window-local by nature: a selection is a cursor, and two
+    /// windows on one space are two cursors (STATE.md's draft rule).
+    pub(crate) post_selection: Option<references::PostSelection>,
+    /// The open source-highlight picker, if any — a passage several posts
+    /// quoted, awaiting a choice of which referencing post to visit. Window-
+    /// local picker state, like the band menu.
+    pub(crate) highlight_picker: Option<HighlightPicker>,
+    /// Supersede slot for a cross-space navigation's home-space resolve. The
+    /// work is a pure read whose only effect is opening a window, so a window
+    /// closing mid-resolve strands nothing (STATE.md — owner = blast radius).
+    pub(crate) navigate_task: Option<Task<()>>,
+    /// Posts that rendered for real this frame and therefore want their
+    /// incoming-reference index (the source-highlight data). Filled during
+    /// render (where visibility is known but `self` is shared) and drained by
+    /// `sync_references` at the head of the *next* render, where the `&mut`
+    /// borrow exists — the same defer-one-frame idiom as `record_height` and
+    /// `slot_bounds`. Bounding the fetch to visible posts is what keeps a long
+    /// transcript from spawning one query per row on open; a frame of latency
+    /// on a decoration is invisible.
+    pub(crate) wants_incoming_refs: RefCell<HashSet<SharedString>>,
     /// One read-only editor per in-flight turn, synced to that turn's live
     /// streaming partial each frame and pruned when the turn ends. Keyed by
     /// [`StreamingTurn::seq`] so concurrent turns render side by side.
@@ -444,6 +564,11 @@ impl SpaceView {
             posts: Vec::new(),
             bodies: HashMap::new(),
             body_seeds: HashMap::new(),
+            body_subs: HashMap::new(),
+            post_selection: None,
+            highlight_picker: None,
+            navigate_task: None,
+            wants_incoming_refs: RefCell::new(HashSet::new()),
             streaming_bodies: HashMap::new(),
             streaming_synced: HashMap::new(),
             drafts: Vec::new(),
@@ -758,6 +883,110 @@ impl SpaceView {
         self.layout.clears()
     }
 
+    // -- Quoted references (test seams) ------------------------------------
+
+    /// Place a selection in post `node_id`'s read-only body directly (no
+    /// pointer geometry) and record it as the quotable selection, exactly as
+    /// the editor's `SelectionChanged` subscription would.
+    #[doc(hidden)]
+    pub fn select_in_post_for_test(
+        &mut self,
+        node_id: &str,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = SharedString::from(node_id.to_string());
+        let Some(editor) = self.bodies.get(&id).cloned() else {
+            return;
+        };
+        editor.update(cx, |e, cx| {
+            e.apply_event_for_test(
+                gpui_markdown_editor::EditorEvent::SetSelection(
+                    gpui_markdown_editor::Selection::range(range.start, range.end),
+                ),
+                cx,
+            );
+        });
+        self.note_body_selection(&id, cx);
+    }
+
+    /// Whether a quotable post selection currently exists — what gates the
+    /// Edit menu's Quote items (their handlers are registered only while it is
+    /// true, so macOS greys them otherwise).
+    #[doc(hidden)]
+    pub fn has_post_selection_for_test(&self) -> bool {
+        self.post_selection.is_some()
+    }
+
+    /// The active draft's pending references as `(ordinal, snippet)` pairs, in
+    /// ordinal order.
+    #[doc(hidden)]
+    pub fn active_draft_references_for_test(&self) -> Vec<(u64, String)> {
+        let Some(active) = self.active_draft.as_ref() else {
+            return Vec::new();
+        };
+        let Some(draft) = self.drafts.iter().find(|d| &d.id == active) else {
+            return Vec::new();
+        };
+        let mut refs: Vec<_> = draft
+            .references
+            .iter()
+            .map(|r| (r.ordinal, r.snippet.to_string()))
+            .collect();
+        refs.sort_by_key(|(o, _)| *o);
+        refs
+    }
+
+    /// The active draft's id, if any.
+    #[doc(hidden)]
+    pub fn active_draft_id_for_test(&self) -> Option<String> {
+        self.active_draft.as_ref().map(|s| s.to_string())
+    }
+
+    /// The reference ordinals the current edit session has marked for removal.
+    #[doc(hidden)]
+    pub fn edit_removals_for_test(&self) -> Vec<i64> {
+        self.editing
+            .as_ref()
+            .map(|e| e.removed_references.clone())
+            .unwrap_or_default()
+    }
+
+    /// The highlight ranges painted on post `i`'s body, as
+    /// `(buffer range, incoming-reference key)`.
+    #[doc(hidden)]
+    pub fn highlight_ranges_for_test(
+        &self,
+        i: usize,
+        cx: &gpui::App,
+    ) -> Vec<(std::ops::Range<usize>, u64)> {
+        self.highlight_ranges(i, cx)
+    }
+
+    /// The open source-highlight picker's choices, as `(action id, label)`.
+    #[doc(hidden)]
+    pub fn highlight_picker_for_test(&self) -> Option<Vec<(String, String)>> {
+        self.highlight_picker.as_ref().map(|p| {
+            p.choices
+                .iter()
+                .map(|(a, _, label)| (a.clone(), label.to_string()))
+                .collect()
+        })
+    }
+
+    /// Drive a highlight click on post `node_id` with the given keys (the
+    /// editor's `on_highlight_click` payload).
+    #[doc(hidden)]
+    pub fn click_highlight_for_test(
+        &mut self,
+        node_id: &str,
+        keys: &[u64],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_highlight_click(SharedString::from(node_id.to_string()), keys, window, cx);
+    }
+
     // -- Snapshot & model resolution --------------------------------------
 
     /// Rebuild the per-row render snapshot from the shared `Space`'s transcript.
@@ -972,6 +1201,19 @@ impl SpaceView {
                         s.set_value(content.to_string(), cx);
                         s
                     });
+                    // Track this post's selection: a read-only body is where
+                    // a quote is *made*, so its `SelectionChanged` is the
+                    // only signal that gates the Edit menu's Quote items.
+                    let sub_id = id.clone();
+                    let sub = cx.subscribe(&editor, move |this, _editor, event, cx| {
+                        if matches!(
+                            event,
+                            gpui_markdown_editor::MarkdownEditorEvent::SelectionChanged
+                        ) {
+                            this.note_body_selection(&sub_id, cx);
+                        }
+                    });
+                    self.body_subs.insert(id.clone(), sub);
                     self.bodies.insert(id.clone(), editor);
                     self.body_seeds.insert(id.clone(), content);
                 }
@@ -979,6 +1221,13 @@ impl SpaceView {
         }
         self.bodies.retain(|id, _| live.contains(id));
         self.body_seeds.retain(|id, _| live.contains(id));
+        self.body_subs.retain(|id, _| live.contains(id));
+        // A selection whose post left the transcript is no longer quotable.
+        if let Some(sel) = &self.post_selection
+            && !live.contains(&sel.node_id)
+        {
+            self.post_selection = None;
+        }
         // An edit session whose post vanished (transcript reshaped under it)
         // has nothing to commit into — drop it with the editor.
         if let Some(ed) = &self.editing
@@ -1112,6 +1361,8 @@ fn post_data_from(
         generation_count: m.generation_count,
         reasoning: m.reasoning.clone().map(SharedString::from),
         reasoning_expanded: m.reasoning_expanded,
+        references: m.references.clone(),
+        blocks: m.blocks.clone(),
     }
 }
 
@@ -1188,6 +1439,9 @@ impl Render for SpaceView {
         self.layout
             .ensure_width(layout::body_width(page_width), theme::font_scale(cx));
         self.sync_bodies(window, cx);
+        // Keep each post's embed map + highlight set current, and request the
+        // incoming-reference index for the posts that rendered last frame.
+        self.sync_references(cx);
         // Keep a docked tail draft at the end of every branch (the always-present
         // composer that replaces the leaf "+").
         self.sync_tail_drafts(window, cx);
@@ -1306,6 +1560,16 @@ impl Render for SpaceView {
             // menu item targets the focused space and macOS greys it when no
             // space window is open. A no-op on a not-yet-persisted blank space.
             .on_action(cx.listener(Self::open_participants))
+            // Edit → Quote / Quote in Reply. Registered **only while a
+            // quotable post selection exists**, so `is_action_available` is
+            // false otherwise and macOS greys both items — the same
+            // registration-is-enablement mechanism as CloseWindow, with the
+            // extra selection condition. `note_body_selection` re-renders on
+            // exactly the transitions that flip this.
+            .when(self.post_selection.is_some(), |d| {
+                d.on_action(cx.listener(Self::quote))
+                    .on_action(cx.listener(Self::quote_in_reply))
+            })
             // The window's single modifiers listener (see `WindowInput`): the
             // root is an ancestor of the focused composer, so it sees every
             // modifier transition and mirrors it into the shared entity for
@@ -1350,6 +1614,10 @@ impl Render for SpaceView {
                 scroll
             })
             .child(self.render_active_draft(&tree, page_width, window_h, window, cx))
+            // The source-highlight picker: which of several posts that quoted
+            // the clicked passage to visit. Above the composer, below the
+            // notices — it's a choice, not a state.
+            .children(self.render_highlight_picker(cx))
             .child(self.render_cascade_band(cx))
             .child(self.render_error_band(cx))
             // The minimap is the last sibling, so it paints after the composer

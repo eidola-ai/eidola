@@ -610,8 +610,8 @@ impl ChromeRoot {
     fn render_menu_panel(&self, _window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         use crate::actions::{
             About, ActualSize, CheckForUpdates, NewSpace, NewSpaceFromTemplate, OpenLibrary,
-            OpenParticipants, OpenRecord, OpenSettings, Quit, ZoomIn, ZoomOut, primary_chord,
-            primary_shift_chord,
+            OpenParticipants, OpenRecord, OpenSettings, Quit, Quote, QuoteInReply, ZoomIn, ZoomOut,
+            primary_chord, primary_shift_chord,
         };
         let theme = cx.theme();
 
@@ -680,6 +680,25 @@ impl ChromeRoot {
                 "Participants…",
                 None,
                 |w, cx| w.dispatch_action(Box::new(OpenParticipants), cx),
+                cx,
+            ))
+            // The selection-scoped verbs (the macOS "Edit" menu's quote pair).
+            // Linux has no Edit menu here — Undo/Cut/Copy/Paste are keyboard
+            // only — but Quote has no chord, so the popover is its only
+            // pointer route. It groups with the space-scoped items above it
+            // because that is what it acts within.
+            .child(menu_item(
+                "quote",
+                "Quote",
+                None,
+                |w, cx| w.dispatch_action(Box::new(Quote), cx),
+                cx,
+            ))
+            .child(menu_item(
+                "quote-in-reply",
+                "Quote in Reply",
+                None,
+                |w, cx| w.dispatch_action(Box::new(QuoteInReply), cx),
                 cx,
             ))
             .child(separator())
