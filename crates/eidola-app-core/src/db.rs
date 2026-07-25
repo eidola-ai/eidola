@@ -2195,6 +2195,189 @@ pub async fn insert_action_antecedent(
     Ok(())
 }
 
+/// Insert a non-structural `reference` edge with its quote detail columns
+/// (`content_block_id` + byte `range` into that block's `text_content`, plus
+/// an optional annotation). The schema CHECK requires `range_start`/`range_end`
+/// to be both present or both absent, with `0 <= start < end`.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_reference_antecedent(
+    conn: &Connection,
+    action_id: &str,
+    antecedent_action_id: &str,
+    ordinal: i64,
+    content_block_id: Option<&str>,
+    range_start: Option<i64>,
+    range_end: Option<i64>,
+    annotation: Option<&str>,
+) -> Result<(), AppError> {
+    fn opt_text(v: Option<&str>) -> Value {
+        match v {
+            Some(s) => Value::Text(s.to_string()),
+            None => Value::Null,
+        }
+    }
+    fn opt_int(v: Option<i64>) -> Value {
+        match v {
+            Some(n) => Value::Integer(n),
+            None => Value::Null,
+        }
+    }
+    conn.execute(
+        "INSERT INTO action_antecedent \
+         (action_id, antecedent_action_id, ordinal, relation, \
+          content_block_id, range_start, range_end, annotation) \
+         VALUES (?1, ?2, ?3, 'reference', ?4, ?5, ?6, ?7)",
+        (
+            Value::Text(action_id.to_string()),
+            Value::Text(antecedent_action_id.to_string()),
+            Value::Integer(ordinal),
+            opt_text(content_block_id),
+            opt_int(range_start),
+            opt_int(range_end),
+            opt_text(annotation),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert reference antecedent: {e}"),
+    })?;
+    Ok(())
+}
+
+/// One outgoing `reference` edge of an action, with the referenced content
+/// block's text joined in (for snippet resolution). Ordered by `ordinal`.
+pub struct ReferenceEdgeRow {
+    pub ordinal: i64,
+    pub antecedent_action_id: String,
+    pub content_block_id: Option<String>,
+    pub range_start: Option<i64>,
+    pub range_end: Option<i64>,
+    pub annotation: Option<String>,
+    /// `text_content` of the referenced content block, when the edge carries
+    /// a `content_block_id` and that block has text.
+    pub block_text: Option<String>,
+}
+
+/// The `reference`-relation antecedents of an action, ordinal order. Used by
+/// `edit_post` to replicate references onto a new generation and by the
+/// upstream-context embed expansion.
+pub async fn reference_antecedents(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Vec<ReferenceEdgeRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT aa.ordinal, aa.antecedent_action_id, aa.content_block_id, \
+                    aa.range_start, aa.range_end, aa.annotation, cb.text_content \
+             FROM action_antecedent aa \
+             LEFT JOIN content_block cb ON cb.id = aa.content_block_id \
+             WHERE aa.action_id = ?1 AND aa.relation = 'reference' \
+             ORDER BY aa.ordinal ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(ReferenceEdgeRow {
+            ordinal: row.get::<i64>(0).map_err(AppError::db)?,
+            antecedent_action_id: row.get::<String>(1).map_err(AppError::db)?,
+            content_block_id: row.get::<Option<String>>(2).map_err(AppError::db)?,
+            range_start: row.get::<Option<i64>>(3).map_err(AppError::db)?,
+            range_end: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+            annotation: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            block_text: row.get::<Option<String>>(6).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// `(action_id, text_content)` of a content block, or `None` if the block
+/// doesn't exist. Used to validate that a [`crate::ReferenceSpec`]'s block
+/// belongs to its antecedent action and that its byte range is honest.
+pub async fn content_block_owner_text(
+    conn: &Connection,
+    content_block_id: &str,
+) -> Result<Option<(String, Option<String>)>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT action_id, text_content FROM content_block WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(content_block_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<Option<String>>(1).map_err(AppError::db)?,
+        ))),
+    }
+}
+
+/// One incoming `reference` edge: a post (elsewhere or in the same space)
+/// referencing the queried action. Restricted to referrers that are their
+/// item's **current generation** with terminal status — the set whose quotes
+/// should highlight the source. The target is the *concrete generation*
+/// queried (references never remap to tips).
+pub struct IncomingReferenceRow {
+    /// The referring post's action id (a current generation).
+    pub action_id: String,
+    /// The referring post's space (references may cross spaces).
+    pub space_id: String,
+    pub ordinal: i64,
+    pub content_block_id: Option<String>,
+    pub range_start: Option<i64>,
+    pub range_end: Option<i64>,
+    pub annotation: Option<String>,
+    pub created_at: i64,
+}
+
+/// All current-generation posts referencing `antecedent_action_id` (relation
+/// `reference`), with their quoted ranges — the reverse index behind source
+/// highlights and click-to-navigate. Pure read.
+pub async fn references_to(
+    conn: &Connection,
+    antecedent_action_id: &str,
+) -> Result<Vec<IncomingReferenceRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT aa.action_id, ar.space_id, aa.ordinal, aa.content_block_id, \
+                    aa.range_start, aa.range_end, aa.annotation, ar.created_at \
+             FROM action_antecedent aa \
+             JOIN action_resolved ar ON ar.action_id = aa.action_id \
+             WHERE aa.antecedent_action_id = ?1 \
+               AND aa.relation = 'reference' \
+               AND ar.is_current = 1 \
+               AND ar.status IN ('complete', 'cancelled') \
+             ORDER BY ar.created_at ASC, aa.action_id ASC, aa.ordinal ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(antecedent_action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(IncomingReferenceRow {
+            action_id: row.get::<String>(0).map_err(AppError::db)?,
+            space_id: row.get::<String>(1).map_err(AppError::db)?,
+            ordinal: row.get::<i64>(2).map_err(AppError::db)?,
+            content_block_id: row.get::<Option<String>>(3).map_err(AppError::db)?,
+            range_start: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+            range_end: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+            annotation: row.get::<Option<String>>(6).map_err(AppError::db)?,
+            created_at: row.get::<i64>(7).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Layer 2 — Semantic: Content block operations
 // ---------------------------------------------------------------------------
@@ -2647,6 +2830,7 @@ pub struct PostActionRow {
 
 /// One content block of a post, in `ordinal` order within its action.
 pub struct PostBlockRow {
+    pub id: String,
     pub action_id: String,
     pub ordinal: i64,
     pub block_type: String,
@@ -2668,9 +2852,13 @@ pub struct AntecedentEdgeRow {
     pub antecedent_current_action_id: Option<String>,
     pub ordinal: i64,
     pub relation: String,
+    pub content_block_id: Option<String>,
     pub range_start: Option<i64>,
     pub range_end: Option<i64>,
     pub annotation: Option<String>,
+    /// `text_content` of the referenced content block (reference edges with a
+    /// `content_block_id` only) — the raw material for snippet resolution.
+    pub block_text: Option<String>,
 }
 
 /// The raw materials for one space's threaded-post render.
@@ -2729,7 +2917,7 @@ pub async fn get_space_tree_data(
 
     // Content blocks of those tip actions, in (action, ordinal) order.
     let block_sql = format!(
-        "SELECT cb.action_id, cb.ordinal, cb.block_type, cb.text_content, \
+        "SELECT cb.id, cb.action_id, cb.ordinal, cb.block_type, cb.text_content, \
                 cb.tool_name, cb.tool_call_id, cb.data \
          FROM content_block cb \
          JOIN action_resolved ar ON ar.action_id = cb.action_id \
@@ -2747,13 +2935,14 @@ pub async fn get_space_tree_data(
     let mut blocks = Vec::new();
     while let Some(row) = rows.next().await.map_err(AppError::db)? {
         blocks.push(PostBlockRow {
-            action_id: row.get::<String>(0).map_err(AppError::db)?,
-            ordinal: row.get::<i64>(1).map_err(AppError::db)?,
-            block_type: row.get::<String>(2).map_err(AppError::db)?,
-            text_content: row.get::<Option<String>>(3).map_err(AppError::db)?,
-            tool_name: row.get::<Option<String>>(4).map_err(AppError::db)?,
-            tool_call_id: row.get::<Option<String>>(5).map_err(AppError::db)?,
-            data: row.get::<Option<String>>(6).map_err(AppError::db)?,
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            action_id: row.get::<String>(1).map_err(AppError::db)?,
+            ordinal: row.get::<i64>(2).map_err(AppError::db)?,
+            block_type: row.get::<String>(3).map_err(AppError::db)?,
+            text_content: row.get::<Option<String>>(4).map_err(AppError::db)?,
+            tool_name: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            tool_call_id: row.get::<Option<String>>(6).map_err(AppError::db)?,
+            data: row.get::<Option<String>>(7).map_err(AppError::db)?,
         });
     }
 
@@ -2767,12 +2956,13 @@ pub async fn get_space_tree_data(
     let edge_sql = format!(
         "SELECT aa.action_id, aa.antecedent_action_id, aa.ordinal, aa.relation, \
                 aa.range_start, aa.range_end, aa.annotation, \
-                ic.current_action_id \
+                ic.current_action_id, aa.content_block_id, qcb.text_content \
          FROM action_antecedent aa \
          JOIN action_resolved ar ON ar.action_id = aa.action_id \
          JOIN action ant ON ant.id = aa.antecedent_action_id \
          LEFT JOIN item_current ic \
            ON ic.space_id = ant.space_id AND ic.item_id = ant.item_id \
+         LEFT JOIN content_block qcb ON qcb.id = aa.content_block_id \
          WHERE ar.space_id = ?1 \
            AND ar.is_current = 1 \
            AND ar.status IN ('complete', 'cancelled') \
@@ -2795,6 +2985,8 @@ pub async fn get_space_tree_data(
             range_end: row.get::<Option<i64>>(5).map_err(AppError::db)?,
             annotation: row.get::<Option<String>>(6).map_err(AppError::db)?,
             antecedent_current_action_id: row.get::<Option<String>>(7).map_err(AppError::db)?,
+            content_block_id: row.get::<Option<String>>(8).map_err(AppError::db)?,
+            block_text: row.get::<Option<String>>(9).map_err(AppError::db)?,
         });
     }
 

@@ -40,6 +40,7 @@ pub fn fixture_post(
         depth,
         is_branch,
         blocks: vec![PostBlock {
+            id: String::new(),
             block_type: "text".into(),
             text: Some(text.into()),
             tool_name: None,
@@ -116,9 +117,11 @@ pub fn kitchen_sink_posts() -> Vec<PostNode> {
     let reply_ref = |antecedent: &str, start: i64, end: i64| PostReference {
         antecedent_action_id: antecedent.into(),
         ordinal: 1,
+        content_block_id: None,
         range_start: Some(start),
         range_end: Some(end),
         annotation: None,
+        snippet: None,
     };
 
     // (action_id, item_id, kind, label, type, depth, is_branch, parent, gen, refs, content)

@@ -599,6 +599,294 @@ fn edit_post_keeps_tree_position_and_rethreads_replies() {
     });
 }
 
+// ===========================================================================
+// Quoted references (wave 1)
+//
+// post_with_references writes ordinal-keyed `relation='reference'` edges
+// (ordinal 0 reserved for the reply edge; references at 1..=N in supplied
+// order — the body's `{{ embed N }}` numbering) and rides post's existing
+// emissions (Space + SpaceIndex?); a validation failure is a pure error with
+// zero durable trace. edit_post replicates references at their original
+// ordinals; edit_post_with_removals drops named ordinals (reply not
+// removable). references_to is a pure read (no emissions).
+// ===========================================================================
+
+#[test]
+fn post_with_references_writes_ordinal_rows_and_resolves_snippets() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let source = core
+            .runtime()
+            .block_on(core.post("The powerhouse of the cell".into(), None))
+            .unwrap();
+        // The seam wave 2 uses: the rendered tree exposes each block's
+        // content_block_id, which a ReferenceSpec quotes by byte range.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .unwrap();
+        let block_id = tree[0].blocks[0].id.clone();
+
+        let mut rx = core.subscribe_changes();
+        let spec = eidola_app_core::ReferenceSpec {
+            antecedent_action_id: source.action_id.clone(),
+            content_block_id: Some(block_id.clone()),
+            range_start: Some(4),
+            range_end: Some(14), // "powerhouse"
+            annotation: Some("the phrase in question".into()),
+        };
+        let posted = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "What is meant here?\n\n{{ embed 1 }}".into(),
+                Some(source.space_id.clone()),
+                None,
+                vec![spec],
+            ))
+            .unwrap();
+
+        // Emissions: exactly post's contract — Space; no SpaceIndex (existing
+        // space, already titled), nothing reference-specific.
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(source.space_id.clone())),
+            "post_with_references emits Space; got {changes:?}"
+        );
+        assert!(
+            !changes.contains(&Change::SpaceIndex),
+            "no SpaceIndex for a second post; got {changes:?}"
+        );
+
+        // The render DTO: ordinal 1, the concrete antecedent, a resolved
+        // snippet, and the embed map keyed by the same ordinal.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .unwrap();
+        let post_node = tree
+            .iter()
+            .find(|n| n.action_id == posted.action_id)
+            .unwrap();
+        assert_eq!(post_node.references.len(), 1);
+        let r = &post_node.references[0];
+        assert_eq!(r.ordinal, 1);
+        assert_eq!(r.antecedent_action_id, source.action_id);
+        assert_eq!(r.content_block_id.as_deref(), Some(block_id.as_str()));
+        assert_eq!(r.snippet.as_deref(), Some("powerhouse"));
+        assert_eq!(
+            post_node.embed_map().get(&1).map(String::as_str),
+            Some("powerhouse")
+        );
+        // The reply edge coexists at its reserved slot: threading intact.
+        assert_eq!(
+            post_node.parent_action_id.as_deref(),
+            Some(source.action_id.as_str())
+        );
+
+        // The reverse index: the source post sees the incoming reference with
+        // its range (a pure read; no emissions).
+        let mut rx = core.subscribe_changes();
+        let incoming = core
+            .runtime()
+            .block_on(core.references_to(source.action_id.clone()))
+            .unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].action_id, posted.action_id);
+        assert_eq!(incoming[0].space_id, source.space_id);
+        assert_eq!(incoming[0].ordinal, 1);
+        assert_eq!(incoming[0].range_start, Some(4));
+        assert_eq!(incoming[0].range_end, Some(14));
+        assert!(
+            drain(&mut rx).is_empty(),
+            "references_to is a pure read and must not emit"
+        );
+    });
+}
+
+#[test]
+fn post_with_invalid_reference_errors_with_zero_trace() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let source = core
+            .runtime()
+            .block_on(core.post("short".into(), None))
+            .unwrap();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .unwrap();
+        let block_id = tree[0].blocks[0].id.clone();
+
+        let mut rx = core.subscribe_changes();
+        // Range runs past the block ("short" is 5 bytes) — dishonest.
+        let bad = eidola_app_core::ReferenceSpec {
+            antecedent_action_id: source.action_id.clone(),
+            content_block_id: Some(block_id),
+            range_start: Some(0),
+            range_end: Some(99),
+            annotation: None,
+        };
+        // Into a NEW space: validation must run before space creation so the
+        // failure leaves no orphaned space.
+        let result = core.runtime().block_on(core.post_with_references(
+            "quoting badly".into(),
+            None,
+            None,
+            vec![bad],
+        ));
+        assert!(result.is_err(), "dishonest range must be refused");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "failed post_with_references must not emit"
+        );
+        let spaces = core.runtime().block_on(core.list_spaces(false)).unwrap();
+        assert_eq!(spaces.len(), 1, "no orphaned space from the failed post");
+
+        // An unknown antecedent is refused the same way.
+        let unknown = eidola_app_core::ReferenceSpec {
+            antecedent_action_id: "no-such-action".into(),
+            content_block_id: None,
+            range_start: None,
+            range_end: None,
+            annotation: None,
+        };
+        let result = core.runtime().block_on(core.post_with_references(
+            "quoting a ghost".into(),
+            Some(source.space_id.clone()),
+            None,
+            vec![unknown],
+        ));
+        assert!(result.is_err(), "unknown antecedent must be refused");
+    });
+}
+
+#[test]
+fn edit_post_replicates_references_and_supports_removal() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let source = core
+            .runtime()
+            .block_on(core.post("alpha beta gamma".into(), None))
+            .unwrap();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .unwrap();
+        let block_id = tree[0].blocks[0].id.clone();
+
+        let make_spec = |start: i64, end: i64| eidola_app_core::ReferenceSpec {
+            antecedent_action_id: source.action_id.clone(),
+            content_block_id: Some(block_id.clone()),
+            range_start: Some(start),
+            range_end: Some(end),
+            annotation: None,
+        };
+        let posted = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "two quotes\n\n{{ embed 1 }}\n\n{{ embed 2 }}".into(),
+                Some(source.space_id.clone()),
+                None,
+                vec![make_spec(0, 5), make_spec(11, 16)], // "alpha", "gamma"
+            ))
+            .unwrap();
+
+        // A plain edit replicates ALL references at their original ordinals.
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(
+                posted.action_id.clone(),
+                "two quotes, reworded\n\n{{ embed 1 }}\n\n{{ embed 2 }}".into(),
+            ))
+            .unwrap();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .unwrap();
+        let node = tree
+            .iter()
+            .find(|n| n.action_id == edited.action_id)
+            .unwrap();
+        let ordinals: Vec<i64> = node.references.iter().map(|r| r.ordinal).collect();
+        assert_eq!(ordinals, vec![1, 2], "edit replicates at original ordinals");
+        assert_eq!(node.references[0].snippet.as_deref(), Some("alpha"));
+        assert_eq!(node.references[1].snippet.as_deref(), Some("gamma"));
+
+        // An edit with a removal drops that ordinal only — the survivor keeps
+        // its original ordinal (a gap, not a renumber), so `{{ embed 2 }}`
+        // in the body still resolves.
+        let edited2 = core
+            .runtime()
+            .block_on(core.edit_post_with_removals(
+                edited.action_id.clone(),
+                "one quote\n\n{{ embed 2 }}".into(),
+                vec![1],
+            ))
+            .unwrap();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .unwrap();
+        let node = tree
+            .iter()
+            .find(|n| n.action_id == edited2.action_id)
+            .unwrap();
+        let ordinals: Vec<i64> = node.references.iter().map(|r| r.ordinal).collect();
+        assert_eq!(ordinals, vec![2], "removal leaves a gap, never renumbers");
+        assert_eq!(node.embed_map().get(&2).map(String::as_str), Some("gamma"));
+        // The reply edge survived every generation.
+        assert_eq!(
+            node.parent_action_id.as_deref(),
+            Some(source.action_id.as_str())
+        );
+
+        // references_to reflects only CURRENT generations: after the removal,
+        // just the surviving edge of the newest generation.
+        let incoming = core
+            .runtime()
+            .block_on(core.references_to(source.action_id.clone()))
+            .unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].action_id, edited2.action_id);
+        assert_eq!(incoming[0].ordinal, 2);
+    });
+}
+
+#[test]
+fn edit_post_cannot_remove_the_reply_edge() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let first = core
+            .runtime()
+            .block_on(core.post("root".into(), None))
+            .unwrap();
+        let second = core
+            .runtime()
+            .block_on(core.post("a reply".into(), Some(first.space_id.clone())))
+            .unwrap();
+
+        let mut rx = core.subscribe_changes();
+        // Ordinal 0 is the reply slot; naming it (or any non-reference
+        // ordinal) is a typed error before any write.
+        let result = core.runtime().block_on(core.edit_post_with_removals(
+            second.action_id.clone(),
+            "still a reply".into(),
+            vec![0],
+        ));
+        assert!(result.is_err(), "removing the reply edge must be refused");
+        let result = core.runtime().block_on(core.edit_post_with_removals(
+            second.action_id.clone(),
+            "still a reply".into(),
+            vec![7],
+        ));
+        assert!(result.is_err(), "an unknown ordinal must be refused");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "refused removals must not emit or write"
+        );
+    });
+}
+
 #[test]
 fn edit_post_on_unknown_action_errors_without_emit() {
     run_in_thread(|| {

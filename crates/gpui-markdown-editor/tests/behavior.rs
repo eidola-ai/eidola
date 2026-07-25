@@ -137,6 +137,7 @@ fn enter_action_inserts_paragraph_break(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "abc".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -159,6 +160,7 @@ fn backspace_removes_one_grapheme(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "abc".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -173,6 +175,7 @@ fn delete_removes_forward_grapheme(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "abc".into(),
         selection: Selection::Cursor(1),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Delete);
@@ -189,6 +192,7 @@ fn arrow_keys_move_cursor(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "abc\n\ndef".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
 
@@ -218,6 +222,7 @@ fn right_arrow_skips_paragraph_break_interior(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "p1\n\np2".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -235,6 +240,7 @@ fn arrow_navigation_through_empty_paragraph_lands_on_visible_row(cx: &mut TestAp
     let initial = EditorState {
         markdown: "p1\n\n\n\np2".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -251,6 +257,7 @@ fn home_end_doc_jump(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "abc\n\ndef".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
 
@@ -269,6 +276,7 @@ fn shift_right_extends_selection(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "abcd".into(),
         selection: Selection::Cursor(1),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftRight);
@@ -296,6 +304,7 @@ fn shift_enter_at_end_of_paragraph_keeps_cursor_in_same_paragraph(cx: &mut TestA
     let initial = EditorState {
         markdown: "paragraph 1".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -331,6 +340,7 @@ fn enter_at_end_of_paragraph_creates_visible_trailing_empty(cx: &mut TestAppCont
     let initial = EditorState {
         markdown: "paragraph 1".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -479,6 +489,7 @@ fn heading_prefix_hidden_when_cursor_elsewhere(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "# Title\n\nbody".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -496,6 +507,7 @@ fn heading_prefix_dims_when_cursor_inside(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "# Title\n".into(),
         selection: Selection::Cursor(4),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -511,6 +523,7 @@ fn bold_delimiters_flip_on_cursor_position(cx: &mut TestAppContext) {
     let outside = EditorState {
         markdown: "**bold**\n\nelsewhere".into(),
         selection: Selection::Cursor(15),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, outside);
     let spec = current_spec(cx, &editor);
@@ -525,6 +538,7 @@ fn bold_delimiters_flip_on_cursor_position(cx: &mut TestAppContext) {
     let inside = EditorState {
         markdown: "**bold**".into(),
         selection: Selection::Cursor(4),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, inside);
     let spec = current_spec(cx, &editor);
@@ -538,6 +552,7 @@ fn italic_and_strike_dim_within_selection(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "*it* and ~~no~~".into(),
         selection: Selection::range(0, 15),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -574,6 +589,7 @@ fn enter_in_middle_of_paragraph_creates_paragraph_break(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "hello world".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -599,6 +615,7 @@ fn three_enters_grow_into_three_visible_empty_rows(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "ab".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
 
@@ -644,6 +661,7 @@ fn backspace_at_paragraph_break_merges_in_one_keystroke(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "first\n\nsecond".into(),
         selection: Selection::Cursor(7),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -661,6 +679,7 @@ fn backspace_through_empty_paragraphs_one_pair_at_a_time(cx: &mut TestAppContext
     let initial = EditorState {
         markdown: "a\n\n\n\nb".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
 
@@ -679,6 +698,7 @@ fn delete_forward_at_paragraph_break_merges(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "first\n\nsecond".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Delete);
@@ -703,6 +723,7 @@ fn enter_inside_code_block_inserts_single_newline(cx: &mut TestAppContext) {
         markdown: "```rust\nlet x = 1;\n```".into(),
         // Cursor at end of "let x = 1;".
         selection: Selection::Cursor(18),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -728,6 +749,7 @@ fn enter_outside_code_block_inserts_paragraph_break(cx: &mut TestAppContext) {
         markdown: "```\nx\n```\n\npara".into(),
         // Cursor inside "para".
         selection: Selection::Cursor(13),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -749,6 +771,7 @@ fn code_block_renders_as_code_block_kind(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "```rust\nlet x = 1;\n```".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -769,6 +792,7 @@ fn backspace_inside_code_block_deletes_one_newline(cx: &mut TestAppContext) {
         markdown: "```\nline1\n\nline2\n```".into(),
         // Cursor right after the second `\n` (start of "line2").
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -785,6 +809,7 @@ fn delete_forward_inside_code_block_deletes_one_newline(cx: &mut TestAppContext)
         // Cursor at the first `\n` of the `\n\n` pair (end of
         // "line1").
         selection: Selection::Cursor(9),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Delete);
@@ -804,6 +829,7 @@ fn cursor_can_land_in_blank_line_inside_code_block(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "```\nline1\n\nline2\n```".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _window, cx| {
@@ -831,6 +857,7 @@ fn pasted_multiline_inside_code_block_keeps_single_newlines(cx: &mut TestAppCont
         // Cursor inside the empty content (between opening `\n` and
         // closing fence).
         selection: Selection::Cursor(4),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _window, cx| {
@@ -862,6 +889,7 @@ fn blockquote_renders_a_paragraph_with_one_container(cx: &mut TestAppContext) {
         markdown: "> hello\n\nbody".into(),
         // Cursor in "body" — outside the blockquote.
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -888,6 +916,7 @@ fn typing_inside_blockquote_keeps_it_a_blockquote(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> hello".into(),
         selection: Selection::Cursor(7),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -916,6 +945,7 @@ fn nested_blockquotes_emit_two_containers(cx: &mut TestAppContext) {
         markdown: "> > deep\n\nbody".into(),
         // Cursor outside (in "body").
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -941,6 +971,7 @@ fn cursor_inside_blockquote_marks_only_overlapping_levels(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "> > deep\n".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -966,6 +997,7 @@ fn enter_inside_blockquote_keeps_new_paragraph_at_same_depth(cx: &mut TestAppCon
     let initial = EditorState {
         markdown: "> hello".into(),
         selection: Selection::Cursor(7),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -994,6 +1026,7 @@ fn enter_inside_nested_blockquote_keeps_depth(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> > deep".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -1021,6 +1054,7 @@ fn shift_enter_inside_blockquote_keeps_marker_on_continuation(cx: &mut TestAppCo
     let initial = EditorState {
         markdown: "> hello".into(),
         selection: Selection::Cursor(7),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -1050,6 +1084,7 @@ fn backspace_at_end_of_depth_1_pair_outdents_to_depth_0(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "> hello\n> \n> ".into(),
         selection: Selection::Cursor(13),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -1068,6 +1103,7 @@ fn backspace_at_end_of_depth_2_pair_outdents_to_depth_1(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "> > deep\n> > \n> > ".into(),
         selection: Selection::Cursor(18),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -1088,6 +1124,7 @@ fn successive_backspaces_walk_paragraph_through_nesting_levels(cx: &mut TestAppC
     let initial = EditorState {
         markdown: "> > deep\n> > \n> > ".into(),
         selection: Selection::Cursor(18),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -1121,6 +1158,7 @@ fn backspace_outdents_interior_paragraph_not_just_trailing(cx: &mut TestAppConte
     let initial = EditorState {
         markdown: "> one\n> \n> two".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -1139,6 +1177,7 @@ fn backspace_at_top_level_paragraph_break_still_merges(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: "p1\n\np2".into(),
         selection: Selection::Cursor(4),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -1159,6 +1198,7 @@ fn backspace_at_first_paragraph_in_blockquote_falls_through(cx: &mut TestAppCont
     let initial = EditorState {
         markdown: "para\n\n> hi".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -1179,6 +1219,7 @@ fn backspace_outdent_preserves_no_soft_break_invariant(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: "> > > p1\n> > > \n> > > p2".into(),
         selection: Selection::Cursor(22),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     // Walk the paragraph from depth 3 → 2 → 1 → 0. At each step the
@@ -1212,6 +1253,7 @@ fn typing_inside_blockquote_after_enter_preserves_scope(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "> p1".into(),
         selection: Selection::Cursor(4),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -1277,6 +1319,7 @@ fn space_inside_blockquote_does_not_inject_extra_lines(cx: &mut TestAppContext) 
         markdown: "> blockquote\n> \n> ".into(),
         // Cursor right after "blockquote".
         selection: Selection::Cursor(12),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -1325,6 +1368,7 @@ fn typing_gt_to_enter_nested_blockquote_does_not_inject_extra_lines(cx: &mut Tes
         markdown: "> level 1\n> \n> ".into(),
         // Cursor at end of buffer.
         selection: Selection::Cursor(15),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -1395,6 +1439,7 @@ fn typing_gt_on_interior_blank_bq_line_does_not_inject_lines(cx: &mut TestAppCon
         markdown: "> Level 1\n> \n> \n> \n> Level 1".into(),
         // Cursor at the `\n` ending line 3 (the middle blank).
         selection: Selection::Cursor(15),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -1440,6 +1485,7 @@ fn typing_gt_on_first_blank_bq_line_does_not_cascade(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> Level 1\n> \n> \n> \n> Level 1".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -1474,6 +1520,7 @@ fn cursor_cannot_set_inside_blockquote_pair(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> p1\n> \n> p2".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -1503,6 +1550,7 @@ fn right_arrow_jumps_over_blockquote_pair(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> p1\n> \n> p2".into(),
         selection: Selection::Cursor(4),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -1517,6 +1565,7 @@ fn delete_forward_at_pair_start_atomically_undoes_break(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "> hello\n> \n> world".into(),
         selection: Selection::Cursor(7),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Delete);
@@ -1535,6 +1584,7 @@ fn soft_break_across_bq_lines_promotes_to_pair(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> p1\n> p2".into(),
         selection: Selection::Cursor(9),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "> p1\n> \n> p2");
@@ -1548,6 +1598,7 @@ fn lazy_continuation_under_soft_break_gets_marker_inserted(cx: &mut TestAppConte
     let initial = EditorState {
         markdown: "> hello\nworld".into(),
         selection: Selection::Cursor(13),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "> hello\n> \n> world");
@@ -1561,6 +1612,7 @@ fn hard_break_to_soft_break_promotes_to_pair(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> hello \n> world".into(),
         selection: Selection::Cursor(9),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "> hello \n> \n> world");
@@ -1573,6 +1625,7 @@ fn missing_space_after_marker_normalizes_when_cursor_moves_off(cx: &mut TestAppC
     let initial = EditorState {
         markdown: ">foo".into(),
         selection: Selection::Cursor(4),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "> foo");
@@ -1585,6 +1638,7 @@ fn missing_space_after_marker_left_alone_when_cursor_just_after_gt(cx: &mut Test
     let initial = EditorState {
         markdown: ">foo".into(),
         selection: Selection::Cursor(1),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, ">foo");
@@ -1597,6 +1651,7 @@ fn code_block_inside_blockquote_carries_blockquote_container(cx: &mut TestAppCon
         markdown: "> ```\n> code\n> ```\n\nbody".into(),
         // Cursor outside.
         selection: Selection::Cursor(22),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -1621,6 +1676,7 @@ fn select_across_paragraph_break_and_replace(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "alpha\n\nbeta".into(),
         selection: Selection::range(2, 9),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     // Replacement comes via the `EntityInputHandler` path (the production
@@ -1643,6 +1699,7 @@ fn unordered_list_renders_one_container_per_item(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo\n- bar\n".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -1662,6 +1719,7 @@ fn enter_at_end_of_unordered_item_creates_next_bullet(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -1684,6 +1742,7 @@ fn enter_at_end_of_ordered_item_increments_number(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. foo".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -1711,6 +1770,7 @@ fn typing_inside_list_does_not_split_on_newline(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo\n- bar".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- foo\n- bar");
@@ -1723,6 +1783,7 @@ fn typing_in_a_list_item_does_not_break_the_list(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo\n- bar".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -1754,6 +1815,7 @@ fn enter_inside_list_inside_blockquote_keeps_both_scopes(cx: &mut TestAppContext
     let initial = EditorState {
         markdown: "> - foo".into(),
         selection: Selection::Cursor(7),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -1782,6 +1844,7 @@ fn list_followed_by_heading_uses_double_newline_boundary(cx: &mut TestAppContext
     let initial = EditorState {
         markdown: "- item\n# heading".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- item\n\n# heading");
@@ -1799,6 +1862,7 @@ fn list_followed_by_lazy_paragraph_canonicalizes_to_continuation(cx: &mut TestAp
     let initial = EditorState {
         markdown: "- item\nparagraph".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- item  \n  paragraph");
@@ -1816,6 +1880,7 @@ fn loose_list_gets_tightened_to_single_newline_separator(cx: &mut TestAppContext
     let initial = EditorState {
         markdown: "- foo\n\n- bar".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- foo\n- bar");
@@ -1830,6 +1895,7 @@ fn lazy_continuation_in_item_promotes_to_hard_break_with_indent(cx: &mut TestApp
     let initial = EditorState {
         markdown: "- foo\nbar".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- foo  \n  bar");
@@ -1843,6 +1909,7 @@ fn soft_break_inside_item_promotes_to_hard_break(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo\n  bar".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- foo  \n  bar");
@@ -1859,6 +1926,7 @@ fn ordered_marker_widening_reindents_continuations(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "9. nine\n10. foo  \n   bar".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "9. nine\n10. foo  \n    bar");
@@ -1869,6 +1937,7 @@ fn ordered_marker_narrowing_reindents_continuations(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. foo  \n    bar".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "1. foo  \n   bar");
@@ -1886,6 +1955,7 @@ fn enter_on_empty_top_level_item_exits_to_paragraph(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo\n- ".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -1910,6 +1980,7 @@ fn enter_on_sole_empty_item_clears_buffer(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- ".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -1934,6 +2005,7 @@ fn enter_on_empty_item_inside_blockquote_exits_to_bq_paragraph(cx: &mut TestAppC
     let initial = EditorState {
         markdown: "> - foo\n> - ".into(),
         selection: Selection::Cursor(12),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -1963,6 +2035,7 @@ fn backspace_at_start_of_top_level_item_strips_marker(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -1984,6 +2057,7 @@ fn backspace_at_start_of_non_first_item_creates_paragraph_break(cx: &mut TestApp
     let initial = EditorState {
         markdown: "1. Item one\n2. Item two".into(),
         selection: Selection::Cursor(15),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -2000,6 +2074,7 @@ fn backspace_at_start_of_nested_item_dedents_to_sibling(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "- a\n  - b".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -2013,6 +2088,7 @@ fn backspace_at_start_of_ordered_item_strips_marker(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. foo".into(),
         selection: Selection::Cursor(3),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -2029,6 +2105,7 @@ fn two_hard_breaks_at_top_level_become_paragraph_break(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: "foo  \n  \nbar".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "foo\n\nbar");
@@ -2042,6 +2119,7 @@ fn two_hard_breaks_in_blockquote_become_bq_paragraph_pair(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "> foo  \n>   \n> bar".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "> foo\n> \n> bar");
@@ -2059,6 +2137,7 @@ fn two_hard_breaks_in_list_item_create_paragraph_break(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: "- foo  \n    \n  bar".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- foo\n\n  bar");
@@ -2072,6 +2151,7 @@ fn shift_enter_twice_inside_list_item_creates_paragraph_break(cx: &mut TestAppCo
     let initial = EditorState {
         markdown: "- foo".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -2115,6 +2195,7 @@ fn multi_paragraph_list_item_is_preserved(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. This is a list\n\n   With a second paragraph.".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(
@@ -2128,6 +2209,7 @@ fn multi_paragraph_item_renders_as_two_paragraph_leaves(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "1. first paragraph\n\n   second paragraph".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2154,6 +2236,7 @@ fn nested_list_renders_with_two_container_levels(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- outer\n  - nested".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2178,6 +2261,7 @@ fn nested_list_with_outer_sibling_renders_three_leaves(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: "- outer\n  - nested\n- sibling".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2200,6 +2284,7 @@ fn triple_nested_list_renders_three_levels(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- a\n  - b\n    - c".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2225,6 +2310,7 @@ fn nested_ordered_inside_unordered(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo\n  1. one\n  2. two".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2268,6 +2354,7 @@ fn enter_inside_nested_list_creates_next_nested_item(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- outer\n  - nested".into(),
         selection: Selection::Cursor(18),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -2292,6 +2379,7 @@ fn tab_nests_top_level_item_under_previous_sibling(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- one\n- two".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -2306,6 +2394,7 @@ fn tab_on_first_item_is_a_noop(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- only".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -2322,6 +2411,7 @@ fn tab_nests_into_existing_nested_list(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- one\n  - nested\n- two".into(),
         selection: Selection::Cursor(19),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -2345,6 +2435,7 @@ fn tab_nests_already_nested_item_one_level_deeper(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- a\n  - b\n  - c".into(),
         selection: Selection::Cursor(15),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -2360,6 +2451,7 @@ fn shift_tab_dedents_nested_item_to_sibling(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- a\n  - b".into(),
         selection: Selection::Cursor(9),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
@@ -2373,6 +2465,7 @@ fn shift_tab_dedents_triple_nested_to_double(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- a\n  - b\n    - c".into(),
         selection: Selection::Cursor(17),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
@@ -2389,6 +2482,7 @@ fn shift_tab_on_top_level_item_drops_marker(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
@@ -2402,6 +2496,7 @@ fn shift_tab_outside_a_list_is_a_noop(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "just a paragraph".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
@@ -2424,6 +2519,7 @@ fn unordered_marker_hidden_and_overlaid_at_level_zero(cx: &mut TestAppContext) {
         markdown: "- foo\n\nbody".into(),
         // Cursor in the body paragraph, well outside the list.
         selection: Selection::Cursor(9),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2444,6 +2540,7 @@ fn unordered_marker_overlay_present_when_cursor_inside(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: "- foo".into(),
         selection: Selection::Cursor(3),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2471,6 +2568,7 @@ fn ordered_marker_hidden_and_overlaid(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. foo\n\nbody".into(),
         selection: Selection::Cursor(10),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2489,6 +2587,7 @@ fn star_marker_also_hidden_and_overlaid(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "* foo\n\nbody".into(),
         selection: Selection::Cursor(9),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2509,6 +2608,7 @@ fn list_max_marker_text_reflects_widest_marker_in_list(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: "1. one\n2. two\n3. three\n4. four\n5. five\n6. six\n7. seven\n8. eight\n9. nine\n10. ten\n11. eleven".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2539,6 +2639,7 @@ fn unordered_list_max_marker_text_canonicalizes_to_dash(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "* foo\n* bar".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2566,6 +2667,7 @@ fn list_item_marker_byte_len_recorded_per_item(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. one\n2. two".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2591,6 +2693,7 @@ fn left_arrow_skips_hidden_list_marker_bytes(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Left);
@@ -2604,6 +2707,7 @@ fn right_arrow_skips_hidden_list_marker_bytes(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -2626,6 +2730,7 @@ fn cursor_at_real_start_of_list_item_line_snaps_forward(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let landed = cx.update(|cx| {
@@ -2651,6 +2756,7 @@ fn down_arrow_lands_at_content_edge_not_line_start(cx: &mut TestAppContext) {
         markdown: "- one\n- two".into(),
         // Cursor at end of "one" (byte 5).
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Down);
@@ -2677,6 +2783,7 @@ fn click_inside_hidden_marker_snaps_to_nearest_edge(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- foo".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let final_state = cx.update(|cx| {
@@ -2705,6 +2812,7 @@ fn nested_list_item_hides_inner_marker(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- outer\n  - nested".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2731,6 +2839,7 @@ fn multi_paragraph_list_item_hides_continuation_indent(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: "- foo\n\n  bar".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -2784,6 +2893,7 @@ fn shift_enter_at_end_of_list_item_with_following_item(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: "1. Item one\n2. Item two".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -2857,6 +2967,7 @@ fn extra_space_after_unordered_marker_is_stripped(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "-  foo".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- foo");
@@ -2867,6 +2978,7 @@ fn multiple_extra_spaces_after_marker_are_stripped(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "-    foo".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- foo");
@@ -2877,6 +2989,7 @@ fn extra_space_after_ordered_marker_is_stripped(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1.  foo".into(),
         selection: Selection::Cursor(7),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "1. foo");
@@ -2891,6 +3004,7 @@ fn empty_item_with_only_extra_trailing_spaces_is_left_alone(cx: &mut TestAppCont
     let initial = EditorState {
         markdown: "- foo\n-  ".into(),
         selection: Selection::Cursor(9),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- foo\n-  ");
@@ -2905,6 +3019,7 @@ fn extra_marker_spacing_preserved_when_cursor_in_gap(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "-  foo".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "-  foo");
@@ -2913,6 +3028,7 @@ fn extra_marker_spacing_preserved_when_cursor_in_gap(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "-  foo".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- foo");
@@ -2929,6 +3045,7 @@ fn residual_blank_line_whitespace_is_stripped(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. one\n   \n   two".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "1. one\n\n   two");
@@ -2942,6 +3059,7 @@ fn residual_blank_line_preserved_when_cursor_parked_there(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "1. one\n   \n   two".into(),
         selection: Selection::Cursor(10), // end of "   " on the blank line
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "1. one\n   \n   two");
@@ -2958,6 +3076,7 @@ fn ordered_list_renumbers_after_inserted_item(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. one\n1. two\n3. three".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "1. one\n2. two\n3. three");
@@ -2969,6 +3088,7 @@ fn ordered_list_renumbers_after_removed_item(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. one\n5. middle\n3. three".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "1. one\n2. middle\n3. three");
@@ -2982,6 +3102,7 @@ fn ordered_list_renumbering_preserves_non_one_start(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "10. ten\n12. twelve".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "10. ten\n11. twelve");
@@ -2995,6 +3116,7 @@ fn ordered_list_renumber_widens_indent_for_continuation(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "9. nine\n9. ten  \n   cont".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "9. nine\n10. ten  \n    cont");
@@ -3020,6 +3142,7 @@ fn tab_on_ordered_item_starts_nested_list_at_one(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. Item one\n2. ".into(),
         selection: Selection::Cursor(15),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -3058,6 +3181,7 @@ fn tab_on_ordered_item_joining_existing_nested_list_renumbers(cx: &mut TestAppCo
     let initial = EditorState {
         markdown: "1. one\n   1. nested-1\n2. two".into(),
         selection: Selection::Cursor(25),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -3076,6 +3200,7 @@ fn shift_tab_on_nested_ordered_item_dedents_correct_one(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "1. Item one\n   1. Item one, one".into(),
         selection: Selection::Cursor(20),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
@@ -3092,6 +3217,7 @@ fn tab_preserves_continuation_lines_under_new_indent(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- one\n- two  \n  cont".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -3146,6 +3272,7 @@ fn bq_inside_list_inside_bq_inside_list_renders_with_full_chain(cx: &mut TestApp
     let initial = EditorState {
         markdown: "- > - > deepest".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -3176,6 +3303,7 @@ fn list_inside_bq_inside_list_inside_bq_renders_with_full_chain(cx: &mut TestApp
     let initial = EditorState {
         markdown: "> - > - deepest".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -3194,6 +3322,7 @@ fn triple_nested_list_carries_three_list_item_entries(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- one\n  - two\n    - three".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -3216,6 +3345,7 @@ fn code_block_inside_list_carries_list_item_chain(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- ```\n  code\n  ```".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -3232,6 +3362,7 @@ fn code_block_inside_bq_carries_blockquote_chain(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> ```\n> code\n> ```".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -3250,6 +3381,7 @@ fn code_block_inside_bq_inside_list_carries_both_chains(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "- > ```\n  > code\n  > ```".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -3267,6 +3399,7 @@ fn code_block_inside_list_inside_bq_carries_both_chains(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "> - ```\n>   code\n>   ```".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -3288,6 +3421,7 @@ fn enter_inside_code_inside_list_inserts_single_newline(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "- ```\n  code\n  ```".into(),
         selection: Selection::Cursor(11), // mid-content on `code` line
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -3318,6 +3452,7 @@ fn multi_paragraph_item_with_nested_list_renders_three_leaves(cx: &mut TestAppCo
     let initial = EditorState {
         markdown: "1. p1\n\n   p2\n\n   - nested".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -3341,6 +3476,7 @@ fn tab_at_depth_2_nests_to_depth_3(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- one\n  - two\n  - three".into(),
         selection: Selection::Cursor(20), // inside "three"
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -3365,6 +3501,7 @@ fn tab_inside_blockquote_list_nests_within_blockquote(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> - one\n> - two".into(),
         selection: Selection::Cursor(13), // inside "two"
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -3380,6 +3517,7 @@ fn shift_tab_at_depth_3_dedents_to_depth_2(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- one\n  - two\n    - three".into(),
         selection: Selection::Cursor(22),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
@@ -3396,6 +3534,7 @@ fn shift_tab_at_top_level_inside_blockquote_becomes_paragraph_in_bq(cx: &mut Tes
     let initial = EditorState {
         markdown: "> - one\n> - two".into(),
         selection: Selection::Cursor(13), // inside "two"
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
@@ -3414,6 +3553,7 @@ fn empty_enter_on_top_level_item_becomes_paragraph(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- one\n- ".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -3446,6 +3586,7 @@ fn backspace_at_li_wrapped_fence_start_unwraps_li(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. ```js\n   body\n   ```".into(),
         selection: Selection::Cursor(3),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -3465,6 +3606,7 @@ fn backspace_at_bq_wrapped_fence_start_unwraps_bq(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> ```js\n> body\n> ```".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -3484,6 +3626,7 @@ fn backspace_on_empty_body_line_in_bq_fence_removes_whole_line(cx: &mut TestAppC
     let initial = EditorState {
         markdown: "> ```js\n> \n> ```".into(),
         selection: Selection::Cursor(10),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -3503,6 +3646,7 @@ fn backspace_on_empty_body_line_in_li_fence_removes_whole_line(cx: &mut TestAppC
     let initial = EditorState {
         markdown: "1. ```js\n   body\n   ```".into(),
         selection: Selection::Cursor(16),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -3555,6 +3699,7 @@ fn typing_bq_marker_at_fence_opener_nests_entire_fence(cx: &mut TestAppContext) 
         let initial = EditorState {
             markdown: src.into(),
             selection: Selection::Cursor(0),
+            ..Default::default()
         };
         let (handle, editor) = open_editor(cx, initial);
         cx.update_window(handle, |_, _, cx| {
@@ -3596,6 +3741,7 @@ fn enter_repeated_in_bq_wrapped_fence_body_keeps_bq_prefixes(cx: &mut TestAppCon
     let initial = EditorState {
         markdown: "> ```js\n> body\n> ```".into(),
         selection: Selection::Cursor(14),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     for _ in 0..4 {
@@ -3635,6 +3781,7 @@ fn enter_at_opener_fence_start_in_li_inserts_new_list_item(cx: &mut TestAppConte
     let initial = EditorState {
         markdown: "1. ```js\n   body\n   ```".into(),
         selection: Selection::Cursor(3),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -3660,6 +3807,7 @@ fn tab_inside_li_wrapped_fence_body_inserts_literal_tab(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "1. ```js\n   body\n   ```".into(),
         selection: Selection::Cursor(16),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -3696,6 +3844,7 @@ fn code_block_fences_are_delimiter_rows_at_every_chain(cx: &mut TestAppContext) 
         let initial = EditorState {
             markdown: src.into(),
             selection: Selection::Cursor(0),
+            ..Default::default()
         };
         let (_handle, editor) = open_editor(cx, initial);
         editor.read_with(cx, |e, _| {
@@ -3743,6 +3892,7 @@ fn multi_enter_from_nested_item_progresses_one_level_per_press(cx: &mut TestAppC
     let initial = EditorState {
         markdown: "- parent\n  - child".into(),
         selection: Selection::Cursor(18),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
 
@@ -3831,6 +3981,7 @@ fn double_enter_at_end_of_nested_item_outdents_on_second_press(cx: &mut TestAppC
     let initial = EditorState {
         markdown: "- parent\n  - child".into(),
         selection: Selection::Cursor(18),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
 
@@ -3892,6 +4043,7 @@ fn empty_enter_on_nested_empty_item_outdents_to_outer_paragraph(cx: &mut TestApp
     let initial = EditorState {
         markdown: "- one\n  - ".into(),
         selection: Selection::Cursor(10),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -3916,6 +4068,7 @@ fn empty_enter_on_top_level_item_inside_blockquote_stays_in_bq(cx: &mut TestAppC
     let initial = EditorState {
         markdown: "> - one\n> - ".into(),
         selection: Selection::Cursor(12),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -3942,6 +4095,7 @@ fn backspace_at_start_of_top_level_item_makes_paragraph(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "- one".into(),
         selection: Selection::Cursor(2), // right after the marker
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -3957,6 +4111,7 @@ fn backspace_at_start_of_nested_item_dedents_to_outer(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- one\n  - two".into(),
         selection: Selection::Cursor(10), // right after the inner marker
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -3996,6 +4151,7 @@ fn enter_past_post_list_separator_does_not_reanimate_list(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "1. asdf".into(),
         selection: Selection::Cursor(7),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -4041,6 +4197,7 @@ fn manually_typed_ordered_list_start_is_preserved(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "5. foo".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     // Trigger a no-op enforce_invariants pass via SelectAll (no
@@ -4057,6 +4214,7 @@ fn manually_typed_ordered_list_in_blockquote_preserves_start(cx: &mut TestAppCon
     let initial = EditorState {
         markdown: "> 7. foo".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, SelectAll);
@@ -4076,6 +4234,7 @@ fn ordered_list_with_manual_start_renumbers_subsequent_items_from_that_start(
     let initial = EditorState {
         markdown: "5. one\n2. two\n3. three".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, SelectAll);
@@ -4101,6 +4260,7 @@ fn split_list_preserves_trailing_orphan_start(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "1. one\n2. two\n3. three".into(),
         selection: Selection::Cursor(10),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -4135,6 +4295,7 @@ fn enter_at_start_of_paragraph_after_list_inserts_paragraph_break(cx: &mut TestA
     let initial = EditorState {
         markdown: "1. one\n\ntwo\n\n1. three".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -4178,6 +4339,7 @@ fn backspace_at_marker_end_of_top_level_item_with_nested_child_strips_orphan_ind
     let initial = EditorState {
         markdown: "1. level one\n2. level one\n   1. level three".into(),
         selection: Selection::Cursor(16),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -4223,6 +4385,7 @@ fn backspace_then_enter_then_tab_sequence_does_not_crash(cx: &mut TestAppContext
     let initial = EditorState {
         markdown: "1. level one\n2. level one\n   1. level three".into(),
         selection: Selection::Cursor(16),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -4274,6 +4437,7 @@ fn tab_on_ordered_item_with_existing_nested_child_does_not_panic(cx: &mut TestAp
     let initial = EditorState {
         markdown: "1. level one\n2. level one\n   1. level three".into(),
         selection: Selection::Cursor(25),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -4342,6 +4506,7 @@ fn deep_code_in_bq_in_list_in_bq_in_list_carries_4_chain_entries(cx: &mut TestAp
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -4374,6 +4539,7 @@ fn deep_code_in_list_in_bq_in_list_in_bq_carries_4_chain_entries(cx: &mut TestAp
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -4394,6 +4560,7 @@ fn deep_5_level_bq_bq_list_bq_list_chain_renders_each_level(cx: &mut TestAppCont
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -4452,6 +4619,7 @@ fn item_with_paragraph_then_blockquote_then_code_renders_all_in_chain(cx: &mut T
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -4484,6 +4652,7 @@ fn item_with_nested_list_then_blockquote_keeps_outer_chain_through_both(cx: &mut
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -4519,6 +4688,7 @@ fn type_inside_code_at_depth_4_lands_in_code_content(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "Y");
@@ -4544,6 +4714,7 @@ fn type_at_end_of_innermost_item_keeps_full_chain(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "er");
@@ -4570,6 +4741,7 @@ fn type_at_start_of_innermost_content_keeps_full_chain(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "X");
@@ -4595,6 +4767,7 @@ fn enter_at_end_of_innermost_item_stays_in_full_chain(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -4628,6 +4801,7 @@ fn type_gt_at_start_of_nested_item_does_not_split_outer_scope(cx: &mut TestAppCo
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, ">");
@@ -4654,6 +4828,7 @@ fn backspace_at_start_of_innermost_item_dedents_one_level(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -4678,6 +4853,7 @@ fn delete_forward_at_end_of_inner_item_does_not_panic(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Delete);
@@ -4701,6 +4877,7 @@ fn backspace_inside_code_at_depth_4_deletes_one_byte(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -4730,6 +4907,7 @@ fn select_all_then_backspace_clears_deep_nest_without_panicking(cx: &mut TestApp
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, SelectAll);
@@ -4753,6 +4931,7 @@ fn shift_tab_at_innermost_of_4_level_alternation_dedents_one_level(cx: &mut Test
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
@@ -4791,6 +4970,7 @@ fn tab_on_a_sibling_inside_deep_nest_nests_within_existing_chain(cx: &mut TestAp
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
@@ -4818,6 +4998,7 @@ fn empty_enter_on_innermost_item_in_deep_nest_dedents(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -4851,6 +5032,7 @@ fn right_arrow_walks_through_entire_deep_fixture_without_panicking(cx: &mut Test
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     let mut last = 0usize;
@@ -4873,6 +5055,7 @@ fn down_arrow_from_top_through_deep_fixture_terminates(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     let mut last = 0usize;
@@ -4910,6 +5093,7 @@ fn home_inside_deeply_indented_continuation_lands_at_content_edge(cx: &mut TestA
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Home);
@@ -4931,6 +5115,7 @@ fn end_inside_deeply_indented_line_lands_at_line_terminus(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, End);
@@ -4947,6 +5132,7 @@ fn typing_a_blockquote_marker_into_a_list_item_deepens_scope(cx: &mut TestAppCon
     let initial = EditorState {
         markdown: "- foo".into(),
         selection: Selection::Cursor(2), // right after `- `
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "> ");
@@ -4983,6 +5169,7 @@ fn list_spacing_does_not_change_with_cursor_focus(cx: &mut TestAppContext) {
         let initial = EditorState {
             markdown: src.into(),
             selection: Selection::Cursor(cursor),
+            ..Default::default()
         };
         let (_handle, editor) = open_editor(cx, initial);
         editor.read_with(cx, |e, _| {
@@ -5028,6 +5215,7 @@ fn list_item_trailing_space_keeps_cursor_in_block(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "- foo ");
@@ -5045,6 +5233,7 @@ fn enter_on_empty_task_item_outdents_to_paragraph(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- [ ] ".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -5073,6 +5262,7 @@ fn enter_on_empty_checked_task_item_outdents(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- [x] ".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -5100,6 +5290,7 @@ fn enter_on_empty_task_in_a_list_drops_only_that_item(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- [x] one\n- [ ] ".into(),
         selection: Selection::Cursor(16),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -5135,6 +5326,7 @@ fn enter_at_end_of_task_item_creates_another_task_item(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: "- [x] done".into(),
         selection: Selection::Cursor(10),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -5158,6 +5350,7 @@ fn enter_at_end_of_unchecked_task_item_creates_another_task_item(cx: &mut TestAp
     let initial = EditorState {
         markdown: "- [ ] todo".into(),
         selection: Selection::Cursor(10),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -5182,6 +5375,7 @@ fn enter_at_end_of_plain_unordered_item_does_not_become_task(cx: &mut TestAppCon
     let initial = EditorState {
         markdown: "- foo".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -5206,6 +5400,7 @@ fn typing_dash_then_letter_injects_marker_space(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "-foo");
@@ -5223,6 +5418,7 @@ fn typing_star_then_letter_injects_marker_space(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "*x");
@@ -5236,6 +5432,7 @@ fn typing_plus_then_letter_injects_marker_space(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "+x");
@@ -5252,6 +5449,7 @@ fn typing_double_dash_does_not_inject_space(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "--");
@@ -5265,6 +5463,7 @@ fn typing_three_dashes_remains_thematic_break_candidate(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "---");
@@ -5281,6 +5480,7 @@ fn typing_inside_existing_list_item_does_not_inject_space(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "- foo\n  ".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "-bar");
@@ -5304,6 +5504,7 @@ fn typing_dash_alone_does_not_inject_space(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "-");
@@ -5318,6 +5519,7 @@ fn typing_a_list_marker_into_a_bq_paragraph_opens_a_list(cx: &mut TestAppContext
     let initial = EditorState {
         markdown: "> ".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "- foo");
@@ -5343,6 +5545,7 @@ fn build_3_level_list_from_scratch_via_tabs(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "- one");
@@ -5384,6 +5587,7 @@ fn build_bq_then_list_then_bq_via_typing(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "> - > deep");
@@ -5412,6 +5616,7 @@ fn chain_remains_consistent_after_typing_at_innermost(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     let chain_before = editor.read_with(cx, |e, _| {
@@ -5437,6 +5642,7 @@ fn end_of_outermost_list_followed_by_paragraph_does_not_reanimate(cx: &mut TestA
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (_handle, editor) = open_editor(cx, initial);
     let chain = editor.read_with(cx, |e, _| {
@@ -5461,6 +5667,7 @@ fn cursor_chain_and_block_chain_agree_on_post_shift_enter_position(cx: &mut Test
     let initial = EditorState {
         markdown: "1. one".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -5513,6 +5720,7 @@ fn paragraph_break_inside_bq_in_list_keeps_full_continuation_prefix(cx: &mut Tes
     let initial = EditorState {
         markdown: "1. one\n\n   > a".into(),
         selection: Selection::Cursor(14), // after `> a`
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -5564,6 +5772,7 @@ fn inserted_text_with_newline_inside_code_in_bq_keeps_single_newline(cx: &mut Te
     let initial = EditorState {
         markdown: "> ```\n> \n> ```".into(),
         selection: Selection::Cursor(8), // inside the empty code body line
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -5601,6 +5810,7 @@ fn render_blocks_have_no_overlapping_source_ranges_in_simple_bq_in_list(cx: &mut
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_handle, editor) = open_editor(cx, initial);
     let spec = editor.read_with(cx, |e, _| e.render_spec());
@@ -5635,6 +5845,7 @@ fn enter_on_empty_inner_item_in_bq_in_outer_list_keeps_outer_indent(cx: &mut Tes
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -5685,6 +5896,7 @@ fn shift_tab_on_inner_li_in_bq_wrapped_list_dedents(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
@@ -5712,6 +5924,7 @@ fn backspace_on_empty_bq_paragraph_inside_li_drops_bq_scope(cx: &mut TestAppCont
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -5789,6 +6002,7 @@ fn left_arrow_skips_hidden_bq_continuation_prefix_in_li(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     // After one Left, cursor must be at a non-forbidden position.
@@ -5817,6 +6031,7 @@ fn same_line_bq_inside_li_renders_with_li_marker_overlay(cx: &mut TestAppContext
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_handle, editor) = open_editor(cx, initial);
     let spec = editor.read_with(cx, |e, _| e.render_spec());
@@ -5867,6 +6082,7 @@ fn empty_paragraph_after_bq_outdent_renders_at_top_level(cx: &mut TestAppContext
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -5908,6 +6124,7 @@ fn same_line_bq_marker_inside_li_is_hidden(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (_handle, editor) = open_editor(cx, initial);
     let spec = editor.read_with(cx, |e, _| e.render_spec());
@@ -5944,6 +6161,7 @@ fn trailing_li_continuation_indent_is_hidden_in_synth_leaf(cx: &mut TestAppConte
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (_handle, editor) = open_editor(cx, initial);
     let spec = editor.read_with(cx, |e, _| e.render_spec());
@@ -5986,6 +6204,7 @@ fn backspace_at_trailing_li_continuation_atomic_deletes(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -6017,6 +6236,7 @@ fn alternating_chain_trailing_synth_hides_full_continuation_prefix(cx: &mut Test
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (_handle, editor) = open_editor(cx, initial);
     let spec = editor.read_with(cx, |e, _| e.render_spec());
@@ -6054,6 +6274,7 @@ fn backspace_on_alternating_chain_keeps_inner_li_scope(cx: &mut TestAppContext) 
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -6107,6 +6328,7 @@ fn alternating_chain_continuation_hides_trailing_li_indent(cx: &mut TestAppConte
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (_handle, editor) = open_editor(cx, initial);
     let spec = editor.read_with(cx, |e, _| e.render_spec());
@@ -6145,6 +6367,7 @@ fn synth_trailing_leaf_in_alternating_chain_keeps_inner_li(cx: &mut TestAppConte
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (_handle, editor) = open_editor(cx, initial);
     let (cursor_chain_len, block_chain_len) = editor.read_with(cx, |e, _| {
@@ -6187,6 +6410,7 @@ fn hard_break_trailing_synth_extends_previous_paragraph(cx: &mut TestAppContext)
         let initial = EditorState {
             markdown: with_content_src.into(),
             selection: Selection::Cursor(with_content_src.len()),
+            ..Default::default()
         };
         let (_handle, editor) = open_editor(cx, initial);
         editor.read_with(cx, |e, _| e.render_spec().blocks.len())
@@ -6196,6 +6420,7 @@ fn hard_break_trailing_synth_extends_previous_paragraph(cx: &mut TestAppContext)
         let initial = EditorState {
             markdown: empty_src.into(),
             selection: Selection::Cursor(empty_src.len()),
+            ..Default::default()
         };
         let (_handle, editor) = open_editor(cx, initial);
         editor.read_with(cx, |e, _| e.render_spec().blocks.len())
@@ -6249,6 +6474,7 @@ fn probe_hard_break_trailing_in_alternating_chain(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     editor.read_with(cx, |e, _| {
@@ -6277,6 +6503,7 @@ fn probe_alternating_chain_backspace_steps(cx: &mut TestAppContext) {
     let mut state = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     for step in 0..6 {
         let initial = state.clone();
@@ -6314,6 +6541,7 @@ fn probe_alternating_chain_backspace_steps(cx: &mut TestAppContext) {
         state = editor.read_with(cx, |e, _| EditorState {
             markdown: e.value().into(),
             selection: e.selection(),
+            ..Default::default()
         });
     }
 }
@@ -6326,6 +6554,7 @@ fn probe_trailing_li_continuation_indent(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     editor.read_with(cx, |e, _| {
@@ -6364,6 +6593,7 @@ fn probe_trailing_li_continuation_indent(cx: &mut TestAppContext) {
         let initial2 = EditorState {
             markdown: src.into(),
             selection: Selection::Cursor(src.len()),
+            ..Default::default()
         };
         let (handle2, editor2) = open_editor(cx, initial2);
         for _ in 0..n_lefts {
@@ -6383,6 +6613,7 @@ fn probe_empty_paragraph_after_bq_outdent(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(cursor),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -6432,6 +6663,7 @@ fn probe_same_line_bq_in_li_render(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (_handle, editor) = open_editor(cx, initial);
     let spec = editor.read_with(cx, |e, _| e.render_spec());
@@ -6469,6 +6701,7 @@ fn probe_left_backspace_on_empty_bq_in_li(cx: &mut TestAppContext) {
         let initial = EditorState {
             markdown: src.into(),
             selection: Selection::Cursor(src.len()),
+            ..Default::default()
         };
         let (handle, editor) = open_editor(cx, initial);
         for _ in 0..n_lefts {
@@ -6521,6 +6754,7 @@ fn enter_after_unterminated_fence_in_bq_auto_closes_with_chain_prefix(cx: &mut T
     let initial = EditorState {
         markdown: "> ```rust".into(),
         selection: Selection::Cursor(9),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -6552,6 +6786,7 @@ fn enter_inside_terminated_fence_in_bq_inserts_newline_with_chain_prefix(cx: &mu
     let initial = EditorState {
         markdown: "> ```rust\n> body\n> ```".into(),
         selection: Selection::Cursor(16), // end of `> body`
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -6583,6 +6818,7 @@ fn enter_on_empty_bq_paragraph_outdents_bq_scope(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> a\n> \n> ".into(),
         selection: Selection::Cursor(9), // end of trailing empty `> `
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -6627,6 +6863,7 @@ fn render_walker_omits_synth_paragraph_inside_unterminated_fence(cx: &mut TestAp
     let initial = EditorState {
         markdown: "> ```rust\n> \n> ".into(),
         selection: Selection::Cursor(15),
+        ..Default::default()
     };
     let (_handle, editor) = open_editor(cx, initial);
     let spec = editor.read_with(cx, |e, _| e.render_spec());
@@ -6660,6 +6897,7 @@ fn auto_close_orphan_dedupes_when_user_types_matching_closer(cx: &mut TestAppCon
     let initial = EditorState {
         markdown: "> ```rust\n> body\n> ```\n> ```".into(),
         selection: Selection::Cursor(22), // end of user's typed `> ```` closer
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     // Trigger an update so enforce_invariants runs (any no-op insert
@@ -6725,6 +6963,7 @@ fn shift_tab_in_li_li_bq_does_not_panic_on_overlapping_strips(cx: &mut TestAppCo
     let initial = EditorState {
         markdown: src.into(),
         selection: Selection::Cursor(src.len()),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     // Shift+Tab on the trailing row inside the BQ — must not panic.
@@ -6748,6 +6987,7 @@ fn auto_close_fence_fires_in_li_li_bq_chain(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "- List\n  - Child\n\n    > Blockquote\n    > \n    > ```js".into(),
         selection: Selection::Cursor(53), // end of `> ```js`
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -6815,6 +7055,7 @@ fn display_math_flips_to_edit_mode_on_arrow_into_construct(cx: &mut TestAppConte
     let initial = EditorState {
         markdown: "$$x^2$$".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     // Inclusive overlap means cursor at 0 (boundary) is already
@@ -6848,6 +7089,7 @@ fn typing_inside_display_math_updates_source(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "$$x$$".into(),
         selection: Selection::Cursor(3),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -6882,6 +7124,7 @@ fn backspace_inside_display_math_deletes_one_byte(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "$$x^2$$".into(),
         selection: Selection::Cursor(5), // right after the `2`
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -6899,6 +7142,7 @@ fn inline_math_outside_cursor_emits_overlay(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "see $x^2$ here".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -6923,6 +7167,7 @@ fn inline_math_dims_delimiters_when_cursor_enters(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "see $x^2$ here".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -6944,6 +7189,7 @@ fn typing_inside_inline_math_extends_latex(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "$x$".into(),
         selection: Selection::Cursor(2), // between `x` and `$`
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -6977,6 +7223,7 @@ fn typing_dollar_dollar_then_enter_auto_closes_block_math(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "$$".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -7014,6 +7261,7 @@ fn enter_inside_block_math_inserts_literal_newline(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "$$\nx\n$$".into(),
         selection: Selection::Cursor(4), // after `x`
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -7050,6 +7298,7 @@ fn block_math_with_blank_line_in_body_round_trips_as_math(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "$$\nx\n\ny\n$$".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -7082,6 +7331,7 @@ fn auto_close_inside_blockquote_carries_chain_prefix(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> $$".into(),
         selection: Selection::Cursor(4),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -7108,6 +7358,7 @@ fn block_math_promoted_when_no_paragraph_wrapper(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "$$\na + b\n$$".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -7141,6 +7392,7 @@ fn multi_line_block_math_with_trailing_newline_is_terminated_and_renders(cx: &mu
         markdown: "Hello\n\n$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n$$\n".into(),
         // Cursor on "Hello" — strictly outside the math block.
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -7189,6 +7441,7 @@ fn enter_inside_terminated_block_math_with_trailing_newline_does_not_duplicate_f
     let initial = EditorState {
         markdown: "$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n$$\n".into(),
         selection: Selection::Cursor(44),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(
@@ -7233,6 +7486,7 @@ fn cursor_at_start_of_next_block_does_not_flip_math_to_edit_mode(cx: &mut TestAp
     let initial = EditorState {
         markdown: "$$\nx\n$$\nbar".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -7264,6 +7518,7 @@ fn bare_dash_in_block_math_body_does_not_get_marker_space_injected(cx: &mut Test
     let initial = EditorState {
         markdown: "$$\n-x\n$$".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -7291,6 +7546,7 @@ fn bare_gt_in_block_math_body_does_not_get_bq_space_injected(cx: &mut TestAppCon
     let initial = EditorState {
         markdown: "$$\n>x\n$$".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -7327,6 +7583,7 @@ fn backspace_on_prefix_only_line_in_bq_wrapped_math_eats_the_line(cx: &mut TestA
     let initial = EditorState {
         markdown: "> $$\n> x\n> \n> $$".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
@@ -7352,6 +7609,7 @@ fn word_left_from_end_of_word_lands_at_start_of_that_word(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "hello world".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, WordLeft);
@@ -7367,6 +7625,7 @@ fn word_left_from_start_of_word_skips_whitespace_to_previous_word(cx: &mut TestA
     let initial = EditorState {
         markdown: "hello world".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, WordLeft);
@@ -7380,6 +7639,7 @@ fn word_right_from_start_of_word_lands_at_end_of_that_word(cx: &mut TestAppConte
     let initial = EditorState {
         markdown: "hello world".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, WordRight);
@@ -7393,6 +7653,7 @@ fn word_right_at_end_of_doc_is_a_noop(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "abc".into(),
         selection: Selection::Cursor(3),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, WordRight);
@@ -7414,6 +7675,7 @@ fn word_left_skips_runs_of_punctuation(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "foo, bar".into(),
         selection: Selection::Cursor(8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, WordLeft);
@@ -7429,6 +7691,7 @@ fn word_right_skips_runs_of_punctuation(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "foo, bar".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, WordRight);
@@ -7442,6 +7705,7 @@ fn shift_word_right_extends_selection(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "alpha beta gamma".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftWordRight);
@@ -7467,6 +7731,7 @@ fn shift_word_left_extends_selection_backward(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "alpha beta gamma".into(),
         selection: Selection::Cursor(16),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftWordLeft);
@@ -7487,6 +7752,7 @@ fn word_left_collapses_existing_selection_to_lower_bound(cx: &mut TestAppContext
     let initial = EditorState {
         markdown: "alpha beta gamma".into(),
         selection: Selection::range(2, 8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, WordLeft);
@@ -7498,6 +7764,7 @@ fn word_right_collapses_existing_selection_to_upper_bound(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "alpha beta gamma".into(),
         selection: Selection::range(2, 8),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, WordRight);
@@ -7511,6 +7778,7 @@ fn delete_word_backward_removes_previous_word(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "hello world".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
@@ -7530,6 +7798,7 @@ fn delete_word_backward_at_start_of_word_eats_preceding_whitespace_and_word(
     let initial = EditorState {
         markdown: "hello world".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
@@ -7544,6 +7813,7 @@ fn delete_word_backward_at_buffer_start_is_a_noop(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "hello".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
@@ -7560,6 +7830,7 @@ fn delete_word_forward_removes_next_word(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "hello world".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordForward);
@@ -7576,6 +7847,7 @@ fn delete_word_forward_at_end_of_word_eats_following_whitespace_and_word(cx: &mu
     let initial = EditorState {
         markdown: "hello world".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordForward);
@@ -7593,6 +7865,7 @@ fn delete_word_backward_with_selection_deletes_the_selection(cx: &mut TestAppCon
     let initial = EditorState {
         markdown: "alpha beta gamma".into(),
         selection: Selection::range(6, 10),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
@@ -7607,6 +7880,7 @@ fn delete_to_line_start_within_paragraph_removes_prefix(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "hello world".into(),
         selection: Selection::Cursor(6),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7621,6 +7895,7 @@ fn delete_to_line_end_within_paragraph_removes_suffix(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "hello world".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineEnd);
@@ -7640,6 +7915,7 @@ fn delete_to_line_start_at_line_start_is_a_noop(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "line one\n\nline two".into(),
         selection: Selection::Cursor(10), // start of "line two"
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7659,6 +7935,7 @@ fn delete_to_line_start_on_second_paragraph_keeps_first(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "alpha\n\nbeta gamma".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7678,6 +7955,7 @@ fn delete_to_line_start_inside_list_item_preserves_marker(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "- hello world".into(),
         selection: Selection::Cursor(13),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7706,6 +7984,7 @@ fn delete_to_line_start_inside_blockquote_preserves_marker(cx: &mut TestAppConte
     let initial = EditorState {
         markdown: "> Paragraph 1\n> \n> Paragraph 2\n> \n> Paragraph 3".into(),
         selection: Selection::Cursor(28),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7726,6 +8005,7 @@ fn delete_to_line_start_inside_nested_blockquote_preserves_all_markers(cx: &mut 
     let initial = EditorState {
         markdown: "> > > foo".into(),
         selection: Selection::Cursor(9),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7743,6 +8023,7 @@ fn delete_to_line_start_at_content_edge_is_a_noop(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> hello".into(),
         selection: Selection::Cursor(2), // right after `> `
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7762,6 +8043,7 @@ fn delete_to_line_start_inside_bq_wrapped_list_item_preserves_both_markers(
     let initial = EditorState {
         markdown: "> - foo".into(),
         selection: Selection::Cursor(7),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7784,6 +8066,7 @@ fn delete_to_line_start_on_list_continuation_preserves_indent(cx: &mut TestAppCo
     let initial = EditorState {
         markdown: "- foo\n\n  bar".into(),
         selection: Selection::Cursor(12),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7807,6 +8090,7 @@ fn delete_to_line_start_in_bq_wrapped_li_continuation_preserves_both_prefixes(
     let initial = EditorState {
         markdown: "> - foo\n>   bar".into(),
         selection: Selection::Cursor(15),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7826,6 +8110,7 @@ fn delete_word_backward_inside_blockquote_preserves_marker(cx: &mut TestAppConte
     let initial = EditorState {
         markdown: "> hello".into(),
         selection: Selection::Cursor(2), // content edge
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
@@ -7843,6 +8128,7 @@ fn delete_word_backward_inside_blockquote_at_word_boundary_deletes_word(cx: &mut
     let initial = EditorState {
         markdown: "> hello world".into(),
         selection: Selection::Cursor(13),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
@@ -7869,6 +8155,7 @@ fn delete_word_forward_does_not_cross_into_next_blockquote_line(cx: &mut TestApp
     let initial = EditorState {
         markdown: "> hello world\n> \n> goodbye".into(),
         selection: Selection::Cursor(13),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordForward);
@@ -7886,6 +8173,7 @@ fn delete_to_line_start_preserves_multi_digit_ordered_marker(cx: &mut TestAppCon
     let initial = EditorState {
         markdown: "10. foo".into(),
         selection: Selection::Cursor(7),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7904,6 +8192,7 @@ fn delete_to_line_start_in_deeply_nested_alternating_chain(cx: &mut TestAppConte
     let initial = EditorState {
         markdown: "> - > - foo".into(),
         selection: Selection::Cursor(11),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
@@ -7921,6 +8210,7 @@ fn delete_word_forward_does_not_cross_into_next_list_item_marker(cx: &mut TestAp
     let initial = EditorState {
         markdown: "- foo\n- bar".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordForward);
@@ -7940,6 +8230,7 @@ fn delete_word_backward_at_buffer_start_inside_blockquote_is_noop(cx: &mut TestA
     let initial = EditorState {
         markdown: "> hello".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
@@ -7957,6 +8248,7 @@ fn delete_word_forward_top_level_crosses_newline(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "alpha\n\nbeta gamma".into(),
         selection: Selection::Cursor(5), // end of "alpha"
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordForward);
@@ -7977,6 +8269,7 @@ fn delete_to_line_end_inside_list_item_stops_at_newline(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "- hello world\n- second".into(),
         selection: Selection::Cursor(8), // start of "world"
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineEnd);
@@ -7996,6 +8289,7 @@ fn delete_to_line_end_at_end_of_line_is_a_noop(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "abc".into(),
         selection: Selection::Cursor(3),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineEnd);
@@ -8040,6 +8334,7 @@ fn right_arrow_lands_on_bq_synth_row_then_next_paragraph(cx: &mut TestAppContext
     let initial = EditorState {
         markdown: "> a\n> \n> \n> \n> b".into(),
         selection: Selection::Cursor(3),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -8057,6 +8352,7 @@ fn left_arrow_lands_on_bq_synth_row_from_next_paragraph(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "> a\n> \n> \n> \n> b".into(),
         selection: Selection::Cursor(15),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Left);
@@ -8073,6 +8369,7 @@ fn down_arrow_from_bq_paragraph_lands_on_next_paragraph(cx: &mut TestAppContext)
     let initial = EditorState {
         markdown: "> a\n> \n> b".into(),
         selection: Selection::Cursor(2), // end of "a"
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Down);
@@ -8089,6 +8386,7 @@ fn down_arrow_through_bq_synth_row(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> a\n> \n> \n> \n> b".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Down);
@@ -8125,6 +8423,7 @@ fn up_arrow_walks_through_bq_synth_row_to_first_paragraph(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "> P1\n> \n> \n> \n> P3".into(),
         selection: Selection::Cursor(18), // end of "P3"
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Up);
@@ -8166,6 +8465,7 @@ fn up_arrow_walks_through_two_bq_synth_rows_one_at_a_time(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "> a\n> \n> \n> \n> \n> \n> b".into(),
         selection: Selection::Cursor(21), // end of "> b" content
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Up);
@@ -8203,6 +8503,7 @@ fn up_arrow_in_user_reported_bug_lands_on_visible_empty_row(cx: &mut TestAppCont
         markdown: "> Paragraph one.\n> \n> \n> \n> Paragraph three.".into(),
         // Cursor at byte 28 = `P` of "Paragraph three." (right after `> `).
         selection: Selection::Cursor(28),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Up);
@@ -8225,6 +8526,7 @@ fn left_arrow_in_user_reported_bug_lands_on_visible_empty_row(cx: &mut TestAppCo
     let initial = EditorState {
         markdown: "> Paragraph one.\n> \n> \n> \n> Paragraph three.".into(),
         selection: Selection::Cursor(28),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Left);
@@ -8279,6 +8581,7 @@ fn down_from_short_paragraph_lands_on_first_wrap_row_of_long_paragraph(cx: &mut 
     let initial = EditorState {
         markdown,
         selection: Selection::Cursor(2), // end of "Hi"
+        ..Default::default()
     };
     let (handle, editor) = open_editor_narrow(cx, initial);
     // Trigger a render so last_blocks is populated before the
@@ -8321,6 +8624,7 @@ fn up_from_second_wrap_row_lands_on_first_wrap_row_same_paragraph(cx: &mut TestA
     let initial = EditorState {
         markdown: markdown.clone(),
         selection: Selection::Cursor(cursor_at),
+        ..Default::default()
     };
     let (handle, editor) = open_editor_narrow(cx, initial);
     // Force a paint pass to populate last_blocks.
@@ -8358,6 +8662,7 @@ fn down_from_first_wrap_row_lands_on_second_wrap_row_same_paragraph(cx: &mut Tes
     let initial = EditorState {
         markdown: markdown.clone(),
         selection: Selection::Cursor(5), // somewhere in "This is..."
+        ..Default::default()
     };
     let (handle, editor) = open_editor_narrow(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -8399,6 +8704,7 @@ fn repeated_down_advances_through_every_wrap_row_to_the_last(cx: &mut TestAppCon
     let initial = EditorState {
         markdown: para,
         selection: Selection::Cursor(1), // "L|orem" — the reported start
+        ..Default::default()
     };
     let (handle, editor) = open_editor_narrow(cx, initial);
     // Populate last_blocks with a paint pass.
@@ -8473,6 +8779,7 @@ fn down_onto_wrap_boundary_renders_caret_on_lower_row(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: para,
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor_narrow(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -8518,6 +8825,7 @@ fn end_on_wrapped_row_stays_on_that_row(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: para,
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor_narrow(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -8561,6 +8869,7 @@ fn intended_x_preserved_across_consecutive_up_presses(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> P1\n> \n> \n> \n> P3".into(),
         selection: Selection::Cursor(18),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Up);
@@ -8586,6 +8895,7 @@ fn intended_x_reset_by_non_vertical_action(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> P1\n> \n> \n> \n> P3".into(),
         selection: Selection::Cursor(18),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Up);
@@ -8637,6 +8947,7 @@ fn home_moves_to_display_line_start_of_wrapped_row(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown,
         selection: Selection::Cursor(cursor_at),
+        ..Default::default()
     };
     let (handle, editor) = open_editor_narrow(cx, initial);
     // Force a paint so last_blocks is populated before Home is handled.
@@ -8668,6 +8979,7 @@ fn end_moves_to_display_line_end_of_wrapped_row(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown,
         selection: Selection::Cursor(cursor_at),
+        ..Default::default()
     };
     let (handle, editor) = open_editor_narrow(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -8697,6 +9009,7 @@ fn shift_home_extends_to_display_line_start(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown,
         selection: Selection::Cursor(cursor_at),
+        ..Default::default()
     };
     let (handle, editor) = open_editor_narrow(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -8729,6 +9042,7 @@ fn shift_end_extends_to_display_line_end(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown,
         selection: Selection::Cursor(cursor_at),
+        ..Default::default()
     };
     let (handle, editor) = open_editor_narrow(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -8762,6 +9076,7 @@ fn display_line_home_records_no_undo_step(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: markdown.clone(),
         selection: Selection::Cursor(cursor_at),
+        ..Default::default()
     };
     let (handle, editor) = open_editor_narrow(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -8817,6 +9132,7 @@ fn empty_intermediate_li_emits_separate_marker_row_block(cx: &mut TestAppContext
     let initial = EditorState {
         markdown: "1. One\n2. \n   1. Two, One".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -8859,6 +9175,7 @@ fn cursor_lands_on_empty_intermediate_li_marker_row(cx: &mut TestAppContext) {
         markdown: "1. One\n2. \n   1. Two, One".into(),
         // Cursor at the `\n` ending the `2. ` line.
         selection: Selection::Cursor(10),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -8878,6 +9195,7 @@ fn typing_on_empty_intermediate_li_marker_row_adds_content_to_item(cx: &mut Test
     let initial = EditorState {
         markdown: "1. One\n2. \n   1. Two, One".into(),
         selection: Selection::Cursor(10),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
@@ -8910,6 +9228,7 @@ fn empty_li_with_only_nested_blockquote_emits_separate_marker_row(cx: &mut TestA
     let initial = EditorState {
         markdown: "1. \n   > quoted".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -8939,6 +9258,7 @@ fn li_with_paragraph_then_nested_list_does_not_emit_synth(cx: &mut TestAppContex
     let initial = EditorState {
         markdown: "1. one\n   1. nested".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (_, editor) = open_editor(cx, initial);
     let spec = current_spec(cx, &editor);
@@ -8985,6 +9305,7 @@ fn undo_restores_buffer_and_selection(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "Hello".into(),
         selection: Selection::Cursor(5),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "!");
@@ -9074,6 +9395,7 @@ fn undo_captures_ime_typed_input(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "abc".into(),
         selection: Selection::Cursor(3),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     ime_insert(cx, handle, &editor, "X");
@@ -9097,6 +9419,7 @@ fn fresh_edit_clears_redo_stack(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "Hi".into(),
         selection: Selection::Cursor(2),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "!"); // "Hi!"
@@ -9114,6 +9437,7 @@ fn undo_redo_noop_on_empty_stacks(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "abc".into(),
         selection: Selection::Cursor(1),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Undo);
@@ -9132,6 +9456,7 @@ fn selection_only_change_records_no_undo_step(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "abc".into(),
         selection: Selection::Cursor(0),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Right);
@@ -9149,6 +9474,7 @@ fn set_value_clears_history(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "a".into(),
         selection: Selection::Cursor(1),
+        ..Default::default()
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "!"); // "a!"

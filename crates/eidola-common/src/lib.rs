@@ -1,11 +1,13 @@
 //! Shared client/server contract logic for eidola.
 //!
 //! This crate holds the small pieces of pure logic that MUST be bit-identical
-//! on both sides of the wire — currently the anonymous-credit pricing
-//! contract for chat-completion prompt holds. It is intentionally lib-only,
-//! zero-dependency, pure Rust, and float-free so both `eidola-app-core` and
-//! `eidola-server` can depend on it and compute identical results on any
-//! platform.
+//! on both sides of a contract boundary — the anonymous-credit pricing
+//! contract for chat-completion prompt holds ([`chargeable_prompt_tokens`]),
+//! and the embed-marker recognition rule shared between the markdown
+//! editor's embed plugin and app-core's upstream quote expansion
+//! ([`embed`]). It is intentionally lib-only, zero-dependency, pure Rust,
+//! and float-free so `eidola-app-core`, `eidola-server`, and tests can
+//! depend on it and compute identical results on any platform.
 //!
 //! # The prompt-hold pricing contract
 //!
@@ -63,6 +65,8 @@
 //! Roles and JSON structure are deliberately excluded from the byte count;
 //! their token cost is covered by [`PER_MESSAGE_TOKENS`] and
 //! [`PER_REQUEST_TOKENS`].
+
+pub mod embed;
 
 /// Numerator of the safe cost factor `N = NUM/DEN = 1.5`.
 ///
