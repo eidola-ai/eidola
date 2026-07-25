@@ -17,7 +17,7 @@
 use eidola_app_core::{NewTemplateParticipant, SpaceTemplateInfo};
 use gpui::{
     AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
     prelude::FluentBuilder,
 };
 use gpui_component::{
@@ -57,6 +57,10 @@ pub struct TemplatesSettingsView {
     templates_store: Entity<TemplatesStore>,
     config: Entity<ConfigStore>,
     draft: Option<TemplateDraft>,
+    /// Tracks the open model-picker dropdown's own scroll (see the identical
+    /// field on `ParticipantsView`) — one handle, reset to the top on each
+    /// open, since at most one participant's picker is open at a time.
+    picker_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -77,6 +81,7 @@ impl TemplatesSettingsView {
             templates_store,
             config,
             draft: None,
+            picker_scroll: ScrollHandle::new(),
             _subscriptions: subs,
         }
     }
@@ -227,12 +232,18 @@ impl TemplatesSettingsView {
     }
 
     pub fn toggle_participant_picker(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let mut opened = false;
         if let Some(draft) = self.draft.as_mut() {
             draft.picker = if draft.picker == Some(idx) {
                 None
             } else {
+                opened = true;
                 Some(idx)
             };
+        }
+        if opened {
+            // A freshly opened picker starts at the top.
+            self.picker_scroll = ScrollHandle::new();
         }
         cx.notify();
     }
@@ -663,6 +674,7 @@ impl TemplatesSettingsView {
                 p.model_ref.as_deref(),
                 picker_open,
                 SharedString::from(format!("settings/templates/participant/{idx}/model")),
+                &self.picker_scroll,
                 cx,
                 move |this, _, _, cx| this.toggle_participant_picker(idx, cx),
                 move |id, this, cx| this.set_participant_model(idx, id, cx),

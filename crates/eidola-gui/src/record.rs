@@ -26,8 +26,8 @@ use eidola_app_core::{
 };
 use gpui::{
     AsyncApp, ClipboardItem, Context, Div, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
+    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, StyledExt, h_flex,
@@ -262,6 +262,10 @@ pub struct RecordView {
     /// Keeps the `RecordStore` observation alive for the window's lifetime.
     _record_observer: Subscription,
     error: Option<String>,
+    /// Tracks the non-virtualized body scroll (detail / pending / empty), so
+    /// the right-edge overlay indicator has a handle to bind to. The
+    /// virtualized listings each carry their own [`UniformListScrollHandle`].
+    detail_scroll: ScrollHandle,
     focus_handle: FocusHandle,
 }
 
@@ -294,6 +298,7 @@ impl RecordView {
             seen_epoch,
             _record_observer: record_observer,
             error: None,
+            detail_scroll: ScrollHandle::new(),
             focus_handle,
         };
         this.fetch_page(RecordSection::Attestations, cx);
@@ -621,22 +626,48 @@ impl Render for RecordView {
         // - A populated listing: a self-scrolling `uniform_list` placed
         //   directly as the `flex_1` child — its render cost is O(visible),
         //   not O(loaded).
-        let body: gpui::AnyElement = if self.detail.is_some() {
-            scroll_wrap(self.render_detail(cx)).into_any_element()
-        } else if self.detail_pending.is_some() {
-            scroll_wrap(
-                div()
-                    .px_6()
-                    .py_4()
-                    .italic()
-                    .text_color(muted_fg)
-                    .child("Loading…"),
+        // Each body shape carries its own scroll handle so the right-edge
+        // overlay indicator (shown only while scrolling) binds to the surface
+        // the user is actually scrolling: the non-virtualized bodies share
+        // `detail_scroll`; each virtualized listing carries its own.
+        let (body, scrollbar): (gpui::AnyElement, gpui::AnyElement) = if self.detail.is_some() {
+            (
+                scroll_wrap(self.render_detail(cx), &self.detail_scroll).into_any_element(),
+                crate::scrollbar::vertical("record-scrollbar", &self.detail_scroll, window)
+                    .into_any_element(),
             )
-            .into_any_element()
+        } else if self.detail_pending.is_some() {
+            (
+                scroll_wrap(
+                    div()
+                        .px_6()
+                        .py_4()
+                        .italic()
+                        .text_color(muted_fg)
+                        .child("Loading…"),
+                    &self.detail_scroll,
+                )
+                .into_any_element(),
+                crate::scrollbar::vertical("record-scrollbar", &self.detail_scroll, window)
+                    .into_any_element(),
+            )
         } else if self.current_listing_is_empty() {
-            scroll_wrap(self.render_empty(cx)).into_any_element()
+            (
+                scroll_wrap(self.render_empty(cx), &self.detail_scroll).into_any_element(),
+                crate::scrollbar::vertical("record-scrollbar", &self.detail_scroll, window)
+                    .into_any_element(),
+            )
         } else {
-            self.render_listing(cx)
+            let list_scroll = match self.section {
+                RecordSection::Attestations => self.attestations.scroll.clone(),
+                RecordSection::Requests => self.requests.scroll.clone(),
+                RecordSection::Spending => self.spending.scroll.clone(),
+            };
+            (
+                self.render_listing(cx),
+                crate::scrollbar::vertical("record-scrollbar", &list_scroll, window)
+                    .into_any_element(),
+            )
         };
 
         crate::chrome::round_client_corners(v_flex(), window)
@@ -648,17 +679,30 @@ impl Render for RecordView {
             .bg(bg)
             .text_color(fg)
             .child(self.render_strip(window, cx))
-            .child(body)
+            // A `relative` column spanning the scroll viewport holds the body
+            // and the overlay indicator as siblings (the indicator must never
+            // be a child of the scrolling element, or it scrolls away).
+            .child(
+                v_flex()
+                    .relative()
+                    .flex_1()
+                    .w_full()
+                    .min_h_0()
+                    .child(body)
+                    .child(scrollbar),
+            )
     }
 }
 
-/// Wrap ordinary (non-virtualized) body content in the scroll container.
-fn scroll_wrap(content: impl IntoElement) -> gpui::Stateful<Div> {
+/// Wrap ordinary (non-virtualized) body content in the scroll container,
+/// tracking `handle` so a right-edge overlay indicator can bind to it.
+fn scroll_wrap(content: impl IntoElement, handle: &ScrollHandle) -> gpui::Stateful<Div> {
     div()
         .id("record-scroll")
         .flex_1()
         .w_full()
         .overflow_y_scroll()
+        .track_scroll(handle)
         .child(content)
 }
 

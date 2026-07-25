@@ -1946,6 +1946,130 @@ fn backends_fixture(eidola_enabled: bool) -> Vec<eidola_app_core::BackendInfo> {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// Scroll indicators — render smoke: the overlay `Scrollbar` binds to each
+// view's tracked scroll handle. A mis-bound handle (wrong field, wrong type)
+// or a panic in `crate::scrollbar::vertical` would surface as a draw panic
+// here. The overlay is `ScrollbarShow::Scrolling`, so nothing is asserted
+// visible — this proves construction + binding, not appearance.
+// ---------------------------------------------------------------------------
+
+/// Force one frame on a test window (mark dirty, then run the scheduled draw),
+/// so the view's `render` — and the scroll-indicator overlay it builds — runs.
+fn draw_frame(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn library_renders_with_scroll_indicator(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            stub_space("a", Some("Alpha"), None, 2_000),
+            stub_space("b", Some("Beta"), None, 1_000),
+        ];
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+    draw_frame(cx, window);
+}
+
+#[gpui::test]
+fn record_renders_with_scroll_indicator(cx: &mut TestAppContext) {
+    // Both body shapes: the virtualized listing (default) and, after opening a
+    // detail, the `scroll_wrap` body — each drives a differently-typed handle
+    // the overlay must bind.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores.clone(), window, cx))
+    });
+    draw_frame(cx, window);
+
+    view.update(cx, |v, _cx| {
+        v.set_detail_for_test(Some(RecordDetail::Attestation(AttestationDetail {
+            hash: "deadbeef".into(),
+            pcr_digest: None,
+            created_at: 0,
+            doc: b"{}".to_vec(),
+        })))
+    });
+    draw_frame(cx, window);
+}
+
+#[gpui::test]
+fn settings_renders_with_scroll_indicator(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    // Every pane rides the one shared body scroll container + its overlay.
+    for pane in [
+        SettingsPane::General,
+        SettingsPane::Backends,
+        SettingsPane::Templates,
+        SettingsPane::Account,
+        SettingsPane::Wallet,
+    ] {
+        view.update(cx, |v, cx| v.select(pane, cx));
+        draw_frame(cx, window);
+    }
+}
+
+#[gpui::test]
+fn updates_renders_with_scroll_indicator(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| UpdatesView::new(stores.clone(), window, cx))
+    });
+    draw_frame(cx, window);
+}
+
+#[gpui::test]
+fn participants_renders_with_scroll_indicator(cx: &mut TestAppContext) {
+    // Seed enough eidola-catalog models that the model-picker dropdown
+    // overflows its 220px max-height — the nested scroller whose own overlay
+    // indicator this exercises (a Codex P1 on PR #232). The draw below opens
+    // the add form + picker; a mis-bound picker handle would panic here.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.models = (0..12)
+            .map(|i| eidola_app_core::ModelInfo {
+                id: format!("model-{i:02}"),
+                context_length: 131_072,
+                prompt_credits_per_token: 1.0,
+                completion_credits_per_token: 2.0,
+                request_credits: None,
+            })
+            .collect();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            ParticipantsView::new(
+                stores.clone(),
+                "demo".into(),
+                Some("Demo".into()),
+                window,
+                cx,
+            )
+        })
+    });
+    // Roster body indicator.
+    draw_frame(cx, window);
+    // Open the add form + its overflowing model picker; the picker's own
+    // overlay indicator binds to `picker_scroll`.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.begin_add(window, cx);
+            v.open_add_picker_for_test(cx);
+        });
+    })
+    .unwrap();
+    draw_frame(cx, window);
+}
+
 /// Build stub stores from a declaratively-described scene — the replacement
 /// for the old `Core::stub()` field-poking.
 fn stub_stores(cx: &mut TestAppContext, setup: impl FnOnce(&mut StoresStub)) -> Stores {

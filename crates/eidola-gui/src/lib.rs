@@ -15,6 +15,7 @@ pub mod participants_view;
 mod plans;
 pub mod probe;
 pub mod record;
+pub mod scrollbar;
 pub mod settings;
 pub mod solar;
 pub mod space;

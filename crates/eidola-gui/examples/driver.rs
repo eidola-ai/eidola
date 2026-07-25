@@ -75,7 +75,7 @@ mod driver {
 
     use eidola_app_core::updates::{UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease};
     use eidola_app_core::{
-        BalancePoolInfo, BalancesResult, ConfigState, ModelInfo, ParticipantInfo,
+        AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState, ModelInfo, ParticipantInfo,
         ParticipantReference, PriceInfo, SpaceInfo, SpaceMessage, SpaceTemplateInfo,
         TemplateParticipantInfo,
     };
@@ -427,11 +427,26 @@ mod driver {
             },
             Scene {
                 name: "record",
-                description: "Record window (stub data: empty listings, live section strip)",
+                description: "Record window (seeded attestation rows, live section strip)",
                 default_size: size(px(860.), px(640.)),
                 build: |window, cx| {
                     let stores = stub_stores(cx, |_| {});
                     let view = cx.new(|cx| RecordView::new(stores, window, cx));
+                    // Seed a full listing so the section scrolls (the stub has no
+                    // backend, so the fetch is a no-op) — lets the scroll
+                    // indicator be exercised in the driver.
+                    view.update(cx, |v, _| {
+                        let rows: Vec<AttestationInfo> = (0..40)
+                            .map(|i| AttestationInfo {
+                                hash: format!("{i:064x}"),
+                                pcr_digest: None,
+                                created_at: 1_700_000_000_000 - (i as i64) * 3_600_000,
+                                doc_bytes: 4096 + i as i64,
+                                connection_count: 1 + (i as i64 % 3),
+                            })
+                            .collect();
+                        v.set_attestations_for_test(rows, true);
+                    });
                     root(view, window, cx)
                 },
             },
@@ -705,6 +720,65 @@ mod driver {
                 context_length: 131_072,
                 prompt_credits_per_token: 1.05,
                 completion_credits_per_token: 5.25,
+                request_credits: None,
+            },
+            // Enough further models that the picker dropdown overflows its
+            // max-height and scrolls independently of the roster body — the QA
+            // fixture for the picker's own scroll indicator.
+            ModelInfo {
+                id: "llama4-scout".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 0.8,
+                completion_credits_per_token: 2.4,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "deepseek-v3".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 1.2,
+                completion_credits_per_token: 3.0,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "mistral-large-3".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 1.5,
+                completion_credits_per_token: 4.5,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "gpt-oss-120b".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 1.1,
+                completion_credits_per_token: 3.3,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "phi5-moe".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 0.4,
+                completion_credits_per_token: 1.2,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "command-r-plus-2".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 1.3,
+                completion_credits_per_token: 3.9,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "yi-large-2".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 0.9,
+                completion_credits_per_token: 2.7,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "glm-5-air".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 0.6,
+                completion_credits_per_token: 1.8,
                 request_credits: None,
             },
         ]

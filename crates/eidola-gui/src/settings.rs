@@ -19,7 +19,7 @@
 
 use gpui::{
     AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, Window, div, px,
+    Render, ScrollHandle, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
@@ -83,6 +83,10 @@ pub struct SettingsView {
     /// to be in the dispatch path, so we `focus()` the handle on
     /// construction.
     focus_handle: FocusHandle,
+    /// Tracks the content column's scroll so the right-edge overlay indicator
+    /// (shown only while scrolling) can bind to it. One handle for every pane —
+    /// switching panes resets to the top, which the shared container does.
+    body_scroll: ScrollHandle,
 }
 
 impl SettingsView {
@@ -115,6 +119,7 @@ impl SettingsView {
             wallet,
             backends_store,
             focus_handle,
+            body_scroll: ScrollHandle::new(),
         }
     }
 
@@ -292,14 +297,27 @@ impl Render for SettingsView {
             // this, long pane text refuses to wrap and rows shrink to
             // content width.
             .child(
-                v_flex().flex_1().h_full().min_w_0().child(
-                    div()
-                        .id("settings-body")
-                        .w_full()
-                        .flex_1()
-                        .overflow_y_scroll()
-                        .child(body),
-                ),
+                v_flex()
+                    .relative()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .id("settings-body")
+                            .w_full()
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.body_scroll)
+                            .child(body),
+                    )
+                    // Overlay indicator: a sibling of the scroll container, so
+                    // it tracks the viewport's right edge without scrolling off.
+                    .child(crate::scrollbar::vertical(
+                        "settings-scrollbar",
+                        &self.body_scroll,
+                        window,
+                    )),
             )
             // Drag band last so it paints atop the sidebar/body columns and
             // wins hit-testing across the full-width traffic-light reserve.
