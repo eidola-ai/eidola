@@ -102,6 +102,64 @@ pub fn snap_duration(dist: f32, stride: f32) -> Duration {
     Duration::from_secs_f32((0.18 + (dist / stride.max(1.0)) * 0.16).clamp(0.18, 0.42))
 }
 
+/// The *proximity* snap decision for a variable-height vertical page (the
+/// onboarding flow's slide stack). Unlike [`snap_target_index`] — which is
+/// *mandatory* and always returns a page to land on — this mirrors CSS
+/// `scroll-snap-type: proximity`: it returns `Some(index)` only when a released
+/// gesture came to rest **near** a slide boundary, and `None` when it ended
+/// deep in a slide's content (stay put — never yank a reader off the prose they
+/// were scrolling through).
+///
+/// - `tops` are the content-space y of each slide's top, ascending, with
+///   `tops[0] == 0` (measured from the live child bounds, so it copes with
+///   slides taller than the window).
+/// - `viewport_top` is the content-space y currently at the viewport's top
+///   (`-offset.y`).
+/// - `v` is the release velocity (the last vertical finger step); a downward
+///   flick — revealing later slides — is **negative**, matching
+///   [`snap_target_index`]'s convention.
+/// - `proximity` is the px band around a boundary within which a rest snaps.
+///
+/// A flick past [`SNAP_FLING_THRESHOLD`] only redirects when the release was
+/// *already* near a boundary (it advances/retreats one slide in the flick's
+/// direction); a flick deep in content is fast reading, not navigation, and
+/// returns `None`.
+pub fn proximity_snap_target(
+    tops: &[f32],
+    viewport_top: f32,
+    v: f32,
+    proximity: f32,
+) -> Option<usize> {
+    let (nearest, dist) = tops
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| (i, (t - viewport_top).abs()))
+        .min_by(|a, b| a.1.total_cmp(&b.1))?;
+
+    let flick_down = v <= -SNAP_FLING_THRESHOLD;
+    let flick_up = v >= SNAP_FLING_THRESHOLD;
+    if flick_down || flick_up {
+        // Directional intent, but honored only near a boundary — a flick in the
+        // middle of a long slide is content scrolling, so leave it to momentum.
+        if dist > proximity {
+            return None;
+        }
+        let target = if flick_down {
+            tops.iter()
+                .position(|&t| t > viewport_top + 1.0)
+                .unwrap_or(tops.len() - 1)
+        } else {
+            tops.iter()
+                .rposition(|&t| t < viewport_top - 1.0)
+                .unwrap_or(0)
+        };
+        return Some(target);
+    }
+
+    // Gentle release: snap only if it rests inside the proximity band.
+    (dist <= proximity).then_some(nearest)
+}
+
 // ---------------------------------------------------------------------------
 // The frame-driven glide + gesture bookkeeping, on `SpaceView`.
 // ---------------------------------------------------------------------------
@@ -347,5 +405,33 @@ mod tests {
         assert_eq!(snap_target_index(-1000.0, 100.0, -50.0, 3), 2);
         assert_eq!(snap_target_index(50.0, 100.0, 50.0, 3), 0);
         assert_eq!(snap_target_index(-100.0, 100.0, 0.0, 1), 0);
+    }
+
+    #[test]
+    fn proximity_snaps_only_near_a_boundary() {
+        // Variable-height slides: boundaries at 0, 100, 250, 400.
+        let tops = [0.0, 100.0, 250.0, 400.0];
+        // Resting near boundary 1 (dist 20 < 30): a gentle release snaps to it.
+        assert_eq!(proximity_snap_target(&tops, 120.0, 0.0, 30.0), Some(1));
+        // Resting in the dead middle of a long slide (nearest dist 70 > 30):
+        // stay put — this is the "reading a long slide" case.
+        assert_eq!(proximity_snap_target(&tops, 170.0, 0.0, 30.0), None);
+    }
+
+    #[test]
+    fn proximity_flick_redirects_only_near_a_boundary() {
+        let tops = [0.0, 100.0, 250.0, 400.0];
+        // A downward flick just below boundary 1 advances to the next boundary.
+        assert_eq!(proximity_snap_target(&tops, 105.0, -20.0, 30.0), Some(2));
+        // An upward flick just above boundary 2 (near it, in slide 1's tail)
+        // retreats to the previous boundary.
+        assert_eq!(proximity_snap_target(&tops, 245.0, 20.0, 30.0), Some(1));
+        // A flick deep in a long slide is fast reading, not navigation — no snap.
+        assert_eq!(proximity_snap_target(&tops, 170.0, -20.0, 30.0), None);
+    }
+
+    #[test]
+    fn proximity_empty_is_none() {
+        assert_eq!(proximity_snap_target(&[], 0.0, 0.0, 30.0), None);
     }
 }
