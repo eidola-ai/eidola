@@ -16,7 +16,7 @@
 use eidola_app_core::updates::{ClaimsComparison, UpdateCheckResult, VerifiedRelease};
 use gpui::{
     Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Sizable, StyledExt,
@@ -67,6 +67,9 @@ pub enum UpdatesDisplay {
 pub struct UpdatesView {
     update: Entity<UpdateStore>,
     focus_handle: FocusHandle,
+    /// Tracks the body scroll so the right-edge overlay indicator can bind to
+    /// it (shown only while scrolling).
+    body_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -89,6 +92,7 @@ impl UpdatesView {
         Self {
             update,
             focus_handle,
+            body_scroll: ScrollHandle::new(),
             _subscriptions,
         }
     }
@@ -255,12 +259,26 @@ impl Render for UpdatesView {
                 cx,
             ))
             .child(
-                div()
-                    .id("updates-body")
+                v_flex()
+                    .relative()
                     .flex_1()
                     .w_full()
-                    .overflow_y_scroll()
-                    .child(body),
+                    .min_h_0()
+                    .child(
+                        div()
+                            .id("updates-body")
+                            .flex_1()
+                            .w_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.body_scroll)
+                            .child(body),
+                    )
+                    // Overlay indicator — sibling of the scroll container.
+                    .child(crate::scrollbar::vertical(
+                        "updates-scrollbar",
+                        &self.body_scroll,
+                        window,
+                    )),
             )
             .child(footer)
     }

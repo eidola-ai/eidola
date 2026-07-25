@@ -548,18 +548,28 @@ impl Render for LibraryView {
         )
         .h_full()
         .w_full()
-        .max_w(rems(34.))
         .px_10()
         .pt_4()
         .track_scroll(&self.scroll);
 
+        // The scroll indicator rides the *list's* right edge, not the window's:
+        // a `relative` column capped at the prose measure holds the list plus
+        // the overlay strip as siblings, so the indicator appears where the
+        // scrollable content actually is on a wide window.
         root.child(
-            h_flex()
-                .w_full()
-                .flex_1()
-                .min_h_0()
-                .justify_center()
-                .child(list),
+            h_flex().w_full().flex_1().min_h_0().justify_center().child(
+                div()
+                    .relative()
+                    .h_full()
+                    .w_full()
+                    .max_w(rems(34.))
+                    .child(list)
+                    .child(crate::scrollbar::vertical(
+                        "library-scrollbar",
+                        &self.scroll,
+                        window,
+                    )),
+            ),
         )
     }
 }
