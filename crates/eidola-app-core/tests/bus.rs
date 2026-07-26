@@ -853,6 +853,154 @@ fn edit_post_replicates_references_and_supports_removal() {
 }
 
 #[test]
+fn submit_with_references_posts_the_edges_and_plans_notifications() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let source = core
+            .runtime()
+            .block_on(core.post("alpha beta gamma".into(), None))
+            .unwrap();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .unwrap();
+        let block_id = tree[0].blocks[0].id.clone();
+
+        let mut rx = core.subscribe_changes();
+        let spec = eidola_app_core::ReferenceSpec {
+            antecedent_action_id: source.action_id.clone(),
+            content_block_id: Some(block_id.clone()),
+            range_start: Some(0),
+            range_end: Some(5), // "alpha"
+            annotation: None,
+        };
+        // The composer CTA path with a pending reference: exactly
+        // `post_with_references` + `plan_notifications`.
+        let result = core
+            .runtime()
+            .block_on(core.submit_with_references(
+                "Quoting this:\n\n{{ embed 1 }}".into(),
+                Some(source.space_id.clone()),
+                None,
+                vec![spec],
+            ))
+            .unwrap();
+
+        // Emissions: post's contract only (Space; no SpaceIndex — existing,
+        // titled space; the plan is a pure read).
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(source.space_id.clone())),
+            "submit_with_references emits Space; got {changes:?}"
+        );
+        assert!(!changes.contains(&Change::SpaceIndex));
+
+        // The reference edge rides the saved post at ordinal 1.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .unwrap();
+        let node = tree
+            .iter()
+            .find(|n| n.action_id == result.post.action_id)
+            .unwrap();
+        assert_eq!(node.references.len(), 1);
+        assert_eq!(node.references[0].ordinal, 1);
+        assert_eq!(node.references[0].snippet.as_deref(), Some("alpha"));
+        // And a plan came back (the seeded default agent's notify policy is
+        // 'human', so a human post plans its turn).
+        assert!(
+            matches!(result.plan, eidola_app_core::NotificationPlan::Turns(ref t) if !t.is_empty()),
+            "a human post over the seeded agent plans a turn; got {:?}",
+            result.plan
+        );
+    });
+}
+
+#[test]
+fn submit_with_invalid_reference_errors_with_zero_trace_and_no_plan() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let source = core
+            .runtime()
+            .block_on(core.post("short".into(), None))
+            .unwrap();
+
+        let mut rx = core.subscribe_changes();
+        let bad = eidola_app_core::ReferenceSpec {
+            antecedent_action_id: source.action_id.clone(),
+            content_block_id: None, // a range requires a block
+            range_start: Some(0),
+            range_end: Some(3),
+            annotation: None,
+        };
+        let result = core.runtime().block_on(core.submit_with_references(
+            "quoting badly".into(),
+            Some(source.space_id.clone()),
+            None,
+            vec![bad],
+        ));
+        assert!(result.is_err(), "a bad spec must refuse the whole submit");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "a refused submit must not emit (no post, no plan)"
+        );
+        // Nothing was saved: the space still has exactly the source post.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .unwrap();
+        assert_eq!(tree.len(), 1);
+    });
+}
+
+#[test]
+fn action_location_resolves_a_posts_item_and_space_without_emitting() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let posted = core
+            .runtime()
+            .block_on(core.post("hello".into(), None))
+            .unwrap();
+
+        let mut rx = core.subscribe_changes();
+        let (item_id, space_id) = core
+            .runtime()
+            .block_on(core.action_location(posted.action_id.clone()))
+            .unwrap()
+            .expect("a persisted post resolves");
+        assert_eq!(space_id, posted.space_id);
+        assert!(!item_id.is_empty());
+        let unknown = core
+            .runtime()
+            .block_on(core.action_location("no-such-action".into()))
+            .unwrap();
+        assert_eq!(unknown, None);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "action_location is a pure read and must not emit"
+        );
+
+        // The item is what survives an edit: the quoted generation leaves the
+        // current-tip tree, but both generations still resolve to one item, so
+        // a reference to the old one can find where its content now lives.
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(posted.action_id.clone(), "hello, again".into()))
+            .unwrap();
+        let (edited_item, _) = core
+            .runtime()
+            .block_on(core.action_location(edited.action_id.clone()))
+            .unwrap()
+            .expect("the edit resolves");
+        assert_eq!(
+            edited_item, item_id,
+            "an edit is a new generation of the same item"
+        );
+    });
+}
+
+#[test]
 fn edit_post_cannot_remove_the_reply_edge() {
     run_in_thread(|| {
         let (core, _dir) = make_core();

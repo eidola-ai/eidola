@@ -152,7 +152,18 @@ impl SpacesStore {
     /// React to a `Change::Space(id)` from the bus by telling the live
     /// registered `Space` (if any) to refresh its transcript. Routed here from
     /// `stores::dispatch_change`.
+    ///
+    /// **Every** live space also drops its cached incoming-reference indexes,
+    /// not just the changed one: a quote written in space B changes what space
+    /// A's posts should highlight, and the bus event carries only the written
+    /// space's id. The indexes are re-fetched lazily per rendered post, so
+    /// this costs a query per *visible* post at most.
     pub fn notify_space_changed(&mut self, id: &str, cx: &mut Context<Self>) {
+        for weak in self.registry.values() {
+            if let Some(entity) = weak.upgrade() {
+                entity.update(cx, |space, cx| space.invalidate_incoming_references(cx));
+            }
+        }
         if let Some(weak) = self.registry.get(id)
             && let Some(entity) = weak.upgrade()
         {

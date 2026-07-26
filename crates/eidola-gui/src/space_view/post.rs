@@ -40,6 +40,12 @@ impl SpaceView {
         let visible = self.warm_remaining.get() > 0
             || (screen_top + h > -VIRT_MARGIN && screen_top < window_h.as_f32() + VIRT_MARGIN);
         if visible {
+            // A post that actually renders wants its incoming-reference index
+            // (the source-highlight data); the request is made from the next
+            // frame's `sync_references`, where the `&mut` borrow exists.
+            if matches!(node.src, NodeSrc::Msg(_)) {
+                self.want_incoming_refs(&node.id);
+            }
             self.render_post(node, page_width, cx).into_any_element()
         } else {
             div().w(page_width).h(px(h)).flex_none().into_any_element()
@@ -212,11 +218,24 @@ impl SpaceView {
             }
         }
         if let Some(editor) = self.bodies.get(&node.id) {
+            // Source highlights: the passages other posts have quoted, painted
+            // by the editor's opaque highlight plugin. The keys are indexes
+            // into this post's incoming-reference list — the editor never
+            // learns what they mean, and hands them back verbatim on a click.
+            let node_id = node.id.clone();
             col = col.child(
                 MarkdownEditor::new(editor)
                     .style(prose_style(cx))
-                    .disabled(!editing),
+                    .disabled(!editing)
+                    .on_highlight_click(cx.listener(move |this, keys: &[u64], window, cx| {
+                        this.on_highlight_click(node_id.clone(), keys, window, cx);
+                    })),
             );
+        }
+        // The footnote rail — the post's references, rendered *outside* the
+        // markdown (the editor never learns what a reference is).
+        if let Some(rail) = self.render_post_footnotes(i, node, editing, cx) {
+            col = col.child(rail);
         }
         col.into_any_element()
     }
@@ -388,6 +407,7 @@ impl SpaceView {
             action_id,
             node_id,
             original,
+            removed_references: Vec::new(),
             _sub: sub,
         });
         let focus = editor.read(cx).focus_handle(cx);
@@ -411,7 +431,23 @@ impl SpaceView {
             return;
         }
         let action_id = ed.action_id.to_string();
-        let accepted = self.space.update(cx, |s, cx| s.edit(action_id, value, cx));
+        // Reference ordinals the session's footnote chips marked for removal.
+        // `edit_post_with_removals` drops them from the **new** generation
+        // only; the prior generation keeps them (history is append-only), and
+        // ordinal 0 — the reply edge — can never be here.
+        let removals = ed.removed_references.clone();
+        // A removed footnote takes its marker with it: the edge is gone, so a
+        // surviving `{{ embed N }}` would render as literal wire syntax on
+        // reload and go upstream literally. Stripped from the *submitted*
+        // string only — the buffer is untouched, so Cancel still restores the
+        // original and a rejected (busy) submit loses nothing.
+        let value = super::references::strip_removed_markers(&value, &removals);
+        if value.is_empty() {
+            return;
+        }
+        let accepted = self
+            .space
+            .update(cx, |s, cx| s.edit(action_id, value, removals, cx));
         if accepted {
             self.editing = None;
             window.focus(&self.focus_handle, cx);
@@ -525,11 +561,17 @@ impl SpaceView {
             }))
             .child(byline_el)
             .child(
-                div().w(bw).child(
-                    MarkdownEditor::new(&editor)
-                        .style(prose_style(cx))
-                        .min_height(editor_fill),
-                ),
+                div()
+                    .w(bw)
+                    .child(
+                        MarkdownEditor::new(&editor)
+                            .style(prose_style(cx))
+                            .min_height(editor_fill),
+                    )
+                    // The draft's pending quotes, as footnotes — the same rail
+                    // a posted exchange carries, so composing looks like what
+                    // it will become.
+                    .children(self.render_draft_footnotes(&node.id, cx)),
             )
             .child(action_gutter())
             .child(record_height(

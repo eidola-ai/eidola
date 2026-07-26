@@ -3572,7 +3572,7 @@ fn space_edit_and_regenerate_supersede_in_flight_load(cx: &mut TestAppContext) {
 
     space.update(cx, |s, cx| {
         s.arm_load_for_test(cx);
-        assert!(s.edit("a1".into(), "edited".into(), cx));
+        assert!(s.edit("a1".into(), "edited".into(), Vec::new(), cx));
         assert!(
             !s.has_pending_load_for_test(),
             "committing an edit must supersede the in-flight transcript load"
@@ -5005,6 +5005,762 @@ fn space_post_fans_out_one_turn_per_planned_responder(cx: &mut TestAppContext) {
         );
         assert!(space.can_retry(), "a failed turn is recorded for Retry");
     });
+
+    drain_runtime(&core);
+}
+
+// ---------------------------------------------------------------------------
+// Quoted references (wave 2) — quote creation, the footnote rail, removals,
+// and the source-post highlights.
+// ---------------------------------------------------------------------------
+
+/// A post fixture whose single block carries a real id, so a selection inside
+/// it resolves to a quotable `(block, range)` pair.
+fn fixture_post_with_block(action_id: &str, block_id: &str, text: &str) -> PostNode {
+    let mut p = fixture_user_post(action_id, text);
+    p.blocks[0].id = block_id.into();
+    p
+}
+
+/// Seed a space with one user post carrying an identified block, force a
+/// frame so `sync_bodies` mints its editor, and return the view.
+fn seed_quotable_space(
+    view: &Entity<SpaceView>,
+    window: AnyWindowHandle,
+    cx: &mut TestAppContext,
+    posts: Vec<PostNode>,
+) {
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(posts, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn space_quote_attaches_a_reference_and_injects_its_marker(cx: &mut TestAppContext) {
+    // The whole creation path: a selection inside a post's read-only body
+    // becomes a quotable `PostSelection` (which gates the Edit menu), `Quote`
+    // attaches it to the active draft at ordinal 1, and the marker lands in
+    // the draft body as its own paragraph so the editor renders it as a quote
+    // block.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.has_post_selection_for_test(),
+            "nothing selected: the Quote items are unregistered (greyed)"
+        );
+    });
+
+    // Select "quick brown" (bytes 4..15).
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.has_post_selection_for_test(),
+            "a selection inside one block is quotable"
+        );
+        assert_eq!(v.post_selection_action_id(), Some("a1".to_string()));
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.quote(&eidola_gui::actions::Quote, window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "the first quote takes ordinal 1 and carries the selected text"
+        );
+        assert!(
+            !v.has_post_selection_for_test(),
+            "the selection is consumed, so a second Quote can't silently re-attach it"
+        );
+    });
+
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("the quote activated a draft");
+    cx.update_window(window, |_, _, cx| {
+        let body = composer.read(cx).value().to_string();
+        assert!(
+            body.contains("{{ embed 1 }}"),
+            "the marker is injected into the draft body: {body:?}"
+        );
+        assert_eq!(
+            composer.read(cx).embeds().get(1),
+            Some("quick brown"),
+            "the editor's embed map maps the ordinal to the quoted passage"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui::test]
+fn space_cross_block_selection_is_not_quotable(cx: &mut TestAppContext) {
+    // A reference edge names exactly one content block. A selection spanning
+    // two blocks names none, so it must not be quotable — inventing a block
+    // would make the stored range a lie.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut post = fixture_post_with_block("a1", "b1", "first block");
+    post.blocks.push(PostBlock {
+        id: "b2".into(),
+        block_type: "text".into(),
+        text: Some("second block".into()),
+        tool_name: None,
+        tool_call_id: None,
+        data: None,
+    });
+    seed_quotable_space(&view, window, cx, vec![post]);
+
+    // 5..17 straddles the "first block" / "second block" boundary at 11.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 5..17, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.has_post_selection_for_test(),
+            "a cross-block selection is not quotable"
+        );
+    });
+
+    // A selection wholly inside the second block is.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 11..17, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| assert!(v.has_post_selection_for_test()));
+}
+
+#[gpui::test]
+fn space_quote_in_reply_targets_the_quoted_post(cx: &mut TestAppContext) {
+    // `Quote in Reply` answers *where the passage is*: the draft it opens
+    // replies to the quoted post, not to the branch tail.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut a2 = fixture_assistant_post("a2", "the reply");
+    a2.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![
+            fixture_post_with_block("a1", "b1", "the quick brown fox"),
+            a2,
+        ],
+    );
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..9, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote_in_reply(&eidola_gui::actions::QuoteInReply, window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_parent_for_test(),
+            Some("a1".to_string()),
+            "the reply branches at the quoted post, not at the tail (a2)"
+        );
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick".to_string())]
+        );
+    });
+}
+
+#[gpui::test]
+fn space_quoted_draft_posts_its_references_and_a_rejected_post_keeps_them(cx: &mut TestAppContext) {
+    // The round trip: a quoted draft's references reach `Space::submit` as
+    // specs in ordinal order — and a **rejected** post (the space busy)
+    // leaves both the draft and its references untouched, the
+    // accept-before-consume contract (PR #227) extended to quotes.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.quote(&eidola_gui::actions::Quote, window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Occupy the exclusive mutation slot so the post is refused.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+    })
+    .unwrap();
+    dispatch_space_action(&view, window, cx, Send);
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.has_active_draft_for_test(),
+            "a rejected post leaves the draft active"
+        );
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "…and leaves its pending references intact"
+        );
+    });
+
+    // Free the slot; the post now lands and carries the reference.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    })
+    .unwrap();
+    dispatch_space_action(&view, window, cx, Send);
+
+    space.read_with(cx, |s, _| {
+        let refs = s.last_submitted_references();
+        assert_eq!(refs.len(), 1, "the post carried its quoted reference");
+        assert_eq!(refs[0].antecedent_action_id, "a1");
+        assert_eq!(refs[0].content_block_id.as_deref(), Some("b1"));
+        assert_eq!(refs[0].range_start, Some(4));
+        assert_eq!(refs[0].range_end, Some(15));
+    });
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.has_active_draft_for_test() || v.active_draft_references_for_test().is_empty(),
+            "an accepted post consumes the draft and its references"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_removing_a_draft_quote_drops_its_marker_and_compacts_on_post(cx: &mut TestAppContext) {
+    // Removing a pending quote takes its marker with it (a stranded marker
+    // would render as literal `{{ embed N }}`), and does **not** renumber the
+    // survivors — their markers already address them. The gap is reconciled
+    // only at the durability boundary, where app-core assigns `1..=N`.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "alpha beta gamma")],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    for range in [0..5usize, 6..10, 11..16] {
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |v, cx| {
+                v.select_in_post_for_test("a1", range.clone(), cx)
+            });
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.quote(&eidola_gui::actions::Quote, window, cx));
+        })
+        .unwrap();
+    }
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test()
+                .iter()
+                .map(|(o, _)| *o)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    });
+
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("draft");
+    let draft_id = view.read_with(cx, |v, _| v.active_draft_id_for_test().unwrap());
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.remove_draft_reference(&draft_id.clone().into(), 2, cx)
+        });
+    })
+    .unwrap();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test()
+                .iter()
+                .map(|(o, _)| *o)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "the survivors keep their ordinals — the gap is correct"
+        );
+    });
+    cx.update_window(window, |_, _, cx| {
+        let body = composer.read(cx).value().to_string();
+        assert!(
+            !body.contains("{{ embed 2 }}"),
+            "the removed quote's marker went with it: {body:?}"
+        );
+        assert!(body.contains("{{ embed 1 }}") && body.contains("{{ embed 3 }}"));
+    })
+    .unwrap();
+
+    // Posting compacts to `1..=N` and rewrites the markers to match, because
+    // that is the order app-core will assign the edges in.
+    dispatch_space_action(&view, window, cx, Send);
+    space.read_with(cx, |s, _| {
+        let refs = s.last_submitted_references();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].range_start, Some(0), "ordinal 1 = the first quote");
+        assert_eq!(refs[1].range_start, Some(11), "ordinal 2 = the third quote");
+    });
+    // The optimistic post's body carries the compacted markers.
+    space.read_with(cx, |s, _| {
+        let last = s
+            .messages()
+            .last()
+            .expect("the posted turn")
+            .message
+            .content
+            .clone();
+        assert!(last.contains("{{ embed 1 }}"), "{last:?}");
+        assert!(last.contains("{{ embed 2 }}"), "{last:?}");
+        assert!(!last.contains("{{ embed 3 }}"), "{last:?}");
+    });
+}
+
+#[gpui::test]
+fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
+    // A persisted post's references are removed through the existing Edit
+    // session: the rail's chips mark ordinals, and committing hands them to
+    // `edit_post_with_removals`. Ordinal 0 — the reply edge — is refused.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    // The body addresses both references by marker, as a real quoted post does.
+    let mut post = fixture_post_with_block(
+        "a1",
+        "b1",
+        "body text\n\n{{ embed 1 }}\n\nmore\n\n{{ embed 2 }}",
+    );
+    post.references = vec![
+        eidola_app_core::PostReference {
+            antecedent_action_id: "x1".into(),
+            ordinal: 1,
+            content_block_id: Some("bx".into()),
+            range_start: Some(0),
+            range_end: Some(4),
+            annotation: None,
+            snippet: Some("some passage".into()),
+        },
+        eidola_app_core::PostReference {
+            antecedent_action_id: "x2".into(),
+            ordinal: 2,
+            content_block_id: Some("by".into()),
+            range_start: Some(0),
+            range_end: Some(4),
+            annotation: None,
+            // The stored range no longer maps — the rail says so rather than
+            // guessing at a remap.
+            snippet: None,
+        },
+    ];
+    seed_quotable_space(&view, window, cx, vec![post]);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    })
+    .unwrap();
+
+    // Ordinal 0 can never be marked (the reply edge is the thread).
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.toggle_reference_removal(0, cx));
+        view.update(cx, |v, cx| v.toggle_reference_removal(2, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.edit_removals_for_test(), vec![2]);
+    });
+    // Toggling is reversible.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.toggle_reference_removal(2, cx));
+        view.update(cx, |v, cx| v.toggle_reference_removal(1, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.edit_removals_for_test(), vec![1]);
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.commit_edit(window, cx));
+    })
+    .unwrap();
+    space.read_with(cx, |s, _| {
+        assert_eq!(
+            s.last_edit_removals(),
+            &[1],
+            "the marked ordinals reach edit_post_with_removals"
+        );
+        // The marker leaves with its edge. Left behind it would render as
+        // literal wire syntax on reload — and go upstream literally, since
+        // there is no edge left to expand it against.
+        let text = s.last_edit_text();
+        assert!(
+            !text.contains("{{ embed 1 }}"),
+            "the removed reference's marker is stripped from the submission: {text:?}"
+        );
+        assert!(
+            text.contains("{{ embed 2 }}"),
+            "a surviving reference keeps the marker that addresses it: {text:?}"
+        );
+        assert!(
+            text.contains("body text") && text.contains("more"),
+            "the prose around the removed marker survives: {text:?}"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_navigating_to_an_edited_generation_selects_its_tip_in_place(cx: &mut TestAppContext) {
+    // A reference names a *concrete generation*, so once the quoted post is
+    // edited that action is gone from the current-tip tree. Navigation must
+    // still land on it via its item — resolving to the tip that superseded it
+    // — rather than treating it as foreign and opening a duplicate window on
+    // the space we are already looking at.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    // A branched space: a2 is the spine (selected by default), a3 a sibling —
+    // so resolving onto a3's item is observable as a selection move.
+    let mut a2 = fixture_assistant_post("a2", "the reply");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_post_with_block("a3", "b3", "the quoted post");
+    a3.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "root"), a2, a3],
+    );
+
+    // A reference to a *superseded* generation of a3's item resolves through
+    // the item to the tip that replaced it (fixtures key items `item-<id>`).
+    let found = cx
+        .update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.select_item_tip("item-a3", window, cx))
+        })
+        .unwrap();
+    assert!(
+        found,
+        "the item's current generation is in this tree, so navigation stays in this window"
+    );
+    let selected = cx
+        .update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, _| v.selected_leaf_for_test(window))
+        })
+        .unwrap();
+    assert_eq!(
+        selected.as_deref(),
+        Some("a3"),
+        "the tip that superseded the quoted generation is selected, not the spine"
+    );
+
+    // An item this space doesn't render is honestly not found — that is what
+    // falls through to opening the reference's own space.
+    let missing = cx
+        .update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.select_item_tip("item-elsewhere", window, cx))
+        })
+        .unwrap();
+    assert!(!missing, "a foreign item does not resolve in this tree");
+}
+
+#[gpui::test]
+fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppContext) {
+    // Source-post highlights: an incoming reference's stored (block, range)
+    // maps back onto the body editor's buffer offsets, a single referencer
+    // navigates directly, and a range that no longer maps paints nothing.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut a2 = fixture_assistant_post("a2", "the reply");
+    a2.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![
+            fixture_post_with_block("a1", "b1", "the quick brown fox"),
+            a2,
+        ],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![
+                    eidola_app_core::IncomingReference {
+                        action_id: "a2".into(),
+                        space_id: "s".into(),
+                        ordinal: 1,
+                        content_block_id: Some("b1".into()),
+                        range_start: Some(4),
+                        range_end: Some(9),
+                        annotation: None,
+                        created_at: 0,
+                    },
+                    // A range past the block's end no longer maps: dropped,
+                    // never approximated.
+                    eidola_app_core::IncomingReference {
+                        action_id: "a2".into(),
+                        space_id: "s".into(),
+                        ordinal: 2,
+                        content_block_id: Some("b1".into()),
+                        range_start: Some(100),
+                        range_end: Some(200),
+                        annotation: None,
+                        created_at: 0,
+                    },
+                ],
+            );
+        });
+    })
+    .unwrap();
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.highlight_ranges_for_test(0, cx),
+            vec![(4usize..9usize, 0u64)],
+            "only the range that still maps is painted"
+        );
+    });
+
+    // One referencer → navigate straight there (the branch is selected).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test("a1", &[0], window, cx)
+        });
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.highlight_picker_for_test().is_none(),
+            "a single referencer needs no picker"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
+    // Overlapping quotes of one passage can't be disambiguated by a click, so
+    // the choice becomes the user's: a small picker naming each referencing
+    // post, dismissed by choosing one.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut a2 = fixture_assistant_post("a2", "first responder");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "second responder");
+    a3.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![
+            fixture_post_with_block("a1", "b1", "the quick brown fox"),
+            a2,
+            a3,
+        ],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let incoming = |action: &str, lo: i64, hi: i64| eidola_app_core::IncomingReference {
+        action_id: action.into(),
+        space_id: "s".into(),
+        ordinal: 1,
+        content_block_id: Some("b1".into()),
+        range_start: Some(lo),
+        range_end: Some(hi),
+        annotation: None,
+        created_at: 0,
+    };
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![incoming("a2", 4, 15), incoming("a3", 10, 19)],
+            );
+        });
+    })
+    .unwrap();
+
+    // Both ranges cover byte 12 — the editor reports both keys.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test("a1", &[0, 1], window, cx)
+        });
+    })
+    .unwrap();
+    let choices = view
+        .read_with(cx, |v, _| v.highlight_picker_for_test())
+        .expect("two referencers open the picker");
+    assert_eq!(choices.len(), 2);
+    assert_eq!(choices[0].0, "a2");
+    assert_eq!(choices[1].0, "a3");
+    assert!(
+        choices[0].1.contains("first responder"),
+        "the row names the reply, not an opaque id: {:?}",
+        choices[0].1
+    );
+
+    // Choosing one navigates and closes the picker.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.navigate_to_action("a3".into(), window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(v.highlight_picker_for_test().is_none());
+    });
+}
+
+#[gpui::test]
+fn space_quote_survives_the_round_trip_into_the_ask_path(cx: &mut TestAppContext) {
+    // Ask-path integrity, end to end against a **real** core: selecting a
+    // passage, quoting it into the tail draft, and posting must land a durable
+    // `reference` edge at ordinal 1 whose snippet resolves — and the post body
+    // must carry the matching `{{ embed 1 }}` marker.
+    //
+    // That pair is the whole contract the ask path rides on: wave 1's
+    // `prepare_turn` expands exactly the structurally-recognized markers whose
+    // ordinals the edges supply, so a marker+edge that agree here is a quote
+    // the model will read (upstream expansion itself is pinned in app-core's
+    // `upstream_context_expands_embed_markers_into_quotes`). `PostNode::
+    // embed_map()` agreeing is the same guarantee on the render side.
+    let (stores, core, _dir, space_id) = participants_scene(cx);
+
+    // A persisted post to quote from.
+    let seed = core
+        .runtime()
+        .block_on(core.post("the quick brown fox".into(), Some(space_id.clone())))
+        .expect("seed post");
+
+    let (window, view) = open_space(cx, &stores, Some(space_id.clone()));
+    wait_until(cx, "transcript load", |cx| {
+        view.read_with(cx, |v, _| v.post_count_for_test() > 0)
+    });
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    // Select "quick brown" in the seeded post and quote it.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.select_in_post_for_test(&seed.action_id, 4..15, cx)
+        });
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.has_post_selection_for_test(),
+            "the seeded post's body is quotable"
+        );
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.quote(&eidola_gui::actions::Quote, window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Type around the quote, then Post quietly (no model call needed — the
+    // reference edge is what this test is about).
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("the quote activated a draft");
+    let body = cx
+        .update_window(window, |_, _, cx| composer.read(cx).value().to_string())
+        .unwrap();
+    assert!(
+        body.contains("{{ embed 1 }}"),
+        "marker in the draft: {body:?}"
+    );
+    cx.update_window(window, |_, _, cx| {
+        composer.update(cx, |e, cx| {
+            let v = format!("{body}\n\nwhat did you mean by this?");
+            e.set_value(v, cx);
+        });
+    })
+    .unwrap();
+    dispatch_space_action(&view, window, cx, PostOnly);
+
+    // The durable edge landed at ordinal 1, resolves its snippet, and the
+    // rendered body still carries the marker addressing it.
+    wait_until(cx, "the quoted post persists", |cx| {
+        let _ = cx;
+        core.runtime()
+            .block_on(core.get_space_tree(space_id.clone()))
+            .map(|nodes| nodes.iter().any(|n| !n.references.is_empty()))
+            .unwrap_or(false)
+    });
+    let nodes = core
+        .runtime()
+        .block_on(core.get_space_tree(space_id.clone()))
+        .expect("tree");
+    let quoted = nodes
+        .iter()
+        .find(|n| !n.references.is_empty())
+        .expect("a post carries the reference edge");
+
+    assert_eq!(quoted.references.len(), 1);
+    let r = &quoted.references[0];
+    assert_eq!(
+        r.ordinal, 1,
+        "ordinal 0 is the reply edge; references start at 1"
+    );
+    assert_eq!(r.antecedent_action_id, seed.action_id);
+    assert_eq!(
+        r.snippet.as_deref(),
+        Some("quick brown"),
+        "the edge resolves the exact passage that was selected"
+    );
+    assert_eq!(
+        quoted.embed_map().get(&1).map(String::as_str),
+        Some("quick brown"),
+        "the render-side embed map addresses it by the same ordinal"
+    );
+    let text: String = quoted
+        .blocks
+        .iter()
+        .filter_map(|b| b.text.as_deref())
+        .collect();
+    assert!(
+        text.contains("{{ embed 1 }}"),
+        "the persisted body carries the marker the edge's ordinal addresses: {text:?}"
+    );
+    assert!(text.contains("what did you mean by this?"));
 
     drain_runtime(&core);
 }

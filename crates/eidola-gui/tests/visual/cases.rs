@@ -58,6 +58,69 @@ fn register_space(s: &mut Snapshots) {
         })
     });
 
+    // Quoted references: a source post whose quoted passages carry the warm
+    // highlight wash (one plain, one overlapping pair), the replies whose
+    // bodies render the quote as an embed block, and the footnote rails
+    // beneath them.
+    s.add("space_quotes", size(px(860.), px(760.)), |window, cx| {
+        let core = stub_stores_with_config(cx);
+        cx.new(|cx| {
+            let view = SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+            let (posts, incoming) = super::fixtures::quoted_reference_posts();
+            view.space().update(cx, |sp, cx| {
+                sp.set_post_tree_for_test(posts, cx);
+                for (action_id, refs) in incoming {
+                    sp.seed_incoming_references_for_test(
+                        action_id,
+                        refs.iter()
+                            .map(|r| eidola_app_core::IncomingReference {
+                                action_id: r.action_id.clone(),
+                                space_id: "demo".into(),
+                                ordinal: 1,
+                                content_block_id: Some(r.block_id.clone()),
+                                range_start: Some(r.range.0),
+                                range_end: Some(r.range.1),
+                                annotation: None,
+                                created_at: 0,
+                            })
+                            .collect(),
+                    );
+                }
+            });
+            view
+        })
+    });
+
+    // Composing with a quote: the pending reference rendered as an embed block
+    // inside the active draft, with its footnote (and remove affordance)
+    // below.
+    s.add(
+        "space_quote_draft",
+        size(px(860.), px(760.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let mut view =
+                    SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+                let (posts, _) = super::fixtures::quoted_reference_posts();
+                view.space().update(cx, |sp, cx| {
+                    sp.set_post_tree_for_test(posts.into_iter().take(1).collect(), cx)
+                });
+                let quoted = super::fixtures::quoted_reference_selection();
+                let source = super::fixtures::quoted_reference_source();
+                view.seed_draft_quote_for_test(
+                    Some("q1"),
+                    "That's the sentence I keep snagging on:\n\n{{ embed 1 }}\n\nIf the care is \
+                 real, doesn't the shepherd analogy quietly concede Socrates' point?",
+                    vec![(1, "kimi-k2", &source[quoted])],
+                    window,
+                    cx,
+                );
+                view
+            })
+        },
+    );
+
     // A brand-new blank space: the composer open at the top of an empty page
     // (the cursor in a fresh notebook).
     s.add("space_blank", size(px(760.), px(680.)), |window, cx| {
