@@ -19,8 +19,9 @@ use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AppCore, AttestationDetail, AttestationInfo, ChatResult, ChatStreamEvent, NotificationPlan,
-    PostNode, PostResult, RequestDetail, RequestInfo, SpendTrailEntry, SubmitResult,
+    AppCore, AttestationDetail, AttestationInfo, ChatResult, ChatStreamEvent, IncomingReference,
+    NotificationPlan, PostNode, PostResult, ReferenceSpec, RequestDetail, RequestInfo,
+    SpendTrailEntry, SubmitResult,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -115,9 +116,11 @@ pub fn submit(
     text: String,
     space_id: Option<String>,
     reply_to: Option<String>,
+    references: Vec<ReferenceSpec>,
 ) -> oneshot::Receiver<Result<SubmitResult, AppError>> {
     spawn_oneshot(core, move |core| async move {
-        core.submit(text, space_id, reply_to).await
+        core.submit_with_references(text, space_id, reply_to, references)
+            .await
     })
 }
 
@@ -141,9 +144,11 @@ pub fn post(
     prompt: String,
     space_id: Option<String>,
     reply_to: Option<String>,
+    references: Vec<ReferenceSpec>,
 ) -> oneshot::Receiver<Result<PostResult, AppError>> {
     spawn_oneshot(core, move |core| async move {
-        core.post_reply(prompt, space_id, reply_to).await
+        core.post_with_references(prompt, space_id, reply_to, references)
+            .await
     })
 }
 
@@ -153,9 +158,35 @@ pub fn edit_post(
     core: Arc<AppCore>,
     action_id: String,
     new_prompt: String,
+    remove_references: Vec<i64>,
 ) -> oneshot::Receiver<Result<PostResult, AppError>> {
     spawn_oneshot(core, move |core| async move {
-        core.edit_post(action_id, new_prompt).await
+        core.edit_post_with_removals(action_id, new_prompt, remove_references)
+            .await
+    })
+}
+
+/// Every current-generation post referencing `action_id` (the reverse index
+/// behind source-post highlights). Pure read.
+pub fn references_to(
+    core: Arc<AppCore>,
+    action_id: String,
+) -> oneshot::Receiver<Result<Vec<IncomingReference>, AppError>> {
+    spawn_oneshot(core, move |core| async move {
+        core.references_to(action_id).await
+    })
+}
+
+/// The `(item_id, space_id)` of a persisted action (`None` if unknown) —
+/// resolves where a quoted post lives before navigating a footnote: its item
+/// finds the tip that superseded an edited generation in *this* space, its
+/// space opens the window for a genuinely cross-space reference.
+pub fn action_location(
+    core: Arc<AppCore>,
+    action_id: String,
+) -> oneshot::Receiver<Result<Option<(String, String)>, AppError>> {
+    spawn_oneshot(core, move |core| async move {
+        core.action_location(action_id).await
     })
 }
 

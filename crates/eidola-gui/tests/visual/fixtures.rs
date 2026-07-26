@@ -294,3 +294,163 @@ pub fn kitchen_sink_posts() -> Vec<PostNode> {
         ),
     ]
 }
+
+/// The quoted-references scene's source-post body — the text every range in
+/// [`quoted_reference_posts`] is measured against. A `fn`, not an inline
+/// literal, so a caller (the driver's composing scene) computes the same byte
+/// offsets rather than hard-coding them past a multi-byte em dash.
+pub fn quoted_reference_source() -> String {
+    "The shepherd image is doing more work than it looks. Thrasymachus is not saying rulers \
+     are cruel; he is saying that ruling, like shepherding, is a craft whose end lies outside \
+     its object. The sheep are fattened, tended, protected — and none of that is for the \
+     sheep.\n\n\
+     What makes it hard to answer is that the care is real. A paternalist state that genuinely \
+     improves lives is not thereby refuted; the question Thrasymachus forces is whose advantage \
+     the rule tracks when the two come apart."
+        .to_string()
+}
+
+/// The passage the composing scene quotes ("the care is real"), as a byte
+/// range into [`quoted_reference_source`].
+///
+/// This module is `include!`d by both the visual cases and the driver example;
+/// only the former needs the range, so the example's build sees it as dead.
+#[allow(dead_code)]
+pub fn quoted_reference_selection() -> std::ops::Range<usize> {
+    let src = quoted_reference_source();
+    let (s, e) = byte_range(&src, "the care is real");
+    s as usize..e as usize
+}
+
+/// Byte offsets of `phrase` within `content` (the schema's units, unlike the
+/// char-based [`char_range`] the older fixtures use).
+pub fn byte_range(content: &str, phrase: &str) -> (i64, i64) {
+    let start = content
+        .find(phrase)
+        .unwrap_or_else(|| panic!("reference phrase not found: {phrase:?}"));
+    (start as i64, (start + phrase.len()) as i64)
+}
+
+/// One incoming reference in [`quoted_reference_posts`] — the shape the scene
+/// converts into `eidola_app_core::IncomingReference` when seeding a `Space`.
+pub struct QuotedIncoming {
+    pub action_id: String,
+    pub block_id: String,
+    pub range: (i64, i64),
+}
+
+/// The quoted-references scene: a source post whose passages other posts have
+/// quoted, and the replies that quote them — the fixture behind the wave-2
+/// footnote rail, embed blocks, and source highlights.
+///
+/// Returns `(posts, incoming)` where `incoming` is the reverse index the
+/// source post's highlights are painted from (`(quoted action, references)`).
+/// Ranges are **byte** offsets into the source block's text, exactly as the
+/// schema stores them.
+#[allow(clippy::type_complexity)]
+pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncoming>)>) {
+    let source = quoted_reference_source();
+    let src = source.as_str();
+
+    let quoted_a = "the care is real";
+    let quoted_b = "whose advantage the rule tracks";
+    let (a_start, a_end) = byte_range(src, quoted_a);
+    let (b_start, b_end) = byte_range(src, quoted_b);
+    // The branch quotes a longer span starting at the same point — an overlap
+    // with the reply's, so a click on the shared text is ambiguous (the picker).
+    let a_long_end = a_end + 30;
+
+    let block = "blk-1";
+    let mut source_post = fixture_post("q1", "agent", "kimi-k2", "inference", src, 0, false, 1);
+    source_post.blocks[0].id = block.into();
+    source_post.created_at = 1;
+
+    // A reply quoting the first passage: the marker stands as its own
+    // paragraph (what the editor renders as a quote block) with prose around it.
+    let mut reply = fixture_post(
+        "q2",
+        "human",
+        "user",
+        "user_input",
+        "That's the sentence I keep snagging on:\n\n{{ embed 1 }}\n\nIf the care is real, \
+         doesn't the shepherd analogy quietly concede Socrates' point — that the craft does \
+         aim at its object after all?",
+        0,
+        false,
+        1,
+    );
+    reply.parent_action_id = Some("q1".into());
+    reply.relation = Some("reply".into());
+    reply.created_at = 2;
+    reply.references = vec![PostReference {
+        antecedent_action_id: "q1".into(),
+        ordinal: 1,
+        content_block_id: Some(block.into()),
+        range_start: Some(a_start),
+        range_end: Some(a_end),
+        annotation: None,
+        snippet: Some(quoted_a.into()),
+    }];
+
+    // A branch quoting the overlapping span plus a second passage — two
+    // references on one post (the rail's plural case).
+    let mut branch = fixture_post(
+        "q3",
+        "human",
+        "Mara",
+        "user_input",
+        "Two things, separately.\n\n{{ embed 1 }}\n\nand\n\n{{ embed 2 }}\n\nThe first is a \
+         concession; the second is the actual test. I'd keep the second and drop the first.",
+        1,
+        true,
+        1,
+    );
+    branch.parent_action_id = Some("q1".into());
+    branch.relation = Some("reply".into());
+    branch.created_at = 3;
+    branch.references = vec![
+        PostReference {
+            antecedent_action_id: "q1".into(),
+            ordinal: 1,
+            content_block_id: Some(block.into()),
+            range_start: Some(a_start),
+            range_end: Some(a_long_end),
+            annotation: None,
+            snippet: src
+                .get(a_start as usize..a_long_end as usize)
+                .map(String::from),
+        },
+        PostReference {
+            antecedent_action_id: "q1".into(),
+            ordinal: 2,
+            content_block_id: Some(block.into()),
+            range_start: Some(b_start),
+            range_end: Some(b_end),
+            annotation: None,
+            snippet: Some(quoted_b.into()),
+        },
+    ];
+
+    let incoming = vec![(
+        "q1".to_string(),
+        vec![
+            QuotedIncoming {
+                action_id: "q2".into(),
+                block_id: block.into(),
+                range: (a_start, a_end),
+            },
+            QuotedIncoming {
+                action_id: "q3".into(),
+                block_id: block.into(),
+                range: (a_start, a_long_end),
+            },
+            QuotedIncoming {
+                action_id: "q3".into(),
+                block_id: block.into(),
+                range: (b_start, b_end),
+            },
+        ],
+    )];
+
+    (vec![source_post, reply, branch], incoming)
+}

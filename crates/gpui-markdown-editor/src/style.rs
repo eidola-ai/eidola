@@ -114,6 +114,12 @@ pub struct MarkdownStyle {
     pub background: Hsla,
     pub caret_color: Hsla,
     pub selection_color: Hsla,
+    /// Wash painted behind host-supplied highlight ranges (see
+    /// [`crate::highlight`]) — a quiet warm underlay, deliberately fainter
+    /// than the selection so a selection over highlighted text still reads.
+    /// The default is a low-alpha amber derived from the theme's mode (the
+    /// same warm family in day and night); hosts can override per palette.
+    pub highlight_color: Hsla,
 
     /// Font family for *inline* code spans. Defaults to
     /// `mono_font_family`, but is exposed separately because inline
@@ -189,6 +195,11 @@ impl MarkdownStyle {
             background: theme.background,
             caret_color: theme.caret,
             selection_color: theme.selection,
+            highlight_color: if theme.mode.is_dark() {
+                gpui::hsla(0.115, 0.55, 0.55, 0.18)
+            } else {
+                gpui::hsla(0.115, 0.85, 0.55, 0.16)
+            },
 
             inline_code_font_family: theme.mono_font_family.clone(),
             inline_code_background: theme.accent,
@@ -309,6 +320,12 @@ impl MarkdownStyle {
 
     pub fn inline_code_background(mut self, bg: Hsla) -> Self {
         self.inline_code_background = bg;
+        self
+    }
+
+    /// Override the highlight wash color (see `highlight_color`).
+    pub fn highlight_color(mut self, color: Hsla) -> Self {
+        self.highlight_color = color;
         self
     }
 

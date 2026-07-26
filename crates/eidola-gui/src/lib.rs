@@ -39,7 +39,7 @@ use crate::about::AboutView;
 use crate::actions::{
     About, ActualSize, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize,
     NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenParticipants, OpenRecord, OpenSettings, Quit,
-    ShowAll, ToggleInspector, Zoom, ZoomIn, ZoomOut,
+    Quote, QuoteInReply, ShowAll, ToggleInspector, Zoom, ZoomIn, ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::onboarding::OnboardingView;
@@ -297,6 +297,13 @@ fn install_menus(cx: &mut App) {
                     gpui_component::input::SelectAll,
                     OsAction::SelectAll,
                 ),
+                MenuItem::Separator,
+                // Quoting is an Edit-menu verb because it acts on the
+                // *selection*, like Cut/Copy. Both handlers are registered
+                // per-`SpaceView` and only while a quotable post selection
+                // exists, so macOS greys them the rest of the time.
+                MenuItem::action("Quote", Quote),
+                MenuItem::action("Quote in Reply", QuoteInReply),
             ],
             disabled: false,
         },

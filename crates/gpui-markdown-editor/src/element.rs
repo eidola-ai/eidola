@@ -243,6 +243,10 @@ pub struct PrepaintState {
     laid_out: LaidOutBlock,
     cursor_quad: Option<TaggedQuad>,
     selection_quads: Vec<TaggedQuad>,
+    /// Wash quads for host-supplied highlight ranges (see
+    /// [`crate::highlight`]) — painted before the selection quads so a
+    /// selection over highlighted text reads on top of the wash.
+    highlight_quads: Vec<TaggedQuad>,
     /// `Some` only for code blocks. Holds the geometry needed during
     /// paint to draw the rounded background, clip content to the
     /// visible band, and overlay the horizontal scrollbar.
@@ -1762,7 +1766,7 @@ impl Element for BlockElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let (selection, source, scroll_offset, caret_downstream) = {
+        let (selection, source, scroll_offset, caret_downstream, highlight_ranges) = {
             let editor = self.editor.read(cx);
             let scroll = editor.code_block_scroll(self.block_index);
             (
@@ -1770,6 +1774,7 @@ impl Element for BlockElement {
                 editor.state.markdown.clone(),
                 scroll,
                 editor.caret_downstream(),
+                editor.highlights().merged_ranges(),
             )
         };
 
@@ -2093,6 +2098,12 @@ impl Element for BlockElement {
             caret_downstream,
         );
 
+        // Host-supplied highlight washes — the same per-line quad geometry as
+        // a selection, in the (fainter, warmer) highlight color. The ranges
+        // arrive pre-merged (see `HighlightSet::merged_ranges`), so
+        // overlapping highlights paint one wash, never a stacked darker band.
+        let highlight_quads = build_highlight_quads(&laid_out, &highlight_ranges, &style);
+
         if cursor_quad.is_none() && source.is_empty() && self.block_index == 0 {
             // Truly empty document — paint a cursor at the origin so the
             // user sees the editor is focused.
@@ -2285,6 +2296,7 @@ impl Element for BlockElement {
             laid_out,
             cursor_quad,
             selection_quads,
+            highlight_quads,
             code_block_paint,
             table_paint,
             math_paint,
@@ -2553,6 +2565,7 @@ impl Element for BlockElement {
 
         let cursor_quad = prepaint.cursor_quad.take();
         let selection_quads = std::mem::take(&mut prepaint.selection_quads);
+        let highlight_quads = std::mem::take(&mut prepaint.highlight_quads);
         let focused = focus_handle.is_focused(window);
 
         // Split paint into delimiter and content phases. Fence-row
@@ -2564,6 +2577,8 @@ impl Element for BlockElement {
         // right edge. Non-code blocks have `code_block_paint == None`
         // and skip the mask entirely.
         if let Some(cb) = &code_block_paint {
+            let (delim_hl, content_hl): (Vec<_>, Vec<_>) =
+                highlight_quads.into_iter().partition(|t| t.is_delimiter);
             let (delim_sel, content_sel): (Vec<_>, Vec<_>) =
                 selection_quads.into_iter().partition(|t| t.is_delimiter);
             let (cursor_for_delim, cursor_for_content) = match cursor_quad {
@@ -2574,6 +2589,9 @@ impl Element for BlockElement {
 
             // Phase 1: delimiter lines + their cursor / selection,
             // unmasked.
+            for tq in delim_hl {
+                window.paint_quad(tq.quad);
+            }
             for tq in delim_sel {
                 window.paint_quad(tq.quad);
             }
@@ -2602,6 +2620,9 @@ impl Element for BlockElement {
                 bounds: cb.content_clip,
             };
             window.with_content_mask(Some(mask), |window| {
+                for tq in content_hl {
+                    window.paint_quad(tq.quad);
+                }
                 for tq in content_sel {
                     window.paint_quad(tq.quad);
                 }
@@ -2668,6 +2689,9 @@ impl Element for BlockElement {
                         window,
                         cx,
                     );
+                }
+                for tq in highlight_quads {
+                    window.paint_quad(tq.quad);
                 }
                 for tq in selection_quads {
                     window.paint_quad(tq.quad);
@@ -4231,6 +4255,41 @@ fn build_caret_and_selection(
     }
 
     (cursor.or(boundary_fallback), sel_quads)
+}
+
+/// Wash quads for host-supplied highlight ranges over one block: for each
+/// (pre-merged) range that intersects a laid-out line, the same quad geometry
+/// as a selection (via [`paint_selection_for_line`]) in
+/// `MarkdownStyle::highlight_color`. Inert with respect to the caret and
+/// selection — pure decoration under the text.
+fn build_highlight_quads(
+    block: &LaidOutBlock,
+    ranges: &[std::ops::Range<usize>],
+    style: &MarkdownStyle,
+) -> Vec<TaggedQuad> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    let mut quads = Vec::new();
+    for line in &block.lines {
+        let lo = line.source_range.start;
+        let hi = line.source_range.end;
+        for range in ranges {
+            let lo_clamped = range.start.max(lo);
+            let hi_clamped = range.end.min(hi);
+            if hi_clamped > lo_clamped {
+                paint_selection_for_line(
+                    line,
+                    lo_clamped,
+                    hi_clamped,
+                    hi,
+                    style.highlight_color,
+                    &mut quads,
+                );
+            }
+        }
+    }
+    quads
 }
 
 fn paint_selection_for_line(

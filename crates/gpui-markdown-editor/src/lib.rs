@@ -19,6 +19,7 @@ pub mod element;
 pub mod embed;
 pub mod escapes;
 pub mod event;
+pub mod highlight;
 pub mod image;
 pub mod math;
 pub mod parser;
@@ -39,6 +40,7 @@ pub use editor::{
 };
 pub use embed::{EmbedMap, embed_marker, parse_embed_text};
 pub use event::{EditorEvent, MarkdownEditorEvent};
+pub use highlight::HighlightSet;
 pub use parser::parse;
 pub use render::render;
 pub use render_spec::{
