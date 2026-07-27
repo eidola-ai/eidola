@@ -70,6 +70,12 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 rustls-rustcrypto = "0.0.2-alpha"
 
 [[test]]
+name = "record_perf"
+path = "tests/record_perf.rs"
+# Same main-thread requirement as the visual tier (VisualTestAppContext + AppKit).
+harness = false
+
+[[test]]
 name = "visual"
 path = "tests/visual.rs"
 # Skip libtest's worker-thread harness — VisualTestAppContext talks to AppKit
