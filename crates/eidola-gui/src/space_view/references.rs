@@ -681,8 +681,10 @@ impl SpaceView {
         Some(rail.into_any_element())
     }
 
-    /// The rail under a **draft**: its pending references, each with a remove
-    /// affordance (dropping the row also drops its marker).
+    /// The rail under a **draft**: its pending references, each with an
+    /// **embed** affordance (re-place the quote's marker in the body when it
+    /// isn't there) and a remove affordance (dropping the row also drops its
+    /// marker).
     ///
     /// `measure` records the rail's painted height into
     /// [`SpaceView::composer_rail_h`] — set only for the *active* draft, whose
@@ -698,6 +700,18 @@ impl SpaceView {
         if draft.references.is_empty() {
             return None;
         }
+        // Which ordinals the body already carries as *recognized* embed
+        // blocks — the ones whose "embed" affordance would duplicate a marker
+        // that is already there. Same recognition the composer's compaction
+        // and the editor's rendering use, so the affordance appears exactly
+        // when the quote block is missing from the draft.
+        let body = draft.editor.read(cx).value();
+        let map = gpui_markdown_editor::EmbedMap::new(draft.embed_map());
+        let placed: std::collections::HashSet<u64> =
+            gpui_markdown_editor::embed::embed_blocks(body, &map)
+                .into_iter()
+                .map(|b| b.ordinal)
+                .collect();
         let mut refs = draft.references.clone();
         refs.sort_by_key(|r| r.ordinal);
 
@@ -719,13 +733,44 @@ impl SpaceView {
                 antecedent_action_id: r.spec.antecedent_action_id.clone(),
             };
             let ordinal = r.ordinal;
-            let el = self.footnote_row(
+            let mut el = self.footnote_row(
                 format!("space-draft-fn-{}-{}", draft.id, ordinal),
                 format!("space/draft/footnote/{}", row.index),
                 &row,
                 false,
                 cx,
             );
+            // "embed" — put the quote back into the body. A reference and its
+            // marker are separable (deleting the block leaves the reference,
+            // which is what makes the footnote a backlink), so the rail owns
+            // the way back. Offered only while the marker is *absent*: with the
+            // block already in the body a second one would render the same
+            // quote twice and confuse removal.
+            if !placed.contains(&ordinal) {
+                let draft_id = draft_id.clone();
+                el = el.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "space-draft-fn-embed-{}-{}",
+                            draft.id, ordinal
+                        )))
+                        .probe(
+                            format!("space/draft/footnote/{}/embed", row.index),
+                            gpui::Role::Button,
+                            "Embed this quote in the draft",
+                        )
+                        .flex_none()
+                        .px_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(cx.theme().foreground))
+                        .child("embed")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.embed_draft_reference(&draft_id, ordinal, window, cx);
+                        })),
+                );
+            }
             let draft_id = draft_id.clone();
             let el = el.child(
                 div()
@@ -743,6 +788,7 @@ impl SpaceView {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .cursor_pointer()
+                    .hover(|s| s.text_color(cx.theme().foreground))
                     .child("×")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.remove_draft_reference(&draft_id, ordinal, cx);
@@ -751,6 +797,37 @@ impl SpaceView {
             rail = rail.child(el);
         }
         Some(rail.into_any_element())
+    }
+
+    /// Place the marker for a pending reference the draft's body no longer
+    /// carries — the rail's "embed" affordance, and the inverse of the
+    /// deletion that made the quote a bare backlink. The editor owns the
+    /// splice (`insert_embed_marker` pads it into its own paragraph), so the
+    /// host never touches marker bytes.
+    pub fn embed_draft_reference(
+        &mut self,
+        draft_id: &SharedString,
+        ordinal: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft) = self.drafts.iter().find(|d| &d.id == draft_id) else {
+            return;
+        };
+        if !draft.references.iter().any(|r| r.ordinal == ordinal) {
+            return;
+        }
+        let embeds = draft.embed_map();
+        let editor = draft.editor.clone();
+        editor.update(cx, |e, cx| {
+            e.set_embeds(embeds, cx);
+            e.insert_embed_marker(ordinal, cx);
+        });
+        // The marker lands at the caret, so the composer must have it: focus
+        // the editor the way `attach_quote` does.
+        let focus = editor.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
     }
 
     /// The rail's container: a hairline rule above a tight column — a book's
