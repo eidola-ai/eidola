@@ -107,6 +107,12 @@ pub(crate) const MINIMAP_FADE: std::time::Duration = std::time::Duration::from_m
 /// past this margin renders as a sized placeholder.
 pub(crate) const VIRT_MARGIN: f32 = 600.0;
 
+/// How close to the end of the document the page must sit for a streaming turn
+/// to keep it pinned there ("tail-following"). A couple of pixels of slack
+/// absorbs sub-pixel layout rounding without ever mistaking a deliberate scroll
+/// away from the tail for "still at the end".
+pub(crate) const TAIL_FOLLOW_EPSILON: f32 = 2.0;
+
 /// Vertical band (px) at the top and bottom of the viewport within which an
 /// active readonly-post selection drag autoscrolls the page.
 pub(crate) const SELECTION_AUTOSCROLL_MARGIN: f32 = 56.0;
@@ -728,6 +734,16 @@ impl SpaceView {
     pub fn scroll_page_to_top_for_test(&self) {
         let off = self.page_scroll.offset();
         self.page_scroll.set_offset(gpui::point(off.x, px(0.)));
+    }
+
+    /// Scroll the whole page to the end of the current document — the position
+    /// tail-following keeps a streaming turn pinned to. Tests use it to park
+    /// the reader at the tail before deltas arrive.
+    #[doc(hidden)]
+    pub fn scroll_page_to_end_for_test(&self) {
+        let off = self.page_scroll.offset();
+        self.page_scroll
+            .set_offset(gpui::point(off.x, px(self.scroll_min_y.get())));
     }
 
     /// Whether the minimap is currently shown (tests assert scroll reveals it).
@@ -1515,8 +1531,14 @@ impl Render for SpaceView {
         let doc_reserve = self.doc_reserve();
         let total_doc =
             doc_reserve + self.selected_total_height(&tree, page_width, window_h) + floating_pad;
-        self.scroll_min_y
-            .set((window_h.as_f32() - total_doc).min(0.0));
+        let prev_min_y = self
+            .scroll_min_y
+            .replace((window_h.as_f32() - total_doc).min(0.0));
+
+        // **Follow the producing tail.** While a turn streams, the document
+        // grows with every delta; a reader parked at the end wants to stay
+        // there, and a reader who has scrolled away must never be yanked back.
+        self.follow_streaming_tail(streaming, prev_min_y);
 
         // While a readonly post is being drag-selected, autoscroll the page when
         // the pointer sits against a viewport edge — so a selection can pull
@@ -1647,6 +1669,43 @@ impl SpaceView {
             .values()
             .find(|e| e.read(cx).is_selecting())
             .cloned()
+    }
+
+    /// **Tail-following.** While a response streams, the document grows with
+    /// every delta. If the reader is parked at the end of the branch, keep them
+    /// there — the answer should write itself into view. If they have scrolled
+    /// away to re-read something, leave them exactly where they are.
+    ///
+    /// The "am I at the end?" question is answered by *observation*, not by a
+    /// flag: the page is following iff its current offset still sits at the
+    /// **previous** frame's end-of-document (`prev_min_y`, the value
+    /// `scroll_min_y` held before this frame's document was measured). That
+    /// makes every scroll source — the wheel, a minimap drag, selection
+    /// autoscroll, a programmatic dock — participate for free, with no state to
+    /// keep in sync: scrolling up leaves the band and following stops;
+    /// scrolling back down re-enters it and following resumes. There is no
+    /// "sticky" mode to get wedged.
+    ///
+    /// Deliberately gated on `streaming`: a growing document is otherwise the
+    /// composer's runway or a post measuring for the first time, and neither
+    /// should move the reader. Composer growth keeps its own caret-into-view
+    /// path (`composer::caret_into_view`), which this must not race.
+    ///
+    /// Runs in `render` immediately after `scroll_min_y` is set for the frame,
+    /// so every consumer of `clamped_scroll_y` sees the followed position.
+    fn follow_streaming_tail(&self, streaming: bool, prev_min_y: f32) {
+        if !streaming {
+            return;
+        }
+        let off = self.page_scroll.offset();
+        let at_tail = off.y.as_f32() <= prev_min_y + TAIL_FOLLOW_EPSILON;
+        if !at_tail {
+            return; // the reader scrolled away — never yank them back
+        }
+        let target = self.scroll_min_y.get();
+        if (target - off.y.as_f32()).abs() > 0.5 {
+            self.page_scroll.set_offset(gpui::point(off.x, px(target)));
+        }
     }
 
     /// While a readonly post is being drag-selected, scroll the page toward
