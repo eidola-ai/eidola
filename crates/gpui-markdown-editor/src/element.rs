@@ -2268,6 +2268,27 @@ impl Element for BlockElement {
             None
         };
 
+        // Embed caret affinity: the marker's shaped line is fully hidden, so
+        // it has zero width and *both* edges of the block map to display
+        // column 0 — a caret before and a caret after the embed painted in the
+        // same place, which is a lie about where the next character lands.
+        // Treat the block the way a caret treats a glyph: leading edge at its
+        // left (already the case), trailing edge at its **right**, on the
+        // block's last row. Only the x/y move — the caret keeps its own width
+        // and row height, so it reads as a caret, not a border.
+        if let Some(ep) = embed_paint.as_ref()
+            && let Some(caret) = cursor_quad.as_mut()
+            && selection.is_collapsed()
+            && selection.head() == self.block.source_range.end
+        {
+            let w = caret.quad.bounds.size.width;
+            let h = caret.quad.bounds.size.height;
+            caret.quad.bounds.origin = point(
+                (ep.bounds.origin.x + ep.bounds.size.width - w).max(ep.bounds.origin.x),
+                (ep.bounds.origin.y + ep.bounds.size.height - h).max(ep.bounds.origin.y),
+            );
+        }
+
         // Block image in display mode: load and stash bounds. Loading
         // / failed states fall through to the regular shape path
         // (which renders the source bytes as a fallback row).
