@@ -547,7 +547,7 @@ impl SpaceView {
                     // The draft's pending quotes, as footnotes — the same rail
                     // a posted exchange carries, so composing looks like what
                     // it will become.
-                    .children(self.render_draft_footnotes(&node.id, cx)),
+                    .children(self.render_draft_footnotes(&node.id, false, cx)),
             )
             .child(action_gutter())
             .child(record_height(

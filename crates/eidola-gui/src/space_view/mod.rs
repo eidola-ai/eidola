@@ -404,8 +404,23 @@ pub struct SpaceView {
     /// (content fits, incl. empty / one line) a wheel over it scrolls the page
     /// underneath, so it can dock, instead of being trapped scrolling nothing.
     pub(crate) composer_scrollable: Cell<bool>,
-    /// The composer's natural (unclipped) content height, recorded each frame.
+    /// The composer's natural (unclipped) content height, recorded each frame:
+    /// the editor's own laid-out text height **plus** the footnote rail's
+    /// measured height (see [`composer_rail_h`](Self::composer_rail_h)) plus
+    /// the bottom breath. Everything that sizes the composer — the floating
+    /// bar, the docked runway, the minimap — reads this one value, so what the
+    /// bar reserves is what the body actually renders.
     pub(crate) composer_content_h: Rc<RefCell<Pixels>>,
+    /// Flow positions bracketing the active composer's footnote rail, written
+    /// by the two zero-height probes the composer body places around it (see
+    /// [`references::flow_mark`]). Their difference is the rail's **measured**
+    /// occupancy — margin, rule, padding and all — which is what the bar
+    /// reserves for it, instead of a row-count formula that drifts the moment
+    /// the rail's styling changes. With no rail rendered the two coincide, so
+    /// the reservation is zero without a special case. Both paint before
+    /// `record_height`'s probe, so the sum above is consistent within a frame.
+    pub(crate) composer_rail_top: Rc<Cell<f32>>,
+    pub(crate) composer_rail_bottom: Rc<Cell<f32>>,
     /// Painted bounds of the composer's in-flow placeholder slot, keyed by the
     /// draft sentinel id — positions the dock and feeds the minimap.
     pub(crate) slot_bounds: Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>,
@@ -586,6 +601,8 @@ impl SpaceView {
             composer_overlayed: Cell::new(false),
             composer_scrollable: Cell::new(false),
             composer_content_h: Rc::new(RefCell::new(px(0.))),
+            composer_rail_top: Rc::new(Cell::new(0.0)),
+            composer_rail_bottom: Rc::new(Cell::new(0.0)),
             slot_bounds: Rc::new(RefCell::new(HashMap::new())),
             scroll_owner: None,
             band_menu: None,
