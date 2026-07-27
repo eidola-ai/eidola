@@ -1543,6 +1543,62 @@ fn delete_selection(state: &EditorState) -> (String, usize) {
     }
 }
 
+/// Keep a mapped `{{ embed N }}` marker on a line of its own when a splice
+/// lands on one of its edges — **the whole line is the block**.
+///
+/// A marker only parses as a marker when it is a paragraph's entire content,
+/// so a character typed (or pasted) at either edge would otherwise land on the
+/// marker's line and silently degrade the rendered block back to literal text.
+/// The honest reading of "type here" at a block's edge is "type in a new
+/// paragraph beside it", so this splices exactly the paragraph separator the
+/// incoming bytes are missing and hands the caller the position to splice at:
+///
+/// * at the **trailing** edge the separator goes *before* the text (the caller
+///   splices past it, so the typed bytes open a fresh paragraph below);
+/// * at the **leading** edge it goes *after* (the caller splices at the same
+///   position, so the typed bytes open a fresh paragraph above).
+///
+/// Newlines the incoming text already carries count toward the separator, so
+/// a host call that pads its own insertion ([`MarkdownEditorState::insert_embed_marker`])
+/// is not padded twice. Empty text (the deletion path) and embed-free buffers
+/// are untouched.
+///
+/// [`MarkdownEditorState::insert_embed_marker`]: crate::MarkdownEditorState::insert_embed_marker
+fn protect_embed_line(
+    markdown: String,
+    cursor: usize,
+    embeds: &crate::embed::EmbedMap,
+    text: &str,
+) -> (String, usize) {
+    if text.is_empty() || embeds.is_empty() || !markdown.contains("{{") {
+        return (markdown, cursor);
+    }
+    let blocks = crate::embed::embed_blocks(&markdown, embeds);
+    let mut markdown = markdown;
+    // A marker is ≥ 13 bytes, so no position is both an end and a start.
+    if blocks.iter().any(|b| b.range.end == cursor) {
+        let have = text.bytes().take_while(|&b| b == b'\n').count().min(2);
+        if have < 2 {
+            let sep = "\n".repeat(2 - have);
+            markdown.insert_str(cursor, &sep);
+            return (markdown, cursor + sep.len());
+        }
+    } else if blocks.iter().any(|b| b.range.start == cursor) {
+        let have = text
+            .bytes()
+            .rev()
+            .take_while(|&b| b == b'\n')
+            .count()
+            .min(2);
+        if have < 2 {
+            let sep = "\n".repeat(2 - have);
+            markdown.insert_str(cursor, &sep);
+            return (markdown, cursor);
+        }
+    }
+    (markdown, cursor)
+}
+
 fn insert_text(state: EditorState, text: &str) -> EditorState {
     // Typing `|` inside a table cell inserts a **column boundary at
     // the caret, table-wide**: the caret's cell splits, the header
@@ -1602,7 +1658,11 @@ fn insert_text(state: EditorState, text: &str) -> EditorState {
             }
         }
     }
-    let (mut buf, cursor) = delete_selection(&state);
+    let (buf, cursor) = delete_selection(&state);
+    // The whole marker line is the block: a splice at either edge opens a
+    // fresh paragraph beside it rather than dissolving it (see
+    // `protect_embed_line`).
+    let (mut buf, cursor) = protect_embed_line(buf, cursor, &state.embeds, text);
     buf.insert_str(cursor, text);
     EditorState {
         markdown: buf,
@@ -1635,6 +1695,11 @@ fn insert_text(state: EditorState, text: &str) -> EditorState {
 /// them risks rounding their structure.
 fn paste(state: EditorState, text: &str, internal: bool) -> EditorState {
     let (md, cursor) = delete_selection(&state);
+    // Same embed-line protection typing gets (see `protect_embed_line`): a
+    // paste at a marker's edge opens its own paragraph beside the block.
+    // `markdown_paste`'s own block padding sees the fresh boundary this
+    // leaves and does not pad again.
+    let (md, cursor) = protect_embed_line(md, cursor, &state.embeds, text);
     let mid = EditorState {
         markdown: md,
         selection: Selection::Cursor(cursor),
