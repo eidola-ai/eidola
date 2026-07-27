@@ -1963,6 +1963,25 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
         names.contains(&"space/draft/footnote/1/remove".to_string()),
         "a pending quote is always removable: {names:?}"
     );
+    assert!(
+        !names.contains(&"space/draft/footnote/1/embed".to_string()),
+        "the marker is in the body, so there is nothing to re-embed: {names:?}"
+    );
+
+    // Drop the marker (as a Backspace over the quote block would) and the
+    // rail grows its "embed" affordance — the way back.
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("the draft's editor");
+    cx.update_window(window, |_, _, cx| {
+        composer.update(cx, |e, cx| e.set_value("prose only", cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/draft/footnote/1/embed".to_string()),
+        "a quote with no marker offers to re-embed: {names:?}"
+    );
 
     // The multi-referencer picker.
     let incoming = |action: &str| eidola_app_core::IncomingReference {

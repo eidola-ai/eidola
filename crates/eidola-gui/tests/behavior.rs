@@ -5591,6 +5591,93 @@ fn space_removing_a_draft_quote_drops_its_marker_and_compacts_on_post(cx: &mut T
 }
 
 #[gpui::test]
+fn space_draft_footnote_can_re_embed_its_quote(cx: &mut TestAppContext) {
+    // A reference and its marker are separable — deleting the quote block in
+    // the body leaves the footnote behind — so the rail carries the way back.
+    // The affordance re-places the marker, and does **not** offer to place a
+    // second one while the block is already there.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "alpha beta gamma")],
+    );
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 0..5, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.quote(&eidola_gui::actions::Quote, window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("draft");
+    let draft_id: gpui::SharedString = view
+        .read_with(cx, |v, _| v.active_draft_id_for_test().unwrap())
+        .into();
+
+    cx.update_window(window, |_, _, cx| {
+        assert!(composer.read(cx).value().contains("{{ embed 1 }}"));
+        // Strip the marker the way a Backspace over the block would, leaving
+        // the reference (and its footnote row) in place.
+        composer.update(cx, |e, cx| e.set_value("just prose", cx));
+    })
+    .unwrap();
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.embed_draft_reference(&draft_id, 1, window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        let body = composer.read(cx).value().to_string();
+        assert!(
+            body.contains("{{ embed 1 }}"),
+            "the rail put the quote back: {body:?}"
+        );
+        assert!(body.contains("just prose"), "prose is kept: {body:?}");
+        assert_eq!(
+            body.matches("{{ embed 1 }}").count(),
+            1,
+            "exactly one marker: {body:?}"
+        );
+    })
+    .unwrap();
+
+    // The reference itself is untouched — this places a marker, it does not
+    // mint a quote.
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test()
+                .iter()
+                .map(|(o, _)| *o)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    });
+
+    // A reference the draft doesn't carry is a no-op (no stray marker).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.embed_draft_reference(&draft_id, 9, window, cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, _, cx| {
+        assert!(!composer.read(cx).value().contains("{{ embed 9 }}"));
+    })
+    .unwrap();
+}
+
+#[gpui::test]
 fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
     // A persisted post's references are removed through the existing Edit
     // session: the rail's chips mark ordinals, and committing hands them to
