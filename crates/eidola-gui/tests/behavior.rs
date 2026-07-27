@@ -3628,6 +3628,113 @@ fn space_post_reasoning_projection_toggles(cx: &mut TestAppContext) {
     });
 }
 
+/// Seed a space whose branch is far taller than the window and start one
+/// streaming turn on it, returning the turn's seq. Shared by the two
+/// tail-following cases.
+fn seed_streaming_tall_space(
+    view: &Entity<SpaceView>,
+    window: AnyWindowHandle,
+    cx: &mut TestAppContext,
+) -> u64 {
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2], cx);
+            s.push_streaming_turn_for_test(
+                Some("agent-b".into()),
+                Some("a2".into()),
+                Default::default(),
+                cx,
+            )
+        })
+    })
+    .unwrap()
+}
+
+#[gpui::test]
+fn space_streaming_tail_follows_when_parked_at_the_end(cx: &mut TestAppContext) {
+    // Parked at the end of the branch while a turn streams: each delta grows
+    // the document, and the page stays pinned to the new end — the answer
+    // writes itself into view instead of running off the bottom.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let seq = seed_streaming_tall_space(&view, window, cx);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Park the reader at the tail.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+    let before = view.read_with(&vcx, |v, _| v.scroll_min_y_for_test());
+    assert!(
+        before < -1.0,
+        "the seeded branch must overflow the window (scroll_min_y {before})"
+    );
+
+    // The turn produces a long reply.
+    space.update(&mut vcx, |s, cx| {
+        s.push_content_delta_for_test(seq, &"streamed answer line\n".repeat(60), cx)
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let after = v.scroll_min_y_for_test();
+        assert!(
+            after < before - 1.0,
+            "the streamed reply must grow the document ({before} -> {after})"
+        );
+        assert!(
+            (v.page_scroll_offset_y_for_test() - after).abs() < 2.0,
+            "the page follows the producing tail (offset {} should track the new \
+             end {after})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_streaming_tail_does_not_yank_a_reader_who_scrolled_away(cx: &mut TestAppContext) {
+    // The other half of the contract: a reader who has scrolled back up to
+    // re-read something must be left exactly where they are, however much the
+    // streaming reply grows.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let seq = seed_streaming_tall_space(&view, window, cx);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Scroll away from the tail (all the way back to the top).
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+    let before = view.read_with(&vcx, |v, _| v.scroll_min_y_for_test());
+
+    space.update(&mut vcx, |s, cx| {
+        s.push_content_delta_for_test(seq, &"streamed answer line\n".repeat(60), cx)
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.scroll_min_y_for_test() < before - 1.0,
+            "the streamed reply must grow the document (else this proves nothing)"
+        );
+        assert!(
+            v.page_scroll_offset_y_for_test().abs() < 2.0,
+            "a reader who scrolled away is never yanked to the tail (offset {})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
 #[gpui::test]
 fn space_edit_commits_and_escape_restores(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
