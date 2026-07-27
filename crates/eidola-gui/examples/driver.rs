@@ -316,6 +316,49 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_thinking",
+                description: "Space view: the thinking disclosure in all three states — a finished post whose persisted `thinking` block is collapsed, one already expanded, and a live streaming turn still saying \"Thinking…\"",
+                default_size: size(px(860.), px(760.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(thinking_posts(), cx);
+                        // The finished reply at index 3 opens its disclosure, so
+                        // one screenshot carries the collapsed and expanded
+                        // states side by side — both reading their *persisted*
+                        // thinking block, not a live buffer.
+                        s.toggle_message_reasoning(3, cx);
+                        // …and a live turn, still producing.
+                        s.push_streaming_turn_for_test(
+                            None,
+                            Some("a4".into()),
+                            eidola_gui::space::StreamingResponse {
+                                reasoning: "Weighing whether to bring up Rayleigh scattering \
+                                            again or start from the geometry…"
+                                    .into(),
+                                content: "The short answer is that the same scattering that \
+                                          makes the sky blue"
+                                    .into(),
+                                expanded: false,
+                                error: None,
+                            },
+                            cx,
+                        );
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_branches",
                 description: "Space view: a branched post tree with docked tail drafts (kitchen-sink fixture)",
                 default_size: size(px(900.), px(700.)),
@@ -879,6 +922,82 @@ mod driver {
                 credits: 20_000_000,
             },
         ]
+    }
+
+    /// A linear conversation whose two assistant replies each carry a persisted
+    /// `thinking` content block — what a *reopened* space looks like now that
+    /// reasoning is durable (it used to come back with no disclosure at all).
+    fn thinking_posts() -> Vec<eidola_app_core::PostNode> {
+        let mut posts = Vec::new();
+        let mut push = |action_id: &str,
+                        kind: &str,
+                        label: &str,
+                        atype: &str,
+                        parent: Option<&str>,
+                        thinking: Option<&str>,
+                        text: &str| {
+            let mut n = fixtures::fixture_post(action_id, kind, label, atype, text, 0, false, 1);
+            n.parent_action_id = parent.map(String::from);
+            n.relation = parent.map(|_| "reply".to_string());
+            if let Some(t) = thinking {
+                n.blocks.insert(
+                    0,
+                    eidola_app_core::PostBlock {
+                        id: format!("cb-think-{action_id}"),
+                        block_type: "thinking".into(),
+                        text: Some(t.into()),
+                        tool_name: None,
+                        tool_call_id: None,
+                        data: None,
+                    },
+                );
+            }
+            posts.push(n);
+        };
+        push(
+            "a1",
+            "human",
+            "user",
+            "user_input",
+            None,
+            None,
+            "Why is the sky blue?",
+        );
+        push(
+            "a2",
+            "agent",
+            "kimi-k2",
+            "inference",
+            Some("a1"),
+            Some(
+                "The user wants the physical mechanism, not a metaphor. Rayleigh scattering, \
+                 then the 1/λ⁴ dependence, then why we don't see violet.",
+            ),
+            "Sunlight is a fairly even mix across the visible spectrum. As it crosses the \
+             atmosphere it meets molecules far smaller than its wavelength, and those \
+             scatter short (blue) wavelengths far more strongly than long (red) ones.",
+        );
+        push(
+            "a3",
+            "human",
+            "user",
+            "user_input",
+            Some("a2"),
+            None,
+            "And at sunset?",
+        );
+        push(
+            "a4",
+            "agent",
+            "kimi-k2",
+            "inference",
+            Some("a3"),
+            Some("Same mechanism, longer path."),
+            "Near sunset the light skims a long, slanted path through the air, the blue is \
+             scattered away entirely, and what survives to reach you is the warm red-orange \
+             of a low sun.",
+        );
+        posts
     }
 
     fn conversation() -> Vec<SpaceMessage> {

@@ -513,8 +513,16 @@ async fn handle_chat(
 
     match config.chat {
         ChatBehavior::OkBlocking | ChatBehavior::OkBlockingNoInlineRefund => {
+            // `reasoning_content` mirrors the SSE stream's `delta.reasoning`:
+            // the blocking path recovers the model's thinking from the
+            // aggregated `message` object, so both transports persist a
+            // `thinking` block symmetrically.
             let mut body = serde_json::json!({
-                "choices": [{ "message": { "role": "assistant", "content": "Hello from the mock." } }],
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "Hello from the mock.",
+                    "reasoning_content": "thinking…",
+                } }],
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if matches!(config.chat, ChatBehavior::OkBlocking)

@@ -3796,6 +3796,74 @@ fn space_streaming_tail_does_not_yank_a_reader_who_scrolled_away(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn space_persisted_thinking_block_renders_the_disclosure(cx: &mut TestAppContext) {
+    // Reasoning is durable: an inference's `thinking` content block comes back
+    // from the post tree, so a *reloaded* space shows the disclosure without
+    // any live stream having run in this process. The thinking text must stay
+    // out of the reading column (it's a disclosure, not prose) and out of the
+    // quotable block spans.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut reply = fixture_user_post("a2", "The answer.");
+    reply.parent_action_id = Some("a1".into());
+    reply.action_type = "inference".into();
+    reply.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "gemma4-31b".into(),
+    };
+    // The persisted pair, in the order `persist_turn` writes them.
+    reply.blocks = vec![
+        PostBlock {
+            id: "cb-think".into(),
+            block_type: "thinking".into(),
+            text: Some("chain of thought".into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        },
+        PostBlock {
+            id: "cb-text".into(),
+            block_type: "text".into(),
+            text: Some("The answer.".into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        },
+    ];
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the question"), reply], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.post_reasoning_for_test(1),
+            Some(("chain of thought".to_string(), false)),
+            "a persisted thinking block feeds the disclosure on reload"
+        );
+    });
+    space.read_with(cx, |s, _| {
+        let reply = &s.messages()[1];
+        assert_eq!(
+            reply.message.content, "The answer.",
+            "the reading column carries only the text blocks"
+        );
+        assert_eq!(
+            reply.blocks.len(),
+            1,
+            "only text blocks are quotable; got {:?}",
+            reply.blocks
+        );
+        assert_eq!(reply.blocks[0].block_id, "cb-text");
+    });
+}
+
+#[gpui::test]
 fn space_edit_commits_and_escape_restores(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, Some("s".into()));

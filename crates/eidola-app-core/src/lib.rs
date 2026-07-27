@@ -3796,13 +3796,26 @@ impl Inner {
             .and_then(|u| u.get("completion_tokens"))
             .and_then(|v| v.as_i64());
 
-        let response_content = body
+        let message = body
             .get("choices")
             .and_then(|c| c.as_array())
             .and_then(|arr| arr.first())
-            .and_then(|c| c.get("message"))
+            .and_then(|c| c.get("message"));
+
+        let response_content = message
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // The blocking twin of the streaming path's reasoning capture: the
+        // same two non-standard spellings, on the aggregated `message` object
+        // rather than the per-chunk `delta`. Both are provider extensions, so
+        // this is tolerant by construction — a provider that emits neither
+        // simply persists no `thinking` block, exactly as before.
+        let response_reasoning = ["reasoning_content", "reasoning"]
+            .iter()
+            .find_map(|k| message.and_then(|m| m.get(*k)).and_then(|v| v.as_str()))
             .unwrap_or("")
             .to_string();
 
@@ -3815,6 +3828,7 @@ impl Inner {
                 },
                 input_tokens,
                 output_tokens,
+                &response_reasoning,
                 &response_content,
                 &request_body_json,
                 request_at,
@@ -4142,6 +4156,7 @@ impl Inner {
                 "complete",
                 input_tokens,
                 output_tokens,
+                &full_reasoning,
                 &full_content,
                 &request_body_json,
                 request_at,
@@ -5999,15 +6014,25 @@ impl TurnPrep {
 
     /// Persist the turn's durable rows — the inference action (per the attach
     /// plan, with its reply edge), the context-assembly record (exactly the
-    /// actions fed upstream), the response content block, and the request row
+    /// actions fed upstream), the response content blocks, and the request row
     /// — and return the inference action id. Emissions stay with the caller
     /// (they differ per exit point; see the table in `tests/bus.rs`).
+    ///
+    /// `reasoning` is the model's own "thinking" output, when the upstream
+    /// emitted any (streaming `delta.reasoning_content` / `delta.reasoning`,
+    /// or the blocking response's `message.reasoning_content` / `.reasoning`).
+    /// It is written as a `thinking` content block **before** the `text` block
+    /// — so the disclosure survives a reload instead of dying with the
+    /// process — and is deliberately excluded from every context query
+    /// (`db::get_upstream_context` / `db::get_space_actions_for_context` join
+    /// only `text` blocks), so persisting it never changes what a model reads.
     #[allow(clippy::too_many_arguments)]
     async fn persist_turn(
         &self,
         action_status: &str,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
+        reasoning: &str,
         content: &str,
         request_body_json: &serde_json::Value,
         request_at: i64,
@@ -6071,12 +6096,28 @@ impl TurnPrep {
             .await?;
         }
 
+        // Content blocks, in reading order: the reasoning disclosure first
+        // (ordinal 0 when present), then the answer. Ordinals stay dense, so a
+        // turn with no reasoning writes exactly what it always did.
+        let mut ordinal: i64 = 0;
+        if !reasoning.is_empty() {
+            db::insert_text_content_block(
+                &self.db_conn,
+                &Uuid::now_v7().to_string(),
+                &inference_action_id,
+                ordinal,
+                "thinking",
+                reasoning,
+            )
+            .await?;
+            ordinal += 1;
+        }
         if !content.is_empty() {
             db::insert_text_content_block(
                 &self.db_conn,
                 &Uuid::now_v7().to_string(),
                 &inference_action_id,
-                0,
+                ordinal,
                 "text",
                 content,
             )
