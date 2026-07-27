@@ -2713,6 +2713,66 @@ fn space_reply_branches_at_target_and_clears_on_submit(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+fn space_post_in_a_new_branch_stays_on_that_branch(cx: &mut TestAppContext) {
+    // Reply on a post that already has a committed reply → a fork draft on a
+    // *second* branch, which `pending_select` brings onto the selected path.
+    // Posting it must keep that branch selected. It used to snap back to the
+    // first branch: the draft was consumed a moment before its post existed,
+    // leaving the parent's strip with a single page, whose scroll offset gpui
+    // then clamped to 0 — and the reload landed on the (now) first branch.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // a1 (root) with one committed reply a2 — so a1's band offers Reply.
+    let mut a2 = fixture_assistant_post("a2", "the first branch");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the root post"), a2], cx)
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    // Fork a new branch off a1 and post into it.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a1".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the fork draft is the active composer");
+    editor.update(&mut vcx, |e, cx| e.set_value("a second branch", cx));
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| focus.dispatch_action(&Send, window, cx));
+    vcx.run_until_parked();
+
+    // The persist lands: a3 is a1's *second* child (the branch just posted
+    // into). The view must still be on it.
+    let mut a2b = fixture_assistant_post("a2", "the first branch");
+    a2b.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "a second branch");
+    a3.parent_action_id = Some("a1".into());
+    space.update(&mut vcx, |s, cx| {
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", "the root post"), a2b, a3], cx)
+    });
+    vcx.run_until_parked();
+
+    let leaf = vcx.update(|window, cx| view.read(cx).selected_leaf_for_test(window));
+    assert_eq!(
+        leaf.as_deref(),
+        Some("a3"),
+        "posting into a new branch stays on that branch, not the first one"
+    );
+}
+
+#[gpui::test]
 fn space_auto_tail_draft_at_each_leaf(cx: &mut TestAppContext) {
     // Every branch leaf gets an always-present, *docked* tail draft (the
     // composer that replaces the leaf "+"); non-leaves do not.

@@ -258,6 +258,27 @@ fn views_from_nodes(nodes: Vec<PostNode>) -> Vec<ChatMessageView> {
     nodes.into_iter().map(ChatMessageView::from_post).collect()
 }
 
+/// The optimistic user turn a save appends before its post is durable.
+///
+/// **It carries `reply_to` as its structural parent.** Without it the row is
+/// unparented, and `space_view::model::build_tree` chains an unparented row
+/// onto the previous row in the flat list — which is the *tail of the
+/// transcript*, not the post being replied to. Posting into a **branch** then
+/// momentarily emptied that branch of everything but its first sibling; gpui
+/// clamps the parent strip's scroll offset to the single remaining page, and
+/// the branch selection was gone by the time the reload restored the second
+/// child. Carrying the parent keeps the new post in the very slot the draft
+/// occupied, so the selected branch survives the save with no re-selection
+/// dance and no visible flash.
+fn optimistic_user_turn(prompt: &str, reply_to: Option<&str>) -> ChatMessageView {
+    let mut view = ChatMessageView::new(SpaceMessage {
+        role: "user".to_string(),
+        content: prompt.to_string(),
+    });
+    view.parent_action_id = reply_to.map(str::to_string);
+    view
+}
+
 /// Semantic events a `Space` emits. `cx.observe` covers plain re-render; these
 /// let a view react to *what* happened (tail-scroll only on `StreamDelta`, a
 /// failure band on `Failed`, etc.).
@@ -838,14 +859,13 @@ impl Space {
         // eagerly).
         self.supersede_load_for_mutation();
 
-        // Append the user's turn locally. This mutation is what a
-        // submit-vs-load race must not clobber; since the same entity owns the
-        // load, the guard drops the stale result.
+        // Append the user's turn locally, **under its reply antecedent** (see
+        // `optimistic_user_turn` — this is what keeps a branch reply on its own
+        // branch across the save). This mutation is what a submit-vs-load race
+        // must not clobber; since the same entity owns the load, the guard
+        // drops the stale result.
         let mut messages = self.transcript.value().cloned().unwrap_or_default();
-        messages.push(ChatMessageView::new(SpaceMessage {
-            role: "user".to_string(),
-            content: prompt.clone(),
-        }));
+        messages.push(optimistic_user_turn(&prompt, reply_to.as_deref()));
         self.transcript = Loadable::loaded(messages);
         cx.emit(SpaceEvent::MessagesChanged);
         cx.notify();
@@ -954,13 +974,10 @@ impl Space {
         self.last_submitted_references = references.clone();
         self.supersede_load_for_mutation();
 
-        // Optimistically append the user's turn (no streaming state — this path
-        // requests nothing).
+        // Optimistically append the user's turn under its reply antecedent (no
+        // streaming state — this path requests nothing).
         let mut messages = self.transcript.value().cloned().unwrap_or_default();
-        messages.push(ChatMessageView::new(SpaceMessage {
-            role: "user".to_string(),
-            content: prompt.clone(),
-        }));
+        messages.push(optimistic_user_turn(&prompt, reply_to.as_deref()));
         self.transcript = Loadable::loaded(messages);
         cx.emit(SpaceEvent::MessagesChanged);
         cx.notify();
