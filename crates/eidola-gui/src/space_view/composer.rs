@@ -547,32 +547,39 @@ impl SpaceView {
         self.composer_overlayed.set(overlayed);
 
         let full_h = (content + chrome).max(win);
-        let bar_h = if docked {
-            let denom = (float_top - self.doc_reserve()).max(1.0);
-            let progress = ((float_top - top_y) / denom).clamp(0.0, 1.0);
-            float_bar_h + progress * (full_h - float_bar_h)
-        } else {
-            float_bar_h
-        };
-        // Never extend past the window bottom: everything below it was
-        // invisible anyway, and ending exactly there keeps the bar's rounded
-        // bottom corners aligned with the window's (a bar clipped mid-body by
-        // the chrome frame would show square corners in the corner notches).
-        // Floating, `win - top_y == float_bar_h`, so this is an identity.
-        let bar_h = bar_h.min(win - top_y);
+        let bar_h = composer_bar_h(
+            float_bar_h,
+            full_h,
+            float_top,
+            top_y,
+            self.doc_reserve(),
+            docked,
+        );
         let body_h = (bar_h - chrome).max(0.0);
-        // The same containment at the *top*: when the draft's slot scrolls
-        // above the viewport, `top_y` goes negative and the docked bar covers
-        // the whole window — but a quad hanging above the window top shows
-        // its square mid-section in the top corner notches (its own corners
-        // are off-screen, so per-element rounding can't help). Split the
-        // visible quad from the virtual geometry: pin the quad's top at the
-        // window edge, hang the inner content at the virtual offset, and
-        // round the quad's top corners whenever it owns the window's top.
-        // For `top_y >= 0` all three are identities.
+        // **The visible quad is not the bar.** `bar_h` above is the composer's
+        // *virtual* geometry — the scroll viewport the ramp grows so a scrolled
+        // composer's internal offset eases to its top by the time it docks. The
+        // painted background quad is a separate, window-clipped rectangle:
+        //
+        // - at the **top**, when the draft's slot scrolls above the viewport
+        //   `top_y` goes negative and a quad hanging above the window top shows
+        //   its square mid-section in the corner notches (its own corners are
+        //   off-screen, so per-element rounding can't help) — pin the quad's
+        //   top at the window edge, hang the inner content at the virtual
+        //   offset, and round the quad's top corners when it owns that edge;
+        // - at the **bottom**, end the quad exactly at the window edge so its
+        //   rounded bottom corners align with the window's (a quad clipped
+        //   mid-body by the chrome frame would show square corners there).
+        //
+        // Clamping `bar_h` itself instead — which is what this used to do —
+        // pinned the scroll viewport to the *visible* height, so `scroll_max`
+        // never reached zero and a docked composer stayed scrolled off its own
+        // top by `doc_reserve + rail`, cut off at the bottom by the same
+        // amount. For a floating composer all of this is an identity
+        // (`win - top_y == float_bar_h`, `content_shift == 0`).
         let bar_top = top_y.max(0.0);
         let content_shift = top_y - bar_top; // ≤ 0: inner content overhang
-        let quad_h = bar_h + content_shift;
+        let quad_h = (bar_h + content_shift).min(win - bar_top).max(0.0);
         let covers_top = bar_top <= 0.5;
         // The composer scrolls internally only when floating *and* its content
         // exceeds the visible bar — i.e. it's capped at `COMPOSER_MAX_FRACTION`.
@@ -958,6 +965,38 @@ fn record_height(
     .size_full()
 }
 
+/// The composer bar's **virtual** height: `float_bar_h` while floating, and,
+/// once docked, a ramp from there up to `full_h` (the whole content, at least a
+/// window) as the slot rises from the float line toward the document's top
+/// reserve.
+///
+/// This is the *dock ramp*, and its point is the composer's internal scroll:
+/// `body_h = bar_h − chrome` is the scroll viewport, so as the bar grows
+/// `scroll_max = content − body_h` shrinks and gpui clamps the frozen internal
+/// offset toward zero — a scrolled floating composer glides to its own top and
+/// lands there exactly as it docks, instead of snapping. Reaching `full_h`
+/// is what makes `scroll_max` actually reach **zero**; anything that clamps
+/// this to the *visible* height (the window bottom, say) leaves a permanent
+/// residual offset and the composer docks scrolled off its own top and cut off
+/// at the bottom. Window clipping belongs to the painted quad, not here.
+///
+/// Pure so the ramp is testable without a render.
+fn composer_bar_h(
+    float_bar_h: f32,
+    full_h: f32,
+    float_top: f32,
+    top_y: f32,
+    doc_reserve: f32,
+    docked: bool,
+) -> f32 {
+    if !docked {
+        return float_bar_h;
+    }
+    let denom = (float_top - doc_reserve).max(1.0);
+    let progress = ((float_top - top_y) / denom).clamp(0.0, 1.0);
+    float_bar_h + progress * (full_h - float_bar_h)
+}
+
 /// Breathing room kept between the caret and the composer viewport edge when
 /// scrolling it into view, so the caret never lands flush against the fold.
 const CARET_SCROLL_MARGIN: f32 = 8.0;
@@ -1319,9 +1358,65 @@ fn compact_draft_references(
 
 #[cfg(test)]
 mod tests {
-    use super::{CARET_SCROLL_MARGIN, caret_scroll_offset};
+    use super::{CARET_SCROLL_MARGIN, caret_scroll_offset, composer_bar_h};
 
     const M: f32 = CARET_SCROLL_MARGIN;
+
+    /// The dock ramp must reach the composer's **whole** content height, so
+    /// the internal scroll it eases lands at exactly zero. Regression for the
+    /// `bar_h.min(win − top_y)` clamp that pinned the scroll viewport to the
+    /// visible bar: the ramp then stalled a `doc_reserve`-plus-rail short of
+    /// the content, and a docked composer stayed scrolled off its own top by
+    /// that much (and clipped at the bottom by the same).
+    #[test]
+    fn dock_ramp_reaches_the_full_content_height() {
+        // A 760-tall window; the composer's content is taller than the window,
+        // so `full_h` is the content and the bar must ramp all the way to it.
+        let (win, chrome, doc_reserve): (f32, f32, f32) = (760.0, 20.0, 36.0);
+        let content: f32 = 1400.0;
+        let full_h = (content + chrome).max(win);
+        let float_bar_h = (content + chrome).min(0.5 * win);
+        let float_top = win - float_bar_h;
+
+        // Floating: the ramp is the identity.
+        assert_eq!(
+            composer_bar_h(
+                float_bar_h,
+                full_h,
+                float_top,
+                float_top,
+                doc_reserve,
+                false
+            ),
+            float_bar_h
+        );
+
+        // Docked at its resting position — the slot top comes to rest at the
+        // document's top reserve, where progress is 1.
+        let bar_h = composer_bar_h(
+            float_bar_h,
+            full_h,
+            float_top,
+            doc_reserve,
+            doc_reserve,
+            true,
+        );
+        assert!((bar_h - full_h).abs() < 0.01, "bar_h={bar_h}");
+        // …which leaves the scroll viewport at least as tall as the content:
+        // nothing left to scroll, so the eased offset clamps to the top.
+        let body_h = bar_h - chrome;
+        assert!(body_h >= content, "body_h={body_h} content={content}");
+        // The ramp is monotone and starts at the floating height.
+        let mid = composer_bar_h(
+            float_bar_h,
+            full_h,
+            float_top,
+            (float_top + doc_reserve) / 2.0,
+            doc_reserve,
+            true,
+        );
+        assert!(mid > float_bar_h && mid < full_h, "mid={mid}");
+    }
 
     #[test]
     fn caret_already_visible_is_a_noop() {
