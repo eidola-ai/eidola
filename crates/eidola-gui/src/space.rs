@@ -115,10 +115,13 @@ pub struct PostBlockSpan {
 /// [`Self::new`], which derives the byline from the role and leaves the ids
 /// `None`.
 ///
-/// Reasoning is ephemeral session state — the local DB stores only the
-/// assistant's final content — so older posts from a re-loaded space carry
-/// `reasoning = None`. New assistant posts adopt whatever reasoning was
-/// captured for their action id at finalize.
+/// Reasoning is **durable**: an inference's captured thinking is persisted as
+/// a `thinking` content block beside its `text` block, so a re-loaded space
+/// still shows the disclosure. [`Self::from_post`] splits the two — `text`
+/// blocks are the readable body (and the only quotable ones), the `thinking`
+/// block is the disclosure. The in-flight capture on `StreamingResponse` is
+/// still attached at finalize so the disclosure never blinks out in the frame
+/// between the stream ending and the reload landing.
 #[derive(Clone)]
 pub struct ChatMessageView {
     pub message: SpaceMessage,
@@ -184,8 +187,12 @@ impl ChatMessageView {
     }
 
     /// A row from the persisted post tree: the body is the post's concatenated
-    /// text blocks, the byline is its participant identity, and the post ids
-    /// are carried for hover wiring.
+    /// **text** blocks, the byline is its participant identity, and the post
+    /// ids are carried for hover wiring. A `thinking` block (the model's own
+    /// reasoning, persisted by `TurnPrep::persist_turn`) is lifted out of the
+    /// body into [`Self::reasoning`] — it is a disclosure, not prose: it must
+    /// not join the reading column, and it must not be quotable (the block
+    /// spans that back a selection→quote carry only text blocks).
     pub fn from_post(node: PostNode) -> Self {
         let role = match node.action_type.as_str() {
             "user_input" => "user",
@@ -195,17 +202,27 @@ impl ChatMessageView {
         }
         .to_string();
         // Concatenate the text blocks, recording each block's span within the
-        // joined content (the selection→quote mapping).
+        // joined content (the selection→quote mapping); collect the thinking
+        // blocks separately as the disclosure.
         let mut content = String::new();
         let mut blocks = Vec::new();
+        let mut reasoning = String::new();
         for b in &node.blocks {
-            if let Some(text) = b.text.as_deref() {
-                let start = content.len();
-                content.push_str(text);
-                blocks.push(PostBlockSpan {
-                    block_id: b.id.clone(),
-                    range: start..content.len(),
-                });
+            let Some(text) = b.text.as_deref() else {
+                continue;
+            };
+            match b.block_type.as_str() {
+                "text" => {
+                    let start = content.len();
+                    content.push_str(text);
+                    blocks.push(PostBlockSpan {
+                        block_id: b.id.clone(),
+                        range: start..content.len(),
+                    });
+                }
+                "thinking" => reasoning.push_str(text),
+                // Other typed blocks (tool_use/…) have no v1 render.
+                _ => {}
             }
         }
         let byline = byline_for_participant(&node.participant.kind, &node.participant.label);
@@ -222,7 +239,7 @@ impl ChatMessageView {
             generation_count: node.generation_count,
             references: node.references,
             blocks,
-            reasoning: None,
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
             reasoning_expanded: false,
         }
     }
@@ -685,15 +702,21 @@ impl Space {
         true
     }
 
-    /// Merge a fresh post-tree render list into the transcript, preserving any
-    /// previously-attached reasoning by index (we only ever append, so
-    /// positions are stable) and attaching just-captured streaming reasoning
-    /// to its finalized post. `new_reasoning` is `(action_id, reasoning)` —
-    /// attached to the row with that action id (the turn's persisted
-    /// response), falling back to the last assistant entry when the id is
-    /// unknown. The incoming rows carry the byline + post ids from the tree;
-    /// only the ephemeral reasoning state is carried forward from the prior
-    /// snapshot.
+    /// Merge a fresh post-tree render list into the transcript, carrying the
+    /// **disclosure state** forward by index (we only ever append, so positions
+    /// are stable) and attaching just-captured streaming reasoning to its
+    /// finalized post. `new_reasoning` is `(action_id, reasoning)` — attached
+    /// to the row with that action id (the turn's persisted response), falling
+    /// back to the last assistant entry when the id is unknown.
+    ///
+    /// The reasoning **text** now comes from the DB (a persisted `thinking`
+    /// block), so the prior snapshot is only a *fallback* for it: it fills a
+    /// row whose reasoning the tree didn't carry (the frame between a stream
+    /// ending and its reload landing, or a build whose upstream emitted no
+    /// thinking). It must never overwrite what the tree supplied — that would
+    /// blank a reloaded space's disclosure with a stale `None`. `expanded`, by
+    /// contrast, is pure view state and is always carried forward, so a reload
+    /// doesn't collapse an open disclosure under the reader.
     fn merge_from_db(
         &mut self,
         mut next: Vec<ChatMessageView>,
@@ -706,7 +729,9 @@ impl Space {
                 p.message.role == entry.message.role && p.message.content == entry.message.content
             });
             if same_position {
-                entry.reasoning = prior_entry.and_then(|p| p.reasoning.clone());
+                if entry.reasoning.is_none() {
+                    entry.reasoning = prior_entry.and_then(|p| p.reasoning.clone());
+                }
                 entry.reasoning_expanded = prior_entry.is_some_and(|p| p.reasoning_expanded);
             }
         }

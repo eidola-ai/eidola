@@ -161,10 +161,13 @@ impl SpaceView {
     }
 
     /// A finalized post's reading column: an optional reasoning disclosure
-    /// (the streaming "Thinking…" pattern, preserved after finalize —
-    /// reasoning is ephemeral, re-attached by position on reload) above the
-    /// prose body. The body renders read-only, or **editable in place** while
-    /// this post is the active edit session.
+    /// above the prose body. The reasoning is **durable** (a persisted
+    /// `thinking` content block), so the disclosure is present whenever
+    /// thinking exists — on a freshly-finalized turn *and* on a space reopened
+    /// weeks later. Its label reads "Show thinking" / "Hide thinking" here:
+    /// the stream is over, so "Thinking…" would be a lie (that state belongs
+    /// to [`Self::render_streaming_body`]). The body renders read-only, or
+    /// **editable in place** while this post is the active edit session.
     fn render_post_body(
         &self,
         i: usize,
@@ -178,35 +181,20 @@ impl SpaceView {
 
         let mut col = v_flex().w(bw).gap_2();
         if let Some(reasoning) = post.reasoning.clone() {
-            let label = if post.reasoning_expanded {
-                "Hide thinking"
-            } else {
-                "Thinking…"
-            };
+            let (label, aria) = thinking_labels(false, post.reasoning_expanded);
             col = col.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "space-post-reasoning-{}",
-                        node.id
-                    )))
-                    .probe(
-                        format!("space/post/{i}/reasoning"),
-                        gpui::Role::Button,
-                        if post.reasoning_expanded {
-                            "Hide thinking"
-                        } else {
-                            "Show thinking"
-                        },
-                    )
-                    .aria_expanded(post.reasoning_expanded)
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .cursor_pointer()
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.space
-                            .update(cx, |s, cx| s.toggle_message_reasoning(i, cx));
-                    })),
+                verb_button(
+                    SharedString::from(format!("space-post-reasoning-{}", node.id)),
+                    format!("space/post/{i}/reasoning"),
+                    label,
+                    aria,
+                    cx,
+                )
+                .aria_expanded(post.reasoning_expanded)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.space
+                        .update(cx, |s, cx| s.toggle_message_reasoning(i, cx));
+                })),
             );
             if post.reasoning_expanded {
                 col = col.child(
@@ -260,22 +248,10 @@ impl SpaceView {
             return col;
         }
 
-        let theme = cx.theme();
-        let fg = theme.muted_foreground;
-        let fg_hover = theme.foreground;
-        let bg_hover = theme.muted;
+        // The shared quiet-verb look (see `verb_button`) — the same family the
+        // reading column's thinking disclosure uses.
         let verb = |id: SharedString, probe: String, label: &'static str, aria: SharedString| {
-            h_flex()
-                .id(id)
-                .probe(probe, gpui::Role::Button, aria)
-                .px_1()
-                .ml_neg_1()
-                .rounded_md()
-                .cursor_pointer()
-                .text_sm()
-                .text_color(fg)
-                .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
-                .child(label)
+            verb_button(id, probe, label, aria, cx)
         };
 
         if self.editing.as_ref().map(|e| &e.node_id) == Some(&node.id) {
@@ -600,32 +576,20 @@ impl SpaceView {
 
         let mut col = v_flex().w(bw).gap_2();
         if !streaming.reasoning.is_empty() {
-            let label = if streaming.expanded {
-                "Hide thinking"
-            } else {
-                "Thinking…"
-            };
+            let (label, aria) = thinking_labels(true, streaming.expanded);
             col = col.child(
-                div()
-                    .id(SharedString::from(format!("space-reasoning-toggle-{seq}")))
-                    .probe(
-                        format!("space/reasoning/toggle/{seq}"),
-                        gpui::Role::Button,
-                        if streaming.expanded {
-                            "Hide thinking"
-                        } else {
-                            "Show thinking"
-                        },
-                    )
-                    .aria_expanded(streaming.expanded)
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .cursor_pointer()
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.space
-                            .update(cx, |s, cx| s.toggle_streaming_reasoning(seq, cx));
-                    })),
+                verb_button(
+                    SharedString::from(format!("space-reasoning-toggle-{seq}")),
+                    format!("space/reasoning/toggle/{seq}"),
+                    label,
+                    aria,
+                    cx,
+                )
+                .aria_expanded(streaming.expanded)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.space
+                        .update(cx, |s, cx| s.toggle_streaming_reasoning(seq, cx));
+                })),
             );
             if streaming.expanded {
                 col = col.child(
@@ -885,6 +849,60 @@ pub(crate) const DRAFT_BYLINE_OPACITY: f32 = 0.85;
 /// that keeps the reading column centered.
 pub(crate) fn action_gutter() -> gpui::Div {
     v_flex().w(GUTTER_WIDTH).flex_none().items_start().pt_4()
+}
+
+/// A **quiet verb** — the shared look of every per-post affordance: small,
+/// muted at rest, lifting to full foreground on a `muted` chip when hovered,
+/// hung a hair left (`ml_neg_1` cancels its own `px_1`) so its text aligns with
+/// the column it sits in.
+///
+/// `self_start` is load-bearing for the reading-column host: a `v_flex`
+/// stretches its children across the cross axis, which blew the hover chip out
+/// to the full 600px measure — a wash behind the word "Show thinking" rather
+/// than a chip on it. (The action gutter already sets `items_start`, so this is
+/// a no-op there; carrying it on the verb makes the look independent of what
+/// the host happens to do.)
+///
+/// Shared so the verbs can't drift: the action gutter's Edit / Regenerate /
+/// Save / Cancel and the reading column's thinking disclosure are one visual
+/// family, which is exactly what the disclosure previously wasn't (it was bare
+/// muted text with no hover, reading as a caption rather than a control).
+pub(crate) fn verb_button(
+    id: impl Into<SharedString>,
+    probe: String,
+    label: impl Into<SharedString>,
+    aria: impl Into<SharedString>,
+    cx: &gpui::App,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = cx.theme();
+    let fg = theme.muted_foreground;
+    let fg_hover = theme.foreground;
+    let bg_hover = theme.muted;
+    h_flex()
+        .id(id.into())
+        .probe(probe, gpui::Role::Button, aria.into())
+        .self_start()
+        .px_1()
+        .ml_neg_1()
+        .rounded_md()
+        .cursor_pointer()
+        .text_sm()
+        .text_color(fg)
+        .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
+        .child(label.into())
+}
+
+/// The thinking disclosure's label + accessible name, for the three states the
+/// control has: **live** (reasoning still arriving — "Thinking…", the state
+/// that says *something is happening*), **collapsed** (finished, hidden), and
+/// **expanded**. The accessible name always says what the click *does*, even
+/// while the visible label narrates the stream.
+pub(crate) fn thinking_labels(streaming: bool, expanded: bool) -> (&'static str, &'static str) {
+    match (streaming, expanded) {
+        (_, true) => ("Hide thinking", "Hide thinking"),
+        (true, false) => ("Thinking…", "Show thinking"),
+        (false, false) => ("Show thinking", "Show thinking"),
+    }
 }
 
 /// The right-aligned byline gutter column that sits beside a reading column:

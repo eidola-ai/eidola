@@ -311,6 +311,144 @@ fn streaming_chat_delivers_deltas_and_persists() {
     });
 }
 
+/// A streamed `ReasoningDelta` is **persisted** as a `thinking` content block
+/// on the inference, ahead of its `text` block — so reopening a space still
+/// shows the thinking disclosure instead of losing it with the process.
+/// It must **not** leak into the readable transcript or the upstream context:
+/// both context queries join only `text` blocks.
+#[test]
+fn streamed_reasoning_persists_as_a_thinking_block() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let res = core.runtime().block_on(async {
+            let drainer = async { while events_rx.recv().await.is_some() {} };
+            let chat = core.chat_stream("stream me".into(), MODEL.into(), None, tx);
+            let (res, ()) = tokio::join!(chat, drainer);
+            res
+        });
+        let res = res.expect("stream should complete");
+
+        // Read it back the way the GUI does — through the post tree.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id.clone()))
+            .expect("space tree");
+        let inference = tree
+            .iter()
+            .find(|n| n.action_type == "inference")
+            .expect("the persisted response");
+
+        let kinds: Vec<&str> = inference
+            .blocks
+            .iter()
+            .map(|b| b.block_type.as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["thinking", "text"],
+            "thinking is persisted before the answer"
+        );
+        assert_eq!(inference.blocks[0].text.as_deref(), Some("thinking…"));
+        assert_eq!(
+            inference.blocks[1].text.as_deref(),
+            Some("Hello from the stream.")
+        );
+
+        // The flat transcript (and therefore the upstream context, which shares
+        // the text-only block filter) sees the answer, never the thinking.
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(res.space_id))
+            .expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "Hello from the stream.");
+    });
+}
+
+/// The blocking transport recovers reasoning from the aggregated
+/// `message.reasoning_content` and persists it identically — the two
+/// transports must not disagree about what a reopened space shows.
+#[test]
+fn blocking_reasoning_persists_as_a_thinking_block() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+
+        let res = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id))
+            .expect("space tree");
+        let inference = tree
+            .iter()
+            .find(|n| n.action_type == "inference")
+            .expect("the persisted response");
+        let kinds: Vec<&str> = inference
+            .blocks
+            .iter()
+            .map(|b| b.block_type.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["thinking", "text"]);
+        assert_eq!(inference.blocks[0].text.as_deref(), Some("thinking…"));
+    });
+}
+
+/// A persisted `thinking` block never reaches the model: the next turn's
+/// upstream context carries the prior answer's text and nothing else.
+#[test]
+fn persisted_thinking_is_not_sent_upstream() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, mut rx1) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let first = core.runtime().block_on(async {
+            let drainer = async { while rx1.recv().await.is_some() {} };
+            let chat = core.chat_stream("first".into(), MODEL.into(), None, tx);
+            let (res, ()) = tokio::join!(chat, drainer);
+            res
+        });
+        let space_id = first.expect("first turn").space_id;
+
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let second = core.runtime().block_on(async {
+            let drainer = async { while rx2.recv().await.is_some() {} };
+            let chat = core.chat_stream("second".into(), MODEL.into(), Some(space_id.clone()), tx2);
+            let (res, ()) = tokio::join!(chat, drainer);
+            res
+        });
+        second.expect("second turn");
+
+        let body = mock
+            .chat_bodies()
+            .last()
+            .cloned()
+            .expect("the second turn's request body");
+        let text = body.to_string();
+        assert!(
+            text.contains("Hello from the stream."),
+            "the prior answer is in context: {text}"
+        );
+        assert!(
+            !text.contains("thinking…"),
+            "the prior turn's thinking must never be replayed upstream: {text}"
+        );
+    });
+}
+
 // ===========================================================================
 // Auto-provisioning (wave-1 debt)
 // ===========================================================================
