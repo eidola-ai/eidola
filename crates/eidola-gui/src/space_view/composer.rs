@@ -504,11 +504,15 @@ impl SpaceView {
         };
         let editor = draft.editor.clone();
         let draft_id = draft.id.clone();
-        // Height the pending-reference rail claims from the composer bar (see
-        // `references::rail_height`) — subtracted from the editor's runway
-        // floor below so the two share the bar instead of the rail hanging
-        // below the fold.
-        let draft_rail_h = super::references::rail_height(draft.references.len());
+        // Height the pending-reference rail claims from the composer bar — the
+        // distance between the two flow marks that bracketed it last frame,
+        // not a row-count formula. It is subtracted from the editor's runway
+        // floor below so the two share the bar, and folded into the bar's
+        // natural height by `record_height`, so the rail is part of what the
+        // composer sizes itself to rather than something hanging below the
+        // fold.
+        let draft_rail_h =
+            (self.composer_rail_bottom.get() - self.composer_rail_top.get()).max(0.0);
         let theme = cx.theme();
         let bw = px(body_width(page_width));
 
@@ -671,12 +675,25 @@ impl SpaceView {
             )
             // The draft's pending quotes, as footnotes — the same rail a
             // posted exchange carries, right where it will be once posted.
-            .children(self.render_draft_footnotes(&draft_id, cx))
-            // Measure the editor's *natural* text height (decoupled from the
-            // `min_height` floor) and fold in the half-pad breath, so the bar
-            // sizes to the content without a feedback loop against its own floor.
+            // The draft's pending quotes, as footnotes, bracketed by the two
+            // zero-height flow marks that measure exactly how much room they
+            // take (see `references::flow_mark`). With no rail the marks
+            // coincide and the reservation is zero — no special case.
+            .child(super::references::flow_mark(self.composer_rail_top.clone()))
+            .children(self.render_draft_footnotes(&draft_id, true, cx))
+            .child(super::references::flow_mark(
+                self.composer_rail_bottom.clone(),
+            ))
+            // Measure the composer body's *natural* content height — the
+            // editor's own laid-out text (decoupled from the `min_height`
+            // floor, so growing the editor to fill the runway doesn't feed
+            // back into the height that sizes it) plus the rail's measured
+            // occupancy plus the half-pad breath. Both terms come from real
+            // rendering, so the bar reserves exactly what the body draws.
             .child(record_height(
                 self.composer_content_h.clone(),
+                self.composer_rail_top.clone(),
+                self.composer_rail_bottom.clone(),
                 editor.downgrade(),
                 cx.entity().downgrade(),
                 half_pad,
@@ -888,13 +905,19 @@ use crate::probe::Probe as _;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Record the composer's natural content height (the editor's laid-out text
-/// height, `extra` folded in for the bottom breath) into `cell`, scheduling a
+/// Record the composer body's natural content height into `cell`, scheduling a
 /// catch-up frame when it changes so the bar resizes as the content settles.
-/// Reads the editor's `content_height` in the **paint** phase (a later sibling,
-/// so the editor's blocks have painted and updated their bounds this frame) —
-/// this is decoupled from the editor's own `min_height`, so growing the editor
-/// to fill the runway doesn't feed back into the height that sizes the runway.
+///
+/// The height is the sum of what the body actually draws: the editor's own
+/// laid-out text (`content_height`, read in the **paint** phase — a later
+/// sibling, so the editor's blocks have painted and updated their bounds this
+/// frame — and decoupled from the editor's `min_height`, so growing the editor
+/// to fill the runway doesn't feed back into the height that sizes the runway),
+/// the footnote rail's measured height (`rail`, written by the rail's own
+/// probe, which paints earlier in this same frame — see
+/// [`references::measure_rail`](super::references)), and `extra` for the bottom
+/// breath. Nothing here is derived from a row count or a styling constant, so
+/// the reservation cannot drift from the rendering.
 ///
 /// **Pinned to the origin** (`top_0().left_0()`): it's a zero-visual measuring
 /// probe, but as an `absolute` child with no inset taffy places it at its
@@ -906,6 +929,8 @@ use std::rc::Rc;
 /// nothing to the scrollable content.
 fn record_height(
     cell: Rc<RefCell<gpui::Pixels>>,
+    rail_top: Rc<std::cell::Cell<f32>>,
+    rail_bottom: Rc<std::cell::Cell<f32>>,
     editor: gpui::WeakEntity<MarkdownEditorState>,
     view: gpui::WeakEntity<SpaceView>,
     extra: f32,
@@ -916,7 +941,8 @@ fn record_height(
             let Some(editor) = editor.upgrade() else {
                 return;
             };
-            let h = editor.read(cx).content_height().as_f32() + extra;
+            let rail = (rail_bottom.get() - rail_top.get()).max(0.0);
+            let h = editor.read(cx).content_height().as_f32() + rail + extra;
             if (cell.borrow().as_f32() - h).abs() > 0.5 {
                 *cell.borrow_mut() = gpui::px(h);
                 let view = view.clone();

@@ -137,23 +137,30 @@ pub(crate) enum FootnoteBody {
     Backlink,
 }
 
-/// Vertical space one footnote row occupies, and the rail's own chrome (the
-/// hairline rule plus the padding above and below it). Rows are single-line by
-/// construction — the passage is truncated, never wrapped — so the rail's
-/// height is exact, not estimated, which is what lets the active composer
-/// reserve room for it out of its own bar rather than letting it hang below
-/// the fold. Keep in step with `rail_frame`/`footnote_row`'s styling.
-const RAIL_ROW_H: f32 = 18.0;
-const RAIL_CHROME_H: f32 = 14.0;
-
-/// Height of a rail carrying `rows` footnotes (`0` for none — no rail, no
-/// chrome).
-pub(crate) fn rail_height(rows: usize) -> f32 {
-    if rows == 0 {
-        0.0
-    } else {
-        RAIL_CHROME_H + rows as f32 * RAIL_ROW_H
-    }
+/// A zero-height, zero-visual **in-flow** probe that records its own flow
+/// position into `cell`.
+///
+/// Two of these, bracketing the composer's footnote rail, measure the rail's
+/// exact vertical occupancy — top margin, rule, padding and all — as the
+/// difference of two real painted positions. That is the honest answer to "how
+/// tall is the rail", and the reason the composer no longer carries a
+/// row-count formula that drifts the moment the rail's styling changes. It
+/// also degenerates correctly: with no rail rendered the two marks coincide
+/// and the height is zero.
+///
+/// Deliberately **not** an absolute `size_full` child of the rail (the
+/// `record_height` idiom): that resolves against the parent's *padding* box,
+/// silently dropping the rail's margin and rule — a quiet under-count of the
+/// same kind this replaces.
+pub(crate) fn flow_mark(cell: std::rc::Rc<std::cell::Cell<f32>>) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| {},
+        move |bounds: gpui::Bounds<gpui::Pixels>, _, _, _| {
+            cell.set(bounds.origin.y.as_f32());
+        },
+    )
+    .w_full()
+    .h_0()
 }
 
 /// Drop a post's **recognized** embed blocks from a text preview, leaving its
@@ -676,9 +683,15 @@ impl SpaceView {
 
     /// The rail under a **draft**: its pending references, each with a remove
     /// affordance (dropping the row also drops its marker).
+    ///
+    /// `measure` records the rail's painted height into
+    /// [`SpaceView::composer_rail_h`] — set only for the *active* draft, whose
+    /// bar has to reserve room for it; an inactive draft's rail rides its
+    /// post-shaped frame and needs no reservation.
     pub(crate) fn render_draft_footnotes(
         &self,
         draft_id: &SharedString,
+        measure: bool,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let draft = self.drafts.iter().find(|d| &d.id == draft_id)?;
@@ -689,6 +702,14 @@ impl SpaceView {
         refs.sort_by_key(|r| r.ordinal);
 
         let mut rail = self.rail_frame(cx);
+        if measure {
+            // The active composer's rail is the last thing in the bar, so it
+            // carries the bar's bottom breath — the mirror of the `half_pad`
+            // chrome above the byline. Keeping it *inside* the measured rail
+            // (rather than folding it in as a separate term) is what stops the
+            // last footnote row sitting flush against the window edge.
+            rail = rail.pb(px(super::POST_PAD_Y.as_f32() / 2.0));
+        }
         for (idx, r) in refs.iter().enumerate() {
             let row = FootnoteRow {
                 index: idx + 1,
@@ -698,36 +719,35 @@ impl SpaceView {
                 antecedent_action_id: r.spec.antecedent_action_id.clone(),
             };
             let ordinal = r.ordinal;
+            let el = self.footnote_row(
+                format!("space-draft-fn-{}-{}", draft.id, ordinal),
+                format!("space/draft/footnote/{}", row.index),
+                &row,
+                false,
+                cx,
+            );
             let draft_id = draft_id.clone();
-            let el = self
-                .footnote_row(
-                    format!("space-draft-fn-{}-{}", draft.id, ordinal),
-                    format!("space/draft/footnote/{}", row.index),
-                    &row,
-                    false,
-                    cx,
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "space-draft-fn-rm-{}-{}",
-                            draft.id, ordinal
-                        )))
-                        .probe(
-                            format!("space/draft/footnote/{}/remove", row.index),
-                            gpui::Role::Button,
-                            "Remove this quote",
-                        )
-                        .flex_none()
-                        .px_1()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .cursor_pointer()
-                        .child("×")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.remove_draft_reference(&draft_id, ordinal, cx);
-                        })),
-                );
+            let el = el.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "space-draft-fn-rm-{}-{}",
+                        draft.id, ordinal
+                    )))
+                    .probe(
+                        format!("space/draft/footnote/{}/remove", row.index),
+                        gpui::Role::Button,
+                        "Remove this quote",
+                    )
+                    .flex_none()
+                    .px_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .cursor_pointer()
+                    .child("×")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_draft_reference(&draft_id, ordinal, cx);
+                    })),
+            );
             rail = rail.child(el);
         }
         Some(rail.into_any_element())
