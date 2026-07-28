@@ -3873,6 +3873,102 @@ fn space_streaming_tail_does_not_yank_a_reader_who_scrolled_away(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn space_streaming_tail_ignores_a_sibling_branchs_stream(cx: &mut TestAppContext) {
+    // Tail-following is scoped to the branch the reader is on. A fan-out can
+    // stream on a *sibling* branch, and while it does, the selected branch's
+    // own document still grows for the ordinary non-stream reasons the design
+    // deliberately excludes (its composer's runway, a post measuring for the
+    // first time, a post arriving from another window). None of those is a
+    // producing tail, so none of them may move the reader — even though some
+    // turn, somewhere in the space, is streaming.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    // a1 forks: a2 is the (selected) first branch, a3 the second.
+    let branch = |aid: &str| {
+        let mut p = fixture_assistant_post(aid, &long);
+        p.parent_action_id = Some("a1".into());
+        p
+    };
+    let seq = cx
+        .update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.set_post_tree_for_test(
+                    vec![fixture_user_post("a1", &long), branch("a2"), branch("a3")],
+                    cx,
+                );
+                // The turn streams on the *other* branch.
+                s.push_streaming_turn_for_test(
+                    Some("agent-b".into()),
+                    Some("a3".into()),
+                    Default::default(),
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // The reader is on the first branch (the default active page) and parked at
+    // its end.
+    let leaf = vcx.update(|window, cx| view.read(cx).selected_leaf_for_test(window));
+    assert_eq!(
+        leaf.as_deref(),
+        Some("a2"),
+        "the reader is on the first branch — the one *not* streaming"
+    );
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+    let (parked, before) = view.read_with(&vcx, |v, _| {
+        (v.page_scroll_offset_y_for_test(), v.scroll_min_y_for_test())
+    });
+    assert!(
+        before < -1.0,
+        "the selected branch must overflow the window (scroll_min_y {before})"
+    );
+
+    // The sibling's stream keeps producing — it must be irrelevant here.
+    space.update(&mut vcx, |s, cx| {
+        s.push_content_delta_for_test(seq, &"streamed answer line\n".repeat(60), cx)
+    });
+    // …while the *selected* branch grows for a non-stream reason: a post lands
+    // on it (another window's write, or this one's own reload).
+    space.update(&mut vcx, |s, cx| {
+        let mut a4 = fixture_user_post("a4", &long);
+        a4.parent_action_id = Some("a2".into());
+        s.set_post_tree_for_test(
+            vec![
+                fixture_user_post("a1", &long),
+                branch("a2"),
+                branch("a3"),
+                a4,
+            ],
+            cx,
+        )
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let after = v.scroll_min_y_for_test();
+        assert!(
+            after < before - 1.0,
+            "the selected branch's document must have grown ({before} -> {after})"
+        );
+        assert!(
+            (v.page_scroll_offset_y_for_test() - parked).abs() < 2.0,
+            "a stream on a sibling branch must not make the selected branch's \
+             own growth follow the reader (offset {} should still be {parked})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
 fn space_persisted_thinking_block_renders_the_disclosure(cx: &mut TestAppContext) {
     // Reasoning is durable: an inference's `thinking` content block comes back
     // from the post tree, so a *reloaded* space shows the disclosure without
