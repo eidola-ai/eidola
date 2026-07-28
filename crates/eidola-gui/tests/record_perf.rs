@@ -291,9 +291,12 @@ mod perf {
             Modifiers::default(),
         );
         cx.run_until_parked();
-        // The selection is computed during paint, so it needs a frame.
+        // The selection is computed during paint, so it needs a frame. gpui
+        // requires the element arena to be cleared before the next draw, and
+        // `draw` hands back the token that owes it — so clear it here rather
+        // than dropping it (see `measure` for the same contract).
         cx.update_window(handle, |_, window, cx| {
-            let _clear = window.draw(cx);
+            window.draw(cx).clear();
         })
         .ok();
 
@@ -391,8 +394,15 @@ mod perf {
             let t = cx
                 .update_window(handle, |_, window, cx| {
                     let start = Instant::now();
-                    let _clear = window.draw(cx);
-                    start.elapsed().as_secs_f64() * 1000.0
+                    let clear = window.draw(cx);
+                    // Stop the clock *before* clearing: the arena teardown is
+                    // gpui's per-frame bookkeeping, not the frame cost we are
+                    // reporting. But clear it — the token is `#[must_use]`
+                    // because gpui requires the arena empty before the next
+                    // draw, so each measured frame starts from the same state.
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    clear.clear();
+                    elapsed
                 })
                 .expect("draw");
             times.push(t);
