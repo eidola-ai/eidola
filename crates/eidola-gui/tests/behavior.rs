@@ -2773,6 +2773,83 @@ fn space_post_in_a_new_branch_stays_on_that_branch(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_draft_rethreads_onto_an_edited_parents_current_tip(cx: &mut TestAppContext) {
+    // A draft can outlive an edit of the very post it replies to — another
+    // window on the same space commits a new generation, and the shared
+    // entity's reloaded transcript then carries only that item's **current
+    // tip**. The draft still names the superseded action, which is in no
+    // current post, so the reply antecedent was silently dropped: the post
+    // landed at the space tail (durably!) instead of beside its sibling on the
+    // parent's branch. Reply threading follows *item* identity — so a draft
+    // whose parent was superseded must rethread onto that item's tip.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // a1 (root) with one committed reply a2 — so a1's band offers Reply.
+    let mut a2 = fixture_assistant_post("a2", "the first branch");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the root post"), a2], cx)
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    // Fork a new branch off a1 and type into it (an unsent, non-empty draft).
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a1".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the fork draft is the active composer");
+    editor.update(&mut vcx, |e, cx| e.set_value("a second branch", cx));
+    vcx.run_until_parked();
+
+    // Another window edits a1 while this draft is open: a new generation
+    // (`a1b`, same item) supersedes it and every reply rethreads under the tip.
+    let mut a1b = fixture_user_post("a1b", "the root post, edited");
+    a1b.item_id = "item-a1".into();
+    a1b.generation = 1;
+    a1b.generation_count = 2;
+    let mut a2b = fixture_assistant_post("a2", "the first branch");
+    a2b.parent_action_id = Some("a1b".into());
+    space.update(&mut vcx, |s, cx| {
+        s.set_post_tree_for_test(vec![a1b, a2b], cx)
+    });
+    vcx.run_until_parked();
+
+    // Post the draft.
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| focus.dispatch_action(&Send, window, cx));
+    vcx.run_until_parked();
+
+    // The optimistic row's parent is the antecedent `Space::submit` received —
+    // and therefore the one the durable post links to. It must be the item's
+    // current tip, not `None` (the space tail) and not the superseded id.
+    let parent = space.read_with(&vcx, |s, _| {
+        s.messages()
+            .last()
+            .expect("the optimistic user turn was appended")
+            .parent_action_id
+            .clone()
+    });
+    assert_eq!(
+        parent.as_deref(),
+        Some("a1b"),
+        "a draft whose parent was edited elsewhere replies to that item's \
+         current tip (got {parent:?})"
+    );
+}
+
+#[gpui::test]
 fn space_auto_tail_draft_at_each_leaf(cx: &mut TestAppContext) {
     // Every branch leaf gets an always-present, *docked* tail draft (the
     // composer that replaces the leaf "+"); non-leaves do not.

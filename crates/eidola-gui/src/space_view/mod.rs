@@ -1024,9 +1024,9 @@ impl SpaceView {
 
     /// Rebuild the per-row render snapshot from the shared `Space`'s transcript.
     /// Called on every space change (cheap `SharedString` projection) and at
-    /// construction. Drafts are local UI state and are left untouched (an
-    /// orphaned draft whose parent vanished re-attaches as a root in
-    /// [`Self::effective_tree`]).
+    /// construction. Drafts are local UI state, but their reply antecedent is a
+    /// reference *into* the transcript, so it is rethreaded here — see
+    /// [`Self::rethread_drafts`].
     pub(crate) fn rebuild(&mut self, cx: &mut Context<Self>) {
         let messages: Vec<crate::space::ChatMessageView> = self.space.read(cx).messages().to_vec();
         let posts: Vec<PostData> = messages
@@ -1045,7 +1045,71 @@ impl SpaceView {
                 post_data_from(m, byline, byline_backend)
             })
             .collect();
+        self.rethread_drafts(&posts);
         self.posts = posts;
+    }
+
+    /// Carry every draft's reply antecedent across a generation change of the
+    /// post it replies to.
+    ///
+    /// **Reply threading follows item identity** (workspace `AGENTS.md`: an
+    /// action id is causality, an item id is the intended logical flow) — but a
+    /// draft names its parent by *action* id, because that is the node id the
+    /// tree renders. When that generation is superseded — an edit committed
+    /// from another window on the same shared `Space`, or this window's own
+    /// Edit session, which *keeps* a non-empty fork draft — the reloaded
+    /// transcript carries only the item's new tip, and the draft's parent names
+    /// a post that is no longer there. Everything downstream then quietly
+    /// mis-threads: [`Self::effective_tree`] re-attaches the draft as its own
+    /// root, and `send_active_draft` (which only passes a parent it can find
+    /// among the current posts) drops the antecedent entirely — so the post
+    /// landed **durably** at the space tail instead of beside its sibling on
+    /// the parent's branch.
+    ///
+    /// The cure is to keep the draft pointing at the *item*: resolve the
+    /// vanished action id through the outgoing snapshot to its item, then
+    /// forward it to that item's current tip in the incoming one. Only drafts
+    /// whose parent actually vanished are touched (the common case does no
+    /// work), and an id that resolves to nothing is left alone — an honestly
+    /// orphaned draft, exactly as before.
+    fn rethread_drafts(&mut self, next: &[PostData]) {
+        if self.drafts.is_empty() {
+            return;
+        }
+        let live: HashSet<&str> = next.iter().filter_map(|p| p.action_id.as_deref()).collect();
+        let stale: Vec<SharedString> = self
+            .drafts
+            .iter()
+            .filter_map(|d| d.parent.clone())
+            .filter(|p| !live.contains(p.as_ref()))
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        for parent in stale {
+            // The superseded generation's item, from the snapshot it was last
+            // seen in, then that item's current tip in the fresh one.
+            let Some(item) = self
+                .posts
+                .iter()
+                .find(|p| p.action_id.as_deref() == Some(parent.as_ref()))
+                .and_then(|p| p.item_id.clone())
+            else {
+                continue;
+            };
+            let Some(tip) = next
+                .iter()
+                .find(|p| p.item_id.as_deref() == Some(item.as_ref()))
+                .and_then(|p| p.action_id.clone())
+            else {
+                continue;
+            };
+            for draft in &mut self.drafts {
+                if draft.parent.as_deref() == Some(parent.as_ref()) {
+                    draft.parent = Some(tip.clone());
+                }
+            }
+        }
     }
 
     /// Split a model selection id into its human display pair: the model's
@@ -1384,6 +1448,7 @@ fn post_data_from(
 ) -> PostData {
     PostData {
         action_id: m.action_id.clone().map(SharedString::from),
+        item_id: m.item_id.clone().map(SharedString::from),
         parent_action_id: m.parent_action_id.clone().map(SharedString::from),
         role: m.message.role.clone().into(),
         byline,
