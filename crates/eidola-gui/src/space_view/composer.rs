@@ -694,16 +694,18 @@ impl SpaceView {
             // Measure the composer body's *natural* content height — the
             // editor's own laid-out text (decoupled from the `min_height`
             // floor, so growing the editor to fill the runway doesn't feed
-            // back into the height that sizes it) plus the rail's measured
-            // occupancy plus the half-pad breath. Both terms come from real
-            // rendering, so the bar reserves exactly what the body draws.
+            // back into the height that sizes it) plus its tail: the rail's
+            // measured occupancy, or a bare breath when there is no rail. The
+            // rail carries the breath as its own padding, so the two are a
+            // `max`, never a sum — the bar reserves exactly what the body
+            // draws, in both rail states.
             .child(record_height(
                 self.composer_content_h.clone(),
                 self.composer_rail_top.clone(),
                 self.composer_rail_bottom.clone(),
                 editor.downgrade(),
                 cx.entity().downgrade(),
-                half_pad,
+                bottom_breath(),
             ))
             // Scroll the caret into view after an edit. Runs in the paint phase
             // (a later sibling than the editor, so this frame's post-edit
@@ -901,11 +903,45 @@ impl SpaceView {
 
         col
     }
+
+    /// The active composer's measured geometry: `(reserved, rail, text)` — the
+    /// natural content height the bar sizes itself to
+    /// ([`composer_content_h`](SpaceView::composer_content_h)), the footnote
+    /// rail's measured occupancy (the flow-mark span, `0.0` with no rail), and
+    /// the editor's own laid-out text height. `None` with no active draft.
+    ///
+    /// The invariant tests read off these three: `reserved == text + rail` with
+    /// a rail (which carries the bottom breath as its own padding) and
+    /// `reserved == text + bottom_breath()` without one — reserved is what the
+    /// body draws, and the breath is counted exactly once either way.
+    #[doc(hidden)]
+    pub fn composer_geometry_for_test(&self, cx: &gpui::App) -> Option<(f32, f32, f32)> {
+        let active = self.active_draft.as_ref()?;
+        let draft = self.drafts.iter().find(|d| &d.id == active)?;
+        let reserved = self.composer_content_h.borrow().as_f32();
+        let rail = (self.composer_rail_bottom.get() - self.composer_rail_top.get()).max(0.0);
+        let text = draft.editor.read(cx).content_height().as_f32();
+        Some((reserved, rail, text))
+    }
 }
 
 /// A small muted keyboard hint beside a verb (shown while ⌥ is held).
 fn kbd_hint(text: &'static str, color: gpui::Hsla) -> gpui::Div {
     div().text_xs().text_color(color).child(text)
+}
+
+/// The composer bar's **bottom breath** — the mirror of the `half_pad` chrome
+/// above the byline, so the last thing in the bar never sits flush against the
+/// window edge.
+///
+/// It is **drawn exactly once**, by whichever element ends the composer body:
+/// the footnote rail's own bottom padding when a rail is present (see
+/// [`SpaceView::render_draft_footnotes`](super::SpaceView::render_draft_footnotes)),
+/// and the editor's runway when it isn't — the editor's `min_height` fills the
+/// bar, so with no rail the breath is live, clickable notes space rather than a
+/// dead strip. One function, both call sites, so the two can't drift.
+pub fn bottom_breath() -> f32 {
+    POST_PAD_Y.as_f32() / 2.0
 }
 
 use crate::probe::Probe as _;
@@ -920,11 +956,22 @@ use std::rc::Rc;
 /// sibling, so the editor's blocks have painted and updated their bounds this
 /// frame — and decoupled from the editor's `min_height`, so growing the editor
 /// to fill the runway doesn't feed back into the height that sizes the runway),
-/// the footnote rail's measured height (`rail`, written by the rail's own
-/// probe, which paints earlier in this same frame — see
-/// [`references::measure_rail`](super::references)), and `extra` for the bottom
-/// breath. Nothing here is derived from a row count or a styling constant, so
-/// the reservation cannot drift from the rendering.
+/// plus the **tail** below that text: the footnote rail's measured height
+/// (`rail`, the distance between the two flow marks bracketing it — see
+/// [`references::flow_mark`](super::references::flow_mark)), or a bare `breath`
+/// when there is no rail.
+///
+/// **The tail is a `max`, not a sum, because the breath is drawn once.** A
+/// populated rail already carries it as its own bottom padding — inside the
+/// bracketed span — so adding [`bottom_breath`] on top would reserve it twice
+/// and inflate the bar by a pad-height (visible as a gap between the last line
+/// of text and the footnote rule, since the editor's `min_height` floor —
+/// `body_h − rail` — grows to swallow the surplus). With no rail the marks
+/// coincide, `max` degenerates to the breath, and the editor's runway draws it
+/// as live notes space. No branch on "is the rail empty", and either way the
+/// bar reserves exactly what the body draws. Nothing here is derived from a row
+/// count or a styling constant, so the reservation cannot drift from the
+/// rendering.
 ///
 /// **Pinned to the origin** (`top_0().left_0()`): it's a zero-visual measuring
 /// probe, but as an `absolute` child with no inset taffy places it at its
@@ -940,7 +987,7 @@ fn record_height(
     rail_bottom: Rc<std::cell::Cell<f32>>,
     editor: gpui::WeakEntity<MarkdownEditorState>,
     view: gpui::WeakEntity<SpaceView>,
-    extra: f32,
+    breath: f32,
 ) -> impl IntoElement {
     gpui::canvas(
         |_, _, _| {},
@@ -949,7 +996,7 @@ fn record_height(
                 return;
             };
             let rail = (rail_bottom.get() - rail_top.get()).max(0.0);
-            let h = editor.read(cx).content_height().as_f32() + rail + extra;
+            let h = editor.read(cx).content_height().as_f32() + rail.max(breath);
             if (cell.borrow().as_f32() - h).abs() > 0.5 {
                 *cell.borrow_mut() = gpui::px(h);
                 let view = view.clone();

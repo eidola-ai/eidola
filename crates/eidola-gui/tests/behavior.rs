@@ -6259,3 +6259,89 @@ fn space_quote_survives_the_round_trip_into_the_ask_path(cx: &mut TestAppContext
 
     drain_runtime(&core);
 }
+
+#[gpui::test]
+fn space_composer_counts_the_bottom_breath_once(cx: &mut TestAppContext) {
+    // The composer bar sizes itself to what its body draws — the editor's
+    // laid-out text plus the *tail* below it — and the bar's bottom breath is
+    // part of that tail exactly once.
+    //
+    // Which element draws the breath depends on what ends the body. With no
+    // rail it is the editor's own runway (its `min_height` fills the bar, so
+    // the breath is live notes space, not a dead strip). With a footnote rail
+    // it is the rail's own bottom padding — *inside* the span the two flow
+    // marks measure. Counting both (a measured rail whose padding is the
+    // breath, plus the breath again as a separate term) inflates the bar, and
+    // the whole floating/docking runway with it, by a pad-height: the editor's
+    // floor (`body_h − rail`) grows to swallow the surplus, opening a gap
+    // between the last line of text and the footnote rule.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let breath = eidola_gui::space_view::composer::bottom_breath();
+
+    // Phase 1 — no rail. The tail is the bare breath, drawn by the editor.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.seed_draft_quote_for_test(Some("a1"), "a plain reply", vec![], window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let (reserved, rail, text) = view
+        .read_with(cx, |v, cx| v.composer_geometry_for_test(cx))
+        .expect("the seeded draft is the active composer");
+    assert!(
+        rail.abs() < 0.5,
+        "no references, so the two flow marks coincide and the rail measures zero (was {rail})"
+    );
+    assert!(
+        (reserved - (text + breath)).abs() < 0.5,
+        "with no rail the bar reserves the editor's text plus one breath \
+         (reserved {reserved}, text {text}, breath {breath})"
+    );
+
+    // Phase 2 — a populated rail. The tail is the measured rail, which carries
+    // the breath as its own bottom padding.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.seed_draft_quote_for_test(
+                Some("a1"),
+                "a reply that quotes:\n\n{{ embed 1 }}\n\nand goes on",
+                vec![(1, "kimi-k2", "quick brown")],
+                window,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let (reserved, rail, text) = view
+        .read_with(cx, |v, cx| v.composer_geometry_for_test(cx))
+        .expect("the quoting draft is the active composer");
+    assert!(
+        rail > breath,
+        "the rail measures its rule, its row, and the breath it pads with \
+         (rail {rail}, breath {breath})"
+    );
+    assert!(
+        (reserved - (text + rail)).abs() < 0.5,
+        "with a rail the bar reserves the editor's text plus the rail's measured \
+         occupancy — the breath rides inside that span, so adding it again would \
+         reserve {breath}px the body never draws (reserved {reserved}, text {text}, \
+         rail {rail})"
+    );
+}
