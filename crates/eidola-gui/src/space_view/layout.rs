@@ -367,6 +367,30 @@ impl SpaceView {
             })
     }
 
+    /// Whether the **selected path** carries a live streaming overlay — the
+    /// honest scope for tail-following (`follow_streaming_tail`).
+    ///
+    /// "Is some turn streaming?" is a *space*-wide question, and Participants v1
+    /// makes concurrent turns on sibling branches ordinary: a fan-out streams
+    /// several replies at once, each attached at its own target post. The reader
+    /// is on exactly one branch, and only *that* branch's tail is producing for
+    /// them. Answering the space-wide question would let a sibling's stream
+    /// re-enable following for a selected branch whose own growth is the
+    /// composer's runway or a post measuring for the first time — precisely the
+    /// non-stream growth the design excludes (and which the composer's own
+    /// `caret_into_view` path owns). Like every other selection question here it
+    /// is answered by *observation* of the tree the frame actually renders — no
+    /// flag, no mode.
+    pub(crate) fn selected_path_is_streaming(
+        &self,
+        roots: &[TreeNode],
+        page_width: Pixels,
+    ) -> bool {
+        self.selected_levels(roots, page_width)
+            .into_iter()
+            .any(|(sibs, active)| matches!(sibs[active].src, NodeSrc::Streaming(_)))
+    }
+
     /// Document-space top of a node that is **on the selected path** (after
     /// `select_path_to`), by accumulating heights down the path. `None` if the
     /// node isn't on the selected path.

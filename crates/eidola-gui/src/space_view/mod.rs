@@ -1617,10 +1617,15 @@ impl Render for SpaceView {
             .scroll_min_y
             .replace((window_h.as_f32() - total_doc).min(0.0));
 
-        // **Follow the producing tail.** While a turn streams, the document
-        // grows with every delta; a reader parked at the end wants to stay
-        // there, and a reader who has scrolled away must never be yanked back.
-        self.follow_streaming_tail(streaming, prev_min_y);
+        // **Follow the producing tail.** While a turn streams *on the branch
+        // the reader is on*, the document grows with every delta; a reader
+        // parked at the end wants to stay there, and a reader who has scrolled
+        // away must never be yanked back. A sibling branch's stream is not this
+        // reader's tail (see `selected_path_is_streaming`).
+        self.follow_streaming_tail(
+            self.selected_path_is_streaming(&tree, page_width),
+            prev_min_y,
+        );
 
         // While a readonly post is being drag-selected, autoscroll the page when
         // the pointer sits against a viewport edge — so a selection can pull
@@ -1768,15 +1773,20 @@ impl SpaceView {
     /// scrolling back down re-enters it and following resumes. There is no
     /// "sticky" mode to get wedged.
     ///
-    /// Deliberately gated on `streaming`: a growing document is otherwise the
-    /// composer's runway or a post measuring for the first time, and neither
-    /// should move the reader. Composer growth keeps its own caret-into-view
-    /// path (`composer::caret_into_view`), which this must not race.
+    /// Deliberately gated on `producing` — **the selected path carries a live
+    /// stream** ([`Self::selected_path_is_streaming`]), not merely "some turn in
+    /// this space is streaming". A growing document is otherwise the composer's
+    /// runway or a post measuring for the first time, and neither should move
+    /// the reader; composer growth keeps its own caret-into-view path
+    /// (`composer::caret_into_view`), which this must not race. Scoping to the
+    /// space would have re-opened exactly that race whenever a fan-out streamed
+    /// on a *sibling* branch — a routine Participants-v1 state, and one in which
+    /// the reader's own branch is by definition not producing.
     ///
     /// Runs in `render` immediately after `scroll_min_y` is set for the frame,
     /// so every consumer of `clamped_scroll_y` sees the followed position.
-    fn follow_streaming_tail(&self, streaming: bool, prev_min_y: f32) {
-        if !streaming {
+    fn follow_streaming_tail(&self, producing: bool, prev_min_y: f32) {
+        if !producing {
             return;
         }
         let off = self.page_scroll.offset();
