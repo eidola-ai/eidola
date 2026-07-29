@@ -161,8 +161,8 @@ pub fn estimate_post_height(
 
 use super::model::{NodeSrc, TreeNode};
 use super::{
-    BAND_HEIGHT, BODY_MAX_WIDTH, COMPOSER_MAX_FRACTION, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y,
-    PROSE_FONT_SIZE, PROSE_LINE_HEIGHT, PROSE_PARAGRAPH_GAP, SpaceView, TITLE_BAR_RESERVE,
+    BAND_HEIGHT, BODY_MAX_WIDTH, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y, PROSE_FONT_SIZE,
+    PROSE_LINE_HEIGHT, PROSE_PARAGRAPH_GAP, SpaceView, TITLE_BAR_RESERVE,
 };
 use gpui::Pixels;
 
@@ -470,12 +470,32 @@ impl SpaceView {
         }
     }
 
+    /// The floating composer bar's height under the window's live sizing
+    /// state: the natural content height (`composer_chrome() + content`)
+    /// capped at `composer_fraction · window` (**Max**, the resting behavior),
+    /// or pinned to exactly that fraction regardless of content (**Exact**,
+    /// entered by the separator-handle resize drag). The one place the
+    /// window-local fraction meets geometry — the composer render, the
+    /// pre-dock glide, and the off-branch floating pad all read this, so they
+    /// can never disagree on the bar. Pure core:
+    /// [`super::composer::float_bar_height`], unit-tested.
+    pub(crate) fn composer_float_bar_h(&self, window_h: Pixels) -> f32 {
+        let natural = Self::composer_chrome() + self.composer_content_h.borrow().as_f32();
+        super::composer::float_bar_height(
+            natural,
+            self.composer_fraction,
+            window_h.as_f32(),
+            self.composer_sizing,
+        )
+    }
+
     /// Bottom padding the page needs so the selected branch's tail can scroll
     /// clear of a *floating, off-branch* active draft. On the draft's own branch
     /// its in-flow slot already reserves the room (it docks), so this is zero;
-    /// off-branch the floating bar (its content height, capped at half the
-    /// window) occludes the bottom, so pad by it. This is what lets the minimap
-    /// and the scroll range account for a foreign floating draft (item 4).
+    /// off-branch the floating bar occludes the bottom, so pad by its height
+    /// ([`Self::composer_float_bar_h`] — fraction- and sizing-aware). This is
+    /// what lets the minimap and the scroll range account for a foreign
+    /// floating draft (item 4).
     pub(crate) fn floating_pad(
         &self,
         roots: &[TreeNode],
@@ -488,9 +508,7 @@ impl SpaceView {
         if self.selected_leaf_id(roots, page_width).as_deref() == Some(active) {
             return 0.0; // on its own branch — docks, no extra room needed
         }
-        let win = window_h.as_f32();
-        let content = self.composer_content_h.borrow().as_f32();
-        (Self::composer_chrome() + content).min(COMPOSER_MAX_FRACTION * win)
+        self.composer_float_bar_h(window_h)
     }
 }
 

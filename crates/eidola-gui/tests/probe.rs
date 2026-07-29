@@ -306,6 +306,12 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
             .any(|n| n.starts_with("space/request-panel") || *n == "space/composer/model"),
         "the retired model picker must record no probes; recorded: {names:?}"
     );
+    // The floating composer's separator doubles as its resize handle (this
+    // scene's root draft floats off-path over the seeded branch).
+    assert!(
+        names.contains(&"space/composer/resize"),
+        "floating composer resize-handle probe missing; recorded: {names:?}"
+    );
     // The minimap is a navigable table of contents: a labelled Group of
     // per-node Buttons.
     assert!(
@@ -352,6 +358,12 @@ fn space_composer_alt_reveals_post_quiet_probe(cx: &mut TestAppContext) {
     assert!(
         names.contains(&"space/composer/post-quiet".to_string()),
         "⌥ must reveal Post quietly; recorded: {names:?}"
+    );
+    // This scene's blank-space composer is docked (page geometry, not a
+    // floating pane), so it offers no resize handle.
+    assert!(
+        !names.contains(&"space/composer/resize".to_string()),
+        "a docked composer must offer no resize handle; recorded: {names:?}"
     );
 
     probe::set_probes_enabled(false);

@@ -88,9 +88,15 @@ pub(crate) const BODY_MAX_WIDTH: Pixels = px(600.);
 pub(crate) const POST_PAD_Y: Pixels = px(40.);
 pub(crate) const BAND_HEIGHT: Pixels = px(48.);
 
-/// The composer grows with content up to this fraction of the window, then
-/// scrolls internally; near the bottom of a branch it *docks* and grows into
-/// the page.
+/// The **default** floating-composer fraction of the window height — every
+/// window opens with it, so the out-of-the-box behavior is unchanged. The live
+/// value is per-window state ([`SpaceView::composer_fraction`], a ratio so it
+/// survives window resizes), adjusted by dragging the floating bar's separator
+/// handle and applied per [`composer::ComposerSizing`]: as a *max* (the bar
+/// grows with content up to the fraction, then scrolls internally — the
+/// resting behavior) or *exact* (the bar is pinned to the fraction while
+/// floating — entered by the resize drag, reverted on deactivation). Near the
+/// bottom of a branch the composer *docks* and grows into the page either way.
 pub(crate) const COMPOSER_MAX_FRACTION: f32 = 0.5;
 
 /// Width of the topology minimap pinned to the right edge, and the gap between
@@ -394,6 +400,25 @@ pub struct SpaceView {
     /// Internal scroll of the floating composer overlay.
     pub(crate) composer_scroll: ScrollHandle,
     pub(crate) composer_prev_off_y: f32,
+    /// The floating composer's height as a **fraction of the window** —
+    /// window-local state (never persisted to the space, config, or shared
+    /// across windows), seeded with [`COMPOSER_MAX_FRACTION`] so every window
+    /// opens with the default. Written only by the separator-handle resize
+    /// drag; a ratio rather than pixels, so a window resize scales the bar
+    /// with it. Survives deactivation — only the *sizing mode* below reverts.
+    pub(crate) composer_fraction: f32,
+    /// How [`Self::composer_fraction`] applies to the floating bar: `Max`
+    /// (grow with content up to it — the resting behavior) or `Exact` (pinned
+    /// to it regardless of content — entered by the resize drag, so the bar
+    /// can exceed its content). Reverts to `Max` whenever the composer
+    /// deactivates or a different draft is selected
+    /// ([`Self::reset_composer_sizing`]).
+    pub(crate) composer_sizing: composer::ComposerSizing,
+    /// An in-flight separator-handle resize drag, if any (see
+    /// [`composer::ComposerResizeDrag`]). Tracked window-globally the way a
+    /// minimap drag is, so the drag keeps following after the cursor leaves
+    /// the thin strip.
+    pub(crate) composer_resize: Option<composer::ComposerResizeDrag>,
     /// The previous frame's dock-approach runway — how far the active draft's
     /// would-be dock top still had to travel to reach the float line, saturated
     /// at the approach zone (see [`composer::dock_runway`]). `None` when no
@@ -614,6 +639,9 @@ impl SpaceView {
             pending_select: None,
             composer_scroll: ScrollHandle::new(),
             composer_prev_off_y: 0.0,
+            composer_fraction: COMPOSER_MAX_FRACTION,
+            composer_sizing: composer::ComposerSizing::Max,
+            composer_resize: None,
             composer_dock_runway: None,
             composer_overlayed: Cell::new(false),
             composer_scrollable: Cell::new(false),
@@ -759,6 +787,56 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn page_scroll_offset_y_for_test(&self) -> f32 {
         self.page_scroll.offset().y.as_f32()
+    }
+
+    /// The window-local floating-composer fraction and whether the sizing mode
+    /// is pinned (`Exact`) — the resize-drag state machine's observables.
+    #[doc(hidden)]
+    pub fn composer_fraction_for_test(&self) -> f32 {
+        self.composer_fraction
+    }
+
+    #[doc(hidden)]
+    pub fn composer_sizing_is_exact_for_test(&self) -> bool {
+        self.composer_sizing == composer::ComposerSizing::Exact
+    }
+
+    /// The floating bar height the current window state yields for a
+    /// `window_h`-tall window — the same helper the render, the pre-dock
+    /// glide, and the floating pad read.
+    #[doc(hidden)]
+    pub fn composer_float_bar_h_for_test(&self, window_h: f32) -> f32 {
+        self.composer_float_bar_h(px(window_h))
+    }
+
+    /// Drive the separator-handle resize drag without synthesizing mouse
+    /// events (the Library-archive precedent: tests call the same methods the
+    /// element listeners route to). `begin` grabs the bar at its current
+    /// height, exactly as the strip's mousedown does.
+    #[doc(hidden)]
+    pub fn begin_composer_resize_for_test(
+        &mut self,
+        pointer_y: f32,
+        window_h: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let bar_h = self.composer_float_bar_h(px(window_h));
+        self.start_composer_resize(pointer_y, bar_h, window_h, cx);
+    }
+
+    #[doc(hidden)]
+    pub fn move_composer_resize_for_test(
+        &mut self,
+        pointer_y: f32,
+        window_h: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_composer_resize(pointer_y, window_h, cx);
+    }
+
+    #[doc(hidden)]
+    pub fn end_composer_resize_for_test(&mut self, cx: &mut Context<Self>) {
+        self.end_composer_resize(cx);
     }
 
     /// Scroll the whole page to the top. Tests use this to push an active tail
