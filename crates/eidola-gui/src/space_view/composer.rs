@@ -252,6 +252,7 @@ impl SpaceView {
         self.active_draft = Some(id);
         self.composer_scroll.set_offset(point(px(0.), px(0.)));
         self.composer_prev_off_y = 0.0;
+        self.composer_dock_runway = None;
         cx.notify();
     }
 
@@ -523,6 +524,75 @@ impl SpaceView {
         cx.notify();
     }
 
+    /// The pre-dock glide: ease a scrolled floating composer's internal offset
+    /// toward its top as the page approaches the dock threshold, so the content
+    /// sits at exactly its top the moment the composer docks — instead of
+    /// docking mid-scroll and unwinding afterwards.
+    ///
+    /// **Zone-gated.** The glide engages only while the dock threshold sits
+    /// *under* the floating bar: the draft's would-be dock top (`slot_top +
+    /// half_pad`, the same value the dock decision in
+    /// [`Self::render_active_draft`] compares against the float line) between
+    /// the float line and the window bottom — the last `float_bar_h` (at most
+    /// half a window) of page travel before docking. Outside that zone a page
+    /// scroll never moves the internal content ([`dock_runway`] saturates, so
+    /// consecutive frames read equal runways and step nothing).
+    ///
+    /// **Robust by form, not by bookkeeping.** Each step scales the offset by
+    /// the ratio of runway remaining ([`approach_glide_offset`]), and ratios
+    /// telescope: any monotone descent through the zone yields the same offset
+    /// at a given runway no matter where the scroll stopped and restarted, a
+    /// retreat (scrolling away from the dock) deliberately leaves the offset
+    /// alone — the glide never reverses — and a step that lands on (or jumps
+    /// past) the threshold multiplies by zero, so the offset is **exactly**
+    /// zero at dock by construction, with no accumulated error to correct. The
+    /// dock ramp ([`composer_bar_h`]) remains the geometric backstop: once
+    /// docked, the growing scroll viewport clamps out any residual offset from
+    /// a path this glide can't see (a mid-zone resize, a document reflow).
+    ///
+    /// Runs once per `render`, after the frame's page offset is final and
+    /// before the frozen-offset baseline (`composer_prev_off_y`) is taken — so
+    /// every page-scroll source drives it (wheel anywhere in the window,
+    /// minimap drag, tail-follow, programmatic docks like [`Self::go_home`]),
+    /// not just wheel events over the bar, and the wheel handler's
+    /// frozen-offset restore can never undo an eased step.
+    pub(crate) fn glide_composer_toward_dock(
+        &mut self,
+        roots: &[TreeNode],
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+    ) {
+        // Only an active draft on its own branch ever docks; anything else
+        // resets the tracking so a stale runway can't seed a bogus first step
+        // when the composer next lands on-path.
+        let on_path = match self.active_draft.as_ref() {
+            Some(active) => self.selected_leaf_id(roots, page_width).as_ref() == Some(active),
+            None => false,
+        };
+        if !on_path {
+            self.composer_dock_runway = None;
+            return;
+        }
+
+        let win = window_h.as_f32();
+        let content = self.composer_content_h.borrow().as_f32();
+        let float_bar_h = (Self::composer_chrome() + content).min(COMPOSER_MAX_FRACTION * win);
+        let float_top = win - float_bar_h;
+        let half_pad = POST_PAD_Y.as_f32() / 2.0;
+        let dock_top = self.placeholder_doc_top(roots, page_width, window_h)
+            + self.clamped_scroll_y()
+            + half_pad;
+        let runway = dock_runway(dock_top, float_top, win);
+        if let Some(prev) = self.composer_dock_runway {
+            let off = self.composer_scroll.offset();
+            let eased = approach_glide_offset(off.y.as_f32(), prev, runway);
+            if (eased - off.y.as_f32()).abs() > 0.01 {
+                self.composer_scroll.set_offset(point(off.x, px(eased)));
+            }
+        }
+        self.composer_dock_runway = Some(runway);
+    }
+
     // -- The floating composer ---------------------------------------------
 
     /// The active draft's editor, pinned over the bottom and styled like a post.
@@ -683,13 +753,15 @@ impl SpaceView {
             .w(bw)
             .h(px(body_h))
             // Scroll tracking stays on **unconditionally**, even when the composer
-            // owns no scroll session — this is what smooths the dock transition.
-            // As a scrolled floating composer docks, `bar_h` (and thus `body_h`,
-            // the scroll viewport) ramps up from the floating height toward the
-            // full content height, so gpui clamps the frozen internal offset toward
-            // 0: the scrolled content glides to the top and lands exactly there as
-            // it docks, instead of snapping. Keeping `track_scroll` off while
-            // docked (an earlier version) abandoned the offset and caused that snap.
+            // owns no scroll session — the dock transition depends on it. A
+            // scrolled floating composer's offset is walked to its top *before*
+            // docking by the pre-dock glide (`glide_composer_toward_dock`, run
+            // each render while the dock threshold is under the floating bar),
+            // and once docked, `bar_h` (and thus `body_h`, the scroll viewport)
+            // ramps up toward the full content height so gpui clamps any residual
+            // offset to 0 — the backstop for paths the glide can't see. Keeping
+            // `track_scroll` off while docked (an earlier version) abandoned the
+            // offset the instant the composer docked and snapped the content.
             // A fit-height composer can't scroll regardless (`scroll_max == 0` once
             // the measuring canvas is pinned — see `record_height`), so always-on
             // reintroduces no phantom scroll.
@@ -706,8 +778,9 @@ impl SpaceView {
                 // The composer *owns* the wheel (internal scroll, page locked out)
                 // only when floating with real overflow; otherwise the page does —
                 // so a floating fit-height composer scrolls the conversation
-                // underneath (letting it dock), and a docked composer lets the page
-                // scroll while its frozen offset ramps to the top (above).
+                // underneath (letting it dock), and a scrolled composer nearing
+                // its dock lets the page scroll while the pre-dock glide walks
+                // its frozen offset to the top (`glide_composer_toward_dock`).
                 let owner = *this
                     .scroll_owner
                     .get_or_insert(if this.composer_scrollable.get() {
@@ -1122,11 +1195,14 @@ fn record_height(
 /// window) as the slot rises from the float line toward the document's top
 /// reserve.
 ///
-/// This is the *dock ramp*, and its point is the composer's internal scroll:
+/// This is the *dock ramp*. It gives the docked composer its real geometry —
 /// `body_h = bar_h − chrome` is the scroll viewport, so as the bar grows
-/// `scroll_max = content − body_h` shrinks and gpui clamps the frozen internal
-/// offset toward zero — a scrolled floating composer glides to its own top and
-/// lands there exactly as it docks, instead of snapping. Reaching `full_h`
+/// `scroll_max = content − body_h` shrinks to zero and the whole content is
+/// laid out in flow — and it is the **backstop** for the internal scroll: a
+/// scrolled floating composer's offset is normally walked to its top *before*
+/// docking (the pre-dock glide, [`SpaceView::glide_composer_toward_dock`]),
+/// but any residual the glide couldn't see (a mid-zone resize, a document
+/// reflow) is clamped out here as the viewport grows. Reaching `full_h`
 /// is what makes `scroll_max` actually reach **zero**; anything that clamps
 /// this to the *visible* height (the window bottom, say) leaves a permanent
 /// residual offset and the composer docks scrolled off its own top and cut off
@@ -1147,6 +1223,39 @@ fn composer_bar_h(
     let denom = (float_top - doc_reserve).max(1.0);
     let progress = ((float_top - top_y) / denom).clamp(0.0, 1.0);
     float_bar_h + progress * (full_h - float_bar_h)
+}
+
+/// The dock-approach runway: how much page travel remains before the floating
+/// composer docks, saturated at the **approach zone**. `dock_top` is where the
+/// bar's top would sit if it docked to its slot this frame (`slot_top +
+/// half_pad`, window coordinates), `float_top` the float line (the floating
+/// bar's top), `win` the window bottom. The zone is `[float_top, win]` — the
+/// dock threshold sitting under the floating bar — so the runway saturates at
+/// the bar's height (`win − float_top`): any page position at or below the
+/// zone reads as a full runway, which is what gates the glide to the zone
+/// (equal saturated runways step nothing in [`approach_glide_offset`]).
+/// Pure so the zone gating is unit-testable without a render.
+fn dock_runway(dock_top: f32, float_top: f32, win: f32) -> f32 {
+    (dock_top - float_top).clamp(0.0, (win - float_top).max(0.0))
+}
+
+/// One step of the pre-dock glide: scale the composer's internal scroll `off`
+/// (`<= 0`) by the fraction of dock runway remaining — `r_prev` last frame's
+/// runway, `r_now` this frame's (both from [`dock_runway`]). Steps only on a
+/// *descent* (`r_now < r_prev`); stasis and retreat return `off` unchanged
+/// (the glide never reverses — scrolling away from the dock leaves the
+/// composer's content where the reader put it). Consecutive descents
+/// telescope (`off·(r₁/r₀)·(r₂/r₁) = off·(r₂/r₀)`), so the glide is
+/// path-independent over any monotone descent — stop, restart, or jump
+/// anywhere in the zone and the offset at a given runway is the same — and a
+/// step landing on (or past) the threshold multiplies by zero: exactly zero
+/// at dock, by construction rather than by accumulation. Pure and
+/// unit-tested.
+fn approach_glide_offset(off: f32, r_prev: f32, r_now: f32) -> f32 {
+    if off >= 0.0 || r_prev <= 0.0 || r_now >= r_prev {
+        return off;
+    }
+    off * (r_now / r_prev)
 }
 
 /// Breathing room kept between the caret and the composer viewport edge when
@@ -1510,9 +1619,97 @@ fn compact_draft_references(
 
 #[cfg(test)]
 mod tests {
-    use super::{CARET_SCROLL_MARGIN, caret_scroll_offset, composer_bar_h};
+    use super::{
+        CARET_SCROLL_MARGIN, approach_glide_offset, caret_scroll_offset, composer_bar_h,
+        dock_runway,
+    };
 
     const M: f32 = CARET_SCROLL_MARGIN;
+
+    // -- The pre-dock glide (`glide_composer_toward_dock`'s pure core) -------
+    //
+    // Scene for all glide tests: an 800-tall window with a 400-tall floating
+    // bar (the 50% cap), so the float line is at 400 and the approach zone is
+    // the 400px where the slot's dock top sits under the bar.
+    const WIN: f32 = 800.0;
+    const FLOAT_TOP: f32 = 400.0;
+
+    #[test]
+    fn glide_lands_exactly_zero_at_the_threshold() {
+        // A descent that reaches the threshold multiplies by zero — exact, not
+        // an accumulation that drifts.
+        let r0 = dock_runway(700.0, FLOAT_TOP, WIN); // mid-zone
+        let r1 = dock_runway(FLOAT_TOP, FLOAT_TOP, WIN); // at the threshold
+        assert_eq!(approach_glide_offset(-317.4, r0, r1), 0.0);
+        // …including a single step that jumps clean past it (one large wheel
+        // delta, a programmatic dock like go_home / scroll-to-tail).
+        let below = dock_runway(1500.0, FLOAT_TOP, WIN); // slot below the zone
+        let past = dock_runway(250.0, FLOAT_TOP, WIN); // docked, past the line
+        assert_eq!(approach_glide_offset(-1234.5, below, past), 0.0);
+    }
+
+    #[test]
+    fn glide_is_path_independent_over_any_monotone_descent() {
+        // Stopping and restarting anywhere must not change where the offset
+        // sits at a given runway: chained steps telescope to the direct step.
+        let stops = [780.0, 655.0, 610.5, 512.0, 431.0];
+        let mut off = -300.0;
+        let mut r_prev = dock_runway(stops[0], FLOAT_TOP, WIN);
+        for s in &stops[1..] {
+            let r = dock_runway(*s, FLOAT_TOP, WIN);
+            off = approach_glide_offset(off, r_prev, r);
+            r_prev = r;
+        }
+        let direct = approach_glide_offset(
+            -300.0,
+            dock_runway(stops[0], FLOAT_TOP, WIN),
+            dock_runway(431.0, FLOAT_TOP, WIN),
+        );
+        assert!(
+            (off - direct).abs() < 0.01,
+            "chained {off} vs direct {direct}"
+        );
+    }
+
+    #[test]
+    fn glide_ignores_retreat_and_still_lands_zero() {
+        // Scrolling away from the dock leaves the offset alone…
+        let r_mid = dock_runway(600.0, FLOAT_TOP, WIN);
+        let r_back = dock_runway(750.0, FLOAT_TOP, WIN);
+        assert_eq!(approach_glide_offset(-200.0, r_mid, r_back), -200.0);
+        // …and a later descent from the retreated position still reaches
+        // exactly zero at the threshold (scaled over the larger runway).
+        let part = approach_glide_offset(-200.0, r_back, r_mid);
+        assert!(part > -200.0 && part < 0.0, "part={part}");
+        assert_eq!(
+            approach_glide_offset(part, r_mid, dock_runway(FLOAT_TOP, FLOAT_TOP, WIN)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn glide_is_inert_outside_the_zone() {
+        // With the slot anywhere below the zone the runway saturates at the
+        // bar height, so consecutive frames read equal runways and a page
+        // scroll moves nothing — the composer's content only ever eases while
+        // the dock threshold is under the floating bar.
+        let deep = dock_runway(2000.0, FLOAT_TOP, WIN);
+        let nearer = dock_runway(900.0, FLOAT_TOP, WIN);
+        assert_eq!(deep, WIN - FLOAT_TOP);
+        assert_eq!(deep, nearer);
+        assert_eq!(approach_glide_offset(-500.0, deep, nearer), -500.0);
+    }
+
+    #[test]
+    fn glide_never_deepens_the_offset_and_noops_at_top() {
+        // An unscrolled composer stays unscrolled through the whole approach…
+        let r0 = dock_runway(790.0, FLOAT_TOP, WIN);
+        let r1 = dock_runway(500.0, FLOAT_TOP, WIN);
+        assert_eq!(approach_glide_offset(0.0, r0, r1), 0.0);
+        // …and a descent step can only move a scrolled offset toward zero.
+        let stepped = approach_glide_offset(-120.0, r0, r1);
+        assert!((-120.0..=0.0).contains(&stepped), "stepped={stepped}");
+    }
 
     /// The dock ramp must reach the composer's **whole** content height, so
     /// the internal scroll it eases lands at exactly zero. Regression for the
