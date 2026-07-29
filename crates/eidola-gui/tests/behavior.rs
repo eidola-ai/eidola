@@ -3969,6 +3969,113 @@ fn space_streaming_tail_ignores_a_sibling_branchs_stream(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn space_post_parks_the_reader_at_the_tail_and_holds_it_there(cx: &mut TestAppContext) {
+    // Posting from a reader parked anywhere (here: the top of a long space)
+    // must land them at the *end* of the branch the post joined — including the
+    // post itself, which the pre-post snapshot does not carry — and hold them
+    // there while the exchange settles, so tail-following picks up when the
+    // answer starts arriving.
+    //
+    // Both halves used to be missing. The scroll measured the document before
+    // the optimistic turn reached the view's snapshot (the `MessagesChanged`
+    // emission is delivered after the submit handler returns), leaving the page
+    // a post short of the end; and the growth between the save landing and the
+    // response's first delta — the persisted post re-keyed and re-measured —
+    // moved the end out from under the reader while nothing was streaming yet.
+    // Either one leaves `at_tail` false, and the answer then writes itself off
+    // the bottom of the window.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2], cx)
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // The reader is up at the top of the transcript when they post.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a2".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the draft is the active composer");
+    editor.update(&mut vcx, |e, cx| e.set_value("a new post", cx));
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| focus.dispatch_action(&Send, window, cx));
+    vcx.run_until_parked();
+
+    let (parked, end) = view.read_with(&vcx, |v, _| {
+        assert!(v.tail_pin_for_test(), "the post arms the tail pin");
+        (v.page_scroll_offset_y_for_test(), v.scroll_min_y_for_test())
+    });
+    assert!(
+        end < -1.0,
+        "the seeded branch must overflow the window (scroll_min_y {end})"
+    );
+    assert!(
+        (parked - end).abs() < 2.0,
+        "posting parks the reader at the end of the branch, post included \
+         (offset {parked} should be the document end {end})"
+    );
+
+    // Now the production gap the pin exists for: the save is in flight and
+    // nothing is streaming yet (the stub's synthetic turn stands in for the
+    // real one, which only starts once the post has persisted). Both steps run
+    // in one update so no frame observes a settled space and retires the pin.
+    let seq = view.read_with(&vcx, |v, cx| v.space().read(cx).streams()[0].seq);
+    space.update(&mut vcx, |s, cx| {
+        s.finish_streaming_turn_for_test(seq, cx);
+        s.arm_post_runner_for_test(cx);
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, cx| {
+        assert!(!v.space().read(cx).is_streaming(), "the save window");
+        assert!(v.tail_pin_for_test(), "the pin outlives the save window");
+    });
+
+    // The persisted transcript lands: the post comes back re-keyed (a fresh
+    // node id, so it re-measures from its estimate) and the document end moves.
+    let mut a2b = fixture_assistant_post("a2", &long);
+    a2b.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", &long);
+    a3.parent_action_id = Some("a2".into());
+    space.update(&mut vcx, |s, cx| {
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2b, a3], cx)
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let after = v.scroll_min_y_for_test();
+        assert!(
+            after < end - 1.0,
+            "the persisted post must have moved the document end ({end} -> {after})"
+        );
+        assert!(
+            (v.page_scroll_offset_y_for_test() - after).abs() < 2.0,
+            "the reader is held at the end across the save (offset {} should \
+             track the new end {after})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
 fn space_persisted_thinking_block_renders_the_disclosure(cx: &mut TestAppContext) {
     // Reasoning is durable: an inference's `thinking` content block comes back
     // from the post tree, so a *reloaded* space shows the disclosure without
