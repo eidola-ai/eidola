@@ -394,6 +394,15 @@ pub struct SpaceView {
     /// Internal scroll of the floating composer overlay.
     pub(crate) composer_scroll: ScrollHandle,
     pub(crate) composer_prev_off_y: f32,
+    /// The previous frame's dock-approach runway — how far the active draft's
+    /// would-be dock top still had to travel to reach the float line, saturated
+    /// at the approach zone (see [`composer::dock_runway`]). `None` when no
+    /// active on-path draft rendered last frame, so a stale runway can never
+    /// seed a bogus first step. Consumed once per render by
+    /// [`Self::glide_composer_toward_dock`], which scales the composer's
+    /// internal scroll by the runway each frame consumes so a scrolled floating
+    /// composer's content reaches its own top exactly as the composer docks.
+    pub(crate) composer_dock_runway: Option<f32>,
     /// Whether the composer overlay is floating (vs docked), cached from the
     /// last render so the scroll handler can decide session ownership.
     pub(crate) composer_overlayed: Cell<bool>,
@@ -605,6 +614,7 @@ impl SpaceView {
             pending_select: None,
             composer_scroll: ScrollHandle::new(),
             composer_prev_off_y: 0.0,
+            composer_dock_runway: None,
             composer_overlayed: Cell::new(false),
             composer_scrollable: Cell::new(false),
             composer_content_h: Rc::new(RefCell::new(px(0.))),
@@ -759,6 +769,17 @@ impl SpaceView {
     pub fn scroll_page_to_top_for_test(&self) {
         let off = self.page_scroll.offset();
         self.page_scroll.set_offset(gpui::point(off.x, px(0.)));
+    }
+
+    /// Scroll the whole page by `dy` (negative = toward the document end),
+    /// clamped to the last rendered frame's valid range. Tests use it to walk
+    /// the page toward the composer's dock threshold in increments, asserting
+    /// the pre-dock glide at each step.
+    #[doc(hidden)]
+    pub fn scroll_page_by_for_test(&self, dy: f32) {
+        let off = self.page_scroll.offset();
+        let y = (off.y.as_f32() + dy).clamp(self.scroll_min_y.get(), 0.0);
+        self.page_scroll.set_offset(gpui::point(off.x, px(y)));
     }
 
     /// Scroll the whole page to the end of the current document — the position
@@ -1677,6 +1698,17 @@ impl Render for SpaceView {
             let entity = cx.entity();
             window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
         }
+
+        // The pre-dock glide: while the dock threshold sits under the floating
+        // composer (the last `float_bar_h` of page travel before docking), each
+        // increment of page scroll consumed toward the threshold unwinds a
+        // proportional share of the composer's internal scroll, so a scrolled
+        // floating composer's content reaches its own top exactly as it docks —
+        // instead of docking mid-scroll. Render-time, after this frame's page
+        // offset is final, so every scroll source participates (wheel, minimap
+        // drag, tail-follow, programmatic docks); must run before the
+        // frozen-offset baseline below so the baseline picks up the eased value.
+        self.glide_composer_toward_dock(&tree, page_width, window_h);
 
         self.composer_prev_off_y = self.composer_scroll.offset().y.as_f32();
 

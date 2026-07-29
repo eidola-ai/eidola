@@ -3576,6 +3576,192 @@ fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_scrolled_floating_composer_glides_to_its_top_by_the_dock(cx: &mut TestAppContext) {
+    // The float→dock transition for an internally-scrolled composer (the
+    // pre-dock glide, `SpaceView::glide_composer_toward_dock`). A floating
+    // composer scrolled off its own top must NOT carry that scroll into the
+    // dock: while the dock threshold sits under the floating bar (the last
+    // ≤half-window of page travel before docking), each increment of page
+    // scroll unwinds a proportional share of the internal offset, so the
+    // content sits at exactly its top the moment the composer docks. Page
+    // scrolling outside that zone must never move the internal content, the
+    // unwind must be monotone, and reversing the page mid-zone must leave the
+    // internal offset where it is (the glide never reverses) while a resumed
+    // descent still lands exactly at the top. The per-step math is unit-tested
+    // (`composer::approach_glide_offset`); this drives it through real renders
+    // at arbitrary stop/reverse/restart points.
+    use eidola_app_core::{PostBlock, PostNode, PostParticipant};
+    use gpui_markdown_editor::EditorEvent;
+    let post = |aid: &str, parent: Option<&str>, user: bool| PostNode {
+        action_id: aid.into(),
+        item_id: format!("item-{aid}"),
+        parent_action_id: parent.map(Into::into),
+        participant: PostParticipant {
+            kind: if user { "human".into() } else { "agent".into() },
+            label: if user { "You".into() } else { "kimi".into() },
+        },
+        action_type: if user {
+            "user_input".into()
+        } else {
+            "inference".into()
+        },
+        generation: 0,
+        generation_count: 1,
+        is_current: true,
+        model: None,
+        credits_consumed: None,
+        relation: parent.map(|_| "reply".to_string()),
+        depth: 0,
+        is_branch: false,
+        blocks: vec![PostBlock {
+            id: String::new(),
+            block_type: "text".into(),
+            text: Some(
+                "A few sentences of body text so each post has a realistic \
+                 measured height, tall enough that the transcript overflows."
+                    .into(),
+            ),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }],
+        references: Vec::new(),
+        created_at: 0,
+    };
+    let nodes: Vec<PostNode> = (0..8)
+        .map(|i| {
+            let parent = (i > 0).then(|| format!("a{}", i - 1));
+            post(&format!("a{i}"), parent.as_deref(), i % 2 == 0)
+        })
+        .collect();
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("glide".into()));
+    view.update(cx, |v, cx| {
+        v.space()
+            .update(cx, |s, cx| s.set_post_tree_for_test(nodes, cx));
+    });
+    cx.run_until_parked();
+    open_space_draft(&view, window, cx, Some("a7"));
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(620.)));
+    vcx.run_until_parked();
+
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the tail draft is the active composer");
+
+    // A draft far taller than the ~310px floating viewport; the caret-into-view
+    // path scrolls the composer deep off its own top. Then park the page at the
+    // top so the slot sits far below the fold: the composer floats, scrolled.
+    let long = "line of the draft that carries some words\n".repeat(40);
+    editor.update(&mut vcx, |e, cx| {
+        e.apply_event_for_test(EditorEvent::InsertText(long), cx)
+    });
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+    // A settle frame so the glide's runway tracking has a baseline before the
+    // stepping begins (the first tracked frame only records, never steps).
+    view.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let step = |vcx: &mut VisualTestContext, view: &Entity<SpaceView>, dy: f32| -> (bool, f32) {
+        view.update(vcx, |v, cx| {
+            v.scroll_page_by_for_test(dy);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |v, _| {
+            (
+                v.composer_overlayed_for_test(),
+                v.composer_scroll_offset_y_for_test(),
+            )
+        })
+    };
+
+    let off0 = view.read_with(&vcx, |v, _| v.composer_scroll_offset_y_for_test());
+    assert!(
+        off0 < -100.0,
+        "precondition: the floating composer is scrolled well off its top \
+         (offset {off0})"
+    );
+
+    // Outside the approach zone (the slot is several hundred px below the
+    // window bottom here) page scrolling must not touch the internal offset.
+    for _ in 0..2 {
+        let (overlayed, off) = step(&mut vcx, &view, -20.0);
+        assert!(overlayed, "still floating just below the page top");
+        assert!(
+            (off - off0).abs() < 0.5,
+            "page scroll outside the approach zone moved the internal offset \
+             ({off0} -> {off})"
+        );
+    }
+
+    // Walk the page toward the dock. The offset must unwind monotonically,
+    // begin unwinding while still floating, survive a mid-zone reversal
+    // untouched, and read ~0 on the very first docked frame.
+    let mut last_off = off0;
+    let mut reversed = false;
+    let mut docked_off = None;
+    for i in 0..200 {
+        let (overlayed, off) = step(&mut vcx, &view, -40.0);
+        assert!(
+            off >= last_off - 0.01,
+            "the glide must never deepen the internal scroll (step {i}: \
+             {last_off} -> {off})"
+        );
+        last_off = off;
+        if !overlayed {
+            docked_off = Some(off);
+            break;
+        }
+        // Once the glide has visibly engaged (still floating, partially
+        // unwound), reverse the page mid-zone: the offset must hold — the
+        // glide never reverses — and the later descent still lands at 0.
+        if !reversed && off > off0 + 5.0 {
+            reversed = true;
+            for _ in 0..3 {
+                let (_, back_off) = step(&mut vcx, &view, 40.0);
+                assert!(
+                    (back_off - off).abs() < 0.5,
+                    "reversing the page must leave the internal offset where \
+                     it was ({off} -> {back_off})"
+                );
+            }
+            last_off = off;
+        }
+    }
+    let docked_off = docked_off.expect("the page walk reached the dock threshold");
+    assert!(
+        reversed,
+        "the glide must engage while the composer still floats (the offset \
+         never moved off {off0} before docking)"
+    );
+    assert!(
+        docked_off.abs() < 1.0,
+        "the internal scroll must sit at exactly its top the moment the \
+         composer docks (was {docked_off})"
+    );
+
+    // And it stays at the top through the rest of the docked traversal.
+    view.update(&mut vcx, |v, cx| {
+        v.scroll_page_to_end_for_test();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.composer_scroll_offset_y_for_test().abs() < 1.0,
+            "the docked composer stays at its top to the end of the document \
+             (offset {})",
+            v.composer_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
 fn space_docked_composer_edit_scrolls_page_into_view(cx: &mut TestAppContext) {
     // The docked/page counterpart of the floating test above. A blank ⌘N
     // notebook's composer is **docked**: it owns no internal scroll and expands
