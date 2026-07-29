@@ -41,9 +41,7 @@ use super::model::{self, TreeNode};
 const SHADOW_OFFSET_Y: Pixels = px(-3.);
 const SHADOW_BLUR: Pixels = px(18.);
 use super::nav::ScrollOwner;
-use super::{
-    COMPOSER_MAX_FRACTION, Draft, GUTTER_GAP, POST_PAD_Y, PostOnly, Send, SpaceView, prose_style,
-};
+use super::{Draft, GUTTER_GAP, POST_PAD_Y, PostOnly, Send, SpaceView, prose_style};
 
 impl SpaceView {
     // -- Draft lifecycle ---------------------------------------------------
@@ -273,8 +271,11 @@ impl SpaceView {
         let Some(id) = self.active_draft.take() else {
             return;
         };
-        // Any open band menu belongs to the retiring interaction.
+        // Any open band menu belongs to the retiring interaction — and so
+        // does an exact-height resize: deactivating (or switching drafts)
+        // reverts the sizing to the resting Max.
         self.band_menu = None;
+        self.reset_composer_sizing();
         let Some(draft) = self.drafts.iter().find(|d| d.id == id) else {
             return;
         };
@@ -372,8 +373,10 @@ impl SpaceView {
             return;
         }
 
-        // Consume the draft (it's becoming a persisted post).
+        // Consume the draft (it's becoming a persisted post). Posting is a
+        // deactivation, so the exact-height resize reverts with it.
         self.active_draft = None;
+        self.reset_composer_sizing();
         self.delete_draft(&active);
         self.error = None;
         self.band_menu = None;
@@ -458,6 +461,7 @@ impl SpaceView {
         if let Some(id) = empty_draft {
             if self.active_draft.as_ref() == Some(&id) {
                 self.active_draft = None;
+                self.reset_composer_sizing();
                 window.focus(&self.focus_handle, cx);
             }
             self.delete_draft(&id);
@@ -573,10 +577,17 @@ impl SpaceView {
             self.composer_dock_runway = None;
             return;
         }
+        // A resize drag moves the float line itself: runway deltas during it
+        // are the handle, not page travel toward the dock, and easing on them
+        // would unwind scroll the user didn't approach with. Suspend and
+        // re-baseline once the drag ends.
+        if self.composer_resize.is_some() {
+            self.composer_dock_runway = None;
+            return;
+        }
 
         let win = window_h.as_f32();
-        let content = self.composer_content_h.borrow().as_f32();
-        let float_bar_h = (Self::composer_chrome() + content).min(COMPOSER_MAX_FRACTION * win);
+        let float_bar_h = self.composer_float_bar_h(window_h);
         let float_top = win - float_bar_h;
         let half_pad = POST_PAD_Y.as_f32() / 2.0;
         let dock_top = self.placeholder_doc_top(roots, page_width, window_h)
@@ -591,6 +602,77 @@ impl SpaceView {
             }
         }
         self.composer_dock_runway = Some(runway);
+    }
+
+    // -- The separator resize handle -----------------------------------------
+
+    /// Begin a separator-handle resize drag: snapshot the grab (pointer `y` +
+    /// the bar's current height) and switch the sizing to **Exact**
+    /// immediately — grabbing the handle *means* sizing the bar independent of
+    /// its content, including in excess of it. The fraction snapshots the
+    /// bar's *current* ratio rather than the stored cap, so nothing jumps
+    /// under the grab: a Max bar resting below its cap starts the drag exactly
+    /// where it rests.
+    pub(crate) fn start_composer_resize(
+        &mut self,
+        pointer_y: f32,
+        bar_h: f32,
+        win: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if win <= 0.0 {
+            return;
+        }
+        self.composer_fraction = (bar_h / win).clamp(0.01, COMPOSER_FRACTION_MAX);
+        self.composer_sizing = ComposerSizing::Exact;
+        self.composer_resize = Some(ComposerResizeDrag {
+            start_y: pointer_y,
+            start_bar_h: bar_h,
+        });
+        cx.notify();
+    }
+
+    /// One motion step of the resize drag: the bar's top edge follows the
+    /// pointer as a delta from the grab (up = taller), clamped to the
+    /// fraction bounds. A no-op with no drag in flight, so the window-global
+    /// listeners can stay registered unconditionally (the minimap pattern).
+    pub(crate) fn update_composer_resize(
+        &mut self,
+        pointer_y: f32,
+        win: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.composer_resize else {
+            return;
+        };
+        if win <= 0.0 {
+            return;
+        }
+        let bar_h = drag.start_bar_h + (drag.start_y - pointer_y);
+        let fraction = (bar_h / win).clamp(COMPOSER_FRACTION_MIN, COMPOSER_FRACTION_MAX);
+        if (fraction - self.composer_fraction).abs() > f32::EPSILON {
+            self.composer_fraction = fraction;
+            cx.notify();
+        }
+    }
+
+    /// End the resize drag (mouse-up, or a move with no button held). The
+    /// sizing stays **Exact** — only deactivation reverts it.
+    pub(crate) fn end_composer_resize(&mut self, cx: &mut Context<Self>) {
+        if self.composer_resize.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Revert the sizing mode to the resting **Max** and drop any in-flight
+    /// resize drag. Called whenever the composer deactivates (Escape, a post
+    /// consuming the draft, an ask discarding it) or a different draft is
+    /// selected. The *fraction* deliberately survives — it remains this
+    /// window's cap until the window closes or the handle is dragged again;
+    /// only the exact-height pin reverts.
+    pub(crate) fn reset_composer_sizing(&mut self) {
+        self.composer_sizing = ComposerSizing::Max;
+        self.composer_resize = None;
     }
 
     // -- The floating composer ---------------------------------------------
@@ -647,7 +729,11 @@ impl SpaceView {
         // height/dock math below stays in terms of the total.
         let scroll_gap = composer_scroll_gap();
 
-        let float_bar_h = (chrome + content).min(COMPOSER_MAX_FRACTION * win);
+        // The floating bar height under the window's fraction + sizing mode
+        // (the dynamic replacement for the old fixed 50% cap) — the same
+        // helper the glide and the off-branch floating pad read, so the three
+        // can't disagree on the bar.
+        let float_bar_h = self.composer_float_bar_h(window_h);
         let float_top = win - float_bar_h;
         let slot_top = if on_path {
             Some(self.placeholder_doc_top(roots, page_width, window_h) + self.clamped_scroll_y())
@@ -718,7 +804,8 @@ impl SpaceView {
         // (where the page scroll reaches it) rather than overlaying it.
         let clipped_tail = (bar_h + content_shift - quad_h).max(0.0);
         // The composer scrolls internally only when floating *and* its content
-        // exceeds the visible bar — i.e. it's capped at `COMPOSER_MAX_FRACTION`.
+        // exceeds the visible bar — i.e. it's capped at the window's composer
+        // fraction (or pinned under it, with Exact sizing).
         // When it's floating at its natural height (content fits, incl. empty /
         // one line) the editor's `min_height` fills the bar exactly, so there's
         // nothing to scroll; letting the wheel fall through to the page (below)
@@ -885,6 +972,7 @@ impl SpaceView {
                 cx.entity().downgrade(),
                 editor.downgrade(),
                 body_h,
+                docked,
                 page_slot_doc_top,
                 win,
             ));
@@ -955,6 +1043,100 @@ impl SpaceView {
                         linear_color_stop(hsla(0., 0., 0., 0.08), 0.),
                         linear_color_stop(hsla(0., 0., 0., 0.), 1.),
                     )),
+            );
+        }
+        if overlayed {
+            // The separator doubles as a **resize handle** while floating: a
+            // centered dot marks it, the band carries the vertical-resize
+            // cursor, and a drag writes the window's composer fraction
+            // directly — switching the sizing to Exact on grab so the bar can
+            // be sized in excess of its content (`start_composer_resize`).
+            // Docked, the bar is page geometry and offers no handle.
+            let handle_fg = theme.muted_foreground.opacity(0.5);
+            let grab_bar_h = float_bar_h;
+            composer = composer.child(
+                div()
+                    .id("space-composer-resize")
+                    .probe(
+                        "space/composer/resize",
+                        gpui::Role::Slider,
+                        "Resize composer",
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(COMPOSER_RESIZE_HIT_H))
+                    .cursor(gpui::CursorStyle::ResizeUpDown)
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.start_composer_resize(ev.position.y.as_f32(), grab_bar_h, win, cx);
+                        }),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .h(px(COMPOSER_SEPARATOR_H))
+                            .justify_center()
+                            .child(
+                                div()
+                                    .size(px(COMPOSER_RESIZE_DOT))
+                                    .rounded_full()
+                                    .bg(handle_fg),
+                            ),
+                    ),
+            );
+        }
+        // Window-global tracking for an in-flight resize drag (the minimap
+        // pattern): `on_mouse_event` listeners are cleared each frame, so they
+        // are re-registered every frame; they no-op unless a drag is live, and
+        // registering unconditionally avoids a first-move gap. This is what
+        // keeps the drag following after the cursor leaves the thin strip —
+        // and what keeps it live if the bar docks mid-drag (the handle
+        // unmounts; the drag doesn't).
+        {
+            let weak = cx.entity().downgrade();
+            composer = composer.child(
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _cx| {
+                        let move_weak = weak.clone();
+                        window.on_mouse_event(
+                            move |ev: &gpui::MouseMoveEvent, _phase, _window, cx| {
+                                let Some(this) = move_weak.upgrade() else {
+                                    return;
+                                };
+                                this.update(cx, |this, cx| {
+                                    if this.composer_resize.is_none() {
+                                        return;
+                                    }
+                                    if !ev.dragging() {
+                                        // Button released without a delivered up event.
+                                        this.end_composer_resize(cx);
+                                        return;
+                                    }
+                                    cx.stop_propagation();
+                                    this.update_composer_resize(ev.position.y.as_f32(), win, cx);
+                                });
+                            },
+                        );
+                        let up_weak = weak.clone();
+                        window.on_mouse_event(
+                            move |_: &gpui::MouseUpEvent, _phase, _window, cx| {
+                                let Some(this) = up_weak.upgrade() else {
+                                    return;
+                                };
+                                this.update(cx, |this, cx| this.end_composer_resize(cx));
+                            },
+                        );
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
             );
         }
         if overlayed {
@@ -1160,7 +1342,7 @@ pub fn rail_breath() -> f32 {
 /// ([`SpaceView::composer_chrome`], half the inter-post gap): on a scrolled
 /// floating composer this band is dead space, and at the full chrome height it
 /// read as a blank strip where a familiar pane separator was expected.
-pub(crate) const COMPOSER_SEPARATOR_H: f32 = 8.0;
+pub(crate) const COMPOSER_SEPARATOR_H: f32 = 12.0;
 
 /// The remainder of the bar's top chrome, folded **inside** the scroll content
 /// as an in-flow spacer above the editor: `composer_chrome() −`
@@ -1178,6 +1360,70 @@ pub(crate) const COMPOSER_SEPARATOR_H: f32 = 8.0;
 /// measuring canvas and leaves `scroll_max` exactly as it was.
 pub(crate) fn composer_scroll_gap() -> f32 {
     (SpaceView::composer_chrome() - COMPOSER_SEPARATOR_H).max(0.0)
+}
+
+/// How the window's floating-composer fraction
+/// ([`SpaceView::composer_fraction`], a ratio of the window height) applies to
+/// the floating bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum ComposerSizing {
+    /// The fraction is a **cap**: the bar floats at its natural content height
+    /// up to `fraction · window`, then scrolls internally — the resting
+    /// behavior every activation starts from (and, at the default fraction,
+    /// exactly the pre-configurability behavior).
+    #[default]
+    Max,
+    /// The fraction **is** the bar: while floating, the composer is exactly
+    /// `fraction · window` tall regardless of its content — short content gets
+    /// blank runway below, like the docked notebook — and it enters/leaves the
+    /// floating state on that height rather than on what it happens to
+    /// contain. Entered by grabbing the separator's resize handle (the whole
+    /// point of the drag is sizing the bar in excess of its content); reverted
+    /// to [`Self::Max`] whenever the composer deactivates or a different draft
+    /// is selected ([`SpaceView::reset_composer_sizing`]).
+    Exact,
+}
+
+/// An in-flight separator-handle resize drag: the pointer's window-space `y`
+/// and the floating bar's height at the moment of grab. Motion applies as a
+/// **delta** from these (`bar = start_bar_h + (start_y − pointer_y)`) rather
+/// than as absolute window coordinates, so the math is immune to the Linux CSD
+/// content insets and can never jump under the grab.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ComposerResizeDrag {
+    pub(crate) start_y: f32,
+    pub(crate) start_bar_h: f32,
+}
+
+/// Bounds for the resize drag's fraction: enough bar left at the bottom for a
+/// few lines, enough conversation left visible above it. The *stored* fraction
+/// may rest below the minimum (grabbing a short Max bar snapshots its honest
+/// current ratio so nothing jumps); the bounds clamp only where the user
+/// drags to.
+pub(crate) const COMPOSER_FRACTION_MIN: f32 = 0.1;
+pub(crate) const COMPOSER_FRACTION_MAX: f32 = 0.85;
+
+/// The resize handle's hit band: the separator plus a few px into the body's
+/// blank in-content spacer below it (the chrome.rs resize-band precedent — a
+/// thin strip needs a forgiving target, and the overlap covers nothing
+/// clickable), and the little dot that marks the separator as a handle.
+const COMPOSER_RESIZE_HIT_H: f32 = COMPOSER_SEPARATOR_H + 4.0;
+const COMPOSER_RESIZE_DOT: f32 = 4.0;
+
+/// The pure sizing core behind [`SpaceView::composer_float_bar_h`]: the
+/// floating bar's height given the natural content height (`chrome +
+/// content`), the window fraction, and the sizing mode. Pure and unit-tested.
+pub(crate) fn float_bar_height(
+    natural: f32,
+    fraction: f32,
+    win: f32,
+    sizing: ComposerSizing,
+) -> f32 {
+    let cap = fraction * win;
+    match sizing {
+        ComposerSizing::Max => natural.min(cap),
+        ComposerSizing::Exact => cap,
+    }
 }
 
 use crate::probe::Probe as _;
@@ -1387,6 +1633,7 @@ fn caret_into_view(
     view: gpui::WeakEntity<SpaceView>,
     editor: gpui::WeakEntity<MarkdownEditorState>,
     body_h: f32,
+    docked: bool,
     page_slot_doc_top: f32,
     window_h: f32,
 ) -> impl IntoElement {
@@ -1408,21 +1655,21 @@ fn caret_into_view(
             let natural = ed.content_height().as_f32();
             let caret_top = top.as_f32();
             let caret_bot = bot.as_f32();
-            // Docked vs floating is decided from the composer's **visible bar
-            // height** this frame (`body_h`, passed from the same render) — not the
-            // `composer_overlayed`/`composer_scrollable` cells, which derive from
-            // the frame-behind `composer_content_h` and read inconsistently under a
-            // repaint. A *floating* composer's bar is capped at
-            // `COMPOSER_MAX_FRACTION` of the window (it overlays the bottom), so its
-            // `body_h` never exceeds `COMPOSER_MAX_FRACTION * window_h`; a *docked*
-            // composer's bar is uncapped and ramps toward the full window, so its
-            // `body_h` grows past that line. The threshold thus cleanly separates
-            // them (a razor-thin ambiguity only at the dock/float transition point,
-            // where the two behaviors are continuous anyway). When docked, the page
-            // owns the caret's window visibility; when floating, `natural - body_h`
-            // (fresh measures) separates a real overflow (scroll the composer's own
-            // bar) from a fit-height bar (caret already visible — no-op).
-            let docked = body_h > COMPOSER_MAX_FRACTION * window_h;
+            // Docked vs floating is the **render's own decision this frame**,
+            // passed in alongside `body_h` (frame-consistent by construction) —
+            // not the `composer_overlayed`/`composer_scrollable` cells, which
+            // derive from the frame-behind `composer_content_h` and read
+            // inconsistently under a repaint. An earlier version re-derived it
+            // here as `body_h > COMPOSER_MAX_FRACTION · window` — a proxy that
+            // (a) only held while the float cap was a fixed constant, which the
+            // window-local fraction retired, and (b) silently classified the
+            // whole lower dock ramp as "floating", scrolling a docked bar's
+            // internal offset instead of the page. When docked, the page owns
+            // the caret's window visibility; when floating, `natural - body_h`
+            // (fresh measures) separates a real overflow (scroll the composer's
+            // own bar) from a fit-height bar (caret already visible — no-op;
+            // under Exact sizing that includes content shorter than the pinned
+            // bar, whose runway shows the caret by construction).
             let composer_scroll_max = (natural - body_h).max(0.0);
             let changed = if !docked && composer_scroll_max > 0.5 {
                 // Floating-with-overflow: scroll the composer's own viewport.
@@ -1765,6 +2012,33 @@ mod tests {
         assert_eq!(deep, WIN - FLOAT_TOP);
         assert_eq!(deep, nearer);
         assert_eq!(approach_glide_offset(-500.0, deep, nearer), -500.0);
+    }
+
+    #[test]
+    fn float_bar_height_caps_under_max_and_pins_under_exact() {
+        use super::{ComposerSizing, float_bar_height};
+        // Max: the fraction is a cap — natural height wins below it.
+        assert_eq!(
+            float_bar_height(200.0, 0.5, 800.0, ComposerSizing::Max),
+            200.0
+        );
+        assert_eq!(
+            float_bar_height(600.0, 0.5, 800.0, ComposerSizing::Max),
+            400.0
+        );
+        // Exact: the fraction is the bar, whichever side the content is on —
+        // this is what lets a drag size the bar in excess of its content, and
+        // what keeps a floating bar's height fixed as its content shrinks.
+        assert_eq!(
+            float_bar_height(200.0, 0.5, 800.0, ComposerSizing::Exact),
+            400.0
+        );
+        assert_eq!(
+            float_bar_height(600.0, 0.5, 800.0, ComposerSizing::Exact),
+            400.0
+        );
+        // The resting mode is Max — every activation starts there.
+        assert_eq!(ComposerSizing::default(), ComposerSizing::Max);
     }
 
     #[test]

@@ -2191,6 +2191,77 @@ fn open_space_draft(
     cx.run_until_parked();
 }
 
+/// A scene whose active tail draft **floats**: a tall eight-post transcript,
+/// the (empty) draft replying to the last post, a 760×620 window, and the page
+/// parked at the top so the draft's slot sits far below the fold. The shared
+/// setup for the composer resize-handle tests (the caret / glide tests build
+/// the same scene inline with their own draft content).
+fn open_floating_composer_scene(
+    cx: &mut TestAppContext,
+    space_id: &str,
+) -> (AnyWindowHandle, Entity<SpaceView>, VisualTestContext) {
+    use eidola_app_core::{PostBlock, PostNode, PostParticipant};
+    let post = |aid: &str, parent: Option<&str>, user: bool| PostNode {
+        action_id: aid.into(),
+        item_id: format!("item-{aid}"),
+        parent_action_id: parent.map(Into::into),
+        participant: PostParticipant {
+            kind: if user { "human".into() } else { "agent".into() },
+            label: if user { "You".into() } else { "kimi".into() },
+        },
+        action_type: if user {
+            "user_input".into()
+        } else {
+            "inference".into()
+        },
+        generation: 0,
+        generation_count: 1,
+        is_current: true,
+        model: None,
+        credits_consumed: None,
+        relation: parent.map(|_| "reply".to_string()),
+        depth: 0,
+        is_branch: false,
+        blocks: vec![PostBlock {
+            id: String::new(),
+            block_type: "text".into(),
+            text: Some(
+                "A few sentences of body text so each post has a realistic \
+                 measured height, tall enough that the transcript overflows."
+                    .into(),
+            ),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }],
+        references: Vec::new(),
+        created_at: 0,
+    };
+    let nodes: Vec<PostNode> = (0..8)
+        .map(|i| {
+            let parent = (i > 0).then(|| format!("a{}", i - 1));
+            post(&format!("a{i}"), parent.as_deref(), i % 2 == 0)
+        })
+        .collect();
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some(space_id.into()));
+    view.update(cx, |v, cx| {
+        v.space()
+            .update(cx, |s, cx| s.set_post_tree_for_test(nodes, cx));
+    });
+    cx.run_until_parked();
+    open_space_draft(&view, window, cx, Some("a7"));
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(620.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    view.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    (window, view, vcx)
+}
+
 fn dispatch_space_action<A: gpui::Action>(
     view: &Entity<SpaceView>,
     window: AnyWindowHandle,
@@ -3550,15 +3621,23 @@ fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
         .read_with(&vcx, |v, _| v.composer_state_for_test())
         .expect("the tail draft is the active composer");
 
+    // Scroll the page to the top **and settle a frame** so the composer's slot
+    // sits far below the fold and the composer renders floating (capped)
+    // before the edit lands. Order matters: the caret canvas branches on the
+    // frame's own docked/floating decision, and a fresh draft is docked at its
+    // home — arming the flag while that stale docked frame is still current
+    // routes the caret to the *page*, which is docked behavior, not the
+    // floating behavior under test.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    view.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
     // Type a draft far taller than the ~310px floating viewport. `InsertText`
     // leaves the caret at the end of the inserted text — below the fold.
     let long = "line of the draft that carries some words\n".repeat(40);
     editor.update(&mut vcx, |e, cx| {
         e.apply_event_for_test(EditorEvent::InsertText(long), cx)
     });
-    // Scroll the page to the top so the composer's slot sits far below the fold
-    // and the composer floats (capped) rather than docking.
-    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
     vcx.run_until_parked();
 
     view.read_with(&vcx, |v, _| {
@@ -3652,14 +3731,19 @@ fn space_scrolled_floating_composer_glides_to_its_top_by_the_dock(cx: &mut TestA
         .read_with(&vcx, |v, _| v.composer_state_for_test())
         .expect("the tail draft is the active composer");
 
-    // A draft far taller than the ~310px floating viewport; the caret-into-view
-    // path scrolls the composer deep off its own top. Then park the page at the
-    // top so the slot sits far below the fold: the composer floats, scrolled.
+    // Park the page at the top (and settle a frame) so the slot sits far below
+    // the fold and the composer renders floating **before** the edit lands —
+    // the caret canvas branches on the frame's own docked/floating decision,
+    // and the fresh draft is otherwise still docked at its home. Then type a
+    // draft far taller than the ~310px floating viewport; the caret-into-view
+    // path scrolls the floating composer deep off its own top.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    view.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
     let long = "line of the draft that carries some words\n".repeat(40);
     editor.update(&mut vcx, |e, cx| {
         e.apply_event_for_test(EditorEvent::InsertText(long), cx)
     });
-    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
     vcx.run_until_parked();
     // A settle frame so the glide's runway tracking has a baseline before the
     // stepping begins (the first tracked frame only records, never steps).
@@ -3757,6 +3841,160 @@ fn space_scrolled_floating_composer_glides_to_its_top_by_the_dock(cx: &mut TestA
             "the docked composer stays at its top to the end of the document \
              (offset {})",
             v.composer_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_composer_resize_drag_pins_exact_height_and_reverts_on_deactivate(cx: &mut TestAppContext) {
+    // The separator resize handle's state machine. Grabbing the handle
+    // switches the window-local sizing to **Exact** at the bar's *current*
+    // ratio (never a jump under the grab), dragging follows the pointer as a
+    // delta clamped to the fraction bounds — sizing the bar in excess of its
+    // (unchanged) content, which Max could never do — releasing keeps the
+    // pin, and deactivating (Escape) reverts the pin to Max while the
+    // fraction itself survives as the window's cap.
+    let (_window, view, mut vcx) = open_floating_composer_scene(cx, "resize");
+    const WIN: f32 = 620.0;
+
+    let (overlayed, fraction, exact, natural) = view.read_with(&vcx, |v, _| {
+        (
+            v.composer_overlayed_for_test(),
+            v.composer_fraction_for_test(),
+            v.composer_sizing_is_exact_for_test(),
+            v.composer_float_bar_h_for_test(WIN),
+        )
+    });
+    assert!(overlayed, "the scene's tail draft floats");
+    assert!(
+        (fraction - 0.5).abs() < 1e-6 && !exact,
+        "every window opens at the default: fraction 0.5, Max sizing \
+         (fraction {fraction}, exact {exact})"
+    );
+    // The empty draft floats at its natural height, well under the cap —
+    // which is what makes "in excess of the content" observable below.
+    assert!(
+        natural < 0.5 * WIN - 1.0,
+        "precondition: the empty draft's natural bar ({natural}) rests under \
+         the 50% cap"
+    );
+
+    // Grab the handle: Exact immediately, pinned at the current height.
+    view.update(&mut vcx, |v, cx| {
+        v.begin_composer_resize_for_test(400.0, WIN, cx)
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.composer_sizing_is_exact_for_test(),
+            "grabbing the handle switches to Exact immediately"
+        );
+        let bar = v.composer_float_bar_h_for_test(WIN);
+        assert!(
+            (bar - natural).abs() < 1.0,
+            "the grab pins the bar where it rests — no jump ({natural} -> {bar})"
+        );
+    });
+
+    // Drag 150px up: the bar is exactly 150 taller — in excess of content.
+    view.update(&mut vcx, |v, cx| {
+        v.move_composer_resize_for_test(250.0, WIN, cx)
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        let bar = v.composer_float_bar_h_for_test(WIN);
+        assert!(
+            (bar - (natural + 150.0)).abs() < 1.0,
+            "the bar edge follows the pointer ({} vs {})",
+            bar,
+            natural + 150.0
+        );
+        assert!(
+            v.composer_overlayed_for_test(),
+            "still floating at the pinned height"
+        );
+    });
+
+    // Wild drags clamp to the fraction bounds (deltas are from the grab, so
+    // these don't accumulate).
+    view.update(&mut vcx, |v, cx| {
+        v.move_composer_resize_for_test(-10_000.0, WIN, cx)
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            (v.composer_fraction_for_test() - 0.85).abs() < 1e-6,
+            "dragging past the top clamps to the max fraction (got {})",
+            v.composer_fraction_for_test()
+        );
+    });
+    view.update(&mut vcx, |v, cx| {
+        v.move_composer_resize_for_test(10_000.0, WIN, cx)
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            (v.composer_fraction_for_test() - 0.1).abs() < 1e-6,
+            "dragging past the bottom clamps to the min fraction (got {})",
+            v.composer_fraction_for_test()
+        );
+    });
+
+    // Settle mid-range and release: the pin survives the drag's end.
+    view.update(&mut vcx, |v, cx| {
+        v.move_composer_resize_for_test(250.0, WIN, cx);
+        v.end_composer_resize_for_test(cx);
+    });
+    vcx.run_until_parked();
+    let pinned = view.read_with(&vcx, |v, _| {
+        assert!(
+            v.composer_sizing_is_exact_for_test(),
+            "Exact survives releasing the handle"
+        );
+        v.composer_fraction_for_test()
+    });
+
+    // Deactivate (Escape's path): the pin reverts to Max; the fraction is
+    // window state and survives as the cap until re-dragged.
+    view.update(&mut vcx, |v, cx| v.deactivate_for_test(cx));
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.composer_sizing_is_exact_for_test(),
+            "deactivation reverts the sizing to Max"
+        );
+        assert!(
+            (v.composer_fraction_for_test() - pinned).abs() < 1e-6,
+            "the fraction survives deactivation ({} vs {pinned})",
+            v.composer_fraction_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_composer_resize_reverts_to_max_when_the_draft_posts(cx: &mut TestAppContext) {
+    // Posting consumes the draft — a deactivation — so an exact-height resize
+    // reverts to Max with it (the `send_active_draft` reset path, distinct
+    // from Escape's `retire_active_draft`).
+    let (window, view, mut vcx) = open_floating_composer_scene(cx, "resize-post");
+    const WIN: f32 = 620.0;
+
+    view.update(&mut vcx, |v, cx| {
+        v.begin_composer_resize_for_test(400.0, WIN, cx);
+        v.move_composer_resize_for_test(250.0, WIN, cx);
+        v.end_composer_resize_for_test(cx);
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(v.composer_sizing_is_exact_for_test());
+    });
+
+    set_space_composer_text(&view, window, &mut vcx, "a resized draft, posted");
+    dispatch_space_action(&view, window, &mut vcx, Send);
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "the accepted post consumed the draft"
+        );
+        assert!(
+            !v.composer_sizing_is_exact_for_test(),
+            "posting reverts the sizing to Max"
         );
     });
 }
