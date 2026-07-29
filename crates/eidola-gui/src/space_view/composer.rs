@@ -641,6 +641,11 @@ impl SpaceView {
         let chrome = Self::composer_chrome();
         let content = self.composer_content_h.borrow().as_f32();
         let half_pad = POST_PAD_Y.as_f32() / 2.0;
+        // The top chrome's render split (see `composer_scroll_gap`): the thin
+        // separator stays outside the scroll clip, the rest rides inside the
+        // scroll content. Together they are exactly `chrome`, so all the
+        // height/dock math below stays in terms of the total.
+        let scroll_gap = composer_scroll_gap();
 
         let float_bar_h = (chrome + content).min(COMPOSER_MAX_FRACTION * win);
         let float_top = win - float_bar_h;
@@ -721,10 +726,19 @@ impl SpaceView {
         // the page owns the scroll regardless.
         let composer_scrollable = overlayed && (chrome + content > bar_h + 0.5);
         self.composer_scrollable.set(composer_scrollable);
-        let scrolled_down = self.composer_scroll.offset().y.as_f32() < -0.5;
+        // The internal fold shadow appears once actual *text* is cut at the
+        // fold — the first `scroll_gap` of internal scroll only consumes the
+        // in-content spacer, and a shadow over that still-blank strip would
+        // announce a cut that hasn't happened.
+        let scrolled_down = self.composer_scroll.offset().y.as_f32() < -(scroll_gap + 0.5);
 
+        // Both gutters take the scroll gap as a top margin: the h_flex below
+        // pads only the separator, so without it the byline and the action
+        // verbs would ride up by the gap — they must stay aligned with the
+        // (unscrolled) first text line, exactly where a post's gutter sits.
         let mut byline =
-            super::post::byline_gutter("You", theme.info, Some(super::post::DRAFT_BYLINE_OPACITY));
+            super::post::byline_gutter("You", theme.info, Some(super::post::DRAFT_BYLINE_OPACITY))
+                .mt(px(scroll_gap));
         if overlayed {
             let home_fg = theme.muted_foreground;
             let home_fg_hover = theme.foreground;
@@ -751,7 +765,12 @@ impl SpaceView {
         let mut body = div()
             .id("space-composer-body")
             .w(bw)
-            .h(px(body_h))
+            // The body owns the chrome's in-content share: its frame reaches up
+            // to the separator (the clip fold), and the first `scroll_gap` of
+            // its content is the spacer below. Viewport and content both grow
+            // by the same `scroll_gap`, so `scroll_max` — and with it the
+            // glide, the dock ramp, and the caret math — is untouched.
+            .h(px(body_h + scroll_gap))
             // Scroll tracking stays on **unconditionally**, even when the composer
             // owns no scroll session — the dock transition depends on it. A
             // scrolled floating composer's offset is walked to its top *before*
@@ -797,6 +816,13 @@ impl SpaceView {
                     }
                 }
             }))
+            // The top chrome's in-content share (`composer_scroll_gap`): an
+            // in-flow spacer, so unscrolled text sits exactly `chrome` below
+            // the bar top while a scrolled composer carries the gap away with
+            // the content and clips at the thin separator. A child, not
+            // padding on this div — padding joins gpui's scrollable extent
+            // and would let a fit-height composer scroll by the gap.
+            .child(div().h(px(scroll_gap)))
             // "Notes editor" affordance owned by the editor itself: `min_height`
             // grows it to fill the docked runway, and a click in the blank tail
             // below the text resolves to document end inside the editor (see
@@ -903,19 +929,24 @@ impl SpaceView {
                     .w(page_width)
                     .mt(px(content_shift))
                     .h(px(bar_h))
-                    .pt(px(half_pad))
+                    // Only the separator slice of the top chrome lives outside
+                    // the columns; the rest is the body's in-content spacer
+                    // (and the gutters' compensating top margins), so the
+                    // scroll fold sits a thin, pane-separator band below the
+                    // bar's edge while nothing else moves.
+                    .pt(px(COMPOSER_SEPARATOR_H))
                     .justify_center()
                     .items_start()
                     .gap(GUTTER_GAP)
                     .child(byline)
                     .child(body)
-                    .child(self.render_composer_actions(&editor, cx)),
+                    .child(self.render_composer_actions(&editor, cx).mt(px(scroll_gap))),
             );
         if scrolled_down {
             composer = composer.child(
                 div()
                     .absolute()
-                    .top(px(half_pad))
+                    .top(px(COMPOSER_SEPARATOR_H))
                     .left_0()
                     .right_0()
                     .h(px(8.))
@@ -1122,6 +1153,33 @@ pub fn rail_breath() -> f32 {
     POST_PAD_Y.as_f32()
 }
 
+/// The slice of the composer bar's top chrome that stays **outside** the
+/// scroll clip — the thin band between the bar's top edge (where the external
+/// drop shadow is cast) and the scroll fold (where scrolled content clips and
+/// the internal shadow paints). Deliberately thinner than the full top chrome
+/// ([`SpaceView::composer_chrome`], half the inter-post gap): on a scrolled
+/// floating composer this band is dead space, and at the full chrome height it
+/// read as a blank strip where a familiar pane separator was expected.
+pub(crate) const COMPOSER_SEPARATOR_H: f32 = 8.0;
+
+/// The remainder of the bar's top chrome, folded **inside** the scroll content
+/// as an in-flow spacer above the editor: `composer_chrome() −`
+/// [`COMPOSER_SEPARATOR_H`]. Unscrolled it sits right under the separator, so
+/// the text starts exactly `composer_chrome()` below the bar top — the same
+/// place as before the split (and the docked editor keeps its post-matching
+/// `2·half_pad` slot offset, see `caret_into_view`'s docked arm) — and it
+/// scrolls away with the content, so a scrolled composer's dead band is only
+/// the separator. The split is a **render concern only**: every height / dock
+/// / runway computation keeps using the `composer_chrome()` total, so nothing
+/// there can drift. It is a spacer child rather than container padding because
+/// gpui adds padding to the scrollable extent (`scroll_max = content + padding
+/// − bounds`, `div.rs`), which would mint a `scroll_gap` phantom scroll on a
+/// fit-height composer; an in-flow child is covered by the origin-pinned
+/// measuring canvas and leaves `scroll_max` exactly as it was.
+pub(crate) fn composer_scroll_gap() -> f32 {
+    (SpaceView::composer_chrome() - COMPOSER_SEPARATOR_H).max(0.0)
+}
+
 use crate::probe::Probe as _;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -1304,7 +1362,13 @@ fn caret_scroll_offset(
 /// - **Floating with overflow** (`composer_scrollable`): the composer owns
 ///   `composer_scroll`, so the caret is scrolled within the composer's own
 ///   viewport (`body_h`). A fit-height composer has `scroll_max == 0`, so it's
-///   inherently a no-op there.
+///   inherently a no-op there. `body_h` is the **editor's share** of the
+///   viewport — the body's real frame is `body_h + composer_scroll_gap()`,
+///   with the gap's spacer above the editor — and the caret span is
+///   editor-local, so for the (common) below-the-fold reveal the gap shifts
+///   the caret's content position and the viewport bottom by the same amount
+///   and cancels exactly; the above-the-fold reveal just gains the gap on top
+///   of [`CARET_SCROLL_MARGIN`] (over-reveals, never under).
 /// - **Docked** (`!composer_overlayed` — incl. the blank ⌘N notebook, which
 ///   expands and grows below the window): the composer has no internal scroll
 ///   and sits at its slot, so bringing the caret onto the *window* is a
@@ -1399,8 +1463,11 @@ fn caret_into_view(
                 // **The editor-top offset (`POST_PAD_Y`).** The composer's editor
                 // body does not begin at `page_slot_doc_top` (the slot block top):
                 // the docked composer's `top_y` sits `half_pad` below the slot top,
-                // and the composer's inner h_flex adds a `.pt(half_pad)` before the
-                // editor — so the editor content (where `caret_content_y` measures
+                // and the bar's top chrome — the separator on the inner h_flex
+                // plus the body's in-content spacer, together `composer_chrome()
+                // = half_pad` (see `composer_scroll_gap`; docked, the internal
+                // scroll is zero so the spacer is fully in place) — precedes the
+                // editor, so the editor content (where `caret_content_y` measures
                 // from y=0) starts `2·half_pad = POST_PAD_Y` below the slot top
                 // (exactly aligning with where a post's body sits under its
                 // `POST_PAD_Y` top pad). Omitting this term put every docked caret
@@ -1698,6 +1765,25 @@ mod tests {
         assert_eq!(deep, WIN - FLOAT_TOP);
         assert_eq!(deep, nearer);
         assert_eq!(approach_glide_offset(-500.0, deep, nearer), -500.0);
+    }
+
+    #[test]
+    fn top_chrome_split_preserves_the_text_position() {
+        // The separator (outside the scroll clip) plus the in-content scroll
+        // gap must sum to the bar's total top chrome — the invariant that
+        // keeps unscrolled text exactly where it sat before the split, keeps
+        // the docked editor at its post-matching `2·half_pad` slot offset
+        // (`caret_into_view`'s docked arm bakes that as `POST_PAD_Y`), and
+        // keeps every height/dock computation honest about using the total.
+        use super::{COMPOSER_SEPARATOR_H, SpaceView, composer_scroll_gap};
+        assert!(
+            COMPOSER_SEPARATOR_H > 0.0 && COMPOSER_SEPARATOR_H < SpaceView::composer_chrome(),
+            "the separator is a thin, non-empty slice of the top chrome"
+        );
+        assert_eq!(
+            COMPOSER_SEPARATOR_H + composer_scroll_gap(),
+            SpaceView::composer_chrome()
+        );
     }
 
     #[test]

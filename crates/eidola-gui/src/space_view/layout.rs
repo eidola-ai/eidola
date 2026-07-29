@@ -197,8 +197,13 @@ impl SpaceView {
         ((scrolled / stride).round() as i64).clamp(0, count as i64 - 1) as usize
     }
 
-    /// Half the document's inter-post spacing — the composer bar's fixed top
-    /// chrome.
+    /// Half the document's inter-post spacing — the composer bar's **total**
+    /// fixed top chrome (bar top edge → editor content). Every height / dock /
+    /// runway computation uses this total; the render alone splits it at the
+    /// scroll clip — a thin pane-separator band outside
+    /// ([`super::composer::COMPOSER_SEPARATOR_H`]) and the remainder as an
+    /// in-content spacer ([`super::composer::composer_scroll_gap`]) — so the
+    /// split is invisible until the composer scrolls internally.
     pub(crate) fn composer_chrome() -> f32 {
         POST_PAD_Y.as_f32() / 2.0
     }
