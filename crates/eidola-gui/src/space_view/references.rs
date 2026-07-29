@@ -137,23 +137,30 @@ pub(crate) enum FootnoteBody {
     Backlink,
 }
 
-/// Vertical space one footnote row occupies, and the rail's own chrome (the
-/// hairline rule plus the padding above and below it). Rows are single-line by
-/// construction — the passage is truncated, never wrapped — so the rail's
-/// height is exact, not estimated, which is what lets the active composer
-/// reserve room for it out of its own bar rather than letting it hang below
-/// the fold. Keep in step with `rail_frame`/`footnote_row`'s styling.
-const RAIL_ROW_H: f32 = 18.0;
-const RAIL_CHROME_H: f32 = 14.0;
-
-/// Height of a rail carrying `rows` footnotes (`0` for none — no rail, no
-/// chrome).
-pub(crate) fn rail_height(rows: usize) -> f32 {
-    if rows == 0 {
-        0.0
-    } else {
-        RAIL_CHROME_H + rows as f32 * RAIL_ROW_H
-    }
+/// A zero-height, zero-visual **in-flow** probe that records its own flow
+/// position into `cell`.
+///
+/// Two of these, bracketing the composer's footnote rail, measure the rail's
+/// exact vertical occupancy — top margin, rule, padding and all — as the
+/// difference of two real painted positions. That is the honest answer to "how
+/// tall is the rail", and the reason the composer no longer carries a
+/// row-count formula that drifts the moment the rail's styling changes. It
+/// also degenerates correctly: with no rail rendered the two marks coincide
+/// and the height is zero.
+///
+/// Deliberately **not** an absolute `size_full` child of the rail (the
+/// `record_height` idiom): that resolves against the parent's *padding* box,
+/// silently dropping the rail's margin and rule — a quiet under-count of the
+/// same kind this replaces.
+pub(crate) fn flow_mark(cell: std::rc::Rc<std::cell::Cell<f32>>) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| {},
+        move |bounds: gpui::Bounds<gpui::Pixels>, _, _, _| {
+            cell.set(bounds.origin.y.as_f32());
+        },
+    )
+    .w_full()
+    .h_0()
 }
 
 /// Drop a post's **recognized** embed blocks from a text preview, leaving its
@@ -674,21 +681,53 @@ impl SpaceView {
         Some(rail.into_any_element())
     }
 
-    /// The rail under a **draft**: its pending references, each with a remove
-    /// affordance (dropping the row also drops its marker).
+    /// The rail under a **draft**: its pending references, each with an
+    /// **embed** affordance (re-place the quote's marker in the body when it
+    /// isn't there) and a remove affordance (dropping the row also drops its
+    /// marker).
+    ///
+    /// `measure` records the rail's painted height into
+    /// [`SpaceView::composer_rail_h`] — set only for the *active* draft, whose
+    /// bar has to reserve room for it; an inactive draft's rail rides its
+    /// post-shaped frame and needs no reservation.
     pub(crate) fn render_draft_footnotes(
         &self,
         draft_id: &SharedString,
+        measure: bool,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let draft = self.drafts.iter().find(|d| &d.id == draft_id)?;
         if draft.references.is_empty() {
             return None;
         }
+        // Which ordinals the body already carries as *recognized* embed
+        // blocks — the ones whose "embed" affordance would duplicate a marker
+        // that is already there. Same recognition the composer's compaction
+        // and the editor's rendering use, so the affordance appears exactly
+        // when the quote block is missing from the draft.
+        let body = draft.editor.read(cx).value();
+        let map = gpui_markdown_editor::EmbedMap::new(draft.embed_map());
+        let placed: std::collections::HashSet<u64> =
+            gpui_markdown_editor::embed::embed_blocks(body, &map)
+                .into_iter()
+                .map(|b| b.ordinal)
+                .collect();
         let mut refs = draft.references.clone();
         refs.sort_by_key(|r| r.ordinal);
 
         let mut rail = self.rail_frame(cx);
+        if measure {
+            // The active composer's rail is the last thing in the bar, so it
+            // carries the bar's bottom breath — [`composer::rail_breath`], a
+            // post's full bottom pad (the half-pad that mirrors the chrome
+            // above the byline reads as crowding under a ruled row). Keeping it
+            // *inside* the measured rail (rather than folding it in as a
+            // separate term) is what stops the last footnote row sitting flush
+            // against the window edge — and it is why `record_height` takes the
+            // **max** of this measured span and the bare breath rather than
+            // their sum: the breath below the composer is drawn once, here.
+            rail = rail.pb(px(super::composer::rail_breath()));
+        }
         for (idx, r) in refs.iter().enumerate() {
             let row = FootnoteRow {
                 index: idx + 1,
@@ -698,39 +737,101 @@ impl SpaceView {
                 antecedent_action_id: r.spec.antecedent_action_id.clone(),
             };
             let ordinal = r.ordinal;
-            let draft_id = draft_id.clone();
-            let el = self
-                .footnote_row(
-                    format!("space-draft-fn-{}-{}", draft.id, ordinal),
-                    format!("space/draft/footnote/{}", row.index),
-                    &row,
-                    false,
-                    cx,
-                )
-                .child(
+            let mut el = self.footnote_row(
+                format!("space-draft-fn-{}-{}", draft.id, ordinal),
+                format!("space/draft/footnote/{}", row.index),
+                &row,
+                false,
+                cx,
+            );
+            // "embed" — put the quote back into the body. A reference and its
+            // marker are separable (deleting the block leaves the reference,
+            // which is what makes the footnote a backlink), so the rail owns
+            // the way back. Offered only while the marker is *absent*: with the
+            // block already in the body a second one would render the same
+            // quote twice and confuse removal.
+            if !placed.contains(&ordinal) {
+                let draft_id = draft_id.clone();
+                el = el.child(
                     div()
                         .id(SharedString::from(format!(
-                            "space-draft-fn-rm-{}-{}",
+                            "space-draft-fn-embed-{}-{}",
                             draft.id, ordinal
                         )))
                         .probe(
-                            format!("space/draft/footnote/{}/remove", row.index),
+                            format!("space/draft/footnote/{}/embed", row.index),
                             gpui::Role::Button,
-                            "Remove this quote",
+                            "Embed this quote in the draft",
                         )
                         .flex_none()
                         .px_1()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .cursor_pointer()
-                        .child("×")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.remove_draft_reference(&draft_id, ordinal, cx);
+                        .hover(|s| s.text_color(cx.theme().foreground))
+                        .child("embed")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.embed_draft_reference(&draft_id, ordinal, window, cx);
                         })),
                 );
+            }
+            let draft_id = draft_id.clone();
+            let el = el.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "space-draft-fn-rm-{}-{}",
+                        draft.id, ordinal
+                    )))
+                    .probe(
+                        format!("space/draft/footnote/{}/remove", row.index),
+                        gpui::Role::Button,
+                        "Remove this quote",
+                    )
+                    .flex_none()
+                    .px_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(cx.theme().foreground))
+                    .child("×")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_draft_reference(&draft_id, ordinal, cx);
+                    })),
+            );
             rail = rail.child(el);
         }
         Some(rail.into_any_element())
+    }
+
+    /// Place the marker for a pending reference the draft's body no longer
+    /// carries — the rail's "embed" affordance, and the inverse of the
+    /// deletion that made the quote a bare backlink. The editor owns the
+    /// splice (`insert_embed_marker` pads it into its own paragraph), so the
+    /// host never touches marker bytes.
+    pub fn embed_draft_reference(
+        &mut self,
+        draft_id: &SharedString,
+        ordinal: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft) = self.drafts.iter().find(|d| &d.id == draft_id) else {
+            return;
+        };
+        if !draft.references.iter().any(|r| r.ordinal == ordinal) {
+            return;
+        }
+        let embeds = draft.embed_map();
+        let editor = draft.editor.clone();
+        editor.update(cx, |e, cx| {
+            e.set_embeds(embeds, cx);
+            e.insert_embed_marker(ordinal, cx);
+        });
+        // The marker lands at the caret, so the composer must have it: focus
+        // the editor the way `attach_quote` does.
+        let focus = editor.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
     }
 
     /// The rail's container: a hairline rule above a tight column — a book's

@@ -33,6 +33,12 @@ use crate::space::PostBlockSpan;
 pub struct PostData {
     /// The post's persisted action id, or `None` for an optimistic row.
     pub action_id: Option<SharedString>,
+    /// The post's **item** id — stable across every generation of the post
+    /// (an edit or a regenerate appends a generation of the same item). This is
+    /// what survives an edit, and is what a stale action id is resolved
+    /// *through* when a window-local reference to a post outlives the
+    /// generation it named (see `SpaceView::rethread_drafts`).
+    pub item_id: Option<SharedString>,
     /// The structural reply antecedent, used to relink the flat list.
     pub parent_action_id: Option<SharedString>,
     /// `user` / `assistant` / `error`.
@@ -254,6 +260,7 @@ mod tests {
     fn row(action_id: &str, parent: Option<&str>, kind: &str, text: &str) -> PostData {
         PostData {
             action_id: Some(action_id.into()),
+            item_id: Some(format!("item-{action_id}").into()),
             parent_action_id: parent.map(SharedString::from),
             role: if kind == "agent" { "assistant" } else { "user" }.into(),
             byline: if kind == "agent" {
@@ -276,6 +283,7 @@ mod tests {
     fn optimistic(text: &str) -> PostData {
         PostData {
             action_id: None,
+            item_id: None,
             parent_action_id: None,
             role: "user".into(),
             byline: "You".into(),

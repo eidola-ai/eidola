@@ -343,24 +343,84 @@ fn canonicalizer_leaves_embed_lines_alone(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn typing_at_an_edge_degrades_the_marker_honestly(cx: &mut TestAppContext) {
-    // Typing at the trailing edge extends the paragraph past the pattern —
-    // the construct honestly degrades to plain text (and undoes by deleting
-    // the typed character). Documented behavior, not an accident.
+fn typing_at_the_trailing_edge_opens_a_paragraph_below(cx: &mut TestAppContext) {
+    // The whole line is the block, so a character typed at the trailing edge
+    // opens a fresh paragraph *beside* the embed instead of dissolving it.
     let src = format!("ab\n\n{MARKER}");
     let end = 4 + MARKER.len();
     let (_, editor) = embed_editor(cx, &src, end);
-    type_str(cx, &editor, "x");
+    type_str(cx, &editor, "xy");
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.value(), format!("ab\n\n{MARKER}x"));
+        assert_eq!(e.value(), format!("ab\n\n{MARKER}\n\nxy"));
+        // The caret follows the typed text, not the injected separator.
+        assert_eq!(e.selection().head(), e.value().len());
     });
-    let spec = editor.read_with(cx, |e, _| e.render_spec());
-    assert!(
-        spec.blocks
-            .iter()
-            .all(|b| !matches!(b.kind, BlockKind::Embed { .. })),
-        "a marker with trailing content is plain text; got {spec:#?}"
+    assert_embed_blocks(cx, &editor, 1);
+}
+
+#[gpui::test]
+fn typing_at_the_leading_edge_opens_a_paragraph_above(cx: &mut TestAppContext) {
+    let src = format!("{MARKER}\n\nab");
+    let (_, editor) = embed_editor(cx, &src, 0);
+    type_str(cx, &editor, "xy");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), format!("xy\n\n{MARKER}\n\nab"));
+        assert_eq!(e.selection().head(), 2);
+    });
+    assert_embed_blocks(cx, &editor, 1);
+}
+
+#[gpui::test]
+fn pasting_at_an_edge_opens_a_paragraph_beside_the_embed(cx: &mut TestAppContext) {
+    let src = format!("ab\n\n{MARKER}");
+    let end = 4 + MARKER.len();
+    let (_, editor) = embed_editor(cx, &src, end);
+    apply(
+        cx,
+        &editor,
+        EditorEvent::Paste {
+            text: "pasted".into(),
+            internal: false,
+        },
     );
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), format!("ab\n\n{MARKER}\n\npasted"));
+    });
+    assert_embed_blocks(cx, &editor, 1);
+}
+
+#[gpui::test]
+fn inserting_a_second_marker_at_an_edge_is_not_padded_twice(cx: &mut TestAppContext) {
+    // `insert_embed_marker` pads its own insertion; the line protection must
+    // count those newlines rather than stack another blank line on top.
+    let src = MARKER.to_string();
+    let (_, editor) = embed_editor(cx, &src, MARKER.len());
+    editor.update(cx, |e, cx| {
+        e.set_embeds(
+            [
+                (1u64, "quoted **text**".to_string()),
+                (2u64, "second quote".to_string()),
+            ],
+            cx,
+        );
+        e.insert_embed_marker(2, cx);
+    });
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), format!("{MARKER}\n\n{{{{ embed 2 }}}}"));
+    });
+    assert_embed_blocks(cx, &editor, 2);
+}
+
+/// Assert the document renders exactly `n` embed blocks.
+fn assert_embed_blocks(cx: &mut TestAppContext, editor: &Entity<MarkdownEditorState>, n: usize) {
+    let spec = editor.read_with(cx, |e, _| e.render_spec());
+    let got = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.kind, BlockKind::Embed { .. }))
+        .count();
+    assert_eq!(got, n, "expected {n} embed block(s); got {spec:#?}");
 }
 
 #[gpui::test]
@@ -579,13 +639,13 @@ fn set_embeds_snaps_a_selection_inside_a_newly_mapped_marker(cx: &mut TestAppCon
         );
     });
 
-    // Typing now lands at the snapped edge — the marker bytes stay intact
-    // (the trailing-edge type degrades the block honestly, never corrupts it).
+    // Typing now lands at the snapped edge — the marker bytes stay intact,
+    // and the line protection opens a fresh paragraph beside the block.
     type_str(cx, &editor, "x");
     editor.read_with(cx, |e, _| {
         let v = e.value();
         assert!(
-            v == format!("x{MARKER}") || v == format!("{MARKER}x"),
+            v == format!("x\n\n{MARKER}") || v == format!("{MARKER}\n\nx"),
             "typed text must not splice into the marker; got {v:?}"
         );
     });

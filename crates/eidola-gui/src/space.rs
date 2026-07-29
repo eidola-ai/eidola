@@ -115,10 +115,13 @@ pub struct PostBlockSpan {
 /// [`Self::new`], which derives the byline from the role and leaves the ids
 /// `None`.
 ///
-/// Reasoning is ephemeral session state — the local DB stores only the
-/// assistant's final content — so older posts from a re-loaded space carry
-/// `reasoning = None`. New assistant posts adopt whatever reasoning was
-/// captured for their action id at finalize.
+/// Reasoning is **durable**: an inference's captured thinking is persisted as
+/// a `thinking` content block beside its `text` block, so a re-loaded space
+/// still shows the disclosure. [`Self::from_post`] splits the two — `text`
+/// blocks are the readable body (and the only quotable ones), the `thinking`
+/// block is the disclosure. The in-flight capture on `StreamingResponse` is
+/// still attached at finalize so the disclosure never blinks out in the frame
+/// between the stream ending and the reload landing.
 #[derive(Clone)]
 pub struct ChatMessageView {
     pub message: SpaceMessage,
@@ -184,8 +187,12 @@ impl ChatMessageView {
     }
 
     /// A row from the persisted post tree: the body is the post's concatenated
-    /// text blocks, the byline is its participant identity, and the post ids
-    /// are carried for hover wiring.
+    /// **text** blocks, the byline is its participant identity, and the post
+    /// ids are carried for hover wiring. A `thinking` block (the model's own
+    /// reasoning, persisted by `TurnPrep::persist_turn`) is lifted out of the
+    /// body into [`Self::reasoning`] — it is a disclosure, not prose: it must
+    /// not join the reading column, and it must not be quotable (the block
+    /// spans that back a selection→quote carry only text blocks).
     pub fn from_post(node: PostNode) -> Self {
         let role = match node.action_type.as_str() {
             "user_input" => "user",
@@ -195,17 +202,27 @@ impl ChatMessageView {
         }
         .to_string();
         // Concatenate the text blocks, recording each block's span within the
-        // joined content (the selection→quote mapping).
+        // joined content (the selection→quote mapping); collect the thinking
+        // blocks separately as the disclosure.
         let mut content = String::new();
         let mut blocks = Vec::new();
+        let mut reasoning = String::new();
         for b in &node.blocks {
-            if let Some(text) = b.text.as_deref() {
-                let start = content.len();
-                content.push_str(text);
-                blocks.push(PostBlockSpan {
-                    block_id: b.id.clone(),
-                    range: start..content.len(),
-                });
+            let Some(text) = b.text.as_deref() else {
+                continue;
+            };
+            match b.block_type.as_str() {
+                "text" => {
+                    let start = content.len();
+                    content.push_str(text);
+                    blocks.push(PostBlockSpan {
+                        block_id: b.id.clone(),
+                        range: start..content.len(),
+                    });
+                }
+                "thinking" => reasoning.push_str(text),
+                // Other typed blocks (tool_use/…) have no v1 render.
+                _ => {}
             }
         }
         let byline = byline_for_participant(&node.participant.kind, &node.participant.label);
@@ -222,7 +239,7 @@ impl ChatMessageView {
             generation_count: node.generation_count,
             references: node.references,
             blocks,
-            reasoning: None,
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
             reasoning_expanded: false,
         }
     }
@@ -256,6 +273,27 @@ fn byline_for_participant(kind: &str, label: &str) -> String {
 /// Map a freshly-loaded post tree into render rows.
 fn views_from_nodes(nodes: Vec<PostNode>) -> Vec<ChatMessageView> {
     nodes.into_iter().map(ChatMessageView::from_post).collect()
+}
+
+/// The optimistic user turn a save appends before its post is durable.
+///
+/// **It carries `reply_to` as its structural parent.** Without it the row is
+/// unparented, and `space_view::model::build_tree` chains an unparented row
+/// onto the previous row in the flat list — which is the *tail of the
+/// transcript*, not the post being replied to. Posting into a **branch** then
+/// momentarily emptied that branch of everything but its first sibling; gpui
+/// clamps the parent strip's scroll offset to the single remaining page, and
+/// the branch selection was gone by the time the reload restored the second
+/// child. Carrying the parent keeps the new post in the very slot the draft
+/// occupied, so the selected branch survives the save with no re-selection
+/// dance and no visible flash.
+fn optimistic_user_turn(prompt: &str, reply_to: Option<&str>) -> ChatMessageView {
+    let mut view = ChatMessageView::new(SpaceMessage {
+        role: "user".to_string(),
+        content: prompt.to_string(),
+    });
+    view.parent_action_id = reply_to.map(str::to_string);
+    view
 }
 
 /// Semantic events a `Space` emits. `cx.observe` covers plain re-render; these
@@ -528,7 +566,13 @@ impl Space {
     /// operation's own reload is authoritative — so
     /// [`Self::apply_loaded_transcript`] drops it and
     /// [`Self::on_space_changed`] defers to the operation's reload.
-    fn is_busy(&self) -> bool {
+    ///
+    /// Public because it is also the honest answer to "has this exchange
+    /// settled?", which is what bounds the space view's post-submit tail pin
+    /// (`space_view::follow_streaming_tail`): between the save landing and the
+    /// response streaming there is no stream to observe, but the document is
+    /// still the exchange's to grow.
+    pub fn is_busy(&self) -> bool {
         self.post_runner.is_some() || !self.streams.is_empty() || !self.turn_runners.is_empty()
     }
 
@@ -664,15 +708,21 @@ impl Space {
         true
     }
 
-    /// Merge a fresh post-tree render list into the transcript, preserving any
-    /// previously-attached reasoning by index (we only ever append, so
-    /// positions are stable) and attaching just-captured streaming reasoning
-    /// to its finalized post. `new_reasoning` is `(action_id, reasoning)` —
-    /// attached to the row with that action id (the turn's persisted
-    /// response), falling back to the last assistant entry when the id is
-    /// unknown. The incoming rows carry the byline + post ids from the tree;
-    /// only the ephemeral reasoning state is carried forward from the prior
-    /// snapshot.
+    /// Merge a fresh post-tree render list into the transcript, carrying the
+    /// **disclosure state** forward by index (we only ever append, so positions
+    /// are stable) and attaching just-captured streaming reasoning to its
+    /// finalized post. `new_reasoning` is `(action_id, reasoning)` — attached
+    /// to the row with that action id (the turn's persisted response), falling
+    /// back to the last assistant entry when the id is unknown.
+    ///
+    /// The reasoning **text** now comes from the DB (a persisted `thinking`
+    /// block), so the prior snapshot is only a *fallback* for it: it fills a
+    /// row whose reasoning the tree didn't carry (the frame between a stream
+    /// ending and its reload landing, or a build whose upstream emitted no
+    /// thinking). It must never overwrite what the tree supplied — that would
+    /// blank a reloaded space's disclosure with a stale `None`. `expanded`, by
+    /// contrast, is pure view state and is always carried forward, so a reload
+    /// doesn't collapse an open disclosure under the reader.
     fn merge_from_db(
         &mut self,
         mut next: Vec<ChatMessageView>,
@@ -685,7 +735,9 @@ impl Space {
                 p.message.role == entry.message.role && p.message.content == entry.message.content
             });
             if same_position {
-                entry.reasoning = prior_entry.and_then(|p| p.reasoning.clone());
+                if entry.reasoning.is_none() {
+                    entry.reasoning = prior_entry.and_then(|p| p.reasoning.clone());
+                }
                 entry.reasoning_expanded = prior_entry.is_some_and(|p| p.reasoning_expanded);
             }
         }
@@ -838,14 +890,13 @@ impl Space {
         // eagerly).
         self.supersede_load_for_mutation();
 
-        // Append the user's turn locally. This mutation is what a
-        // submit-vs-load race must not clobber; since the same entity owns the
-        // load, the guard drops the stale result.
+        // Append the user's turn locally, **under its reply antecedent** (see
+        // `optimistic_user_turn` — this is what keeps a branch reply on its own
+        // branch across the save). This mutation is what a submit-vs-load race
+        // must not clobber; since the same entity owns the load, the guard
+        // drops the stale result.
         let mut messages = self.transcript.value().cloned().unwrap_or_default();
-        messages.push(ChatMessageView::new(SpaceMessage {
-            role: "user".to_string(),
-            content: prompt.clone(),
-        }));
+        messages.push(optimistic_user_turn(&prompt, reply_to.as_deref()));
         self.transcript = Loadable::loaded(messages);
         cx.emit(SpaceEvent::MessagesChanged);
         cx.notify();
@@ -954,13 +1005,10 @@ impl Space {
         self.last_submitted_references = references.clone();
         self.supersede_load_for_mutation();
 
-        // Optimistically append the user's turn (no streaming state — this path
-        // requests nothing).
+        // Optimistically append the user's turn under its reply antecedent (no
+        // streaming state — this path requests nothing).
         let mut messages = self.transcript.value().cloned().unwrap_or_default();
-        messages.push(ChatMessageView::new(SpaceMessage {
-            role: "user".to_string(),
-            content: prompt.clone(),
-        }));
+        messages.push(optimistic_user_turn(&prompt, reply_to.as_deref()));
         self.transcript = Loadable::loaded(messages);
         cx.emit(SpaceEvent::MessagesChanged);
         cx.notify();

@@ -2191,6 +2191,77 @@ fn open_space_draft(
     cx.run_until_parked();
 }
 
+/// A scene whose active tail draft **floats**: a tall eight-post transcript,
+/// the (empty) draft replying to the last post, a 760×620 window, and the page
+/// parked at the top so the draft's slot sits far below the fold. The shared
+/// setup for the composer resize-handle tests (the caret / glide tests build
+/// the same scene inline with their own draft content).
+fn open_floating_composer_scene(
+    cx: &mut TestAppContext,
+    space_id: &str,
+) -> (AnyWindowHandle, Entity<SpaceView>, VisualTestContext) {
+    use eidola_app_core::{PostBlock, PostNode, PostParticipant};
+    let post = |aid: &str, parent: Option<&str>, user: bool| PostNode {
+        action_id: aid.into(),
+        item_id: format!("item-{aid}"),
+        parent_action_id: parent.map(Into::into),
+        participant: PostParticipant {
+            kind: if user { "human".into() } else { "agent".into() },
+            label: if user { "You".into() } else { "kimi".into() },
+        },
+        action_type: if user {
+            "user_input".into()
+        } else {
+            "inference".into()
+        },
+        generation: 0,
+        generation_count: 1,
+        is_current: true,
+        model: None,
+        credits_consumed: None,
+        relation: parent.map(|_| "reply".to_string()),
+        depth: 0,
+        is_branch: false,
+        blocks: vec![PostBlock {
+            id: String::new(),
+            block_type: "text".into(),
+            text: Some(
+                "A few sentences of body text so each post has a realistic \
+                 measured height, tall enough that the transcript overflows."
+                    .into(),
+            ),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }],
+        references: Vec::new(),
+        created_at: 0,
+    };
+    let nodes: Vec<PostNode> = (0..8)
+        .map(|i| {
+            let parent = (i > 0).then(|| format!("a{}", i - 1));
+            post(&format!("a{i}"), parent.as_deref(), i % 2 == 0)
+        })
+        .collect();
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some(space_id.into()));
+    view.update(cx, |v, cx| {
+        v.space()
+            .update(cx, |s, cx| s.set_post_tree_for_test(nodes, cx));
+    });
+    cx.run_until_parked();
+    open_space_draft(&view, window, cx, Some("a7"));
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(620.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    view.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    (window, view, vcx)
+}
+
 fn dispatch_space_action<A: gpui::Action>(
     view: &Entity<SpaceView>,
     window: AnyWindowHandle,
@@ -2710,6 +2781,143 @@ fn space_reply_branches_at_target_and_clears_on_submit(cx: &mut TestAppContext) 
     view.read_with(cx, |v, _| {
         assert!(!v.has_active_draft_for_test(), "draft consumed on submit");
     });
+}
+
+#[gpui::test]
+fn space_post_in_a_new_branch_stays_on_that_branch(cx: &mut TestAppContext) {
+    // Reply on a post that already has a committed reply → a fork draft on a
+    // *second* branch, which `pending_select` brings onto the selected path.
+    // Posting it must keep that branch selected. It used to snap back to the
+    // first branch: the draft was consumed a moment before its post existed,
+    // leaving the parent's strip with a single page, whose scroll offset gpui
+    // then clamped to 0 — and the reload landed on the (now) first branch.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // a1 (root) with one committed reply a2 — so a1's band offers Reply.
+    let mut a2 = fixture_assistant_post("a2", "the first branch");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the root post"), a2], cx)
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    // Fork a new branch off a1 and post into it.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a1".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the fork draft is the active composer");
+    editor.update(&mut vcx, |e, cx| e.set_value("a second branch", cx));
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| focus.dispatch_action(&Send, window, cx));
+    vcx.run_until_parked();
+
+    // The persist lands: a3 is a1's *second* child (the branch just posted
+    // into). The view must still be on it.
+    let mut a2b = fixture_assistant_post("a2", "the first branch");
+    a2b.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "a second branch");
+    a3.parent_action_id = Some("a1".into());
+    space.update(&mut vcx, |s, cx| {
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", "the root post"), a2b, a3], cx)
+    });
+    vcx.run_until_parked();
+
+    let leaf = vcx.update(|window, cx| view.read(cx).selected_leaf_for_test(window));
+    assert_eq!(
+        leaf.as_deref(),
+        Some("a3"),
+        "posting into a new branch stays on that branch, not the first one"
+    );
+}
+
+#[gpui::test]
+fn space_draft_rethreads_onto_an_edited_parents_current_tip(cx: &mut TestAppContext) {
+    // A draft can outlive an edit of the very post it replies to — another
+    // window on the same space commits a new generation, and the shared
+    // entity's reloaded transcript then carries only that item's **current
+    // tip**. The draft still names the superseded action, which is in no
+    // current post, so the reply antecedent was silently dropped: the post
+    // landed at the space tail (durably!) instead of beside its sibling on the
+    // parent's branch. Reply threading follows *item* identity — so a draft
+    // whose parent was superseded must rethread onto that item's tip.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // a1 (root) with one committed reply a2 — so a1's band offers Reply.
+    let mut a2 = fixture_assistant_post("a2", "the first branch");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the root post"), a2], cx)
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    // Fork a new branch off a1 and type into it (an unsent, non-empty draft).
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a1".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the fork draft is the active composer");
+    editor.update(&mut vcx, |e, cx| e.set_value("a second branch", cx));
+    vcx.run_until_parked();
+
+    // Another window edits a1 while this draft is open: a new generation
+    // (`a1b`, same item) supersedes it and every reply rethreads under the tip.
+    let mut a1b = fixture_user_post("a1b", "the root post, edited");
+    a1b.item_id = "item-a1".into();
+    a1b.generation = 1;
+    a1b.generation_count = 2;
+    let mut a2b = fixture_assistant_post("a2", "the first branch");
+    a2b.parent_action_id = Some("a1b".into());
+    space.update(&mut vcx, |s, cx| {
+        s.set_post_tree_for_test(vec![a1b, a2b], cx)
+    });
+    vcx.run_until_parked();
+
+    // Post the draft.
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| focus.dispatch_action(&Send, window, cx));
+    vcx.run_until_parked();
+
+    // The optimistic row's parent is the antecedent `Space::submit` received —
+    // and therefore the one the durable post links to. It must be the item's
+    // current tip, not `None` (the space tail) and not the superseded id.
+    let parent = space.read_with(&vcx, |s, _| {
+        s.messages()
+            .last()
+            .expect("the optimistic user turn was appended")
+            .parent_action_id
+            .clone()
+    });
+    assert_eq!(
+        parent.as_deref(),
+        Some("a1b"),
+        "a draft whose parent was edited elsewhere replies to that item's \
+         current tip (got {parent:?})"
+    );
 }
 
 #[gpui::test]
@@ -3413,15 +3621,23 @@ fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
         .read_with(&vcx, |v, _| v.composer_state_for_test())
         .expect("the tail draft is the active composer");
 
+    // Scroll the page to the top **and settle a frame** so the composer's slot
+    // sits far below the fold and the composer renders floating (capped)
+    // before the edit lands. Order matters: the caret canvas branches on the
+    // frame's own docked/floating decision, and a fresh draft is docked at its
+    // home — arming the flag while that stale docked frame is still current
+    // routes the caret to the *page*, which is docked behavior, not the
+    // floating behavior under test.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    view.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
     // Type a draft far taller than the ~310px floating viewport. `InsertText`
     // leaves the caret at the end of the inserted text — below the fold.
     let long = "line of the draft that carries some words\n".repeat(40);
     editor.update(&mut vcx, |e, cx| {
         e.apply_event_for_test(EditorEvent::InsertText(long), cx)
     });
-    // Scroll the page to the top so the composer's slot sits far below the fold
-    // and the composer floats (capped) rather than docking.
-    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
     vcx.run_until_parked();
 
     view.read_with(&vcx, |v, _| {
@@ -3434,6 +3650,351 @@ fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
         assert!(
             !v.caret_scroll_pending_for_test(),
             "the caret-into-view canvas consumed the pending flag"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_scrolled_floating_composer_glides_to_its_top_by_the_dock(cx: &mut TestAppContext) {
+    // The float→dock transition for an internally-scrolled composer (the
+    // pre-dock glide, `SpaceView::glide_composer_toward_dock`). A floating
+    // composer scrolled off its own top must NOT carry that scroll into the
+    // dock: while the dock threshold sits under the floating bar (the last
+    // ≤half-window of page travel before docking), each increment of page
+    // scroll unwinds a proportional share of the internal offset, so the
+    // content sits at exactly its top the moment the composer docks. Page
+    // scrolling outside that zone must never move the internal content, the
+    // unwind must be monotone, and reversing the page mid-zone must leave the
+    // internal offset where it is (the glide never reverses) while a resumed
+    // descent still lands exactly at the top. The per-step math is unit-tested
+    // (`composer::approach_glide_offset`); this drives it through real renders
+    // at arbitrary stop/reverse/restart points.
+    use eidola_app_core::{PostBlock, PostNode, PostParticipant};
+    use gpui_markdown_editor::EditorEvent;
+    let post = |aid: &str, parent: Option<&str>, user: bool| PostNode {
+        action_id: aid.into(),
+        item_id: format!("item-{aid}"),
+        parent_action_id: parent.map(Into::into),
+        participant: PostParticipant {
+            kind: if user { "human".into() } else { "agent".into() },
+            label: if user { "You".into() } else { "kimi".into() },
+        },
+        action_type: if user {
+            "user_input".into()
+        } else {
+            "inference".into()
+        },
+        generation: 0,
+        generation_count: 1,
+        is_current: true,
+        model: None,
+        credits_consumed: None,
+        relation: parent.map(|_| "reply".to_string()),
+        depth: 0,
+        is_branch: false,
+        blocks: vec![PostBlock {
+            id: String::new(),
+            block_type: "text".into(),
+            text: Some(
+                "A few sentences of body text so each post has a realistic \
+                 measured height, tall enough that the transcript overflows."
+                    .into(),
+            ),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }],
+        references: Vec::new(),
+        created_at: 0,
+    };
+    let nodes: Vec<PostNode> = (0..8)
+        .map(|i| {
+            let parent = (i > 0).then(|| format!("a{}", i - 1));
+            post(&format!("a{i}"), parent.as_deref(), i % 2 == 0)
+        })
+        .collect();
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("glide".into()));
+    view.update(cx, |v, cx| {
+        v.space()
+            .update(cx, |s, cx| s.set_post_tree_for_test(nodes, cx));
+    });
+    cx.run_until_parked();
+    open_space_draft(&view, window, cx, Some("a7"));
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(620.)));
+    vcx.run_until_parked();
+
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the tail draft is the active composer");
+
+    // Park the page at the top (and settle a frame) so the slot sits far below
+    // the fold and the composer renders floating **before** the edit lands —
+    // the caret canvas branches on the frame's own docked/floating decision,
+    // and the fresh draft is otherwise still docked at its home. Then type a
+    // draft far taller than the ~310px floating viewport; the caret-into-view
+    // path scrolls the floating composer deep off its own top.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    view.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let long = "line of the draft that carries some words\n".repeat(40);
+    editor.update(&mut vcx, |e, cx| {
+        e.apply_event_for_test(EditorEvent::InsertText(long), cx)
+    });
+    vcx.run_until_parked();
+    // A settle frame so the glide's runway tracking has a baseline before the
+    // stepping begins (the first tracked frame only records, never steps).
+    view.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let step = |vcx: &mut VisualTestContext, view: &Entity<SpaceView>, dy: f32| -> (bool, f32) {
+        view.update(vcx, |v, cx| {
+            v.scroll_page_by_for_test(dy);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |v, _| {
+            (
+                v.composer_overlayed_for_test(),
+                v.composer_scroll_offset_y_for_test(),
+            )
+        })
+    };
+
+    let off0 = view.read_with(&vcx, |v, _| v.composer_scroll_offset_y_for_test());
+    assert!(
+        off0 < -100.0,
+        "precondition: the floating composer is scrolled well off its top \
+         (offset {off0})"
+    );
+
+    // Outside the approach zone (the slot is several hundred px below the
+    // window bottom here) page scrolling must not touch the internal offset.
+    for _ in 0..2 {
+        let (overlayed, off) = step(&mut vcx, &view, -20.0);
+        assert!(overlayed, "still floating just below the page top");
+        assert!(
+            (off - off0).abs() < 0.5,
+            "page scroll outside the approach zone moved the internal offset \
+             ({off0} -> {off})"
+        );
+    }
+
+    // Walk the page toward the dock. The offset must unwind monotonically,
+    // begin unwinding while still floating, survive a mid-zone reversal
+    // untouched, and read ~0 on the very first docked frame.
+    let mut last_off = off0;
+    let mut reversed = false;
+    let mut docked_off = None;
+    for i in 0..200 {
+        let (overlayed, off) = step(&mut vcx, &view, -40.0);
+        assert!(
+            off >= last_off - 0.01,
+            "the glide must never deepen the internal scroll (step {i}: \
+             {last_off} -> {off})"
+        );
+        last_off = off;
+        if !overlayed {
+            docked_off = Some(off);
+            break;
+        }
+        // Once the glide has visibly engaged (still floating, partially
+        // unwound), reverse the page mid-zone: the offset must hold — the
+        // glide never reverses — and the later descent still lands at 0.
+        if !reversed && off > off0 + 5.0 {
+            reversed = true;
+            for _ in 0..3 {
+                let (_, back_off) = step(&mut vcx, &view, 40.0);
+                assert!(
+                    (back_off - off).abs() < 0.5,
+                    "reversing the page must leave the internal offset where \
+                     it was ({off} -> {back_off})"
+                );
+            }
+            last_off = off;
+        }
+    }
+    let docked_off = docked_off.expect("the page walk reached the dock threshold");
+    assert!(
+        reversed,
+        "the glide must engage while the composer still floats (the offset \
+         never moved off {off0} before docking)"
+    );
+    assert!(
+        docked_off.abs() < 1.0,
+        "the internal scroll must sit at exactly its top the moment the \
+         composer docks (was {docked_off})"
+    );
+
+    // And it stays at the top through the rest of the docked traversal.
+    view.update(&mut vcx, |v, cx| {
+        v.scroll_page_to_end_for_test();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.composer_scroll_offset_y_for_test().abs() < 1.0,
+            "the docked composer stays at its top to the end of the document \
+             (offset {})",
+            v.composer_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_composer_resize_drag_pins_exact_height_and_reverts_on_deactivate(cx: &mut TestAppContext) {
+    // The separator resize handle's state machine. Grabbing the handle
+    // switches the window-local sizing to **Exact** at the bar's *current*
+    // ratio (never a jump under the grab), dragging follows the pointer as a
+    // delta clamped to the fraction bounds — sizing the bar in excess of its
+    // (unchanged) content, which Max could never do — releasing keeps the
+    // pin, and deactivating (Escape) reverts the pin to Max while the
+    // fraction itself survives as the window's cap.
+    let (_window, view, mut vcx) = open_floating_composer_scene(cx, "resize");
+    const WIN: f32 = 620.0;
+
+    let (overlayed, fraction, exact, natural) = view.read_with(&vcx, |v, _| {
+        (
+            v.composer_overlayed_for_test(),
+            v.composer_fraction_for_test(),
+            v.composer_sizing_is_exact_for_test(),
+            v.composer_float_bar_h_for_test(WIN),
+        )
+    });
+    assert!(overlayed, "the scene's tail draft floats");
+    assert!(
+        (fraction - 0.5).abs() < 1e-6 && !exact,
+        "every window opens at the default: fraction 0.5, Max sizing \
+         (fraction {fraction}, exact {exact})"
+    );
+    // The empty draft floats at its natural height, well under the cap —
+    // which is what makes "in excess of the content" observable below.
+    assert!(
+        natural < 0.5 * WIN - 1.0,
+        "precondition: the empty draft's natural bar ({natural}) rests under \
+         the 50% cap"
+    );
+
+    // Grab the handle: Exact immediately, pinned at the current height.
+    view.update(&mut vcx, |v, cx| {
+        v.begin_composer_resize_for_test(400.0, WIN, cx)
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.composer_sizing_is_exact_for_test(),
+            "grabbing the handle switches to Exact immediately"
+        );
+        let bar = v.composer_float_bar_h_for_test(WIN);
+        assert!(
+            (bar - natural).abs() < 1.0,
+            "the grab pins the bar where it rests — no jump ({natural} -> {bar})"
+        );
+    });
+
+    // Drag 150px up: the bar is exactly 150 taller — in excess of content.
+    view.update(&mut vcx, |v, cx| {
+        v.move_composer_resize_for_test(250.0, WIN, cx)
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        let bar = v.composer_float_bar_h_for_test(WIN);
+        assert!(
+            (bar - (natural + 150.0)).abs() < 1.0,
+            "the bar edge follows the pointer ({} vs {})",
+            bar,
+            natural + 150.0
+        );
+        assert!(
+            v.composer_overlayed_for_test(),
+            "still floating at the pinned height"
+        );
+    });
+
+    // Wild drags clamp to the fraction bounds (deltas are from the grab, so
+    // these don't accumulate).
+    view.update(&mut vcx, |v, cx| {
+        v.move_composer_resize_for_test(-10_000.0, WIN, cx)
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            (v.composer_fraction_for_test() - 0.85).abs() < 1e-6,
+            "dragging past the top clamps to the max fraction (got {})",
+            v.composer_fraction_for_test()
+        );
+    });
+    view.update(&mut vcx, |v, cx| {
+        v.move_composer_resize_for_test(10_000.0, WIN, cx)
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            (v.composer_fraction_for_test() - 0.1).abs() < 1e-6,
+            "dragging past the bottom clamps to the min fraction (got {})",
+            v.composer_fraction_for_test()
+        );
+    });
+
+    // Settle mid-range and release: the pin survives the drag's end.
+    view.update(&mut vcx, |v, cx| {
+        v.move_composer_resize_for_test(250.0, WIN, cx);
+        v.end_composer_resize_for_test(cx);
+    });
+    vcx.run_until_parked();
+    let pinned = view.read_with(&vcx, |v, _| {
+        assert!(
+            v.composer_sizing_is_exact_for_test(),
+            "Exact survives releasing the handle"
+        );
+        v.composer_fraction_for_test()
+    });
+
+    // Deactivate (Escape's path): the pin reverts to Max; the fraction is
+    // window state and survives as the cap until re-dragged.
+    view.update(&mut vcx, |v, cx| v.deactivate_for_test(cx));
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.composer_sizing_is_exact_for_test(),
+            "deactivation reverts the sizing to Max"
+        );
+        assert!(
+            (v.composer_fraction_for_test() - pinned).abs() < 1e-6,
+            "the fraction survives deactivation ({} vs {pinned})",
+            v.composer_fraction_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_composer_resize_reverts_to_max_when_the_draft_posts(cx: &mut TestAppContext) {
+    // Posting consumes the draft — a deactivation — so an exact-height resize
+    // reverts to Max with it (the `send_active_draft` reset path, distinct
+    // from Escape's `retire_active_draft`).
+    let (window, view, mut vcx) = open_floating_composer_scene(cx, "resize-post");
+    const WIN: f32 = 620.0;
+
+    view.update(&mut vcx, |v, cx| {
+        v.begin_composer_resize_for_test(400.0, WIN, cx);
+        v.move_composer_resize_for_test(250.0, WIN, cx);
+        v.end_composer_resize_for_test(cx);
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(v.composer_sizing_is_exact_for_test());
+    });
+
+    set_space_composer_text(&view, window, &mut vcx, "a resized draft, posted");
+    dispatch_space_action(&view, window, &mut vcx, Send);
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "the accepted post consumed the draft"
+        );
+        assert!(
+            !v.composer_sizing_is_exact_for_test(),
+            "posting reverts the sizing to Max"
         );
     });
 }
@@ -3625,6 +4186,384 @@ fn space_post_reasoning_projection_toggles(cx: &mut TestAppContext) {
             Some(("chain of thought".to_string(), true)),
             "the disclosure toggle reaches the snapshot"
         );
+    });
+}
+
+/// Seed a space whose branch is far taller than the window and start one
+/// streaming turn on it, returning the turn's seq. Shared by the two
+/// tail-following cases.
+fn seed_streaming_tall_space(
+    view: &Entity<SpaceView>,
+    window: AnyWindowHandle,
+    cx: &mut TestAppContext,
+) -> u64 {
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2], cx);
+            s.push_streaming_turn_for_test(
+                Some("agent-b".into()),
+                Some("a2".into()),
+                Default::default(),
+                cx,
+            )
+        })
+    })
+    .unwrap()
+}
+
+#[gpui::test]
+fn space_streaming_tail_follows_when_parked_at_the_end(cx: &mut TestAppContext) {
+    // Parked at the end of the branch while a turn streams: each delta grows
+    // the document, and the page stays pinned to the new end — the answer
+    // writes itself into view instead of running off the bottom.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let seq = seed_streaming_tall_space(&view, window, cx);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Park the reader at the tail.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+    let before = view.read_with(&vcx, |v, _| v.scroll_min_y_for_test());
+    assert!(
+        before < -1.0,
+        "the seeded branch must overflow the window (scroll_min_y {before})"
+    );
+
+    // The turn produces a long reply.
+    space.update(&mut vcx, |s, cx| {
+        s.push_content_delta_for_test(seq, &"streamed answer line\n".repeat(60), cx)
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let after = v.scroll_min_y_for_test();
+        assert!(
+            after < before - 1.0,
+            "the streamed reply must grow the document ({before} -> {after})"
+        );
+        assert!(
+            (v.page_scroll_offset_y_for_test() - after).abs() < 2.0,
+            "the page follows the producing tail (offset {} should track the new \
+             end {after})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_streaming_tail_does_not_yank_a_reader_who_scrolled_away(cx: &mut TestAppContext) {
+    // The other half of the contract: a reader who has scrolled back up to
+    // re-read something must be left exactly where they are, however much the
+    // streaming reply grows.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let seq = seed_streaming_tall_space(&view, window, cx);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Scroll away from the tail (all the way back to the top).
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+    let before = view.read_with(&vcx, |v, _| v.scroll_min_y_for_test());
+
+    space.update(&mut vcx, |s, cx| {
+        s.push_content_delta_for_test(seq, &"streamed answer line\n".repeat(60), cx)
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.scroll_min_y_for_test() < before - 1.0,
+            "the streamed reply must grow the document (else this proves nothing)"
+        );
+        assert!(
+            v.page_scroll_offset_y_for_test().abs() < 2.0,
+            "a reader who scrolled away is never yanked to the tail (offset {})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_streaming_tail_ignores_a_sibling_branchs_stream(cx: &mut TestAppContext) {
+    // Tail-following is scoped to the branch the reader is on. A fan-out can
+    // stream on a *sibling* branch, and while it does, the selected branch's
+    // own document still grows for the ordinary non-stream reasons the design
+    // deliberately excludes (its composer's runway, a post measuring for the
+    // first time, a post arriving from another window). None of those is a
+    // producing tail, so none of them may move the reader — even though some
+    // turn, somewhere in the space, is streaming.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    // a1 forks: a2 is the (selected) first branch, a3 the second.
+    let branch = |aid: &str| {
+        let mut p = fixture_assistant_post(aid, &long);
+        p.parent_action_id = Some("a1".into());
+        p
+    };
+    let seq = cx
+        .update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.set_post_tree_for_test(
+                    vec![fixture_user_post("a1", &long), branch("a2"), branch("a3")],
+                    cx,
+                );
+                // The turn streams on the *other* branch.
+                s.push_streaming_turn_for_test(
+                    Some("agent-b".into()),
+                    Some("a3".into()),
+                    Default::default(),
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // The reader is on the first branch (the default active page) and parked at
+    // its end.
+    let leaf = vcx.update(|window, cx| view.read(cx).selected_leaf_for_test(window));
+    assert_eq!(
+        leaf.as_deref(),
+        Some("a2"),
+        "the reader is on the first branch — the one *not* streaming"
+    );
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+    let (parked, before) = view.read_with(&vcx, |v, _| {
+        (v.page_scroll_offset_y_for_test(), v.scroll_min_y_for_test())
+    });
+    assert!(
+        before < -1.0,
+        "the selected branch must overflow the window (scroll_min_y {before})"
+    );
+
+    // The sibling's stream keeps producing — it must be irrelevant here.
+    space.update(&mut vcx, |s, cx| {
+        s.push_content_delta_for_test(seq, &"streamed answer line\n".repeat(60), cx)
+    });
+    // …while the *selected* branch grows for a non-stream reason: a post lands
+    // on it (another window's write, or this one's own reload).
+    space.update(&mut vcx, |s, cx| {
+        let mut a4 = fixture_user_post("a4", &long);
+        a4.parent_action_id = Some("a2".into());
+        s.set_post_tree_for_test(
+            vec![
+                fixture_user_post("a1", &long),
+                branch("a2"),
+                branch("a3"),
+                a4,
+            ],
+            cx,
+        )
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let after = v.scroll_min_y_for_test();
+        assert!(
+            after < before - 1.0,
+            "the selected branch's document must have grown ({before} -> {after})"
+        );
+        assert!(
+            (v.page_scroll_offset_y_for_test() - parked).abs() < 2.0,
+            "a stream on a sibling branch must not make the selected branch's \
+             own growth follow the reader (offset {} should still be {parked})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_post_parks_the_reader_at_the_tail_and_holds_it_there(cx: &mut TestAppContext) {
+    // Posting from a reader parked anywhere (here: the top of a long space)
+    // must land them at the *end* of the branch the post joined — including the
+    // post itself, which the pre-post snapshot does not carry — and hold them
+    // there while the exchange settles, so tail-following picks up when the
+    // answer starts arriving.
+    //
+    // Both halves used to be missing. The scroll measured the document before
+    // the optimistic turn reached the view's snapshot (the `MessagesChanged`
+    // emission is delivered after the submit handler returns), leaving the page
+    // a post short of the end; and the growth between the save landing and the
+    // response's first delta — the persisted post re-keyed and re-measured —
+    // moved the end out from under the reader while nothing was streaming yet.
+    // Either one leaves `at_tail` false, and the answer then writes itself off
+    // the bottom of the window.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2], cx)
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // The reader is up at the top of the transcript when they post.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a2".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the draft is the active composer");
+    editor.update(&mut vcx, |e, cx| e.set_value("a new post", cx));
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| focus.dispatch_action(&Send, window, cx));
+    vcx.run_until_parked();
+
+    let (parked, end) = view.read_with(&vcx, |v, _| {
+        assert!(v.tail_pin_for_test(), "the post arms the tail pin");
+        (v.page_scroll_offset_y_for_test(), v.scroll_min_y_for_test())
+    });
+    assert!(
+        end < -1.0,
+        "the seeded branch must overflow the window (scroll_min_y {end})"
+    );
+    assert!(
+        (parked - end).abs() < 2.0,
+        "posting parks the reader at the end of the branch, post included \
+         (offset {parked} should be the document end {end})"
+    );
+
+    // Now the production gap the pin exists for: the save is in flight and
+    // nothing is streaming yet (the stub's synthetic turn stands in for the
+    // real one, which only starts once the post has persisted). Both steps run
+    // in one update so no frame observes a settled space and retires the pin.
+    let seq = view.read_with(&vcx, |v, cx| v.space().read(cx).streams()[0].seq);
+    space.update(&mut vcx, |s, cx| {
+        s.finish_streaming_turn_for_test(seq, cx);
+        s.arm_post_runner_for_test(cx);
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, cx| {
+        assert!(!v.space().read(cx).is_streaming(), "the save window");
+        assert!(v.tail_pin_for_test(), "the pin outlives the save window");
+    });
+
+    // The persisted transcript lands: the post comes back re-keyed (a fresh
+    // node id, so it re-measures from its estimate) and the document end moves.
+    let mut a2b = fixture_assistant_post("a2", &long);
+    a2b.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", &long);
+    a3.parent_action_id = Some("a2".into());
+    space.update(&mut vcx, |s, cx| {
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2b, a3], cx)
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let after = v.scroll_min_y_for_test();
+        assert!(
+            after < end - 1.0,
+            "the persisted post must have moved the document end ({end} -> {after})"
+        );
+        assert!(
+            (v.page_scroll_offset_y_for_test() - after).abs() < 2.0,
+            "the reader is held at the end across the save (offset {} should \
+             track the new end {after})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_persisted_thinking_block_renders_the_disclosure(cx: &mut TestAppContext) {
+    // Reasoning is durable: an inference's `thinking` content block comes back
+    // from the post tree, so a *reloaded* space shows the disclosure without
+    // any live stream having run in this process. The thinking text must stay
+    // out of the reading column (it's a disclosure, not prose) and out of the
+    // quotable block spans.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut reply = fixture_user_post("a2", "The answer.");
+    reply.parent_action_id = Some("a1".into());
+    reply.action_type = "inference".into();
+    reply.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "gemma4-31b".into(),
+    };
+    // The persisted pair, in the order `persist_turn` writes them.
+    reply.blocks = vec![
+        PostBlock {
+            id: "cb-think".into(),
+            block_type: "thinking".into(),
+            text: Some("chain of thought".into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        },
+        PostBlock {
+            id: "cb-text".into(),
+            block_type: "text".into(),
+            text: Some("The answer.".into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        },
+    ];
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the question"), reply], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.post_reasoning_for_test(1),
+            Some(("chain of thought".to_string(), false)),
+            "a persisted thinking block feeds the disclosure on reload"
+        );
+    });
+    space.read_with(cx, |s, _| {
+        let reply = &s.messages()[1];
+        assert_eq!(
+            reply.message.content, "The answer.",
+            "the reading column carries only the text blocks"
+        );
+        assert_eq!(
+            reply.blocks.len(),
+            1,
+            "only text blocks are quotable; got {:?}",
+            reply.blocks
+        );
+        assert_eq!(reply.blocks[0].block_id, "cb-text");
     });
 }
 
@@ -5356,6 +6295,93 @@ fn space_removing_a_draft_quote_drops_its_marker_and_compacts_on_post(cx: &mut T
 }
 
 #[gpui::test]
+fn space_draft_footnote_can_re_embed_its_quote(cx: &mut TestAppContext) {
+    // A reference and its marker are separable — deleting the quote block in
+    // the body leaves the footnote behind — so the rail carries the way back.
+    // The affordance re-places the marker, and does **not** offer to place a
+    // second one while the block is already there.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "alpha beta gamma")],
+    );
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 0..5, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.quote(&eidola_gui::actions::Quote, window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("draft");
+    let draft_id: gpui::SharedString = view
+        .read_with(cx, |v, _| v.active_draft_id_for_test().unwrap())
+        .into();
+
+    cx.update_window(window, |_, _, cx| {
+        assert!(composer.read(cx).value().contains("{{ embed 1 }}"));
+        // Strip the marker the way a Backspace over the block would, leaving
+        // the reference (and its footnote row) in place.
+        composer.update(cx, |e, cx| e.set_value("just prose", cx));
+    })
+    .unwrap();
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.embed_draft_reference(&draft_id, 1, window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        let body = composer.read(cx).value().to_string();
+        assert!(
+            body.contains("{{ embed 1 }}"),
+            "the rail put the quote back: {body:?}"
+        );
+        assert!(body.contains("just prose"), "prose is kept: {body:?}");
+        assert_eq!(
+            body.matches("{{ embed 1 }}").count(),
+            1,
+            "exactly one marker: {body:?}"
+        );
+    })
+    .unwrap();
+
+    // The reference itself is untouched — this places a marker, it does not
+    // mint a quote.
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test()
+                .iter()
+                .map(|(o, _)| *o)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    });
+
+    // A reference the draft doesn't carry is a no-op (no stray marker).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.embed_draft_reference(&draft_id, 9, window, cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, _, cx| {
+        assert!(!composer.read(cx).value().contains("{{ embed 9 }}"));
+    })
+    .unwrap();
+}
+
+#[gpui::test]
 fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
     // A persisted post's references are removed through the existing Edit
     // session: the rail's chips mark ordinals, and committing hands them to
@@ -5763,4 +6789,161 @@ fn space_quote_survives_the_round_trip_into_the_ask_path(cx: &mut TestAppContext
     assert!(text.contains("what did you mean by this?"));
 
     drain_runtime(&core);
+}
+
+#[gpui::test]
+fn space_composer_counts_the_bottom_breath_once(cx: &mut TestAppContext) {
+    // The composer bar sizes itself to what its body draws — the editor's
+    // laid-out text plus the *tail* below it — and the bar's bottom breath is
+    // part of that tail exactly once.
+    //
+    // Which element draws the breath depends on what ends the body. With no
+    // rail it is the editor's own runway (its `min_height` fills the bar, so
+    // the breath is live notes space, not a dead strip). With a footnote rail
+    // it is the rail's own bottom padding — *inside* the span the two flow
+    // marks measure. Counting both (a measured rail whose padding is the
+    // breath, plus the breath again as a separate term) inflates the bar, and
+    // the whole floating/docking runway with it, by a pad-height: the editor's
+    // floor (`body_h − rail`) grows to swallow the surplus, opening a gap
+    // between the last line of text and the footnote rule.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let breath = eidola_gui::space_view::composer::bottom_breath();
+
+    // Phase 1 — no rail. The tail is the bare breath, drawn by the editor.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.seed_draft_quote_for_test(Some("a1"), "a plain reply", vec![], window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let (reserved, rail, text) = view
+        .read_with(cx, |v, cx| v.composer_geometry_for_test(cx))
+        .expect("the seeded draft is the active composer");
+    assert!(
+        rail.abs() < 0.5,
+        "no references, so the two flow marks coincide and the rail measures zero (was {rail})"
+    );
+    assert!(
+        (reserved - (text + breath)).abs() < 0.5,
+        "with no rail the bar reserves the editor's text plus one breath \
+         (reserved {reserved}, text {text}, breath {breath})"
+    );
+
+    // Phase 2 — a populated rail. The tail is the measured rail, which carries
+    // the breath as its own bottom padding.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.seed_draft_quote_for_test(
+                Some("a1"),
+                "a reply that quotes:\n\n{{ embed 1 }}\n\nand goes on",
+                vec![(1, "kimi-k2", "quick brown")],
+                window,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let (reserved, rail, text) = view
+        .read_with(cx, |v, cx| v.composer_geometry_for_test(cx))
+        .expect("the quoting draft is the active composer");
+    assert!(
+        rail > breath,
+        "the rail measures its rule, its row, and the breath it pads with \
+         (rail {rail}, breath {breath})"
+    );
+    assert!(
+        (reserved - (text + rail)).abs() < 0.5,
+        "with a rail the bar reserves the editor's text plus the rail's measured \
+         occupancy — the breath rides inside that span, so adding it again would \
+         reserve {breath}px the body never draws (reserved {reserved}, text {text}, \
+         rail {rail})"
+    );
+}
+
+#[gpui::test]
+fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppContext) {
+    // The rail is the composer bar's **footer**, so it must land on the bar's
+    // *visible* bottom edge in every configuration — floating, docked at the
+    // end of the document, and docked mid-ramp.
+    //
+    // Mid-ramp is where it used to fall off. `bar_h` is deliberately virtual
+    // (the dock ramp grows it toward `full_h ≥ window` so the internal scroll
+    // eases to zero), and the ramp carries the bar's *bottom* past the window
+    // edge by up to `doc_reserve` on the way down. The painted quad is clipped
+    // back to the window, but the rail was laid out at the end of the virtual
+    // runway — so the quad's clip cut exactly the rail off, and it reappeared
+    // only once the page reached the very end and the two bottoms coincided
+    // again.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.seed_draft_quote_for_test(
+                Some("a1"),
+                "a reply that quotes:\n\n{{ embed 1 }}\n\nand goes on",
+                vec![(1, "kimi-k2", "quick brown")],
+                window,
+                cx,
+            )
+        });
+    });
+    vcx.run_until_parked();
+
+    // Dock the composer at its "home" — slot top around 40% of the window,
+    // which is the middle of the dock ramp (`composer_bar_h`'s `progress`
+    // strictly between 0 and 1): the bar's virtual bottom is past the window
+    // edge while its painted quad stops at it.
+    vcx.update(|window, cx| view.update(cx, |v, cx| v.dock_active_draft_for_test(window, cx)));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The test window has no CSD insets, so its content box is the size it
+    // was resized to.
+    let win = 560.0;
+    view.read_with(&vcx, |v, cx| {
+        assert!(
+            !v.composer_overlayed_for_test(),
+            "the composer must be docked for this to test the ramp"
+        );
+        let (_, rail, _) = v
+            .composer_geometry_for_test(cx)
+            .expect("the quoting draft is the active composer");
+        assert!(rail > 0.5, "the seeded quote renders a rail (was {rail})");
+        let bottom = v.composer_rail_bottom_for_test();
+        assert!(
+            (bottom - win).abs() < 0.5,
+            "the docked rail lands on the bar's *visible* bottom edge — not \
+             clipped off below it (the bug), and not floated up above it \
+             (an over-correction): rail bottom {bottom}, window {win}"
+        );
+    });
 }

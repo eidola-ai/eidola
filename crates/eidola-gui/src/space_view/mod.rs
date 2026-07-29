@@ -88,9 +88,15 @@ pub(crate) const BODY_MAX_WIDTH: Pixels = px(600.);
 pub(crate) const POST_PAD_Y: Pixels = px(40.);
 pub(crate) const BAND_HEIGHT: Pixels = px(48.);
 
-/// The composer grows with content up to this fraction of the window, then
-/// scrolls internally; near the bottom of a branch it *docks* and grows into
-/// the page.
+/// The **default** floating-composer fraction of the window height — every
+/// window opens with it, so the out-of-the-box behavior is unchanged. The live
+/// value is per-window state ([`SpaceView::composer_fraction`], a ratio so it
+/// survives window resizes), adjusted by dragging the floating bar's separator
+/// handle and applied per [`composer::ComposerSizing`]: as a *max* (the bar
+/// grows with content up to the fraction, then scrolls internally — the
+/// resting behavior) or *exact* (the bar is pinned to the fraction while
+/// floating — entered by the resize drag, reverted on deactivation). Near the
+/// bottom of a branch the composer *docks* and grows into the page either way.
 pub(crate) const COMPOSER_MAX_FRACTION: f32 = 0.5;
 
 /// Width of the topology minimap pinned to the right edge, and the gap between
@@ -106,6 +112,12 @@ pub(crate) const MINIMAP_FADE: std::time::Duration = std::time::Duration::from_m
 /// (so a post is fully shaped just before it scrolls into view). Off-screen
 /// past this margin renders as a sized placeholder.
 pub(crate) const VIRT_MARGIN: f32 = 600.0;
+
+/// How close to the end of the document the page must sit for a streaming turn
+/// to keep it pinned there ("tail-following"). A couple of pixels of slack
+/// absorbs sub-pixel layout rounding without ever mistaking a deliberate scroll
+/// away from the tail for "still at the end".
+pub(crate) const TAIL_FOLLOW_EPSILON: f32 = 2.0;
 
 /// Vertical band (px) at the top and bottom of the viewport within which an
 /// active readonly-post selection drag autoscrolls the page.
@@ -388,6 +400,34 @@ pub struct SpaceView {
     /// Internal scroll of the floating composer overlay.
     pub(crate) composer_scroll: ScrollHandle,
     pub(crate) composer_prev_off_y: f32,
+    /// The floating composer's height as a **fraction of the window** —
+    /// window-local state (never persisted to the space, config, or shared
+    /// across windows), seeded with [`COMPOSER_MAX_FRACTION`] so every window
+    /// opens with the default. Written only by the separator-handle resize
+    /// drag; a ratio rather than pixels, so a window resize scales the bar
+    /// with it. Survives deactivation — only the *sizing mode* below reverts.
+    pub(crate) composer_fraction: f32,
+    /// How [`Self::composer_fraction`] applies to the floating bar: `Max`
+    /// (grow with content up to it — the resting behavior) or `Exact` (pinned
+    /// to it regardless of content — entered by the resize drag, so the bar
+    /// can exceed its content). Reverts to `Max` whenever the composer
+    /// deactivates or a different draft is selected
+    /// ([`Self::reset_composer_sizing`]).
+    pub(crate) composer_sizing: composer::ComposerSizing,
+    /// An in-flight separator-handle resize drag, if any (see
+    /// [`composer::ComposerResizeDrag`]). Tracked window-globally the way a
+    /// minimap drag is, so the drag keeps following after the cursor leaves
+    /// the thin strip.
+    pub(crate) composer_resize: Option<composer::ComposerResizeDrag>,
+    /// The previous frame's dock-approach runway — how far the active draft's
+    /// would-be dock top still had to travel to reach the float line, saturated
+    /// at the approach zone (see [`composer::dock_runway`]). `None` when no
+    /// active on-path draft rendered last frame, so a stale runway can never
+    /// seed a bogus first step. Consumed once per render by
+    /// [`Self::glide_composer_toward_dock`], which scales the composer's
+    /// internal scroll by the runway each frame consumes so a scrolled floating
+    /// composer's content reaches its own top exactly as the composer docks.
+    pub(crate) composer_dock_runway: Option<f32>,
     /// Whether the composer overlay is floating (vs docked), cached from the
     /// last render so the scroll handler can decide session ownership.
     pub(crate) composer_overlayed: Cell<bool>,
@@ -398,8 +438,23 @@ pub struct SpaceView {
     /// (content fits, incl. empty / one line) a wheel over it scrolls the page
     /// underneath, so it can dock, instead of being trapped scrolling nothing.
     pub(crate) composer_scrollable: Cell<bool>,
-    /// The composer's natural (unclipped) content height, recorded each frame.
+    /// The composer's natural (unclipped) content height, recorded each frame:
+    /// the editor's own laid-out text height **plus** the footnote rail's
+    /// measured height (see [`composer_rail_h`](Self::composer_rail_h)) plus
+    /// the bottom breath. Everything that sizes the composer — the floating
+    /// bar, the docked runway, the minimap — reads this one value, so what the
+    /// bar reserves is what the body actually renders.
     pub(crate) composer_content_h: Rc<RefCell<Pixels>>,
+    /// Flow positions bracketing the active composer's footnote rail, written
+    /// by the two zero-height probes the composer body places around it (see
+    /// [`references::flow_mark`]). Their difference is the rail's **measured**
+    /// occupancy — margin, rule, padding and all — which is what the bar
+    /// reserves for it, instead of a row-count formula that drifts the moment
+    /// the rail's styling changes. With no rail rendered the two coincide, so
+    /// the reservation is zero without a special case. Both paint before
+    /// `record_height`'s probe, so the sum above is consistent within a frame.
+    pub(crate) composer_rail_top: Rc<Cell<f32>>,
+    pub(crate) composer_rail_bottom: Rc<Cell<f32>>,
     /// Painted bounds of the composer's in-flow placeholder slot, keyed by the
     /// draft sentinel id — positions the dock and feeds the minimap.
     pub(crate) slot_bounds: Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>,
@@ -432,6 +487,13 @@ pub struct SpaceView {
     /// never moves the docked composer / posts / minimap (the flicker fix,
     /// generalized).
     pub(crate) scroll_min_y: Cell<f32>,
+    /// The reader just posted: extend tail-following to the growth that
+    /// follows a submit, until the exchange settles. Armed by
+    /// [`Self::settle_on_new_post`], cleared in `render` the moment the space
+    /// is neither producing nor busy — and by [`Self::activate_draft`], since a
+    /// reader who has started composing again owns the viewport. See
+    /// [`Self::follow_streaming_tail`] for why the pin is needed at all.
+    pub(crate) tail_pin: bool,
     /// Test-only record of the slot-relative offset the **docked**
     /// `caret_into_view` branch folded into the caret's document position —
     /// `page_slot_doc_top + editor_top_offset` (`caret_doc_bot - caret_bot`).
@@ -577,9 +639,15 @@ impl SpaceView {
             pending_select: None,
             composer_scroll: ScrollHandle::new(),
             composer_prev_off_y: 0.0,
+            composer_fraction: COMPOSER_MAX_FRACTION,
+            composer_sizing: composer::ComposerSizing::Max,
+            composer_resize: None,
+            composer_dock_runway: None,
             composer_overlayed: Cell::new(false),
             composer_scrollable: Cell::new(false),
             composer_content_h: Rc::new(RefCell::new(px(0.))),
+            composer_rail_top: Rc::new(Cell::new(0.0)),
+            composer_rail_bottom: Rc::new(Cell::new(0.0)),
             slot_bounds: Rc::new(RefCell::new(HashMap::new())),
             scroll_owner: None,
             band_menu: None,
@@ -589,6 +657,7 @@ impl SpaceView {
             composer_caret_scroll_pending: Cell::new(false),
             page_scroll: ScrollHandle::new(),
             scroll_min_y: Cell::new(0.0),
+            tail_pin: false,
             docked_caret_slot_offset: Cell::new(0.0),
             scrolls: HashMap::new(),
             scroller_counts: HashMap::new(),
@@ -720,6 +789,56 @@ impl SpaceView {
         self.page_scroll.offset().y.as_f32()
     }
 
+    /// The window-local floating-composer fraction and whether the sizing mode
+    /// is pinned (`Exact`) — the resize-drag state machine's observables.
+    #[doc(hidden)]
+    pub fn composer_fraction_for_test(&self) -> f32 {
+        self.composer_fraction
+    }
+
+    #[doc(hidden)]
+    pub fn composer_sizing_is_exact_for_test(&self) -> bool {
+        self.composer_sizing == composer::ComposerSizing::Exact
+    }
+
+    /// The floating bar height the current window state yields for a
+    /// `window_h`-tall window — the same helper the render, the pre-dock
+    /// glide, and the floating pad read.
+    #[doc(hidden)]
+    pub fn composer_float_bar_h_for_test(&self, window_h: f32) -> f32 {
+        self.composer_float_bar_h(px(window_h))
+    }
+
+    /// Drive the separator-handle resize drag without synthesizing mouse
+    /// events (the Library-archive precedent: tests call the same methods the
+    /// element listeners route to). `begin` grabs the bar at its current
+    /// height, exactly as the strip's mousedown does.
+    #[doc(hidden)]
+    pub fn begin_composer_resize_for_test(
+        &mut self,
+        pointer_y: f32,
+        window_h: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let bar_h = self.composer_float_bar_h(px(window_h));
+        self.start_composer_resize(pointer_y, bar_h, window_h, cx);
+    }
+
+    #[doc(hidden)]
+    pub fn move_composer_resize_for_test(
+        &mut self,
+        pointer_y: f32,
+        window_h: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_composer_resize(pointer_y, window_h, cx);
+    }
+
+    #[doc(hidden)]
+    pub fn end_composer_resize_for_test(&mut self, cx: &mut Context<Self>) {
+        self.end_composer_resize(cx);
+    }
+
     /// Scroll the whole page to the top. Tests use this to push an active tail
     /// draft's in-flow slot far below the fold, so the composer *floats* (capped
     /// at [`COMPOSER_MAX_FRACTION`]) rather than docking — the configuration in
@@ -728,6 +847,35 @@ impl SpaceView {
     pub fn scroll_page_to_top_for_test(&self) {
         let off = self.page_scroll.offset();
         self.page_scroll.set_offset(gpui::point(off.x, px(0.)));
+    }
+
+    /// Scroll the whole page by `dy` (negative = toward the document end),
+    /// clamped to the last rendered frame's valid range. Tests use it to walk
+    /// the page toward the composer's dock threshold in increments, asserting
+    /// the pre-dock glide at each step.
+    #[doc(hidden)]
+    pub fn scroll_page_by_for_test(&self, dy: f32) {
+        let off = self.page_scroll.offset();
+        let y = (off.y.as_f32() + dy).clamp(self.scroll_min_y.get(), 0.0);
+        self.page_scroll.set_offset(gpui::point(off.x, px(y)));
+    }
+
+    /// Scroll the whole page to the end of the current document — the position
+    /// tail-following keeps a streaming turn pinned to. Tests use it to park
+    /// the reader at the tail before deltas arrive.
+    #[doc(hidden)]
+    pub fn scroll_page_to_end_for_test(&self) {
+        let off = self.page_scroll.offset();
+        self.page_scroll
+            .set_offset(gpui::point(off.x, px(self.scroll_min_y.get())));
+    }
+
+    /// Whether the post-submit tail pin is armed — the widened follow gate that
+    /// carries a just-posted exchange from the save to its first delta (see
+    /// [`Self::follow_streaming_tail`]).
+    #[doc(hidden)]
+    pub fn tail_pin_for_test(&self) -> bool {
+        self.tail_pin
     }
 
     /// Whether the minimap is currently shown (tests assert scroll reveals it).
@@ -991,9 +1139,9 @@ impl SpaceView {
 
     /// Rebuild the per-row render snapshot from the shared `Space`'s transcript.
     /// Called on every space change (cheap `SharedString` projection) and at
-    /// construction. Drafts are local UI state and are left untouched (an
-    /// orphaned draft whose parent vanished re-attaches as a root in
-    /// [`Self::effective_tree`]).
+    /// construction. Drafts are local UI state, but their reply antecedent is a
+    /// reference *into* the transcript, so it is rethreaded here — see
+    /// [`Self::rethread_drafts`].
     pub(crate) fn rebuild(&mut self, cx: &mut Context<Self>) {
         let messages: Vec<crate::space::ChatMessageView> = self.space.read(cx).messages().to_vec();
         let posts: Vec<PostData> = messages
@@ -1012,7 +1160,71 @@ impl SpaceView {
                 post_data_from(m, byline, byline_backend)
             })
             .collect();
+        self.rethread_drafts(&posts);
         self.posts = posts;
+    }
+
+    /// Carry every draft's reply antecedent across a generation change of the
+    /// post it replies to.
+    ///
+    /// **Reply threading follows item identity** (workspace `AGENTS.md`: an
+    /// action id is causality, an item id is the intended logical flow) — but a
+    /// draft names its parent by *action* id, because that is the node id the
+    /// tree renders. When that generation is superseded — an edit committed
+    /// from another window on the same shared `Space`, or this window's own
+    /// Edit session, which *keeps* a non-empty fork draft — the reloaded
+    /// transcript carries only the item's new tip, and the draft's parent names
+    /// a post that is no longer there. Everything downstream then quietly
+    /// mis-threads: [`Self::effective_tree`] re-attaches the draft as its own
+    /// root, and `send_active_draft` (which only passes a parent it can find
+    /// among the current posts) drops the antecedent entirely — so the post
+    /// landed **durably** at the space tail instead of beside its sibling on
+    /// the parent's branch.
+    ///
+    /// The cure is to keep the draft pointing at the *item*: resolve the
+    /// vanished action id through the outgoing snapshot to its item, then
+    /// forward it to that item's current tip in the incoming one. Only drafts
+    /// whose parent actually vanished are touched (the common case does no
+    /// work), and an id that resolves to nothing is left alone — an honestly
+    /// orphaned draft, exactly as before.
+    fn rethread_drafts(&mut self, next: &[PostData]) {
+        if self.drafts.is_empty() {
+            return;
+        }
+        let live: HashSet<&str> = next.iter().filter_map(|p| p.action_id.as_deref()).collect();
+        let stale: Vec<SharedString> = self
+            .drafts
+            .iter()
+            .filter_map(|d| d.parent.clone())
+            .filter(|p| !live.contains(p.as_ref()))
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        for parent in stale {
+            // The superseded generation's item, from the snapshot it was last
+            // seen in, then that item's current tip in the fresh one.
+            let Some(item) = self
+                .posts
+                .iter()
+                .find(|p| p.action_id.as_deref() == Some(parent.as_ref()))
+                .and_then(|p| p.item_id.clone())
+            else {
+                continue;
+            };
+            let Some(tip) = next
+                .iter()
+                .find(|p| p.item_id.as_deref() == Some(item.as_ref()))
+                .and_then(|p| p.action_id.clone())
+            else {
+                continue;
+            };
+            for draft in &mut self.drafts {
+                if draft.parent.as_deref() == Some(parent.as_ref()) {
+                    draft.parent = Some(tip.clone());
+                }
+            }
+        }
     }
 
     /// Split a model selection id into its human display pair: the model's
@@ -1351,6 +1563,7 @@ fn post_data_from(
 ) -> PostData {
     PostData {
         action_id: m.action_id.clone().map(SharedString::from),
+        item_id: m.item_id.clone().map(SharedString::from),
         parent_action_id: m.parent_action_id.clone().map(SharedString::from),
         role: m.message.role.clone().into(),
         byline,
@@ -1515,8 +1728,29 @@ impl Render for SpaceView {
         let doc_reserve = self.doc_reserve();
         let total_doc =
             doc_reserve + self.selected_total_height(&tree, page_width, window_h) + floating_pad;
-        self.scroll_min_y
-            .set((window_h.as_f32() - total_doc).min(0.0));
+        let prev_min_y = self
+            .scroll_min_y
+            .replace((window_h.as_f32() - total_doc).min(0.0));
+
+        // **Follow the producing tail.** While a turn streams *on the branch
+        // the reader is on*, the document grows with every delta; a reader
+        // parked at the end wants to stay there, and a reader who has scrolled
+        // away must never be yanked back. A sibling branch's stream is not this
+        // reader's tail (see `selected_path_is_streaming`).
+        //
+        // A just-posted exchange follows too, via `tail_pin`: between the save
+        // landing and the response's first delta there is no stream to observe,
+        // yet the document keeps growing (the persisted post replaces the
+        // optimistic one under a new node id and re-measures from its estimate),
+        // which would drift the reader off the end before following could ever
+        // engage. The pin ends the moment the exchange settles — checked *before*
+        // following, so the tail draft `sync_tail_drafts` then docks under the
+        // finished exchange isn't itself chased.
+        let producing = self.selected_path_is_streaming(&tree, page_width);
+        if self.tail_pin && !producing && !self.space.read(cx).is_busy() {
+            self.tail_pin = false;
+        }
+        self.follow_streaming_tail(producing || self.tail_pin, prev_min_y);
 
         // While a readonly post is being drag-selected, autoscroll the page when
         // the pointer sits against a viewport edge — so a selection can pull
@@ -1542,6 +1776,17 @@ impl Render for SpaceView {
             let entity = cx.entity();
             window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
         }
+
+        // The pre-dock glide: while the dock threshold sits under the floating
+        // composer (the last `float_bar_h` of page travel before docking), each
+        // increment of page scroll consumed toward the threshold unwinds a
+        // proportional share of the composer's internal scroll, so a scrolled
+        // floating composer's content reaches its own top exactly as it docks —
+        // instead of docking mid-scroll. Render-time, after this frame's page
+        // offset is final, so every scroll source participates (wheel, minimap
+        // drag, tail-follow, programmatic docks); must run before the
+        // frozen-offset baseline below so the baseline picks up the eased value.
+        self.glide_composer_toward_dock(&tree, page_width, window_h);
 
         self.composer_prev_off_y = self.composer_scroll.offset().y.as_f32();
 
@@ -1647,6 +1892,59 @@ impl SpaceView {
             .values()
             .find(|e| e.read(cx).is_selecting())
             .cloned()
+    }
+
+    /// **Tail-following.** While a response streams, the document grows with
+    /// every delta. If the reader is parked at the end of the branch, keep them
+    /// there — the answer should write itself into view. If they have scrolled
+    /// away to re-read something, leave them exactly where they are.
+    ///
+    /// The "am I at the end?" question is answered by *observation*, not by a
+    /// flag: the page is following iff its current offset still sits at the
+    /// **previous** frame's end-of-document (`prev_min_y`, the value
+    /// `scroll_min_y` held before this frame's document was measured). That
+    /// makes every scroll source — the wheel, a minimap drag, selection
+    /// autoscroll, a programmatic dock — participate for free, with no state to
+    /// keep in sync: scrolling up leaves the band and following stops;
+    /// scrolling back down re-enters it and following resumes. There is no
+    /// "sticky" mode to get wedged.
+    ///
+    /// Deliberately gated on `producing` — **the selected path carries a live
+    /// stream** ([`Self::selected_path_is_streaming`]), not merely "some turn in
+    /// this space is streaming". A growing document is otherwise the composer's
+    /// runway or a post measuring for the first time, and neither should move
+    /// the reader; composer growth keeps its own caret-into-view path
+    /// (`composer::caret_into_view`), which this must not race. Scoping to the
+    /// space would have re-opened exactly that race whenever a fan-out streamed
+    /// on a *sibling* branch — a routine Participants-v1 state, and one in which
+    /// the reader's own branch is by definition not producing.
+    ///
+    /// The one deliberate widening is the post-submit pin ([`Self::tail_pin`],
+    /// folded into `producing` by the caller): a submit *is* the reader's own
+    /// branch producing, but the stream that proves it only starts once the post
+    /// has persisted and the notification plan resolves. Across that gap the
+    /// document still grows, and a reader parked at the end by
+    /// [`Self::settle_on_new_post`] would be left above it — with `at_tail`
+    /// false by the time the first delta arrives, so following never engaged and
+    /// the answer wrote itself off the bottom of the window. The pin is bounded
+    /// by the exchange (`Space::is_busy`) and by the reader starting a new
+    /// draft, so it never reaches the composer-runway growth the gate excludes.
+    ///
+    /// Runs in `render` immediately after `scroll_min_y` is set for the frame,
+    /// so every consumer of `clamped_scroll_y` sees the followed position.
+    fn follow_streaming_tail(&self, producing: bool, prev_min_y: f32) {
+        if !producing {
+            return;
+        }
+        let off = self.page_scroll.offset();
+        let at_tail = off.y.as_f32() <= prev_min_y + TAIL_FOLLOW_EPSILON;
+        if !at_tail {
+            return; // the reader scrolled away — never yank them back
+        }
+        let target = self.scroll_min_y.get();
+        if (target - off.y.as_f32()).abs() > 0.5 {
+            self.page_scroll.set_offset(gpui::point(off.x, px(target)));
+        }
     }
 
     /// While a readonly post is being drag-selected, scroll the page toward
