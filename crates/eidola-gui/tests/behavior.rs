@@ -6452,3 +6452,74 @@ fn space_composer_counts_the_bottom_breath_once(cx: &mut TestAppContext) {
          rail {rail})"
     );
 }
+
+#[gpui::test]
+fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppContext) {
+    // The rail is the composer bar's **footer**, so it must land on the bar's
+    // *visible* bottom edge in every configuration — floating, docked at the
+    // end of the document, and docked mid-ramp.
+    //
+    // Mid-ramp is where it used to fall off. `bar_h` is deliberately virtual
+    // (the dock ramp grows it toward `full_h ≥ window` so the internal scroll
+    // eases to zero), and the ramp carries the bar's *bottom* past the window
+    // edge by up to `doc_reserve` on the way down. The painted quad is clipped
+    // back to the window, but the rail was laid out at the end of the virtual
+    // runway — so the quad's clip cut exactly the rail off, and it reappeared
+    // only once the page reached the very end and the two bottoms coincided
+    // again.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.seed_draft_quote_for_test(
+                Some("a1"),
+                "a reply that quotes:\n\n{{ embed 1 }}\n\nand goes on",
+                vec![(1, "kimi-k2", "quick brown")],
+                window,
+                cx,
+            )
+        });
+    });
+    vcx.run_until_parked();
+
+    // Dock the composer at its "home" — slot top around 40% of the window,
+    // which is the middle of the dock ramp (`composer_bar_h`'s `progress`
+    // strictly between 0 and 1): the bar's virtual bottom is past the window
+    // edge while its painted quad stops at it.
+    vcx.update(|window, cx| view.update(cx, |v, cx| v.dock_active_draft_for_test(window, cx)));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The test window has no CSD insets, so its content box is the size it
+    // was resized to.
+    let win = 560.0;
+    view.read_with(&vcx, |v, cx| {
+        assert!(
+            !v.composer_overlayed_for_test(),
+            "the composer must be docked for this to test the ramp"
+        );
+        let (_, rail, _) = v
+            .composer_geometry_for_test(cx)
+            .expect("the quoting draft is the active composer");
+        assert!(rail > 0.5, "the seeded quote renders a rail (was {rail})");
+        let bottom = v.composer_rail_bottom_for_test();
+        assert!(
+            (bottom - win).abs() < 0.5,
+            "the docked rail lands on the bar's *visible* bottom edge — not \
+             clipped off below it (the bug), and not floated up above it \
+             (an over-correction): rail bottom {bottom}, window {win}"
+        );
+    });
+}

@@ -718,14 +718,15 @@ impl SpaceView {
         let mut rail = self.rail_frame(cx);
         if measure {
             // The active composer's rail is the last thing in the bar, so it
-            // carries the bar's bottom breath — [`composer::bottom_breath`],
-            // the mirror of the `half_pad` chrome above the byline. Keeping it
+            // carries the bar's bottom breath — [`composer::rail_breath`], a
+            // post's full bottom pad (the half-pad that mirrors the chrome
+            // above the byline reads as crowding under a ruled row). Keeping it
             // *inside* the measured rail (rather than folding it in as a
             // separate term) is what stops the last footnote row sitting flush
             // against the window edge — and it is why `record_height` takes the
             // **max** of this measured span and the bare breath rather than
             // their sum: the breath below the composer is drawn once, here.
-            rail = rail.pb(px(super::composer::bottom_breath()));
+            rail = rail.pb(px(super::composer::rail_breath()));
         }
         for (idx, r) in refs.iter().enumerate() {
             let row = FootnoteRow {

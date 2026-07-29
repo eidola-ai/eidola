@@ -623,6 +623,25 @@ impl SpaceView {
         let content_shift = top_y - bar_top; // ≤ 0: inner content overhang
         let quad_h = (bar_h + content_shift).min(win - bar_top).max(0.0);
         let covers_top = bar_top <= 0.5;
+        // **What the quad clipped, the footer must not lose.** `bar_h` is
+        // virtual (see above), and mid-dock the ramp carries the bar's *bottom*
+        // past the window edge: the bar's bottom is `top_y + bar_h`, which the
+        // ramp drives from exactly `win` (at the float line) to `doc_reserve +
+        // full_h` (fully docked) — always ≥ `win`, by up to a `doc_reserve`.
+        // The `.min()` above clips the painted quad back to the window, and the
+        // footnote rail — laid out at the end of the body's flow, i.e. at the
+        // end of the *virtual* runway — went with the clipped part. Hence the
+        // rail vanishing on a docked composer and reappearing only once the
+        // page reached the very end, where the two bottoms coincide again.
+        //
+        // The rail is the bar's footer, so it belongs on the bar's *visible*
+        // bottom edge. Taking the clipped tail out of the editor's runway floor
+        // below moves the rail up by exactly what was cut — no more, so it
+        // still lands flush on that edge with its own breath beneath it. When
+        // the draft's text is genuinely taller than the runway the floor
+        // doesn't bind, and the rail keeps following the text below the fold
+        // (where the page scroll reaches it) rather than overlaying it.
+        let clipped_tail = (bar_h + content_shift - quad_h).max(0.0);
         // The composer scrolls internally only when floating *and* its content
         // exceeds the visible bar — i.e. it's capped at `COMPOSER_MAX_FRACTION`.
         // When it's floating at its natural height (content fits, incl. empty /
@@ -718,9 +737,12 @@ impl SpaceView {
                     // The footnote rail below shares the bar's height, so the
                     // editor's runway floor is the bar minus the rail — the
                     // rows are single-line by construction (`truncate`), so
-                    // the reservation is exact rather than a guess.
+                    // the reservation is exact rather than a guess — minus
+                    // whatever the window clipped off the bar's virtual bottom
+                    // (`clipped_tail`), so the rail lands on the *visible*
+                    // edge instead of below it.
                     .style(prose_style(cx))
-                    .min_height(px((body_h - draft_rail_h).max(0.0))),
+                    .min_height(px((body_h - draft_rail_h - clipped_tail).max(0.0))),
             )
             // The draft's pending quotes, as footnotes — the same rail a
             // posted exchange carries, right where it will be once posted.
@@ -965,6 +987,33 @@ impl SpaceView {
         let text = draft.editor.read(cx).content_height().as_f32();
         Some((reserved, rail, text))
     }
+
+    /// Dock the active draft at its "home" (the composer's own "See in
+    /// context" verb): slot top around 40% of the window, which lands the bar
+    /// in the *middle* of the dock ramp — the configuration whose geometry
+    /// differs most from both floating and end-of-document docked.
+    #[doc(hidden)]
+    pub fn dock_active_draft_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.go_home(window, cx);
+    }
+
+    /// Whether the composer floated (vs docked into its slot) on the last
+    /// rendered frame — the precondition tests state before asserting anything
+    /// about docked geometry.
+    #[doc(hidden)]
+    pub fn composer_overlayed_for_test(&self) -> bool {
+        self.composer_overlayed.get()
+    }
+
+    /// The footnote rail's painted bottom edge in **window** coordinates (the
+    /// lower flow mark's own position, so it includes the rail's bottom
+    /// breath). Tests assert it stays inside the window in every composer
+    /// configuration — the rail is the bar's footer, not something that hangs
+    /// off the end of the virtual dock runway.
+    #[doc(hidden)]
+    pub fn composer_rail_bottom_for_test(&self) -> f32 {
+        self.composer_rail_bottom.get()
+    }
 }
 
 /// A small muted keyboard hint beside a verb (shown while ⌥ is held).
@@ -984,6 +1033,20 @@ fn kbd_hint(text: &'static str, color: gpui::Hsla) -> gpui::Div {
 /// dead strip. One function, both call sites, so the two can't drift.
 pub fn bottom_breath() -> f32 {
     POST_PAD_Y.as_f32() / 2.0
+}
+
+/// The breath kept **below the footnote rail** — a post's full bottom pad
+/// rather than the bar's half-pad [`bottom_breath`].
+///
+/// The rail is a ruled, text-bearing footer, not the tail of the writing
+/// surface: at the half-pad the last footnote row read as crowded against the
+/// window edge, where the same half-pad under a bare runway reads as open notes
+/// space. So the rail keeps the page's own vertical rhythm (`POST_PAD_Y`, what
+/// a post pads with) beneath it. It rides *inside* the span the two flow marks
+/// measure, so `record_height`'s `max(rail, breath)` still counts the bar's
+/// bottom breath exactly once.
+pub fn rail_breath() -> f32 {
+    POST_PAD_Y.as_f32()
 }
 
 use crate::probe::Probe as _;
