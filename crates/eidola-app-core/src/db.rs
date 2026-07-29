@@ -2619,6 +2619,12 @@ pub struct SpaceActionRow {
 /// branch-scoped thread instead). Filters to terminal statuses and to the
 /// *current* generation of each item (via item_current), so superseded
 /// generations never enter the context the model sees.
+///
+/// **Only `text` blocks are joined.** An inference's persisted `thinking`
+/// block is the model's own reasoning; it is a render-side disclosure, never
+/// part of a conversation's readable text (and never something we replay to a
+/// model). The filter rides the `LEFT JOIN`'s `ON` clause so an action with no
+/// text block still yields its row.
 pub async fn get_space_actions_for_context(
     conn: &Connection,
     space_id: &str,
@@ -2639,7 +2645,8 @@ pub async fn get_space_actions_for_context(
                           MIN(created_at) AS born_at, MIN(id) AS first_action_id \
                    FROM action GROUP BY space_id, item_id) origin \
                ON origin.space_id = a.space_id AND origin.item_id = a.item_id \
-             LEFT JOIN content_block cb ON cb.action_id = a.id \
+             LEFT JOIN content_block cb \
+               ON cb.action_id = a.id AND cb.block_type = 'text' \
              WHERE a.space_id = ?1 \
                AND a.status IN ('complete', 'cancelled') \
              ORDER BY origin.born_at ASC, origin.first_action_id ASC, cb.ordinal ASC",
@@ -2673,6 +2680,10 @@ pub async fn get_space_actions_for_context(
 /// see its own prior output); a fresh reply (`ResponseMode::Reply`) walks from
 /// the post being answered *inclusive* — on a linear thread that is the whole
 /// conversation, and on a branched space it is exactly the target's branch.
+///
+/// Like `get_space_actions_for_context`, only `text` blocks are joined: a
+/// persisted `thinking` block is a render-side disclosure of one agent's own
+/// reasoning and is never replayed upstream.
 pub async fn get_upstream_context(
     conn: &Connection,
     target_action_id: &str,
@@ -2713,7 +2724,8 @@ pub async fn get_upstream_context(
                         cb.text_content, cb.ordinal \
                  FROM action a \
                  JOIN participant p ON p.id = a.participant_id \
-                 LEFT JOIN content_block cb ON cb.action_id = a.id \
+                 LEFT JOIN content_block cb \
+                   ON cb.action_id = a.id AND cb.block_type = 'text' \
                  WHERE a.id = ?1 \
                    AND a.status IN ('complete', 'cancelled') \
                  ORDER BY cb.ordinal ASC",

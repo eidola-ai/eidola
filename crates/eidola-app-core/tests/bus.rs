@@ -47,6 +47,17 @@
 //! action/content/antecedent inserts stays *unemitted* — internal-consistency
 //! (kill-`-9`-class) failures, not durable partial state to reconcile.
 //!
+//! **Reasoning is durable, and adds no exit point.** A turn whose upstream
+//! emitted thinking (`delta.reasoning_content` / `delta.reasoning` on the
+//! stream, `message.reasoning_content` / `.reasoning` on the blocking body)
+//! writes an extra `thinking` content block inside `TurnPrep::persist_turn`,
+//! ordinal 0, ahead of the `text` block. It rides the success arm's existing
+//! `Space` + `Record` emissions — same commit, same exit point, no new row in
+//! this table. Covered by `chat_path.rs`
+//! (`streamed_reasoning_persists_as_a_thinking_block`,
+//! `blocking_reasoning_persists_as_a_thinking_block`,
+//! `persisted_thinking_is_not_sent_upstream`).
+//!
 //! **Re-request (`respond_stream`).** The GUI's failed-ask "Retry" path calls
 //! `AppCore::respond_stream`, which is exactly the `run_turn_stream(Reply)` half
 //! of `chat_stream` with **no leading `post`** — it requests a response to an

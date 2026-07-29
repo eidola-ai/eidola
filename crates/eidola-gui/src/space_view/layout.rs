@@ -161,8 +161,8 @@ pub fn estimate_post_height(
 
 use super::model::{NodeSrc, TreeNode};
 use super::{
-    BAND_HEIGHT, BODY_MAX_WIDTH, COMPOSER_MAX_FRACTION, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y,
-    PROSE_FONT_SIZE, PROSE_LINE_HEIGHT, PROSE_PARAGRAPH_GAP, SpaceView, TITLE_BAR_RESERVE,
+    BAND_HEIGHT, BODY_MAX_WIDTH, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y, PROSE_FONT_SIZE,
+    PROSE_LINE_HEIGHT, PROSE_PARAGRAPH_GAP, SpaceView, TITLE_BAR_RESERVE,
 };
 use gpui::Pixels;
 
@@ -197,8 +197,13 @@ impl SpaceView {
         ((scrolled / stride).round() as i64).clamp(0, count as i64 - 1) as usize
     }
 
-    /// Half the document's inter-post spacing — the composer bar's fixed top
-    /// chrome.
+    /// Half the document's inter-post spacing — the composer bar's **total**
+    /// fixed top chrome (bar top edge → editor content). Every height / dock /
+    /// runway computation uses this total; the render alone splits it at the
+    /// scroll clip — a thin pane-separator band outside
+    /// ([`super::composer::COMPOSER_SEPARATOR_H`]) and the remainder as an
+    /// in-content spacer ([`super::composer::composer_scroll_gap`]) — so the
+    /// split is invisible until the composer scrolls internally.
     pub(crate) fn composer_chrome() -> f32 {
         POST_PAD_Y.as_f32() / 2.0
     }
@@ -367,6 +372,30 @@ impl SpaceView {
             })
     }
 
+    /// Whether the **selected path** carries a live streaming overlay — the
+    /// honest scope for tail-following (`follow_streaming_tail`).
+    ///
+    /// "Is some turn streaming?" is a *space*-wide question, and Participants v1
+    /// makes concurrent turns on sibling branches ordinary: a fan-out streams
+    /// several replies at once, each attached at its own target post. The reader
+    /// is on exactly one branch, and only *that* branch's tail is producing for
+    /// them. Answering the space-wide question would let a sibling's stream
+    /// re-enable following for a selected branch whose own growth is the
+    /// composer's runway or a post measuring for the first time — precisely the
+    /// non-stream growth the design excludes (and which the composer's own
+    /// `caret_into_view` path owns). Like every other selection question here it
+    /// is answered by *observation* of the tree the frame actually renders — no
+    /// flag, no mode.
+    pub(crate) fn selected_path_is_streaming(
+        &self,
+        roots: &[TreeNode],
+        page_width: Pixels,
+    ) -> bool {
+        self.selected_levels(roots, page_width)
+            .into_iter()
+            .any(|(sibs, active)| matches!(sibs[active].src, NodeSrc::Streaming(_)))
+    }
+
     /// Document-space top of a node that is **on the selected path** (after
     /// `select_path_to`), by accumulating heights down the path. `None` if the
     /// node isn't on the selected path.
@@ -441,12 +470,32 @@ impl SpaceView {
         }
     }
 
+    /// The floating composer bar's height under the window's live sizing
+    /// state: the natural content height (`composer_chrome() + content`)
+    /// capped at `composer_fraction · window` (**Max**, the resting behavior),
+    /// or pinned to exactly that fraction regardless of content (**Exact**,
+    /// entered by the separator-handle resize drag). The one place the
+    /// window-local fraction meets geometry — the composer render, the
+    /// pre-dock glide, and the off-branch floating pad all read this, so they
+    /// can never disagree on the bar. Pure core:
+    /// [`super::composer::float_bar_height`], unit-tested.
+    pub(crate) fn composer_float_bar_h(&self, window_h: Pixels) -> f32 {
+        let natural = Self::composer_chrome() + self.composer_content_h.borrow().as_f32();
+        super::composer::float_bar_height(
+            natural,
+            self.composer_fraction,
+            window_h.as_f32(),
+            self.composer_sizing,
+        )
+    }
+
     /// Bottom padding the page needs so the selected branch's tail can scroll
     /// clear of a *floating, off-branch* active draft. On the draft's own branch
     /// its in-flow slot already reserves the room (it docks), so this is zero;
-    /// off-branch the floating bar (its content height, capped at half the
-    /// window) occludes the bottom, so pad by it. This is what lets the minimap
-    /// and the scroll range account for a foreign floating draft (item 4).
+    /// off-branch the floating bar occludes the bottom, so pad by its height
+    /// ([`Self::composer_float_bar_h`] — fraction- and sizing-aware). This is
+    /// what lets the minimap and the scroll range account for a foreign
+    /// floating draft (item 4).
     pub(crate) fn floating_pad(
         &self,
         roots: &[TreeNode],
@@ -459,9 +508,7 @@ impl SpaceView {
         if self.selected_leaf_id(roots, page_width).as_deref() == Some(active) {
             return 0.0; // on its own branch — docks, no extra room needed
         }
-        let win = window_h.as_f32();
-        let content = self.composer_content_h.borrow().as_f32();
-        (Self::composer_chrome() + content).min(COMPOSER_MAX_FRACTION * win)
+        self.composer_float_bar_h(window_h)
     }
 }
 

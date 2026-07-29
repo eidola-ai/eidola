@@ -306,6 +306,12 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
             .any(|n| n.starts_with("space/request-panel") || *n == "space/composer/model"),
         "the retired model picker must record no probes; recorded: {names:?}"
     );
+    // The floating composer's separator doubles as its resize handle (this
+    // scene's root draft floats off-path over the seeded branch).
+    assert!(
+        names.contains(&"space/composer/resize"),
+        "floating composer resize-handle probe missing; recorded: {names:?}"
+    );
     // The minimap is a navigable table of contents: a labelled Group of
     // per-node Buttons.
     assert!(
@@ -352,6 +358,12 @@ fn space_composer_alt_reveals_post_quiet_probe(cx: &mut TestAppContext) {
     assert!(
         names.contains(&"space/composer/post-quiet".to_string()),
         "⌥ must reveal Post quietly; recorded: {names:?}"
+    );
+    // This scene's blank-space composer is docked (page geometry, not a
+    // floating pane), so it offers no resize handle.
+    assert!(
+        !names.contains(&"space/composer/resize".to_string()),
+        "a docked composer must offer no resize handle; recorded: {names:?}"
     );
 
     probe::set_probes_enabled(false);
@@ -1962,6 +1974,25 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
     assert!(
         names.contains(&"space/draft/footnote/1/remove".to_string()),
         "a pending quote is always removable: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/draft/footnote/1/embed".to_string()),
+        "the marker is in the body, so there is nothing to re-embed: {names:?}"
+    );
+
+    // Drop the marker (as a Backspace over the quote block would) and the
+    // rail grows its "embed" affordance — the way back.
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("the draft's editor");
+    cx.update_window(window, |_, _, cx| {
+        composer.update(cx, |e, cx| e.set_value("prose only", cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/draft/footnote/1/embed".to_string()),
+        "a quote with no marker offers to re-embed: {names:?}"
     );
 
     // The multi-referencer picker.
