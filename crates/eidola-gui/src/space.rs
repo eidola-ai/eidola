@@ -566,7 +566,13 @@ impl Space {
     /// operation's own reload is authoritative — so
     /// [`Self::apply_loaded_transcript`] drops it and
     /// [`Self::on_space_changed`] defers to the operation's reload.
-    fn is_busy(&self) -> bool {
+    ///
+    /// Public because it is also the honest answer to "has this exchange
+    /// settled?", which is what bounds the space view's post-submit tail pin
+    /// (`space_view::follow_streaming_tail`): between the save landing and the
+    /// response streaming there is no stream to observe, but the document is
+    /// still the exchange's to grow.
+    pub fn is_busy(&self) -> bool {
         self.post_runner.is_some() || !self.streams.is_empty() || !self.turn_runners.is_empty()
     }
 

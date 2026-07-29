@@ -245,6 +245,10 @@ impl SpaceView {
         if self.active_draft.as_ref() != Some(&id) {
             self.retire_active_draft(cx);
         }
+        // A reader who has started composing again owns the viewport: from here
+        // the composer's own caret-into-view path drives the page, and the
+        // post-submit pin must not race it (see `follow_streaming_tail`).
+        self.tail_pin = false;
         self.active_draft = Some(id);
         self.composer_scroll.set_offset(point(px(0.), px(0.)));
         self.composer_prev_off_y = 0.0;
@@ -374,8 +378,46 @@ impl SpaceView {
         self.band_menu = None;
         self.cascade_notice = None;
 
-        self.scroll_to_tail(window, cx);
+        self.settle_on_new_post(window, cx);
         cx.notify();
+    }
+
+    /// Land the reader on the post they just made: re-derive the snapshot so
+    /// the new turn is in it, select the branch it joined, park the page at the
+    /// end of that branch, and arm the tail pin.
+    ///
+    /// Each step is load-bearing, and the order is:
+    ///
+    /// - **Rebuild first.** `Space::submit`/`post_only` append the optimistic
+    ///   user turn and *emit* `MessagesChanged`; gpui delivers that event after
+    ///   this handler returns, so `self.posts` is still the pre-post snapshot
+    ///   here and every measurement below would describe the document *before*
+    ///   the post — scrolling to a "tail" a post short of the real one, which is
+    ///   what left the window above the end (and tail-following disengaged).
+    /// - **Then select.** The post lands where the draft was, so the branch is
+    ///   usually already right — but saying so explicitly is what guarantees the
+    ///   response attaches and renders where the reader is looking, the same
+    ///   select-before-render rule the explicit asks follow (PR #218).
+    /// - **Then scroll**, against the selected branch.
+    /// - **Then pin**, because the document is not done growing: the persisted
+    ///   reload re-keys the post (new node id → unmeasured → estimate, then the
+    ///   warm pass measures it) and the response's own leaf follows. See
+    ///   [`SpaceView::follow_streaming_tail`].
+    fn settle_on_new_post(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rebuild(cx);
+
+        let page_width = crate::chrome::content_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        // The optimistic turn is the last row of the fresh snapshot.
+        if let Some(last) = self.posts.len().checked_sub(1) {
+            let node = model::node_id(&self.posts, last);
+            if model::node_ref(&tree, &node).is_some() {
+                self.select_path_to(&tree, &node, page_width);
+            }
+        }
+        self.scroll_to_tail(window, cx);
+        self.tail_pin = true;
     }
 
     // -- Asks --------------------------------------------------------------

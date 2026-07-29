@@ -453,6 +453,13 @@ pub struct SpaceView {
     /// never moves the docked composer / posts / minimap (the flicker fix,
     /// generalized).
     pub(crate) scroll_min_y: Cell<f32>,
+    /// The reader just posted: extend tail-following to the growth that
+    /// follows a submit, until the exchange settles. Armed by
+    /// [`Self::settle_on_new_post`], cleared in `render` the moment the space
+    /// is neither producing nor busy — and by [`Self::activate_draft`], since a
+    /// reader who has started composing again owns the viewport. See
+    /// [`Self::follow_streaming_tail`] for why the pin is needed at all.
+    pub(crate) tail_pin: bool,
     /// Test-only record of the slot-relative offset the **docked**
     /// `caret_into_view` branch folded into the caret's document position —
     /// `page_slot_doc_top + editor_top_offset` (`caret_doc_bot - caret_bot`).
@@ -612,6 +619,7 @@ impl SpaceView {
             composer_caret_scroll_pending: Cell::new(false),
             page_scroll: ScrollHandle::new(),
             scroll_min_y: Cell::new(0.0),
+            tail_pin: false,
             docked_caret_slot_offset: Cell::new(0.0),
             scrolls: HashMap::new(),
             scroller_counts: HashMap::new(),
@@ -761,6 +769,14 @@ impl SpaceView {
         let off = self.page_scroll.offset();
         self.page_scroll
             .set_offset(gpui::point(off.x, px(self.scroll_min_y.get())));
+    }
+
+    /// Whether the post-submit tail pin is armed — the widened follow gate that
+    /// carries a just-posted exchange from the save to its first delta (see
+    /// [`Self::follow_streaming_tail`]).
+    #[doc(hidden)]
+    pub fn tail_pin_for_test(&self) -> bool {
+        self.tail_pin
     }
 
     /// Whether the minimap is currently shown (tests assert scroll reveals it).
@@ -1622,10 +1638,20 @@ impl Render for SpaceView {
         // parked at the end wants to stay there, and a reader who has scrolled
         // away must never be yanked back. A sibling branch's stream is not this
         // reader's tail (see `selected_path_is_streaming`).
-        self.follow_streaming_tail(
-            self.selected_path_is_streaming(&tree, page_width),
-            prev_min_y,
-        );
+        //
+        // A just-posted exchange follows too, via `tail_pin`: between the save
+        // landing and the response's first delta there is no stream to observe,
+        // yet the document keeps growing (the persisted post replaces the
+        // optimistic one under a new node id and re-measures from its estimate),
+        // which would drift the reader off the end before following could ever
+        // engage. The pin ends the moment the exchange settles — checked *before*
+        // following, so the tail draft `sync_tail_drafts` then docks under the
+        // finished exchange isn't itself chased.
+        let producing = self.selected_path_is_streaming(&tree, page_width);
+        if self.tail_pin && !producing && !self.space.read(cx).is_busy() {
+            self.tail_pin = false;
+        }
+        self.follow_streaming_tail(producing || self.tail_pin, prev_min_y);
 
         // While a readonly post is being drag-selected, autoscroll the page when
         // the pointer sits against a viewport edge — so a selection can pull
@@ -1782,6 +1808,17 @@ impl SpaceView {
     /// space would have re-opened exactly that race whenever a fan-out streamed
     /// on a *sibling* branch — a routine Participants-v1 state, and one in which
     /// the reader's own branch is by definition not producing.
+    ///
+    /// The one deliberate widening is the post-submit pin ([`Self::tail_pin`],
+    /// folded into `producing` by the caller): a submit *is* the reader's own
+    /// branch producing, but the stream that proves it only starts once the post
+    /// has persisted and the notification plan resolves. Across that gap the
+    /// document still grows, and a reader parked at the end by
+    /// [`Self::settle_on_new_post`] would be left above it — with `at_tail`
+    /// false by the time the first delta arrives, so following never engaged and
+    /// the answer wrote itself off the bottom of the window. The pin is bounded
+    /// by the exchange (`Space::is_busy`) and by the reader starting a new
+    /// draft, so it never reaches the composer-runway growth the gate excludes.
     ///
     /// Runs in `render` immediately after `scroll_min_y` is set for the frame,
     /// so every consumer of `clamped_scroll_y` sees the followed position.
