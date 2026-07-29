@@ -9,13 +9,24 @@
 //!   pure-decision unit test; `auto_provisioning_*` here drives the empty-wallet
 //!   + funded-account path all the way through a successful chat.
 //!
+//! Several tests also pin the **exact rendered upstream bytes** (roles +
+//! `#<handle> · <label>` headers + the system message) via `chat_bodies()` —
+//! see `single_agent_thread_renders_alternating_roles_with_headers`,
+//! `branch_reply_sends_only_its_branch_context`,
+//! `regenerate_sends_only_upstream_context_at_current_versions`, and
+//! `model_emitted_header_is_stripped_before_persisting`. The multi-agent role
+//! split lives in `tests/participants_orchestration.rs`.
+//!
 //! Determinism: the mock is in-process over loopback HTTP with no real network
 //! and no attestation handshake (the `with_test_http_client` seam). The whole
 //! suite runs in well under a second.
 
 mod chat_harness;
 
-use chat_harness::{ChatBehavior, MODEL, MockConfig, MockServer, RefundMode, with_account};
+use chat_harness::{
+    ChatBehavior, DEFAULT_AGENT_LABEL, HUMAN_LABEL, MODEL, MockConfig, MockServer, RefundMode,
+    flat_messages, headed, system_message, with_account,
+};
 use eidola_app_core::changes::Change;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{AppCore, ChatStreamEvent};
@@ -585,6 +596,7 @@ fn regenerate_sends_only_upstream_context_at_current_versions() {
             .expect("tree");
         assert_eq!(tree.len(), 4, "u1, i1, u2, i2; got {tree:#?}");
         let u1 = tree[0].action_id.clone();
+        let u1_item = tree[0].item_id.clone();
         assert_eq!(tree[1].action_type, "inference");
         let i1 = tree[1].action_id.clone();
 
@@ -598,30 +610,36 @@ fn regenerate_sends_only_upstream_context_at_current_versions() {
 
         // The regenerate call (third request) must see ONLY its upstream
         // thread — the edited question at its most recent version — never the
-        // downstream turn (u2/i2) or its own prior output (i1).
+        // downstream turn (u2/i2) or its own prior output (i1). Rendered bytes
+        // are pinned: system prompt + protocol note, then the edited post under
+        // its human author's header.
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 3, "two chats + one regenerate");
-        let flat: Vec<(String, String)> = bodies[2]["messages"]
-            .as_array()
-            .expect("messages array")
-            .iter()
-            .map(|m| {
-                (
-                    m["role"].as_str().unwrap_or_default().to_string(),
-                    m["content"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect();
         assert_eq!(
-            flat,
+            flat_messages(&bodies[2]),
             vec![
-                ("system".to_string(), SEEDED_SYSTEM_PROMPT.to_string()),
+                (
+                    "system".to_string(),
+                    system_message(Some(SEEDED_SYSTEM_PROMPT))
+                ),
                 (
                     "user".to_string(),
-                    "How do tides work? Explain it for a sailor.".to_string()
+                    headed(
+                        &u1_item,
+                        HUMAN_LABEL,
+                        "How do tides work? Explain it for a sailor."
+                    )
                 )
             ],
             "regenerate context = system prompt + upstream only, most-recent versions"
+        );
+
+        // The handle is derived from the ITEM id, so the edit did not change
+        // it: the bytes the model already read keep naming the same post.
+        assert_eq!(
+            flat_messages(&bodies[0])[1].1,
+            headed(&u1_item, HUMAN_LABEL, "How do tides work?"),
+            "the pre-edit rendering carries the same handle"
         );
 
         // Sanity: the second chat (a Reply on the linear spine) saw the full
@@ -717,8 +735,12 @@ fn upstream_context_expands_embed_markers_into_quotes() {
         );
         assert_eq!(
             contents[2],
-            "What does this mean?\n\n> powerhouse\n\nAnd {{ embed 9 }} is unmapped.\n\n\
-             ```\n\n{{ embed 1 }}\n\n```",
+            headed(
+                &posted.item_id,
+                HUMAN_LABEL,
+                "What does this mean?\n\n> powerhouse\n\nAnd {{ embed 9 }} is unmapped.\n\n\
+                 ```\n\n{{ embed 1 }}\n\n```"
+            ),
             "structural marker expands; unmapped and fence-defused markers go upstream literal"
         );
     });
@@ -757,6 +779,8 @@ fn branch_reply_sends_only_its_branch_context() {
             .expect("tree");
         assert_eq!(tree.len(), 4, "u1, i1, u2, i2; got {tree:#?}");
         assert_eq!(tree[1].action_type, "inference");
+        let u1_item = tree[0].item_id.clone();
+        let i1_item = tree[1].item_id.clone();
         let i1 = tree[1].action_id.clone();
 
         let (tx, _rx3) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
@@ -769,36 +793,199 @@ fn branch_reply_sends_only_its_branch_context() {
                 tx,
             ))
             .expect("branch reply");
+        let branch_item = item_id_of(&core, &first.space_id, "What about spring tides?");
 
         // The branch ask (third request) must see ONLY its own branch: the
-        // ancestry of the new post — never the sibling turn (u2/i2).
+        // ancestry of the new post — never the sibling turn (u2/i2). Exact
+        // bytes: every message headed, and the responding agent's own prior
+        // answer (and only it) rendered `assistant`.
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 3, "two spine turns + one branch reply");
-        let flat: Vec<(String, String)> = bodies[2]["messages"]
-            .as_array()
-            .expect("messages array")
-            .iter()
-            .map(|m| {
-                (
-                    m["role"].as_str().unwrap_or_default().to_string(),
-                    m["content"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect();
         assert_eq!(
-            flat,
+            flat_messages(&bodies[2]),
             vec![
-                ("system".to_string(), SEEDED_SYSTEM_PROMPT.to_string()),
-                ("user".to_string(), "How do tides work?".to_string()),
+                (
+                    "system".to_string(),
+                    system_message(Some(SEEDED_SYSTEM_PROMPT))
+                ),
+                (
+                    "user".to_string(),
+                    headed(&u1_item, HUMAN_LABEL, "How do tides work?")
+                ),
                 (
                     "assistant".to_string(),
-                    "Hello from the stream.".to_string()
+                    headed(&i1_item, DEFAULT_AGENT_LABEL, "Hello from the stream.")
                 ),
-                ("user".to_string(), "What about spring tides?".to_string()),
+                (
+                    "user".to_string(),
+                    headed(&branch_item, HUMAN_LABEL, "What about spring tides?")
+                ),
             ],
             "branch reply context = system prompt + the branch's ancestry only"
         );
     });
+}
+
+/// The single-agent linear thread — the common case — rendered upstream:
+/// alternating `user` / `assistant`, every message carrying its uniform
+/// `#<handle> · <label>` header, and one leading `system` message (the agent's
+/// effective prompt + the header protocol note). This is the byte-shape pin
+/// for the case that must stay equivalent-modulo-headers to the pre-role-split
+/// rendering.
+#[test]
+fn single_agent_thread_renders_alternating_roles_with_headers() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, _rx1) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let first = core
+            .runtime()
+            .block_on(core.chat_stream("How do tides work?".into(), MODEL.into(), None, tx))
+            .expect("first turn");
+        let (tx, _rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.chat_stream(
+                "And why two per day?".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+                tx,
+            ))
+            .expect("second turn");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        assert_eq!(tree.len(), 4, "u1, i1, u2, i2; got {tree:#?}");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+
+        // Turn 1: system + the single human post.
+        assert_eq!(
+            flat_messages(&bodies[0]),
+            vec![
+                (
+                    "system".to_string(),
+                    system_message(Some(SEEDED_SYSTEM_PROMPT))
+                ),
+                (
+                    "user".to_string(),
+                    headed(&tree[0].item_id, HUMAN_LABEL, "How do tides work?")
+                ),
+            ]
+        );
+
+        // Turn 2: the whole spine, the responding agent's own answer as
+        // `assistant`, the human's two posts as `user`.
+        assert_eq!(
+            flat_messages(&bodies[1]),
+            vec![
+                (
+                    "system".to_string(),
+                    system_message(Some(SEEDED_SYSTEM_PROMPT))
+                ),
+                (
+                    "user".to_string(),
+                    headed(&tree[0].item_id, HUMAN_LABEL, "How do tides work?")
+                ),
+                (
+                    "assistant".to_string(),
+                    headed(
+                        &tree[1].item_id,
+                        DEFAULT_AGENT_LABEL,
+                        "Hello from the stream."
+                    )
+                ),
+                (
+                    "user".to_string(),
+                    headed(&tree[2].item_id, HUMAN_LABEL, "And why two per day?")
+                ),
+            ]
+        );
+    });
+}
+
+/// Strip-on-receipt: a model that mimics the visible header scaffolding has
+/// that leading line removed before anything is persisted — the durable post
+/// and the returned `ChatResult` both carry the bare answer.
+#[test]
+fn model_emitted_header_is_stripped_before_persisting() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            // The streaming mock's content is header-shaped (see
+            // `ChatBehavior::OkStreamingWithHeader`).
+            chat: ChatBehavior::OkStreamingWithHeader,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let result = core
+            .runtime()
+            .block_on(async {
+                let collector = async {
+                    let mut seen = String::new();
+                    while let Some(ev) = rx.recv().await {
+                        if let ChatStreamEvent::ContentDelta(d) = ev {
+                            seen.push_str(&d);
+                        }
+                    }
+                    seen
+                };
+                let chat = core.chat_stream("hi".into(), MODEL.into(), None, tx);
+                let (res, streamed) = tokio::join!(chat, collector);
+                res.map(|r| (r, streamed))
+            })
+            .expect("stream");
+        let (result, streamed) = result;
+
+        // The deltas reach the caller verbatim (the emission contract is
+        // untouched); the *persisted* and *reported* text is stripped.
+        assert!(
+            streamed.starts_with('#'),
+            "the raw deltas are forwarded as received: {streamed:?}"
+        );
+        assert_eq!(result.content, "Hello from the stream.");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(result.space_id.clone()))
+            .expect("tree");
+        let answer = tree
+            .iter()
+            .find(|n| n.action_type == "inference")
+            .expect("inference post");
+        let text_block = answer
+            .blocks
+            .iter()
+            .find(|b| b.block_type == "text")
+            .expect("text block");
+        assert_eq!(
+            text_block.text.as_deref(),
+            Some("Hello from the stream."),
+            "the header-shaped first line never reaches the durable trail"
+        );
+    });
+}
+
+/// The item id of the current-generation post whose text block equals `text`.
+fn item_id_of(core: &AppCore, space_id: &str, text: &str) -> String {
+    core.runtime()
+        .block_on(core.get_space_tree(space_id.to_string()))
+        .expect("tree")
+        .into_iter()
+        .find(|n| {
+            n.blocks
+                .iter()
+                .any(|b| b.text.as_deref() == Some(text) && b.block_type == "text")
+        })
+        .unwrap_or_else(|| panic!("no post with text {text:?}"))
+        .item_id
 }
 
 // Post-first contract (wave 5.2b): chat = post + run_turn. The post persists

@@ -9,6 +9,10 @@
 //! * **Participant-aware context** — an explicit participant's effective system
 //!   prompt is prepended as the leading `system` message, and an edit to that
 //!   prompt is honored on the next turn (effective config resolved per turn).
+//! * **Participant-aware rendering** — the role split: in a multi-agent space
+//!   another agent's post reaches the responder as `user` (headed with its
+//!   author's label), and only the responder's own prior posts are
+//!   `assistant`. Exact rendered bytes are pinned.
 //! * **Cascade guard** — a chain of consecutive agent posts reaches the space's
 //!   `cascade_limit`, and `plan_notifications` returns the paused marker;
 //!   explicit asks (`respond_stream_as`) bypass the guard.
@@ -24,7 +28,10 @@
 
 mod chat_harness;
 
-use chat_harness::{ChatBehavior, MODEL, MockConfig, RefundMode, with_account};
+use chat_harness::{
+    ChatBehavior, HUMAN_LABEL, MODEL, MockConfig, RefundMode, flat_messages, headed,
+    system_message, with_account,
+};
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AppCore, ChatResult, ChatStreamEvent, NewParticipant, NotificationPlan, ParticipantUpdate,
@@ -235,11 +242,110 @@ fn explicit_participant_prepends_effective_system_prompt() {
 
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 1);
-        let messages = bodies[0]["messages"].as_array().expect("messages");
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[0]["content"], "You are a pirate.");
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"], "ahoy");
+        assert_eq!(
+            flat_messages(&bodies[0]),
+            vec![
+                (
+                    "system".to_string(),
+                    system_message(Some("You are a pirate."))
+                ),
+                (
+                    "user".to_string(),
+                    headed(&posted.item_id, HUMAN_LABEL, "ahoy")
+                ),
+            ]
+        );
+    });
+}
+
+/// The role split, on the case it exists for: in a multi-agent space, the
+/// *other* agent's post reaches the responder as `user` — with a header naming
+/// its author — while only the responder's own prior post is `assistant`.
+/// Before the split, every `inference` rendered `assistant`, so a model was
+/// shown another agent's words as its own.
+#[test]
+fn other_agents_posts_render_as_user_with_a_header() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let space = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+        add_agent(&core, &space, "Ada", MODEL, "explicit", Some("I am Ada."));
+        add_agent(&core, &space, "Bo", MODEL, "explicit", Some("I am Bo."));
+        let ada = agent_id(&core, &space, "Ada");
+        let bo = agent_id(&core, &space, "Bo");
+
+        // Human post → Ada answers → Bo answers Ada → Ada answers Bo.
+        let posted = core
+            .runtime()
+            .block_on(core.post("what say you both?".into(), Some(space.clone())))
+            .expect("post");
+        let ada_turn = drive_as(&core, &space, &ada, &posted.action_id).expect("ada turn");
+        let ada_post = ada_turn.response_action_id.expect("ada's post");
+        let bo_turn = drive_as(&core, &space, &bo, &ada_post).expect("bo turn");
+        let bo_post = bo_turn.response_action_id.expect("bo's post");
+        drive_as(&core, &space, &ada, &bo_post).expect("ada's second turn");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let item_of = |action_id: &str| {
+            tree.iter()
+                .find(|n| n.action_id == action_id)
+                .unwrap_or_else(|| panic!("no post {action_id}"))
+                .item_id
+                .clone()
+        };
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3, "ada, bo, ada");
+
+        // Bo's turn: the human post AND Ada's post are both `user` — Ada's
+        // headed with her label, so Bo can tell who said what.
+        assert_eq!(
+            flat_messages(&bodies[1]),
+            vec![
+                ("system".to_string(), system_message(Some("I am Bo."))),
+                (
+                    "user".to_string(),
+                    headed(&posted.item_id, HUMAN_LABEL, "what say you both?")
+                ),
+                (
+                    "user".to_string(),
+                    headed(&item_of(&ada_post), "Ada", "Hello from the stream.")
+                ),
+            ],
+            "another agent's post is `user`, never `assistant`"
+        );
+
+        // Ada's second turn: her own earlier post is `assistant`; Bo's is
+        // `user`. Same rows, different point of view.
+        assert_eq!(
+            flat_messages(&bodies[2]),
+            vec![
+                ("system".to_string(), system_message(Some("I am Ada."))),
+                (
+                    "user".to_string(),
+                    headed(&posted.item_id, HUMAN_LABEL, "what say you both?")
+                ),
+                (
+                    "assistant".to_string(),
+                    headed(&item_of(&ada_post), "Ada", "Hello from the stream.")
+                ),
+                (
+                    "user".to_string(),
+                    headed(&item_of(&bo_post), "Bo", "Hello from the stream.")
+                ),
+            ],
+            "only the responder's own prior post is `assistant`"
+        );
     });
 }
 
@@ -290,8 +396,14 @@ fn effective_system_prompt_edit_is_honored_next_turn() {
 
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 2);
-        assert_eq!(bodies[0]["messages"][0]["content"], "First prompt.");
-        assert_eq!(bodies[1]["messages"][0]["content"], "Second prompt.");
+        assert_eq!(
+            bodies[0]["messages"][0]["content"],
+            system_message(Some("First prompt."))
+        );
+        assert_eq!(
+            bodies[1]["messages"][0]["content"],
+            system_message(Some("Second prompt."))
+        );
     });
 }
 
@@ -769,13 +881,14 @@ fn submit_with_references_carries_the_quote_to_the_wire() {
             .iter()
             .map(|m| m["content"].as_str().unwrap_or_default().to_string())
             .collect();
-        let quoting = contents
-            .iter()
-            .find(|c| c.starts_with("What does this mean?"))
-            .expect("the quoting post reaches the wire");
-        assert_eq!(
-            quoting, "What does this mean?\n\n> powerhouse",
-            "the marker expands into the quoted passage"
+        let expected = headed(
+            &result.post.item_id,
+            HUMAN_LABEL,
+            "What does this mean?\n\n> powerhouse",
+        );
+        assert!(
+            contents.contains(&expected),
+            "the marker expands into the quoted passage under the post's header; got {contents:?}"
         );
     });
 }
