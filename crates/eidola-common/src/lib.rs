@@ -5,9 +5,28 @@
 //! contract for chat-completion prompt holds ([`chargeable_prompt_tokens`]),
 //! and the embed-marker recognition rule shared between the markdown
 //! editor's embed plugin and app-core's upstream quote expansion
-//! ([`embed`]). It is intentionally lib-only, zero-dependency, pure Rust,
-//! and float-free so `eidola-app-core`, `eidola-server`, and tests can
-//! depend on it and compute identical results on any platform.
+//! ([`embed`]). It is intentionally lib-only, pure Rust, and float-free so
+//! `eidola-app-core`, `eidola-server`, and tests can depend on it and
+//! compute identical results on any platform.
+//!
+//! # The dependency rule
+//!
+//! This crate was zero-dependency, which cost more fidelity than it bought:
+//! unable to see a request, it could own the pricing *arithmetic* but not
+//! the *walk* — which parts of a request count and how each is measured —
+//! so each consumer reimplemented the walk and the two could drift. The
+//! rule that replaced it:
+//!
+//! > **A dependency is admissible here only if it is already in every
+//! > consumer's graph and is required for contract fidelity.** Today that
+//! > set is `serde_json`. Any addition needs the same argument written
+//! > down.
+//!
+//! `serde_json` qualifies on both counts: every consumer (app-core, server,
+//! gui; cli via app-core) already carries it, so admitting it adds no code,
+//! no trust surface, and no compile time to any binary — and it is what
+//! lets [`prompt_charge`] be the single walk both sides call rather than
+//! two implementations held together by a test.
 //!
 //! # The prompt-hold pricing contract
 //!
@@ -67,20 +86,21 @@
 //! their token cost is covered by [`PER_MESSAGE_TOKENS`] and
 //! [`PER_REQUEST_TOKENS`].
 //!
-//! # Gathering the inputs: [`PromptCharge`]
+//! # Gathering the inputs: [`prompt_charge`]
 //!
 //! *What* counts is as much a part of the contract as the arithmetic, and it
-//! is where the two sides can silently drift: the client holds
-//! `serde_json::Value` messages, the server holds parsed
-//! `ChatCompletionRequest` structs, and this crate is zero-dependency (it
-//! cannot see either shape). [`PromptCharge`] is therefore the shared
-//! *accounting* surface: each side walks its own request shape and reports
-//! the parts through one API whose semantics — which counter each
-//! contribution lands in — live here, in one place. Each side's ~10-line walk
-//! is held to the other by a tripwire test
-//! (`eidola-server`'s `client_and_server_prompt_terms_agree`).
+//! is where the two sides could silently drift. [`prompt_charge`] is the one
+//! walk: it reads a request's `messages` and `tools` arrays as
+//! `serde_json::Value` and returns a [`PromptCharge`]. app-core already
+//! holds its messages as `Value`s; the server converts its parsed
+//! `ChatCompletionRequest` with `serde_json::to_value` at the pricing call
+//! site (negligible against a request it already fully re-serializes to
+//! forward upstream). [`PromptCharge`] itself stays pure arithmetic — serde
+//! is for the walk, never for the accounting semantics.
 
 pub mod embed;
+
+use serde_json::Value;
 
 /// Numerator of the safe cost factor `N = NUM/DEN = 1.5`.
 ///
@@ -241,6 +261,102 @@ impl PromptCharge {
     }
 }
 
+/// Byte length of a JSON value measured as text: its own bytes when it is a
+/// string (the OpenAI shape for a tool call's `arguments`), otherwise its
+/// compact JSON serialization.
+///
+/// # Two properties this measure rests on
+///
+/// **Key order cannot skew it.** The measure is a *length*, and a compact
+/// serialization's length does not depend on the order its object keys are
+/// emitted in. So even if `serde_json`'s `preserve_order` feature were ever
+/// unified into the workspace graph — flipping `Map` from a sorted `BTreeMap`
+/// to an insertion-ordered `IndexMap` — the client and server would still
+/// agree. The dependency is nevertheless declared featureless on purpose:
+/// relying on the invariance is a safety net, not a licence to perturb a
+/// contract crate's dependency behaviour.
+///
+/// **Formatting is assumed stable across `serde_json` releases.** A byte
+/// measure of a serializer's output is only cross-version-exact if that
+/// serializer formats identically in both processes — which matters for
+/// old-client/new-server pairs, since they are separate binaries built at
+/// different times. The realistic exposure is float formatting inside a
+/// `tools` JSON Schema (`{"multipleOf": 0.1}` and friends); integers,
+/// strings, and structural bytes have one spelling. A divergence there would
+/// shift the charge by a few bytes on a rare shape — bounded, and clamped on
+/// the server to actual usage either way — so this is **documented, not
+/// designed around**. It was equally true when the two sides each had their
+/// own walk; centralizing the walk is what makes the assumption auditable in
+/// one place instead of implicit in two.
+pub fn json_text_bytes(value: &Value) -> u64 {
+    match value.as_str() {
+        Some(s) => s.len() as u64,
+        None => serde_json::to_string(value).map(|s| s.len()).unwrap_or(0) as u64,
+    }
+}
+
+/// **The** walk of the pricing contract: gather a chat-completion request's
+/// chargeable parts into a [`PromptCharge`].
+///
+/// One implementation, called by both sides — app-core passes the `Value`
+/// messages it already holds, the server passes the result of
+/// `serde_json::to_value` on its parsed request. `tools` is `None` for a
+/// request that advertises none (equivalent to an empty slice; the wire
+/// distinguishes absent from empty, the charge does not).
+///
+/// # What is read
+///
+/// * **`content`** — a string contributes its UTF-8 bytes; an array of
+///   content parts contributes the sum of its parts' `text` strings (a
+///   multimodal message's image parts carry no prompt text of their own);
+///   absent or `null` contributes zero. Every entry counts as one message
+///   regardless.
+/// * **`tool_calls[]`** — each entry contributes [`json_text_bytes`] of the
+///   whole entry.
+/// * **`tools[]`** — each entry contributes [`json_text_bytes`] of the whole
+///   entry, once per request.
+///
+/// Anything not named above is deliberately not measured by byte: roles,
+/// JSON structure, and the message-level scalars (`name`, `tool_call_id`)
+/// are what [`PER_MESSAGE_TOKENS`] and [`PER_REQUEST_TOKENS`] cover.
+pub fn prompt_charge(messages: &[Value], tools: Option<&[Value]>) -> PromptCharge {
+    let mut charge = PromptCharge::new();
+
+    for message in messages {
+        charge.add_message(content_bytes(message.get("content")));
+        if let Some(calls) = message.get("tool_calls").and_then(|c| c.as_array()) {
+            for call in calls {
+                charge.add_tool_call(json_text_bytes(call));
+            }
+        }
+    }
+
+    for tool in tools.unwrap_or(&[]) {
+        charge.add_tool_definition(json_text_bytes(tool));
+    }
+
+    charge
+}
+
+/// Prompt-text bytes of a message's `content`: a plain string, or the summed
+/// `text` of an array of content parts (the multimodal shape). Absent,
+/// `null`, or any other shape contributes zero.
+fn content_bytes(content: Option<&Value>) -> u64 {
+    match content {
+        Some(Value::String(s)) => s.len() as u64,
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .map(|p| {
+                p.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0)
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,27 +504,164 @@ mod tests {
         );
     }
 
-    /// The cross-crate fixture. `eidola-server`'s
-    /// `client_and_server_prompt_terms_agree` and `eidola-app-core`'s
-    /// `prompt_charge_matches_the_shared_contract_fixture` both walk the same
-    /// logical request — a user post, an assistant tool call, a tool result,
-    /// and one advertised tool — and must arrive at exactly these numbers.
-    /// Change them here and both sides fail until they agree again.
+    // -----------------------------------------------------------------
+    // prompt_charge: the walk
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_tool_less_request_walks_to_the_pre_tool_calling_value() {
+        // The shape of nearly all traffic: no tools, no tool calls. Must be
+        // exactly what the contract charged before tool calling existed.
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "be brief"}),
+            serde_json::json!({"role": "user", "content": "héllo wörld"}),
+        ];
+        let bytes: u64 = messages
+            .iter()
+            .map(|m| m["content"].as_str().unwrap().len() as u64)
+            .sum();
+        assert_eq!(
+            prompt_charge(&messages, None).chargeable_prompt_tokens(),
+            chargeable_prompt_tokens(bytes, 2)
+        );
+    }
+
+    #[test]
+    fn absent_and_empty_tools_charge_alike() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        assert_eq!(
+            prompt_charge(&messages, None),
+            prompt_charge(&messages, Some(&[]))
+        );
+    }
+
+    #[test]
+    fn multimodal_content_parts_contribute_their_text() {
+        // A `content` array (the multimodal shape) contributes the sum of its
+        // parts' `text`; an image part carries no prompt text of its own.
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is in"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                {"type": "text", "text": " this?"}
+            ]
+        })];
+        let charge = prompt_charge(&messages, None);
+        assert_eq!(charge.total_content_bytes(), 10 + 6);
+        assert_eq!(charge.message_count(), 1);
+    }
+
+    #[test]
+    fn absent_or_null_content_still_counts_as_a_message() {
+        for content in [
+            serde_json::json!({"role": "assistant", "content": null}),
+            serde_json::json!({"role": "assistant"}),
+        ] {
+            let charge = prompt_charge(&[content], None);
+            assert_eq!(charge.total_content_bytes(), 0);
+            assert_eq!(charge.message_count(), 1);
+        }
+    }
+
+    #[test]
+    fn the_whole_tool_call_entry_is_charged_not_just_name_and_arguments() {
+        // The client replays the provider's call object verbatim — id, `type`
+        // and any provider extension included — and those bytes reach the
+        // upstream, where a template like Mistral's renders the call id
+        // straight into the prompt.
+        let call = |extra: serde_json::Value| {
+            let mut entry = serde_json::json!({
+                "id": "c", "type": "function",
+                "function": {"name": "calc", "arguments": "{}"}
+            });
+            if let Some(obj) = extra.as_object() {
+                for (k, v) in obj {
+                    entry[k] = v.clone();
+                }
+            }
+            vec![serde_json::json!({
+                "role": "assistant", "content": null, "tool_calls": [entry]
+            })]
+        };
+
+        let plain = prompt_charge(&call(serde_json::json!({})), None);
+        let long_id = prompt_charge(
+            &call(serde_json::json!({"id": "call_9tK2mQz7Xb4LpR1vN8sYcE0d"})),
+            None,
+        );
+        let extension = prompt_charge(
+            &call(serde_json::json!({"provider_extra": {"trace": "0123456789abcdef"}})),
+            None,
+        );
+
+        assert!(
+            long_id.total_content_bytes() > plain.total_content_bytes(),
+            "a longer call id is more forwarded bytes and must cost more"
+        );
+        assert!(
+            extension.total_content_bytes() > plain.total_content_bytes(),
+            "a forwarded provider extension must not ride free"
+        );
+    }
+
+    #[test]
+    fn non_string_tool_call_arguments_are_measured_as_json() {
+        // Off-spec (the OpenAI shape mandates a string), but seen in the
+        // wild. Measured as the entry's serialization like any other entry,
+        // so both sides still agree.
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id": "c", "function": {"name": "ca", "arguments": {"expr": "2+2"}}}]
+        })];
+        let charge = prompt_charge(&messages, None);
+        assert_eq!(
+            charge.total_content_bytes(),
+            json_text_bytes(&messages[0]["tool_calls"][0])
+        );
+    }
+
+    #[test]
+    fn json_text_bytes_reads_a_string_as_itself_not_as_quoted_json() {
+        // A quoted re-serialization would add the surrounding quotes and
+        // escape the inner ones, over-counting an `arguments` payload.
+        assert_eq!(json_text_bytes(&serde_json::json!("{\"a\":1}")), 7);
+        assert_eq!(json_text_bytes(&serde_json::json!({"a": 1})), 7);
+    }
+
+    /// **The contract's canonical pin.** One logical request — a user post,
+    /// an assistant tool call, a tool result, and one advertised tool —
+    /// walked by the real [`prompt_charge`] and pinned to exact numbers.
+    ///
+    /// Each consumer keeps one agreement test that feeds its *own* request
+    /// representation through the same walk and asserts the same 230
+    /// (`eidola-server`'s `tool_round_fixture_charges_the_pinned_contract_value`
+    /// over a parsed `ChatCompletionRequest`, `eidola-app-core`'s
+    /// `prompt_charge_matches_the_shared_contract_fixture` over the `Value`
+    /// messages a turn actually sends). Those still have teeth after the
+    /// consolidation: they catch a consumer feeding the shared walk a
+    /// malformed *view* of its request, which no in-crate test here can see.
     #[test]
     fn cross_crate_tool_round_fixture() {
-        let mut charge = PromptCharge::new();
-        // {"role":"user","content":"what is 2+2?"}
-        charge.add_message(12);
-        // {"role":"assistant","content":null,"tool_calls":[<one 93-byte
-        //  entry: id, type, and function{name,arguments}>]}
-        charge.add_message(0).add_tool_call(TOOL_CALL_BYTES);
-        // {"role":"tool","tool_call_id":"call_1","content":"4"}
-        charge.add_message(1);
-        // The advertised `calc` schema, compact-serialized (see the
-        // consuming tests for the literal JSON).
-        charge.add_tool_definition(TOOL_DEFINITION_BYTES);
+        let (messages, tools) = tool_round_fixture();
+        let charge = prompt_charge(&messages, Some(&tools));
+
+        // The two composite measures, pinned individually so a change in
+        // either is named rather than showing up only in the total.
+        assert_eq!(
+            json_text_bytes(&messages[1]["tool_calls"][0]),
+            TOOL_CALL_BYTES,
+            "the fixture's call entry must stay {TOOL_CALL_BYTES} bytes"
+        );
+        assert_eq!(
+            json_text_bytes(&tools[0]),
+            TOOL_DEFINITION_BYTES,
+            "the fixture's schema must stay {TOOL_DEFINITION_BYTES} bytes"
+        );
 
         assert_eq!(charge.message_count(), 3);
+        // 12 ("what is 2+2?") + 0 (null) + 1 ("4") content bytes.
         assert_eq!(
             charge.total_content_bytes(),
             13 + TOOL_CALL_BYTES + TOOL_DEFINITION_BYTES
@@ -422,6 +675,33 @@ mod tests {
 
     /// Compact JSON byte length of the fixture's single tool definition.
     const TOOL_DEFINITION_BYTES: u64 = 154;
+
+    /// The canonical fixture request, as `(messages, tools)`. The same
+    /// logical request each consumer reconstructs in its own representation.
+    fn tool_round_fixture() -> (Vec<Value>, Vec<Value>) {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "what is 2+2?"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "calc", "arguments": "{\"expr\":\"2+2\"}"}
+                }]
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "4"}),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "calc",
+                "description": "Evaluate arithmetic.",
+                "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}}
+            }
+        })];
+        (messages, tools)
+    }
 
     #[test]
     fn overflow_safe_at_extreme_inputs() {
