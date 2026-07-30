@@ -2698,6 +2698,96 @@ fn a_tool_rounds_hold_covers_the_tool_bytes_it_sends() {
     });
 }
 
+/// The context assembly is the **ordered composition of the prompt**, so a
+/// replayed trace occupies the position it actually occupied on the wire —
+/// between the post it answered and the answer it produced — not a lump at the
+/// end. Only the rounds the *current* turn generated come last, because that is
+/// where they were appended live.
+#[test]
+fn the_context_assembly_records_the_order_the_messages_were_sent_in() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let second = core
+            .runtime()
+            .block_on(core.chat(
+                "and now?".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+            ))
+            .expect("turn 2");
+
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(first.space_id.clone()))
+            .expect("raw actions");
+        let id_of = |n: usize| actions[n].id.clone();
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "user_input",
+                "tool_call",
+                "tool_result",
+                "inference",
+                "user_input",
+                "inference"
+            ]
+        );
+        let (post1, call, result, inference1, post2) =
+            (id_of(0), id_of(1), id_of(2), id_of(3), id_of(4));
+
+        // Turn 1: the post it answered, then the round it ran (appended live).
+        assert_eq!(
+            core.runtime()
+                .block_on(core.test_context_assembly(inference1.clone()))
+                .expect("assembly"),
+            vec![post1.clone(), call.clone(), result.clone()],
+        );
+
+        // Turn 2: the same round, now *replayed*, sits where it was sent —
+        // before the answer it produced, not after the whole conversation.
+        assert_eq!(
+            core.runtime()
+                .block_on(
+                    core.test_context_assembly(
+                        second.response_action_id.clone().expect("an answer")
+                    )
+                )
+                .expect("assembly"),
+            vec![post1, call, result, inference1, post2],
+        );
+
+        // …which is exactly the order of the posts and traces on the wire.
+        let last = mock.chat_bodies().last().expect("turn 2's request").clone();
+        let shape: Vec<String> = last["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .skip(1) // the system message is not an action
+            .map(|m| match (m["role"].as_str(), m.get("tool_calls")) {
+                (Some("assistant"), Some(_)) => "tool_call".to_string(),
+                (Some("tool"), _) => "tool_result".to_string(),
+                (Some(r), _) => r.to_string(),
+                _ => "?".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["user", "tool_call", "tool_result", "assistant", "user"],
+        );
+    });
+}
+
 /// A regeneration replays nothing of the generation it replaces — not the
 /// answer (`get_upstream_context` withholds it), and not the working that
 /// produced it. A trace belongs to the turn whose post you can see, and a
