@@ -248,11 +248,41 @@ impl SpaceView {
         // the composer's own caret-into-view path drives the page, and the
         // post-submit pin must not race it (see `follow_streaming_tail`).
         self.tail_pin = false;
+        // An editing session is beginning: seed the accessible value from the
+        // draft as it stands. This is the seam every session passes through —
+        // the band's Reply, a click on an inactive draft, the editor's own
+        // `Focus` event, the quote paths — which is why it is *here* and not at
+        // retirement. Without it a draft retired and re-opened (Escape, then
+        // clicking back in) reports its pre-typing text forever: retirement
+        // clears `active_draft` before any frame renders the composer
+        // unfocused, and re-opening focuses the *same* draft, so neither of
+        // `composer_aria_value`'s render-time conditions can ever fire.
+        self.seed_composer_aria_value(&id, cx);
         self.active_draft = Some(id);
         self.composer_scroll.set_offset(point(px(0.), px(0.)));
         self.composer_prev_off_y = 0.0;
         self.composer_dock_runway = None;
         cx.notify();
+    }
+
+    /// Write the draft's current buffer into the accessible-value snapshot.
+    /// A no-op when the id names no live draft (the caller's own guard clauses
+    /// already cover that; this just refuses to invent a value).
+    fn seed_composer_aria_value(&self, id: &gpui::SharedString, cx: &Context<Self>) {
+        let Some(draft) = self.drafts.iter().find(|d| d.id == *id) else {
+            return;
+        };
+        let text = SharedString::from(draft.editor.read(cx).value().to_string());
+        *self.composer_aria_value.borrow_mut() = (id.clone(), text);
+    }
+
+    /// Re-activate a persisted (inactive) draft by index — the same call the
+    /// inactive-draft click and the editor's `Focus` event make.
+    #[doc(hidden)]
+    pub fn activate_draft_for_test(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(id) = self.drafts.get(index).map(|d| d.id.clone()) {
+            self.activate_draft(id, cx);
+        }
     }
 
     /// Deactivate the active draft (Escape / external request). An empty **tail**
@@ -686,11 +716,14 @@ impl SpaceView {
     /// freezes for exactly this reason, and the audit (§4) makes it the rule
     /// for us.
     ///
-    /// So it refreshes at two settled moments only: when a **different** draft
-    /// becomes active (re-opening a saved draft reads its real text, and
-    /// switching between branches' drafts reads the right one), and on frames
-    /// where focus has left the composer — which is precisely when a
-    /// screen-reader user is reviewing the draft rather than writing it.
+    /// So it refreshes at settled moments only. Two are decided here: a frame
+    /// where the composer does **not** hold focus — precisely when a
+    /// screen-reader user is reviewing the draft rather than writing it — and
+    /// (as a backstop) a frame whose draft is not the one the snapshot names,
+    /// for any path that makes a draft active without going through
+    /// [`Self::activate_draft`]. The third and most important is decided
+    /// *there*: **activation seeds the snapshot**, which is what makes a
+    /// retired-and-re-opened draft report the text it actually holds.
     fn composer_aria_value(
         &self,
         draft_id: &SharedString,
