@@ -131,7 +131,7 @@ pub fn chargeable_prompt_tokens(total_content_bytes: u64, message_count: u64) ->
 /// | Part of the request | Method | Counted as |
 /// | --- | --- | --- |
 /// | a `messages` entry | [`add_message`](Self::add_message) | one message + its `content` string's bytes |
-/// | an assistant `tool_calls` entry | [`add_tool_call`](Self::add_tool_call) | the function name's bytes + the raw `arguments` string's bytes |
+/// | an assistant `tool_calls` entry | [`add_tool_call`](Self::add_tool_call) | the entry's compact JSON serialization, in bytes |
 /// | a request-level `tools` entry | [`add_tool_definition`](Self::add_tool_definition) | the entry's compact JSON serialization, in bytes |
 ///
 /// # Why tool bytes are charged at all
@@ -164,8 +164,13 @@ pub fn chargeable_prompt_tokens(total_content_bytes: u64, message_count: u64) ->
 ///   server's value is parsed from the very bytes the client serialized, and
 ///   a serialization's *length* does not depend on key order, so the two
 ///   sides agree without needing a canonical form;
-/// * an `arguments` value that is not a string (off-spec, but seen in the
-///   wild) is measured the same way, as its compact serialization.
+/// * a `tool_calls` entry is measured the same way, for the same reason.
+///
+/// The one thing charged per *message* rather than per byte is the
+/// message-level scalar framing — `name`, and a tool result's
+/// `tool_call_id` — which [`PER_MESSAGE_TOKENS`] already exists to cover.
+/// That allowance is per message, so it cannot stretch over the *N* call
+/// objects an assistant message may carry; those get the byte measure above.
 ///
 /// All adds saturate: an absurd input can only ever raise the hold and the
 /// cap, never open an under-charge.
@@ -195,16 +200,21 @@ impl PromptCharge {
         self
     }
 
-    /// Account for one `tool_calls` entry on an assistant message: the
-    /// function name and the raw `arguments` payload.
+    /// Account for one `tool_calls` entry on an assistant message, measured
+    /// as the UTF-8 byte length of its compact JSON serialization.
+    ///
+    /// **The whole entry, not just `function.{name,arguments}`.** A client
+    /// replays the provider's call object verbatim and the proxy forwards it
+    /// verbatim, so the `id`, the `type`, and any provider extension field
+    /// all reach the upstream — and which of them the chat template renders
+    /// into the prompt is a per-model decision the proxy cannot see (Mistral
+    /// templates render the call id; Qwen and Llama ones do not). Charging
+    /// the forwarded bytes is the measure that does not depend on knowing.
     ///
     /// The enclosing message is counted separately by
     /// [`add_message`](Self::add_message) — this only adds bytes.
-    pub fn add_tool_call(&mut self, name_bytes: u64, arguments_bytes: u64) -> &mut Self {
-        self.total_content_bytes = self
-            .total_content_bytes
-            .saturating_add(name_bytes)
-            .saturating_add(arguments_bytes);
+    pub fn add_tool_call(&mut self, serialized_bytes: u64) -> &mut Self {
+        self.total_content_bytes = self.total_content_bytes.saturating_add(serialized_bytes);
         self
     }
 
@@ -311,34 +321,31 @@ mod tests {
         // An assistant message that only called tools: no content string,
         // but a function name and an arguments payload the model read.
         let mut with_call = PromptCharge::new();
-        with_call.add_message(0).add_tool_call(4, 14);
+        with_call.add_message(0).add_tool_call(93);
 
         let mut without = PromptCharge::new();
         without.add_message(0);
 
-        assert_eq!(with_call.total_content_bytes(), 18);
+        assert_eq!(with_call.total_content_bytes(), 93);
         assert_eq!(with_call.message_count(), without.message_count());
         assert!(
             with_call.chargeable_prompt_tokens() > without.chargeable_prompt_tokens(),
             "tool-call bytes must not ride free"
         );
         // The bytes land in the byte term at the safe cost factor, like any
-        // other bytes: ceil(18*2/3) = 12 tokens more than the empty message.
+        // other bytes: ceil(93*2/3) = 62 tokens more than the empty message.
         assert_eq!(
             with_call.chargeable_prompt_tokens() - without.chargeable_prompt_tokens(),
-            12
+            62
         );
     }
 
     #[test]
     fn several_tool_calls_on_one_message_count_once_as_a_message() {
         let mut charge = PromptCharge::new();
-        charge
-            .add_message(0)
-            .add_tool_call(3, 10)
-            .add_tool_call(3, 10);
+        charge.add_message(0).add_tool_call(40).add_tool_call(40);
         assert_eq!(charge.message_count(), 1, "one message, two calls");
-        assert_eq!(charge.total_content_bytes(), 26);
+        assert_eq!(charge.total_content_bytes(), 80);
     }
 
     #[test]
@@ -372,7 +379,7 @@ mod tests {
         let mut charge = PromptCharge::new();
         charge
             .add_message(u64::MAX)
-            .add_tool_call(u64::MAX, u64::MAX)
+            .add_tool_call(u64::MAX)
             .add_tool_definition(u64::MAX);
         assert_eq!(charge.total_content_bytes(), u64::MAX);
         assert_eq!(
@@ -392,9 +399,9 @@ mod tests {
         let mut charge = PromptCharge::new();
         // {"role":"user","content":"what is 2+2?"}
         charge.add_message(12);
-        // {"role":"assistant","content":null,"tool_calls":[…name "calc",
-        //  arguments "{\"expr\":\"2+2\"}"…]}
-        charge.add_message(0).add_tool_call(4, 14);
+        // {"role":"assistant","content":null,"tool_calls":[<one 93-byte
+        //  entry: id, type, and function{name,arguments}>]}
+        charge.add_message(0).add_tool_call(TOOL_CALL_BYTES);
         // {"role":"tool","tool_call_id":"call_1","content":"4"}
         charge.add_message(1);
         // The advertised `calc` schema, compact-serialized (see the
@@ -402,10 +409,16 @@ mod tests {
         charge.add_tool_definition(TOOL_DEFINITION_BYTES);
 
         assert_eq!(charge.message_count(), 3);
-        assert_eq!(charge.total_content_bytes(), 31 + TOOL_DEFINITION_BYTES);
-        // ceil((31 + 154) * 2 / 3) + 8*3 + 32 = 124 + 24 + 32 = 180
-        assert_eq!(charge.chargeable_prompt_tokens(), 180);
+        assert_eq!(
+            charge.total_content_bytes(),
+            13 + TOOL_CALL_BYTES + TOOL_DEFINITION_BYTES
+        );
+        // ceil((13 + 93 + 154) * 2 / 3) + 8*3 + 32 = 174 + 24 + 32 = 230
+        assert_eq!(charge.chargeable_prompt_tokens(), 230);
     }
+
+    /// Compact JSON byte length of the fixture's single tool-call entry.
+    const TOOL_CALL_BYTES: u64 = 93;
 
     /// Compact JSON byte length of the fixture's single tool definition.
     const TOOL_DEFINITION_BYTES: u64 = 154;
