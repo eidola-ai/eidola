@@ -15,8 +15,8 @@ use gpui::{
     MouseUpEvent, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, point, px, size,
 };
 use gpui_markdown_editor::{
-    BlockKind, EditorEvent, EditorState, EmbedMap, MarkdownEditor, MarkdownEditorState, Selection,
-    embed_marker,
+    BlockKind, EditorEvent, EditorState, EmbedChromeCounts, EmbedMap, MarkdownEditor,
+    MarkdownEditorState, Selection, embed_marker,
 };
 
 struct EditorHarness {
@@ -649,4 +649,179 @@ fn set_embeds_snaps_a_selection_inside_a_newly_mapped_marker(cx: &mut TestAppCon
             "typed text must not splice into the marker; got {v:?}"
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Embedded markdown fidelity — real layout
+//
+// `layout_embed` re-renders the mapped content readonly and stacks it inside
+// the quote container. Constructs whose visual is *chrome* rather than shaped
+// text (list markers, code-block panels, typeset math) have to be re-emitted
+// there explicitly, and originally weren't: an embedded list rendered as bare
+// indented paragraphs — no bullets, no numbers, no checkboxes. These pin the
+// chrome via `debug_embed_content`, which reports what the container actually
+// painted. Everything that *is* shaped text (headings, emphasis, links,
+// tables, blockquotes, hard breaks) already rode the shared shaping path and
+// is covered by the visual corpus in `tests/visual/cases.rs`.
+// ---------------------------------------------------------------------------
+
+/// Open a window over a document that is nothing but a mapped embed of
+/// `content`, run a real layout, and return everything the embed painted:
+/// `(text pieces as (text, x, y), chrome counts)`.
+fn embed_paint(
+    cx: &mut TestAppContext,
+    content: &str,
+) -> (Vec<(String, f32, f32)>, EmbedChromeCounts) {
+    let state = EditorState {
+        markdown: MARKER.into(),
+        selection: Selection::Cursor(0),
+        embeds: EmbedMap::new([(1u64, content.to_string())]),
+    };
+    let (handle, editor) = cx.update(|cx| {
+        gpui_component::init(cx);
+        let mut inner: Option<Entity<MarkdownEditorState>> = None;
+        let bounds = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(560.), px(600.)),
+        };
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let editor = cx.new(|cx| MarkdownEditorState::with_state(state, window, cx));
+                    inner = Some(editor.clone());
+                    let harness = cx.new(|_| EditorHarness {
+                        state: editor.clone(),
+                    });
+                    cx.new(|cx| gpui_component::Root::new(harness, window, cx))
+                },
+            )
+            .expect("open window");
+        (window.into(), inner.expect("editor built"))
+    });
+    let vcx = VisualTestContext::from_window(handle, cx);
+    vcx.run_until_parked();
+    editor
+        .read_with(&vcx, |e, _| e.debug_embed_content(1))
+        .expect("the embed painted")
+}
+
+/// Text pieces in painted order, trimmed — the readable transcript of what an
+/// embed put on screen.
+fn texts(pieces: &[(String, f32, f32)]) -> Vec<String> {
+    pieces.iter().map(|(t, ..)| t.trim().to_string()).collect()
+}
+
+#[gpui::test]
+fn an_embedded_unordered_list_paints_its_bullets(cx: &mut TestAppContext) {
+    let (pieces, _) = embed_paint(cx, "- alpha\n- beta\n");
+    assert_eq!(
+        texts(&pieces).iter().filter(|t| *t == "•").count(),
+        2,
+        "one bullet glyph per item; got {:?}",
+        texts(&pieces)
+    );
+    // Each bullet sits left of its item's text on the same row.
+    for item in ["alpha", "beta"] {
+        let (_, text_x, text_y) = pieces
+            .iter()
+            .find(|(t, ..)| t.trim() == item)
+            .unwrap_or_else(|| panic!("{item} shaped"));
+        assert!(
+            pieces
+                .iter()
+                .any(|(t, x, y)| t.trim() == "•" && *x < *text_x && (*y - *text_y).abs() < 0.5),
+            "a bullet must sit left of {item} on its own row"
+        );
+    }
+}
+
+#[gpui::test]
+fn an_embedded_ordered_list_paints_its_numbers(cx: &mut TestAppContext) {
+    let (pieces, _) = embed_paint(cx, "8. eight\n9. nine\n10. ten\n");
+    let markers: Vec<String> = texts(&pieces)
+        .into_iter()
+        .filter(|t| t.ends_with('.'))
+        .collect();
+    assert_eq!(markers, vec!["8.", "9.", "10."]);
+    // Markers right-align against a shared content edge, so the two-digit
+    // one starts further left than the one-digit ones.
+    let x_of = |needle: &str| {
+        pieces
+            .iter()
+            .find(|(t, ..)| t.trim() == needle)
+            .map(|(_, x, _)| *x)
+            .unwrap_or_else(|| panic!("{needle} painted"))
+    };
+    assert!(x_of("10.") < x_of("8."), "wider markers extend leftward");
+}
+
+#[gpui::test]
+fn an_embedded_nested_list_indents_each_level(cx: &mut TestAppContext) {
+    let (pieces, _) = embed_paint(cx, "- outer\n  - inner\n    - deepest\n");
+    let x_of = |needle: &str| {
+        pieces
+            .iter()
+            .find(|(t, ..)| t.trim() == needle)
+            .map(|(_, x, _)| *x)
+            .unwrap_or_else(|| panic!("{needle} painted"))
+    };
+    assert_eq!(texts(&pieces).iter().filter(|t| *t == "•").count(), 3);
+    assert!(x_of("outer") < x_of("inner") && x_of("inner") < x_of("deepest"));
+}
+
+#[gpui::test]
+fn an_embedded_task_list_paints_its_checkboxes(cx: &mut TestAppContext) {
+    let (pieces, _) = embed_paint(cx, "- [x] done\n- [ ] todo\n- plain\n");
+    let t = texts(&pieces);
+    assert!(t.iter().any(|s| s == "☑"), "checked box; got {t:?}");
+    assert!(t.iter().any(|s| s == "☐"), "unchecked box; got {t:?}");
+    assert!(t.iter().any(|s| s == "•"), "plain sibling keeps its bullet");
+    // The GFM chrome never shapes into the text.
+    assert!(
+        t.iter().all(|s| !s.contains('[')),
+        "raw brackets leaked: {t:?}"
+    );
+}
+
+#[gpui::test]
+fn an_embedded_list_inside_a_blockquote_keeps_both_chromes(cx: &mut TestAppContext) {
+    let (pieces, chrome) = embed_paint(cx, "> - one\n> - two\n");
+    assert_eq!(texts(&pieces).iter().filter(|t| *t == "•").count(), 2);
+    assert!(
+        chrome.bars > 0,
+        "the nested blockquote keeps its border bar"
+    );
+}
+
+#[gpui::test]
+fn an_embedded_code_block_paints_a_background_panel(cx: &mut TestAppContext) {
+    let (pieces, chrome) = embed_paint(cx, "intro\n\n```rust\nlet x = 1;\n```\n\nouttro");
+    assert_eq!(chrome.code_panels, 1, "one panel behind the fenced block");
+    let t = texts(&pieces);
+    assert!(t.iter().any(|s| s == "let x = 1;"), "code shapes: {t:?}");
+    assert!(
+        t.iter().all(|s| !s.contains("```")),
+        "fence rows collapse rather than shaping: {t:?}"
+    );
+}
+
+#[gpui::test]
+fn embedded_inline_math_typesets_instead_of_showing_its_source(cx: &mut TestAppContext) {
+    let (pieces, chrome) = embed_paint(cx, "before $x^2$ after");
+    assert_eq!(chrome.math, 1, "the construct typesets");
+    assert!(
+        texts(&pieces).iter().all(|s| !s.contains('$')),
+        "raw LaTeX must not shape once it typesets: {:?}",
+        texts(&pieces)
+    );
+}
+
+#[gpui::test]
+fn an_embedded_thematic_break_paints_a_rule(cx: &mut TestAppContext) {
+    let (_, chrome) = embed_paint(cx, "above\n\n---\n\nbelow");
+    assert_eq!(chrome.rules, 1);
 }
