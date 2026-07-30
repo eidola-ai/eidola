@@ -237,6 +237,33 @@ pub struct LaidOutBlock {
     /// — an incidental cross-module invariant no test owned; recording the
     /// ordinal at render removes the coupling (and the per-click parse).
     pub embed_ordinal: Option<u64>,
+    /// `Some` for a rendered embed: what its quote container actually painted
+    /// this frame. Moved out of the paint state once painting is done rather
+    /// than cloned, so recording it costs one `Vec` per embed per frame.
+    ///
+    /// The pieces are display-only — no caret, no hit-testing — so nothing in
+    /// the interaction path reads this; it exists so the embed-fidelity
+    /// regressions can assert on real laid-out chrome (a list's bullet
+    /// glyphs, a code block's panel) instead of eyeballing a snapshot.
+    pub embed_content: Option<EmbedContentGeometry>,
+}
+
+/// Laid-out content of one rendered embed block, in window coordinates.
+/// See [`LaidOutBlock::embed_content`].
+#[derive(Default)]
+pub struct EmbedContentGeometry {
+    /// Every painted text piece: shaped text plus its origin. Includes the
+    /// list-marker glyphs (`• `, `1. `, `☑ `), which are chrome rather than
+    /// document text and so appear in no shaped line.
+    pub pieces: Vec<(SharedString, Point<Pixels>)>,
+    /// Rounded background panels behind embedded fenced code blocks.
+    pub code_panels: Vec<Bounds<Pixels>>,
+    /// Origins of the typeset math (inline and display) painted inside.
+    pub math_origins: Vec<Point<Pixels>>,
+    /// Hairline rules — embedded tables' row boundaries and thematic breaks.
+    pub rules: Vec<Bounds<Pixels>>,
+    /// Border bars of blockquotes nested inside the embedded content.
+    pub bars: Vec<Bounds<Pixels>>,
 }
 
 pub struct PrepaintState {
@@ -1144,13 +1171,20 @@ fn layout_table(
 // blockquote indent). The sub-lines are display-only — no cursor, no
 // hit-testing inside; the *outer* block's atomicity rules own interaction.
 //
-// v1 fidelity notes (documented degradations): embedded math and images
-// render as their raw markdown source (the overlay/typeset passes don't run
-// inside embeds — `strip_embed_overlays` un-hides their bytes so nothing
-// silently vanishes); embedded tables reuse `layout_table` (aligned boxes +
-// hairline rules); embedded code blocks shape mono without the background
-// strip or horizontal scrollbar (long lines clip at the embed mask); GFM
-// task checkboxes (a marker-overlay feature) don't paint.
+// Chrome that isn't shaped text has to be re-emitted here explicitly, since
+// only the shaping path is shared: list markers (`emit_embed_marker_overlays`
+// — bullets, numbers, task checkboxes), code-block panels, thematic-break and
+// table rules, nested blockquote bars, and typeset math.
+//
+// Remaining fidelity notes: an embedded table reuses `layout_table` but takes
+// no horizontal scroll (a wide one clips at the embed mask, as does a long
+// code line); a code block gets one flat panel rather than the editor's
+// fence-frame-plus-inset-strip, because the embed collapses the fence rows
+// that frame would need; and **images render as their raw markdown source**
+// (`strip_embed_image_overlays` un-hides their bytes so nothing silently
+// vanishes) — resolving one calls `Window::use_asset`, which needs the
+// rendering entity on the window stack, and `layout_embed` also runs from the
+// measure closure, where it isn't.
 // ---------------------------------------------------------------------------
 
 /// One shaped line of an embed's rendered content. Origins are relative to
@@ -1180,19 +1214,28 @@ struct EmbedLayoutOut {
     /// Blockquote border bars for nested blockquotes *inside* the embedded
     /// content, relative bounds.
     bars: Vec<Bounds<Pixels>>,
+    /// Rounded background panels for embedded fenced code blocks. One flat
+    /// fill rather than the main editor's two-layer fence-frame-plus-inset-
+    /// strip, because an embed collapses the fence rows that frame would
+    /// need — the panel *is* the content area.
+    code_panels: Vec<Bounds<Pixels>>,
     size: Size<Pixels>,
 }
 
-/// Un-hide the byte ranges of overlay constructs that don't run their
-/// augment/typeset passes inside embeds (inline math, inline images) and
-/// drop the overlay records, so the raw markdown shapes honestly instead of
-/// silently vanishing under a hide with nothing painted in its place.
-fn strip_embed_overlays(block: &mut RenderBlock) {
+/// Un-hide the byte ranges of image overlays and drop the records, so the raw
+/// markdown shapes honestly instead of silently vanishing under a hide with
+/// nothing painted in its place.
+///
+/// Images are the one overlay an embed can't resolve: `crate::image::load`
+/// calls `Window::use_asset`, which needs the rendering entity on the window's
+/// stack — and `layout_embed` also runs from the measure closure, after
+/// `request_layout` has returned. Inline math has no such constraint and does
+/// run its augment pass inside embeds.
+fn strip_embed_image_overlays(block: &mut RenderBlock) {
     let cuts: Vec<Range<usize>> = block
-        .math_overlays
+        .image_overlays
         .drain(..)
         .map(|o| o.source_range)
-        .chain(block.image_overlays.drain(..).map(|o| o.source_range))
         .collect();
     for cut in &cuts {
         subtract_hidden_range(&mut block.hidden_ranges, cut);
@@ -1218,6 +1261,114 @@ fn subtract_hidden_range(hidden: &mut Vec<Range<usize>>, cut: &Range<usize>) {
     *hidden = out;
 }
 
+/// Position every inline-math construct that lives on `row` as an embed math
+/// piece. The embed twin of `paint_inline_math_overlays`: the substitution's
+/// display offset gives x; the y puts the math's baseline on the row's text
+/// baseline, mirroring gpui's vertical centering of a shaped line inside
+/// `row_height`.
+///
+/// Consumes the specs it places (`MathLayout` isn't `Clone`, and a construct
+/// belongs to exactly one row anyway) — the caller's vector keeps only the
+/// specs still awaiting a row.
+#[allow(clippy::too_many_arguments)]
+fn place_embed_inline_math(
+    specs: &mut Vec<InlineMathPaintSpec>,
+    row: &ShapedLine,
+    row_origin: Point<Pixels>,
+    row_height: Pixels,
+    body_ascent: Pixels,
+    body_descent: Pixels,
+    out: &mut Vec<EmbedMathPiece>,
+) {
+    if specs.is_empty() {
+        return;
+    }
+    let half_leading = ((row_height - body_ascent - body_descent) / 2.0).max(px(0.0));
+    let mut unplaced = Vec::with_capacity(specs.len());
+    for spec in specs.drain(..) {
+        let on_this_row = spec.source_range.start >= row.source_range.start
+            && spec.source_range.start < row.source_range.end;
+        let local = on_this_row
+            .then(|| {
+                row.display_to_source
+                    .iter()
+                    .position(|&src| src == spec.source_range.start)
+                    .and_then(|off| row.line.position_for_index(off, row_height))
+            })
+            .flatten();
+        let Some(local) = local else {
+            unplaced.push(spec);
+            continue;
+        };
+        let text_baseline = row_origin.y + local.y + half_leading + body_ascent;
+        out.push(EmbedMathPiece {
+            rel_origin: point(
+                row_origin.x + local.x,
+                text_baseline - spec.layout.baseline(spec.em_px),
+            ),
+            layout: spec.layout,
+            em_px: spec.em_px,
+        });
+    }
+    *specs = unplaced;
+}
+
+/// Re-emit a block's [`MarkerOverlay`](crate::render_spec::MarkerOverlay)
+/// chrome as embed pieces.
+///
+/// A list item's marker (`• `, `1. `, `☑ `) is **not** shaped text: the
+/// render layer hides the marker bytes so content shapes at column 0, and the
+/// element paints the glyph into the item's indent strip. `layout_embed`
+/// shapes lines only, so before this every embedded list rendered as bare
+/// indented paragraphs — no bullets, no numbers, no checkboxes.
+///
+/// Positioning mirrors `paint_list_marker_overlay` exactly (right-aligned
+/// against the level's content edge, so short and long markers in one list
+/// share a content edge); the row comes from the shaped row whose source
+/// range contains the marker's first byte, falling back to the block's top.
+///
+/// Blockquote markers are deliberately not handled: `render::attach_marker`
+/// records them only when the cursor is *inside*, and embed content renders
+/// through `render_readonly` (cursor nowhere), so an embed never has one.
+/// The bar itself is drawn by `layout_embed`'s container pass.
+fn emit_embed_marker_overlays(
+    block: &RenderBlock,
+    shaped_rows: &[(Range<usize>, Pixels)],
+    block_top: Pixels,
+    line_height: Pixels,
+    style: &MarkdownStyle,
+    window: &mut Window,
+    pieces: &mut Vec<EmbedPiece>,
+) {
+    for marker in &block.marker_overlays {
+        let Some(Container::ListItem {
+            kind,
+            cursor_inside,
+            ..
+        }) = block.containers.get(marker.level)
+        else {
+            continue;
+        };
+        let text = list_marker_display_text(*kind, *cursor_inside);
+        let Some(glyph) = shape_marker_text(&text, style, window) else {
+            continue;
+        };
+        let strip_right = container_x_at_level(&block.containers, marker.level + 1, style, window);
+        let row_y = shaped_rows
+            .iter()
+            .find(|(r, _)| {
+                r.start <= marker.source_range.start && marker.source_range.start < r.end
+            })
+            .map(|(_, y)| *y)
+            .unwrap_or(block_top);
+        pieces.push(EmbedPiece {
+            rel_origin: point((strip_right - glyph.width()).max(px(0.0)), row_y),
+            line: glyph,
+            row_height: line_height,
+        });
+    }
+}
+
 /// Lay out an embed's mapped markdown at `avail_w`: parse + readonly-render
 /// the content, then stack each sub-block using the editor's own shaping and
 /// spacing rules (per-block font size, symmetric half-gaps, container
@@ -1238,6 +1389,7 @@ fn layout_embed(
         math: Vec::new(),
         rules: Vec::new(),
         bars: Vec::new(),
+        code_panels: Vec::new(),
         size: Size::default(),
     };
     let mut y = px(0.0);
@@ -1252,6 +1404,12 @@ fn layout_embed(
         let bar_top = y;
         y += above;
         let block_top = y;
+
+        // Source range + y origin of each shaped row this block emitted —
+        // what `emit_embed_marker_overlays` needs to put a list marker on the
+        // row its bytes belong to (the main editor reads the same thing off
+        // `LaidOutLine`).
+        let mut shaped_rows: Vec<(Range<usize>, Pixels)> = Vec::new();
 
         match &block.kind {
             BlockKind::Table { .. } => {
@@ -1318,9 +1476,29 @@ fn layout_embed(
                     if matches!(b.kind, BlockKind::DisplayMath { .. }) {
                         b.hidden_ranges.clear();
                     }
-                    strip_embed_overlays(&mut b);
+                    // Inline math typesets inside an embed exactly as it does
+                    // in the editor: the augment pass replaces each construct
+                    // with a width-matched padding run and returns a paint
+                    // spec. Images can't take this path — see
+                    // `strip_embed_image_overlays`.
+                    let (mut b, mut math_specs) =
+                        augment_block_with_math(&b, content, font_size, style, window);
+                    strip_embed_image_overlays(&mut b);
+                    let (body_ascent, body_descent) =
+                        body_metrics_for_block(&b.kind, style, font_size, window);
                     let is_code = is_code_block(&b.kind);
                     let wrap_w = if is_code { None } else { Some(inner_w) };
+                    // A code block insets its content from its background
+                    // panel on all four sides, exactly as the main editor
+                    // does — without the pad the first and last code rows sit
+                    // flush against the panel edge.
+                    let pad = if is_code {
+                        style.code_block_padding
+                    } else {
+                        px(0.0)
+                    };
+                    let text_left = indent + pad;
+                    y += pad;
                     let shaped = shape_block_lines(content, &b, style, font_size, wrap_w, window);
                     let mut advanced = false;
                     for sl in shaped {
@@ -1331,14 +1509,37 @@ fn layout_embed(
                         if sl.is_delimiter {
                             continue;
                         }
+                        // A row whose math overshoots the body font's natural
+                        // half-leading reserves extra space above/below, the
+                        // same shift the editor's own line layout applies —
+                        // otherwise a tall construct paints over its
+                        // neighbours.
+                        let extra = compute_math_row_extra(
+                            &sl.source_range,
+                            &math_specs,
+                            body_ascent,
+                            body_descent,
+                            line_height,
+                        );
                         let wrap_count = (sl.line.wrap_boundaries().len() as f32) + 1.0;
-                        let h = line_height * wrap_count;
-                        if indent + sl.line.width() > max_w {
-                            max_w = indent + sl.line.width();
+                        let h = (line_height + extra.total()) * wrap_count;
+                        let row_y = y + extra.top;
+                        if text_left + sl.line.width() > max_w {
+                            max_w = text_left + sl.line.width();
                         }
+                        place_embed_inline_math(
+                            &mut math_specs,
+                            &sl,
+                            point(text_left, row_y),
+                            line_height,
+                            body_ascent,
+                            body_descent,
+                            &mut out.math,
+                        );
+                        shaped_rows.push((sl.source_range.clone(), row_y));
                         out.pieces.push(EmbedPiece {
                             line: sl.line,
-                            rel_origin: point(indent, y),
+                            rel_origin: point(text_left, row_y),
                             row_height: line_height,
                         });
                         y += h;
@@ -1346,11 +1547,31 @@ fn layout_embed(
                     }
                     if !advanced {
                         // Keep the layout total even for a blank block.
-                        y = block_top + line_height;
+                        y = block_top + line_height + pad;
+                    }
+                    y += pad;
+                    if is_code {
+                        out.code_panels.push(Bounds::new(
+                            point(indent, block_top),
+                            size(inner_w, (y - block_top).max(px(0.0))),
+                        ));
+                        if indent + inner_w > max_w {
+                            max_w = indent + inner_w;
+                        }
                     }
                 }
             }
         }
+
+        emit_embed_marker_overlays(
+            block,
+            &shaped_rows,
+            block_top,
+            line_height,
+            style,
+            window,
+            &mut out.pieces,
+        );
 
         y += below;
 
@@ -1379,6 +1600,7 @@ struct EmbedPaint {
     math: Vec<EmbedMathPiece>,
     rules: Vec<(Bounds<Pixels>, bool)>,
     bars: Vec<Bounds<Pixels>>,
+    code_panels: Vec<Bounds<Pixels>>,
     /// The embed's own quote bar (the container chrome).
     bar: Bounds<Pixels>,
     /// Full content bounds — the clip mask and the selection-wash rect.
@@ -2069,6 +2291,7 @@ impl Element for BlockElement {
                 BlockKind::Embed { ordinal } => Some(*ordinal),
                 _ => None,
             },
+            embed_content: None,
         };
 
         // Marker-overlay cursor: when the cursor is inside a task
@@ -2241,6 +2464,10 @@ impl Element for BlockElement {
                     bar.origin.x += origin.x;
                     bar.origin.y += origin.y;
                 }
+                for panel in &mut layout.code_panels {
+                    panel.origin.x += origin.x;
+                    panel.origin.y += origin.y;
+                }
                 let content_bounds = Bounds::new(
                     point(block_left, block_top),
                     size(block_width, (block_bottom - block_top).max(px(0.0))),
@@ -2253,6 +2480,7 @@ impl Element for BlockElement {
                     math: layout.math,
                     rules: layout.rules,
                     bars: layout.bars,
+                    code_panels: layout.code_panels,
                     bar: Bounds::new(
                         point(block_left + style.blockquote_border_inset, block_top),
                         size(
@@ -2535,6 +2763,7 @@ impl Element for BlockElement {
         // line or table never leaks outside the container). Painted before
         // the regular line pass — the marker's own shaped line is empty, so
         // ordering only matters vs. the caret, which paints last.
+        let mut embed_content: Option<EmbedContentGeometry> = None;
         if let Some(ep) = prepaint.embed_paint.take() {
             if ep.selected {
                 window.paint_quad(fill(ep.bounds, self.style.selection_color));
@@ -2542,6 +2771,16 @@ impl Element for BlockElement {
             window.paint_quad(fill(ep.bar, self.style.blockquote_border_color));
             let mask = ContentMask { bounds: ep.bounds };
             window.with_content_mask(Some(mask), |window| {
+                for panel in &ep.code_panels {
+                    window.paint_quad(quad(
+                        *panel,
+                        self.style.code_block_radius,
+                        self.style.code_block_content_background,
+                        Edges::default(),
+                        gpui::transparent_black(),
+                        BorderStyle::default(),
+                    ));
+                }
                 for bar in &ep.bars {
                     window.paint_quad(fill(*bar, self.style.blockquote_border_color));
                 }
@@ -2581,6 +2820,19 @@ impl Element for BlockElement {
                     m.layout
                         .paint(m.rel_origin, m.em_px, self.style.text_color, window, cx);
                 }
+            });
+            // Record what was painted (moving, not cloning — `ep` is dropped
+            // here regardless). See `LaidOutBlock::embed_content`.
+            embed_content = Some(EmbedContentGeometry {
+                pieces: ep
+                    .pieces
+                    .into_iter()
+                    .map(|p| (p.line.text.clone(), p.rel_origin))
+                    .collect(),
+                code_panels: ep.code_panels,
+                math_origins: ep.math.into_iter().map(|m| m.rel_origin).collect(),
+                rules: ep.rules.into_iter().map(|(r, _)| r).collect(),
+                bars: ep.bars,
             });
         }
 
@@ -2843,8 +3095,13 @@ impl Element for BlockElement {
                 lines: Vec::new(),
                 source_range: 0..0,
                 embed_ordinal: None,
+                embed_content: None,
             },
         );
+        let laid_out = LaidOutBlock {
+            embed_content,
+            ..laid_out
+        };
         let block_index = self.block_index;
         self.editor.update(cx, |editor, _| {
             editor.last_blocks.insert(block_index, laid_out);
