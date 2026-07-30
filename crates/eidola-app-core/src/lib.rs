@@ -3726,6 +3726,13 @@ impl Inner {
         } else {
             consumer_tools.clone()
         };
+        // Serialize the advertised schemas once: the charge estimate below
+        // and every round's request body read this same array, so the hold
+        // covers exactly the tool bytes that go on the wire. If the backend
+        // rejects the tools field, `withdraw_auto_tools` re-derives this
+        // array from the restored registry so the retry's estimate and body
+        // agree again.
+        let tool_schemas = tool_registry.schemas();
 
         // The spend side runs only for eidola turns. Local and external
         // turns carry no charge estimate, no credential, and no ACT header
@@ -3735,8 +3742,12 @@ impl Inner {
         let (charge_credits, spend, auth_value) = match remote_pricing {
             None => (0u128, None, external_auth),
             Some(pricing) => {
-                let charge_credits =
-                    estimate_charge_credits(&messages, max_completion_tokens, pricing);
+                let charge_credits = estimate_charge_credits(
+                    &messages,
+                    &tool_schemas,
+                    max_completion_tokens,
+                    pricing,
+                );
                 if charge_credits == 0 {
                     return Err(wrap(AppError::Credential {
                         message: "computed charge is zero — model pricing may be missing".into(),
@@ -3777,6 +3788,7 @@ impl Inner {
             trace_reply_to: inf_reply_to_for_trace,
             messages,
             tools: tool_registry,
+            tool_schemas,
             consumer_tools,
             auto_tools: nav_tools,
             remote_pricing,
@@ -3900,8 +3912,12 @@ impl Inner {
             return Ok(());
         };
         let cfg = self.load_config();
-        let charge_credits =
-            estimate_charge_credits(&prep.messages, prep.max_completion_tokens, pricing);
+        let charge_credits = estimate_charge_credits(
+            &prep.messages,
+            &prep.tool_schemas,
+            prep.max_completion_tokens,
+            pricing,
+        );
         if charge_credits == 0 {
             return Err(AppError::Credential {
                 message: "computed charge is zero — model pricing may be missing".into(),
@@ -6630,6 +6646,14 @@ struct TurnPrep {
     /// The tool registry snapshot for this turn (see [`tools`]). Empty ⇒ the
     /// request body carries no `tools` field at all.
     tools: Arc<tools::ToolRegistry>,
+    /// The advertised tool schemas, serialized **once** at preparation from
+    /// that snapshot (and re-derived by `withdraw_auto_tools` when a
+    /// rejection degrade shrinks the registry). Every round's charge estimate
+    /// and every round's wire request read this one array, exactly as they
+    /// both read `messages` — the schemas are part of the prompt the model
+    /// reads, so the pricing contract charges their bytes (see
+    /// `eidola_common::prompt_charge`).
+    tool_schemas: Vec<serde_json::Value>,
     /// The registry as it stood *before* this turn attached its navigation
     /// tools — what a tool-rejection degrade falls back to.
     consumer_tools: Arc<tools::ToolRegistry>,
@@ -6686,6 +6710,11 @@ impl TurnPrep {
     fn withdraw_auto_tools(&mut self) {
         if self.auto_tools {
             self.tools = self.consumer_tools.clone();
+            // The serialized schemas are what `request_body` sends and what
+            // every round's estimate charges, so they must shrink with the
+            // registry — or the "toolless" retry would still advertise (and
+            // hold for) the tools the backend just refused.
+            self.tool_schemas = self.tools.schemas();
             self.auto_tools = false;
         }
     }
@@ -6702,8 +6731,8 @@ impl TurnPrep {
             "messages": self.messages,
             "max_completion_tokens": self.max_completion_tokens,
         });
-        if !self.tools.is_empty() {
-            body["tools"] = serde_json::Value::Array(self.tools.schemas());
+        if !self.tool_schemas.is_empty() {
+            body["tools"] = serde_json::Value::Array(self.tool_schemas.clone());
         }
         if stream {
             body["stream"] = serde_json::Value::Bool(true);
@@ -7607,43 +7636,24 @@ async fn execute_tool_calls(
     out
 }
 
-/// The shared client/server pricing inputs for a messages array: the summed
-/// UTF-8 byte length of each entry's `content` **string** plus the entry count.
-///
-/// Deliberately identical to the server's `chargeable_prompt_tokens_for`
-/// (which reads `Message::content`), including for the tool-loop shapes: an
-/// assistant message carrying `tool_calls` has no content string and
-/// contributes zero bytes, and a `tool` result message contributes its content
-/// like any other. Both sides computing the same function of the same array is
-/// what makes hold ≥ charge structural.
-fn messages_charge_inputs(messages: &[serde_json::Value]) -> (u64, u64) {
-    let bytes = messages
-        .iter()
-        .map(|m| {
-            m.get("content")
-                .and_then(|c| c.as_str())
-                .map(|s| s.len() as u64)
-                .unwrap_or(0)
-        })
-        .sum();
-    (bytes, messages.len() as u64)
-}
-
-/// The worst-case charge in credits for one request over `messages`.
+/// The worst-case charge in credits for one request over `messages` and the
+/// `tool_schemas` that request advertises.
 ///
 /// `pricing` is `(prompt_rate, completion_rate, scale_factor)` from the model
-/// catalog. The prompt side is the shared contract
-/// (`eidola_common::chargeable_prompt_tokens`); the completion side is the
-/// full `max_completion_tokens` ceiling.
+/// catalog. The prompt side is the shared contract's **single walk**,
+/// `eidola_common::prompt_charge` — the same function the server calls over
+/// the same request, which is what makes hold ≥ charge structural rather
+/// than a property two crates must keep agreeing on. The completion side is
+/// the full `max_completion_tokens` ceiling.
 fn estimate_charge_credits(
     messages: &[serde_json::Value],
+    tool_schemas: &[serde_json::Value],
     max_completion_tokens: u32,
     pricing: (u128, u128, u128),
 ) -> u128 {
     let (prompt_rate, completion_rate, sf) = pricing;
-    let (total_content_bytes, message_count) = messages_charge_inputs(messages);
     let chargeable_prompt =
-        eidola_common::chargeable_prompt_tokens(total_content_bytes, message_count);
+        eidola_common::prompt_charge(messages, Some(tool_schemas)).chargeable_prompt_tokens();
     let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
     let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
     prompt_credits + completion_credits
@@ -9968,9 +9978,50 @@ mod tests {
         );
     }
 
-    /// Strip-on-receipt removes a leading header-shaped line (and the blank
-    /// line under it) — but leaves ordinary content, including markdown
-    /// headings, untouched.
+    // --- the shared pricing contract's tool-calling extension ------------
+
+    /// app-core's agreement test for the shared pricing contract.
+    ///
+    /// The canonical pin lives in `eidola_common`'s
+    /// `cross_crate_tool_round_fixture`; this reconstructs the same logical
+    /// request in app-core's **own** representation — the `serde_json::Value`
+    /// messages and tool schemas a turn actually puts on the wire — and must
+    /// reach the same 230 chargeable prompt tokens.
+    #[test]
+    fn prompt_charge_matches_the_shared_contract_fixture() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "what is 2+2?"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "calc", "arguments": "{\"expr\":\"2+2\"}"}
+                }]
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "4"}),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "calc",
+                "description": "Evaluate arithmetic.",
+                "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}}
+            }
+        })];
+
+        // Fed through the *shared* walk, exactly as `estimate_charge_credits`
+        // does — so this proves app-core hands the contract a well-formed
+        // view of the request it really sends, which is the part no test
+        // inside eidola-common can see.
+        let charge = eidola_common::prompt_charge(&messages, Some(&tools));
+        assert_eq!(charge.message_count(), 3);
+        // 13 content + 93 tool-call + 154 schema bytes.
+        assert_eq!(charge.total_content_bytes(), 260);
+        assert_eq!(charge.chargeable_prompt_tokens(), 230);
+    }
+
     // --- tool-call shape + streamed provider-field preservation ----------
 
     #[test]

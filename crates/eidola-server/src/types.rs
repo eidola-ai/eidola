@@ -45,6 +45,25 @@ pub struct ChatCompletionRequest {
     /// Up to 4 sequences where the API will stop generating.
     #[serde(default)]
     pub stop: Option<StopSequence>,
+
+    /// Tool (function) definitions the model may call.
+    ///
+    /// **Opaque pass-through.** Each entry is forwarded upstream verbatim:
+    /// the server never executes a tool and has no reason to understand the
+    /// JSON Schema inside `function.parameters`, while modelling it would
+    /// mean rejecting (via this struct's `deny_unknown_fields`) every
+    /// provider extension a client legitimately sends. Keeping the entries
+    /// as raw `Value`s is also what lets the pricing contract measure
+    /// exactly the bytes that go on the wire — see
+    /// `handlers::chargeable_prompt_tokens_for`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+
+    /// How the model should choose among `tools` (`"none"` / `"auto"` /
+    /// `"required"`, or a `{"type":"function", …}` object). Opaque
+    /// pass-through for the same reason as [`Self::tools`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 /// OpenAI-compatible streaming options.
@@ -84,11 +103,40 @@ pub struct Message {
     pub role: Role,
 
     /// The content of the message.
-    pub content: MessageContent,
+    ///
+    /// Nullable since tool calling: an assistant message that only called
+    /// tools carries `"content": null`. The key is deliberately **always
+    /// serialized** (no `skip_serializing_if`) — several chat templates
+    /// require it to exist, and clients send the explicit `null` for that
+    /// reason, so dropping it on the way upstream would change the request.
+    #[serde(default)]
+    pub content: Option<MessageContent>,
 
     /// An optional name for the participant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// Tool calls the assistant made, replayed by the client verbatim on the
+    /// follow-up request.
+    ///
+    /// **Opaque pass-through**, like [`ChatCompletionRequest::tools`]: the
+    /// client is required to replay the provider's own call objects
+    /// unchanged (ids and any provider extension fields intact), so the
+    /// server must not normalize them through a narrower struct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+
+    /// The id of the tool call this message answers (`role: "tool"` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl Message {
+    /// UTF-8 byte length of the message's text content — 0 when the content
+    /// is absent or `null` (an assistant message that only called tools).
+    pub fn content_byte_len(&self) -> usize {
+        self.content.as_ref().map(|c| c.byte_len()).unwrap_or(0)
+    }
 }
 
 /// The role of a message author.
@@ -98,6 +146,8 @@ pub enum Role {
     System,
     User,
     Assistant,
+    /// The result of a tool call, keyed by `tool_call_id`.
+    Tool,
 }
 
 /// Message content can be a simple string or array of content parts (for multimodal).
@@ -228,6 +278,14 @@ pub struct AssistantMessage {
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+
+    /// Tool calls the model asked for. Relayed to the client **verbatim**
+    /// (raw `Value`s) so the ids and any provider extension fields survive —
+    /// the client replays these objects unchanged on its follow-up request,
+    /// and a narrower struct here would silently drop what it doesn't model,
+    /// exactly the defect the `reasoning*` fields above were added to fix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 /// The reason the model stopped generating.
@@ -237,6 +295,10 @@ pub enum FinishReason {
     Stop,
     Length,
     ContentFilter,
+    /// The model stopped to call tools. Without this variant the whole
+    /// completion (blocking) or chunk (SSE) fails to deserialize, so a
+    /// tool-calling response never reaches the client at all.
+    ToolCalls,
 }
 
 /// Token usage statistics.
@@ -317,6 +379,18 @@ pub struct ChunkDelta {
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+
+    /// Streamed tool-call deltas, relayed **verbatim** as raw `Value`s.
+    ///
+    /// Nothing about a streamed tool call is guaranteed to arrive whole: the
+    /// id, the function name and the `arguments` string all arrive in
+    /// fragments keyed by the entry's `index`, and the client reassembles
+    /// them. The proxy therefore must not model, reorder, or normalize these
+    /// entries — including the streaming-only `index` framing key, which the
+    /// client's accumulator needs. Same rule as `reasoning*` above: a field
+    /// this struct does not name is dropped on re-serialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 /// A list of available models.
@@ -418,7 +492,7 @@ mod tests {
         assert_eq!(request.messages[0].role, Role::User);
         assert!(matches!(
             &request.messages[0].content,
-            MessageContent::Text(t) if t == "Hello!"
+            Some(MessageContent::Text(t)) if t == "Hello!"
         ));
         assert!(!request.stream);
     }
@@ -506,7 +580,7 @@ mod tests {
         let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
 
         match &request.messages[0].content {
-            MessageContent::Parts(parts) => {
+            Some(MessageContent::Parts(parts)) => {
                 assert_eq!(parts.len(), 2);
                 assert!(
                     matches!(&parts[0], ContentPart::Text { text } if text == "What's in this image?")
@@ -535,7 +609,7 @@ mod tests {
         let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
 
         match &request.messages[0].content {
-            MessageContent::Parts(parts) => match &parts[0] {
+            Some(MessageContent::Parts(parts)) => match &parts[0] {
                 ContentPart::ImageUrl { image_url } => {
                     assert_eq!(image_url.detail, Some("high".to_string()));
                 }
@@ -583,6 +657,7 @@ mod tests {
                     content: Some("Hello!".to_string()),
                     reasoning_content: None,
                     reasoning: None,
+                    tool_calls: None,
                 },
                 finish_reason: Some(FinishReason::Stop),
             }],
@@ -613,6 +688,7 @@ mod tests {
                     content: None,
                     reasoning_content: None,
                     reasoning: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -645,6 +721,191 @@ mod tests {
         }"#;
         let err = serde_json::from_str::<ChatCompletionRequest>(json).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    // -----------------------------------------------------------------
+    // Tool calling: the three request shapes, and the two response shapes
+    //
+    // The server is a stateless proxy: what it parses it must forward
+    // upstream unchanged, and what upstream sends it must relay to the
+    // client unchanged. Each test below therefore asserts the *round trip*
+    // (parse → re-serialize), which is exactly what `backend.rs` does with
+    // `.json(request)` on the way up and `serde_json::to_string(&chunk)` on
+    // the way down.
+    // -----------------------------------------------------------------
+
+    /// The full tool-bearing request: a `tools` array, an assistant message
+    /// with `tool_calls` and `content: null`, and a `role: "tool"` result.
+    /// Before this landed, every one of these 422'd at the extractor.
+    const TOOL_REQUEST: &str = r#"{
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "what is 2+2?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "index": 0,
+                 "function": {"name": "calc", "arguments": "{\"expr\":\"2+2\"}"},
+                 "provider_extra": {"trace": "abc"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "4"}
+        ],
+        "tools": [
+            {"type": "function", "function": {
+                "name": "calc",
+                "description": "Evaluate arithmetic.",
+                "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}}
+            }}
+        ],
+        "tool_choice": "auto"
+    }"#;
+
+    #[test]
+    fn tool_bearing_request_parses() {
+        let request: ChatCompletionRequest = serde_json::from_str(TOOL_REQUEST).unwrap();
+
+        assert_eq!(request.messages.len(), 3);
+
+        // Assistant message: null content, verbatim call objects.
+        let assistant = &request.messages[1];
+        assert_eq!(assistant.role, Role::Assistant);
+        assert!(assistant.content.is_none());
+        assert_eq!(assistant.content_byte_len(), 0);
+        let calls = assistant.tool_calls.as_ref().expect("tool_calls parsed");
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["name"], "calc");
+
+        // Tool result message.
+        let tool = &request.messages[2];
+        assert_eq!(tool.role, Role::Tool);
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool.content_byte_len(), 1);
+
+        // Request-level tool advertisement.
+        assert_eq!(request.tools.as_ref().unwrap().len(), 1);
+        assert_eq!(request.tool_choice.as_ref().unwrap(), "auto");
+    }
+
+    #[test]
+    fn tool_bearing_request_forwards_upstream_unchanged() {
+        let request: ChatCompletionRequest = serde_json::from_str(TOOL_REQUEST).unwrap();
+        // `backend.rs` forwards with `.json(request)` — compare the
+        // re-serialized value against the parsed original.
+        let forwarded: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        let original: serde_json::Value = serde_json::from_str(TOOL_REQUEST).unwrap();
+
+        // Opaque pass-through: provider extension fields and the streaming
+        // `index` key inside a call object survive the proxy.
+        assert_eq!(
+            forwarded["messages"][1]["tool_calls"], original["messages"][1]["tool_calls"],
+            "tool_calls must be forwarded verbatim"
+        );
+        assert_eq!(forwarded["tools"], original["tools"]);
+        assert_eq!(forwarded["tool_choice"], original["tool_choice"]);
+        assert_eq!(forwarded["messages"][2], original["messages"][2]);
+
+        // The explicit null content survives: several chat templates require
+        // the key to exist on an assistant tool-call message.
+        assert!(forwarded["messages"][1].get("content").is_some());
+        assert!(forwarded["messages"][1]["content"].is_null());
+    }
+
+    #[test]
+    fn message_without_content_key_is_accepted() {
+        // Some clients omit `content` entirely rather than sending null.
+        let json = r#"{
+            "model": "gpt-4o",
+            "messages": [{"role": "assistant", "tool_calls": [
+                {"id": "c", "type": "function", "function": {"name": "n", "arguments": "{}"}}
+            ]}]
+        }"#;
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(request.messages[0].content.is_none());
+        assert_eq!(request.messages[0].content_byte_len(), 0);
+    }
+
+    #[test]
+    fn request_without_tools_serializes_exactly_as_before() {
+        // The pre-tool-calling shape must be untouched on the wire: no
+        // `tools` / `tool_choice` / `tool_calls` / `tool_call_id` keys.
+        let json = r#"{"model": "m", "messages": [{"role": "user", "content": "hi"}]}"#;
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let out = serde_json::to_string(&request).unwrap();
+        assert!(!out.contains("tools"));
+        assert!(!out.contains("tool_choice"));
+        assert!(!out.contains("tool_calls"));
+        assert!(!out.contains("tool_call_id"));
+    }
+
+    #[test]
+    fn blocking_response_relays_tool_calls_verbatim() {
+        // The upstream's blocking answer: `finish_reason: "tool_calls"` plus
+        // call objects carrying a provider extension field.
+        let upstream = r#"{
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 1,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "calc", "arguments": "{\"expr\":\"2+2\"}"},
+                     "provider_extra": {"trace": "abc"}}
+                ]},
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        }"#;
+        let parsed: ChatCompletionResponse = serde_json::from_str(upstream).unwrap();
+        assert!(matches!(
+            parsed.choices[0].finish_reason,
+            Some(FinishReason::ToolCalls)
+        ));
+
+        let relayed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        let original: serde_json::Value = serde_json::from_str(upstream).unwrap();
+        assert_eq!(
+            relayed["choices"][0]["message"]["tool_calls"],
+            original["choices"][0]["message"]["tool_calls"],
+            "the client replays these objects verbatim — nothing may be dropped"
+        );
+        assert_eq!(relayed["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn streamed_tool_call_deltas_relay_verbatim() {
+        // A streamed call arrives in fragments keyed by `index`; the client
+        // reassembles them, so the proxy must relay each delta unchanged.
+        let deltas = [
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m",
+                "choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
+                    {"index":0,"id":"call_1","type":"function",
+                     "function":{"name":"ca","arguments":""},"provider_extra":{"t":1}}
+                ]},"finish_reason":null}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m",
+                "choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"function":{"name":"lc","arguments":"{\"expr\":"}}
+                ]},"finish_reason":null}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m",
+                "choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"function":{"arguments":"\"2+2\"}"}}
+                ]},"finish_reason":"tool_calls"}]}"#,
+        ];
+
+        for delta in deltas {
+            let chunk: ChatCompletionChunk = serde_json::from_str(delta).unwrap();
+            let relayed: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&chunk).unwrap()).unwrap();
+            let original: serde_json::Value = serde_json::from_str(delta).unwrap();
+            assert_eq!(
+                relayed["choices"][0]["delta"]["tool_calls"],
+                original["choices"][0]["delta"]["tool_calls"],
+                "streamed tool_calls must relay verbatim (index framing included)"
+            );
+            assert_eq!(
+                relayed["choices"][0]["finish_reason"],
+                original["choices"][0]["finish_reason"]
+            );
+        }
     }
 
     #[test]
