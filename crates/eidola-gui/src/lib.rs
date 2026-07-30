@@ -668,6 +668,14 @@ fn try_focus_existing_onboarding(cx: &mut App) -> bool {
 /// gradient), `settings::NAV_TOP_RESERVE` (the lights sit over the nav
 /// band), and `record::STRIP_LEFT_PAD` (the section strip doubles as the
 /// title bar).
+///
+/// `title: None` here only means "no title at creation" — every
+/// `open_*_window` calls `Window::set_window_title` anyway, which names the
+/// window for the macOS Window menu, the window switcher, and (the reason it
+/// was added) VoiceOver's window chooser, *and* labels the accessibility
+/// tree's otherwise-anonymous root node. It paints nothing: gpui_macos pairs
+/// `titlebarAppearsTransparent` with `NSWindowTitleHidden`, so the string
+/// never reaches the title bar.
 fn transparent_titlebar() -> TitlebarOptions {
     TitlebarOptions {
         title: None,
@@ -724,6 +732,7 @@ fn open_about_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
+        window.set_window_title("About Eidola");
         let view = cx.new(|cx| AboutView::new(window, cx));
         let view = chrome::ChromeRoot::wrap(view.into(), cx);
         cx.new(|cx| chrome::themed_root(view, window, cx))
@@ -803,6 +812,7 @@ fn open_library_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
+        window.set_window_title("Library");
         let view = cx.new(|cx| LibraryView::new(stores.clone(), window, cx));
         let view = chrome::ChromeRoot::wrap(view.into(), cx);
         cx.new(|cx| chrome::themed_root(view, window, cx))
@@ -823,6 +833,7 @@ fn open_updates_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
+        window.set_window_title("Updates");
         let view = cx.new(|cx| UpdatesView::new(stores.clone(), window, cx));
         let view = chrome::ChromeRoot::wrap(view.into(), cx);
         cx.new(|cx| chrome::themed_root(view, window, cx))
@@ -844,6 +855,7 @@ fn open_record_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
+        window.set_window_title("The Record");
         let view = cx.new(|cx| RecordView::new(stores.clone(), window, cx));
         let view = chrome::ChromeRoot::wrap(view.into(), cx);
         cx.new(|cx| chrome::themed_root(view, window, cx))
@@ -866,6 +878,7 @@ fn open_onboarding_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
+        window.set_window_title("Get Started");
         let view = cx.new(|cx| OnboardingView::new(stores.clone(), window, cx));
         let view = chrome::ChromeRoot::wrap(view.into(), cx);
         cx.new(|cx| chrome::themed_root(view, window, cx))
@@ -892,6 +905,10 @@ pub fn open_participants_window(
 
     let _ = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
+        window.set_window_title(&match space_title.as_deref() {
+            Some(t) => format!("Participants — {t}"),
+            None => "Participants".to_string(),
+        });
         let view = cx.new(|cx| {
             participants_view::ParticipantsView::new(
                 stores.clone(),
@@ -914,6 +931,7 @@ fn open_settings_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
+        window.set_window_title("Settings");
         let view = cx.new(|cx| SettingsView::new(stores.clone(), window, cx));
         let view = chrome::ChromeRoot::wrap(view.into(), cx);
         cx.new(|cx| chrome::themed_root(view, window, cx))
