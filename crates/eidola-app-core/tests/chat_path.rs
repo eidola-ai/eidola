@@ -25,7 +25,8 @@ mod chat_harness;
 
 use chat_harness::{
     ChatBehavior, DEFAULT_AGENT_LABEL, HUMAN_LABEL, MODEL, MockConfig, MockServer, RefundMode,
-    flat_messages, headed, system_message, with_account,
+    THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, flat_messages, headed, map_entry, system_message,
+    system_message_with, thread_map, with_account,
 };
 use eidola_app_core::changes::Change;
 use eidola_app_core::error::AppError;
@@ -799,6 +800,12 @@ fn branch_reply_sends_only_its_branch_context() {
         // ancestry of the new post — never the sibling turn (u2/i2). Exact
         // bytes: every message headed, and the responding agent's own prior
         // answer (and only it) rendered `assistant`.
+        //
+        // The sibling turn is *named* rather than shown: the space now branches
+        // at i1, so the turn carries a trailing thread map (task 21). That is
+        // the whole point — the model learns the branch exists without its
+        // bytes entering the trunk.
+        let u2_item = item_id_of(&core, &first.space_id, "And why two per day?");
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 3, "two spine turns + one branch reply");
         assert_eq!(
@@ -806,7 +813,7 @@ fn branch_reply_sends_only_its_branch_context() {
             vec![
                 (
                     "system".to_string(),
-                    system_message(Some(SEEDED_SYSTEM_PROMPT))
+                    system_message_with(Some(SEEDED_SYSTEM_PROMPT), &[THREAD_MAP_NOTE])
                 ),
                 (
                     "user".to_string(),
@@ -820,9 +827,691 @@ fn branch_reply_sends_only_its_branch_context() {
                     "user".to_string(),
                     headed(&branch_item, HUMAN_LABEL, "What about spring tides?")
                 ),
+                (
+                    "user".to_string(),
+                    thread_map(
+                        &[(
+                            format!("at #{}", eidola_app_core::post_handle(&i1_item)),
+                            vec![map_entry(
+                                &u2_item,
+                                HUMAN_LABEL,
+                                "2 posts",
+                                "just now",
+                                "And why two per day?",
+                            )],
+                        )],
+                        &eidola_app_core::post_handle(&branch_item),
+                    )
+                ),
             ],
-            "branch reply context = system prompt + the branch's ancestry only"
+            "branch reply context = system prompt + the branch's ancestry + the trailing map"
         );
+    });
+}
+
+// ===========================================================================
+// Thread map (task 21)
+// ===========================================================================
+
+/// Take one streaming turn, optionally branching at `reply_to`. The
+/// thread-map tests all build multi-post fixtures, so this keeps them readable.
+fn turn(
+    core: &AppCore,
+    prompt: &str,
+    space: Option<String>,
+    reply_to: Option<String>,
+) -> eidola_app_core::ChatResult {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+    core.runtime()
+        .block_on(core.chat_stream_reply(prompt.to_string(), MODEL.into(), space, reply_to, tx))
+        .unwrap_or_else(|e| panic!("turn {prompt:?} failed: {e}"))
+}
+
+/// The linear common case sends **no** map, no map note, and no `tools` field —
+/// byte-identical to what it sent before task 21. This is the pin that keeps
+/// the overwhelming majority of turns (and their upstream prefix caches)
+/// untouched by the feature.
+#[test]
+fn a_linear_space_sends_no_thread_map_and_no_tools() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = turn(&core, "How do tides work?", None, None);
+        turn(
+            &core,
+            "And why two per day?",
+            Some(first.space_id.clone()),
+            None,
+        );
+
+        for body in mock.chat_bodies() {
+            assert!(
+                body.get("tools").is_none(),
+                "a linear space attaches no tools: {body}"
+            );
+            let msgs = flat_messages(&body);
+            assert_eq!(
+                msgs[0].1,
+                system_message(Some(SEEDED_SYSTEM_PROMPT)),
+                "the system message is untouched without a map"
+            );
+            assert!(
+                msgs.iter().all(|(_, c)| !c.contains("<thread-map>")),
+                "no map block anywhere: {msgs:#?}"
+            );
+        }
+    });
+}
+
+/// A branched space's turn carries the map as its **last** message, naming
+/// every branch the spine does not contain: the fork it hangs off (by handle),
+/// the branch's author, post count, recency, and opening line. Dormant branches
+/// get short entries — never omission.
+#[test]
+fn a_branched_space_appends_a_thread_map_as_the_last_message() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // u1 -> i1 -> u2 -> i2, then a branch off i1.
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        turn(&core, "And why two per day?", Some(space.clone()), None);
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let i1 = tree[1].action_id.clone();
+        let i1_item = tree[1].item_id.clone();
+        let i2 = tree[3].action_id.clone();
+
+        turn(
+            &core,
+            "What about spring tides?",
+            Some(space.clone()),
+            Some(i1),
+        );
+        let branch_item = item_id_of(&core, &space, "What about spring tides?");
+
+        // Now take a turn back on the ORIGINAL spine (replying to i2), so the
+        // branch is what the turn cannot see.
+        turn(&core, "Anything else?", Some(space.clone()), Some(i2));
+        let last_item = item_id_of(&core, &space, "Anything else?");
+
+        let bodies = mock.chat_bodies();
+        let msgs = flat_messages(&bodies[3]);
+
+        // The map is the LAST message — the placement decision. Everything
+        // above it is conversation.
+        assert_eq!(
+            msgs.last().expect("a message").clone(),
+            (
+                "user".to_string(),
+                thread_map(
+                    &[(
+                        format!("at #{}", eidola_app_core::post_handle(&i1_item)),
+                        vec![map_entry(
+                            &branch_item,
+                            HUMAN_LABEL,
+                            // The branch's own ask plus the answer it drew.
+                            "2 posts",
+                            "just now",
+                            "What about spring tides?",
+                        )],
+                    )],
+                    &eidola_app_core::post_handle(&last_item),
+                ),
+            ),
+        );
+        assert_eq!(
+            msgs[0].1,
+            system_message_with(Some(SEEDED_SYSTEM_PROMPT), &[THREAD_MAP_NOTE]),
+            "the map note joins the system message; the tools note does not \
+             (the eidola backend cannot carry a `tools` field yet)"
+        );
+        assert!(
+            bodies[3].get("tools").is_none(),
+            "no tools on the eidola path until task 25: {}",
+            bodies[3]
+        );
+    });
+}
+
+/// The cache invariant, as byte equality.
+///
+/// Two things are pinned, and they are different strengths on purpose:
+///
+/// * **The conversation trunk is unconditionally identical** across every turn
+///   in the space — the posts up to the fork are the same bytes in the same
+///   order whether the turn is on branch A, on branch B, or on a linear space
+///   that has not branched yet. Nothing a branch does may move a shared byte.
+/// * **The full prefix, system message included, is identical across sibling
+///   branches** once both see a branched space. The system message flips
+///   exactly once per space — when the space first branches and the map note
+///   joins it — and is byte-stable from then on, which is why the two sibling
+///   turns below share it and the pre-branch turn does not.
+///
+/// All the per-turn volatility (which branches exist, how recently they moved)
+/// is in the trailing map, where recompute is cheap by construction.
+#[test]
+fn sibling_branch_turns_send_identical_trunk_bytes() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // Trunk: u1 -> i1. Then two sibling branches off i1.
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let i1 = tree[1].action_id.clone();
+
+        let branch_a = turn(
+            &core,
+            "What about spring tides?",
+            Some(space.clone()),
+            Some(i1.clone()),
+        );
+        turn(
+            &core,
+            "And what about neap tides?",
+            Some(space.clone()),
+            Some(i1.clone()),
+        );
+
+        // A third turn, back on branch A now that B exists — the genuine
+        // sibling of branch B's turn (both see the same branched space).
+        turn(
+            &core,
+            "Go on.",
+            Some(space.clone()),
+            branch_a.response_action_id.clone(),
+        );
+
+        let bodies = mock.chat_bodies();
+        let a = flat_messages(&bodies[1]); // branch A forked a linear space
+        let b = flat_messages(&bodies[2]); // branch B, space now branched
+        let c = flat_messages(&bodies[3]); // branch A continues, space branched
+
+        // The conversation trunk — the posts before the fork — is the same
+        // bytes in all three, including the pre-branch turn.
+        assert_eq!(&a[1..3], &b[1..3], "posts before the fork: A vs B");
+        assert_eq!(
+            &a[1..3],
+            &c[1..3],
+            "posts before the fork: A vs A-continued"
+        );
+
+        // Sibling turns over the branched space share the WHOLE prefix,
+        // system message included.
+        assert_eq!(
+            &b[..3],
+            &c[..3],
+            "sibling branches share every byte up to the fork, system message included"
+        );
+
+        // The one-time flip: A's turn predates the branch, so it carries
+        // neither the map note nor a map.
+        assert_eq!(
+            a[0].1,
+            system_message(Some(SEEDED_SYSTEM_PROMPT)),
+            "the pre-branch turn's system message is the pre-task-21 one"
+        );
+        assert!(
+            a.iter().all(|(_, c)| !c.contains("<thread-map>")),
+            "branch A forked a linear space: no map yet"
+        );
+
+        // And in both branched turns the map is the LAST message — all the
+        // volatility at the tail.
+        for msgs in [&b, &c] {
+            assert!(
+                msgs.last()
+                    .expect("a message")
+                    .1
+                    .starts_with("<thread-map>"),
+                "the map is the last message: {msgs:#?}"
+            );
+            assert_eq!(
+                msgs.iter()
+                    .filter(|(_, c)| c.starts_with("<thread-map>"))
+                    .count(),
+                1,
+                "exactly one map block"
+            );
+        }
+    });
+}
+
+// ===========================================================================
+// Navigation tools (task 21)
+//
+// These run over an `openai` backend rather than the eidola one, because that
+// is the real production gate: `prepare_turn` attaches the navigation tools
+// only when the space has branches AND the backend can carry a `tools` field,
+// and the Eidola server rejects unknown body fields today (see
+// `backend_accepts_tools`). Testing through the gate rather than around it is
+// what makes the eidola-path assertion above meaningful.
+// ===========================================================================
+
+/// An `openai` backend pointed at the mock — no account, no spend.
+fn external_backend(core: &AppCore, base_url: &str) {
+    core.runtime()
+        .block_on(core.add_backend(eidola_app_core::NewBackend {
+            id: "ext".into(),
+            kind: eidola_app_core::BackendKind::OpenAi,
+            display_name: String::new(),
+            base_url: Some(base_url.to_string()),
+            api_key: None,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+        }))
+        .expect("add backend");
+}
+
+/// The three navigation tools are advertised on a branched space's turn, and a
+/// round of real calls — including a deliberately stale handle — round-trips
+/// through the task-20 loop and comes back to the model as tool *results*.
+#[test]
+fn navigation_tools_round_trip_through_the_turn_loop() {
+    run(|| {
+        let script = chat_harness::tool_script();
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolScript,
+            tool_script: script.clone(),
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        let model = "qwen3-8b@ext";
+
+        // u1 -> i1 -> u2 -> i2, plus a branch post off i1 (saved, not asked —
+        // `post_reply` makes no request, so the mock's script stays untouched).
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), model.into(), None))
+            .expect("first turn");
+        let space = first.space_id.clone();
+        core.runtime()
+            .block_on(core.chat(
+                "And why two per day?".into(),
+                model.into(),
+                Some(space.clone()),
+            ))
+            .expect("second turn");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let i1 = tree[1].action_id.clone();
+        let u2_item = tree[2].item_id.clone();
+        let i2_item = tree[3].item_id.clone();
+        let i1_item = tree[1].item_id.clone();
+        core.runtime()
+            .block_on(core.post_reply(
+                "What about spring tides?".into(),
+                Some(space.clone()),
+                Some(i1),
+            ))
+            .expect("branch post");
+
+        // Now ask on the branch. The space forks at i1, so the map is present
+        // and the tools attach.
+        *script.lock().unwrap() = vec![
+            ("list_branches".into(), "{}".into()),
+            (
+                "read_thread".into(),
+                serde_json::json!({
+                    "handle": format!("#{}", eidola_app_core::post_handle(&u2_item)),
+                    "limit": 1,
+                })
+                .to_string(),
+            ),
+            (
+                "read_post".into(),
+                serde_json::json!({ "handle": eidola_app_core::post_handle(&i2_item) }).to_string(),
+            ),
+            (
+                "read_post".into(),
+                serde_json::json!({ "handle": "#zzzzzzz" }).to_string(),
+            ),
+        ];
+        let result = core
+            .runtime()
+            .block_on(core.chat("Tell me more.".into(), model.into(), Some(space.clone())))
+            .expect("the tool round-trip must not fail the turn");
+        assert_eq!(result.content, chat_harness::TOOL_FINAL_CONTENT);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 4, "two fixture turns + two rounds");
+
+        // Round 1 advertises exactly the three navigation tools.
+        let advertised: Vec<String> = bodies[2]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(advertised, ["list_branches", "read_thread", "read_post"]);
+        assert!(
+            flat_messages(&bodies[2])[0]
+                .1
+                .contains(THREAD_MAP_TOOLS_NOTE),
+            "the tools note only joins the system message when the tools attach"
+        );
+
+        // Round 2 replays the results the model reads.
+        let results: Vec<String> = flat_messages(&bodies[3])
+            .into_iter()
+            .filter(|(role, _)| role == "tool")
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(results.len(), 4, "one result per call, in order");
+
+        // list_branches: the whole space's structure, not just the map's.
+        assert!(
+            results[0].starts_with("1 fork point in this space."),
+            "{}",
+            results[0]
+        );
+        assert!(
+            results[0].contains(&format!("at #{}", eidola_app_core::post_handle(&i1_item))),
+            "{}",
+            results[0]
+        );
+
+        // read_thread: a bounded window, rendered in the task-19 header format,
+        // stating honestly what it did not show.
+        let u2_handle = eidola_app_core::post_handle(&u2_item);
+        assert!(
+            results[1].starts_with(&format!("Thread from #{u2_handle} — 2 posts, showing 1–1")),
+            "{}",
+            results[1]
+        );
+        assert!(
+            results[1].contains(&headed(&u2_item, HUMAN_LABEL, "And why two per day?")),
+            "one rendering path — the exact wire header format: {}",
+            results[1]
+        );
+        assert!(
+            results[1].ends_with("1 post not shown — call read_thread again with offset=1."),
+            "{}",
+            results[1]
+        );
+
+        // read_post: one post in full.
+        assert!(
+            results[2].starts_with(&format!("#{} · ", eidola_app_core::post_handle(&i2_item))),
+            "{}",
+            results[2]
+        );
+        assert!(
+            results[2].contains(chat_harness::TOOL_FINAL_CONTENT),
+            "{}",
+            results[2]
+        );
+
+        // A stale handle is answered honestly IN THE RESULT — the map is a
+        // snapshot, and reading a stale one must not burn the turn.
+        assert!(results[3].contains("`#zzzzzzz`"), "{}", results[3]);
+        assert!(results[3].contains("snapshot"), "{}", results[3]);
+        assert!(
+            !results[3].starts_with("error:"),
+            "a stale handle is an answer, not a tool error: {}",
+            results[3]
+        );
+    });
+}
+
+/// Build a branched fixture space over an `openai` backend and return
+/// `(space_id, the action to reply to)`. Two posts and a branch post, so the
+/// next turn carries a map (and would carry tools).
+fn branched_external_space(core: &AppCore) -> String {
+    let first = core
+        .runtime()
+        .block_on(core.chat("How do tides work?".into(), "qwen3-8b@ext".into(), None))
+        .expect("first turn");
+    let space = first.space_id.clone();
+    core.runtime()
+        .block_on(core.chat(
+            "And why two per day?".into(),
+            "qwen3-8b@ext".into(),
+            Some(space.clone()),
+        ))
+        .expect("second turn");
+    let tree = core
+        .runtime()
+        .block_on(core.get_space_tree(space.clone()))
+        .expect("tree");
+    core.runtime()
+        .block_on(core.post_reply(
+            "What about spring tides?".into(),
+            Some(space.clone()),
+            Some(tree[1].action_id.clone()),
+        ))
+        .expect("branch post");
+    space
+}
+
+/// Backend *kind* cannot establish tool-calling capability: a generic
+/// OpenAI-compatible endpoint — or a llama.cpp server whose model template's
+/// tool block does not render — speaks chat completions perfectly well and
+/// rejects only the `tools` field. Since attachment is automatic on branch,
+/// that would otherwise mean "branching your conversation breaks every turn"
+/// with no opt-out. Instead the turn withdraws the tools it added and retries
+/// the round once, keeping the map.
+#[test]
+fn a_backend_that_rejects_tools_degrades_to_a_toolless_retry() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        let space = branched_external_space(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat(
+                "Tell me more.".into(),
+                "qwen3-8b@ext".into(),
+                Some(space.clone()),
+            ))
+            .expect("the turn must survive a backend that rejects tools");
+        assert_eq!(result.content, "Hello from the mock.");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len(),
+            4,
+            "two fixture turns + the rejected try + the retry"
+        );
+        assert!(
+            bodies[2].get("tools").is_some(),
+            "the first try offers the navigation tools"
+        );
+        assert!(
+            bodies[3].get("tools").is_none(),
+            "the retry withdraws them: {}",
+            bodies[3]
+        );
+        // The map is not part of the degrade — it rides the messages array and
+        // is unaffected by the tools field.
+        for body in [&bodies[2], &bodies[3]] {
+            let msgs = flat_messages(body);
+            assert!(
+                msgs.last()
+                    .expect("a message")
+                    .1
+                    .starts_with("<thread-map>"),
+                "the map survives the degrade: {msgs:#?}"
+            );
+        }
+    });
+}
+
+/// The degrade is remembered for the process, so the wasted request happens at
+/// most once per backend rather than on every branched turn. It is an
+/// in-process observation, not a config surface and not persisted — the
+/// capability flag stays genuinely deferred.
+#[test]
+fn a_backend_observed_to_reject_tools_is_not_offered_them_again() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        let space = branched_external_space(&core);
+
+        for prompt in ["Tell me more.", "And more."] {
+            core.runtime()
+                .block_on(core.chat(prompt.into(), "qwen3-8b@ext".into(), Some(space.clone())))
+                .expect("turn succeeds");
+        }
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len(),
+            5,
+            "two fixture turns + (rejected try + retry) + ONE request for the second turn"
+        );
+        assert!(
+            bodies[4].get("tools").is_none(),
+            "the second branched turn never offers tools again: {}",
+            bodies[4]
+        );
+        assert!(
+            flat_messages(&bodies[4])
+                .last()
+                .expect("a message")
+                .1
+                .starts_with("<thread-map>"),
+            "…and still carries the map"
+        );
+    });
+}
+
+/// A failure that is *not* attributable to the tools field must not silently
+/// downgrade the backend forever. The memo records only when the toolless
+/// retry actually succeeds — which is the evidence that the field was the
+/// cause.
+#[test]
+fn a_rejection_unrelated_to_tools_does_not_downgrade_the_backend() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::Non2xx(500),
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+
+        // Build the branched fixture with `post` alone — no HTTP, so the
+        // always-500 mock doesn't interfere with the setup.
+        let post = core
+            .runtime()
+            .block_on(core.post("How do tides work?".into(), None))
+            .expect("post");
+        let space = post.space_id.clone();
+        core.runtime()
+            .block_on(core.post_reply(
+                "What about spring tides?".into(),
+                Some(space.clone()),
+                Some(post.action_id.clone()),
+            ))
+            .expect("branch post");
+        core.runtime()
+            .block_on(core.post_reply(
+                "And neap tides?".into(),
+                Some(space.clone()),
+                Some(post.action_id.clone()),
+            ))
+            .expect("second branch post");
+
+        // The space forks, so the turn attaches tools; the endpoint 500s for
+        // an unrelated reason, so the toolless retry fails too.
+        let err = core
+            .runtime()
+            .block_on(core.chat(
+                "Tell me more.".into(),
+                "qwen3-8b@ext".into(),
+                Some(space.clone()),
+            ))
+            .expect_err("the turn fails honestly");
+        assert!(
+            matches!(err.root(), AppError::Server { status: 500, .. }),
+            "{err:?}"
+        );
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2, "the try and the one toolless retry");
+        assert!(bodies[0].get("tools").is_some());
+        assert!(bodies[1].get("tools").is_none());
+    });
+}
+
+/// The navigation tool names are reserved at the registration seam.
+///
+/// Without this, a consumer's `read_thread` would register fine, work on every
+/// linear turn, and then be silently replaced by the built-in the moment a
+/// space branched — the advertised schema and the executed implementation
+/// diverging on exactly the turns the feature exists for. The turn layers its
+/// tools onto the registry snapshot and `ToolRegistry::register` is
+/// last-write-wins, so the collision has to be refused where it is made.
+#[test]
+fn registering_a_reserved_navigation_tool_name_is_refused() {
+    struct Impostor(&'static str);
+    impl eidola_app_core::tools::Tool for Impostor {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "a consumer's own tool"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn call<'a>(
+            &'a self,
+            _arguments: serde_json::Value,
+        ) -> eidola_app_core::tools::ToolFuture<'a> {
+            Box::pin(async move { Ok(String::new()) })
+        }
+    }
+
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        for name in eidola_app_core::tools::RESERVED_TOOL_NAMES {
+            let err = core
+                .register_tool(std::sync::Arc::new(Impostor(name)))
+                .expect_err("a reserved name must be refused");
+            assert!(
+                matches!(err.root(), AppError::NotConfigured { message } if message.contains(name)),
+                "{err:?}"
+            );
+        }
+        assert!(
+            core.registered_tools().is_empty(),
+            "nothing was registered: {:?}",
+            core.registered_tools()
+        );
+        // Any other name still registers exactly as before.
+        core.register_tool(std::sync::Arc::new(Impostor("summarize")))
+            .expect("an unreserved name registers");
+        assert_eq!(core.registered_tools(), vec!["summarize".to_string()]);
     });
 }
 
@@ -1605,7 +2294,8 @@ use eidola_app_core::tools::EchoTool;
 /// Register the harness's echo tool — the only thing that makes a turn send
 /// `tools` at all.
 fn with_echo_tool(core: &AppCore) {
-    core.register_tool(std::sync::Arc::new(EchoTool));
+    core.register_tool(std::sync::Arc::new(EchoTool))
+        .expect("echo is not a reserved name");
 }
 
 /// A turn whose registry is empty must send **no** `tools` field: the whole
