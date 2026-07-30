@@ -12,7 +12,7 @@ use image::RgbaImage;
 type BuildRoot = Box<dyn Fn(&mut gpui::Window, &mut gpui::App) -> Entity<Root>>;
 
 struct Case {
-    name: &'static str,
+    name: String,
     size: Size<Pixels>,
     build: BuildRoot,
 }
@@ -38,13 +38,13 @@ impl Snapshots {
         }
     }
 
-    pub fn add<V, F>(&mut self, name: &'static str, size: Size<Pixels>, build: F)
+    pub fn add<V, F>(&mut self, name: impl Into<String>, size: Size<Pixels>, build: F)
     where
         V: Render + 'static,
         F: Fn(&mut gpui::Window, &mut gpui::App) -> Entity<V> + 'static,
     {
         self.cases.push(Case {
-            name,
+            name: name.into(),
             size,
             build: Box::new(move |window, cx| {
                 let view = build(window, cx);
@@ -53,8 +53,17 @@ impl Snapshots {
         });
     }
 
-    pub fn run_or_exit(self) -> ! {
+    pub fn run_or_exit(mut self) -> ! {
         std::fs::create_dir_all(&self.snapshot_dir).expect("create snapshot dir");
+
+        // `VISUAL_FILTER=<substring>` renders only matching cases — the full
+        // set is minutes of offscreen rendering, and a targeted audit wants
+        // one family at a time.
+        if let Ok(filter) = std::env::var("VISUAL_FILTER")
+            && !filter.is_empty()
+        {
+            self.cases.retain(|c| c.name.contains(&filter));
+        }
 
         let platform = gpui_platform::current_platform(false);
         let mut cx = VisualTestAppContext::with_asset_source(platform, Arc::new(Assets));
