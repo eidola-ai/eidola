@@ -68,10 +68,15 @@ pub fn plan_rows(
         list = list.child(
             v_flex()
                 .id(("plan", idx))
-                .probe(
+                // Name and price make the option's name; the subline — how many
+                // credits, and the expiry disclosure that must stay visible at
+                // the point of purchase — is the value, so it is not lost to a
+                // reader who only hears the row's name.
+                .probe_value(
                     format!("{name_prefix}/plan/{idx}"),
                     Role::ListBoxOption,
                     plan_aria,
+                    SharedString::from(subline.clone()),
                 )
                 .w_full()
                 .py_3()
