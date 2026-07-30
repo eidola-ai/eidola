@@ -38,7 +38,14 @@ jobs:
   rust-checks:
     name: Rust checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # 60 rather than 30: dev builds compile dependencies at opt-level 2 (see
+    # the root Cargo.toml profile block), so a COLD-cache run — a dependency
+    # or profile change, or a cache eviction — exceeds 30 minutes on this
+    # runner. Warm-cache runs are unaffected. The generous ceiling also
+    # protects the post-merge push run that SAVES the cache: rust-cache saves
+    # in a post step, which a timeout cancellation skips — a too-tight timeout
+    # there would leave every subsequent PR cold, timing out in a spiral.
+    timeout-minutes: 60
     permissions:
       contents: read
 

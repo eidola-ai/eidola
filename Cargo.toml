@@ -12,6 +12,55 @@ authors = ["Mike Marcacci"]
 repository = "https://github.com/eidola-ai/eidola"
 publish = false
 
+# Optimize dependencies in dev builds. Our own crates stay at the dev default
+# (opt-level = 0) — they are recompiled constantly. Dependencies are the
+# opposite: recompiled almost never, executed on every frame. `"*"` means every
+# non-workspace-member package, and per the Cargo book's override precedence it
+# outranks `build-override`, so proc macros and build scripts are covered too
+# (verified: `serde_derive`, a real `--crate-type proc-macro`, compiles at
+# opt-level 2 under this). `profile.docker-dev` inherits it (also verified).
+#
+# Measured on an M4 Max against `cargo build -p eidola-gui`, opt-level 0 -> 2:
+#
+#   - Runtime: 8-17x faster frames. The Record frame-cost harness
+#     (`crates/eidola-gui/tests/record_perf.rs`) drops from 10.2 ms to 0.6 ms
+#     median per frame on a 64 KiB payload, and 3.2 ms to 0.4 ms at 4 KiB —
+#     because a frame is almost entirely dependency code (gpui text layout,
+#     gpui-component). The harness's selection fingerprints are byte-identical
+#     before and after, so nothing miscompiled.
+#   - One-time cost: a cold build goes from ~58 s to ~145 s. Paid on a
+#     dependency bump or a fresh checkout, not on iteration.
+#   - Iteration cost: none. Touching a file in eidola-gui rebuilds in ~1.5-2.8 s
+#     either way; touching eidola-app-core (which rebuilds the GUI downstream)
+#     went 2.8 s -> 2.2 s; rebuilding all five workspace crates from scratch
+#     with deps cached stayed ~15 s. The Cargo book warns that opt-level >= 2
+#     stops crates sharing monomorphized generics, which could have shown up
+#     here as slower rebuilds of our crates; measurably it does not.
+#   - The debug binary halves: 179 MB -> 93 MB.
+#
+# What this gives up: dependency frames are optimized, so single-stepping
+# through a dependency is unreliable and its locals often read "optimized out".
+# Backtraces are NOT affected — verified frame-for-frame with file:line intact,
+# because rustc still emits inline-frame DWARF and `debug` stays at the dev
+# default here. If you need to debug inside a dependency, temporarily set
+# opt-level = 0 below (or pin just that one package with
+# `[profile.dev.package.<name>]`).
+#
+# Companions considered and rejected:
+#   - `debug = "line-tables-only"` for dependencies: saves ~1.1 GB in target/
+#     and ~20 s of cold build, and (measured) leaves backtraces intact. Rejected
+#     because it removes dependency locals outright rather than merely degrading
+#     them, compounding the one thing opt-level 2 already costs.
+#   - `[profile.dev.build-override] opt-level = 2`: measured indistinguishable
+#     (145 s vs 144 s cold, same 695 compiled units — so no double-compilation
+#     of dual-role crates either), because `package."*"` already outranks it.
+#   - `opt-level = 1` for dependencies, the Cargo book's suggestion for keeping
+#     generic sharing: same runtime to within noise and ~25 s faster cold, but
+#     a larger binary (104 MB) — and the sharing penalty it guards against did
+#     not materialize at 2.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.docker-dev]
 inherits = "dev"
 opt-level = 1
