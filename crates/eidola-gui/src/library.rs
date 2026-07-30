@@ -214,6 +214,7 @@ impl LibraryView {
     /// `uniform_list` — clones only the visible slice from the store, so the
     /// per-frame cost is O(visible), not O(loaded).
     fn render_rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let total = self.spaces.read(cx).list().len();
         let visible: Vec<(usize, SpaceInfo)> = self
             .spaces
             .read(cx)
@@ -223,7 +224,7 @@ impl LibraryView {
             .unwrap_or_default();
         visible
             .into_iter()
-            .map(|(idx, space)| self.render_row(idx, &space, cx).into_any_element())
+            .map(|(idx, space)| self.render_row(idx, &space, total, cx).into_any_element())
             .collect()
     }
 
@@ -231,6 +232,7 @@ impl LibraryView {
         &self,
         idx: usize,
         space: &SpaceInfo,
+        total: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -382,6 +384,10 @@ impl LibraryView {
                 gpui::Role::ListItem,
                 row_label,
             )
+            // `uniform_list` renders only the visible window, so without the
+            // set metadata AT sees "6 spaces" in a library of six hundred.
+            .aria_position_in_set(idx + 1)
+            .aria_size_of_set(total)
             .w_full()
             .h(ROW_H)
             .gap_3()
@@ -559,6 +565,13 @@ impl Render for LibraryView {
         root.child(
             h_flex().w_full().flex_1().min_h_0().justify_center().child(
                 div()
+                    .id("library-list-wrap")
+                    // The listing's container: `uniform_list` itself can't
+                    // carry a role (it implements `InteractiveElement` but not
+                    // `StatefulInteractiveElement`, where gpui's aria builders
+                    // live), so the wrapper that already spans the viewport is
+                    // where the `List` parent goes.
+                    .probe("library/list", gpui::Role::List, "Spaces")
                     .relative()
                     .h_full()
                     .w_full()
