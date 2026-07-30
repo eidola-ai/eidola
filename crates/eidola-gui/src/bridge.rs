@@ -125,7 +125,14 @@ pub fn submit(
 }
 
 /// Compute the auto-response plan for an already-persisted post (the cascade
-/// continuation after each driven turn). A pure read — commits nothing.
+/// continuation after each driven turn). Commits nothing.
+///
+/// `AppCore::plan_notifications` is the plan **+ may-decline-router
+/// refinement** entry point, so every hop of a cascade is refined, not just
+/// the first one `submit` returns. It can involve one small-model call when
+/// the space has a router model configured (none by default), which is why
+/// this runs on the core runtime like any other async read; a router failure
+/// degrades to the mechanical set rather than failing the plan.
 pub fn plan_notifications(
     core: Arc<AppCore>,
     space_id: String,

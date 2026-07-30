@@ -423,20 +423,34 @@ pub struct ChatResult {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub credits_charged: i64,
-    /// The persisted action id this turn produced — the `inference` normally,
-    /// or the `decision` when the turn was declined. Lets a caller continue an
-    /// auto-notify cascade by re-planning on the fresh post
-    /// (`plan_notifications(space_id, response_action_id)`). `None` only on
-    /// paths that produced no action row (none today — every success path
-    /// persists one).
+    /// The **post** this turn produced: the persisted `inference` action. Lets
+    /// a caller continue an auto-notify cascade by re-planning on it
+    /// (`plan_notifications(space_id, response_action_id)`).
+    ///
+    /// `None` exactly when the turn produced no post — today that means the
+    /// agent-side decline checkpoint fired, and [`Self::declined`] carries the
+    /// decision instead. That split is deliberate: a `decision` is not a post,
+    /// and a caller that re-planned on it would cascade off something nobody
+    /// can reply to. Keeping the decision id out of this field is what makes
+    /// that mistake unrepresentable rather than merely documented.
     pub response_action_id: Option<String>,
-    /// `Some(reason)` when the responding agent used the decline checkpoint
-    /// (see [`decline`]): the turn ran, the model saw the full context and
-    /// chose to bow out, and **no post was written** — `content` is empty and
-    /// `response_action_id` names the `decision` action rather than an
-    /// inference. `None` on every ordinary turn. A caller driving a cascade
-    /// should not re-plan on a declined turn: there is no new post to answer.
-    pub declined: Option<String>,
+    /// `Some(..)` when the responding agent used the decline checkpoint (see
+    /// [`decline`]): the turn ran, the model saw the full context and chose to
+    /// bow out, and **no post was written** — `content` is empty and
+    /// `response_action_id` is `None`. `None` on every ordinary turn.
+    pub declined: Option<DeclineOutcome>,
+}
+
+/// A turn that ended at the agent-side decline checkpoint (see [`decline`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclineOutcome {
+    /// The reason the agent stated, or empty when it gave none. The *act* of
+    /// declining is the datum; the reason is commentary.
+    pub reason: String,
+    /// The persisted `decision` action. Deliberately **not**
+    /// [`ChatResult::response_action_id`]: it is renderable and navigable, but
+    /// it is not a post and must never be treated as one.
+    pub action_id: String,
 }
 
 /// Outcome of [`AppCore::post`] — saving a thought without requesting a
@@ -3741,10 +3755,12 @@ impl Inner {
     /// persisted (the trace stays honest, and a `decline` called alongside
     /// another tool doesn't leave a `tool_call` action with no answers), a
     /// `decision` action is written against the post the turn answers, and the
-    /// turn ends with **no inference** — the would-be post is suppressed.
-    /// Emissions mirror the ordinary success arm minus nothing: `Space` (the
-    /// decision is new state a UI wants to render), `Wallet` when the turn
-    /// spent, and `Record` (request rows were written).
+    /// turn ends with **no inference** — the would-be post is suppressed, so
+    /// `ChatResult::response_action_id` is `None` and the decision id rides in
+    /// `ChatResult::declined` instead. Emissions mirror the ordinary success
+    /// arm minus nothing: `Space` (the decision is new state a UI wants to
+    /// render), `Wallet` when the turn spent, and `Record` (request rows were
+    /// written).
     async fn decline_checkpoint(
         &self,
         prep: &mut TurnPrep,
@@ -3775,8 +3791,13 @@ impl Inner {
             input_tokens: None,
             output_tokens: None,
             credits_charged: prep.total_credits as i64,
-            response_action_id: Some(decision_id),
-            declined: Some(reason),
+            // No post was written: the decision travels in `declined` so no
+            // caller can mistake it for one and cascade off it.
+            response_action_id: None,
+            declined: Some(DeclineOutcome {
+                reason,
+                action_id: decision_id,
+            }),
         }))
     }
 
@@ -4706,15 +4727,20 @@ impl Inner {
 
     // --- submit + notification planning (Participants v1) ----------------
 
-    /// Compute the auto-response notification plan for a post over the space's
-    /// participants (owned ∪ referenced globals, effective config). Applies the
-    /// data-derived cascade guard first: if the post's derived cascade depth has
-    /// reached the space's `cascade_limit`, returns [`NotificationPlan::Paused`]
-    /// instead of turns. Otherwise the notify set is every agent member (except
-    /// the post's author, and skipping model-less agents) whose `notify_policy`
-    /// fires: `all` → always; `human` → only when the post's author is human;
-    /// `explicit` → never (only an explicit ask reaches them).
-    async fn plan_notifications(
+    /// The **mechanical** auto-response notification plan for a post over the
+    /// space's participants (owned ∪ referenced globals, effective config).
+    /// Applies the data-derived cascade guard first: if the post's derived
+    /// cascade depth has reached the space's `cascade_limit`, returns
+    /// [`NotificationPlan::Paused`] instead of turns. Otherwise the notify set
+    /// is every agent member (except the post's author, and skipping
+    /// model-less agents) whose `notify_policy` fires: `all` → always; `human`
+    /// → only when the post's author is human; `explicit` → never (only an
+    /// explicit ask reaches them).
+    ///
+    /// A **pure read** — no network, no commits, no emissions. Production
+    /// callers go through [`Inner::plan_and_refine`], which additionally
+    /// filters this set through the space's may-decline router.
+    async fn mechanical_plan(
         &self,
         space_id: &str,
         post_action_id: &str,
@@ -4728,6 +4754,19 @@ impl Inner {
         // space's agent, persisting a cross-space reply edge). Reject up front.
         self.require_action_in_space(&conn, post_action_id, space_id)
             .await?;
+
+        // Only a **post** notifies anyone. Trace actions (`tool_call` /
+        // `tool_result`) and the decline checkpoint's `decision` are not
+        // things a participant replies to, and `get_space_tree` doesn't even
+        // render them — so a caller that mistakes one for a fresh post gets
+        // zero turns rather than a cascade hanging off a non-post. Defense in
+        // depth behind `ChatResult::response_action_id` being `None` on a
+        // declined turn (see [`decline`]); the guard is cheap and the failure
+        // it prevents is silent.
+        match db::action_type(&conn, post_action_id).await?.as_deref() {
+            Some("user_input") | Some("inference") => {}
+            _ => return Ok(NotificationPlan::Turns(Vec::new())),
+        }
 
         let limit = db::space_cascade_limit(&conn, space_id).await?.unwrap_or(4);
         let depth = db::agent_cascade_depth(&conn, post_action_id).await?;
@@ -4772,13 +4811,34 @@ impl Inner {
         Ok(NotificationPlan::Turns(turns))
     }
 
-    /// The composer CTA path: save a post (`post`), plan notifications over it,
-    /// then refine that plan through the space's may-decline router (a no-op
-    /// unless the space has a router model — see [`router`]). The caller drives
-    /// one turn per [`PlannedTurn`] (via [`AppCore::respond_stream_as`]) and may
-    /// re-plan on each resulting post — through
-    /// [`AppCore::plan_notifications`] + [`AppCore::refine_notifications`] — to
-    /// continue an auto-notify cascade until the guard pauses it.
+    /// The notification plan production drives: the mechanical set
+    /// ([`Inner::mechanical_plan`]) filtered through the space's may-decline
+    /// router ([`router`]) — a no-op unless the space has a router model.
+    ///
+    /// **This is the only planning entry point exposed on [`AppCore`]** (as
+    /// `plan_notifications`). Refinement is not something a caller opts into:
+    /// a cascade re-plans on every hop, and one unrefined hop would notify
+    /// agents the router had already filtered out. Making the refined plan the
+    /// *only* thing a caller can get is what keeps that unrepresentable — the
+    /// unrefined set is reachable only through the deliberately-named
+    /// [`AppCore::mechanical_notification_plan`].
+    async fn plan_and_refine(
+        &self,
+        space_id: &str,
+        post_action_id: &str,
+    ) -> Result<NotificationPlan, AppError> {
+        let plan = self.mechanical_plan(space_id, post_action_id).await?;
+        Ok(self
+            .refine_notifications(space_id, post_action_id, plan)
+            .await)
+    }
+
+    /// The composer CTA path: save a post (`post`), then plan + refine over it
+    /// ([`Inner::plan_and_refine`]). The caller drives one turn per
+    /// [`PlannedTurn`] (via [`AppCore::respond_stream_as`]) and re-plans on
+    /// each resulting post — through [`AppCore::plan_notifications`], which
+    /// refines too — to continue an auto-notify cascade until the guard pauses
+    /// it.
     ///
     /// The post itself is committed and emitted *before* the router runs, so a
     /// router call never delays the writer seeing their own words, and a router
@@ -4792,11 +4852,8 @@ impl Inner {
     ) -> Result<SubmitResult, AppError> {
         let post = self.post(space_id, text, reply_to, references).await?;
         let plan = self
-            .plan_notifications(&post.space_id, &post.action_id)
+            .plan_and_refine(&post.space_id, &post.action_id)
             .await?;
-        let plan = self
-            .refine_notifications(&post.space_id, &post.action_id, plan)
-            .await;
         Ok(SubmitResult { post, plan })
     }
 }
@@ -5046,16 +5103,25 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// Compute the auto-response notification plan for an already-persisted post
-    /// (owned ∪ referenced participants, effective notify policy, data-derived
-    /// cascade guard). Used to continue a cascade after each driven turn.
+    /// Compute the auto-response notification plan for an already-persisted
+    /// post (owned ∪ referenced participants, effective notify policy,
+    /// data-derived cascade guard) **and refine it through the space's
+    /// may-decline router** (see [`router`] — a no-op, and no HTTP call at
+    /// all, unless the space has a router model). Used to continue a cascade
+    /// after each driven turn.
     ///
-    /// A **pure read**: no network, no commits, no emissions — the mechanical
-    /// candidate set. Pipe it through [`Self::refine_notifications`] before
-    /// driving turns to apply the space's may-decline router (which [`submit`]
-    /// already does for the first hop).
+    /// Refinement is deliberately not opt-in. A cascade re-plans on every hop,
+    /// so a caller that skipped it on the second hop would notify agents the
+    /// router had already filtered out on the first; there is no legitimate
+    /// production use for an unrefined plan. The unrefined set is reachable
+    /// only through [`Self::mechanical_notification_plan`], which says so in
+    /// its name.
     ///
-    /// [`submit`]: Self::submit
+    /// The router can never fail this call: an unreachable router or
+    /// unparseable output degrades to the mechanical set (the failure mode is
+    /// extra notifications, never lost ones). Explicit asks
+    /// ([`Self::respond_stream`] / [`Self::respond_stream_as`]) never come
+    /// through here at all.
     pub async fn plan_notifications(
         &self,
         space_id: String,
@@ -5063,34 +5129,28 @@ impl AppCore {
     ) -> Result<NotificationPlan, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.plan_notifications(&space_id, &post_action_id).await })
+            .spawn(async move { inner.plan_and_refine(&space_id, &post_action_id).await })
             .await
             .map_err(join_err)?
     }
 
-    /// Filter a mechanical notification plan through the space's may-decline
-    /// router — one small-model call deciding who of the planned candidates
-    /// should actually respond (see [`router`]).
+    /// The **unrefined** mechanical notification plan — a pure read (no
+    /// network, no commits, no emissions) that consults the notify policies
+    /// and the cascade guard but never the may-decline router.
     ///
-    /// Infallible by construction: an unset router model (the default — the
-    /// feature is off), an unreachable router, or unparseable output all return
-    /// `plan` unchanged. A `Paused` plan and an empty plan are returned without
-    /// touching the network. Explicit asks never come through here at all.
-    pub async fn refine_notifications(
+    /// Exists for tests and inspection, not for driving turns: drive from
+    /// [`Self::plan_notifications`], which is the same computation with the
+    /// router applied.
+    pub async fn mechanical_notification_plan(
         &self,
         space_id: String,
         post_action_id: String,
-        plan: NotificationPlan,
     ) -> Result<NotificationPlan, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move {
-                inner
-                    .refine_notifications(&space_id, &post_action_id, plan)
-                    .await
-            })
+            .spawn(async move { inner.mechanical_plan(&space_id, &post_action_id).await })
             .await
-            .map_err(join_err)
+            .map_err(join_err)?
     }
 }
 

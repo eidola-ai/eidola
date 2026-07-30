@@ -723,6 +723,49 @@ impl Space {
     /// blank a reloaded space's disclosure with a stale `None`. `expanded`, by
     /// contrast, is pure view state and is always carried forward, so a reload
     /// doesn't collapse an open disclosure under the reader.
+    /// Apply a completed turn's outcome: drop its stream buffers, adopt the
+    /// space id, and merge the reloaded tree — attaching the reasoning the
+    /// turn streamed to the response it produced.
+    ///
+    /// A **declined** turn (the agent-side decline checkpoint) produced no
+    /// post: `response_action_id` is `None`, and `merge_from_db`'s
+    /// `None`-action fallback would attach the captured reasoning to the last
+    /// assistant message in the transcript — i.e. put this agent's private
+    /// thinking under *another* agent's post. So a decline drops the capture
+    /// instead. (Rendering the decision itself is a follow-up; `get_space_tree`
+    /// keeps only post-bearing action types, so nothing shows today.)
+    fn apply_turn_success(
+        &mut self,
+        seq: u64,
+        result: &ChatResult,
+        msgs: Result<Vec<ChatMessageView>, AppError>,
+        cx: &mut Context<Self>,
+    ) {
+        let captured = self
+            .streams
+            .iter()
+            .find(|s| s.seq == seq)
+            .map(|s| s.response.reasoning.clone());
+        self.streams.retain(|s| s.seq != seq);
+        self.id = Some(result.space_id.clone());
+        match msgs {
+            Ok(messages) => {
+                let attach = captured
+                    .filter(|r| !r.is_empty())
+                    .filter(|_| result.declined.is_none())
+                    .map(|r| (result.response_action_id.clone(), r));
+                self.merge_from_db(messages, attach);
+                cx.emit(SpaceEvent::MessagesChanged);
+                cx.emit(SpaceEvent::StreamEnded);
+            }
+            Err(e) => {
+                self.transcript = std::mem::take(&mut self.transcript).resolve(Err(e.clone()));
+                cx.emit(SpaceEvent::Failed(e));
+            }
+        }
+        cx.notify();
+    }
+
     fn merge_from_db(
         &mut self,
         mut next: Vec<ChatMessageView>,
@@ -1303,35 +1346,17 @@ impl Space {
                         })
                         .map(views_from_nodes);
                     let _ = this.update(cx, |this, cx| {
-                        let captured = this
-                            .streams
-                            .iter()
-                            .find(|s| s.seq == seq)
-                            .map(|s| s.response.reasoning.clone());
-                        this.streams.retain(|s| s.seq != seq);
-                        this.id = Some(result.space_id.clone());
-                        match msgs {
-                            Ok(messages) => {
-                                let attach = captured
-                                    .filter(|r| !r.is_empty())
-                                    .map(|r| (result.response_action_id.clone(), r));
-                                this.merge_from_db(messages, attach);
-                                cx.emit(SpaceEvent::MessagesChanged);
-                                cx.emit(SpaceEvent::StreamEnded);
-                            }
-                            Err(e) => {
-                                this.transcript =
-                                    std::mem::take(&mut this.transcript).resolve(Err(e.clone()));
-                                cx.emit(SpaceEvent::Failed(e));
-                            }
-                        }
-                        cx.notify();
+                        this.apply_turn_success(seq, &result, msgs, cx)
                     });
 
-                    // Continue the cascade on the fresh post: the responding
-                    // participant's reply may itself notify others (`all`
-                    // policies), bounded by the data-derived cascade guard.
-                    // Best-effort — a failed *plan* read is not a failed turn.
+                    // Continue the cascade on the fresh **post**: the
+                    // responding participant's reply may itself notify others
+                    // (`all` policies), bounded by the data-derived cascade
+                    // guard and filtered by the space's may-decline router
+                    // (`plan_notifications` refines). Best-effort — a failed
+                    // *plan* read is not a failed turn. A declined turn wrote
+                    // no post, so `response_action_id` is `None` and the
+                    // cascade simply ends here.
                     if let Some(response_id) = result.response_action_id.clone() {
                         let plan =
                             bridge::plan_notifications(app_core, space_id, response_id.clone())
@@ -1552,6 +1577,40 @@ impl Space {
         cx.emit(SpaceEvent::MessagesChanged);
         cx.emit(SpaceEvent::StreamEnded);
         cx.notify();
+    }
+
+    /// Test-only: drive one streaming turn's **success** completion exactly as
+    /// the real runner's success arm does ([`Self::apply_turn_success`]),
+    /// with the reloaded tree supplied by the caller. `declined` stands in for
+    /// a turn that ended at the agent-side decline checkpoint (no post, so
+    /// `response_action_id` is `None`). Drives the regression that a decline's
+    /// captured reasoning must not be attached to another agent's post.
+    #[doc(hidden)]
+    pub fn apply_turn_success_for_test(
+        &mut self,
+        seq: u64,
+        nodes: Vec<PostNode>,
+        declined: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let result = ChatResult {
+            space_id: self.id.clone().unwrap_or_default(),
+            content: String::new(),
+            model: String::new(),
+            input_tokens: None,
+            output_tokens: None,
+            credits_charged: 0,
+            response_action_id: if declined {
+                None
+            } else {
+                nodes.last().map(|n| n.action_id.clone())
+            },
+            declined: declined.then(|| eidola_app_core::DeclineOutcome {
+                reason: "nothing to add".into(),
+                action_id: "decision-1".into(),
+            }),
+        };
+        self.apply_turn_success(seq, &result, Ok(views_from_nodes(nodes)), cx);
     }
 
     /// Test-only: whether a transcript load is in flight (the load slot is

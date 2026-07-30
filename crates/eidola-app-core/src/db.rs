@@ -3485,6 +3485,24 @@ pub async fn reply_antecedent(
 /// kind)`. `None` if the action doesn't exist. Used by `plan_notifications`
 /// to identify a post's author (to exclude it from the notify set and to
 /// resolve the `human`-policy predicate).
+/// An action's `action_type`. Used by notification planning to refuse to
+/// cascade off a non-post action (a `decision` / `tool_call` / `tool_result`
+/// is not something anyone replies to).
+pub async fn action_type(conn: &Connection, action_id: &str) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT action_type FROM action WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
 pub async fn action_author(
     conn: &Connection,
     action_id: &str,

@@ -161,6 +161,12 @@ pub const ROUTER_SLUG: &str = "router";
 /// key it dispatches the router arm on.
 pub const ROUTER_MODEL: &str = "router@local";
 
+/// A **remote** (eidola-backend) router model, advertised by the mock's
+/// catalog alongside [`MODEL`] with the same trivial pricing. Lets the tests
+/// exercise the router's spend path (a remote router bills a normal
+/// inference) while still dispatching separately from the turns.
+pub const ROUTER_REMOTE_MODEL: &str = "router-remote";
+
 /// How the mock answers a chat request for [`ROUTER_MODEL`] — the may-decline
 /// router's scripted seam. Every arm keeps the *turn* behaviour
 /// ([`ChatBehavior`]) untouched, so one mock serves both roles in one test.
@@ -176,6 +182,11 @@ pub enum RouterBehavior {
     /// Non-2xx error body — the router is reachable but refuses. Exercises
     /// degrade-on-failure.
     Fail(u16),
+    /// Send a 200 response head promising a body, then drop the connection
+    /// without writing it: the request was **accepted**, so a remote router's
+    /// credential hold is already placed, but the body read fails. Exercises
+    /// the refund-settlement path on a post-send body-read failure.
+    DropBody,
 }
 
 /// Whether the refund endpoints (inline + recovery) actually mint a successor
@@ -607,7 +618,7 @@ async fn handle_conn(
                 .as_ref()
                 .and_then(|b| b.get("model"))
                 .and_then(|m| m.as_str())
-                .is_some_and(|m| m == ROUTER_MODEL);
+                .is_some_and(|m| m == ROUTER_MODEL || m == ROUTER_REMOTE_MODEL);
             if let Some(body) = parsed {
                 chat_bodies.lock().unwrap().push(body);
             }
@@ -626,6 +637,20 @@ async fn handle_conn(
                 }
                 (true, RouterBehavior::Fail(status)) => {
                     write_json(&mut stream, *status, &error_body("router unavailable")).await?;
+                }
+                (true, RouterBehavior::DropBody) => {
+                    // Headers promise 64 bytes; none arrive and the connection
+                    // closes, so the client's body read errors after the
+                    // request was accepted.
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\n\
+                              Content-Type: application/json\r\n\
+                              Content-Length: 64\r\n\
+                              Connection: close\r\n\r\n",
+                        )
+                        .await?;
+                    stream.flush().await?;
                 }
                 _ => {
                     handle_chat(&mut stream, &issuer, &config, req.auth.as_deref(), hit).await?;
@@ -1075,6 +1100,13 @@ fn models_body() -> String {
     serde_json::json!({
         "data": [{
             "id": MODEL,
+            "context_length": 8192u64,
+            "pricing": {
+                "per_prompt_token": { "value": 1u64, "scale_factor": 1u64 },
+                "per_completion_token": { "value": 1u64, "scale_factor": 1u64 }
+            }
+        }, {
+            "id": ROUTER_REMOTE_MODEL,
             "context_length": 8192u64,
             "pricing": {
                 "per_prompt_token": { "value": 1u64, "scale_factor": 1u64 },
