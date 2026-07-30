@@ -45,6 +45,9 @@
 //! `elements` with its painted bounds, and `click`/`scroll` accept the probe
 //! name as `target`. The same annotation feeds the AccessKit tree, so the
 //! driver's selector vocabulary is exactly the app's accessible surface.
+//! Elements annotated with `probe_value` also report a `value` — the content
+//! channel (a settled post's text, a balance, an alert's message); it is
+//! `null` for everything else.
 //!
 //! Scenes are stub-store fixtures (no backend, no network), mirroring the
 //! visual snapshot cases — deterministic scenes the agent can interact with.
@@ -1577,6 +1580,10 @@ mod driver {
                                 "name": name,
                                 "role": format!("{:?}", e.role),
                                 "label": e.label.to_string(),
+                                // The content channel (`aria_value`), when the
+                                // call site sets one — a post's text, a
+                                // balance, an alert's message. `null` otherwise.
+                                "value": e.value.as_ref().map(|v| v.to_string()),
                                 "x": b.origin.x.as_f32(),
                                 "y": b.origin.y.as_f32(),
                                 "width": b.size.width.as_f32(),

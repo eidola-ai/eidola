@@ -477,6 +477,17 @@ pub struct SpaceView {
     /// an entity update; only ever set for the active draft, so an off-screen /
     /// inline edit never triggers a composer scroll.
     pub(crate) composer_caret_scroll_pending: Cell<bool>,
+    /// The composer's accessible **value** — `(draft id, text)`, the draft as
+    /// assistive technology last read it.
+    ///
+    /// It is refreshed at two settled moments and at no other: when a
+    /// *different* draft becomes the active one (so re-opening a saved draft
+    /// reads its real text), and on any frame where the composer does **not**
+    /// hold keyboard focus. It therefore never tracks keystrokes: AT re-reads a
+    /// focused control's whole value on every change, which would turn typing
+    /// into a stutter of the entire draft (audit §4; Zed's own text field
+    /// freezes for the same reason).
+    pub(crate) composer_aria_value: RefCell<(SharedString, SharedString)>,
 
     /// Vertical scroll of the whole page.
     pub(crate) page_scroll: ScrollHandle,
@@ -672,6 +683,7 @@ impl SpaceView {
             hovered_post: None,
             editing: None,
             composer_caret_scroll_pending: Cell::new(false),
+            composer_aria_value: RefCell::new((SharedString::default(), SharedString::default())),
             page_scroll: ScrollHandle::new(),
             scroll_min_y: Cell::new(0.0),
             tail_pin: false,
@@ -2363,6 +2375,16 @@ impl SpaceView {
             .p_3()
             .child(
                 v_flex()
+                    .id("space-error-band")
+                    // The notice was three unexplained buttons to a screen
+                    // reader — "Dismiss", "Copy", "Retry" — because the message
+                    // itself was a node-less `div`. The message rides as the
+                    // **value**, not the label: the macOS adapter announces a
+                    // live region from a node's value and re-announces only when
+                    // that value changes, so this is the shape that starts
+                    // speaking the day `aria_live` exists upstream (audit §7,
+                    // U1). Until then it is at least perceivable.
+                    .probe_value("space/error", Role::Alert, "Request failed", msg.clone())
                     .max_w(rems(34.))
                     .gap_2()
                     .px_4()
@@ -2463,6 +2485,11 @@ impl SpaceView {
         }
         let theme = cx.theme();
         let agents = self.space_agents(cx);
+        let notice_text = SharedString::from(format!(
+            "Replies paused — the conversation reached its cascade limit ({}). \
+             Ask to continue.",
+            notice.limit
+        ));
 
         let mut actions = h_flex().items_center().gap_1().flex_wrap();
         for (i, (pid, label)) in agents.iter().enumerate() {
@@ -2503,6 +2530,16 @@ impl SpaceView {
             .p_3()
             .child(
                 v_flex()
+                    .id("space-cascade-band")
+                    // Same shape as the failure notice: the sentence is the
+                    // value (the announcement channel), the label names the
+                    // state. Muted, not danger — nothing failed.
+                    .probe_value(
+                        "space/cascade",
+                        Role::Alert,
+                        "Replies paused",
+                        notice_text.clone(),
+                    )
                     .max_w(rems(34.))
                     .gap_2()
                     .px_4()
@@ -2522,11 +2559,7 @@ impl SpaceView {
                                     .min_w_0()
                                     .text_sm()
                                     .text_color(theme.muted_foreground)
-                                    .child(SharedString::from(format!(
-                                        "Replies paused — the conversation reached its \
-                                         cascade limit ({}). Ask to continue.",
-                                        notice.limit
-                                    ))),
+                                    .child(notice_text),
                             )
                             .child(
                                 div()

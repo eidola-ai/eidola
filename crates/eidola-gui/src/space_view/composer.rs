@@ -19,10 +19,11 @@
 //! (`Space > Participants…`); explicit asks live on the separators.
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, BoxShadow, Context, Element, Focusable, GlobalElementId,
-    InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, ParentElement,
-    Pixels, ScrollWheelEvent, StatefulInteractiveElement, Styled, TouchPhase, Window, div, hsla,
-    linear_color_stop, linear_gradient, point, prelude::FluentBuilder as _, px, size,
+    AnyElement, App, AppContext, Bounds, BoxShadow, Context, Element, Entity, Focusable,
+    GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
+    ParentElement, Pixels, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    TouchPhase, Window, div, hsla, linear_color_stop, linear_gradient, point,
+    prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::{ActiveTheme, h_flex};
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorEvent, MarkdownEditorState};
@@ -675,6 +676,46 @@ impl SpaceView {
         self.composer_resize = None;
     }
 
+    /// The composer's accessible value, **frozen while it holds keyboard
+    /// focus**.
+    ///
+    /// The composer is the one place in the app whose text changes on every
+    /// keystroke, and assistive technology re-reads a focused control's entire
+    /// value whenever it changes — so a value wired straight to the buffer
+    /// would re-speak the whole draft per character. Zed's own text field
+    /// freezes for exactly this reason, and the audit (§4) makes it the rule
+    /// for us.
+    ///
+    /// So it refreshes at two settled moments only: when a **different** draft
+    /// becomes active (re-opening a saved draft reads its real text, and
+    /// switching between branches' drafts reads the right one), and on frames
+    /// where focus has left the composer — which is precisely when a
+    /// screen-reader user is reviewing the draft rather than writing it.
+    fn composer_aria_value(
+        &self,
+        draft_id: &SharedString,
+        editor: &Entity<MarkdownEditorState>,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> SharedString {
+        let state = editor.read(cx);
+        let mut snapshot = self.composer_aria_value.borrow_mut();
+        if snapshot.0 != *draft_id || !state.focus_handle(cx).is_focused(window) {
+            snapshot.0 = draft_id.clone();
+            snapshot.1 = SharedString::from(state.value().to_string());
+        }
+        snapshot.1.clone()
+    }
+
+    /// The composer's current accessible value — the frozen snapshot
+    /// [`Self::composer_aria_value`] maintains. `aria_value` reaches the
+    /// emitted AccessKit tree, which is unobservable at this pin, so the freeze
+    /// itself is regression-tested through the computation.
+    #[doc(hidden)]
+    pub fn composer_aria_value_for_test(&self) -> SharedString {
+        self.composer_aria_value.borrow().1.clone()
+    }
+
     // -- The floating composer ---------------------------------------------
 
     /// The active draft's editor, pinned over the bottom and styled like a post.
@@ -989,7 +1030,12 @@ impl SpaceView {
                 crate::chrome::round_top_client_corners(d, window)
             })
             .id("space-composer")
-            .probe("space/composer", gpui::Role::TextInput, "Message composer")
+            .probe_value(
+                "space/composer",
+                gpui::Role::TextInput,
+                "Message composer",
+                self.composer_aria_value(&draft_id, &editor, window, cx),
+            )
             .absolute()
             .left_0()
             .right_0()

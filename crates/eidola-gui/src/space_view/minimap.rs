@@ -108,11 +108,12 @@ const LABEL_MAX_CHARS: usize = 56;
 /// away, markdown punctuation dropped, whitespace folded, truncated on a word
 /// boundary.
 ///
-/// The minimap's labels are the only place a post's *text* reaches assistive
-/// technology today, and they used to be `content.chars().take(56)` — raw. So
+/// The minimap's labels used to be the only place a post's *text* reached
+/// assistive technology, and they were `content.chars().take(56)` — raw. So
 /// VoiceOver read the wire format aloud ("You: That's the sentence I keep
-/// snagging on: {{ embed 1 }} If") and cut mid-word with no ellipsis. Wave C
-/// will expose post bodies properly; until then this is what is heard.
+/// snagging on: {{ embed 1 }} If") and cut mid-word with no ellipsis. Post
+/// bodies now carry their own text ([`spoken_text`], wave C); this stays the
+/// map's short form.
 ///
 /// Deliberately *not* a markdown renderer: it drops the delimiters that are
 /// pure punctuation to the ear (block markers at a line's head, emphasis runs,
@@ -133,6 +134,21 @@ pub(crate) fn spoken_snippet(
         .map(|line| strip_block_markers(line.trim()))
         .collect();
     super::references::snippet_to(&strip_inline_markup(&deblocked.join(" ")), max)
+}
+
+/// A settled post's **whole** text as a screen reader should hear it — the
+/// same pipeline as [`spoken_snippet`] with no truncation. This is what a post
+/// row carries as its `aria_value` (wave C), so the conversation is readable
+/// rather than merely enumerable.
+///
+/// Two consequences worth knowing, both deliberate: line structure folds to
+/// single spaces (an accessible value is one string, and the snippet pipeline
+/// already flattens), and a **recognized embed block is dropped** — the quoted
+/// passage belongs to the post it was quoted from and is reachable through the
+/// footnote rail, so replaying it inside the quoting post's value would read
+/// the same passage twice.
+pub(crate) fn spoken_text(content: &str, references: &[eidola_app_core::PostReference]) -> String {
+    spoken_snippet(content, references, usize::MAX)
 }
 
 /// Drop a line's leading markdown block markers — headings, blockquotes,
@@ -853,6 +869,21 @@ mod tests {
         // An *unmapped* marker is literal text and stays literal (the same
         // rule the editor and the wire follow).
         assert!(spoken_snippet(quoted, &[], 56).contains("{{ embed 1 }}"));
+    }
+
+    #[test]
+    fn spoken_text_keeps_the_whole_post() {
+        // A post's article value is never truncated — the map's cell is the
+        // short form; the article is the read.
+        let long = "word ".repeat(40);
+        let out = spoken_text(&long, &[]);
+        assert!(!out.ends_with('…'), "got {out:?}");
+        assert_eq!(out.split_whitespace().count(), 40);
+        // Same stripping as the snippet, and paragraphs fold to one string.
+        assert_eq!(
+            spoken_text("# Heading\n\nAnd **body** text.", &[]),
+            "Heading And body text."
+        );
     }
 
     #[test]
