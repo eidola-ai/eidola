@@ -862,6 +862,27 @@ const EMBED_AUDIT_CORPORA: &[(&str, &str, f32)] = &[
         "Inline $x^2 + y^2$ in a sentence.\n\n$$\n\\frac{a}{b}\n$$\n\nafter the math.",
         260.,
     ),
+    // Tall inline math on a *non-final* visual row of a soft-wrapped
+    // paragraph. KNOWN DEFECT — this case currently renders wrong, in the
+    // live editor and the embed alike: `compute_math_row_extra` is a
+    // per-*logical*-line overshoot, but the row layout multiplies it into
+    // the height (`(line_height + extra) * wrap_count`) while the shaped
+    // line is still painted with `row_height: line_height`, so gpui strides
+    // its visual rows by the bare `line_height` (`line.rs`'s
+    // `glyph_origin.y += line_height` at each wrap boundary). Two visible
+    // consequences: the construct overlaps the glyphs of the row beneath
+    // it, and `(wrap_count - 1) * extra` of reserved space piles up as dead
+    // air after the whole logical line. Kept as the reproduction for the
+    // fix; see the audit note for the measured numbers.
+    (
+        "wrapped_math",
+        "A paragraph whose tall $\\frac{\\frac{\\frac{a}{b}}{\\frac{c}{d}}}{\\frac{e}{f}}$ \
+         appears early on, and which then continues with enough further words that the \
+         logical line must soft-wrap several times at this measure — so the tall \
+         construct sits on the first visual row while ordinary text keeps flowing \
+         onto the rows below it.",
+        260.,
+    ),
     (
         "list_with_code",
         "- item with a fence:\n\n  ```\n  let x = 1;\n  ```\n\n- plain item\n",
