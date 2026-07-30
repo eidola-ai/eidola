@@ -2606,8 +2606,17 @@ pub async fn get_space(conn: &Connection, space_id: &str) -> Result<Option<Space
 
 pub struct SpaceActionRow {
     pub action_id: String,
+    /// The action's **item** identity — stable across edits/regenerations.
+    /// This is what the upstream message header's handle is derived from
+    /// (`crate::post_handle`), so a post keeps its handle when edited.
+    pub item_id: String,
     pub action_type: String,
+    pub participant_id: String,
     pub participant_kind: String,
+    /// The author's **effective** label in this space: a referenced global's
+    /// per-membership `override_label` when set, else the participant's own.
+    /// Rendered into the upstream message header next to the handle.
+    pub participant_label: String,
     pub status: String,
     pub text_content: Option<String>,
     pub block_ordinal: Option<i64>,
@@ -2635,12 +2644,15 @@ pub async fn get_space_actions_for_context(
     // order in `get_space_tree_data`).
     let mut stmt = conn
         .prepare(
-            "SELECT a.id, a.action_type, p.kind, a.status, \
+            "SELECT a.id, a.item_id, a.action_type, a.participant_id, p.kind, \
+                    COALESCE(sp.override_label, p.label), a.status, \
                     cb.text_content, cb.ordinal \
              FROM action a \
              JOIN item_current ic \
                ON ic.current_action_id = a.id \
              JOIN participant p ON p.id = a.participant_id \
+             LEFT JOIN space_participant sp \
+               ON sp.space_id = a.space_id AND sp.participant_id = a.participant_id \
              JOIN (SELECT space_id, item_id, \
                           MIN(created_at) AS born_at, MIN(id) AS first_action_id \
                    FROM action GROUP BY space_id, item_id) origin \
@@ -2661,11 +2673,14 @@ pub async fn get_space_actions_for_context(
     while let Some(row) = rows.next().await.map_err(AppError::db)? {
         results.push(SpaceActionRow {
             action_id: row.get::<String>(0).map_err(AppError::db)?,
-            action_type: row.get::<String>(1).map_err(AppError::db)?,
-            participant_kind: row.get::<String>(2).map_err(AppError::db)?,
-            status: row.get::<String>(3).map_err(AppError::db)?,
-            text_content: row.get::<Option<String>>(4).map_err(AppError::db)?,
-            block_ordinal: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+            item_id: row.get::<String>(1).map_err(AppError::db)?,
+            action_type: row.get::<String>(2).map_err(AppError::db)?,
+            participant_id: row.get::<String>(3).map_err(AppError::db)?,
+            participant_kind: row.get::<String>(4).map_err(AppError::db)?,
+            participant_label: row.get::<String>(5).map_err(AppError::db)?,
+            status: row.get::<String>(6).map_err(AppError::db)?,
+            text_content: row.get::<Option<String>>(7).map_err(AppError::db)?,
+            block_ordinal: row.get::<Option<i64>>(8).map_err(AppError::db)?,
         });
     }
     Ok(results)
@@ -2720,10 +2735,13 @@ pub async fn get_upstream_context(
     for id in &chain {
         let mut stmt = conn
             .prepare(
-                "SELECT a.id, a.action_type, p.kind, a.status, \
+                "SELECT a.id, a.item_id, a.action_type, a.participant_id, p.kind, \
+                        COALESCE(sp.override_label, p.label), a.status, \
                         cb.text_content, cb.ordinal \
                  FROM action a \
                  JOIN participant p ON p.id = a.participant_id \
+                 LEFT JOIN space_participant sp \
+                   ON sp.space_id = a.space_id AND sp.participant_id = a.participant_id \
                  LEFT JOIN content_block cb \
                    ON cb.action_id = a.id AND cb.block_type = 'text' \
                  WHERE a.id = ?1 \
@@ -2739,11 +2757,14 @@ pub async fn get_upstream_context(
         while let Some(row) = rows.next().await.map_err(AppError::db)? {
             results.push(SpaceActionRow {
                 action_id: row.get::<String>(0).map_err(AppError::db)?,
-                action_type: row.get::<String>(1).map_err(AppError::db)?,
-                participant_kind: row.get::<String>(2).map_err(AppError::db)?,
-                status: row.get::<String>(3).map_err(AppError::db)?,
-                text_content: row.get::<Option<String>>(4).map_err(AppError::db)?,
-                block_ordinal: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+                item_id: row.get::<String>(1).map_err(AppError::db)?,
+                action_type: row.get::<String>(2).map_err(AppError::db)?,
+                participant_id: row.get::<String>(3).map_err(AppError::db)?,
+                participant_kind: row.get::<String>(4).map_err(AppError::db)?,
+                participant_label: row.get::<String>(5).map_err(AppError::db)?,
+                status: row.get::<String>(6).map_err(AppError::db)?,
+                text_content: row.get::<Option<String>>(7).map_err(AppError::db)?,
+                block_ordinal: row.get::<Option<i64>>(8).map_err(AppError::db)?,
             });
         }
     }

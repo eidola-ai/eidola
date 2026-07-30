@@ -82,6 +82,10 @@ pub enum ChatBehavior {
     OkBlockingNoInlineRefund,
     /// 200 SSE stream: content + reasoning deltas, usage, `[DONE]`.
     OkStreaming,
+    /// As `OkStreaming`, but the model mimics the per-message header
+    /// scaffolding: its content starts with a header-shaped line. Exercises
+    /// strip-on-receipt.
+    OkStreamingWithHeader,
     /// 200 SSE stream that the server aborts mid-event (writes a partial event,
     /// then drops the TCP connection). Exercises the mid-SSE read failure arm.
     StreamingMidAbort,
@@ -179,6 +183,61 @@ impl MockServer {
             .and_then(|p| p.parse().ok())
             .expect("mock base_url always carries a port")
     }
+}
+
+// ===========================================================================
+// Participant-aware upstream rendering (roles + headers)
+// ===========================================================================
+
+/// The label of the seeded default agent — `db::default_agent_label` over the
+/// compiled-in `DEFAULT_MODEL`, which the harness's [`MODEL`] matches.
+pub const DEFAULT_AGENT_LABEL: &str = "Gemma4 31b";
+
+/// The shared human participant's label.
+pub const HUMAN_LABEL: &str = "You";
+
+/// The rendering-protocol note app-core appends to every turn's system
+/// message. Pinned here verbatim (the same discipline as pinning the rendered
+/// message bytes) — a change to `HEADER_PROTOCOL_NOTE` in `lib.rs` must be a
+/// deliberate edit here too.
+pub const HEADER_PROTOCOL_NOTE: &str = "Each message in this conversation begins with a one-line header identifying the post and \
+     its author: `#<handle> · <author>`. Handles are assigned by the client; never write a \
+     header line yourself — reply with your message text only.";
+
+/// The exact `system` message content a turn sends: the responding
+/// participant's effective system prompt (when it has one) followed by the
+/// rendering-protocol note.
+pub fn system_message(prompt: Option<&str>) -> String {
+    match prompt {
+        Some(p) => format!("{p}\n\n{HEADER_PROTOCOL_NOTE}"),
+        None => HEADER_PROTOCOL_NOTE.to_string(),
+    }
+}
+
+/// The exact rendered upstream content of a post: its `#<handle> · <label>`
+/// header line, a blank line, then the text.
+pub fn headed(item_id: &str, label: &str, text: &str) -> String {
+    let handle = eidola_app_core::post_handle(item_id);
+    if text.is_empty() {
+        format!("#{handle} · {label}")
+    } else {
+        format!("#{handle} · {label}\n\n{text}")
+    }
+}
+
+/// `(role, content)` pairs of a recorded chat request body's `messages` array.
+pub fn flat_messages(body: &serde_json::Value) -> Vec<(String, String)> {
+    body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .map(|m| {
+            (
+                m["role"].as_str().unwrap_or_default().to_string(),
+                m["content"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
 }
 
 /// The mock issuer: an ACT keypair plus the params/context the server derives.
@@ -543,15 +602,35 @@ async fn handle_chat(
             // all reqwest surfaces a transport error from `send`.
             Ok(())
         }
-        ChatBehavior::OkStreaming => write_sse_stream(stream, true).await,
-        ChatBehavior::StreamingMidAbort => write_sse_stream(stream, false).await,
+        ChatBehavior::OkStreaming => write_sse_stream(stream, true, STREAM_CONTENT).await,
+        ChatBehavior::OkStreamingWithHeader => {
+            write_sse_stream(
+                stream,
+                true,
+                &format!("{MIMICKED_HEADER}\n\n{STREAM_CONTENT}"),
+            )
+            .await
+        }
+        ChatBehavior::StreamingMidAbort => write_sse_stream(stream, false, STREAM_CONTENT).await,
     }
 }
+
+/// The streaming mock's answer text.
+pub const STREAM_CONTENT: &str = "Hello from the stream.";
+
+/// A header-shaped first line a model might mimic (see
+/// `ChatBehavior::OkStreamingWithHeader`). Deliberately *not* a real handle of
+/// anything — strip-on-receipt is shape-based, not identity-based.
+pub const MIMICKED_HEADER: &str = "#a2c3d4e · Gemma4 31b";
 
 /// Write a chunked SSE stream. When `complete`, emits reasoning + content
 /// deltas, a usage chunk, and `[DONE]`. When not complete, emits one partial
 /// event and then drops the connection mid-stream (simulating an abort).
-async fn write_sse_stream(stream: &mut TcpStream, complete: bool) -> std::io::Result<()> {
+async fn write_sse_stream(
+    stream: &mut TcpStream,
+    complete: bool,
+    content_text: &str,
+) -> std::io::Result<()> {
     let head = "HTTP/1.1 200 OK\r\n\
                 Content-Type: text/event-stream\r\n\
                 Transfer-Encoding: chunked\r\n\
@@ -580,7 +659,7 @@ async fn write_sse_stream(stream: &mut TcpStream, complete: bool) -> std::io::Re
     }
 
     let content = serde_json::json!({
-        "choices": [{ "delta": { "content": "Hello from the stream." } }]
+        "choices": [{ "delta": { "content": content_text } }]
     });
     stream.write_all(&send_event(content.to_string())).await?;
 
