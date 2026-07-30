@@ -957,10 +957,11 @@ fn space_with_two_candidates(core: &AppCore) -> (String, String) {
     (space, post.action_id)
 }
 
+/// The **unrefined** mechanical set — the router is never consulted.
 fn mechanical_turns(core: &AppCore, space: &str, post: &str) -> Vec<eidola_app_core::PlannedTurn> {
     match core
         .runtime()
-        .block_on(core.plan_notifications(space.to_string(), post.to_string()))
+        .block_on(core.mechanical_notification_plan(space.to_string(), post.to_string()))
         .expect("mechanical plan")
     {
         NotificationPlan::Turns(t) => t,
@@ -968,10 +969,14 @@ fn mechanical_turns(core: &AppCore, space: &str, post: &str) -> Vec<eidola_app_c
     }
 }
 
-fn refine(core: &AppCore, space: &str, post: &str, plan: NotificationPlan) -> NotificationPlan {
+/// The plan production actually drives — `AppCore::plan_notifications`, which
+/// plans **and** refines. There is deliberately no public way to get an
+/// unrefined plan for driving: a cascade re-plans on every hop, and one
+/// unrefined hop would notify agents the router already filtered out.
+fn planned(core: &AppCore, space: &str, post: &str) -> NotificationPlan {
     core.runtime()
-        .block_on(core.refine_notifications(space.to_string(), post.to_string(), plan))
-        .expect("refine")
+        .block_on(core.plan_notifications(space.to_string(), post.to_string()))
+        .expect("plan")
 }
 
 #[test]
@@ -988,12 +993,7 @@ fn router_selection_drops_the_participants_it_did_not_choose() {
         assert_eq!(mechanical.len(), 2, "both policies fire on a human post");
 
         let mut rx = core.subscribe_changes();
-        let refined = refine(
-            &core,
-            &space,
-            &post,
-            NotificationPlan::Turns(mechanical.clone()),
-        );
+        let refined = planned(&core, &space, &post);
 
         // Exactly the first candidate survives — and it survives *unchanged*,
         // cascade_depth included: the router filters the set, it never
@@ -1038,7 +1038,7 @@ fn router_can_choose_nobody() {
         let mechanical = mechanical_turns(&core, &space, &post);
         assert_eq!(mechanical.len(), 2);
         assert_eq!(
-            refine(&core, &space, &post, NotificationPlan::Turns(mechanical)),
+            planned(&core, &space, &post),
             NotificationPlan::Turns(Vec::new()),
             "an empty selection is a valid decision: zero turns"
         );
@@ -1057,12 +1057,7 @@ fn an_unreachable_router_degrades_to_the_mechanical_set() {
 
         let mechanical = mechanical_turns(&core, &space, &post);
         assert_eq!(
-            refine(
-                &core,
-                &space,
-                &post,
-                NotificationPlan::Turns(mechanical.clone())
-            ),
+            planned(&core, &space, &post),
             NotificationPlan::Turns(mechanical),
             "a post is never blocked on the router: the failure mode is extra \
              notifications, not lost ones"
@@ -1084,12 +1079,7 @@ fn unusable_router_output_degrades_to_the_mechanical_set() {
 
         let mechanical = mechanical_turns(&core, &space, &post);
         assert_eq!(
-            refine(
-                &core,
-                &space,
-                &post,
-                NotificationPlan::Turns(mechanical.clone())
-            ),
+            planned(&core, &space, &post),
             NotificationPlan::Turns(mechanical),
             "prose instead of JSON degrades rather than guessing"
         );
@@ -1105,12 +1095,7 @@ fn an_unset_router_model_is_never_invoked() {
 
         let mechanical = mechanical_turns(&core, &space, &post);
         assert_eq!(
-            refine(
-                &core,
-                &space,
-                &post,
-                NotificationPlan::Turns(mechanical.clone())
-            ),
+            planned(&core, &space, &post),
             NotificationPlan::Turns(mechanical)
         );
         assert!(
@@ -1171,12 +1156,8 @@ fn a_paused_plan_never_reaches_the_router() {
 
         // Depth 1 == the limit: the cascade guard speaks first and the router
         // is not consulted at all.
-        let plan = core
-            .runtime()
-            .block_on(core.plan_notifications(space.clone(), i1.clone()))
-            .expect("plan");
+        let plan = planned(&core, &space, &i1);
         assert!(matches!(plan, NotificationPlan::Paused { .. }));
-        assert_eq!(refine(&core, &space, &i1, plan.clone()), plan);
         assert!(
             router_calls(&mock).is_empty(),
             "the guard short-circuits before any router call"
@@ -1209,6 +1190,50 @@ fn an_explicit_ask_bypasses_the_router_entirely() {
     });
 }
 
+#[test]
+fn a_remote_routers_hold_is_settled_when_the_body_read_fails() {
+    run(|| {
+        // The request is accepted (so the credential is already `spending`)
+        // and then the connection drops before the body arrives. The
+        // refinement must degrade *and* settle the hold: leaving it stranded
+        // would make the very next turn burn its bounded provisioning wait on
+        // a refund that is never coming.
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            router: chat_harness::RouterBehavior::DropBody,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (space, post) = space_with_two_candidates(&core);
+        // A *remote* router: the eidola backend, so the call really spends.
+        core.runtime()
+            .block_on(core.set_space_router_model(
+                space.clone(),
+                Some(chat_harness::ROUTER_REMOTE_MODEL.into()),
+            ))
+            .expect("set remote router model");
+
+        let mechanical = mechanical_turns(&core, &space, &post);
+        assert_eq!(
+            planned(&core, &space, &post),
+            NotificationPlan::Turns(mechanical),
+            "a body-read failure degrades like any other router failure"
+        );
+
+        assert!(
+            mock.refund_hits() >= 1,
+            "the hold must be settled through the recovery endpoint"
+        );
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("wallet lifecycle");
+        assert!(
+            !lifecycle.iter().any(|c| c.state == "spending"),
+            "no credential may be left stranded in `spending`; got {lifecycle:?}"
+        );
+    });
+}
+
 // ===========================================================================
 // Agent-side decline checkpoint (task 22)
 // ===========================================================================
@@ -1229,13 +1254,16 @@ fn a_declining_agent_writes_a_decision_and_suppresses_the_post() {
         let mut rx = core.subscribe_changes();
         let result = drive_as(&core, &space, &agent, &post).expect("declined turn still succeeds");
 
-        // The would-be post is suppressed.
-        assert_eq!(
-            result.declined.as_deref(),
-            Some(chat_harness::DECLINE_REASON),
-            "the stated reason rides back to the caller"
-        );
+        // The would-be post is suppressed — and the decision id is kept OUT of
+        // `response_action_id`, so a caller cannot mistake it for a fresh post
+        // and cascade off it.
+        let declined = result.declined.clone().expect("the turn declined");
+        assert_eq!(declined.reason, chat_harness::DECLINE_REASON);
         assert!(result.content.is_empty(), "no post content");
+        assert_eq!(
+            result.response_action_id, None,
+            "a decline produced no post"
+        );
 
         // …and the thread still holds only the human post: `decision` is not a
         // post-bearing action type, so it collapses out of the render.
@@ -1258,7 +1286,7 @@ fn a_declining_agent_writes_a_decision_and_suppresses_the_post() {
             "the round's trace is kept and the decision is appended"
         );
         let decision = actions.last().expect("decision row");
-        assert_eq!(decision.id, result.response_action_id.clone().unwrap());
+        assert_eq!(decision.id, declined.action_id);
         assert_eq!(
             decision.reply_to.as_deref(),
             Some(post.as_str()),
@@ -1286,6 +1314,17 @@ fn a_declining_agent_writes_a_decision_and_suppresses_the_post() {
         assert!(
             !events.iter().any(|c| matches!(c, Change::SpaceIndex)),
             "a decline adds no item to the listing"
+        );
+
+        // Defense in depth: even a caller that reached for the decision id
+        // anyway gets no cascade — a `decision` is not a post, and planning
+        // over one yields zero turns rather than notifying anybody.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.plan_notifications(space.clone(), declined.action_id.clone()))
+                .expect("plan over the decision"),
+            NotificationPlan::Turns(Vec::new()),
+            "planning never cascades off a non-post action"
         );
     });
 }
@@ -1315,6 +1354,7 @@ fn the_decline_name_alone_is_not_a_decline_without_the_tool_registered() {
         // turn failure — the point is only that it is never a silent decline.)
         match result {
             Ok(r) => assert!(r.declined.is_none(), "no decline without registration"),
+            // (the `Err` arm is checked below)
             Err(e) => assert!(
                 matches!(e.root(), AppError::ToolLoop { .. }),
                 "expected the ordinary tool loop to run on, got {e:?}"

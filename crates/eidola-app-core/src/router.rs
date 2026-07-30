@@ -531,9 +531,31 @@ impl Inner {
             }
         };
         let status = response.status();
-        let text = response.text().await.map_err(|e| AppError::Network {
-            message: format!("failed to read the router response: {e}"),
-        })?;
+        // The body read can fail *after* the request was accepted (a connection
+        // dropped mid-body). The hold is already placed at that point, so this
+        // must settle before it returns — exactly the discipline the chat
+        // transports keep on their own body-read failures. Leaking out of here
+        // would strand the credential in `spending`, and the very next turn
+        // would burn its bounded provisioning wait on a refund that is never
+        // coming.
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                self.settle_router_refund(
+                    &db_conn,
+                    &spend,
+                    &auth_value,
+                    &client,
+                    &base_url,
+                    None,
+                    now,
+                )
+                .await;
+                return Err(AppError::Network {
+                    message: format!("failed to read the router response: {e}"),
+                });
+            }
+        };
         let parsed: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
 
