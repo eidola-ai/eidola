@@ -283,6 +283,8 @@ fn without_a_utility_model_the_map_stays_structural() {
             HUMAN_LABEL,
             "2 posts",
             "just now",
+            // The branch's answer is this responder's own post.
+            Some("1 post"),
             "What about spring tides?",
         )));
         assert!(
@@ -355,6 +357,7 @@ fn a_generated_summary_renders_under_the_structural_entry() {
                         HUMAN_LABEL,
                         "2 posts",
                         "just now",
+                        Some("1 post"),
                         "What about spring tides?",
                         SUMMARY,
                     )],
@@ -693,6 +696,7 @@ fn a_failed_or_unusable_generation_degrades_silently() {
                 HUMAN_LABEL,
                 "2 posts",
                 "just now",
+                Some("1 post"),
                 "What about spring tides?",
             )));
         });
