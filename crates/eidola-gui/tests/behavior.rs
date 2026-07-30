@@ -3048,18 +3048,26 @@ fn space_window_is_named_after_its_space(cx: &mut TestAppContext) {
     // Library title: a blank ⌘N space is "New Space", a titled one carries its
     // title, and a rename re-titles the window. `TestWindow` doesn't implement
     // `get_title`, so the view's own record is the observable end of the call.
+    //
+    // This asserts the *values*, not the ordering. The ordering half — that
+    // the title is written by the `stores.spaces` observer, ahead of the frame
+    // its notify schedules, rather than from inside `render` — is **not
+    // testable at this pin**: `App::flush_effects` draws every dirty window
+    // inside the same update under `test-support`, so both placements look
+    // identical from here, and the thing that would actually distinguish them
+    // (the AccessKit root label built in `a11y.begin_frame`) is crate-private.
+    // See `sync_window_title` for why the placement still matters in
+    // production.
     let stores = stub_stores(cx, |s| {
         s.spaces = vec![stub_space("s1", Some("Tides and the moon"), None, 0)];
     });
 
-    let (blank_w, blank) = open_space(cx, &stores, None);
-    draw_window(cx, blank_w);
+    let (_blank_w, blank) = open_space(cx, &stores, None);
     blank.read_with(cx, |v, _| {
         assert_eq!(v.window_title_for_test(), Some("New Space"));
     });
 
-    let (w, view) = open_space(cx, &stores, Some("s1".into()));
-    draw_window(cx, w);
+    let (_w, view) = open_space(cx, &stores, Some("s1".into()));
     view.read_with(cx, |v, _| {
         assert_eq!(v.window_title_for_test(), Some("Tides and the moon"));
     });
@@ -3067,7 +3075,6 @@ fn space_window_is_named_after_its_space(cx: &mut TestAppContext) {
     stores.spaces.update(cx, |s, cx| {
         s.rename("s1".into(), "The moon and tides".into(), cx)
     });
-    draw_window(cx, w);
     view.read_with(cx, |v, _| {
         assert_eq!(v.window_title_for_test(), Some("The moon and tides"));
     });

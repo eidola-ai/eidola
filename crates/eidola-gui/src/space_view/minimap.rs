@@ -115,20 +115,24 @@ const LABEL_MAX_CHARS: usize = 56;
 /// will expose post bodies properly; until then this is what is heard.
 ///
 /// Deliberately *not* a markdown renderer: it drops the delimiters that are
-/// pure punctuation to the ear (block markers at a line's head, emphasis and
-/// code runs) and leaves everything else — including link and image syntax —
-/// alone rather than guessing. Pure, so it is unit-tested without a window.
+/// pure punctuation to the ear (block markers at a line's head, emphasis runs,
+/// code-span backticks) and leaves everything else — including link and image
+/// syntax — alone rather than guessing. Pure, so it is unit-tested without a
+/// window.
 pub(crate) fn spoken_snippet(
     content: &str,
     references: &[eidola_app_core::PostReference],
     max: usize,
 ) -> String {
     let without_embeds = super::references::strip_embed_blocks(content, references);
-    let plain: Vec<String> = without_embeds
+    // Block markers are per line; the inline pass runs over the joined text so
+    // a fenced block's opening and closing fences pair as one code span and
+    // its body is spoken verbatim.
+    let deblocked: Vec<&str> = without_embeds
         .lines()
-        .map(|line| strip_emphasis(strip_block_markers(line.trim())))
+        .map(|line| strip_block_markers(line.trim()))
         .collect();
-    super::references::snippet_to(&plain.join(" "), max)
+    super::references::snippet_to(&strip_inline_markup(&deblocked.join(" ")), max)
 }
 
 /// Drop a line's leading markdown block markers — headings, blockquotes,
@@ -159,25 +163,167 @@ fn strip_block_markers(line: &str) -> &str {
     }
 }
 
-/// Drop emphasis and code delimiters. `*` and backticks go unconditionally
-/// (they are never word characters); `_` only when it isn't between two word
-/// characters, so `snake_case` survives while `_emphasis_` does not.
-fn strip_emphasis(line: &str) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    let mut out = String::with_capacity(line.len());
-    for (i, &c) in chars.iter().enumerate() {
-        match c {
-            '*' | '`' => {}
-            '_' => {
-                let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric());
-                if word(chars.get(i.wrapping_sub(1)).filter(|_| i > 0)) && word(chars.get(i + 1)) {
-                    out.push(c);
+/// One tokenized span of the inline pass.
+enum Piece {
+    /// Literal text — escapes already resolved, code spans already unwrapped.
+    Text(String),
+    /// A run of `*` or `_` that may or may not be an emphasis delimiter.
+    Delim {
+        ch: char,
+        run: usize,
+        flanking: bool,
+    },
+}
+
+/// Drop the inline delimiters that are punctuation to the ear, and **only**
+/// those.
+///
+/// Deleting every `*` and backtick unconditionally (the first version of this)
+/// corrupts exactly the posts this app is most likely to carry: `` `x * y` ``
+/// was spoken as "x y", losing the operator, and a literal `\*` lost the
+/// character entirely. So the scan is positional:
+///
+/// - a backslash escape yields the escaped character, without the backslash;
+/// - a **code span** is spoken *verbatim* — its content is code, so nothing
+///   inside it is markup — and only its backticks are dropped. An unclosed
+///   run stays literal. Joining the lines first means a fenced block's two
+///   fences pair here as well;
+/// - a `*` / `_` run is dropped only when it reads as a **delimiter**: not
+///   whitespace-flanked on both sides (`2 * 3` is arithmetic), not intraword
+///   for `_` (`snake_case`), and only when that delimiter appears flanking at
+///   least twice, so an unpaired `2*3` stays literal.
+///
+/// The residual miss cases, stated rather than parsed away: a document mixing
+/// a real `*emphasis*` with an unpaired intraword `2*3` drops that lone
+/// asterisk too (both are "flanking", and pairing them properly is a parser's
+/// job), and link/image syntax is left alone entirely. Wave C exposes post
+/// bodies properly; this is a label heuristic, not a renderer.
+fn strip_inline_markup(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            // CommonMark §2.4 — the escaped punctuation is literal text.
+            '\\' if chars.get(i + 1).is_some_and(|c| c.is_ascii_punctuation()) => {
+                buf.push(chars[i + 1]);
+                i += 2;
+            }
+            '`' => {
+                let open = backtick_run(&chars, i);
+                match closing_backticks(&chars, i + open, open) {
+                    Some(close) => {
+                        buf.extend(code_span_body(&chars[i + open..close]));
+                        i = close + open;
+                    }
+                    None => {
+                        buf.extend(std::iter::repeat_n('`', open));
+                        i += open;
+                    }
                 }
             }
-            _ => out.push(c),
+            c @ ('*' | '_') => {
+                let run = chars[i..].iter().take_while(|&&x| x == c).count();
+                if !buf.is_empty() {
+                    pieces.push(Piece::Text(std::mem::take(&mut buf)));
+                }
+                let flanking = is_flanking(&chars, i, run, c);
+                pieces.push(Piece::Delim {
+                    ch: c,
+                    run,
+                    flanking,
+                });
+                i += run;
+            }
+            c => {
+                buf.push(c);
+                i += 1;
+            }
+        }
+    }
+    if !buf.is_empty() {
+        pieces.push(Piece::Text(buf));
+    }
+
+    let paired = |ch: char| {
+        pieces
+            .iter()
+            .filter(|p| matches!(p, Piece::Delim { ch: d, flanking: true, .. } if *d == ch))
+            .count()
+            >= 2
+    };
+    let (stars, unders) = (paired('*'), paired('_'));
+
+    let mut out = String::with_capacity(text.len());
+    for piece in &pieces {
+        match piece {
+            Piece::Text(t) => out.push_str(t),
+            Piece::Delim { ch, run, flanking } => {
+                let is_delimiter = *flanking && if *ch == '*' { stars } else { unders };
+                if !is_delimiter {
+                    out.extend(std::iter::repeat_n(*ch, *run));
+                }
+            }
         }
     }
     out
+}
+
+/// Whether a `*`/`_` run reads as an emphasis delimiter rather than as
+/// literal punctuation in the text.
+fn is_flanking(chars: &[char], i: usize, run: usize, c: char) -> bool {
+    let before = (i > 0).then(|| chars[i - 1]);
+    let after = chars.get(i + run).copied();
+    let is_space = |x: Option<char>| x.is_none_or(|x| x.is_whitespace());
+    // Air on both sides: `2 * 3` is a multiplication sign, not markup.
+    if is_space(before) && is_space(after) {
+        return false;
+    }
+    // `_` never delimits inside a word, so `snake_case` survives.
+    if c == '_'
+        && before.is_some_and(|x| x.is_alphanumeric())
+        && after.is_some_and(|x| x.is_alphanumeric())
+    {
+        return false;
+    }
+    true
+}
+
+fn backtick_run(chars: &[char], i: usize) -> usize {
+    chars[i..].iter().take_while(|&&c| c == '`').count()
+}
+
+/// The index of the next run of *exactly* `len` backticks at or after `from`.
+fn closing_backticks(chars: &[char], from: usize, len: usize) -> Option<usize> {
+    let mut i = from;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            let n = backtick_run(chars, i);
+            if n == len {
+                return Some(i);
+            }
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// CommonMark §6.1: a code span padded with one space at each end (and with
+/// some non-space content) drops that pair.
+fn code_span_body(inner: &[char]) -> Vec<char> {
+    if inner.len() > 2
+        && inner.first() == Some(&' ')
+        && inner.last() == Some(&' ')
+        && inner.iter().any(|c| *c != ' ')
+    {
+        inner[1..inner.len() - 1].to_vec()
+    } else {
+        inner.to_vec()
+    }
 }
 
 impl SpaceView {
@@ -724,6 +870,32 @@ mod tests {
             spoken_snippet("call snake_case not _this_", &[], 56),
             "call snake_case not this"
         );
+    }
+
+    #[test]
+    fn spoken_snippet_speaks_code_spans_verbatim() {
+        // Deleting every backtick and asterisk lost the operator here.
+        assert_eq!(spoken_snippet("`x * y`", &[], 56), "x * y");
+        assert_eq!(
+            spoken_snippet("a `code * span` and *emph*", &[], 56),
+            "a code * span and emph"
+        );
+        // A fenced block pairs across lines and keeps its body intact.
+        assert_eq!(
+            spoken_snippet("```\nlet z = a * b;\n```", &[], 56),
+            "let z = a * b;"
+        );
+        // An unclosed run is literal backticks, not a swallowed remainder.
+        assert_eq!(spoken_snippet("a ` b", &[], 56), "a ` b");
+    }
+
+    #[test]
+    fn spoken_snippet_keeps_escaped_and_unpaired_punctuation() {
+        // `\*` is a literal asterisk — it must survive as one.
+        assert_eq!(spoken_snippet(r"a \* b", &[], 56), "a * b");
+        // Arithmetic, not emphasis: air on both sides, and unpaired.
+        assert_eq!(spoken_snippet("2 * 3 = 6", &[], 56), "2 * 3 = 6");
+        assert_eq!(spoken_snippet("2*3", &[], 56), "2*3");
     }
 
     #[test]

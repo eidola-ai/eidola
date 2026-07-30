@@ -608,7 +608,13 @@ impl SpaceView {
             // The space index carries the title — the window's name (see
             // `sync_window_title`), which arrives only once the first
             // exchange auto-titles the space and changes again on rename.
-            cx.observe(&stores.spaces, |_, _, cx| cx.notify()),
+            // `observe_in` (not plain `observe`) because the title has to be
+            // written *before* the frame this notify schedules — see
+            // `sync_window_title`.
+            cx.observe_in(&stores.spaces, window, |this, _, window, cx| {
+                this.sync_window_title(window, cx);
+                cx.notify();
+            }),
             // The space's participants feed the separator Ask menus, the
             // streaming bylines, and the cascade notice's ask affordances.
             cx.observe(&stores.participants, |_, _, cx| cx.notify()),
@@ -693,6 +699,8 @@ impl SpaceView {
         };
         this.rebuild(cx);
         this.ensure_participants(cx);
+        // Name the window before its first frame; the observer keeps it current.
+        this.sync_window_title(window, cx);
         if is_blank {
             // The blank notebook: a root draft, focused and ready.
             this.create_draft(None, window, cx);
@@ -1663,7 +1671,6 @@ impl Render for SpaceView {
         // where no text reflows. See `layout::body_width`.
         self.layout
             .ensure_width(layout::body_width(page_width), theme::font_scale(cx));
-        self.sync_window_title(window, cx);
         self.sync_bodies(window, cx);
         // Keep each post's embed map + highlight set current, and request the
         // incoming-reference index for the posts that rendered last frame.
@@ -2563,9 +2570,19 @@ impl SpaceView {
     }
 
     /// Name the window after the conversation it holds, so VoiceOver's window
-    /// chooser and the macOS Window menu can tell two spaces apart. Called
-    /// each render and guarded on change — the title only moves when the
-    /// space is auto-titled or renamed.
+    /// chooser and the macOS Window menu can tell two spaces apart. Guarded on
+    /// change — the title only moves when the space is auto-titled or renamed.
+    ///
+    /// **Called from the `stores.spaces` observer, never from `render`.**
+    /// `Window::draw_roots` builds the frame's AccessKit root node — label and
+    /// all — in `a11y.begin_frame()` *before* prepainting the root element, so
+    /// a title written during `render` lands after that frame's root was
+    /// already built from the previous one; and `set_window_title` marks
+    /// nothing dirty, so no follow-up frame is scheduled. The platform title
+    /// (Window menu, switcher) would update at once while the *accessible*
+    /// root kept the stale name until some unrelated redraw. Writing it in the
+    /// observer — which runs before the frame its own `notify` schedules —
+    /// gets both from one pass.
     fn sync_window_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let title = self
             .space_title(cx)
