@@ -1277,6 +1277,244 @@ fn navigation_tools_round_trip_through_the_turn_loop() {
     });
 }
 
+/// Build a branched fixture space over an `openai` backend and return
+/// `(space_id, the action to reply to)`. Two posts and a branch post, so the
+/// next turn carries a map (and would carry tools).
+fn branched_external_space(core: &AppCore) -> String {
+    let first = core
+        .runtime()
+        .block_on(core.chat("How do tides work?".into(), "qwen3-8b@ext".into(), None))
+        .expect("first turn");
+    let space = first.space_id.clone();
+    core.runtime()
+        .block_on(core.chat(
+            "And why two per day?".into(),
+            "qwen3-8b@ext".into(),
+            Some(space.clone()),
+        ))
+        .expect("second turn");
+    let tree = core
+        .runtime()
+        .block_on(core.get_space_tree(space.clone()))
+        .expect("tree");
+    core.runtime()
+        .block_on(core.post_reply(
+            "What about spring tides?".into(),
+            Some(space.clone()),
+            Some(tree[1].action_id.clone()),
+        ))
+        .expect("branch post");
+    space
+}
+
+/// Backend *kind* cannot establish tool-calling capability: a generic
+/// OpenAI-compatible endpoint — or a llama.cpp server whose model template's
+/// tool block does not render — speaks chat completions perfectly well and
+/// rejects only the `tools` field. Since attachment is automatic on branch,
+/// that would otherwise mean "branching your conversation breaks every turn"
+/// with no opt-out. Instead the turn withdraws the tools it added and retries
+/// the round once, keeping the map.
+#[test]
+fn a_backend_that_rejects_tools_degrades_to_a_toolless_retry() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        let space = branched_external_space(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat(
+                "Tell me more.".into(),
+                "qwen3-8b@ext".into(),
+                Some(space.clone()),
+            ))
+            .expect("the turn must survive a backend that rejects tools");
+        assert_eq!(result.content, "Hello from the mock.");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len(),
+            4,
+            "two fixture turns + the rejected try + the retry"
+        );
+        assert!(
+            bodies[2].get("tools").is_some(),
+            "the first try offers the navigation tools"
+        );
+        assert!(
+            bodies[3].get("tools").is_none(),
+            "the retry withdraws them: {}",
+            bodies[3]
+        );
+        // The map is not part of the degrade — it rides the messages array and
+        // is unaffected by the tools field.
+        for body in [&bodies[2], &bodies[3]] {
+            let msgs = flat_messages(body);
+            assert!(
+                msgs.last()
+                    .expect("a message")
+                    .1
+                    .starts_with("<thread-map>"),
+                "the map survives the degrade: {msgs:#?}"
+            );
+        }
+    });
+}
+
+/// The degrade is remembered for the process, so the wasted request happens at
+/// most once per backend rather than on every branched turn. It is an
+/// in-process observation, not a config surface and not persisted — the
+/// capability flag stays genuinely deferred.
+#[test]
+fn a_backend_observed_to_reject_tools_is_not_offered_them_again() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        let space = branched_external_space(&core);
+
+        for prompt in ["Tell me more.", "And more."] {
+            core.runtime()
+                .block_on(core.chat(prompt.into(), "qwen3-8b@ext".into(), Some(space.clone())))
+                .expect("turn succeeds");
+        }
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len(),
+            5,
+            "two fixture turns + (rejected try + retry) + ONE request for the second turn"
+        );
+        assert!(
+            bodies[4].get("tools").is_none(),
+            "the second branched turn never offers tools again: {}",
+            bodies[4]
+        );
+        assert!(
+            flat_messages(&bodies[4])
+                .last()
+                .expect("a message")
+                .1
+                .starts_with("<thread-map>"),
+            "…and still carries the map"
+        );
+    });
+}
+
+/// A failure that is *not* attributable to the tools field must not silently
+/// downgrade the backend forever. The memo records only when the toolless
+/// retry actually succeeds — which is the evidence that the field was the
+/// cause.
+#[test]
+fn a_rejection_unrelated_to_tools_does_not_downgrade_the_backend() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::Non2xx(500),
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+
+        // Build the branched fixture with `post` alone — no HTTP, so the
+        // always-500 mock doesn't interfere with the setup.
+        let post = core
+            .runtime()
+            .block_on(core.post("How do tides work?".into(), None))
+            .expect("post");
+        let space = post.space_id.clone();
+        core.runtime()
+            .block_on(core.post_reply(
+                "What about spring tides?".into(),
+                Some(space.clone()),
+                Some(post.action_id.clone()),
+            ))
+            .expect("branch post");
+        core.runtime()
+            .block_on(core.post_reply(
+                "And neap tides?".into(),
+                Some(space.clone()),
+                Some(post.action_id.clone()),
+            ))
+            .expect("second branch post");
+
+        // The space forks, so the turn attaches tools; the endpoint 500s for
+        // an unrelated reason, so the toolless retry fails too.
+        let err = core
+            .runtime()
+            .block_on(core.chat(
+                "Tell me more.".into(),
+                "qwen3-8b@ext".into(),
+                Some(space.clone()),
+            ))
+            .expect_err("the turn fails honestly");
+        assert!(
+            matches!(err.root(), AppError::Server { status: 500, .. }),
+            "{err:?}"
+        );
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2, "the try and the one toolless retry");
+        assert!(bodies[0].get("tools").is_some());
+        assert!(bodies[1].get("tools").is_none());
+    });
+}
+
+/// The navigation tool names are reserved at the registration seam.
+///
+/// Without this, a consumer's `read_thread` would register fine, work on every
+/// linear turn, and then be silently replaced by the built-in the moment a
+/// space branched — the advertised schema and the executed implementation
+/// diverging on exactly the turns the feature exists for. The turn layers its
+/// tools onto the registry snapshot and `ToolRegistry::register` is
+/// last-write-wins, so the collision has to be refused where it is made.
+#[test]
+fn registering_a_reserved_navigation_tool_name_is_refused() {
+    struct Impostor(&'static str);
+    impl eidola_app_core::tools::Tool for Impostor {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "a consumer's own tool"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn call<'a>(
+            &'a self,
+            _arguments: serde_json::Value,
+        ) -> eidola_app_core::tools::ToolFuture<'a> {
+            Box::pin(async move { Ok(String::new()) })
+        }
+    }
+
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        for name in eidola_app_core::tools::RESERVED_TOOL_NAMES {
+            let err = core
+                .register_tool(std::sync::Arc::new(Impostor(name)))
+                .expect_err("a reserved name must be refused");
+            assert!(
+                matches!(err.root(), AppError::NotConfigured { message } if message.contains(name)),
+                "{err:?}"
+            );
+        }
+        assert!(
+            core.registered_tools().is_empty(),
+            "nothing was registered: {:?}",
+            core.registered_tools()
+        );
+        // Any other name still registers exactly as before.
+        core.register_tool(std::sync::Arc::new(Impostor("summarize")))
+            .expect("an unreserved name registers");
+        assert_eq!(core.registered_tools(), vec!["summarize".to_string()]);
+    });
+}
+
 /// The single-agent linear thread — the common case — rendered upstream:
 /// alternating `user` / `assistant`, every message carrying its uniform
 /// `#<handle> · <label>` header, and one leading `system` message (the agent's
@@ -2056,7 +2294,8 @@ use eidola_app_core::tools::EchoTool;
 /// Register the harness's echo tool — the only thing that makes a turn send
 /// `tools` at all.
 fn with_echo_tool(core: &AppCore) {
-    core.register_tool(std::sync::Arc::new(EchoTool));
+    core.register_tool(std::sync::Arc::new(EchoTool))
+        .expect("echo is not a reserved name");
 }
 
 /// A turn whose registry is empty must send **no** `tools` field: the whole

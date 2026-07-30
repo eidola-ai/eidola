@@ -130,6 +130,17 @@ pub enum ChatBehavior {
     /// chunk. Pins that streamed calls preserve provider fields (as blocking
     /// calls do) and that the merge rule is last-wins.
     ToolRoundsStreamingWithExtras(u64),
+    /// Blocking: reject any request whose body carries a `tools` field with
+    /// llama.cpp's own 500 (`"tools param requires --jinja flag"`), and answer
+    /// normally otherwise.
+    ///
+    /// This is a real, verified upstream shape, not an invented one: llama.cpp
+    /// returns exactly that 500 without `--jinja`, and *with* `--jinja` returns
+    /// a 500 template-render crash when the model's tool block uses Jinja
+    /// filters it lacks. Either way the endpoint speaks chat completions
+    /// perfectly well and rejects only the `tools` field — which is the case
+    /// backend kind cannot predict.
+    RejectTools,
     /// Blocking: the next chat request answers with **one round requesting
     /// every call currently in [`MockConfig::tool_script`]**, consuming the
     /// script; later requests answer normally.
@@ -643,7 +654,17 @@ async fn handle_conn(
             }
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
-            handle_chat(&mut stream, &issuer, &config, req.auth.as_deref(), hit).await?;
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            handle_chat(
+                &mut stream,
+                &issuer,
+                &config,
+                req.auth.as_deref(),
+                hit,
+                &parsed,
+            )
+            .await?;
         }
         _ => {
             write_json(&mut stream, 404, &error_body("not found")).await?;
@@ -681,6 +702,7 @@ async fn handle_chat(
     config: &MockConfig,
     auth: Option<&str>,
     hit: u64,
+    request: &serde_json::Value,
 ) -> std::io::Result<()> {
     // Compute an inline refund object once (shared by the blocking happy path).
     let inline_refund = if config.refund == RefundMode::Succeed {
@@ -830,6 +852,27 @@ async fn handle_chat(
             write_json(stream, 200, &body.to_string()).await
         }
         ChatBehavior::ToolCallsNotAnArrayStreaming => write_sse_bad_tool_calls_stream(stream).await,
+        ChatBehavior::RejectTools => {
+            if request.get("tools").is_some() {
+                return write_json(
+                    stream,
+                    500,
+                    &error_body("tools param requires --jinja flag"),
+                )
+                .await;
+            }
+            let mut body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "Hello from the mock.",
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
         ChatBehavior::ToolScript => {
             // Consume the script: the round that serves it asks for every
             // scripted call at once (so one turn can exercise several tools),
