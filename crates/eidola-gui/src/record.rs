@@ -917,24 +917,64 @@ impl RecordView {
             RecordSection::Requests => &self.requests.display,
             RecordSection::Spending => &self.spending.display,
         };
-        let total = display.len();
         range
             .filter_map(|dix| display.get(dix).copied().map(|row| (dix, row)))
             .map(|(dix, row)| match (section, row) {
                 (RecordSection::Attestations, DisplayRow::Data(i)) => {
-                    self.render_attestation_row(dix, i, total, cx)
+                    self.render_attestation_row(dix, i, cx)
                 }
                 (RecordSection::Requests, DisplayRow::Data(i)) => {
-                    self.render_request_row(dix, i, total, cx)
+                    self.render_request_row(dix, i, cx)
                 }
                 (RecordSection::Spending, DisplayRow::Header(i)) => self.render_spend_header(i, cx),
-                (RecordSection::Spending, DisplayRow::Data(i)) => {
-                    self.render_spend_row(dix, i, total, cx)
-                }
+                (RecordSection::Spending, DisplayRow::Data(i)) => self.render_spend_row(i, cx),
                 (_, DisplayRow::LoadMore) => self.render_load_more_row(cx),
                 // No other (section, row) combinations are produced by the
                 // display builders.
                 _ => div().h(ROW_H).into_any_element(),
+            })
+            .collect()
+    }
+
+    /// The `(position, size)` a listing row reports to assistive technology:
+    /// its 1-based index among the section's **loaded data rows**, and how
+    /// many of those there are.
+    ///
+    /// Deliberately *not* the display index or `display.len()`. The display
+    /// model interleaves spending group headers and a trailing load-more
+    /// affordance, so those would announce the first spending entry as "2 of
+    /// N" and count the button as an extra item. Both display builders push
+    /// `Data(idx)` in `rows` order, so the data index is already contiguous.
+    ///
+    /// `size` is the *loaded* count, not the server-side total: with
+    /// `has_more` there are more rows behind the load-more affordance and
+    /// gpui offers no way to say "unknown". The loaded count is what the list
+    /// actually contains, which is the honest answer available.
+    fn row_set_metadata(&self, section: RecordSection, row_index: usize) -> (usize, usize) {
+        let loaded = match section {
+            RecordSection::Attestations => self.attestations.rows.len(),
+            RecordSection::Requests => self.requests.rows.len(),
+            RecordSection::Spending => self.spending.rows.len(),
+        };
+        (row_index + 1, loaded)
+    }
+
+    /// Test-only: the `(position, size)` every data row of the current
+    /// section would report, in display order. `aria_*` attributes don't pass
+    /// through `.probe()`, so walking the real display model through the real
+    /// rule is the only seam that can pin them.
+    #[doc(hidden)]
+    pub fn row_set_metadata_for_test(&self) -> Vec<(usize, usize)> {
+        let display = match self.section {
+            RecordSection::Attestations => &self.attestations.display,
+            RecordSection::Requests => &self.requests.display,
+            RecordSection::Spending => &self.spending.display,
+        };
+        display
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Data(i) => Some(self.row_set_metadata(self.section, *i)),
+                _ => None,
             })
             .collect()
     }
@@ -947,17 +987,11 @@ impl RecordView {
         &self,
         id: (&'static str, usize),
         dix: usize,
-        total: usize,
         cx: &Context<Self>,
     ) -> gpui::Stateful<Div> {
         let theme = cx.theme();
         let mut row = v_flex()
             .id(id)
-            // `uniform_list` renders only the visible window, so without the
-            // set metadata AT perceives a page of eleven rows as the whole
-            // listing.
-            .aria_position_in_set(dix + 1)
-            .aria_size_of_set(total)
             .w_full()
             .h(ROW_H)
             .justify_center()
@@ -1010,13 +1044,7 @@ impl RecordView {
 
     // --- Attestations -----------------------------------------------------
 
-    fn render_attestation_row(
-        &self,
-        dix: usize,
-        i: usize,
-        total: usize,
-        cx: &Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_attestation_row(&self, dix: usize, i: usize, cx: &Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme();
         let a = &self.attestations.rows[i];
         let hash = a.hash.clone();
@@ -1029,7 +1057,10 @@ impl RecordView {
             plural(a.connection_count, "connection"),
             format_bytes(a.doc_bytes),
         );
-        self.row_shell(("attestation", dix), dix, total, cx)
+        let (pos, size) = self.row_set_metadata(RecordSection::Attestations, i);
+        self.row_shell(("attestation", dix), dix, cx)
+            .aria_position_in_set(pos)
+            .aria_size_of_set(size)
             .probe(
                 format!("record/attestation/{dix}"),
                 gpui::Role::ListItem,
@@ -1100,13 +1131,7 @@ impl RecordView {
 
     // --- Requests -----------------------------------------------------------
 
-    fn render_request_row(
-        &self,
-        dix: usize,
-        i: usize,
-        total: usize,
-        cx: &Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_request_row(&self, dix: usize, i: usize, cx: &Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme();
         let r = &self.requests.rows[i];
         let id = r.id.clone();
@@ -1141,7 +1166,10 @@ impl RecordView {
         }
         sub_parts.push(fmt_utc(r.request_at, false));
 
-        self.row_shell(("request", dix), dix, total, cx)
+        let (pos, size) = self.row_set_metadata(RecordSection::Requests, i);
+        self.row_shell(("request", dix), dix, cx)
+            .aria_position_in_set(pos)
+            .aria_size_of_set(size)
             .probe(
                 format!("record/request/{dix}"),
                 gpui::Role::ListItem,
@@ -1355,14 +1383,9 @@ impl RecordView {
     }
 
     /// A spending data row (clicks through to the request detail).
-    fn render_spend_row(
-        &self,
-        dix: usize,
-        i: usize,
-        total: usize,
-        cx: &Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_spend_row(&self, i: usize, cx: &Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme();
+        let (pos, size) = self.row_set_metadata(RecordSection::Spending, i);
         let e = &self.spending.rows[i];
         let id = e.request_id.clone();
         let mut sub_parts: Vec<String> = Vec::new();
@@ -1381,8 +1404,8 @@ impl RecordView {
 
         v_flex()
             .id(("spend", i))
-            .aria_position_in_set(dix + 1)
-            .aria_size_of_set(total)
+            .aria_position_in_set(pos)
+            .aria_size_of_set(size)
             .probe(
                 format!("record/spend/{i}"),
                 gpui::Role::ListItem,
