@@ -46,6 +46,7 @@
 //! | `run_turn`/`run_turn_stream` — tool round persisted, then the **round cap** binds | The posted user turn; every executed round's `tool_call` + `tool_result` actions and request rows; the capped round's `tool_call` + request row (its tools are deliberately *not* executed) | `Space(id)`, `Record`; `Wallet` at each round's spend start; **error is `AppError::ToolLoop`, wrapped with the space id** | `chat_path.rs` (`round_cap_ends_the_turn_honestly_with_the_rounds_persisted`) |
 //! | `run_turn`/`run_turn_stream` — tool round persisted, then **`begin_next_round` fails** (budget exceeded / provisioning) | The posted user turn; every completed round's `tool_call` + `tool_result` actions and request rows | `Space(id)`, `Record`; `Wallet` at each round's spend start; error wraps the space id | `chat_path.rs` (`budget_exceeded_mid_loop_fails_with_the_first_round_persisted`) |
 //! | `run_turn`/`run_turn_stream` — **structurally unusable `tool_calls`** (no call id / no function name, or a present-but-non-array `tool_calls` / `delta.tool_calls`; an absent or explicitly `null` value is an ordinary no-tools completion) | The posted user turn; the round's raw request row, attached to **no action** (nothing could be written as a `tool_use` block) | `Space(id)`, `Record`; **error is `AppError::ToolLoop`**, wrapped with the space id | `chat_path.rs` (`structurally_malformed_tool_call_fails_the_turn_honestly`) |
+//! | `run_turn`/`run_turn_stream` — the **agent-side decline checkpoint** fires (a round's tool calls include `decline` *and* the turn's registry holds it) | The posted user turn; the round's `tool_call` + `tool_result` actions and request row; a **`decision`** action hanging off the post the turn answers, carrying the stated reason | `Space(id)`, `Record`; `Wallet` when the turn spent. **No `SpaceIndex`** — the would-be post is suppressed, so the listing gains no item — and **no `inference`**: `ChatResult::declined` carries the reason and `response_action_id` names the decision | `participants_orchestration.rs` (`a_declining_agent_writes_a_decision_and_suppresses_the_post`; `the_decline_name_alone_is_not_a_decline_without_the_tool_registered` pins that the checkpoint keys on the registry, never on the name) |
 //!
 //! `SpaceIndex?` = emitted by `post` when the listing changed (new space /
 //! auto-title); `run_turn` never emits it. Plain `?` on intervening local-DB
@@ -223,6 +224,98 @@ fn set_default_template_emits_config_and_templates() {
         changes.contains(&Change::Templates),
         "set_default_template should emit Templates; got {changes:?}"
     );
+}
+
+#[test]
+fn router_model_settings_round_trip_and_emit_their_domains() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let space = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+
+        // Off by default — the may-decline router is opt-in per space.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.space_router_model(space.clone()))
+                .expect("read"),
+            None
+        );
+
+        // A space setting is a Space change (the cascade_limit precedent).
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.set_space_router_model(space.clone(), Some("tiny@local".into())))
+            .expect("set");
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space.clone())),
+            "a space setting emits Space; got {changes:?}"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.space_router_model(space.clone()))
+                .expect("read"),
+            Some("tiny@local".into())
+        );
+
+        // Clearing it back to off round-trips…
+        core.runtime()
+            .block_on(core.set_space_router_model(space.clone(), None))
+            .expect("clear");
+        assert_eq!(
+            core.runtime()
+                .block_on(core.space_router_model(space.clone()))
+                .expect("read"),
+            None
+        );
+
+        // …and a nonexistent backend is refused up front rather than degrading
+        // silently on every post.
+        assert!(
+            core.runtime()
+                .block_on(core.set_space_router_model(space.clone(), Some("m@nope".into())))
+                .is_err()
+        );
+
+        // The template half is a Templates change.
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.set_template_router_model(
+                eidola_app_core::DEFAULT_TEMPLATE_ID.into(),
+                Some("tiny@local".into()),
+            ))
+            .expect("set template");
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Templates),
+            "a template setting emits Templates; got {changes:?}"
+        );
+        let tmpl = core
+            .runtime()
+            .block_on(core.list_space_templates())
+            .expect("templates")
+            .into_iter()
+            .find(|t| t.id == eidola_app_core::DEFAULT_TEMPLATE_ID)
+            .expect("default template");
+        assert_eq!(tmpl.router_model.as_deref(), Some("tiny@local"));
+
+        // A space instantiated from it is born with the setting.
+        let child = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+        assert_eq!(
+            core.runtime()
+                .block_on(core.space_router_model(child))
+                .expect("read"),
+            Some("tiny@local".into()),
+            "copied at instantiation exactly like cascade_limit"
+        );
+    });
 }
 
 #[test]
