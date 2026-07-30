@@ -2932,6 +2932,153 @@ pub async fn insert_context_assembly_action(
     Ok(())
 }
 
+/// The actions an inference's context assembly records, in `position` order —
+/// the ordered composition of the prompt that produced it.
+pub async fn context_assembly_actions(
+    conn: &Connection,
+    inference_action_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT caa.action_id \
+             FROM context_assembly ca \
+             JOIN context_assembly_action caa ON caa.context_assembly_id = ca.id \
+             WHERE ca.action_id = ?1 \
+             ORDER BY caa.position ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(inference_action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(out)
+}
+
+/// One tool-payload content block of a **trace** action recorded in some
+/// inference's context assembly — the rows a later turn of the same
+/// participant replays as its own first-person memory (task 33).
+pub struct TraceBlockRow {
+    /// The `tool_call` / `tool_result` action the block belongs to.
+    pub action_id: String,
+    /// `tool_call` | `tool_result`.
+    pub action_type: String,
+    /// `tool_use` | `tool_result`.
+    pub block_type: String,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    /// A `tool_result` block's text — what the model was shown.
+    pub text_content: Option<String>,
+    /// A `tool_use` block's raw arguments string.
+    pub data: Option<String>,
+}
+
+/// The tool rounds an inference's turn actually ran, in the order they were
+/// fed upstream: the `tool_use` / `tool_result` blocks of the `tool_call` and
+/// `tool_result` actions recorded in that inference's **context assembly**.
+///
+/// The assembly is what attributes a trace to its turn. The trace chain hangs
+/// off the *post* the turn answered (never off the inference — a capped or
+/// declined turn writes no inference), so nothing structural links a chain to
+/// the answer it produced; the writing turn, however, recorded exactly its own
+/// rounds as fed context. Reading it back is therefore branch-correct,
+/// regeneration-correct and abandoned-chain-correct by construction: you see
+/// the traces of the turns whose posts you can see.
+///
+/// Only the tool payload blocks come back. A round's `thinking` and `text`
+/// blocks are deliberately excluded — the live loop replays a round as an
+/// assistant message with `content: null` and its calls, so replaying anything
+/// more would be a shape the model never produced.
+pub async fn assembly_trace_blocks(
+    conn: &Connection,
+    inference_action_id: &str,
+) -> Result<Vec<TraceBlockRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.id, a.action_type, cb.block_type, cb.tool_name, cb.tool_call_id, \
+                    cb.text_content, cb.data \
+             FROM context_assembly ca \
+             JOIN context_assembly_action caa ON caa.context_assembly_id = ca.id \
+             JOIN action a ON a.id = caa.action_id \
+             JOIN content_block cb ON cb.action_id = a.id \
+             WHERE ca.action_id = ?1 \
+               AND a.action_type IN ('tool_call', 'tool_result') \
+               AND cb.block_type IN ('tool_use', 'tool_result') \
+             ORDER BY caa.position ASC, cb.ordinal ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(inference_action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(TraceBlockRow {
+            action_id: row.get::<String>(0).map_err(AppError::db)?,
+            action_type: row.get::<String>(1).map_err(AppError::db)?,
+            block_type: row.get::<String>(2).map_err(AppError::db)?,
+            tool_name: row.get::<Option<String>>(3).map_err(AppError::db)?,
+            tool_call_id: row.get::<Option<String>>(4).map_err(AppError::db)?,
+            text_content: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            data: row.get::<Option<String>>(6).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Whether a space holds any tool-round trace at all. The one cheap read that
+/// keeps a traceless space — the overwhelming majority — from paying a
+/// per-spine-inference lookup on every turn.
+pub async fn space_has_trace_actions(conn: &Connection, space_id: &str) -> Result<bool, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT 1 FROM action \
+             WHERE space_id = ?1 AND action_type IN ('tool_call', 'tool_result') \
+             LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    Ok(rows.next().await.map_err(AppError::db)?.is_some())
+}
+
+/// Author (`participant_id`) of every current-generation **post** in a space,
+/// keyed by action id. The thread map's per-participant annotation needs it
+/// and `PostNode` carries only the display label, so it rides alongside the
+/// tree materials rather than widening a public DTO.
+pub async fn post_authors(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<std::collections::HashMap<String, String>, AppError> {
+    let sql = format!(
+        "SELECT a.id, a.participant_id \
+         FROM action a \
+         JOIN item_current ic ON ic.current_action_id = a.id \
+         WHERE a.space_id = ?1 AND a.action_type IN ({POST_ACTION_TYPES_SQL})"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut out = std::collections::HashMap::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.insert(
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<String>(1).map_err(AppError::db)?,
+        );
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Layer 2 — Semantic: Space query operations
 // ---------------------------------------------------------------------------
