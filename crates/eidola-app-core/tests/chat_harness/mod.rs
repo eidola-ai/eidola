@@ -136,6 +136,33 @@ pub enum ChatBehavior {
 /// `eidola_app_core::tools::EchoTool`.
 pub const TOOL_NAME: &str = "echo";
 
+/// The engine slug the may-decline router tests register against the mock
+/// (`test_register_loaded_local_model("local", ROUTER_SLUG, mock.port())`).
+pub const ROUTER_SLUG: &str = "router";
+
+/// The qualified model reference a space's `router_model` is set to in the
+/// router tests. Engine-backed backends send the canonical qualified id as the
+/// wire model, so this is exactly what the mock sees in the request body — the
+/// key it dispatches the router arm on.
+pub const ROUTER_MODEL: &str = "router@local";
+
+/// How the mock answers a chat request for [`ROUTER_MODEL`] — the may-decline
+/// router's scripted seam. Every arm keeps the *turn* behaviour
+/// ([`ChatBehavior`]) untouched, so one mock serves both roles in one test.
+#[derive(Clone, Debug)]
+pub enum RouterBehavior {
+    /// Not router-aware: a request for the router model is answered like any
+    /// other chat request. The default, and what every pre-router test sees.
+    Passthrough,
+    /// 200 JSON completion whose assistant content is exactly this string —
+    /// the scripted routing decision (e.g. `{"notify": [1]}`), or deliberate
+    /// garbage for the degrade-on-malformed-output row.
+    Reply(String),
+    /// Non-2xx error body — the router is reachable but refuses. Exercises
+    /// degrade-on-failure.
+    Fail(u16),
+}
+
 /// Whether the refund endpoints (inline + recovery) actually mint a successor
 /// credential, or fail. Lets refund-recovery-succeeds vs -fails be selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +177,8 @@ pub enum RefundMode {
 #[derive(Clone)]
 pub struct MockConfig {
     pub chat: ChatBehavior,
+    /// How a request for [`ROUTER_MODEL`] is answered (see [`RouterBehavior`]).
+    pub router: RouterBehavior,
     pub refund: RefundMode,
     /// Account available balance returned by `/v1/account/balances`.
     pub balance: i64,
@@ -164,6 +193,7 @@ impl Default for MockConfig {
     fn default() -> Self {
         Self {
             chat: ChatBehavior::OkBlocking,
+            router: RouterBehavior::Passthrough,
             refund: RefundMode::Succeed,
             balance: 10_000_000,
             models_status: None,
@@ -557,12 +587,35 @@ async fn handle_conn(
             // 1-based index of this chat request — the tool-calling
             // behaviours script their answer per round.
             let hit = chat_hits.fetch_add(1, Ordering::SeqCst) + 1;
-            if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) {
+            let parsed = serde_json::from_slice::<serde_json::Value>(&req.body).ok();
+            let is_router = parsed
+                .as_ref()
+                .and_then(|b| b.get("model"))
+                .and_then(|m| m.as_str())
+                .is_some_and(|m| m == ROUTER_MODEL);
+            if let Some(body) = parsed {
                 chat_bodies.lock().unwrap().push(body);
             }
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
-            handle_chat(&mut stream, &issuer, &config, req.auth.as_deref(), hit).await?;
+            // A request for the router model is answered by the router arm
+            // (unless the mock is not router-aware), leaving `ChatBehavior`
+            // free to script the *turns* in the same test.
+            match (is_router, &config.router) {
+                (true, RouterBehavior::Reply(content)) => {
+                    let body = serde_json::json!({
+                        "choices": [{ "message": { "role": "assistant", "content": content } }],
+                        "usage": { "prompt_tokens": 7, "completion_tokens": 3 },
+                    });
+                    write_json(&mut stream, 200, &body.to_string()).await?;
+                }
+                (true, RouterBehavior::Fail(status)) => {
+                    write_json(&mut stream, *status, &error_body("router unavailable")).await?;
+                }
+                _ => {
+                    handle_chat(&mut stream, &issuer, &config, req.auth.as_deref(), hit).await?;
+                }
+            }
         }
         _ => {
             write_json(&mut stream, 404, &error_body("not found")).await?;

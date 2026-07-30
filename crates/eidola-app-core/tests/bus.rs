@@ -225,6 +225,98 @@ fn set_default_template_emits_config_and_templates() {
 }
 
 #[test]
+fn router_model_settings_round_trip_and_emit_their_domains() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let space = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+
+        // Off by default — the may-decline router is opt-in per space.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.space_router_model(space.clone()))
+                .expect("read"),
+            None
+        );
+
+        // A space setting is a Space change (the cascade_limit precedent).
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.set_space_router_model(space.clone(), Some("tiny@local".into())))
+            .expect("set");
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space.clone())),
+            "a space setting emits Space; got {changes:?}"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.space_router_model(space.clone()))
+                .expect("read"),
+            Some("tiny@local".into())
+        );
+
+        // Clearing it back to off round-trips…
+        core.runtime()
+            .block_on(core.set_space_router_model(space.clone(), None))
+            .expect("clear");
+        assert_eq!(
+            core.runtime()
+                .block_on(core.space_router_model(space.clone()))
+                .expect("read"),
+            None
+        );
+
+        // …and a nonexistent backend is refused up front rather than degrading
+        // silently on every post.
+        assert!(
+            core.runtime()
+                .block_on(core.set_space_router_model(space.clone(), Some("m@nope".into())))
+                .is_err()
+        );
+
+        // The template half is a Templates change.
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.set_template_router_model(
+                eidola_app_core::DEFAULT_TEMPLATE_ID.into(),
+                Some("tiny@local".into()),
+            ))
+            .expect("set template");
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Templates),
+            "a template setting emits Templates; got {changes:?}"
+        );
+        let tmpl = core
+            .runtime()
+            .block_on(core.list_space_templates())
+            .expect("templates")
+            .into_iter()
+            .find(|t| t.id == eidola_app_core::DEFAULT_TEMPLATE_ID)
+            .expect("default template");
+        assert_eq!(tmpl.router_model.as_deref(), Some("tiny@local"));
+
+        // A space instantiated from it is born with the setting.
+        let child = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+        assert_eq!(
+            core.runtime()
+                .block_on(core.space_router_model(child))
+                .expect("read"),
+            Some("tiny@local".into()),
+            "copied at instantiation exactly like cascade_limit"
+        );
+    });
+}
+
+#[test]
 fn clear_base_url_override_emits_backends() {
     run_in_thread(|| {
         let (core, _dir) = make_core();

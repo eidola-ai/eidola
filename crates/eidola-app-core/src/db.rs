@@ -17,7 +17,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 2;
+const LATEST_VERSION: i64 = 3;
 
 /// Well-known id of the shared human "You" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -1881,6 +1881,45 @@ pub async fn space_cascade_limit(
     }
 }
 
+/// A space's `router_model` (the may-decline router setting, copied from the
+/// template it was instantiated from). `Ok(None)` covers both "no such space"
+/// and "the feature is off here" — the caller validates space existence
+/// separately, and both answers mean *don't call a router*.
+pub async fn space_router_model(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT router_model FROM space WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(space_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(row.get::<Option<String>>(0).map_err(AppError::db)?),
+    }
+}
+
+/// Set (or clear, with `None`) a space's `router_model`. Returns whether a row
+/// was updated.
+pub async fn set_space_router_model(
+    conn: &Connection,
+    space_id: &str,
+    router_model: Option<&str>,
+) -> Result<bool, AppError> {
+    let n = conn
+        .execute(
+            "UPDATE space SET router_model = ?2 WHERE id = ?1",
+            (Value::Text(space_id.to_string()), opt_str(router_model)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
 // --- space templates -------------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -1888,6 +1927,9 @@ pub struct SpaceTemplateRow {
     pub id: String,
     pub title: String,
     pub cascade_limit: i64,
+    /// The may-decline router model copied into a space at instantiation.
+    /// `None` = the feature is off for spaces born from this template.
+    pub router_model: Option<String>,
     pub created_at: i64,
     pub removed_at: Option<i64>,
 }
@@ -1897,8 +1939,9 @@ fn space_template_row_from(row: &turso::Row) -> Result<SpaceTemplateRow, AppErro
         id: row.get::<String>(0).map_err(AppError::db)?,
         title: row.get::<String>(1).map_err(AppError::db)?,
         cascade_limit: row.get::<i64>(2).map_err(AppError::db)?,
-        created_at: row.get::<i64>(3).map_err(AppError::db)?,
-        removed_at: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+        router_model: row.get::<Option<String>>(3).map_err(AppError::db)?,
+        created_at: row.get::<i64>(4).map_err(AppError::db)?,
+        removed_at: row.get::<Option<i64>>(5).map_err(AppError::db)?,
     })
 }
 
@@ -1906,7 +1949,7 @@ fn space_template_row_from(row: &turso::Row) -> Result<SpaceTemplateRow, AppErro
 pub async fn list_space_templates(conn: &Connection) -> Result<Vec<SpaceTemplateRow>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, cascade_limit, created_at, removed_at \
+            "SELECT id, title, cascade_limit, router_model, created_at, removed_at \
              FROM space_template WHERE removed_at IS NULL \
              ORDER BY created_at, id",
         )
@@ -1927,7 +1970,7 @@ pub async fn get_space_template(
 ) -> Result<Option<SpaceTemplateRow>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, cascade_limit, created_at, removed_at \
+            "SELECT id, title, cascade_limit, router_model, created_at, removed_at \
              FROM space_template WHERE id = ?1",
         )
         .await
@@ -1947,15 +1990,17 @@ pub async fn insert_space_template(
     id: &str,
     title: &str,
     cascade_limit: i64,
+    router_model: Option<&str>,
     created_at: i64,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO space_template (id, title, cascade_limit, created_at) \
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO space_template (id, title, cascade_limit, router_model, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         (
             Value::Text(id.to_string()),
             Value::Text(title.to_string()),
             Value::Integer(cascade_limit),
+            opt_str(router_model),
             Value::Integer(created_at),
         ),
     )
@@ -1992,6 +2037,27 @@ pub async fn update_space_template(
         sets.join(", ")
     );
     let n = conn.execute(&sql, params).await.map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
+/// Set (or clear, with `None`) a template's `router_model`. Deliberately its
+/// own setter rather than another optional parameter on
+/// [`update_space_template`]: `Option<&str>` there would be ambiguous between
+/// "leave alone" and "clear", and the router setting has exactly two states.
+/// Returns whether a live row was updated.
+pub async fn set_template_router_model(
+    conn: &Connection,
+    id: &str,
+    router_model: Option<&str>,
+) -> Result<bool, AppError> {
+    let n = conn
+        .execute(
+            "UPDATE space_template SET router_model = ?2 \
+             WHERE id = ?1 AND removed_at IS NULL",
+            (Value::Text(id.to_string()), opt_str(router_model)),
+        )
+        .await
+        .map_err(AppError::db)?;
     Ok(n > 0)
 }
 
@@ -2088,7 +2154,7 @@ pub async fn soft_remove_space_template(
 // --- projections (INSERT … SELECT-style row copies) ------------------------
 
 /// Instantiate a template into a **new space**: create the space (copying
-/// `cascade_limit`); copy the template's OWNED participants into fresh
+/// `cascade_limit` and `router_model`); copy the template's OWNED participants into fresh
 /// SPACE-owned rows; copy its reference rows (with overrides) into space
 /// references; then ensure the shared human "You" is referenced (as owner).
 /// Errors if the template is missing or removed.
@@ -2112,13 +2178,15 @@ pub async fn instantiate_template(
     }
 
     conn.execute(
-        "INSERT INTO space (id, parent_space_id, title, linkability, cascade_limit, created_at) \
-         VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+        "INSERT INTO space \
+         (id, parent_space_id, title, linkability, cascade_limit, router_model, created_at) \
+         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6)",
         (
             Value::Text(new_space_id.to_string()),
             opt_str(title),
             Value::Text(linkability.to_string()),
             Value::Integer(template.cascade_limit),
+            opt_str(template.router_model.as_deref()),
             Value::Integer(now),
         ),
     )
@@ -2170,9 +2238,9 @@ pub async fn instantiate_template(
 }
 
 /// Project a space's current participants + settings into a **new template**:
-/// copy `cascade_limit`; copy the space's OWNED participants into
-/// TEMPLATE-owned rows; copy its reference rows (with overrides) into template
-/// references.
+/// copy `cascade_limit` and `router_model`; copy the space's OWNED participants
+/// into TEMPLATE-owned rows; copy its reference rows (with overrides) into
+/// template references.
 pub async fn template_from_space(
     conn: &Connection,
     space_id: &str,
@@ -2186,7 +2254,16 @@ pub async fn template_from_space(
             .ok_or_else(|| AppError::NotConfigured {
                 message: format!("space not found: {space_id}"),
             })?;
-    insert_space_template(conn, new_template_id, title, cascade_limit, now).await?;
+    let router_model = space_router_model(conn, space_id).await?;
+    insert_space_template(
+        conn,
+        new_template_id,
+        title,
+        cascade_limit,
+        router_model.as_deref(),
+        now,
+    )
+    .await?;
 
     // Space-owned participants → fresh template-owned rows.
     for p in list_space_owned_participants(conn, space_id).await? {
@@ -4865,6 +4942,17 @@ mod tests {
             space_cascade_limit(&conn, "space-x").await.unwrap(),
             Some(4)
         );
+        // The may-decline router is OFF by default: the seeded template carries
+        // no router model, so neither does a space born from it.
+        assert_eq!(
+            get_space_template(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+                .await
+                .unwrap()
+                .unwrap()
+                .router_model,
+            None
+        );
+        assert_eq!(space_router_model(&conn, "space-x").await.unwrap(), None);
 
         // Effective members: You (referenced global, owner) + one owned agent.
         let members = space_participants(&conn, "space-x").await.unwrap();
@@ -4929,18 +5017,32 @@ mod tests {
         assert_eq!(agent.label, "Justin");
         assert_eq!(agent.model_ref.as_deref(), Some("kimi-k2-6"));
 
+        // Turn the may-decline router on for this space, so the projection
+        // below carries it exactly like cascade_limit.
+        assert!(
+            set_space_router_model(&conn, "space-x", Some("router@local"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            space_router_model(&conn, "space-x")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("router@local")
+        );
+
         // Project back into a template: owned agent → template-owned; the You
         // reference (with its override) → a template reference.
         template_from_space(&conn, "space-x", "My Template", "tmpl-x", 2_000)
             .await
             .unwrap();
+        let projected = get_space_template(&conn, "tmpl-x").await.unwrap().unwrap();
+        assert_eq!(projected.cascade_limit, 4);
         assert_eq!(
-            get_space_template(&conn, "tmpl-x")
-                .await
-                .unwrap()
-                .unwrap()
-                .cascade_limit,
-            4
+            projected.router_model.as_deref(),
+            Some("router@local"),
+            "template_from_space copies router_model like cascade_limit"
         );
 
         let owned = list_template_owned_participants(&conn, "tmpl-x")
@@ -4968,6 +5070,32 @@ mod tests {
         instantiate_template(&conn, "tmpl-x", "space-y", None, "unlinked", 3_000)
             .await
             .unwrap();
+        assert_eq!(
+            space_router_model(&conn, "space-y")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("router@local"),
+            "instantiate_template copies router_model into the new space"
+        );
+        // …and clearing it back to NULL (the feature off) round-trips.
+        assert!(
+            set_template_router_model(&conn, "tmpl-x", None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            get_space_template(&conn, "tmpl-x")
+                .await
+                .unwrap()
+                .unwrap()
+                .router_model,
+            None
+        );
+        instantiate_template(&conn, "tmpl-x", "space-z", None, "unlinked", 4_000)
+            .await
+            .unwrap();
+        assert_eq!(space_router_model(&conn, "space-z").await.unwrap(), None);
         let members = space_participants(&conn, "space-y").await.unwrap();
         let you = members.iter().find(|m| m.kind == "human").unwrap();
         assert_eq!(you.label, "Mike");
@@ -5027,7 +5155,7 @@ mod tests {
     async fn instantiate_removed_template_fails() {
         let db = open_memory_fresh().await;
         let conn = fk_conn(&db).await;
-        insert_space_template(&conn, "t-gone", "Gone", 4, 1_000)
+        insert_space_template(&conn, "t-gone", "Gone", 4, None, 1_000)
             .await
             .unwrap();
         assert!(
@@ -5048,7 +5176,7 @@ mod tests {
     async fn update_template_tx_rolls_back_on_failure() {
         let db = open_memory_fresh().await;
         let conn = fk_conn(&db).await;
-        insert_space_template(&conn, "t-atomic", "Orig", 4, 1_000)
+        insert_space_template(&conn, "t-atomic", "Orig", 4, None, 1_000)
             .await
             .unwrap();
         for (pid, label, model) in [("a1", "One", "m1"), ("a2", "Two", "m2")] {
@@ -5107,7 +5235,7 @@ mod tests {
     async fn update_template_tx_commits_a_valid_replacement() {
         let db = open_memory_fresh().await;
         let conn = fk_conn(&db).await;
-        insert_space_template(&conn, "t-ok", "Orig", 4, 1_000)
+        insert_space_template(&conn, "t-ok", "Orig", 4, None, 1_000)
             .await
             .unwrap();
         insert_participant(
