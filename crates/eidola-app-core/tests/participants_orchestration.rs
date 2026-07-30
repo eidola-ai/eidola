@@ -30,9 +30,10 @@ mod chat_harness;
 
 use chat_harness::{
     ChatBehavior, HUMAN_LABEL, MODEL, MockConfig, RefundMode, flat_messages, headed,
-    system_message, with_account,
+    system_message, tool_result_text, with_account,
 };
 use eidola_app_core::error::AppError;
+use eidola_app_core::tools::EchoTool;
 use eidola_app_core::{
     AppCore, ChatResult, ChatStreamEvent, NewParticipant, NotificationPlan, ParticipantUpdate,
 };
@@ -255,6 +256,85 @@ fn explicit_participant_prepends_effective_system_prompt() {
                 ),
             ]
         );
+    });
+}
+
+/// **First-person traces (task 33), the scoping half.** A trace is the private
+/// record of how one participant reached a conclusion; the post is its
+/// distillation. So Ada's tool round reaches Ada's next turn and reaches
+/// nobody else — Bo, answering on the very same branch, sees Ada's *post* and
+/// no trace of how she got there.
+#[test]
+fn another_participants_traces_never_reach_this_turn() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::ToolRoundsStreaming(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.register_tool(std::sync::Arc::new(EchoTool))
+            .expect("echo is not a reserved name");
+        let space = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+        add_agent(&core, &space, "Ada", MODEL, "explicit", Some("I am Ada."));
+        add_agent(&core, &space, "Bo", MODEL, "explicit", Some("I am Bo."));
+        let ada = agent_id(&core, &space, "Ada");
+        let bo = agent_id(&core, &space, "Bo");
+
+        // Ada answers with a tool round (requests 1-2), Bo answers Ada
+        // (request 3), then Ada answers Bo (request 4).
+        let posted = core
+            .runtime()
+            .block_on(core.post("what say you both?".into(), Some(space.clone())))
+            .expect("post");
+        let ada_post = drive_as(&core, &space, &ada, &posted.action_id)
+            .expect("ada turn")
+            .response_action_id
+            .expect("ada's post");
+        let bo_post = drive_as(&core, &space, &bo, &ada_post)
+            .expect("bo turn")
+            .response_action_id
+            .expect("bo's post");
+        drive_as(&core, &space, &ada, &bo_post).expect("ada's second turn");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 4, "ada (2 rounds), bo, ada");
+        let roles = |body: &serde_json::Value| -> Vec<String> {
+            body["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .map(|m| m["role"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+
+        // Bo's turn: Ada's answer, none of Ada's working.
+        assert_eq!(
+            roles(&bodies[2]),
+            vec!["system", "user", "user"],
+            "another participant's trace is invisible: {}",
+            bodies[2]
+        );
+        assert!(
+            bodies[2]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m.get("tool_calls").is_none()),
+            "no replayed calls either: {}",
+            bodies[2]
+        );
+
+        // Ada's next turn: her own round is right back where it happened —
+        // after the post she answered, before the answer it produced.
+        assert_eq!(
+            roles(&bodies[3]),
+            vec!["system", "user", "assistant", "tool", "assistant", "user"],
+        );
+        assert_eq!(bodies[3]["messages"][3]["content"], tool_result_text(1));
     });
 }
 

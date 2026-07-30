@@ -3707,9 +3707,15 @@ impl Inner {
         // map is where it is told about it (see the `ThreadSnapshot` module
         // comment for the cache reasoning behind the tail placement).
         let mut spine: Vec<String> = Vec::new();
+        // The responder's own answers on that spine, in order — where its own
+        // tool rounds hang (see the first-person trace assembly below).
+        let mut own_inferences: Vec<String> = Vec::new();
         for row in &context_rows {
             if spine.last().map(String::as_str) != Some(row.action_id.as_str()) {
                 spine.push(row.action_id.clone());
+                if row.action_type == "inference" && row.participant_id == model_participant_id {
+                    own_inferences.push(row.action_id.clone());
+                }
             }
         }
         // Built from exactly the materials the GUI renders, so threading and
@@ -3722,14 +3728,19 @@ impl Inner {
         // Branch summaries are **read** here and nowhere else in the turn path:
         // whatever the background summarizer has committed is rendered, and a
         // missing or lagging one costs the turn nothing (see [`summaries`]). A
-        // linear space never even asks.
+        // linear space never even asks. The map's per-participant annotation
+        // (task 33) needs the same gate and the same one extra read: which
+        // branches this responder has posted in.
         let thread = Arc::new(if thread.has_forks() {
             let stored = db::current_branch_summaries(&db_conn, &space_id)
                 .await?
                 .into_iter()
                 .map(|s| (s.branch_item_id, s.text))
                 .collect();
-            thread.with_summaries(stored)
+            let authors = db::post_authors(&db_conn, &space_id).await?;
+            thread
+                .with_summaries(stored)
+                .with_viewer(authors, model_participant_id.clone())
         } else {
             thread
         });
@@ -3752,7 +3763,39 @@ impl Inner {
         // only its own prior posts are `assistant`, everyone else's are `user`,
         // and every message carries its uniform `#<handle> · <label>` header
         // line (see `actions_to_upstream_messages`).
-        let mut prior_messages = actions_to_upstream_messages(&context_rows, &model_participant_id);
+        let posts = actions_to_upstream_messages(&context_rows, &model_participant_id);
+
+        // ---- First-person traces (task 33) --------------------------------
+        //
+        // A post is the distillation of its trace; the trace is the private
+        // record of how the conclusion was reached. So the responder reads its
+        // *own* prior tool rounds back — "that didn't work, try again" is
+        // incoherent otherwise — and nobody else's, ever. Each turn's rounds
+        // are keyed to the answer they produced by that inference's context
+        // assembly (`db::assembly_trace_blocks`), and render immediately
+        // before it, exactly where they happened.
+        //
+        // No sliding window: traces stay in context until a future explicit
+        // consolidation event. A rolling verbatim window would churn bytes at
+        // the elision boundary every turn, which is precisely the cache
+        // invariant the trunk must keep — growth here is append-only.
+        let mut own_traces: std::collections::HashMap<String, Vec<serde_json::Value>> =
+            std::collections::HashMap::new();
+        let mut replayed_trace_ids: Vec<String> = Vec::new();
+        let mut seen_traces: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // One cheap read gates the per-inference lookups: a space that has
+        // never run a tool — the overwhelming majority — pays a single
+        // `LIMIT 1` and nothing else.
+        if !own_inferences.is_empty() && db::space_has_trace_actions(&db_conn, &space_id).await? {
+            for inference_id in &own_inferences {
+                let blocks = db::assembly_trace_blocks(&db_conn, inference_id).await?;
+                let (msgs, ids) = trace_messages(&blocks, &mut seen_traces);
+                if !msgs.is_empty() {
+                    own_traces.insert(inference_id.clone(), msgs);
+                    replayed_trace_ids.extend(ids);
+                }
+            }
+        }
 
         // Prepend the responding participant's effective system prompt as a
         // leading `system` message (Participants v1), with the header
@@ -3792,13 +3835,22 @@ impl Inner {
             }
             None => notes.join("\n\n"),
         };
-        prior_messages.insert(
-            0,
-            SpaceMessage {
-                role: "system".to_string(),
-                content: system_content,
-            },
-        );
+        // The OpenAI messages array — built *before* the charge estimate so
+        // both the estimate and the wire request read one array. Rounds 2+ of
+        // a tool loop append to exactly this vector, which is what keeps their
+        // holds computed over the same bytes the request carries. Replayed
+        // trace messages ride in it too, so the shared
+        // `eidola_common::prompt_charge` walk covers their bytes on both sides
+        // by construction (a `tool_calls` entry is charged whole; a `tool`
+        // message's result is charged as content).
+        let mut messages: Vec<serde_json::Value> = Vec::with_capacity(posts.len() + 2);
+        messages.push(serde_json::json!({"role": "system", "content": system_content}));
+        for (action_id, m) in &posts {
+            if let Some(trace) = own_traces.remove(action_id) {
+                messages.extend(trace);
+            }
+            messages.push(serde_json::json!({"role": m.role, "content": m.content}));
+        }
 
         // The trailing map: appended *after* the post being answered, carrying
         // an explicit `Respond to #h.` pointer. Exactly one message is volatile
@@ -3808,20 +3860,11 @@ impl Inner {
         // delimiters and the system note both say plainly that it is not a post.
         if has_map {
             let respond_to = context_rows.last().map(|r| post_handle(&r.item_id));
-            prior_messages.push(SpaceMessage {
-                role: "user".to_string(),
-                content: thread.render_map(&forks, respond_to.as_deref()),
-            });
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": thread.render_map(&forks, respond_to.as_deref()),
+            }));
         }
-
-        // The OpenAI messages array — built *before* the charge estimate so
-        // both the estimate and the wire request read one array. Rounds 2+ of
-        // a tool loop append to exactly this vector, which is what keeps their
-        // holds computed over the same bytes the request carries.
-        let messages: Vec<serde_json::Value> = prior_messages
-            .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
-            .collect();
 
         // Snapshot the tool registry for this turn (see `tools`). An empty
         // registry sends no `tools` field at all, so today's requests stay
@@ -3911,6 +3954,7 @@ impl Inner {
             inf_supersedes,
             inf_reply_to,
             context_rows,
+            replayed_trace_ids,
             trace_action_ids: Vec::new(),
             trace_reply_to: inf_reply_to_for_trace,
             messages,
@@ -7012,6 +7056,12 @@ struct TurnPrep {
     inf_reply_to: Option<String>,
     /// The context rows fed upstream, recorded as the context assembly.
     context_rows: Vec<db::SpaceActionRow>,
+    /// The responder's own **prior** trace actions this turn replayed into its
+    /// messages array (task 33). They were fed upstream, so they belong in
+    /// this inference's context assembly like everything else that was —
+    /// which is also what lets the *next* turn attribute each trace to the
+    /// turn that produced it (first occurrence on the spine wins).
+    replayed_trace_ids: Vec<String>,
     /// The `tool_call` / `tool_result` actions this turn wrote, in order.
     /// They were fed upstream too (as the in-flight `assistant`/`tool`
     /// messages), so `persist_turn` records them in the context assembly
@@ -7426,20 +7476,12 @@ impl TurnPrep {
     /// own content verbatim too, because the follow-up request must present
     /// the exact call objects the model emitted.
     fn append_tool_round_messages(&mut self, calls: &[ParsedToolCall], outcomes: &[ToolOutcome]) {
-        let mut assistant = serde_json::json!({
-            "role": "assistant",
-            "tool_calls": calls.iter().map(|c| c.raw.clone()).collect::<Vec<_>>(),
-        });
-        // Some templates require the key to exist; `null` is the OpenAI shape
-        // for "the assistant said nothing but called tools".
-        assistant["content"] = serde_json::Value::Null;
-        self.messages.push(assistant);
+        self.messages.push(assistant_tool_call_message(
+            calls.iter().map(|c| c.raw.clone()).collect(),
+        ));
         for outcome in outcomes {
-            self.messages.push(serde_json::json!({
-                "role": "tool",
-                "tool_call_id": outcome.call_id,
-                "content": outcome.content,
-            }));
+            self.messages
+                .push(tool_result_message(&outcome.call_id, &outcome.content));
         }
     }
 
@@ -7573,7 +7615,8 @@ impl TurnPrep {
         // A tool loop's own rounds were fed upstream too (as the in-flight
         // assistant/`tool` messages), so they belong in the assembly record —
         // "exactly the actions fed into this inference" stays literally true.
-        for id in &self.trace_action_ids {
+        // So were the responder's replayed prior rounds (task 33).
+        for id in self.replayed_trace_ids.iter().chain(&self.trace_action_ids) {
             if !fed_ids.contains(id) {
                 fed_ids.push(id.clone());
             }
@@ -8318,6 +8361,9 @@ fn strip_leading_header(text: &str) -> &str {
 /// [`actions_to_upstream_messages`].
 fn actions_to_messages(action_rows: &[db::SpaceActionRow]) -> Vec<SpaceMessage> {
     render_messages(action_rows, None)
+        .into_iter()
+        .map(|(_, m)| m)
+        .collect()
 }
 
 /// Render the turn's context rows as the **upstream** messages array, from the
@@ -8339,18 +8385,22 @@ fn actions_to_messages(action_rows: &[db::SpaceActionRow]) -> Vec<SpaceMessage> 
 ///
 /// Headers ride inside the messages array, so `chargeable_prompt_tokens`
 /// covers them on both sides by construction — no pricing change.
+///
+/// Each message is paired with the action id it renders: the turn path needs
+/// the key so a post's own trace rounds can be spliced in at the position they
+/// occurred (see [`trace_messages`]).
 fn actions_to_upstream_messages(
     action_rows: &[db::SpaceActionRow],
     responder_participant_id: &str,
-) -> Vec<SpaceMessage> {
+) -> Vec<(String, SpaceMessage)> {
     render_messages(action_rows, Some(responder_participant_id))
 }
 
 fn render_messages(
     action_rows: &[db::SpaceActionRow],
     responder_participant_id: Option<&str>,
-) -> Vec<SpaceMessage> {
-    let mut messages: Vec<SpaceMessage> = Vec::new();
+) -> Vec<(String, SpaceMessage)> {
+    let mut messages: Vec<(String, SpaceMessage)> = Vec::new();
     let mut current_action_id: Option<&str> = None;
 
     for row in action_rows {
@@ -8379,7 +8429,7 @@ fn render_messages(
         if current_action_id == Some(row.action_id.as_str()) {
             // Additional content block for the same action — append text
             if let Some(text) = &row.text_content
-                && let Some(last) = messages.last_mut()
+                && let Some((_, last)) = messages.last_mut()
             {
                 last.content.push_str(text);
             }
@@ -8392,14 +8442,117 @@ fn render_messages(
             } else {
                 text.to_string()
             };
-            messages.push(SpaceMessage {
-                role: role.to_string(),
-                content,
-            });
+            messages.push((
+                row.action_id.clone(),
+                SpaceMessage {
+                    role: role.to_string(),
+                    content,
+                },
+            ));
         }
     }
 
     messages
+}
+
+/// One tool round's `assistant` message: its calls, and the `content: null`
+/// some templates require ("said nothing, called tools"). The live loop and
+/// the replay both build it here, so their bytes — key order included — cannot
+/// drift.
+fn assistant_tool_call_message(calls: Vec<serde_json::Value>) -> serde_json::Value {
+    let mut assistant = serde_json::json!({"role": "assistant", "tool_calls": calls});
+    assistant["content"] = serde_json::Value::Null;
+    assistant
+}
+
+/// One tool result's `tool` message — raw, with no `#<handle> · <label>`
+/// header: a tool result is neither a post nor authored by a participant.
+fn tool_result_message(call_id: &str, content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": content,
+    })
+}
+
+/// Render one turn's persisted tool rounds back into the wire shape the model
+/// produced them in: an `assistant` message carrying that round's `tool_calls`
+/// with `content: null`, then one `tool` message per result — byte-for-byte
+/// the arrangement [`TurnPrep::append_tool_round_messages`] built live.
+///
+/// **First-person traces (task 33).** A trace is the private record of how a
+/// conclusion was reached, so only the responding participant's own rounds are
+/// ever replayed; the caller supplies exactly its own spine inferences' blocks
+/// (see [`db::assembly_trace_blocks`]).
+///
+/// One fidelity note: the live round replays the model's call objects
+/// *verbatim*, extension fields intact, because it still holds them. Across
+/// turns only the persisted `(id, name, arguments)` survive, so a replayed call
+/// is reconstructed in the canonical OpenAI shape. Provider extension fields on
+/// a call do not outlive their turn — which also means a round whose provider
+/// sent extra keys reads back a few bytes different from the request that
+/// carried it live. That is a **one-time** difference at the boundary of that
+/// turn; every later turn replays the same canonical bytes, so the trunk is
+/// still append-only from the next turn on.
+///
+/// `seen` deduplicates across the spine: a later turn's context assembly
+/// records the traces it replayed as well as the ones it ran, so the first
+/// (chronologically earliest) inference that names a trace — the turn that
+/// produced it — is where the trace renders.
+fn trace_messages(
+    blocks: &[db::TraceBlockRow],
+    seen: &mut std::collections::HashSet<String>,
+) -> (Vec<serde_json::Value>, Vec<String>) {
+    let mut messages = Vec::new();
+    let mut action_ids: Vec<String> = Vec::new();
+    let mut idx = 0;
+    while idx < blocks.len() {
+        let action_id = blocks[idx].action_id.as_str();
+        let end = blocks[idx..]
+            .iter()
+            .position(|b| b.action_id != action_id)
+            .map(|p| idx + p)
+            .unwrap_or(blocks.len());
+        let group = &blocks[idx..end];
+        idx = end;
+
+        if !seen.insert(action_id.to_string()) {
+            continue;
+        }
+        match group[0].action_type.as_str() {
+            "tool_call" => {
+                let calls: Vec<serde_json::Value> = group
+                    .iter()
+                    .filter(|b| b.block_type == "tool_use")
+                    .map(|b| {
+                        serde_json::json!({
+                            "id": b.tool_call_id.clone().unwrap_or_default(),
+                            "type": "function",
+                            "function": {
+                                "name": b.tool_name.clone().unwrap_or_default(),
+                                "arguments": b.data.clone().unwrap_or_default(),
+                            },
+                        })
+                    })
+                    .collect();
+                if calls.is_empty() {
+                    continue;
+                }
+                messages.push(assistant_tool_call_message(calls));
+            }
+            "tool_result" => {
+                for b in group.iter().filter(|b| b.block_type == "tool_result") {
+                    messages.push(tool_result_message(
+                        b.tool_call_id.as_deref().unwrap_or_default(),
+                        b.text_content.as_deref().unwrap_or_default(),
+                    ));
+                }
+            }
+            _ => continue,
+        }
+        action_ids.push(action_id.to_string());
+    }
+    (messages, action_ids)
 }
 
 /// Assemble the flattened threaded-post render list from the raw space-tree
@@ -8636,7 +8789,8 @@ const THREAD_MAP_CLOSE: &str = "</thread-map>";
 
 /// The map block's one-line legend, explaining its entry format.
 const THREAD_MAP_LEGEND: &str = "Branches of this space that the conversation above does not \
-     contain. Each line: handle · author · posts · last activity — opening line.";
+     contain. Each line: handle · author · posts · last activity — opening line; a branch you \
+     have posted in also says so.";
 
 /// Appended to the turn's system message **only when the turn carries a map**.
 ///
@@ -8695,6 +8849,12 @@ struct BranchEntry {
     /// off, unavailable, or has not caught up — the structural entry above is
     /// the always-present fallback, so the map never depends on it.
     summary: Option<String>,
+    /// How many posts in this branch the **responding participant** wrote
+    /// (task 33). `0` renders nothing; anything else adds the
+    /// `you participated, N posts` segment — the retrieval prompt that tells a
+    /// model there is something of its own down there to fetch. Always `0`
+    /// when the snapshot has no viewer attached.
+    viewer_posts: usize,
 }
 
 /// A fork point and the branches at it.
@@ -8737,6 +8897,12 @@ struct ThreadSnapshot {
     /// unless a caller attached one with [`ThreadSnapshot::with_summaries`];
     /// every entry renders as an extra line under its structural one.
     summaries: std::collections::HashMap<String, String>,
+    /// Post action id → author participant id, and the participant whose point
+    /// of view this snapshot is rendered from. Attached by
+    /// [`ThreadSnapshot::with_viewer`]; without it no entry claims
+    /// participation.
+    authors: std::collections::HashMap<String, String>,
+    viewer: Option<String>,
 }
 
 impl ThreadSnapshot {
@@ -8781,6 +8947,8 @@ impl ThreadSnapshot {
             roots,
             now,
             summaries: std::collections::HashMap::new(),
+            authors: std::collections::HashMap::new(),
+            viewer: None,
         }
     }
 
@@ -8789,6 +8957,19 @@ impl ThreadSnapshot {
     /// structural line they had.
     fn with_summaries(mut self, summaries: std::collections::HashMap<String, String>) -> Self {
         self.summaries = summaries;
+        self
+    }
+
+    /// Render this snapshot from one participant's point of view: branch
+    /// entries it posted in say so (task 33). `authors` is post action id →
+    /// author participant id (`db::post_authors`).
+    fn with_viewer(
+        mut self,
+        authors: std::collections::HashMap<String, String>,
+        viewer: String,
+    ) -> Self {
+        self.authors = authors;
+        self.viewer = Some(viewer);
         self
     }
 
@@ -8814,7 +8995,15 @@ impl ThreadSnapshot {
             .map(|&i| self.nodes[i].created_at)
             .max()
             .unwrap_or(self.nodes[idx].created_at);
+        let viewer_posts = match &self.viewer {
+            Some(v) => sub
+                .iter()
+                .filter(|&&i| self.authors.get(&self.nodes[i].action_id) == Some(v))
+                .count(),
+            None => 0,
+        };
         BranchEntry {
+            viewer_posts,
             handle: self.handles[idx].clone(),
             author: self.nodes[idx].participant.label.clone(),
             posts: sub.len(),
@@ -9003,8 +9192,18 @@ impl ThreadSnapshot {
             }
             out.push('\n');
             for b in &f.branches {
+                // `you participated, N posts` — the retrieval prompt (task
+                // 33). Off-the-shelf models do not descend unless told there
+                // is something of their own to descend to, and the map is the
+                // volatile tail, so a per-participant segment costs no shared
+                // cache.
+                let mine = if b.viewer_posts > 0 {
+                    format!(" · you participated, {}", plural_posts(b.viewer_posts))
+                } else {
+                    String::new()
+                };
                 out.push_str(&format!(
-                    "  #{} · {} · {} · {} — {}\n",
+                    "  #{} · {} · {} · {}{mine} — {}\n",
                     b.handle,
                     one_line(&b.author),
                     plural_posts(b.posts),
@@ -9049,7 +9248,7 @@ impl ThreadSnapshot {
         }
         let mut out = format!(
             "{} fork point{} in this space. Each line: handle · author · posts · last activity — \
-             opening line.\n",
+             opening line; a branch you have posted in also says so.\n",
             forks.len(),
             if forks.len() == 1 { "" } else { "s" }
         );
