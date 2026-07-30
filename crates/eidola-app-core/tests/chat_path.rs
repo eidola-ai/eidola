@@ -837,6 +837,7 @@ fn branch_reply_sends_only_its_branch_context() {
                                 HUMAN_LABEL,
                                 "2 posts",
                                 "just now",
+                                Some("1 post"),
                                 "And why two per day?",
                             )],
                         )],
@@ -964,6 +965,8 @@ fn a_branched_space_appends_a_thread_map_as_the_last_message() {
                             // The branch's own ask plus the answer it drew.
                             "2 posts",
                             "just now",
+                            // One of which is this responder's own.
+                            Some("1 post"),
                             "What about spring tides?",
                         )],
                     )],
@@ -981,6 +984,93 @@ fn a_branched_space_appends_a_thread_map_as_the_last_message() {
             bodies[3].get("tools").is_none(),
             "no tools on the eidola path until task 25: {}",
             bodies[3]
+        );
+    });
+}
+
+/// **The map's you-participated annotation (task 33).** A branch the
+/// responding participant has posted in says so, with its own post count; a
+/// branch it has never touched says nothing. The map is the volatile tail, so
+/// this per-participant segment costs no shared prefix — and it is the
+/// retrieval prompt: a model does not descend unless told there is something
+/// of its own down there.
+#[test]
+fn the_map_says_which_branches_the_responder_posted_in() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // Spine: u1 -> i1 -> u2 -> i2.
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        turn(&core, "And why two per day?", Some(space.clone()), None);
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let i1 = tree[1].action_id.clone();
+        let i1_item = tree[1].item_id.clone();
+        let i2 = tree[3].action_id.clone();
+
+        // Branch A off i1: asked, so the responder answered in it.
+        turn(
+            &core,
+            "What about spring tides?",
+            Some(space.clone()),
+            Some(i1.clone()),
+        );
+        let answered_branch = item_id_of(&core, &space, "What about spring tides?");
+
+        // Branch B off i1: saved only (`post_reply` makes no request), so the
+        // responder has never posted there.
+        core.runtime()
+            .block_on(core.post_reply(
+                "And neap tides?".into(),
+                Some(space.clone()),
+                Some(i1.clone()),
+            ))
+            .expect("saved branch");
+        let quiet_branch = item_id_of(&core, &space, "And neap tides?");
+
+        // A turn back on the original spine sees both branches in its map.
+        turn(&core, "Anything else?", Some(space.clone()), Some(i2));
+        let last_item = item_id_of(&core, &space, "Anything else?");
+
+        let msgs = flat_messages(mock.chat_bodies().last().expect("a request"));
+        assert_eq!(
+            msgs.last().expect("a message").clone(),
+            (
+                "user".to_string(),
+                thread_map(
+                    &[(
+                        format!("at #{}", eidola_app_core::post_handle(&i1_item)),
+                        vec![
+                            map_entry(
+                                &answered_branch,
+                                HUMAN_LABEL,
+                                "2 posts",
+                                "just now",
+                                // The answer in that branch is the responder's.
+                                Some("1 post"),
+                                "What about spring tides?",
+                            ),
+                            map_entry(
+                                &quiet_branch,
+                                HUMAN_LABEL,
+                                "1 post",
+                                "just now",
+                                None,
+                                "And neap tides?",
+                            ),
+                        ],
+                    )],
+                    &eidola_app_core::post_handle(&last_item),
+                ),
+            ),
         );
     });
 }
@@ -2608,6 +2698,197 @@ fn a_tool_rounds_hold_covers_the_tool_bytes_it_sends() {
     });
 }
 
+/// The context assembly is the **ordered composition of the prompt**, so a
+/// replayed trace occupies the position it actually occupied on the wire —
+/// between the post it answered and the answer it produced — not a lump at the
+/// end. Only the rounds the *current* turn generated come last, because that is
+/// where they were appended live.
+#[test]
+fn the_context_assembly_records_the_order_the_messages_were_sent_in() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let second = core
+            .runtime()
+            .block_on(core.chat(
+                "and now?".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+            ))
+            .expect("turn 2");
+
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(first.space_id.clone()))
+            .expect("raw actions");
+        let id_of = |n: usize| actions[n].id.clone();
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "user_input",
+                "tool_call",
+                "tool_result",
+                "inference",
+                "user_input",
+                "inference"
+            ]
+        );
+        let (post1, call, result, inference1, post2) =
+            (id_of(0), id_of(1), id_of(2), id_of(3), id_of(4));
+
+        // Turn 1: the post it answered, then the round it ran (appended live).
+        assert_eq!(
+            core.runtime()
+                .block_on(core.test_context_assembly(inference1.clone()))
+                .expect("assembly"),
+            vec![post1.clone(), call.clone(), result.clone()],
+        );
+
+        // Turn 2: the same round, now *replayed*, sits where it was sent —
+        // before the answer it produced, not after the whole conversation.
+        assert_eq!(
+            core.runtime()
+                .block_on(
+                    core.test_context_assembly(
+                        second.response_action_id.clone().expect("an answer")
+                    )
+                )
+                .expect("assembly"),
+            vec![post1, call, result, inference1, post2],
+        );
+
+        // …which is exactly the order of the posts and traces on the wire.
+        let last = mock.chat_bodies().last().expect("turn 2's request").clone();
+        let shape: Vec<String> = last["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .skip(1) // the system message is not an action
+            .map(|m| match (m["role"].as_str(), m.get("tool_calls")) {
+                (Some("assistant"), Some(_)) => "tool_call".to_string(),
+                (Some("tool"), _) => "tool_result".to_string(),
+                (Some(r), _) => r.to_string(),
+                _ => "?".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["user", "tool_call", "tool_result", "assistant", "user"],
+        );
+    });
+}
+
+/// A regeneration replays nothing of the generation it replaces — not the
+/// answer (`get_upstream_context` withholds it), and not the working that
+/// produced it. A trace belongs to the turn whose post you can see, and a
+/// `Revise` turn is precisely the one that cannot see that post.
+#[test]
+fn regenerate_does_not_replay_the_traces_of_the_generation_it_replaces() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("tool turn succeeds");
+        core.runtime()
+            .block_on(core.regenerate(
+                first.response_action_id.clone().expect("an answer"),
+                MODEL.into(),
+            ))
+            .expect("regenerate succeeds");
+
+        let bodies = mock.chat_bodies();
+        let regen = bodies.last().expect("the regenerate request");
+        let msgs = regen["messages"].as_array().expect("messages");
+        assert_eq!(
+            msgs.iter()
+                .map(|m| m["role"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["system", "user"],
+            "only the post being answered: {regen}"
+        );
+        assert!(msgs.iter().all(|m| m.get("tool_calls").is_none()));
+    });
+}
+
+/// The same pricing regression for a **replayed** trace (task 33): a later
+/// turn's hold is computed over its own wire bytes, so the trace rounds it
+/// reads back are charged by exactly the walk the server will run over the
+/// same array — the task-25 tool-entry rule applies to a replayed call
+/// identically to a live one, because it is the same function over the same
+/// bytes.
+#[test]
+fn a_later_turns_hold_covers_the_traces_it_replays() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let second = core
+            .runtime()
+            .block_on(core.chat(
+                "and now?".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+            ))
+            .expect("turn 2");
+
+        let bodies = mock.chat_bodies();
+        let last = bodies.last().expect("turn 2's request");
+        assert!(
+            last["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m.get("tool_calls").is_some()),
+            "turn 2 replays turn 1's round: {last}"
+        );
+
+        assert_eq!(
+            second.credits_charged as u64,
+            contract_prompt_tokens(last) + last["max_completion_tokens"].as_u64().expect("ceiling"),
+            "the hold equals the contract over the bytes actually sent"
+        );
+
+        // The replayed call and its result really are chargeable bytes — a
+        // content-only walk of the same array under-counts.
+        let mut content_only = eidola_common::PromptCharge::new();
+        for message in last["messages"].as_array().unwrap() {
+            content_only.add_message(
+                message
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0),
+            );
+        }
+        assert!(content_only.chargeable_prompt_tokens() < contract_prompt_tokens(last));
+    });
+}
+
 /// The SSE twin: a tool call assembled from four partial deltas (function name
 /// in two pieces, arguments in two) drives exactly the same loop.
 #[test]
@@ -2919,11 +3200,17 @@ fn unknown_tool_name_is_reported_back_to_the_model() {
     });
 }
 
-/// A later turn's context never replays a prior turn's tool traffic: the
-/// upstream renderer keeps only post-bearing action types, so the second ask
-/// sees the two posts and nothing else.
+/// **First-person traces (task 33).** A later turn of the *same* participant
+/// reads its own prior tool rounds back, inline where they happened — between
+/// the post that prompted them and the answer they produced — in the wire shape
+/// the model emitted them in: an `assistant` message with `content: null` and
+/// its `tool_calls`, then one `tool` message per result.
+///
+/// (The other half of the rule — that another participant's traces never
+/// appear — is `another_participants_traces_never_reach_this_turn` in
+/// `tests/participants_orchestration.rs`, which needs two agents.)
 #[test]
-fn a_later_turns_context_does_not_replay_tool_traffic() {
+fn a_later_turn_replays_its_own_tool_rounds_inline() {
     run(|| {
         let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::ToolRoundsBlocking(1),
@@ -2948,25 +3235,125 @@ fn a_later_turns_context_does_not_replay_tool_traffic() {
 
         let bodies = mock.chat_bodies();
         let last = bodies.last().expect("a third request");
-        let roles: Vec<String> = last["messages"]
-            .as_array()
-            .expect("messages")
+        let msgs = last["messages"].as_array().expect("messages");
+        let roles: Vec<&str> = msgs
             .iter()
-            .map(|m| m["role"].as_str().unwrap_or_default().to_string())
+            .map(|m| m["role"].as_str().unwrap_or_default())
             .collect();
-        assert!(
-            !roles.contains(&"tool".to_string()),
-            "a later turn must not replay tool results: {roles:?}"
+        assert_eq!(
+            roles,
+            vec!["system", "user", "assistant", "tool", "assistant", "user"],
+            "the round sits between the post it answered and the answer it produced"
         );
-        assert!(
-            last["messages"]
+
+        // The replayed call: canonical OpenAI shape, carrying the persisted
+        // id, name and raw arguments.
+        assert_eq!(msgs[2]["content"], serde_json::Value::Null);
+        let calls = msgs[2]["tool_calls"].as_array().expect("tool_calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], tool_call_id(1));
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], TOOL_NAME);
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"text":"round-1"}"#);
+
+        // The replayed result: raw, keyed by call id — a tool result is not a
+        // post and wears no header.
+        assert_eq!(msgs[3]["tool_call_id"], tool_call_id(1));
+        assert_eq!(msgs[3]["content"], tool_result_text(1));
+
+        // The answer the round produced follows it, as an ordinary headed post.
+        let answer_item = item_id_of(&core, &first.space_id, TOOL_FINAL_CONTENT);
+        assert_eq!(
+            msgs[4]["content"],
+            headed(&answer_item, DEFAULT_AGENT_LABEL, TOOL_FINAL_CONTENT)
+        );
+
+        // Exactly once — a trace is attributed to the turn that produced it,
+        // not re-emitted by every later turn that replayed it.
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| m.get("tool_calls").is_some())
+                .count(),
+            1
+        );
+    });
+}
+
+/// The trunk of one participant's branch is **append-only**, byte for byte:
+/// every request's `messages` array is a literal prefix of every later one's,
+/// tool rounds included. That is the no-elision invariant — traces stay inline
+/// where they happened until an explicit consolidation event, so nothing above
+/// the tail ever moves and an upstream prefix cache keeps its whole hit.
+#[test]
+fn a_participants_trunk_is_append_only_across_turns() {
+    run(|| {
+        let script = chat_harness::tool_script();
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolScript,
+            tool_script: script.clone(),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        // Three turns, the first two with a tool round each (the script is
+        // consumed by the next request, so it is refilled per turn).
+        *script.lock().unwrap() = vec![(TOOL_NAME.to_string(), r#"{"text":"first"}"#.to_string())];
+        let first = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let space = first.space_id.clone();
+
+        *script.lock().unwrap() = vec![(TOOL_NAME.to_string(), r#"{"text":"second"}"#.to_string())];
+        core.runtime()
+            .block_on(core.chat("again".into(), MODEL.into(), Some(space.clone())))
+            .expect("turn 2");
+
+        core.runtime()
+            .block_on(core.chat("and now?".into(), MODEL.into(), Some(space.clone())))
+            .expect("turn 3");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 5, "two 2-round turns and one plain turn");
+
+        // Compare serialized messages: an explicit byte statement, not a
+        // structural one.
+        let serialized = |body: &serde_json::Value| -> Vec<String> {
+            body["messages"]
                 .as_array()
-                .unwrap()
+                .expect("messages")
                 .iter()
-                .all(|m| m.get("tool_calls").is_none()),
-            "a later turn must not replay tool calls"
+                .map(|m| m.to_string())
+                .collect()
+        };
+        let arrays: Vec<Vec<String>> = bodies.iter().map(serialized).collect();
+        for (i, window) in arrays.windows(2).enumerate() {
+            let (earlier, later) = (&window[0], &window[1]);
+            assert!(
+                later.len() >= earlier.len(),
+                "request {} shrank the context: {} → {}",
+                i + 1,
+                earlier.len(),
+                later.len()
+            );
+            assert_eq!(
+                &later[..earlier.len()],
+                &earlier[..],
+                "request {} moved a byte of the trunk",
+                i + 1
+            );
+        }
+        // And the traces really are in there (the invariant would hold
+        // vacuously otherwise).
+        let last = arrays.last().expect("a last request");
+        assert_eq!(
+            last.iter()
+                .filter(|m| m.contains(r#""tool_calls""#))
+                .count(),
+            2,
+            "both prior rounds are still inline: {last:#?}"
         );
-        assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
     });
 }
 
