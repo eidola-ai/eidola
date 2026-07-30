@@ -12,6 +12,11 @@
 //! * **The cache** — keyed on the branch's tip action id: a second pass over an
 //!   unchanged branch makes no call, and growth regenerates as a **new
 //!   generation** of the same item (the prior summary survives in the Record).
+//!   An edit **anywhere** in the branch — including a non-tip post — moves that
+//!   key, because the key is read off the resolved tip generations.
+//! * **The slice** — an over-cap branch sends its opening *and* its newest
+//!   posts, so a long branch's summary describes where it got to and two
+//!   refreshes of a growing branch never send the same prompt twice.
 //! * **Cost** — a remote (`eidola`) utility model summarizes and spends through
 //!   the same machinery the may-decline router uses.
 //! * **Degradation** — a failed or unusable generation leaves the structural
@@ -197,6 +202,45 @@ fn respond(core: &AppCore, space: &str, target: &str) {
     core.runtime()
         .block_on(core.respond_stream(space.to_string(), MODEL.into(), target.to_string(), tx))
         .expect("respond");
+}
+
+/// A branch grown past the summarizer's slice: the 2-post branch of
+/// [`branched_space`] plus `extra` human follow-ups. Returns the fixture and
+/// the branch's posts as `(author, text)`, oldest first.
+fn over_cap_branch(core: &AppCore, extra: usize) -> (Fixture, Vec<(String, String)>) {
+    let fx = branched_space(core);
+    let mut posts = vec![
+        (
+            HUMAN_LABEL.to_string(),
+            "What about spring tides?".to_string(),
+        ),
+        (
+            chat_harness::DEFAULT_AGENT_LABEL.to_string(),
+            chat_harness::STREAM_CONTENT.to_string(),
+        ),
+    ];
+    let mut tail = fx.branch_tail.clone();
+    for i in 1..=extra {
+        let text = format!("follow-up {i}");
+        tail = core
+            .runtime()
+            .block_on(core.post_reply(text.clone(), Some(fx.space.clone()), Some(tail)))
+            .expect("post")
+            .action_id;
+        posts.push((HUMAN_LABEL.to_string(), text));
+    }
+    (fx, posts)
+}
+
+/// The action id of the post whose text is `text`.
+fn branch_tail_action(core: &AppCore, space: &str, text: &str) -> String {
+    core.runtime()
+        .block_on(core.get_space_tree(space.to_string()))
+        .expect("tree")
+        .into_iter()
+        .find(|n| n.blocks.iter().any(|b| b.text.as_deref() == Some(text)))
+        .unwrap_or_else(|| panic!("no post with text {text:?}"))
+        .action_id
 }
 
 /// The trailing map of the most recent turn request.
@@ -405,6 +449,165 @@ fn an_unchanged_branch_is_not_resummarized_and_growth_supersedes() {
             tree.iter().all(|n| n.action_type != "checkpoint"),
             "a summary is not a post: it collapses out of the render"
         );
+    });
+}
+
+/// A branch longer than the slice sends its **opening and its newest posts**,
+/// with the elided middle stated. Pinned as exact prompt bytes: an oldest-N
+/// slice would describe the branch's opening forever, however far it moved.
+#[test]
+fn an_over_cap_branch_keeps_its_opening_and_its_newest_posts() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            summary: SummaryBehavior::Reply(SUMMARY.into()),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (fx, posts) = over_cap_branch(&core, 13);
+        use_utility_model(&core, &mock, &fx.space, chat_harness::ROUTER_MODEL);
+
+        summarize(&core, &fx.space);
+        let call = summary_calls(&mock).remove(0);
+        let prompt = call["messages"][1]["content"]
+            .as_str()
+            .expect("user message");
+
+        // 15 posts, a 4-post opening and the 8 newest: 3 elided in between.
+        let mut expected = String::from("BRANCH (oldest first):\n");
+        for (author, text) in &posts[..4] {
+            expected.push_str(&format!("{author}: {text}\n"));
+        }
+        expected.push_str("(… 3 posts omitted …)\n");
+        for (author, text) in &posts[posts.len() - 8..] {
+            expected.push_str(&format!("{author}: {text}\n"));
+        }
+        expected.push_str("\nSummarize this branch in one or two sentences.");
+        assert_eq!(prompt, expected);
+    });
+}
+
+/// Two refreshes of a *growing* over-cap branch send different prompts. The
+/// billing-thoughtfulness half of the same bug: a fixed oldest-N slice would
+/// re-send identical bytes on every growth.
+#[test]
+fn successive_refreshes_of_a_growing_over_cap_branch_differ() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            summary: SummaryBehavior::Reply(SUMMARY.into()),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (fx, _) = over_cap_branch(&core, 13);
+        use_utility_model(&core, &mock, &fx.space, chat_harness::ROUTER_MODEL);
+        summarize(&core, &fx.space);
+
+        let tail = branch_tail_action(&core, &fx.space, "follow-up 13");
+        core.runtime()
+            .block_on(core.post_reply("follow-up 14".into(), Some(fx.space.clone()), Some(tail)))
+            .expect("post");
+        summarize(&core, &fx.space);
+
+        let calls = summary_calls(&mock);
+        assert_eq!(calls.len(), 2, "growth regenerates");
+        let first = calls[0]["messages"][1]["content"].as_str().expect("prompt");
+        let second = calls[1]["messages"][1]["content"].as_str().expect("prompt");
+        assert_ne!(first, second, "a grown branch is not the same prompt");
+        assert!(
+            second.contains("follow-up 14") && !first.contains("follow-up 14"),
+            "the newest post is what changed"
+        );
+    });
+}
+
+// ===========================================================================
+// Edits
+// ===========================================================================
+
+/// Editing a post **anywhere** in a branch — here its opening, not its tip —
+/// moves the cache key, so the next pass regenerates against the edited text.
+/// The key is read off the branch's resolved tip generations, and an edit is a
+/// new generation, so a non-tip edit is not invisible to it.
+#[test]
+fn editing_a_non_tip_branch_post_invalidates_the_cache() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            summary: SummaryBehavior::Reply(SUMMARY.into()),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let fx = branched_space(&core);
+        use_utility_model(&core, &mock, &fx.space, chat_harness::ROUTER_MODEL);
+        summarize(&core, &fx.space);
+        assert_eq!(summary_calls(&mock).len(), 1);
+
+        // The branch's opening post — its *root*, not its tip.
+        let opening = branch_tail_action(&core, &fx.space, "What about spring tides?");
+        core.runtime()
+            .block_on(core.edit_post(opening, "What about neap tides?".into()))
+            .expect("edit");
+
+        summarize(&core, &fx.space);
+        let calls = summary_calls(&mock);
+        assert_eq!(calls.len(), 2, "the edit moved the branch's cache key");
+        let prompt = calls[1]["messages"][1]["content"].as_str().expect("prompt");
+        assert!(prompt.contains("What about neap tides?"), "{prompt}");
+        assert!(!prompt.contains("What about spring tides?"), "{prompt}");
+    });
+}
+
+/// An edit **schedules** a pass, like a post or a turn does. Without the hook
+/// an edited branch keeps its stale summary until some unrelated later write
+/// happens to trigger a refresh.
+#[test]
+fn every_write_that_moves_a_branch_schedules_a_pass() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            summary: SummaryBehavior::Reply(SUMMARY.into()),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let fx = branched_space(&core);
+        use_utility_model(&core, &mock, &fx.space, chat_harness::ROUTER_MODEL);
+
+        let opening = branch_tail_action(&core, &fx.space, "What about spring tides?");
+        for (what, write) in [
+            (
+                "post",
+                Box::new(|| {
+                    core.runtime()
+                        .block_on(core.post_reply(
+                            "another".into(),
+                            Some(fx.space.clone()),
+                            Some(fx.branch_tail.clone()),
+                        ))
+                        .expect("post");
+                }) as Box<dyn Fn()>,
+            ),
+            (
+                "turn",
+                Box::new(|| respond(&core, &fx.space, &fx.spine_post)),
+            ),
+            (
+                "edit",
+                Box::new(|| {
+                    core.runtime()
+                        .block_on(core.edit_post(opening.clone(), "edited".into()))
+                        .expect("edit");
+                }),
+            ),
+        ] {
+            core.test_take_summary_triggers();
+            write();
+            assert_eq!(
+                core.test_take_summary_triggers(),
+                vec![fx.space.clone()],
+                "a {what} must schedule a summary pass"
+            );
+        }
     });
 }
 
