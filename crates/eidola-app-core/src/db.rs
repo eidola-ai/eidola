@@ -26,6 +26,15 @@ const LATEST_VERSION: i64 = 3;
 /// actions across all spaces reference one row.
 pub const HUMAN_PARTICIPANT_ID: &str = "00000000-0000-7000-8000-000000000001";
 
+/// Well-known id of the harness itself as a participant — a **global**,
+/// `kind = 'system'` row that authors the actions Eidola writes on its own
+/// behalf rather than on anyone's: today the branch summaries of
+/// [`crate::summaries`]. It is deliberately never *referenced* into a space,
+/// so it is not a member anywhere: it never appears in a participant list,
+/// never gets planned a turn, never authors a post. Attributing these to the
+/// human "You" or to an agent participant would be a lie in the Record.
+pub const SYSTEM_PARTICIPANT_ID: &str = "00000000-0000-7000-8000-000000000002";
+
 /// Well-known id of the seeded "Default" template's single agent participant
 /// (seed-only; user-created template participants get fresh UUIDv7s).
 const DEFAULT_TEMPLATE_AGENT_ID: &str = "00000000-0000-7000-8000-000000000011";
@@ -279,6 +288,20 @@ async fn ensure_default_participants(conn: &Connection) -> Result<(), AppError> 
          VALUES (?1, 'global', 'human', 'You', 'explicit', 'owner', ?2)",
         (
             Value::Text(HUMAN_PARTICIPANT_ID.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+
+    // Eidola itself, for the actions it writes on its own behalf (branch
+    // summaries). Global, but referenced into no space — see the const.
+    conn.execute(
+        "INSERT OR IGNORE INTO participant \
+         (id, scope, kind, label, notify_policy, role, created_at) \
+         VALUES (?1, 'global', 'system', 'Eidola', 'explicit', 'observer', ?2)",
+        (
+            Value::Text(SYSTEM_PARTICIPANT_ID.to_string()),
             Value::Integer(now),
         ),
     )
@@ -2542,17 +2565,18 @@ pub async fn references_to(
     antecedent_action_id: &str,
 ) -> Result<Vec<IncomingReferenceRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT aa.action_id, ar.space_id, aa.ordinal, aa.content_block_id, \
                     aa.range_start, aa.range_end, aa.annotation, ar.created_at \
              FROM action_antecedent aa \
              JOIN action_resolved ar ON ar.action_id = aa.action_id \
              WHERE aa.antecedent_action_id = ?1 \
                AND aa.relation = 'reference' \
+               AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
                AND ar.is_current = 1 \
                AND ar.status IN ('complete', 'cancelled') \
-             ORDER BY ar.created_at ASC, aa.action_id ASC, aa.ordinal ASC",
-        )
+             ORDER BY ar.created_at ASC, aa.action_id ASC, aa.ordinal ASC"
+        ))
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -2570,6 +2594,78 @@ pub async fn references_to(
             range_end: row.get::<Option<i64>>(5).map_err(AppError::db)?,
             annotation: row.get::<Option<String>>(6).map_err(AppError::db)?,
             created_at: row.get::<i64>(7).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// `action.intent` marking a `checkpoint` action as a branch summary (see
+/// [`crate::summaries`]).
+pub const BRANCH_SUMMARY_INTENT: &str = "branch_summary";
+
+/// Ordinal of a branch summary's `reference` edge to the **branch root** —
+/// which branch this summarizes. Any generation of the root resolves to the
+/// same item, which is the identity the cache keys on.
+pub const BRANCH_SUMMARY_ROOT_ORDINAL: i64 = 1;
+
+/// Ordinal of a branch summary's `reference` edge to the **tip it read** — the
+/// concrete generation the summary was current as of, i.e. the cache key.
+/// (Ordinal 0 stays reserved for the structural `reply` edge, which a summary
+/// does not have: it is not part of the thread.)
+pub const BRANCH_SUMMARY_TIP_ORDINAL: i64 = 2;
+
+/// One current-generation branch summary in a space.
+#[derive(Clone, Debug)]
+pub struct BranchSummaryRow {
+    /// Item id of the branch's root post — the branch's stable identity.
+    pub branch_item_id: String,
+    /// The summary action (the item's current generation).
+    pub action_id: String,
+    /// The summary's item — superseded, not replaced, when it regenerates.
+    pub item_id: String,
+    /// The branch tip this summary read. Compare against the branch's current
+    /// tip to decide whether it is stale.
+    pub summarized_action_id: String,
+    pub text: String,
+}
+
+/// Every branch summary in a space, at its current generation.
+pub async fn current_branch_summaries(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Vec<BranchSummaryRow>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT root.item_id, s.id, s.item_id, tip_e.antecedent_action_id, cb.text_content \
+             FROM action s \
+             JOIN action_antecedent root_e \
+               ON root_e.action_id = s.id AND root_e.ordinal = {BRANCH_SUMMARY_ROOT_ORDINAL} \
+             JOIN action root ON root.id = root_e.antecedent_action_id \
+             JOIN action_antecedent tip_e \
+               ON tip_e.action_id = s.id AND tip_e.ordinal = {BRANCH_SUMMARY_TIP_ORDINAL} \
+             LEFT JOIN content_block cb ON cb.action_id = s.id AND cb.ordinal = 0 \
+             WHERE s.space_id = ?1 AND s.action_type = 'checkpoint' AND s.intent = ?2 \
+               AND NOT EXISTS (SELECT 1 FROM action x WHERE x.supersedes_action_id = s.id)"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(space_id.to_string()),
+            Value::Text(BRANCH_SUMMARY_INTENT.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        let text: Option<String> = row.get(4).map_err(AppError::db)?;
+        let Some(text) = text else { continue };
+        out.push(BranchSummaryRow {
+            branch_item_id: row.get::<String>(0).map_err(AppError::db)?,
+            action_id: row.get::<String>(1).map_err(AppError::db)?,
+            item_id: row.get::<String>(2).map_err(AppError::db)?,
+            summarized_action_id: row.get::<String>(3).map_err(AppError::db)?,
+            text,
         });
     }
     Ok(out)
@@ -2876,6 +2972,7 @@ pub async fn list_spaces(
                 COUNT(a.id) AS message_count \
          FROM space s \
          LEFT JOIN action a ON a.space_id = s.id \
+              AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
               AND a.status IN ('complete', 'cancelled') \
               AND NOT EXISTS ( \
                   SELECT 1 FROM action sup WHERE sup.supersedes_action_id = a.id \
