@@ -6,10 +6,12 @@ pub mod decline;
 pub mod error;
 pub mod local_models;
 pub mod router;
+pub mod summaries;
 pub mod tools;
 pub mod trust_root;
 pub mod updater;
 pub mod updates;
+pub mod utility;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
