@@ -95,7 +95,28 @@ pub enum ChatBehavior {
     /// Accept the request, then drop the connection before sending any
     /// response bytes (network error after send).
     DropBeforeResponse,
+    /// Blocking: the first `n` chat requests answer with a tool call for
+    /// [`TOOL_NAME`]; request `n + 1` answers normally. `n = 0` is an ordinary
+    /// completion; a large `n` drives the loop into its round cap.
+    ToolRoundsBlocking(u64),
+    /// SSE twin of [`ChatBehavior::ToolRoundsBlocking`]. The tool call is split
+    /// across four deltas (name in two pieces, arguments in two), so the
+    /// client's incremental assembly is exercised rather than a single
+    /// pre-assembled chunk.
+    ToolRoundsStreaming(u64),
+    /// Blocking: a tool call with **no `id`** — structurally unusable, so the
+    /// turn must fail honestly rather than panic or silently drop it.
+    ToolCallMalformed,
+    /// Blocking: the first request answers with a tool call whose
+    /// `function.arguments` is not valid JSON; the second answers normally.
+    /// The bad arguments are a *model* mistake, so the loop reports them back
+    /// as a tool error and carries on.
+    ToolCallBadArguments,
 }
+
+/// The tool name the tool-calling behaviours call — matches
+/// `eidola_app_core::tools::EchoTool`.
+pub const TOOL_NAME: &str = "echo";
 
 /// Whether the refund endpoints (inline + recovery) actually mint a successor
 /// credential, or fail. Lets refund-recovery-succeeds vs -fails be selected.
@@ -515,13 +536,15 @@ async fn handle_conn(
             handle_refund(&mut stream, &issuer, &config, req.auth.as_deref()).await?;
         }
         ("POST", "/v1/chat/completions") => {
-            chat_hits.fetch_add(1, Ordering::SeqCst);
+            // 1-based index of this chat request — the tool-calling
+            // behaviours script their answer per round.
+            let hit = chat_hits.fetch_add(1, Ordering::SeqCst) + 1;
             if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) {
                 chat_bodies.lock().unwrap().push(body);
             }
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
-            handle_chat(&mut stream, &issuer, &config, req.auth.as_deref()).await?;
+            handle_chat(&mut stream, &issuer, &config, req.auth.as_deref(), hit).await?;
         }
         _ => {
             write_json(&mut stream, 404, &error_body("not found")).await?;
@@ -558,6 +581,7 @@ async fn handle_chat(
     issuer: &Issuer,
     config: &MockConfig,
     auth: Option<&str>,
+    hit: u64,
 ) -> std::io::Result<()> {
     // Compute an inline refund object once (shared by the blocking happy path).
     let inline_refund = if config.refund == RefundMode::Succeed {
@@ -612,7 +636,147 @@ async fn handle_chat(
             .await
         }
         ChatBehavior::StreamingMidAbort => write_sse_stream(stream, false, STREAM_CONTENT).await,
+        ChatBehavior::ToolRoundsBlocking(rounds) => {
+            if hit <= rounds {
+                let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
+                if let Some(refund) = inline_refund {
+                    body["refund"] = refund;
+                }
+                write_json(stream, 200, &body.to_string()).await
+            } else {
+                let mut body = serde_json::json!({
+                    "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": TOOL_FINAL_CONTENT,
+                    } }],
+                    "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                });
+                if let Some(refund) = inline_refund {
+                    body["refund"] = refund;
+                }
+                write_json(stream, 200, &body.to_string()).await
+            }
+        }
+        ChatBehavior::ToolCallMalformed => {
+            // No `id` on the call — nothing to execute, nothing to persist.
+            let call = serde_json::json!({
+                "type": "function",
+                "function": { "name": TOOL_NAME, "arguments": "{}" },
+            });
+            let mut body = tool_call_body(&call);
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::ToolCallBadArguments => {
+            let mut body = if hit == 1 {
+                tool_call_body(&tool_call_object(1, "{not json"))
+            } else {
+                serde_json::json!({
+                    "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": TOOL_FINAL_CONTENT,
+                    } }],
+                    "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                })
+            };
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::ToolRoundsStreaming(rounds) => {
+            if hit <= rounds {
+                write_sse_tool_stream(stream, hit).await
+            } else {
+                write_sse_stream(stream, true, TOOL_FINAL_CONTENT).await
+            }
+        }
     }
+}
+
+/// The answer text the tool-calling behaviours give once they stop calling.
+pub const TOOL_FINAL_CONTENT: &str = "Done, the tool said so.";
+
+/// The `text` argument round `n`'s tool call carries.
+pub fn tool_arguments(round: u64) -> String {
+    serde_json::json!({ "text": format!("round-{round}") }).to_string()
+}
+
+/// The call id round `n`'s tool call carries.
+pub fn tool_call_id(round: u64) -> String {
+    format!("call_{round}")
+}
+
+/// The echoed result the harness's tool produces for round `n`.
+pub fn tool_result_text(round: u64) -> String {
+    format!("round-{round}")
+}
+
+fn tool_call_object(round: u64, arguments: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": tool_call_id(round),
+        "type": "function",
+        "function": { "name": TOOL_NAME, "arguments": arguments },
+    })
+}
+
+fn tool_call_body(call: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{ "message": {
+            "role": "assistant",
+            "content": serde_json::Value::Null,
+            "tool_calls": [call],
+        } }],
+        "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+    })
+}
+
+/// SSE stream whose single tool call arrives in **four** deltas: the id plus
+/// the first half of the function name, the second half of the name, then the
+/// arguments string in two pieces. Nothing is a complete JSON value on its own,
+/// which is exactly what the client's per-index accumulator has to survive.
+async fn write_sse_tool_stream(stream: &mut TcpStream, round: u64) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let args = tool_arguments(round);
+    let (args_a, args_b) = args.split_at(args.len() / 2);
+    let (name_a, name_b) = TOOL_NAME.split_at(2);
+
+    let deltas = vec![
+        serde_json::json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":tool_call_id(round),"type":"function",
+             "function":{"name":name_a}}]}}]}),
+        serde_json::json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"function":{"name":name_b}}]}}]}),
+        serde_json::json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":args_a}}]}}]}),
+        serde_json::json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":args_b}}]}}]}),
+        serde_json::json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}}),
+    ];
+    for d in deltas {
+        stream.write_all(&sse_event(&d.to_string())).await?;
+    }
+    stream.write_all(&sse_event("[DONE]")).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// One chunked SSE `data:` event.
+fn sse_event(payload: &str) -> Vec<u8> {
+    let event = format!("data: {payload}\n\n");
+    let mut out = format!("{:x}\r\n", event.len()).into_bytes();
+    out.extend_from_slice(event.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 /// The streaming mock's answer text.
