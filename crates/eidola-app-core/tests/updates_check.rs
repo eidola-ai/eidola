@@ -621,7 +621,8 @@ fn app_core_resolves_feed_override_and_persists_result() {
     let core = eidola_app_core::AppCore::new(
         config_dir.path().to_path_buf(),
         data_dir.path().to_path_buf(),
-    );
+    )
+    .expect("open core");
     assert!(core.last_update_check().is_none(), "fresh data dir");
 
     let snapshot = core.runtime().block_on(async {
@@ -655,7 +656,8 @@ fn app_core_resolves_feed_override_and_persists_result() {
     let core2 = eidola_app_core::AppCore::new(
         config_dir.path().to_path_buf(),
         data_dir.path().to_path_buf(),
-    );
+    )
+    .expect("reopen core after the first released its database lock");
     assert_eq!(core2.last_update_check(), Some(snapshot));
 }
 

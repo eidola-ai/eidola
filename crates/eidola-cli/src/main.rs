@@ -320,7 +320,7 @@ enum SpacesCommand {
     },
 }
 
-fn build_core() -> AppCore {
+fn build_core() -> Result<AppCore, AppError> {
     let config_dir = config::default_config_path()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .expect("could not determine config directory");
@@ -328,11 +328,58 @@ fn build_core() -> AppCore {
     AppCore::new(config_dir, data_dir)
 }
 
+/// Print an error plus, for the typed variants a user can act on, a hint.
+///
+/// Looks through the `ChatFailed` wrapper that `chat`/`chat_stream` attach
+/// once a space is persisted, so a wrapped `NoAccount` / `InsufficientBalance`
+/// still routes to its hint.
+fn report(e: &AppError) {
+    eprintln!("error: {e}");
+    // The typed onboarding errors get actionable hints. (Chat
+    // auto-provisions credentials from the account balance, so these
+    // only fire when the account itself is missing or unfunded.)
+    match e.root() {
+        AppError::NoAccount => {
+            eprintln!("hint: run `eidola account create` to create an anonymous account");
+        }
+        AppError::InsufficientBalance { .. } => {
+            eprintln!(
+                "hint: run `eidola account prices`, then \
+                 `eidola account checkout <price_id>` to add credit"
+            );
+        }
+        AppError::TermsAcceptanceRequired { .. } => {
+            eprintln!(
+                "hint: the terms of service or privacy policy changed — run \
+                 `eidola account accept-terms` to review and accept"
+            );
+        }
+        AppError::DatabaseInUse { .. } => {
+            eprintln!(
+                "hint: the local database is single-writer, so only one Eidola \
+                 can hold it — quit the Eidola app (or the other `eidola` \
+                 command) and run this again"
+            );
+        }
+        _ => {}
+    }
+}
+
 fn main() {
+    // Parse first: `--help`, `--version`, and argument errors must work even
+    // when the local database is held by another Eidola (building the core
+    // takes its exclusive lock and can fail with `DatabaseInUse`).
+    let cli = Cli::parse();
+
     // Build the core (and its tokio runtime) outside any async context so it
     // can be dropped cleanly when main returns.
-    let core = build_core();
-    let cli = Cli::parse();
+    let core = match build_core() {
+        Ok(core) => core,
+        Err(e) => {
+            report(&e);
+            std::process::exit(1);
+        }
+    };
 
     // Use the core's own runtime to drive the CLI commands.
     let result = core.runtime().block_on(run(&core, cli));
@@ -341,31 +388,7 @@ fn main() {
     drop(core);
 
     if let Err(e) = result {
-        eprintln!("error: {e}");
-        // The typed onboarding errors get actionable hints. (Chat
-        // auto-provisions credentials from the account balance, so these
-        // only fire when the account itself is missing or unfunded.) Look
-        // through the `ChatFailed` wrapper that `chat`/`chat_stream` attach
-        // once a space is persisted, so a wrapped `NoAccount` /
-        // `InsufficientBalance` still routes to its hint.
-        match e.root() {
-            AppError::NoAccount => {
-                eprintln!("hint: run `eidola account create` to create an anonymous account");
-            }
-            AppError::InsufficientBalance { .. } => {
-                eprintln!(
-                    "hint: run `eidola account prices`, then \
-                     `eidola account checkout <price_id>` to add credit"
-                );
-            }
-            AppError::TermsAcceptanceRequired { .. } => {
-                eprintln!(
-                    "hint: the terms of service or privacy policy changed — run \
-                     `eidola account accept-terms` to review and accept"
-                );
-            }
-            _ => {}
-        }
+        report(&e);
         std::process::exit(1);
     }
 }

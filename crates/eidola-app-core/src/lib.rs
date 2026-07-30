@@ -927,6 +927,13 @@ struct Inner {
     /// production — only [`AppCore::with_test_http_client`] ever sets it — so
     /// the production attestation path is unchanged.
     http_override: Option<reqwest::Client>,
+    /// The process-lifetime exclusive advisory lock on the local database
+    /// (`<data_dir>/eidola.db.lock`). Taken in [`AppCore::build`] — a second
+    /// opener is refused *there* with [`AppError::DatabaseInUse`] rather than
+    /// silently contending for turso's single-writer file. Held purely by
+    /// existing; released when this `Inner` drops (the descriptor closes), so
+    /// a crash cannot wedge it either. See [`db::DbLock`].
+    _db_lock: db::DbLock,
 }
 
 // --- Config helpers (sync) ---------------------------------------------------
@@ -4590,7 +4597,14 @@ impl AppCore {
     ///
     /// `config_dir` — directory containing `config.toml`.
     /// `data_dir` — directory for the local database.
-    pub fn new(config_dir: PathBuf, data_dir: PathBuf) -> Self {
+    ///
+    /// Takes the process-lifetime exclusive advisory lock on the local
+    /// database (see [`db::DbLock`]) and fails with
+    /// [`AppError::DatabaseInUse`] when another Eidola process already holds
+    /// it — turso is single-writer, so two openers would otherwise contend
+    /// silently. The lock is released when the returned `AppCore` (and any
+    /// task holding its inner `Arc`) drops.
+    pub fn new(config_dir: PathBuf, data_dir: PathBuf) -> Result<Self, AppError> {
         Self::build(config_dir, data_dir, None)
     }
 
@@ -4610,7 +4624,7 @@ impl AppCore {
         config_dir: PathBuf,
         data_dir: PathBuf,
         client: reqwest::Client,
-    ) -> Self {
+    ) -> Result<Self, AppError> {
         Self::build(config_dir, data_dir, Some(client))
     }
 
@@ -4618,15 +4632,21 @@ impl AppCore {
         config_dir: PathBuf,
         data_dir: PathBuf,
         http_override: Option<reqwest::Client>,
-    ) -> Self {
+    ) -> Result<Self, AppError> {
+        // Loud DB contention: claim the single-writer database before
+        // building anything else, so a second opener is refused with a typed
+        // error instead of silently racing the first.
+        let db_lock = db::DbLock::acquire(&data_dir)?;
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_stack_size(8 * 1024 * 1024) // 8 MB — matches default main-thread size
             .build()
-            .expect("failed to create tokio runtime");
+            .map_err(|e| AppError::Internal {
+                message: format!("failed to create tokio runtime: {e}"),
+            })?;
         let bus = BroadcastSource::new();
-        Self {
+        Ok(Self {
             runtime,
             bus: bus.clone(),
             inner: Arc::new(Inner {
@@ -4639,8 +4659,9 @@ impl AppCore {
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
                 http_override,
+                _db_lock: db_lock,
             }),
-        }
+        })
     }
 
     /// Subscribe to the invalidation bus.
@@ -7148,7 +7169,7 @@ mod tests {
         let config_dir = dir.path().to_path_buf();
         let data_dir = dir.path().join("data");
 
-        let core = AppCore::new(config_dir.clone(), data_dir.clone());
+        let core = AppCore::new(config_dir.clone(), data_dir.clone()).unwrap();
         // Fresh install: default_template is the seeded id, and the async
         // default_model resolves from the seeded template's agent (= DEFAULT_MODEL).
         assert_eq!(
@@ -7168,7 +7189,7 @@ mod tests {
     #[test]
     fn config_state_and_default_model_are_safe_inside_the_runtime() {
         let dir = tempfile::tempdir().unwrap();
-        let core = AppCore::new(dir.path().to_path_buf(), dir.path().join("data"));
+        let core = AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).unwrap();
         // Exactly the CLI's shape: sync config_state() + awaited default_model()
         // driven from within the core runtime.
         let (tmpl, model) = core.runtime().block_on(async {
@@ -7186,7 +7207,7 @@ mod tests {
         let config_dir = dir.path().to_path_buf();
         let data_dir = dir.path().join("data");
 
-        let core = AppCore::new(config_dir.clone(), data_dir.clone());
+        let core = AppCore::new(config_dir.clone(), data_dir.clone()).unwrap();
         core.set_default_template("00000000-0000-7000-8000-0000000000ab".into())
             .unwrap();
         assert_eq!(
@@ -7195,7 +7216,10 @@ mod tests {
         );
 
         // A fresh core over the same config dir sees the persisted value.
-        let core2 = AppCore::new(config_dir, data_dir);
+        // Drop the first one first: this simulates a *restart*, and the
+        // database lockfile refuses a concurrent second opener by design.
+        drop(core);
+        let core2 = AppCore::new(config_dir, data_dir).unwrap();
         assert_eq!(
             core2.config_state().default_template,
             "00000000-0000-7000-8000-0000000000ab"
@@ -7215,7 +7239,7 @@ mod tests {
         let config_dir = dir.path().to_path_buf();
         let data_dir = dir.path().join("data");
 
-        let core = AppCore::new(config_dir.clone(), data_dir.clone());
+        let core = AppCore::new(config_dir.clone(), data_dir.clone()).unwrap();
         let state = core.config_state();
         // `auto` (follow the sun) is the shipped default since the
         // local-inference wave flipped it from `system`.
@@ -7244,7 +7268,10 @@ mod tests {
         core.set_font_scale(1.0).unwrap();
 
         // A fresh core over the same config dir sees the persisted values.
-        let core2 = AppCore::new(config_dir, data_dir);
+        // Drop the first one first — a restart, not a second live opener
+        // (which the database lockfile refuses by design).
+        drop(core);
+        let core2 = AppCore::new(config_dir, data_dir).unwrap();
         let state = core2.config_state();
         assert_eq!(state.appearance, config::AppearanceSetting::Day);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);

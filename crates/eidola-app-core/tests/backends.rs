@@ -35,7 +35,7 @@ fn bare_core() -> (AppCore, tempfile::TempDir) {
     let data_dir = dir.path().join("data");
     let client = reqwest::Client::builder().build().expect("client");
     (
-        AppCore::with_test_http_client(config_dir, data_dir, client),
+        AppCore::with_test_http_client(config_dir, data_dir, client).expect("open core"),
         dir,
     )
 }

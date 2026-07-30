@@ -1,10 +1,14 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use turso::{Builder, Connection, Database, Value};
 
 use crate::error::AppError;
 
 const SCHEMA: &str = include_str!("../schema/schema.sql");
+
+/// Name of the sidecar advisory lockfile held next to `eidola.db` for the
+/// lifetime of an `AppCore`. See [`DbLock`].
+pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 
 /// Current schema version. `schema.sql` is the whole baseline — there are no
 /// incremental migrations (the pre-release history was collapsed for the
@@ -55,6 +59,122 @@ pub fn default_agent_label(model_ref: &str) -> String {
     } else {
         words.join(" ")
     }
+}
+
+/// An exclusive advisory lock on `<data_dir>/eidola.db.lock`, held for the
+/// lifetime of the owning `AppCore`.
+///
+/// **Why.** Turso is single-writer. Two processes opening the same
+/// `eidola.db` (an open GUI app plus a `eidola …` CLI invocation is the
+/// everyday case) contend for the file with no honest signal — writes fail or
+/// misbehave silently. The lock makes that state loud: the second opener is
+/// refused at construction with [`AppError::DatabaseInUse`] naming the holder.
+///
+/// **Why `flock` and not a pidfile-existence check.** An advisory lock is held
+/// by the *open file description*, so the kernel drops it when the process
+/// exits — however it exits. A crash therefore cannot wedge a stale lock and
+/// lock out every future run; the file's mere existence means nothing. Do not
+/// replace this with "does the file exist / is that pid alive" logic — that
+/// property is the whole reason for the mechanism.
+///
+/// The lockfile's *contents* are only the holder's pid, written after the lock
+/// is taken, purely so the refusal message can name a process. It is advisory
+/// (never authoritative): a contender that reads a truncated/absent pid still
+/// refuses, it just says less.
+///
+/// Note `flock` conflicts across separate `open()`s in the *same* process too
+/// (each `open` is its own file description), so a second `AppCore` on one data
+/// dir inside one process is refused exactly like a second process — which is
+/// what the tests rely on.
+pub struct DbLock {
+    /// Holding the `File` open holds the lock; dropping it closes the
+    /// descriptor and releases. The lockfile itself is left on disk (an
+    /// unlocked file is meaningless, and unlinking it would race a contender
+    /// that already opened it).
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl DbLock {
+    /// Take the exclusive lock for `data_dir`, creating the directory and the
+    /// lockfile if needed. Fails with [`AppError::DatabaseInUse`] if another
+    /// process (or another `AppCore` in this one) already holds it.
+    pub fn acquire(data_dir: &Path) -> Result<Self, AppError> {
+        use fs4::{FileExt, TryLockError};
+
+        std::fs::create_dir_all(data_dir).map_err(|e| AppError::Database {
+            message: format!("failed to create data directory: {e}"),
+        })?;
+        let path = data_dir.join(LOCK_FILE_NAME);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| AppError::Database {
+                message: format!("failed to open database lockfile {}: {e}", path.display()),
+            })?;
+
+        match FileExt::try_lock(&file) {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                let pid = read_lock_pid(&path);
+                let who = match pid {
+                    Some(pid) => format!("another Eidola process (pid {pid})"),
+                    None => "another Eidola process".to_string(),
+                };
+                return Err(AppError::DatabaseInUse {
+                    pid,
+                    message: format!(
+                        "{who} has this database open ({}). \
+                         Quit it and try again.",
+                        data_dir.join("eidola.db").display()
+                    ),
+                });
+            }
+            Err(TryLockError::Error(e)) => {
+                return Err(AppError::Database {
+                    message: format!("failed to lock database ({}): {e}", path.display()),
+                });
+            }
+        }
+
+        // We hold the lock — record who, for the next contender's message.
+        // Best-effort: a lockfile we can't write is still a lock we hold, and
+        // the contender's refusal is correct with or without a pid.
+        let _ = write_lock_pid(&file);
+
+        Ok(Self { _file: file, path })
+    }
+
+    /// Path of the lockfile this guard holds (diagnostics/tests).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::fmt::Debug for DbLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbLock").field("path", &self.path).finish()
+    }
+}
+
+/// Stamp our pid into the (already locked) lockfile.
+fn write_lock_pid(file: &std::fs::File) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = file;
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    write!(file, "{}", std::process::id())?;
+    file.flush()
+}
+
+/// Read the holder's pid from a lockfile. `None` for an empty/garbage file —
+/// the holder may have been mid-write, which is honest to report as "unknown"
+/// rather than guessed at.
+fn read_lock_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Opens (or creates) the local database at `data_dir/eidola.db` and runs any

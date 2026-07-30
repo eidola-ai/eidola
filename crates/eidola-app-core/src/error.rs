@@ -60,6 +60,24 @@ pub enum AppError {
     #[error("database error: {message}")]
     Database { message: String },
 
+    /// The local database is already open by another Eidola process.
+    ///
+    /// Turso is single-writer and gives no honest signal when a second
+    /// process opens the same file — writes just start failing or
+    /// misbehaving. So `AppCore` takes an exclusive advisory lock on a
+    /// sidecar lockfile at open (see `db::DbLock`) and construction fails
+    /// with this variant when another process holds it. `pid` is the holder
+    /// recorded in the lockfile (`None` when it could not be read — the
+    /// holder may have been mid-write, or the file may be unreadable);
+    /// `message` already names it, so UIs can render the variant directly
+    /// and use `pid` only when they want to say more.
+    ///
+    /// Distinct from [`AppError::Database`] so the CLI can print an
+    /// actionable hint ("quit the other Eidola") and the GUI can route to a
+    /// startup dialog instead of a generic database error.
+    #[error("{message}")]
+    DatabaseInUse { pid: Option<u32>, message: String },
+
     /// Configuration read/write error.
     #[error("config error: {message}")]
     Config { message: String },
