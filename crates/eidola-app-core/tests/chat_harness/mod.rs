@@ -138,6 +138,25 @@ pub enum ChatBehavior {
     /// SSE twin of [`ChatBehavior::DeclineBlocking`] — the streaming path a
     /// driven `respond_stream_as` turn takes.
     DeclineStreaming,
+    /// Blocking: reject any request whose body carries a `tools` field with
+    /// llama.cpp's own 500 (`"tools param requires --jinja flag"`), and answer
+    /// normally otherwise.
+    ///
+    /// This is a real, verified upstream shape, not an invented one: llama.cpp
+    /// returns exactly that 500 without `--jinja`, and *with* `--jinja` returns
+    /// a 500 template-render crash when the model's tool block uses Jinja
+    /// filters it lacks. Either way the endpoint speaks chat completions
+    /// perfectly well and rejects only the `tools` field — which is the case
+    /// backend kind cannot predict.
+    RejectTools,
+    /// Blocking: the next chat request answers with **one round requesting
+    /// every call currently in [`MockConfig::tool_script`]**, consuming the
+    /// script; later requests answer normally.
+    ///
+    /// Exists for the task-21 navigation tools, whose arguments are post
+    /// handles that only exist once the fixture space has been built — so the
+    /// script is set at runtime rather than at mock construction.
+    ToolScript,
 }
 
 /// The reason the decline behaviours state; asserted on the persisted
@@ -189,6 +208,16 @@ pub enum RouterBehavior {
     DropBody,
 }
 
+/// The `(tool_name, arguments_json)` calls [`ChatBehavior::ToolScript`] asks
+/// for. Shared + interior-mutable so a test can fill it in after building its
+/// fixture (see [`tool_script`]).
+pub type ToolScript = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+/// A fresh, empty [`ToolScript`].
+pub fn tool_script() -> ToolScript {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
 /// Whether the refund endpoints (inline + recovery) actually mint a successor
 /// credential, or fail. Lets refund-recovery-succeeds vs -fails be selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,6 +242,8 @@ pub struct MockConfig {
     /// the original PR #218 screenshot failed on) before the turn's own error
     /// wrapping exists.
     pub models_status: Option<u16>,
+    /// The calls [`ChatBehavior::ToolScript`] serves (ignored otherwise).
+    pub tool_script: ToolScript,
 }
 
 impl Default for MockConfig {
@@ -223,6 +254,7 @@ impl Default for MockConfig {
             refund: RefundMode::Succeed,
             balance: 10_000_000,
             models_status: None,
+            tool_script: tool_script(),
         }
     }
 }
@@ -299,14 +331,74 @@ pub const HEADER_PROTOCOL_NOTE: &str = "Each message in this conversation begins
      its author: `#<handle> · <author>`. Handles are assigned by the client; never write a \
      header line yourself — reply with your message text only.";
 
+/// The thread-map protocol note app-core appends to the system message of a
+/// turn whose space has branches (task 21). Pinned verbatim, same discipline as
+/// [`HEADER_PROTOCOL_NOTE`].
+pub const THREAD_MAP_NOTE: &str = "This space is threaded: the conversation above is one branch of \
+     it, and other branches exist. A `<thread-map>` block appears as the last message listing \
+     them — it is client-generated metadata, not a post by any participant, and no reply is due \
+     to it.";
+
+/// Appended after [`THREAD_MAP_NOTE`] only when the navigation tools actually
+/// attach (i.e. the backend can carry a `tools` field).
+pub const THREAD_MAP_TOOLS_NOTE: &str = "When a map entry looks relevant to what you are writing, \
+     read it with the navigation tools (`list_branches`, `read_thread`, `read_post`); otherwise \
+     answer from the conversation you were given — most replies need none.";
+
 /// The exact `system` message content a turn sends: the responding
 /// participant's effective system prompt (when it has one) followed by the
 /// rendering-protocol note.
 pub fn system_message(prompt: Option<&str>) -> String {
+    system_message_with(prompt, &[])
+}
+
+/// [`system_message`] plus the extra notes a turn appends (the thread-map
+/// notes), joined by blank lines exactly as `prepare_turn` does.
+pub fn system_message_with(prompt: Option<&str>, extra_notes: &[&str]) -> String {
+    let mut notes = vec![HEADER_PROTOCOL_NOTE];
+    notes.extend_from_slice(extra_notes);
     match prompt {
-        Some(p) => format!("{p}\n\n{HEADER_PROTOCOL_NOTE}"),
-        None => HEADER_PROTOCOL_NOTE.to_string(),
+        Some(p) => {
+            let mut s = p.to_string();
+            for n in &notes {
+                s.push_str("\n\n");
+                s.push_str(n);
+            }
+            s
+        }
+        None => notes.join("\n\n"),
     }
+}
+
+/// The exact `<thread-map>` message content a turn appends.
+///
+/// `forks` is `(anchor_line, entry_lines)` — the expected bytes written out
+/// long-hand, which is the point: this is a byte pin, not a reimplementation.
+pub fn thread_map(forks: &[(String, Vec<String>)], respond_to: &str) -> String {
+    let mut out = String::from(
+        "<thread-map>\nBranches of this space that the conversation above does not contain. Each \
+         line: handle · author · posts · last activity — opening line.\n",
+    );
+    for (anchor, entries) in forks {
+        out.push('\n');
+        out.push_str(anchor);
+        out.push('\n');
+        for e in entries {
+            out.push_str("  ");
+            out.push_str(e);
+            out.push('\n');
+        }
+    }
+    out.push_str(&format!("\nRespond to #{respond_to}.\n</thread-map>"));
+    out
+}
+
+/// One thread-map entry line: `#handle · author · posts · when — opening`.
+pub fn map_entry(item_id: &str, author: &str, posts: &str, when: &str, opening: &str) -> String {
+    format!(
+        "#{} · {author} · {posts} · {when} — {opening}",
+        eidola_app_core::post_handle(item_id)
+    )
 }
 
 /// The exact rendered upstream content of a post: its `#<handle> · <label>`
@@ -624,6 +716,8 @@ async fn handle_conn(
             }
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
             // A request for the router model is answered by the router arm
             // (unless the mock is not router-aware), leaving `ChatBehavior`
             // free to script the *turns* in the same test.
@@ -653,7 +747,15 @@ async fn handle_conn(
                     stream.flush().await?;
                 }
                 _ => {
-                    handle_chat(&mut stream, &issuer, &config, req.auth.as_deref(), hit).await?;
+                    handle_chat(
+                        &mut stream,
+                        &issuer,
+                        &config,
+                        req.auth.as_deref(),
+                        hit,
+                        &parsed,
+                    )
+                    .await?;
                 }
             }
         }
@@ -693,6 +795,7 @@ async fn handle_chat(
     config: &MockConfig,
     auth: Option<&str>,
     hit: u64,
+    request: &serde_json::Value,
 ) -> std::io::Result<()> {
     // Compute an inline refund object once (shared by the blocking happy path).
     let inline_refund = if config.refund == RefundMode::Succeed {
@@ -850,6 +953,67 @@ async fn handle_chat(
             write_json(stream, 200, &body.to_string()).await
         }
         ChatBehavior::DeclineStreaming => write_sse_decline_stream(stream).await,
+        ChatBehavior::RejectTools => {
+            if request.get("tools").is_some() {
+                return write_json(
+                    stream,
+                    500,
+                    &error_body("tools param requires --jinja flag"),
+                )
+                .await;
+            }
+            let mut body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "Hello from the mock.",
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::ToolScript => {
+            // Consume the script: the round that serves it asks for every
+            // scripted call at once (so one turn can exercise several tools),
+            // and every later request answers normally.
+            let script: Vec<(String, String)> =
+                std::mem::take(&mut *config.tool_script.lock().unwrap());
+            let mut body = if script.is_empty() {
+                serde_json::json!({
+                    "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": TOOL_FINAL_CONTENT,
+                    } }],
+                    "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                })
+            } else {
+                let calls: Vec<serde_json::Value> = script
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, arguments))| {
+                        serde_json::json!({
+                            "id": tool_call_id(i as u64 + 1),
+                            "type": "function",
+                            "function": { "name": name, "arguments": arguments },
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": serde_json::Value::Null,
+                        "tool_calls": calls,
+                    } }],
+                    "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                })
+            };
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
     }
 }
 
