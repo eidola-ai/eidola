@@ -210,6 +210,191 @@ fn space_window_landmarks_name_conversation_and_map(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+// ---------------------------------------------------------------------------
+// Label quality — a probe's label is what a screen reader says, so these
+// assert the *wording*, not just that a probe exists. Every case below is a
+// finding from the task-12a audit (§S8).
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn row_verbs_name_the_row_they_act_on(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            space_info("s1", Some("Tides and the moon")),
+            space_info("s2", Some("Borrow checker")),
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+    // The verbs are hover-revealed; force the hover the snapshot tests use.
+    view.update(cx, |v, _| v.set_hovered_for_test(Some(1)));
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/1/rename",
+        gpui::Role::Button,
+        "Rename Borrow checker",
+    );
+    assert_probe(
+        &entries,
+        "library/row/1/archive",
+        gpui::Role::Button,
+        "Archive Borrow checker",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn participant_row_verbs_name_the_participant(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some(probe_participants());
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ParticipantsView::new(stores, "demo".into(), None, window, cx))
+    });
+
+    // Repeated "Edit"/"Remove" with nothing to distinguish them is exactly the
+    // audit's context-free-label finding; the row's subject supplies it.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "participants/agent-1/edit",
+        gpui::Role::Button,
+        "Edit Assistant",
+    );
+    assert_probe(
+        &entries,
+        "participants/agent-1/remove",
+        gpui::Role::Button,
+        "Remove Assistant",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn appearance_and_text_size_chips_carry_their_group(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    // "Auto" / "System" / "Day" / "Night" say nothing on their own — the
+    // group label they sit beside is a node-less `div`.
+    assert_probe(
+        &entries,
+        "settings/general/appearance/auto",
+        gpui::Role::Button,
+        "Day & night: Auto",
+    );
+    assert_probe(
+        &entries,
+        "settings/general/time-of-day/on",
+        gpui::Role::Button,
+        "Time of day: On",
+    );
+    // The current scale is likewise invisible to AT, so the chips carry it.
+    assert_probe(
+        &entries,
+        "settings/general/text-size/larger",
+        gpui::Role::Button,
+        "Larger text, currently 100%",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn minimap_labels_read_as_prose_not_markdown(cx: &mut TestAppContext) {
+    // The minimap cells are the only place a post's *text* reaches assistive
+    // technology today, and they used to carry raw markdown and raw
+    // `{{ embed N }}` wire syntax cut mid-word at 56 characters.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![probe_post(
+                    "a1",
+                    "**This week: the shepherd's bargain.** In *Republic* I, the argument turns.",
+                )],
+                cx,
+            )
+        });
+    });
+
+    let entries = fresh_entries(cx, window);
+    let (_, cell) = entries
+        .iter()
+        .find(|(n, _)| n == "space/minimap/cell/0/0")
+        .unwrap_or_else(|| {
+            let names: Vec<&String> = entries.iter().map(|(n, _)| n).collect();
+            panic!("minimap cell probe missing; recorded: {names:?}");
+        });
+    assert!(
+        !cell.label.contains('*'),
+        "minimap label still carries markdown: {:?}",
+        cell.label
+    );
+    assert!(
+        cell.label.contains("This week: the shepherd's bargain."),
+        "minimap label lost the prose: {:?}",
+        cell.label
+    );
+    // Truncated on a word boundary, with an ellipsis — never mid-word.
+    assert!(
+        cell.label.ends_with('…'),
+        "minimap label should be truncated here: {:?}",
+        cell.label
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn hash_labels_are_short_enough_to_hear(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+    view.update(cx, |v, _| {
+        v.set_attestations_for_test(
+            vec![stub_attestation(
+                "1122334455667788112233445566778811223344556677881122334455667788",
+            )],
+            false,
+        );
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "record/attestation/0",
+        gpui::Role::ListItem,
+        "Attestation 11223344…",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn disabled_probes_record_nothing(cx: &mut TestAppContext) {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
