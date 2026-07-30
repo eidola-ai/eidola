@@ -4,6 +4,7 @@
 //! virtualization), so only visible posts build the real `MarkdownEditor` and
 //! shape their text.
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, Context, Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement,
     SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, canvas, div, px,
@@ -67,6 +68,11 @@ impl SpaceView {
         let bw = px(body_width(page_width));
         let editing_this = self.editing.as_ref().map(|e| &e.node_id) == Some(&node.id);
 
+        // A **settled** post carries its byline/backend/time as the article's
+        // accessible name and its whole text as the article's value. A
+        // streaming one deliberately carries neither — see `article` below.
+        let mut article: Option<(usize, SharedString, SharedString)> = None;
+
         let (byline, byline_backend, time, body): (
             SharedString,
             Option<SharedString>,
@@ -75,6 +81,14 @@ impl SpaceView {
         ) = match node.src {
             NodeSrc::Msg(i) => {
                 let post = &self.posts[i];
+                article = Some((
+                    i,
+                    article_label(&post.byline, post.byline_backend.as_deref(), &post.time),
+                    SharedString::from(super::minimap::spoken_text(
+                        &post.content,
+                        &post.references,
+                    )),
+                ));
                 (
                     post.byline.clone(),
                     post.byline_backend.clone(),
@@ -131,6 +145,16 @@ impl SpaceView {
         let hover_id = node.id.clone();
         let mut row = h_flex()
             .id(SharedString::from(format!("space-post-{}", node.id)))
+            // The conversation itself, in the tree at last: each settled post
+            // is an `Article` (`AXGroup` + `AXDocumentArticle`) named for its
+            // author and time, carrying its whole text as the value. Only
+            // settled posts — a streaming reply's text mutates every token, and
+            // AT re-reads a changed value in full, so binding one there would
+            // make the app *less* usable than silence (audit §4). The row
+            // becomes a node the moment the stream finalizes into a `Msg`.
+            .when_some(article, |d, (i, label, value)| {
+                d.probe_value(format!("space/post/{i}"), gpui::Role::Article, label, value)
+            })
             .relative()
             .w(page_width)
             .py(POST_PAD_Y)
@@ -837,6 +861,24 @@ impl SpaceView {
     }
 }
 
+/// A settled post's accessible name: everything its byline gutter shows, on
+/// one line — author, the serving backend when it adds something (the same
+/// suppression the gutter applies), then the time. The gutter's three stacked
+/// lines are node-less text, so without this the model/backend line and the
+/// timestamp reach nobody.
+pub(crate) fn article_label(byline: &str, backend: Option<&str>, time: &str) -> SharedString {
+    let mut label = byline.to_string();
+    if let Some(backend) = backend.filter(|b| *b != byline && !b.is_empty()) {
+        label.push_str(" · ");
+        label.push_str(backend);
+    }
+    if !time.is_empty() {
+        label.push_str(" · ");
+        label.push_str(time);
+    }
+    SharedString::from(label)
+}
+
 /// The label opacity for a draft's "You" byline — softened relative to a
 /// committed post's byline so an unsent draft reads as tentative.
 pub(crate) const DRAFT_BYLINE_OPACITY: f32 = 0.85;
@@ -954,4 +996,27 @@ fn record_height(
     )
     .absolute()
     .size_full()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::article_label;
+
+    #[test]
+    fn article_label_folds_the_whole_byline_gutter_onto_one_line() {
+        // Author alone when there is nothing else (a synthetic row carries no
+        // timestamp, and `fmt_clock` renders one as empty).
+        assert_eq!(article_label("You", None, ""), "You");
+        assert_eq!(article_label("You", None, "9:05 AM"), "You · 9:05 AM");
+        // An assistant row's second gutter line is the serving backend — the
+        // "model name" a screen reader otherwise never hears.
+        assert_eq!(
+            article_label("Gemma 4 E2B", Some("Local"), "9:05 AM"),
+            "Gemma 4 E2B · Local · 9:05 AM"
+        );
+        // Suppressed exactly where the gutter suppresses it: when it would
+        // only repeat the author, or when it is empty.
+        assert_eq!(article_label("Eidola", Some("Eidola"), ""), "Eidola");
+        assert_eq!(article_label("Eidola", Some(""), ""), "Eidola");
+    }
 }

@@ -3580,6 +3580,122 @@ fn space_composer_cmd_enter_routes_through_press_enter_to_submit(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn space_composer_accessible_value_freezes_while_it_is_focused(cx: &mut TestAppContext) {
+    // The composer's `aria_value` must not track keystrokes: assistive
+    // technology re-reads a focused control's whole value on every change, so
+    // a live binding would re-speak the entire draft per character (audit §4 —
+    // the same reason Zed's own text field freezes). It refreshes only at
+    // settled moments: a different draft becoming active, or focus leaving.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    draw_frame(cx, window);
+
+    let editor = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("blank space opens with the composer");
+    let editor_focus = editor.read_with(cx, |e, cx| e.focus_handle(cx));
+    cx.update_window(window, |_, window, cx| {
+        editor_focus.focus(window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    set_space_composer_text(&view, window, cx, "half a thought, still typing");
+    draw_frame(cx, window);
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.composer_aria_value_for_test().as_ref(),
+            "",
+            "typing must not move the accessible value"
+        );
+    });
+
+    // Focus leaves the composer (the draft stays active): the value settles to
+    // what is actually there, which is when a reader would ask for it.
+    let root = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| root.focus(window, cx))
+        .unwrap();
+    cx.run_until_parked();
+    draw_frame(cx, window);
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.composer_aria_value_for_test().as_ref(),
+            "half a thought, still typing",
+            "blur settles the value"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_composer_reopened_draft_reads_the_text_it_holds(cx: &mut TestAppContext) {
+    // Escape retires the draft *before* any frame renders it unfocused, and
+    // re-opening focuses the very same draft — so a rule that refreshes only on
+    // "a different draft" or "an unfocused frame" never catches up, and the
+    // reopened composer reports its pre-typing text forever. Activation is the
+    // seam that fixes it: every editing session begins there.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    draw_frame(cx, window);
+
+    let editor = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("blank space opens with the composer");
+    let editor_focus = editor.read_with(cx, |e, cx| e.focus_handle(cx));
+    cx.update_window(window, |_, window, cx| editor_focus.focus(window, cx))
+        .unwrap();
+    cx.run_until_parked();
+    set_space_composer_text(&view, window, cx, "a thought worth keeping");
+    draw_frame(cx, window);
+
+    // Escape: retire the draft and move focus to the view root — exactly what
+    // the composer's key handler does, in that order.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.deactivate_for_test(cx));
+        let root = view.read(cx).focus_handle();
+        root.focus(window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw_frame(cx, window);
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.draft_count_for_test(),
+            1,
+            "the draft is kept — it has content"
+        );
+        assert!(
+            !v.has_active_draft_for_test(),
+            "Escape retires it before any frame renders the composer unfocused"
+        );
+        assert_eq!(
+            v.composer_aria_value_for_test().as_ref(),
+            "",
+            "so the snapshot is still the stale, pre-typing one"
+        );
+    });
+
+    // Click back into it — `activate_draft`, the same call the inactive
+    // draft's click and the editor's own `Focus` event make. The id is
+    // unchanged and the editor is focused again, so nothing the render-time
+    // rule can see has moved; only the activation seed catches this up.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.activate_draft_for_test(0, cx));
+        editor_focus.focus(window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw_frame(cx, window);
+    view.read_with(cx, |v, _| {
+        assert!(v.has_active_draft_for_test(), "the draft is active again");
+        assert_eq!(
+            v.composer_aria_value_for_test().as_ref(),
+            "a thought worth keeping",
+            "a reopened draft must report the text it actually holds"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
     // An edit that pushes the caret below the *floating* composer's visible
     // fold must scroll the composer so the caret stays visible. The full path

@@ -215,34 +215,48 @@ impl Render for UpdatesView {
 
         // Footer: re-check affordance + in-flight hint when a standing
         // result is shown while a re-check runs.
-        let footer =
-            h_flex()
-                .w_full()
-                .px_4()
-                .py_3()
-                .border_t_1()
-                .border_color(theme.border)
-                .gap_3()
-                .child(
-                    // The probed wrapper carries the a11y role/label (the
-                    // gpui-component Button has no a11y annotations at our
-                    // pin); it shrink-wraps the button so its bounds are an
-                    // honest click target.
-                    div()
-                        .id("check-now-wrap")
-                        .probe("updates/check", gpui::Role::Button, check_label)
-                        .child(
-                            Button::new("check-now")
-                                .label(check_label)
-                                .small()
-                                .disabled(checking)
-                                .on_click(cx.listener(|this, _, _, cx| this.check_now(cx))),
-                        ),
-                )
-                .child(div().flex_1())
-                .child(div().text_xs().text_color(theme.muted_foreground).child(
-                    SharedString::from(format!("Eidola {}", env!("CARGO_PKG_VERSION"))),
-                ));
+        let footer = h_flex()
+            .w_full()
+            .px_4()
+            .py_3()
+            .border_t_1()
+            .border_color(theme.border)
+            .gap_3()
+            .child(
+                // The probed wrapper carries the a11y role/label (the
+                // gpui-component Button has no a11y annotations at our
+                // pin); it shrink-wraps the button so its bounds are an
+                // honest click target.
+                div()
+                    .id("check-now-wrap")
+                    .probe("updates/check", gpui::Role::Button, check_label)
+                    .child(
+                        Button::new("check-now")
+                            .label(check_label)
+                            .small()
+                            .disabled(checking)
+                            .on_click(cx.listener(|this, _, _, cx| this.check_now(cx))),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(
+                // The build this window is comparing against — the one
+                // value on the pane that answers "newer than what?".
+                div()
+                    .id("updates-version")
+                    .probe_value(
+                        "updates/version",
+                        gpui::Role::Label,
+                        "This build",
+                        SharedString::from(format!("Eidola {}", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(format!(
+                        "Eidola {}",
+                        env!("CARGO_PKG_VERSION")
+                    ))),
+            );
 
         crate::chrome::round_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)

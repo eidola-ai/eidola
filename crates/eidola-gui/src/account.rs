@@ -295,6 +295,20 @@ impl Render for AccountView {
             if let Some(b) = balances.as_ref() {
                 col = col.child(
                     h_flex()
+                        .id("account-balance")
+                        // The figure and its unit are two node-less `div`s, so
+                        // the balance reached assistive technology nowhere. It
+                        // rides as the value under a stable name, which is also
+                        // what keeps a refreshed figure from renaming the node.
+                        .probe_value(
+                            "settings/account/balance",
+                            gpui::Role::Label,
+                            "Balance",
+                            SharedString::from(format!(
+                                "{} credits available",
+                                format_credits(b.available)
+                            )),
+                        )
                         .items_baseline()
                         .gap_2()
                         .child(
@@ -316,6 +330,16 @@ impl Render for AccountView {
                         line = format!("{line} · {}", humanize_expiry(exp, now));
                     }
                     let mut row = h_flex()
+                        .id(("account-pool", idx))
+                        // Source, amount and humanized expiry are one rendered
+                        // line; it is the value, indexed so repeated pools are
+                        // distinguishable by name (S8's repeated-label rule).
+                        .probe_value(
+                            format!("settings/account/pool/{idx}"),
+                            gpui::Role::Label,
+                            format!("Credit pool {}", idx + 1),
+                            SharedString::from(line.clone()),
+                        )
                         .w_full()
                         .py_1p5()
                         .text_sm()
