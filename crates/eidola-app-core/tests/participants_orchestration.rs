@@ -1200,10 +1200,125 @@ fn an_explicit_ask_bypasses_the_router_entirely() {
 
         // …but an explicit ask consults no guards and no router.
         let result = drive_as(&core, &space, &agent, &post).expect("explicit ask runs");
+        assert!(result.declined.is_none());
         assert!(result.response_action_id.is_some());
         assert!(
             router_calls(&mock).is_empty(),
             "respond_stream_as never routes through the router"
         );
+    });
+}
+
+// ===========================================================================
+// Agent-side decline checkpoint (task 22)
+// ===========================================================================
+
+#[test]
+fn a_declining_agent_writes_a_decision_and_suppresses_the_post() {
+    run(|| {
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::DeclineStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.register_tool(eidola_app_core::decline::decline_tool());
+
+        let (space, post) = space_with_two_candidates(&core);
+        let agent = agent_id(&core, &space, "All-Agent");
+
+        let mut rx = core.subscribe_changes();
+        let result = drive_as(&core, &space, &agent, &post).expect("declined turn still succeeds");
+
+        // The would-be post is suppressed.
+        assert_eq!(
+            result.declined.as_deref(),
+            Some(chat_harness::DECLINE_REASON),
+            "the stated reason rides back to the caller"
+        );
+        assert!(result.content.is_empty(), "no post content");
+
+        // …and the thread still holds only the human post: `decision` is not a
+        // post-bearing action type, so it collapses out of the render.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        assert_eq!(tree.len(), 1, "only the human post; got {tree:?}");
+
+        // The decision IS in the trail, with the post as its antecedent and the
+        // reason as its text.
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(space.clone()))
+            .expect("raw actions");
+        let types: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["user_input", "tool_call", "tool_result", "decision"],
+            "the round's trace is kept and the decision is appended"
+        );
+        let decision = actions.last().expect("decision row");
+        assert_eq!(decision.id, result.response_action_id.clone().unwrap());
+        assert_eq!(
+            decision.reply_to.as_deref(),
+            Some(post.as_str()),
+            "a decision hangs off the post it declines, not the trace chain"
+        );
+        assert!(
+            decision
+                .blocks
+                .iter()
+                .any(|b| b.text_content.as_deref() == Some(chat_harness::DECLINE_REASON)),
+            "the reason is persisted; got {:?}",
+            decision.blocks
+        );
+
+        // Emissions: Space (new state to render) + Wallet (the round spent) +
+        // Record (request rows). No SpaceIndex — nothing was posted.
+        let events = drain(&mut rx);
+        use eidola_app_core::changes::Change;
+        assert!(
+            events
+                .iter()
+                .any(|c| matches!(c, Change::Space(s) if *s == space))
+        );
+        assert!(events.iter().any(|c| matches!(c, Change::Record)));
+        assert!(
+            !events.iter().any(|c| matches!(c, Change::SpaceIndex)),
+            "a decline adds no item to the listing"
+        );
+    });
+}
+
+#[test]
+fn the_decline_name_alone_is_not_a_decline_without_the_tool_registered() {
+    run(|| {
+        // Same scripted `decline` call, but the registry never got the tool:
+        // the model gets an ordinary unknown-tool result and the turn goes on
+        // to answer normally.
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::DeclineBlocking,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (space, post) = space_with_two_candidates(&core);
+        let agent = agent_id(&core, &space, "All-Agent");
+
+        let result = core.runtime().block_on(core.respond_stream_as(
+            space.clone(),
+            agent,
+            post,
+            tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>().0,
+        ));
+        // The turn does *not* end in a decline. (It runs another round against
+        // the same behaviour and eventually hits the round cap, which is a
+        // turn failure — the point is only that it is never a silent decline.)
+        match result {
+            Ok(r) => assert!(r.declined.is_none(), "no decline without registration"),
+            Err(e) => assert!(
+                matches!(e.root(), AppError::ToolLoop { .. }),
+                "expected the ordinary tool loop to run on, got {e:?}"
+            ),
+        }
     });
 }

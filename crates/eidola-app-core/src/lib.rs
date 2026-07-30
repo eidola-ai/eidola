@@ -2,6 +2,7 @@ pub mod backends;
 pub mod changes;
 pub mod config;
 pub mod db;
+pub mod decline;
 pub mod error;
 pub mod local_models;
 pub mod router;
@@ -422,12 +423,20 @@ pub struct ChatResult {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub credits_charged: i64,
-    /// The persisted inference action id this turn produced. Lets a caller
-    /// continue an auto-notify cascade by re-planning on the fresh post
+    /// The persisted action id this turn produced — the `inference` normally,
+    /// or the `decision` when the turn was declined. Lets a caller continue an
+    /// auto-notify cascade by re-planning on the fresh post
     /// (`plan_notifications(space_id, response_action_id)`). `None` only on
-    /// paths that produced no inference row (none today — every success path
+    /// paths that produced no action row (none today — every success path
     /// persists one).
     pub response_action_id: Option<String>,
+    /// `Some(reason)` when the responding agent used the decline checkpoint
+    /// (see [`decline`]): the turn ran, the model saw the full context and
+    /// chose to bow out, and **no post was written** — `content` is empty and
+    /// `response_action_id` names the `decision` action rather than an
+    /// inference. `None` on every ordinary turn. A caller driving a cascade
+    /// should not re-plan on a declined turn: there is no new post to answer.
+    pub declined: Option<String>,
 }
 
 /// Outcome of [`AppCore::post`] — saving a thought without requesting a
@@ -3719,6 +3728,58 @@ impl Inner {
         })
     }
 
+    /// The **agent-side decline checkpoint** (see [`decline`]).
+    ///
+    /// Called right after a round's `tool_call` action is persisted and
+    /// *before* the round cap, since a decline is terminal. Returns `None` —
+    /// and changes nothing — unless the round asked for the `decline` tool
+    /// *and* the turn's registry snapshot actually holds it (a model guessing
+    /// the name against a registry without it gets the ordinary unknown-tool
+    /// result instead).
+    ///
+    /// When it does fire: the round's tools still run and their results are
+    /// persisted (the trace stays honest, and a `decline` called alongside
+    /// another tool doesn't leave a `tool_call` action with no answers), a
+    /// `decision` action is written against the post the turn answers, and the
+    /// turn ends with **no inference** — the would-be post is suppressed.
+    /// Emissions mirror the ordinary success arm minus nothing: `Space` (the
+    /// decision is new state a UI wants to render), `Wallet` when the turn
+    /// spent, and `Record` (request rows were written).
+    async fn decline_checkpoint(
+        &self,
+        prep: &mut TurnPrep,
+        tool_calls: &[ParsedToolCall],
+    ) -> Result<Option<ChatResult>, AppError> {
+        let calls: Vec<(&str, &str)> = tool_calls
+            .iter()
+            .map(|c| (c.name.as_str(), c.arguments.as_str()))
+            .collect();
+        let Some(reason) = decline::declined_reason(&prep.tools, &calls) else {
+            return Ok(None);
+        };
+
+        let outcomes = execute_tool_calls(&prep.tools, tool_calls).await;
+        prep.persist_tool_result_action(&outcomes).await?;
+        let decision_id = prep.persist_decision(&reason).await?;
+
+        self.bus.emit(Change::Space(prep.space_id.clone()));
+        if prep.spend.is_some() {
+            self.bus.emit(Change::Wallet);
+        }
+        self.bus.emit(Change::Record);
+
+        Ok(Some(ChatResult {
+            space_id: prep.space_id.clone(),
+            content: String::new(),
+            model: prep.model.clone(),
+            input_tokens: None,
+            output_tokens: None,
+            credits_charged: prep.total_credits as i64,
+            response_action_id: Some(decision_id),
+            declined: Some(reason),
+        }))
+    }
+
     /// Acquire the credential spend for one request: the ACT provisioning
     /// queue's acquire → spend-proof → flip-to-`spending` step, plus the
     /// `Authorization` header value it produces.
@@ -4090,6 +4151,12 @@ impl Inner {
             )
             .await?;
 
+            // The agent-side decline checkpoint, *before* the round cap: a
+            // decline is terminal, so it never needs another round.
+            if let Some(result) = self.decline_checkpoint(prep, &tool_calls).await? {
+                return Ok(RoundOutcome::Final(result));
+            }
+
             if round == MAX_TURN_ROUNDS {
                 // The cap binds *before* executing tools whose results
                 // could never be sent — the request is persisted, the work
@@ -4167,6 +4234,7 @@ impl Inner {
             output_tokens,
             credits_charged: prep.total_credits as i64,
             response_action_id: Some(response_action_id),
+            declined: None,
         }))
     }
 
@@ -4550,6 +4618,11 @@ impl Inner {
             )
             .await?;
 
+            // The agent-side decline checkpoint (see the blocking twin).
+            if let Some(result) = self.decline_checkpoint(prep, &tool_calls).await? {
+                return Ok(RoundOutcome::Final(result));
+            }
+
             if round == MAX_TURN_ROUNDS {
                 self.bus.emit(Change::Space(prep.space_id.clone()));
                 self.bus.emit(Change::Record);
@@ -4605,6 +4678,7 @@ impl Inner {
             output_tokens,
             credits_charged: prep.total_credits as i64,
             response_action_id: Some(response_action_id),
+            declined: None,
         }))
     }
 
@@ -6912,6 +6986,59 @@ impl TurnPrep {
                 "content": outcome.content,
             }));
         }
+    }
+
+    /// Persist the agent's decline as a `decision` action (see [`decline`]).
+    ///
+    /// Threading is deliberately different from the tool trace: a decision is
+    /// *about the post it declines*, so it hangs off `inf_reply_to` — the
+    /// antecedent the suppressed inference would have had — not off the trace
+    /// chain. It carries the responding agent's model (what decided) but no
+    /// tokens or credits: those belong to the round's `tool_call` action, which
+    /// is where the request row lives. The stated reason, when there is one, is
+    /// its single `text` block.
+    ///
+    /// `get_space_tree` keeps only post-bearing action types, so a decision
+    /// collapses out of the rendered thread exactly like a tool trace does —
+    /// visible in the Record, invisible as a post. Rendering it as "saw this,
+    /// declined" is a GUI follow-up, not something the write side decides.
+    async fn persist_decision(&mut self, reason: &str) -> Result<String, AppError> {
+        let action_id = Uuid::now_v7().to_string();
+        db::insert_action(
+            &self.db_conn,
+            &db::ActionEntry {
+                id: action_id.clone(),
+                space_id: self.space_id.clone(),
+                participant_id: self.model_participant_id.clone(),
+                participant_scope: self.model_participant_scope.clone(),
+                item_id: Uuid::now_v7().to_string(),
+                supersedes_action_id: None,
+                action_type: "decision".to_string(),
+                status: "complete".to_string(),
+                intent: Some("decline".to_string()),
+                model: Some(self.model.clone()),
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at: now_ms(),
+            },
+        )
+        .await?;
+        if let Some(ref ante) = self.inf_reply_to {
+            db::insert_action_antecedent(&self.db_conn, &action_id, ante, 0, "reply").await?;
+        }
+        if !reason.is_empty() {
+            db::insert_text_content_block(
+                &self.db_conn,
+                &Uuid::now_v7().to_string(),
+                &action_id,
+                0,
+                "text",
+                reason,
+            )
+            .await?;
+        }
+        Ok(action_id)
     }
 
     /// Persist the turn's durable rows — the inference action (per the attach
