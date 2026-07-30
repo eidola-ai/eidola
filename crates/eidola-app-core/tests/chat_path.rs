@@ -1861,17 +1861,7 @@ fn server_chargeable_prompt_tokens(body: &serde_json::Value) -> u64 {
             .into_iter()
             .flatten()
         {
-            let function = call.get("function");
-            charge.add_tool_call(
-                function
-                    .and_then(|f| f.get("name"))
-                    .map(text_bytes)
-                    .unwrap_or(0),
-                function
-                    .and_then(|f| f.get("arguments"))
-                    .map(text_bytes)
-                    .unwrap_or(0),
-            );
+            charge.add_tool_call(text_bytes(call));
         }
     }
     for tool in body

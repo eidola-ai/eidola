@@ -7366,9 +7366,9 @@ fn json_text_bytes(value: &serde_json::Value) -> u64 {
 ///   **string**'s bytes (an assistant message that only called tools has no
 ///   content string and contributes zero there; a `tool` result message
 ///   contributes its content like any other);
-/// * every `tool_calls` entry on a message contributes its function name and
-///   its raw `arguments` payload — the bytes that would otherwise ride
-///   upstream uncharged on every round of a tool loop;
+/// * every `tool_calls` entry on a message contributes its compact JSON
+///   serialization — the whole entry, because the whole entry is what gets
+///   replayed upstream on every round of a tool loop;
 /// * every advertised tool schema contributes its compact JSON
 ///   serialization, once per request — the chat template re-injects it into
 ///   the prompt on every round.
@@ -7392,16 +7392,7 @@ fn prompt_charge_inputs(
         );
         if let Some(calls) = message.get("tool_calls").and_then(|c| c.as_array()) {
             for call in calls {
-                let function = call.get("function");
-                let name = function
-                    .and_then(|f| f.get("name"))
-                    .map(json_text_bytes)
-                    .unwrap_or(0);
-                let arguments = function
-                    .and_then(|f| f.get("arguments"))
-                    .map(json_text_bytes)
-                    .unwrap_or(0);
-                charge.add_tool_call(name, arguments);
+                charge.add_tool_call(json_text_bytes(call));
             }
         }
     }
@@ -9008,7 +8999,7 @@ mod tests {
     /// `tool_round_fixture_charges_the_pinned_contract_value` (the server's
     /// walk over the parsed struct), and in `eidola_common`'s
     /// `cross_crate_tool_round_fixture` (the arithmetic). All three must
-    /// produce 180 chargeable prompt tokens.
+    /// produce 230 chargeable prompt tokens.
     #[test]
     fn prompt_charge_matches_the_shared_contract_fixture() {
         let messages = vec![
@@ -9038,12 +9029,59 @@ mod tests {
             154,
             "the fixture's schema must stay 154 bytes"
         );
+        assert_eq!(
+            json_text_bytes(&messages[1]["tool_calls"][0]),
+            93,
+            "the fixture's call entry must stay 93 bytes"
+        );
 
         let charge = prompt_charge_inputs(&messages, &tools);
         assert_eq!(charge.message_count(), 3);
-        // 13 content + 18 tool-call + 154 schema bytes.
-        assert_eq!(charge.total_content_bytes(), 185);
-        assert_eq!(charge.chargeable_prompt_tokens(), 180);
+        // 13 content + 93 tool-call + 154 schema bytes.
+        assert_eq!(charge.total_content_bytes(), 260);
+        assert_eq!(charge.chargeable_prompt_tokens(), 230);
+    }
+
+    /// The whole `tool_calls` entry is charged, not just
+    /// `function.{name,arguments}`: the client replays the provider's call
+    /// object verbatim — id, `type` and any provider extension included —
+    /// and those bytes reach the upstream, where a template like Mistral's
+    /// renders the call id straight into the prompt.
+    #[test]
+    fn tool_call_framing_bytes_are_charged() {
+        let call = |id: &str| {
+            vec![serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id, "type": "function",
+                    "function": {"name": "calc", "arguments": "{}"}
+                }]
+            })]
+        };
+        let short = prompt_charge_inputs(&call("c"), &[]);
+        let realistic = prompt_charge_inputs(&call("call_9tK2mQz7Xb4LpR1vN8sYcE0d"), &[]);
+        assert!(
+            realistic.total_content_bytes() > short.total_content_bytes(),
+            "a longer call id is more forwarded bytes and must cost more"
+        );
+
+        let with_extension = prompt_charge_inputs(
+            &[serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c", "type": "function",
+                    "function": {"name": "calc", "arguments": "{}"},
+                    "provider_extra": {"trace": "0123456789abcdef"}
+                }]
+            })],
+            &[],
+        );
+        assert!(
+            with_extension.total_content_bytes() > short.total_content_bytes(),
+            "a forwarded provider extension must not ride free"
+        );
     }
 
     /// A request with neither `tools` nor `tool_calls` charges exactly what it
@@ -9077,8 +9115,13 @@ mod tests {
             "content": null,
             "tool_calls": [{"id": "c", "function": {"name": "ca", "arguments": value}}]
         })];
+        // The whole entry is measured; the off-spec object still round-trips
+        // to the identical bytes on the server, which is what matters.
         let charge = prompt_charge_inputs(&messages, &[]);
-        assert_eq!(charge.total_content_bytes(), 2 + 14);
+        assert_eq!(
+            charge.total_content_bytes(),
+            json_text_bytes(&messages[0]["tool_calls"][0])
+        );
     }
 
     // --- tool-call shape + streamed provider-field preservation ----------
