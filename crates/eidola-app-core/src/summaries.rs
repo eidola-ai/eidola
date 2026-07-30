@@ -10,12 +10,15 @@
 //! # Cache: keyed on the branch tip
 //!
 //! A summary is generated once per *state* of a branch. The key is the branch's
-//! **tip action id** — the newest post in its subtree — so a summary is
-//! regenerated when the branch grows (or when a post in it is edited or
-//! regenerated, which changes the tip's action id), and never otherwise. A
-//! stored summary is rendered even when the branch has since grown past it: it
-//! is a snapshot, exactly like the navigation tools' results, and the structural
-//! line beside it carries the fresh counts.
+//! **tip action id** — the newest of the branch's resolved current generations
+//! — so a summary is regenerated when the branch grows, and never otherwise.
+//! Reading it off the *resolved* generations is what makes an edit anywhere in
+//! the branch move it too, tip or not: an edit is a new action, so it is the
+//! newest generation in the branch the moment it lands, and a non-tip edit is
+//! not invisible to the cache. A stored summary is rendered even when the
+//! branch has since grown past it: it is a snapshot, exactly like the
+//! navigation tools' results, and the structural line beside it carries the
+//! fresh counts.
 //!
 //! # Storage: a versioned item, forensically visible
 //!
@@ -46,15 +49,19 @@
 //! behavior, not a surprise; what keeps it *bounded* is structural rather than
 //! a policy gate: generation is lazy, keyed on the branch tip (no regeneration
 //! without growth), skips branches too short to be worth a précis, and costs at
-//! most one call per branch that actually grew. Unset (the default) or an
-//! unresolvable reference ⇒ structural lines only, silently.
+//! most one call per branch that actually grew — and each of those calls
+//! carries a *different* prompt, because the slice is head + tail rather than
+//! oldest-N (a fixed oldest-N slice would re-bill an identical prompt on every
+//! growth past the cap, and could only ever describe the branch's opening).
+//! Unset (the default) or an unresolvable reference ⇒ structural lines only,
+//! silently.
 //!
 //! # Scheduling: never in a turn's way
 //!
 //! Generation is **never** on the path of a post or a turn.
-//! [`Inner::spawn_branch_summaries`] is fire-and-forget, called after a post or
-//! a turn has committed and emitted; `prepare_turn` only ever *reads* whatever
-//! is already stored. Two things keep a burst cheap: a **trailing debounce**
+//! [`Inner::spawn_branch_summaries`] is fire-and-forget, called after every
+//! write that can move a branch — a post, an edit, a turn — has committed and
+//! emitted; `prepare_turn` only ever *reads* whatever is already stored. Two things keep a burst cheap: a **trailing debounce**
 //! per space (a later trigger supersedes an earlier one, so an exchange —
 //! post, then the answer it draws — costs one pass, not two), and a gate that
 //! runs one pass at a time with the cache re-read inside it. A pass with
@@ -77,9 +84,13 @@ const CHORE: &str = "branch summary";
 /// quotes the opening line of its only post, so a précis would restate it.
 const MIN_BRANCH_POSTS: usize = 2;
 
-/// How many of a branch's posts the summarizer reads (oldest first — the
-/// opening is what a reader needs to place the branch).
-const BRANCH_SLICE_POSTS: usize = 12;
+/// How many of a branch's **opening** posts the summarizer reads — enough to
+/// place what the branch is about.
+const BRANCH_HEAD_POSTS: usize = 4;
+
+/// How many of a branch's **newest** posts it reads — where the branch got to,
+/// which is the half a reader deciding whether to open it actually needs.
+const BRANCH_TAIL_POSTS: usize = 8;
 
 /// Per-post byte budget inside that slice.
 const POST_MAX_BYTES: usize = 600;
@@ -108,6 +119,16 @@ where it got to. Do not greet, do not explain what you are doing, do not use \
 markdown, do not quote the posts verbatim, and never write more than two \
 sentences.";
 
+/// What the summarizer reads of one branch: its opening posts, its newest
+/// posts, and how many fell out of the middle. A branch that fits the slice is
+/// entirely `head`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BranchSlice {
+    pub head: Vec<SummaryPost>,
+    pub tail: Vec<SummaryPost>,
+    pub omitted: usize,
+}
+
 /// One post of a branch, as the summarizer reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SummaryPost {
@@ -131,21 +152,34 @@ pub(crate) struct BranchKey {
     pub handle: String,
 }
 
-/// Render the summarizer's user message: the branch's posts, oldest first.
+/// Render the summarizer's user message: the branch's posts, oldest first,
+/// with the elided middle stated plainly rather than silently dropped.
 ///
 /// Pure and unit-tested — the prompt is what an offline eval would tune, so it
 /// stays free of I/O.
-pub(crate) fn build_summary_prompt(posts: &[SummaryPost]) -> String {
-    let mut out = String::from("BRANCH (oldest first):\n");
-    if posts.is_empty() {
-        out.push_str("(no text)\n");
-    }
-    for p in posts.iter().take(BRANCH_SLICE_POSTS) {
+pub(crate) fn build_summary_prompt(slice: &BranchSlice) -> String {
+    fn line(out: &mut String, p: &SummaryPost) {
         out.push_str(&format!(
             "{}: {}\n",
             p.author,
             clip(&p.text, POST_MAX_BYTES)
         ));
+    }
+    let mut out = String::from("BRANCH (oldest first):\n");
+    if slice.head.is_empty() && slice.tail.is_empty() {
+        out.push_str("(no text)\n");
+    }
+    for p in &slice.head {
+        line(&mut out, p);
+    }
+    if slice.omitted > 0 {
+        out.push_str(&format!(
+            "(… {} omitted …)\n",
+            crate::plural_posts(slice.omitted)
+        ));
+    }
+    for p in &slice.tail {
+        line(&mut out, p);
     }
     out.push_str("\nSummarize this branch in one or two sentences.");
     out
@@ -276,7 +310,11 @@ impl Inner {
 
         for idx in stale {
             let key = snapshot.branch_key(idx);
-            let prompt = build_summary_prompt(&snapshot.branch_posts(idx, BRANCH_SLICE_POSTS));
+            let prompt = build_summary_prompt(&snapshot.branch_slice(
+                idx,
+                BRANCH_HEAD_POSTS,
+                BRANCH_TAIL_POSTS,
+            ));
             // A per-branch failure is per-branch: the next branch may well be
             // summarizable, and the whole feature is optional anyway.
             let reply = match self
@@ -428,22 +466,42 @@ mod tests {
         assert!(!cleaned.contains('\n'));
     }
 
+    fn post(author: &str, text: &str) -> SummaryPost {
+        SummaryPost {
+            author: author.into(),
+            text: text.into(),
+        }
+    }
+
     #[test]
     fn the_prompt_lists_posts_oldest_first_and_clips_them() {
-        let posts = vec![
-            SummaryPost {
-                author: "You".into(),
-                text: "first".into(),
-            },
-            SummaryPost {
-                author: "Agent".into(),
-                text: "x".repeat(POST_MAX_BYTES + 50),
-            },
-        ];
-        let prompt = build_summary_prompt(&posts);
+        let slice = BranchSlice {
+            head: vec![
+                post("You", "first"),
+                post("Agent", &"x".repeat(POST_MAX_BYTES + 50)),
+            ],
+            tail: Vec::new(),
+            omitted: 0,
+        };
+        let prompt = build_summary_prompt(&slice);
         let first = prompt.find("You: first").unwrap();
         let second = prompt.find("Agent: ").unwrap();
         assert!(first < second);
         assert!(prompt.contains('…'), "the long post is clipped");
+        assert!(!prompt.contains("omitted"), "nothing was elided");
+    }
+
+    #[test]
+    fn an_elided_middle_is_stated_between_the_opening_and_the_newest() {
+        let prompt = build_summary_prompt(&BranchSlice {
+            head: vec![post("You", "opening")],
+            tail: vec![post("You", "newest")],
+            omitted: 1,
+        });
+        assert_eq!(
+            prompt,
+            "BRANCH (oldest first):\nYou: opening\n(… 1 post omitted …)\nYou: newest\n\n\
+             Summarize this branch in one or two sentences."
+        );
     }
 }

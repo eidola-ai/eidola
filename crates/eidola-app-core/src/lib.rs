@@ -3203,6 +3203,10 @@ impl Inner {
         // current generations, and an edit replaces one, it doesn't add an item.
         self.bus.emit(Change::Space(space_id.clone()));
         self.bus.emit(Change::SpaceIndex);
+        // An edit is a new generation, so it moves its branch's summary cache
+        // key exactly as an appended post does — schedule the refresh behind
+        // the commit, or the branch keeps a summary of text nobody wrote.
+        self.spawn_branch_summaries(&space_id);
 
         Ok(PostResult {
             space_id,
@@ -6336,6 +6340,24 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Test-only seam: drain the spaces with a summary pass pending, so a test
+    /// can assert that a write *scheduled* one without waiting out the
+    /// debounce. Draining also disarms those passes (each checks its own stamp
+    /// before running), which keeps a background pass out of a test's counts.
+    #[doc(hidden)]
+    pub fn test_take_summary_triggers(&self) -> Vec<String> {
+        let mut pending: Vec<String> = self
+            .inner
+            .summary_triggers
+            .lock()
+            .expect("summary trigger lock poisoned")
+            .drain()
+            .map(|(space, _)| space)
+            .collect();
+        pending.sort();
+        pending
+    }
+
     /// Test-only seam: run one branch-summary pass to completion.
     ///
     /// Production triggers this in the background after a post or a turn
@@ -8864,17 +8886,33 @@ impl ThreadSnapshot {
         }
     }
 
-    /// The branch's posts in render order, oldest first, capped — the
-    /// summarizer's reading material.
-    fn branch_posts(&self, idx: usize, limit: usize) -> Vec<summaries::SummaryPost> {
-        self.subtree(idx)
-            .into_iter()
-            .take(limit)
-            .map(|i| summaries::SummaryPost {
-                author: self.nodes[i].participant.label.clone(),
-                text: self.texts[i].clone(),
-            })
-            .collect()
+    /// The branch's reading material for the summarizer: its opening `head`
+    /// posts and its newest `tail` posts, in render order, with the count of
+    /// whatever fell out of the middle.
+    ///
+    /// Head **and** tail, not the oldest N: a branch that outgrows the slice
+    /// still gets a summary of where it *got to*, and a growing branch never
+    /// sends the same prompt twice (which under a billing utility model would
+    /// be a charge for an answer that could not have changed). A branch that
+    /// fits is entirely `head`, so short branches are unaffected.
+    fn branch_slice(&self, idx: usize, head: usize, tail: usize) -> summaries::BranchSlice {
+        let sub = self.subtree(idx);
+        let post = |i: usize| summaries::SummaryPost {
+            author: self.nodes[i].participant.label.clone(),
+            text: self.texts[i].clone(),
+        };
+        if sub.len() <= head + tail {
+            return summaries::BranchSlice {
+                head: sub.into_iter().map(post).collect(),
+                tail: Vec::new(),
+                omitted: 0,
+            };
+        }
+        summaries::BranchSlice {
+            head: sub[..head].iter().map(|&i| post(i)).collect(),
+            tail: sub[sub.len() - tail..].iter().map(|&i| post(i)).collect(),
+            omitted: sub.len() - head - tail,
+        }
     }
 
     /// The fork points on `spine` (deduped context action ids, root → the post
