@@ -49,18 +49,12 @@
 //!
 //! # Cost
 //!
-//! The router model is an ordinary qualified `<model>@<backend>` reference and
-//! routes through the ordinary backend registry. An engine-backed reference
-//! (`local` / `llamacpp`) takes the zero-spend path — no charge, no credential,
-//! no account — which is what makes a local router genuinely free. A remote
-//! (`eidola`) reference is allowed and **bills a normal inference on every
-//! triggering post**; any settings surface must say so plainly.
-//!
-//! The call is deliberately **not a turn**: no actions, no context assembly, no
-//! request rows, no attestation records. (For an `eidola` router the
-//! per-handshake attestation still *happens* — it is simply not recorded, since
-//! there is no action to hang the forensic trail from. That is the one honest
-//! gap in "everything is in the Record".)
+//! The router model is an ordinary qualified `<model>@<backend>` reference, run
+//! through the shared chore runner ([`crate::utility`]) — so an engine-backed
+//! reference takes the zero-spend path (what makes a local router genuinely
+//! free), while a remote (`eidola`) reference is allowed and **bills a normal
+//! inference on every triggering post**; any settings surface must say so
+//! plainly. The call is not a turn: nothing is persisted (see that module).
 //!
 //! # Testing
 //!
@@ -73,13 +67,10 @@
 //! deterministic across machines (Metal vs CPU kernels). It would live beside
 //! the other offline harnesses, not in `tests/`.
 
-use crate::Change;
 use crate::db;
 use crate::error::AppError;
-use crate::{
-    EidolaResolved, Inner, NotificationPlan, backends, estimate_charge_credits, fetch_models,
-    local_models, now_ms, process_refund, recover_refund,
-};
+use crate::utility::clip;
+use crate::{Inner, NotificationPlan};
 
 /// How many posts of the triggering post's upstream thread the router sees.
 /// Small on purpose — the router is a routing decision, not a reader.
@@ -137,19 +128,6 @@ Reply with exactly one JSON object and nothing else:
 
 Use the numbers shown in the CANDIDATES list. An empty list means nobody \
 responds.";
-
-/// Truncate to at most `max_bytes`, on a char boundary, marking the cut.
-fn clip(text: &str, max_bytes: usize) -> String {
-    let text = text.trim();
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
-}
 
 /// A participant's system prompt reduced to one clipped line — enough for the
 /// router to tell a code reviewer from a copy editor, cheap enough to send for
@@ -295,7 +273,7 @@ impl Inner {
 
         let prompt = build_router_prompt(&thread, &candidates);
         let reply = match self
-            .router_completion(&router_model, ROUTER_SYSTEM_PROMPT, &prompt)
+            .router_completion(&conn, &router_model, ROUTER_SYSTEM_PROMPT, &prompt)
             .await
         {
             Ok(reply) => reply,
@@ -373,267 +351,22 @@ impl Inner {
         Ok((thread, candidates))
     }
 
-    /// One non-streaming chat completion against the router model, routed
-    /// through the ordinary backend registry.
-    ///
-    /// This is **not a turn**: nothing is persisted, no action is written, no
-    /// engine lease outlives the call. Engine-backed and `openai` backends take
-    /// the zero-spend path; an `eidola` backend spends a credential and settles
-    /// its refund exactly like a turn's round would.
+    /// One non-streaming chat completion against the router model, through the
+    /// shared chore runner ([`crate::utility`]) — zero-spend for an
+    /// engine-backed or `openai` reference, spend-and-settle for an `eidola`
+    /// one. Persists nothing.
     async fn router_completion(
         &self,
+        db_conn: &turso::Connection,
         model_ref: &str,
         system: &str,
         user: &str,
     ) -> Result<String, AppError> {
-        let cfg = self.load_config();
-        let now = now_ms();
-        let db_conn = self.db_conn().await?;
-
-        let mref = backends::parse_model_ref(model_ref);
-        let backend = self.require_backend(&db_conn, &mref.backend_id).await?;
-        let kind =
-            backends::BackendKind::parse(&backend.kind).ok_or_else(|| AppError::Database {
-                message: format!("unknown backend kind `{}`", backend.kind),
-            })?;
-        let canonical = backends::qualified_model_id(&mref.model, &backend.id);
-
-        let messages = vec![
-            serde_json::json!({ "role": "system", "content": system }),
-            serde_json::json!({ "role": "user", "content": user }),
-        ];
-
-        // Held for the life of the call so the engine is not evicted underneath
-        // it; dropped on return.
-        let mut _engine_lease: Option<local_models::EngineLease> = None;
-
-        let (client, base_url, wire_model, pricing, external_auth) = match kind {
-            backends::BackendKind::Local | backends::BackendKind::LlamaCpp => {
-                let (engine_url, _ctx, lease) =
-                    match self.local.lease_engine(&backend.id, &mref.model) {
-                        Some(leased) => leased,
-                        None => {
-                            if kind == backends::BackendKind::LlamaCpp && !backend.auto_start {
-                                return Err(AppError::NotConfigured {
-                                    message: format!(
-                                        "router model `{canonical}` is not loaded and backend \
-                                         `{}` has auto-start disabled",
-                                        backend.id
-                                    ),
-                                });
-                            }
-                            self.load_local_model(&canonical).await?;
-                            self.local
-                                .lease_engine(&backend.id, &mref.model)
-                                .ok_or_else(|| AppError::LocalModel {
-                                    message: format!(
-                                        "router model `{canonical}` was unloaded while starting"
-                                    ),
-                                })?
-                        }
-                    };
-                _engine_lease = Some(lease);
-                let client = match &self.http_override {
-                    Some(c) => c.clone(),
-                    None => local_models::plain_http_client()?,
-                };
-                (client, engine_url, canonical.clone(), None, None)
-            }
-            backends::BackendKind::OpenAi => {
-                let base_url = backend
-                    .base_url
-                    .clone()
-                    .ok_or_else(|| AppError::NotConfigured {
-                        message: format!("backend `{}` has no base URL", backend.id),
-                    })?;
-                let client = match &self.http_override {
-                    Some(c) => c.clone(),
-                    None => local_models::plain_http_client()?,
-                };
-                let auth = backend.api_key.as_ref().map(|k| format!("Bearer {k}"));
-                (client, base_url, mref.model.clone(), None, auth)
-            }
-            backends::BackendKind::Eidola => {
-                let eidola = EidolaResolved::from_row(Some(&backend))?;
-                // No attestation observer: the handshake is still verified,
-                // but a router call writes no rows to hang a record from.
-                let client = self.build_client(&cfg, &eidola, None).await?;
-                let models = fetch_models(&client, &eidola.base_url).await?;
-                let entry = models
-                    .data
-                    .iter()
-                    .find(|m| m.id == mref.model)
-                    .ok_or_else(|| AppError::NotConfigured {
-                        message: format!("router model not found: {canonical}"),
-                    })?;
-                let pricing = (
-                    entry.pricing.per_prompt_token.value as u128,
-                    entry.pricing.per_completion_token.value as u128,
-                    entry.pricing.per_prompt_token.scale_factor as u128,
-                );
-                (
-                    client,
-                    eidola.base_url.clone(),
-                    mref.model.clone(),
-                    Some(pricing),
-                    None,
-                )
-            }
-        };
-
-        // The spend side runs only for a remote (eidola) router.
-        let mut spend = None;
-        let auth_value = match pricing {
-            None => external_auth,
-            Some(pricing) => {
-                // A router call advertises no tools, so the tool-schema term
-                // of the pricing contract is the empty slice.
-                let charge =
-                    estimate_charge_credits(&messages, &[], MAX_COMPLETION_TOKENS, pricing);
-                if charge == 0 {
-                    return Err(AppError::Credential {
-                        message: "computed router charge is zero — model pricing may be missing"
-                            .into(),
-                    });
-                }
-                let (prep, auth) = self.acquire_spend(&cfg, &db_conn, charge, now).await?;
-                spend = Some(prep);
-                Some(auth)
-            }
-        };
-
-        let body = serde_json::json!({
-            "model": wire_model,
-            "messages": messages,
-            "max_completion_tokens": MAX_COMPLETION_TOKENS,
-        });
-
-        let mut request = client
-            .post(format!("{base_url}/v1/chat/completions"))
-            .json(&body);
-        if let Some(auth) = &auth_value {
-            request = request.header("Authorization", auth);
-        }
-
-        let response = match request.send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                // The server may have received the request: recover the refund
-                // rather than abandoning the credential.
-                self.settle_router_refund(
-                    &db_conn,
-                    &spend,
-                    &auth_value,
-                    &client,
-                    &base_url,
-                    None,
-                    now,
-                )
-                .await;
-                return Err(AppError::from_request(e));
-            }
-        };
-        let status = response.status();
-        // The body read can fail *after* the request was accepted (a connection
-        // dropped mid-body). The hold is already placed at that point, so this
-        // must settle before it returns — exactly the discipline the chat
-        // transports keep on their own body-read failures. Leaking out of here
-        // would strand the credential in `spending`, and the very next turn
-        // would burn its bounded provisioning wait on a refund that is never
-        // coming.
-        let text = match response.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                self.settle_router_refund(
-                    &db_conn,
-                    &spend,
-                    &auth_value,
-                    &client,
-                    &base_url,
-                    None,
-                    now,
-                )
-                .await;
-                return Err(AppError::Network {
-                    message: format!("failed to read the router response: {e}"),
-                });
-            }
-        };
-        let parsed: serde_json::Value =
-            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-
-        self.settle_router_refund(
-            &db_conn,
-            &spend,
-            &auth_value,
-            &client,
-            &base_url,
-            parsed.get("refund"),
-            now,
-        )
-        .await;
-
-        if !status.is_success() {
-            return Err(AppError::Server {
-                status: status.as_u16(),
-                message: crate::parse_server_error_message(&text),
-            });
-        }
-
-        Ok(parsed
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or_default()
-            .to_string())
-    }
-
-    /// Settle a remote router call's credential: apply the inline refund when
-    /// the response carried one, otherwise try the recovery endpoint. A no-op
-    /// for the zero-spend backends. Best-effort throughout — a router call must
-    /// never turn a wallet hiccup into a failed post.
-    #[allow(clippy::too_many_arguments)]
-    async fn settle_router_refund(
-        &self,
-        db_conn: &turso::Connection,
-        spend: &Option<crate::SpendPrep>,
-        auth_value: &Option<String>,
-        client: &reqwest::Client,
-        base_url: &str,
-        inline: Option<&serde_json::Value>,
-        now: i64,
-    ) {
-        let Some(spend) = spend else { return };
-        let refund_obj = match inline {
-            Some(obj) => Some(obj.clone()),
-            None => match auth_value {
-                Some(auth) => recover_refund(client, base_url, auth).await.ok(),
-                None => None,
-            },
-        };
-        let Some(refund_obj) = refund_obj else {
-            eprintln!("warning: the may-decline router's credential refund could not be recovered");
-            return;
-        };
-        let applied = process_refund(
-            &refund_obj,
-            &spend.params,
-            &spend.spend_proof,
-            &spend.pre_refund,
-            &spend.public_key,
-            db_conn,
-            &spend.pre_cred_id,
-            spend.cred.generation + 1,
-            now,
-        )
-        .await;
-        match applied {
-            Ok(()) => self.bus.emit(Change::Wallet),
-            Err(e) => eprintln!("warning: the may-decline router's refund failed to apply: {e}"),
-        }
+        let target = self
+            .resolve_utility_target(db_conn, model_ref, "router")
+            .await?;
+        self.utility_completion(db_conn, &target, system, user, MAX_COMPLETION_TOKENS)
+            .await
     }
 }
 
@@ -738,14 +471,5 @@ mod tests {
         let digest = persona_digest(Some(&long)).unwrap();
         assert!(digest.ends_with('…'));
         assert!(digest.len() <= PERSONA_MAX_BYTES + 4);
-    }
-
-    #[test]
-    fn clipping_respects_char_boundaries() {
-        // A 3-byte char straddling the budget must not panic or split.
-        let text = "★".repeat(10);
-        let clipped = clip(&text, 8);
-        assert!(clipped.ends_with('…'));
-        assert!(clipped.is_char_boundary(clipped.len() - '…'.len_utf8()));
     }
 }
