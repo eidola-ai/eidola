@@ -1246,7 +1246,8 @@ fn a_declining_agent_writes_a_decision_and_suppresses_the_post() {
             ..MockConfig::default()
         });
         with_account(&core);
-        core.register_tool(eidola_app_core::decline::decline_tool());
+        core.register_tool(eidola_app_core::decline::decline_tool())
+            .expect("decline is not a reserved name");
 
         let (space, post) = space_with_two_candidates(&core);
         let agent = agent_id(&core, &space, "All-Agent");
