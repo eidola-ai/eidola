@@ -1586,3 +1586,836 @@ fn non_2xx_with_failed_refund_recovery_still_errors_and_emits_record() {
         );
     });
 }
+
+// ===========================================================================
+// Tool-calling turns (task 20)
+//
+// The turn is a bounded agentic loop: the model either answers or asks for
+// tools, and a tool round persists a `tool_call` / `tool_result` pair, appends
+// the results to the in-flight messages array, and runs again — at most
+// `MAX_TURN_ROUNDS` model requests per turn.
+//
+// `get_space_tree` filters trace action types out of the render by design, so
+// these assertions read the raw rows through `test_space_actions`.
+// ===========================================================================
+
+use chat_harness::{TOOL_FINAL_CONTENT, TOOL_NAME, tool_call_id, tool_result_text};
+use eidola_app_core::tools::EchoTool;
+
+/// Register the harness's echo tool — the only thing that makes a turn send
+/// `tools` at all.
+fn with_echo_tool(core: &AppCore) {
+    core.register_tool(std::sync::Arc::new(EchoTool));
+}
+
+/// A turn whose registry is empty must send **no** `tools` field: the whole
+/// point of the omission is that a registry-less install's requests stay
+/// byte-identical to the pre-tools shape (upstream prefix caches, pinned-bytes
+/// tests).
+#[test]
+fn a_turn_with_no_registered_tools_sends_no_tools_field() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat succeeds");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].get("tools").is_none(),
+            "an empty registry must not add a `tools` key: {}",
+            bodies[0]
+        );
+        assert!(bodies[0].get("tool_choice").is_none());
+    });
+}
+
+/// Registering a tool adds exactly one OpenAI function schema to the request.
+#[test]
+fn a_registered_tool_is_advertised_as_a_function_schema() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        with_echo_tool(&core);
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat succeeds");
+
+        let bodies = mock.chat_bodies();
+        let tools = bodies[0]["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], TOOL_NAME);
+        assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+    });
+}
+
+/// The canonical two-round turn (blocking): round 1 asks for a tool, round 2
+/// answers. Pins the persisted rows — types, threading, content — and the
+/// exact shape of the follow-up request.
+#[test]
+fn two_round_blocking_turn_persists_tool_call_and_result_actions() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let mut rx = core.subscribe_changes();
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("tool turn succeeds");
+
+        assert_eq!(result.content, TOOL_FINAL_CONTENT);
+        assert_eq!(mock.chat_hits(), 2, "one HTTP request per round");
+
+        // --- persisted rows ------------------------------------------------
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(result.space_id.clone()))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["user_input", "tool_call", "tool_result", "inference"],
+            "the round's trace is persisted between the post and the answer"
+        );
+
+        let post = &actions[0];
+        let call = &actions[1];
+        let tool_result = &actions[2];
+        let inference = &actions[3];
+
+        // Threading: the trace chains off the post, and the inference replies
+        // to the post — never to the trace. That is what makes the trace
+        // collapse out of `get_space_tree` without orphaning the answer.
+        assert_eq!(call.reply_to.as_deref(), Some(post.id.as_str()));
+        assert_eq!(tool_result.reply_to.as_deref(), Some(call.id.as_str()));
+        assert_eq!(inference.reply_to.as_deref(), Some(post.id.as_str()));
+
+        // The tool_call action carries one `tool_use` block naming the tool,
+        // its call id, and the raw argument string.
+        let blocks: Vec<&str> = call.blocks.iter().map(|b| b.block_type.as_str()).collect();
+        assert_eq!(blocks, vec!["tool_use"]);
+        assert_eq!(call.blocks[0].tool_name.as_deref(), Some(TOOL_NAME));
+        assert_eq!(
+            call.blocks[0].tool_call_id.as_deref(),
+            Some(tool_call_id(1).as_str())
+        );
+        assert_eq!(
+            call.blocks[0].data.as_deref(),
+            Some(r#"{"text":"round-1"}"#)
+        );
+        // Each round is its own priced request, so each round's action carries
+        // its own hold.
+        assert!(call.credits_consumed.unwrap_or(0) > 0);
+        assert_eq!(call.status, "complete");
+
+        // The tool_result action carries the echoed text keyed by call id.
+        assert_eq!(tool_result.blocks.len(), 1);
+        assert_eq!(tool_result.blocks[0].block_type, "tool_result");
+        assert_eq!(
+            tool_result.blocks[0].tool_call_id.as_deref(),
+            Some(tool_call_id(1).as_str())
+        );
+        assert_eq!(
+            tool_result.blocks[0].text_content.as_deref(),
+            Some(tool_result_text(1).as_str())
+        );
+        // Tools run locally — nothing was purchased for them.
+        assert_eq!(tool_result.credits_consumed, None);
+        assert_eq!(tool_result.model, None);
+
+        // --- the follow-up request ------------------------------------------
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        let msgs = bodies[1]["messages"].as_array().expect("messages");
+        let last_two = &msgs[msgs.len() - 2..];
+        assert_eq!(last_two[0]["role"], "assistant");
+        assert_eq!(last_two[0]["content"], serde_json::Value::Null);
+        // The call object is replayed verbatim, ids and all.
+        assert_eq!(last_two[0]["tool_calls"][0]["id"], tool_call_id(1));
+        assert_eq!(last_two[0]["tool_calls"][0]["function"]["name"], TOOL_NAME);
+        assert_eq!(last_two[1]["role"], "tool");
+        assert_eq!(last_two[1]["tool_call_id"], tool_call_id(1));
+        assert_eq!(last_two[1]["content"], tool_result_text(1));
+        // Tool messages are raw — a tool result is not a post and must not
+        // wear a `#<handle> · <label>` header.
+        assert!(
+            !last_two[1]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with('#'),
+        );
+        // Both rounds advertise the same tool set.
+        assert_eq!(bodies[1]["tools"].as_array().map(|a| a.len()), Some(1));
+
+        // The rendered thread shows only the two posts — the trace collapses.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(result.space_id.clone()))
+            .expect("tree");
+        let tree_kinds: Vec<&str> = tree.iter().map(|n| n.action_type.as_str()).collect();
+        assert_eq!(tree_kinds, vec!["user_input", "inference"]);
+
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Space(result.space_id.clone())));
+        assert!(changes.contains(&Change::Record));
+        assert!(changes.contains(&Change::Wallet));
+    });
+}
+
+/// Each round acquires its **own** ACT hold: the protocol consumes a
+/// credential per request (the spend proof is bound to that credential and
+/// that charge), so a hold cannot be reused. Two rounds ⇒ two distinct
+/// credential nonces on the request rows, and `credits_charged` is their sum.
+#[test]
+fn each_tool_round_acquires_its_own_hold() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("tool turn succeeds");
+
+        // Two `PrivateToken` headers, and they differ — each round proved a
+        // fresh spend.
+        let auths: Vec<String> = mock
+            .chat_auth_values()
+            .into_iter()
+            .map(|a| a.expect("every eidola round sends an ACT header"))
+            .collect();
+        assert_eq!(auths.len(), 2);
+        assert!(auths.iter().all(|a| a.starts_with("PrivateToken token=")));
+        assert_ne!(auths[0], auths[1], "each round proves its own spend");
+
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        let chat_rows: Vec<_> = requests
+            .iter()
+            .filter(|r| r.path == "/v1/chat/completions")
+            .collect();
+        assert_eq!(chat_rows.len(), 2, "one request row per round");
+        let nonces: std::collections::HashSet<_> = chat_rows
+            .iter()
+            .filter_map(|r| r.credential_nonce.clone())
+            .collect();
+        assert_eq!(nonces.len(), 2, "each round spent a different credential");
+
+        // The reported charge is the sum of the rounds' holds.
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(result.space_id.clone()))
+            .expect("raw actions");
+        let per_round: i64 = actions
+            .iter()
+            .filter_map(|a| a.credits_consumed)
+            .sum::<i64>();
+        assert_eq!(result.credits_charged, per_round);
+    });
+}
+
+/// The SSE twin: a tool call assembled from four partial deltas (function name
+/// in two pieces, arguments in two) drives exactly the same loop.
+#[test]
+fn streamed_tool_call_is_assembled_across_deltas() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsStreaming(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let (tx, mut rx_events) = tokio::sync::mpsc::unbounded_channel();
+        let result = core
+            .runtime()
+            .block_on(core.chat_stream("use the tool".into(), MODEL.into(), None, tx))
+            .expect("streaming tool turn succeeds");
+
+        assert_eq!(result.content, TOOL_FINAL_CONTENT);
+        assert_eq!(mock.chat_hits(), 2);
+
+        // The tool round is an invisible pause: the caller only ever sees the
+        // final round's deltas (the tool round emitted no content).
+        let mut streamed = String::new();
+        while let Ok(ev) = rx_events.try_recv() {
+            if let ChatStreamEvent::ContentDelta(d) = ev {
+                streamed.push_str(&d);
+            }
+        }
+        assert_eq!(streamed, TOOL_FINAL_CONTENT);
+
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(result.space_id.clone()))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["user_input", "tool_call", "tool_result", "inference"]
+        );
+        // The name and arguments were reassembled from their pieces.
+        assert_eq!(actions[1].blocks[0].tool_name.as_deref(), Some(TOOL_NAME));
+        assert_eq!(
+            actions[1].blocks[0].data.as_deref(),
+            Some(r#"{"text":"round-1"}"#)
+        );
+        assert_eq!(
+            actions[2].blocks[0].text_content.as_deref(),
+            Some(tool_result_text(1).as_str())
+        );
+    });
+}
+
+/// A model that keeps asking for tools hits the round cap. The turn ends with
+/// a typed `ToolLoop` error wrapped with the space id — never a silently
+/// truncated answer — and every round it did run stays persisted.
+#[test]
+fn round_cap_ends_the_turn_honestly_with_the_rounds_persisted() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            // Never stops asking.
+            chat: ChatBehavior::ToolRoundsBlocking(u64::MAX),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("loop forever".into(), MODEL.into(), None))
+            .expect_err("the round cap must fail the turn");
+
+        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        assert!(
+            matches!(err.root(), AppError::ToolLoop { .. }),
+            "expected a typed ToolLoop error, got {err:?}"
+        );
+
+        // Exactly the cap's worth of model requests, no more.
+        assert_eq!(mock.chat_hits(), eidola_app_core::MAX_TURN_ROUNDS as u64);
+
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(space_id.clone()))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        // The post, then (cap - 1) executed rounds, then the capped round's
+        // tool_call — whose tools were deliberately NOT executed, because their
+        // results could never be sent.
+        let mut expected = vec!["user_input"];
+        for _ in 1..eidola_app_core::MAX_TURN_ROUNDS {
+            expected.push("tool_call");
+            expected.push("tool_result");
+        }
+        expected.push("tool_call");
+        assert_eq!(kinds, expected);
+        assert!(
+            !kinds.contains(&"inference"),
+            "no answer was produced, so no inference may be persisted"
+        );
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space_id)),
+            "got {changes:?}"
+        );
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+    });
+}
+
+/// The per-turn `budget` is checked **per round**: round 1 fits, round 2's
+/// estimate over the grown messages array does not. The turn fails with a
+/// typed error and round 1 stays durable.
+#[test]
+fn budget_exceeded_mid_loop_fails_with_the_first_round_persisted() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(u64::MAX),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let mut rx = core.subscribe_changes();
+
+        // Find round 1's exact estimate by running an unbudgeted single-round
+        // turn against the same mock pricing, then budget exactly that: round 1
+        // fits, round 2 (a strictly longer messages array) cannot.
+        let probe = core
+            .runtime()
+            .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, i64::MAX))
+            .expect_err("the probe also hits the cap eventually");
+        let probe_space = probe.chat_space_id().expect("space id").to_string();
+        let round1 = core
+            .runtime()
+            .block_on(core.test_space_actions(probe_space))
+            .expect("raw actions")
+            .into_iter()
+            .find(|a| a.action_type == "tool_call")
+            .and_then(|a| a.credits_consumed)
+            .expect("round 1 recorded its hold");
+
+        let hits_before = mock.chat_hits();
+        drain(&mut rx);
+
+        let err = core
+            .runtime()
+            .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, round1))
+            .expect_err("round 2 must exceed the budget");
+        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        let message = err.to_string();
+        assert!(
+            matches!(err.root(), AppError::Credential { .. }),
+            "expected the budget refusal, got {err:?}"
+        );
+        assert!(message.contains("budget"), "got {message}");
+
+        // Only round 1 was sent; the budget stopped round 2 before the wire.
+        assert_eq!(mock.chat_hits(), hits_before + 1);
+
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(space_id.clone()))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["user_input", "tool_call", "tool_result"],
+            "the round that did run is durable"
+        );
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space_id)),
+            "got {changes:?}"
+        );
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+    });
+}
+
+/// A tool call with no `id` is structurally unusable — there is nothing to
+/// execute and nothing that can be written as a `tool_use` block (the schema
+/// requires the id). The turn fails honestly, records the raw exchange, and
+/// does not panic.
+#[test]
+fn structurally_malformed_tool_call_fails_the_turn_honestly() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolCallMalformed,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("break it".into(), MODEL.into(), None))
+            .expect_err("a malformed tool call must fail the turn");
+        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        assert!(
+            matches!(err.root(), AppError::ToolLoop { .. }),
+            "expected a typed ToolLoop error, got {err:?}"
+        );
+        assert_eq!(mock.chat_hits(), 1, "the loop stops at the bad round");
+
+        // No action could be written, but the raw exchange is still in the
+        // Record (attached to no action).
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(space_id.clone()))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(kinds, vec!["user_input"]);
+
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.path == "/v1/chat/completions")
+                .count(),
+            1,
+            "the unusable round's raw exchange is recorded (attached to no action, \
+             since only the post exists)"
+        );
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space_id)),
+            "got {changes:?}"
+        );
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+    });
+}
+
+/// Arguments that aren't valid JSON are a *model* mistake, not a turn failure:
+/// the loop reports the parse error back as the tool result and carries on, so
+/// the model can correct itself on the next round.
+#[test]
+fn invalid_tool_arguments_are_reported_back_to_the_model() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolCallBadArguments,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("bad args".into(), MODEL.into(), None))
+            .expect("the turn survives a model argument mistake");
+        assert_eq!(result.content, TOOL_FINAL_CONTENT);
+        assert_eq!(mock.chat_hits(), 2);
+
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(result.space_id.clone()))
+            .expect("raw actions");
+        let tool_result = actions
+            .iter()
+            .find(|a| a.action_type == "tool_result")
+            .expect("a tool_result action");
+        // The failure is visible in the trail…
+        assert_eq!(tool_result.status, "error");
+        let text = tool_result.blocks[0]
+            .text_content
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            text.starts_with("error: arguments are not valid JSON"),
+            "got {text}"
+        );
+        // …and it is exactly what the model was shown.
+        let bodies = mock.chat_bodies();
+        let msgs = bodies[1]["messages"].as_array().expect("messages");
+        assert_eq!(msgs[msgs.len() - 1]["content"], text);
+    });
+}
+
+/// An unknown tool name is likewise a model mistake, reported as a tool error
+/// rather than failing the turn — this is the path a registry-mismatch takes.
+#[test]
+fn unknown_tool_name_is_reported_back_to_the_model() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        // Deliberately register nothing… but then the request would carry no
+        // `tools` and the mock would still call one. That is exactly the
+        // registry-mismatch case: a model calling a tool we don't have.
+        let result = core
+            .runtime()
+            .block_on(core.chat("call something".into(), MODEL.into(), None))
+            .expect("the turn survives an unknown tool");
+        assert_eq!(result.content, TOOL_FINAL_CONTENT);
+        assert_eq!(mock.chat_hits(), 2);
+
+        let bodies = mock.chat_bodies();
+        assert!(bodies[0].get("tools").is_none());
+        let msgs = bodies[1]["messages"].as_array().expect("messages");
+        let last = msgs[msgs.len() - 1]["content"].as_str().unwrap_or_default();
+        assert!(last.starts_with("error: unknown tool `echo`"), "got {last}");
+    });
+}
+
+/// A later turn's context never replays a prior turn's tool traffic: the
+/// upstream renderer keeps only post-bearing action types, so the second ask
+/// sees the two posts and nothing else.
+#[test]
+fn a_later_turns_context_does_not_replay_tool_traffic() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("first turn succeeds");
+        // Rounds 1-2 are the first turn; the mock answers plainly from here on
+        // (its scripted tool round is spent).
+        core.runtime()
+            .block_on(core.chat(
+                "and now?".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+            ))
+            .expect("second turn succeeds");
+
+        let bodies = mock.chat_bodies();
+        let last = bodies.last().expect("a third request");
+        let roles: Vec<String> = last["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            !roles.contains(&"tool".to_string()),
+            "a later turn must not replay tool results: {roles:?}"
+        );
+        assert!(
+            last["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m.get("tool_calls").is_none()),
+            "a later turn must not replay tool calls"
+        );
+        assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
+    });
+}
+
+/// A turn that ended on a trace (the round cap) leaves a `tool_result` as the
+/// literal newest action in the space. The next post must still continue the
+/// **thread**, not hang off that trace — `db::last_action_in_space` returns the
+/// last *post*, so the space keeps one root instead of silently growing a
+/// second.
+#[test]
+fn a_post_after_a_trace_ending_turn_threads_under_the_last_post() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(u64::MAX),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("loop forever".into(), MODEL.into(), None))
+            .expect_err("the round cap fails the turn");
+        let space_id = err.chat_space_id().expect("space id").to_string();
+
+        core.runtime()
+            .block_on(core.post("still there?".into(), Some(space_id.clone())))
+            .expect("a follow-up post");
+
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(space_id.clone()))
+            .expect("raw actions");
+        let first_post = actions
+            .iter()
+            .find(|a| a.action_type == "user_input")
+            .expect("the original post");
+        let follow_up = actions
+            .iter()
+            .rfind(|a| a.action_type == "user_input")
+            .expect("the follow-up post");
+        assert_ne!(first_post.id, follow_up.id);
+        assert_eq!(
+            follow_up.reply_to.as_deref(),
+            Some(first_post.id.as_str()),
+            "the follow-up continues the thread, not the abandoned trace"
+        );
+
+        // One thread, two posts — the trace stays invisible.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space_id))
+            .expect("tree");
+        let kinds: Vec<&str> = tree.iter().map(|n| n.action_type.as_str()).collect();
+        assert_eq!(kinds, vec!["user_input", "user_input"]);
+        assert!(tree.iter().all(|n| !n.is_branch));
+    });
+}
+
+/// A `tool_calls` value that is present and non-null but **not an array** is
+/// structurally unusable — there is nothing to execute and nothing that can be
+/// written as a `tool_use` block. It must take the same honest `ToolLoop` exit
+/// as a call with no id, never be read as "the model requested no tools" and
+/// persisted as a successful (empty) answer.
+#[test]
+fn non_array_tool_calls_fails_the_turn_rather_than_answering_empty() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolCallsNotAnArray,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("break it".into(), MODEL.into(), None))
+            .expect_err("a non-array tool_calls must fail the turn");
+        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        assert!(
+            matches!(err.root(), AppError::ToolLoop { .. }),
+            "expected a typed ToolLoop error, got {err:?}"
+        );
+        assert_eq!(mock.chat_hits(), 1);
+
+        // Critically: no `inference` was persisted. The bug this pins would
+        // have committed an empty answer as a successful turn.
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(space_id.clone()))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(kinds, vec!["user_input"]);
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space_id)),
+            "got {changes:?}"
+        );
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+    });
+}
+
+/// The streaming twin: a `delta.tool_calls` that is present and non-null but
+/// not an array takes the same exit.
+#[test]
+fn non_array_streamed_tool_calls_fails_the_turn() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolCallsNotAnArrayStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let mut rx = core.subscribe_changes();
+
+        let (tx, _rx_events) = tokio::sync::mpsc::unbounded_channel();
+        let err = core
+            .runtime()
+            .block_on(core.chat_stream("break it".into(), MODEL.into(), None, tx))
+            .expect_err("a non-array delta.tool_calls must fail the turn");
+        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        assert!(
+            matches!(err.root(), AppError::ToolLoop { .. }),
+            "expected a typed ToolLoop error, got {err:?}"
+        );
+        assert_eq!(mock.chat_hits(), 1);
+
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(space_id.clone()))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(kinds, vec!["user_input"]);
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space_id)),
+            "got {changes:?}"
+        );
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+    });
+}
+
+/// …but an explicit `"tool_calls": null` means "no tools" and stays an
+/// ordinary success. Some providers always emit the key; rejecting that would
+/// break every turn against them.
+#[test]
+fn explicitly_null_tool_calls_is_an_ordinary_completion() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolCallsNull,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("a null tool_calls is not an error");
+        assert_eq!(result.content, chat_harness::TOOL_FINAL_CONTENT);
+
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(result.space_id))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(kinds, vec!["user_input", "inference"]);
+    });
+}
+
+/// Streamed tool calls honor the same provider-field preservation contract as
+/// blocking ones: the follow-up assistant message replays every field the
+/// provider sent, not just the canonical `id` / `type` / `function` triple.
+///
+/// Also pins the merge rule for fields that arrive more than once — **last
+/// non-null wins**, shallow, at both levels — and that the streaming-only
+/// `index` framing key is not replayed.
+#[test]
+fn streamed_tool_calls_preserve_provider_specific_fields() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsStreamingWithExtras(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let (tx, _rx_events) = tokio::sync::mpsc::unbounded_channel();
+        let result = core
+            .runtime()
+            .block_on(core.chat_stream("use the tool".into(), MODEL.into(), None, tx))
+            .expect("streaming tool turn succeeds");
+        assert_eq!(result.content, chat_harness::TOOL_FINAL_CONTENT);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        let msgs = bodies[1]["messages"].as_array().expect("messages");
+        let call = &msgs[msgs.len() - 2]["tool_calls"][0];
+
+        // Canonical fields still assembled from their fragments.
+        assert_eq!(call["id"], tool_call_id(1));
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], TOOL_NAME);
+        assert_eq!(call["function"]["arguments"], r#"{"text":"round-1"}"#);
+
+        // Provider fields survive — including a nested object, which no
+        // concatenating merge could reproduce.
+        assert_eq!(
+            call["trace"]["span"], "s1",
+            "a structured provider field must be replayed intact: {call}"
+        );
+        // Restated fields take the latest value (last-wins), at both levels.
+        assert_eq!(
+            call["provider_tag"], "beta",
+            "a restated top-level provider field is last-wins: {call}"
+        );
+        assert_eq!(
+            call["function"]["cache_key"], "k2",
+            "a restated function-level provider field is last-wins: {call}"
+        );
+
+        // `index` is the SSE fragment key, not part of the assembled call.
+        assert!(
+            call.get("index").is_none(),
+            "the streaming framing key must not be replayed: {call}"
+        );
+    });
+}
