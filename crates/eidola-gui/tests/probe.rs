@@ -968,6 +968,48 @@ fn stub_spend(request_id: &str) -> SpendTrailEntry {
 }
 
 #[gpui::test]
+fn listing_rows_are_positioned_among_data_rows_only(cx: &mut TestAppContext) {
+    // `aria_position_in_set` / `aria_size_of_set` don't pass through `.probe()`,
+    // so the view exposes what it would report. The trap this guards: the
+    // display model interleaves spending group headers and a trailing
+    // load-more row, so positioning by *display* index announces the first
+    // spending entry as "2 of N" and counts the button as an extra item.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+
+    // Attestations with `has_more`: the load-more row must not inflate the set.
+    view.update(cx, |v, _| {
+        v.set_attestations_for_test(
+            vec![stub_attestation("att-1"), stub_attestation("att-2")],
+            true,
+        );
+    });
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.row_set_metadata_for_test(), vec![(1, 2), (2, 2)]);
+    });
+
+    // Spending groups by credential: two nonces means two interleaved headers,
+    // and the data rows must still read 1..=N contiguously.
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Spending, cx);
+        let mut second = stub_spend("req-2");
+        second.credential_nonce = "nonce-2".into();
+        let mut third = stub_spend("req-3");
+        third.credential_nonce = "nonce-2".into();
+        v.set_spending_for_test(vec![stub_spend("req-1"), second, third], true);
+    });
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.row_set_metadata_for_test(), vec![(1, 3), (2, 3), (3, 3)]);
+    });
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
 fn record_probes_cover_rows_tabs_and_chrome(cx: &mut TestAppContext) {
     let _guard = probes_on();
 
