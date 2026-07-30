@@ -654,6 +654,7 @@ mod driver {
                 id: eidola_app_core::DEFAULT_TEMPLATE_ID.into(),
                 title: "Default".into(),
                 cascade_limit: 4,
+                router_model: None,
                 participants: vec![TemplateParticipantInfo {
                     id: "t-default-1".into(),
                     label: "Assistant".into(),
@@ -666,6 +667,7 @@ mod driver {
                 id: "tmpl-research".into(),
                 title: "Research panel".into(),
                 cascade_limit: 6,
+                router_model: None,
                 participants: vec![
                     TemplateParticipantInfo {
                         id: "t-research-1".into(),
