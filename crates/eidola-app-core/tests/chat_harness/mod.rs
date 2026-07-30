@@ -781,7 +781,7 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
     let client = reqwest::Client::builder()
         .build()
         .expect("plain http client");
-    let core = AppCore::with_test_http_client(config_dir, data_dir, client);
+    let core = AppCore::with_test_http_client(config_dir, data_dir, client).expect("open core");
     let mock = core.runtime().block_on(async { start(config).await });
     core.runtime()
         .block_on(core.set_base_url(mock.base_url.clone()))

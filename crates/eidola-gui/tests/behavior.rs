@@ -1822,10 +1822,9 @@ fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let _dir = tempfile::tempdir().unwrap();
-    let core = std::sync::Arc::new(AppCore::new(
-        _dir.path().to_path_buf(),
-        _dir.path().join("data"),
-    ));
+    let core = std::sync::Arc::new(
+        AppCore::new(_dir.path().to_path_buf(), _dir.path().join("data")).expect("open core"),
+    );
     core.runtime()
         .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
         .unwrap();
@@ -5536,10 +5535,9 @@ fn participants_scene(
     cx.executor().allow_parking();
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let dir = tempfile::tempdir().unwrap();
-    let core = std::sync::Arc::new(AppCore::new(
-        dir.path().to_path_buf(),
-        dir.path().join("data"),
-    ));
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
     core.runtime()
         .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
         .unwrap();
