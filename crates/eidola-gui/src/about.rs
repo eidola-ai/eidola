@@ -60,8 +60,17 @@ impl Render for AboutView {
             )
             .child(div().w(rems(3.)).h(px(1.)).bg(theme.border));
 
-        // Version line: muted, italic, small — unobtrusive.
+        // Version line: muted, italic, small — unobtrusive. Unobtrusive is not
+        // absent, though: it carries the version as its accessible value, so
+        // "which build am I running" is answerable without sighted reading.
         let version = div()
+            .id("about-version")
+            .probe_value(
+                "about/version",
+                gpui::Role::Label,
+                "Version",
+                SharedString::from(format!("v{VERSION}")),
+            )
             .text_sm()
             .italic()
             .text_color(theme.muted_foreground)

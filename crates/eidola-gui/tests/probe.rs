@@ -367,6 +367,267 @@ fn minimap_labels_read_as_prose_not_markdown(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+// ---------------------------------------------------------------------------
+// Content exposure (wave C) — the tree stops being affordances-only.
+//
+// Everything here asserts the **value** channel as well as the role and name,
+// because the content is the point: a post whose text is absent, a balance
+// nobody can hear, an alert with no message. The audit's §4 rule bounds it —
+// a value may only be bound to text that has settled.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn settled_posts_are_articles_carrying_their_text(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut timed = probe_post("a2", "*Republic* I, where the argument turns.");
+    timed.parent_action_id = Some("a1".into());
+    // 9:05 AM UTC — `fmt_clock` is timezone-free, so the byline time is
+    // deterministic on every machine.
+    timed.created_at = 9 * 3_600_000 + 5 * 60_000;
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the quick brown fox"), timed], cx)
+        });
+    });
+
+    let entries = fresh_entries(cx, window);
+    // An untimed row names its author alone; the value is the whole post.
+    assert_probe_value(
+        &entries,
+        "space/post/0",
+        gpui::Role::Article,
+        "You",
+        "the quick brown fox",
+    );
+    // Byline and time on one line — the gutter's stacked, node-less text.
+    // Markdown is punctuation to the ear, so the value is spoken prose.
+    assert_probe_value(
+        &entries,
+        "space/post/1",
+        gpui::Role::Article,
+        "You · 9:05 AM",
+        "Republic I, where the argument turns.",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_streaming_reply_is_not_an_article(cx: &mut TestAppContext) {
+    // The §4 trap: a value bound to streaming text makes assistive technology
+    // restart the whole reply on every token. A stream therefore contributes
+    // no node at all until it finalizes into a settled post.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the question")], cx);
+            s.push_streaming_turn_for_test(
+                Some("agent-b".into()),
+                Some("a1".into()),
+                Default::default(),
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    space.read_with(cx, |s, _| {
+        assert_eq!(s.streams().len(), 1, "a turn really is in flight");
+    });
+
+    let entries = fresh_entries(cx, window);
+    let articles: Vec<&String> = entries
+        .iter()
+        .filter(|(_, e)| e.role == gpui::Role::Article)
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(
+        articles,
+        vec!["space/post/0"],
+        "only the settled post is an article while a reply streams"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn space_failure_and_cascade_notices_are_alerts(cx: &mut TestAppContext) {
+    // Both notices used to be three unexplained buttons — the message itself
+    // was a node-less div. The message is the **value** (the channel the macOS
+    // adapter announces from once `aria_live` exists upstream).
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the question")], cx);
+            s.emit_cascade_paused_for_test(4, 4, "a1".into(), cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/cascade",
+        gpui::Role::Alert,
+        "Replies paused",
+        "Replies paused — the conversation reached its cascade limit (4). \
+         Ask to continue.",
+    );
+
+    // A failure outranks the pause (both bottom-anchor; an error is more
+    // urgent), so only the failure notice is in the tree afterwards.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.push_streaming_turn_for_test(
+                Some("agent-b".into()),
+                Some("a1".into()),
+                Default::default(),
+                cx,
+            );
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                eidola_app_core::error::AppError::Network {
+                    message: "connection reset".into(),
+                },
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/error",
+        gpui::Role::Alert,
+        "Request failed",
+        "network error: connection reset",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "space/cascade"),
+        "the failure notice replaces the pause notice"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn account_balance_pools_and_plan_sublines_carry_their_values(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.balances = Some(BalancesResult {
+            available: 4_200_000,
+            pools: vec![eidola_app_core::BalancePoolInfo {
+                amount: 1_000_000,
+                source: "purchase".into(),
+                // No expiry: `humanize_expiry` reads the real clock, and its
+                // buckets have their own unit tests.
+                expires_at: None,
+            }],
+        });
+        s.prices = vec![PriceInfo {
+            id: "price_once".into(),
+            product_name: "One-time".into(),
+            product_description: None,
+            amount_display: "$5".into(),
+            recurrence: "".into(),
+            credits: 5_000_000,
+        }];
+        s.backends = backends_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "settings/account/balance",
+        gpui::Role::Label,
+        "Balance",
+        "4,200,000 credits available",
+    );
+    assert_probe_value(
+        &entries,
+        "settings/account/pool/0",
+        gpui::Role::Label,
+        "Credit pool 1",
+        "purchase — 1,000,000 credits",
+    );
+    // The plan row keeps its name/price name; the subline — credits and the
+    // expiry disclosure that must stay visible at the point of purchase — is
+    // the value.
+    assert_probe_value(
+        &entries,
+        "settings/account/plan/0",
+        gpui::Role::ListBoxOption,
+        "One-time — $5",
+        "5,000,000 credits, expire one year after purchase",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn the_build_version_is_readable_in_about_and_updates(cx: &mut TestAppContext) {
+    use eidola_gui::about::AboutView;
+    use eidola_gui::updates::UpdatesView;
+
+    let _guard = probes_on();
+
+    let version = env!("CARGO_PKG_VERSION");
+    let (about, _view) = open_view(cx, |window, cx| cx.new(|cx| AboutView::new(window, cx)));
+    let entries = fresh_entries(cx, about);
+    assert_probe_value(
+        &entries,
+        "about/version",
+        gpui::Role::Label,
+        "Version",
+        &format!("v{version}"),
+    );
+
+    let stores = ready_stores(cx);
+    let (updates, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| UpdatesView::new(stores, window, cx))
+    });
+    let entries = fresh_entries(cx, updates);
+    assert_probe_value(
+        &entries,
+        "updates/version",
+        gpui::Role::Label,
+        "This build",
+        &format!("Eidola {version}"),
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn hash_labels_are_short_enough_to_hear(cx: &mut TestAppContext) {
     let _guard = probes_on();
@@ -439,10 +700,11 @@ fn fresh_names(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<String> 
 /// This is as deep as the regression gate reaches at the current gpui pin:
 /// `Window`'s emitted AccessKit `TreeUpdate` is crate-private, so nothing here
 /// (or in the driver) can observe tree *shape*, node parentage, or the aria
-/// attributes that don't pass through `.probe()` — `aria_position_in_set`,
-/// `aria_size_of_set`, `aria_value`, `aria_selected`. The probe registry is a
-/// faithful enumeration of the node set with its roles and names, and that is
-/// the whole seam. See `AGENTS.md` → Accessibility for the removal trigger.
+/// attributes that don't pass through `.probe()` / `.probe_value()` —
+/// `aria_position_in_set`, `aria_size_of_set`, `aria_selected`. The probe
+/// registry is a faithful enumeration of the node set with its roles, names and
+/// (since wave C) **values**, and that is the whole seam. See `AGENTS.md` →
+/// Accessibility for the removal trigger.
 fn fresh_entries(
     cx: &mut TestAppContext,
     window: AnyWindowHandle,
@@ -466,6 +728,26 @@ fn assert_probe(
     };
     assert_eq!(entry.role, role, "probe {name:?} role");
     assert_eq!(entry.label.as_ref(), label, "probe {name:?} label");
+}
+
+/// Assert role, label **and** accessible value — the content channel wave C
+/// added (`aria_value`). A `None` value here means the call site used the plain
+/// `probe`, i.e. the content never reaches assistive technology.
+#[track_caller]
+fn assert_probe_value(
+    entries: &[(String, probe::ProbeEntry)],
+    name: &str,
+    role: gpui::Role,
+    label: &str,
+    value: &str,
+) {
+    assert_probe(entries, name, role, label);
+    let (_, entry) = entries.iter().find(|(n, _)| n == name).unwrap();
+    assert_eq!(
+        entry.value.as_ref().map(|v| v.as_ref()),
+        Some(value),
+        "probe {name:?} value"
+    );
 }
 
 /// Force a frame on a test window. `window.refresh()` marks it dirty; the

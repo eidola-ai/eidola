@@ -17,6 +17,13 @@
 //! vocabulary, so annotating for AT and annotating for automated QA are the
 //! same act, and the two views of the UI can't drift apart.
 //!
+//! `probe_value(name, role, label, value)` is the same annotation plus the
+//! element's **content** (`aria_value`) — a settled post's text, a balance, an
+//! alert's message. It is recorded too, so the content channel is regression-
+//! tested at the call site rather than merely compile-checked (the emitted
+//! AccessKit tree is unobservable at this pin). Read the value rule in
+//! [`Probe::probe_value`] before wiring one to anything that changes often.
+//!
 //! gpui keeps its own per-frame bounds maps (`debug_bounds`, the AccessKit
 //! tree) crate-private on real-rendering windows, so the registry is recorded
 //! from inside the element tree using the public `canvas` idiom: an absolute,
@@ -46,6 +53,11 @@ pub struct ProbeEntry {
     pub role: Role,
     /// The accessible label given to the element.
     pub label: SharedString,
+    /// The accessible **value** (`aria_value`), when the call site set one via
+    /// [`Probe::probe_value`]. This is the content channel — a post's text, a
+    /// balance, an alert's message — as distinct from the label, which names
+    /// the element. `None` for a plain [`Probe::probe`].
+    pub value: Option<SharedString>,
     /// The element's bounds in window coordinates, as of the last frame in
     /// which it painted.
     pub bounds: Bounds<Pixels>,
@@ -119,8 +131,42 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         role: Role,
         label: impl Into<SharedString>,
     ) -> Self {
-        let label = label.into();
-        let this = self.role(role).aria_label(label.clone());
+        self.probe_inner(name, role, label.into(), None)
+    }
+
+    /// Like [`Probe::probe`], plus the element's accessible **value**
+    /// (`aria_value`) — the content channel AT reads on request, and the one
+    /// the macOS adapter announces from once a node is a live region.
+    ///
+    /// Use it wherever the element *has* content distinct from its name: a
+    /// settled post's text under a byline label, a balance figure under
+    /// "Balance", an alert's message. **Never bind it to text that mutates at
+    /// speed** (a streaming reply, a live editor buffer, a download counter):
+    /// assistive technology re-reads the whole value on every change of a
+    /// focused control, which turns annotation into noise. See the audit's §4
+    /// (`work/tasks/12a`).
+    fn probe_value(
+        self,
+        name: impl Into<SharedString>,
+        role: Role,
+        label: impl Into<SharedString>,
+        value: impl Into<SharedString>,
+    ) -> Self {
+        self.probe_inner(name, role, label.into(), Some(value.into()))
+    }
+
+    #[doc(hidden)]
+    fn probe_inner(
+        self,
+        name: impl Into<SharedString>,
+        role: Role,
+        label: SharedString,
+        value: Option<SharedString>,
+    ) -> Self {
+        let mut this = self.role(role).aria_label(label.clone());
+        if let Some(value) = value.clone() {
+            this = this.aria_value(value);
+        }
         if !probes_enabled() {
             return this;
         }
@@ -134,6 +180,7 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
                         ProbeEntry {
                             role,
                             label,
+                            value,
                             bounds,
                         },
                     );
