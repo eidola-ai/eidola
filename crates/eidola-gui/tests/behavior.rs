@@ -3042,6 +3042,37 @@ fn space_joins_shared_entity_for_same_id(cx: &mut TestAppContext) {
     v2.read_with(cx, |v, _| assert_eq!(v.post_count_for_test(), 1));
 }
 
+#[gpui::test]
+fn space_window_is_named_after_its_space(cx: &mut TestAppContext) {
+    // The window's accessible name (and its Window-menu entry) tracks the
+    // Library title: a blank ⌘N space is "New Space", a titled one carries its
+    // title, and a rename re-titles the window. `TestWindow` doesn't implement
+    // `get_title`, so the view's own record is the observable end of the call.
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![stub_space("s1", Some("Tides and the moon"), None, 0)];
+    });
+
+    let (blank_w, blank) = open_space(cx, &stores, None);
+    draw_window(cx, blank_w);
+    blank.read_with(cx, |v, _| {
+        assert_eq!(v.window_title_for_test(), Some("New Space"));
+    });
+
+    let (w, view) = open_space(cx, &stores, Some("s1".into()));
+    draw_window(cx, w);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.window_title_for_test(), Some("Tides and the moon"));
+    });
+
+    stores.spaces.update(cx, |s, cx| {
+        s.rename("s1".into(), "The moon and tides".into(), cx)
+    });
+    draw_window(cx, w);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.window_title_for_test(), Some("The moon and tides"));
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Separators — the band's Reply-or-Ask menu, and explicit asks (wave 3b).
 //
