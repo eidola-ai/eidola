@@ -504,6 +504,40 @@ impl MarkdownEditorState {
         out
     }
 
+    /// Test seam: what the embed for `ordinal` actually painted last frame —
+    /// every text piece as `(text, x, y)` in layout order, then the counts of
+    /// its non-text chrome. The marker glyphs of an embedded list (`• `,
+    /// `1. `, `☑ `) are pieces here and appear in no shaped line, so this is
+    /// the only way to assert them without eyeballing a snapshot.
+    ///
+    /// Returns `None` if that ordinal isn't a painted embed block.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn debug_embed_content(
+        &self,
+        ordinal: u64,
+    ) -> Option<(Vec<(String, f32, f32)>, EmbedChromeCounts)> {
+        let block = self
+            .last_blocks
+            .values()
+            .find(|b| b.embed_ordinal == Some(ordinal))?;
+        let content = block.embed_content.as_ref()?;
+        let pieces = content
+            .pieces
+            .iter()
+            .map(|(text, origin)| (text.to_string(), origin.x.as_f32(), origin.y.as_f32()))
+            .collect();
+        Some((
+            pieces,
+            EmbedChromeCounts {
+                code_panels: content.code_panels.len(),
+                math: content.math_origins.len(),
+                rules: content.rules.len(),
+                bars: content.bars.len(),
+            },
+        ))
+    }
+
     /// Diagnostic seam: the recorded (window-coordinate) line geometry from
     /// the last paint — `(block_index, [(origin_x, origin_y, wrapped_height)])`
     /// per block, sorted by block index.
@@ -2514,4 +2548,15 @@ mod tests {
         let text = "a\n\nb";
         assert_eq!(line_range_at(text, 2), 2..2);
     }
+}
+
+/// Counts of the non-text chrome an embed painted — the companion of
+/// [`MarkdownEditorState::debug_embed_content`]'s text pieces.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EmbedChromeCounts {
+    pub code_panels: usize,
+    pub math: usize,
+    pub rules: usize,
+    pub bars: usize,
 }
