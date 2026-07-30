@@ -173,7 +173,10 @@ pub(crate) fn flow_mark(cell: std::rc::Rc<std::cell::Cell<f32>>) -> impl IntoEle
 /// the same set that renders as quote blocks, so a marker the author defused
 /// (fenced) or one with no mapping stays in the preview as the literal text it
 /// literally is.
-fn strip_embed_blocks(content: &str, references: &[eidola_app_core::PostReference]) -> String {
+pub(crate) fn strip_embed_blocks(
+    content: &str,
+    references: &[eidola_app_core::PostReference],
+) -> String {
     let map = gpui_markdown_editor::EmbedMap::new(
         references
             .iter()
@@ -256,14 +259,19 @@ fn close_paragraph_gap(text: &mut String, seam: usize) {
 /// truncated on a word boundary with an ellipsis. The rail is an index, not a
 /// second copy of the quote — the body's embed block is where you read it.
 pub(crate) fn footnote_snippet(text: &str) -> String {
-    const MAX: usize = 96;
+    snippet_to(text, 96)
+}
+
+/// [`footnote_snippet`] with an explicit budget — the minimap's a11y labels
+/// take a shorter one.
+pub(crate) fn snippet_to(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= MAX {
+    if flat.chars().count() <= max {
         return flat;
     }
     let cut = flat
         .char_indices()
-        .nth(MAX)
+        .nth(max)
         .map(|(i, _)| i)
         .unwrap_or(flat.len());
     let head = &flat[..cut];

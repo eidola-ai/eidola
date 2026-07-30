@@ -120,7 +120,14 @@ impl Render for GeneralView {
                 let active = s.appearance == value;
                 day_night = day_night.child(
                     choice_chip(id, label, active, cx)
-                        .probe(probe_name, gpui::Role::Button, label)
+                        // The chips read "Auto"/"System"/"Day"/"Night"; the
+                        // group label that gives them meaning is a plain,
+                        // node-less `div`, so the name has to carry it.
+                        .probe(
+                            probe_name,
+                            gpui::Role::Button,
+                            format!("Day & night: {label}"),
+                        )
                         .aria_selected(active)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_appearance(value, cx);
@@ -156,7 +163,11 @@ impl Render for GeneralView {
                 let active = s.time_of_day_tint == value;
                 tint_row = tint_row.child(
                     choice_chip(id, label, active, cx)
-                        .probe(probe_name, gpui::Role::Button, label)
+                        .probe(
+                            probe_name,
+                            gpui::Role::Button,
+                            format!("Time of day: {label}"),
+                        )
                         .aria_selected(active)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_time_of_day_tint(value, cx);
@@ -204,7 +215,7 @@ impl Render for GeneralView {
                     let active = s.light_character == value;
                     light_row = light_row.child(
                         choice_chip(id, label, active, cx)
-                            .probe(probe_name, gpui::Role::Button, label)
+                            .probe(probe_name, gpui::Role::Button, format!("Light: {label}"))
                             .aria_selected(active)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.set_light_character(value, cx);
@@ -232,10 +243,14 @@ impl Render for GeneralView {
                 .items_center()
                 .child(
                     choice_chip("text-size-smaller", "A−", false, cx)
+                        // The current scale renders as a bare `div` with no
+                        // node of its own, so the chips carry it — otherwise
+                        // "smaller" is announced with nothing to be smaller
+                        // than.
                         .probe(
                             "settings/general/text-size/smaller",
                             gpui::Role::Button,
-                            "Smaller text",
+                            format!("Smaller text, currently {percent}"),
                         )
                         .when(at_min, |el| el.opacity(0.4))
                         .on_click(cx.listener(|this, _, _, cx| this.zoom_out(cx))),
@@ -245,7 +260,7 @@ impl Render for GeneralView {
                         .probe(
                             "settings/general/text-size/larger",
                             gpui::Role::Button,
-                            "Larger text",
+                            format!("Larger text, currently {percent}"),
                         )
                         .when(at_max, |el| el.opacity(0.4))
                         .on_click(cx.listener(|this, _, _, cx| this.zoom_in(cx))),
@@ -255,7 +270,7 @@ impl Render for GeneralView {
                         .probe(
                             "settings/general/text-size/reset",
                             gpui::Role::Button,
-                            "Reset text size",
+                            "Reset text size to 100%",
                         )
                         .on_click(cx.listener(|this, _, _, cx| this.reset_zoom(cx))),
                 )
