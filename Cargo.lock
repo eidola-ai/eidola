@@ -2249,7 +2249,7 @@ dependencies = [
  "chrono",
  "const-oid 0.9.6",
  "dcap-qvl-webpki",
- "der",
+ "der 0.7.10",
  "derive_more 2.1.1",
  "hex",
  "log",
@@ -2265,7 +2265,7 @@ dependencies = [
  "signature",
  "urlencoding",
  "wasm-bindgen-futures",
- "x509-cert",
+ "x509-cert 0.2.5",
 ]
 
 [[package]]
@@ -2359,9 +2359,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid 0.9.6",
- "der_derive",
+ "der_derive 0.7.3",
  "flagset",
- "pem-rfc7468",
+ "pem-rfc7468 0.7.0",
+ "zeroize",
+]
+
+[[package]]
+name = "der"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a69dedd701da44b0536442edf09c81a64b0ab97a7a4a5e3d1971f00027cbc63d"
+dependencies = [
+ "const-oid 0.10.2",
+ "der_derive 0.8.0",
+ "flagset",
+ "pem-rfc7468 1.0.0",
  "zeroize",
 ]
 
@@ -2384,6 +2397,17 @@ name = "der_derive"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "der_derive"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59600e2c2d636fde9b65e99cc6445ac770c63d3628195ff39932b8d6d7409903"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2592,12 +2616,12 @@ version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee27f32b5c5292967d2d4a9d7f1e0b0aed2c15daded5a60300e4abb9d8020bca"
 dependencies = [
- "der",
+ "der 0.7.10",
  "digest 0.10.7",
  "elliptic-curve",
  "rfc6979",
  "signature",
- "spki",
+ "spki 0.7.3",
 ]
 
 [[package]]
@@ -2632,7 +2656,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "const-oid 0.9.6",
- "der",
+ "der 0.7.10",
  "dirs",
  "ecdsa",
  "ed25519-dalek",
@@ -2655,7 +2679,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "signature",
- "spki",
+ "spki 0.7.3",
  "tempfile",
  "thiserror 2.0.19",
  "tinfoil-verifier",
@@ -2664,7 +2688,7 @@ dependencies = [
  "turso",
  "uuid",
  "wiremock",
- "x509-cert",
+ "x509-cert 0.3.0",
 ]
 
 [[package]]
@@ -2733,7 +2757,7 @@ dependencies = [
  "bytes",
  "const-oid 0.9.6",
  "deadpool-postgres",
- "der",
+ "der 0.7.10",
  "eidola-common",
  "futures-util",
  "hex",
@@ -2756,7 +2780,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "signature",
- "spki",
+ "spki 0.7.3",
  "subtle",
  "tinfoil-verifier",
  "tokio",
@@ -2770,7 +2794,7 @@ dependencies = [
  "utoipa-axum",
  "uuid",
  "webpki-roots",
- "x509-cert",
+ "x509-cert 0.3.0",
 ]
 
 [[package]]
@@ -2802,7 +2826,7 @@ dependencies = [
  "generic-array",
  "group",
  "hkdf 0.12.4",
- "pem-rfc7468",
+ "pem-rfc7468 0.7.0",
  "pkcs8",
  "rand_core 0.6.4",
  "sec1",
@@ -6677,6 +6701,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem-rfc7468"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6305423e0e7738146434843d1694d621cce767262b2a86910beab705e4493d9"
+dependencies = [
+ "base64ct",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6836,9 +6869,9 @@ version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8ffb9f10fa047879315e6625af03c164b16962a5368d724ed16323b68ace47f"
 dependencies = [
- "der",
+ "der 0.7.10",
  "pkcs8",
- "spki",
+ "spki 0.7.3",
 ]
 
 [[package]]
@@ -6847,8 +6880,8 @@ version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e847e2c91a18bfa887dd028ec33f2fe6f25db77db3619024764914affe8b69a6"
 dependencies = [
- "der",
- "spki",
+ "der 0.7.10",
+ "spki 0.7.3",
 ]
 
 [[package]]
@@ -6857,9 +6890,9 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
 dependencies = [
- "der",
+ "der 0.7.10",
  "pkcs5",
- "spki",
+ "spki 0.7.3",
 ]
 
 [[package]]
@@ -7788,7 +7821,7 @@ dependencies = [
  "chrono",
  "clap",
  "cryptoki",
- "der",
+ "der 0.7.10",
  "eidola-app-core",
  "eidola-attestation",
  "reqwest 0.13.4",
@@ -7798,9 +7831,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "spki",
+ "spki 0.7.3",
  "tempfile",
- "x509-cert",
+ "x509-cert 0.3.0",
 ]
 
 [[package]]
@@ -8004,7 +8037,7 @@ dependencies = [
  "rand_core 0.6.4",
  "sha2 0.10.9",
  "signature",
- "spki",
+ "spki 0.7.3",
  "subtle",
  "zeroize",
 ]
@@ -8303,7 +8336,7 @@ dependencies = [
  "aes-gcm 0.10.3",
  "chacha20poly1305",
  "crypto-common 0.1.7",
- "der",
+ "der 0.7.10",
  "digest 0.10.7",
  "ecdsa",
  "ed25519-dalek",
@@ -8529,7 +8562,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
 dependencies = [
  "base16ct",
- "der",
+ "der 0.7.10",
  "generic-array",
  "pkcs8",
  "subtle",
@@ -8754,7 +8787,7 @@ dependencies = [
  "sha2 0.10.9",
  "static_assertions",
  "uuid",
- "x509-cert",
+ "x509-cert 0.2.5",
 ]
 
 [[package]]
@@ -9059,7 +9092,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
- "der",
+ "der 0.7.10",
+]
+
+[[package]]
+name = "spki"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d9efca8738c78ee9484207732f728b1ef517bbb1833d6fc0879ca898a522f6f"
+dependencies = [
+ "base64ct",
+ "der 0.8.1",
 ]
 
 [[package]]
@@ -9663,7 +9706,7 @@ dependencies = [
  "arc-swap",
  "axum",
  "base64 0.22.1",
- "der",
+ "der 0.7.10",
  "hex",
  "hyper",
  "hyper-util",
@@ -9679,14 +9722,14 @@ dependencies = [
  "serde_json",
  "sev",
  "sha2 0.11.0",
- "spki",
+ "spki 0.7.3",
  "tokio",
  "tokio-rustls",
  "tower-service",
  "tracing",
  "tracing-subscriber",
  "webpki-roots",
- "x509-cert",
+ "x509-cert 0.3.0",
 ]
 
 [[package]]
@@ -9696,7 +9739,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dcap-qvl",
- "der",
+ "der 0.7.10",
  "flate2",
  "getrandom 0.4.3",
  "hex",
@@ -9715,14 +9758,14 @@ dependencies = [
  "sev",
  "sha2 0.10.9",
  "signature",
- "spki",
+ "spki 0.7.3",
  "thiserror 2.0.19",
  "tokio",
  "tower 0.5.3",
  "tracing",
  "urlencoding",
  "webpki-roots",
- "x509-cert",
+ "x509-cert 0.3.0",
 ]
 
 [[package]]
@@ -9863,7 +9906,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
- "x509-cert",
+ "x509-cert 0.2.5",
 ]
 
 [[package]]
@@ -12005,8 +12048,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
 dependencies = [
  "const-oid 0.9.6",
- "der",
- "spki",
+ "der 0.7.10",
+ "spki 0.7.3",
+ "tls_codec",
+]
+
+[[package]]
+name = "x509-cert"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "105ef4642d9cb137ef83d623d0e4bf08b8adf69e9918ca904a174adb6d3d038b"
+dependencies = [
+ "const-oid 0.10.2",
+ "der 0.8.1",
+ "spki 0.8.0",
  "tls_codec",
 ]
 

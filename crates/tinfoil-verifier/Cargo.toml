@@ -43,7 +43,7 @@ pem = "3"
 chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
 
 # DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
-x509-cert = "0.2"
+x509-cert = "0.3"
 der = { version = "0.7", features = ["alloc"] }
 # RSA-PSS verification for AMD CRLs (the `sev` crate uses this same crate
 # internally for ARK→ASK signature verification when built with the
