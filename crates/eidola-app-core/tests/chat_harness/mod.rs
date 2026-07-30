@@ -400,7 +400,8 @@ pub fn system_message_with(prompt: Option<&str>, extra_notes: &[&str]) -> String
 pub fn thread_map(forks: &[(String, Vec<String>)], respond_to: &str) -> String {
     let mut out = String::from(
         "<thread-map>\nBranches of this space that the conversation above does not contain. Each \
-         line: handle · author · posts · last activity — opening line.\n",
+         line: handle · author · posts · last activity — opening line; a branch you have posted \
+         in also says so.\n",
     );
     for (anchor, entries) in forks {
         out.push('\n');
@@ -416,10 +417,22 @@ pub fn thread_map(forks: &[(String, Vec<String>)], respond_to: &str) -> String {
     out
 }
 
-/// One thread-map entry line: `#handle · author · posts · when — opening`.
-pub fn map_entry(item_id: &str, author: &str, posts: &str, when: &str, opening: &str) -> String {
+/// One thread-map entry line: `#handle · author · posts · when — opening`,
+/// with the task-33 `· you participated, <mine>` segment when the responding
+/// participant posted in that branch.
+pub fn map_entry(
+    item_id: &str,
+    author: &str,
+    posts: &str,
+    when: &str,
+    mine: Option<&str>,
+    opening: &str,
+) -> String {
+    let mine = mine
+        .map(|m| format!(" · you participated, {m}"))
+        .unwrap_or_default();
     format!(
-        "#{} · {author} · {posts} · {when} — {opening}",
+        "#{} · {author} · {posts} · {when}{mine} — {opening}",
         eidola_app_core::post_handle(item_id)
     )
 }
@@ -427,17 +440,19 @@ pub fn map_entry(item_id: &str, author: &str, posts: &str, when: &str, opening: 
 /// A thread-map entry plus the LLM-written summary line under it. The summary
 /// carries its own indent because [`thread_map`] only prefixes an entry's first
 /// line.
+#[allow(clippy::too_many_arguments)]
 pub fn map_entry_summarized(
     item_id: &str,
     author: &str,
     posts: &str,
     when: &str,
+    mine: Option<&str>,
     opening: &str,
     summary: &str,
 ) -> String {
     format!(
         "{}\n      {summary}",
-        map_entry(item_id, author, posts, when, opening)
+        map_entry(item_id, author, posts, when, mine, opening)
     )
 }
 
