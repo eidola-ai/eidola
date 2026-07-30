@@ -93,7 +93,16 @@ impl Stores {
         let data_dir = eidola_app_core::config::default_data_dir()
             .expect("could not determine eidola data directory");
 
-        let app_core = Arc::new(AppCore::new(config_dir, data_dir));
+        // Construction can fail — notably `AppError::DatabaseInUse` when
+        // another Eidola process already holds the single-writer local
+        // database. There is no startup-failure surface in the GUI yet (the
+        // directory resolution above panics the same way), so this stays a
+        // loud abort with an honest message rather than a silent
+        // half-initialized app; a real startup dialog is a follow-up.
+        let app_core = Arc::new(
+            AppCore::new(config_dir, data_dir)
+                .unwrap_or_else(|e| panic!("could not open the local Eidola database: {e}")),
+        );
         Self::with_core(Some(app_core), cx)
     }
 

@@ -139,7 +139,7 @@ fn make_core() -> (AppCore, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let config_dir = dir.path().to_path_buf();
     let data_dir = dir.path().join("data");
-    (AppCore::new(config_dir, data_dir), dir)
+    (AppCore::new(config_dir, data_dir).expect("open core"), dir)
 }
 
 // ---------------------------------------------------------------------------
