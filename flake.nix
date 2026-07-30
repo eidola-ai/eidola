@@ -32,7 +32,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
 
         # SHA256 for rust-toolchain.toml (single source of truth)
-        rustToolchainSha256 = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
+        rustToolchainSha256 = "sha256-A1abGIbOtcBSdrUMhDGrER3pRM1hQP4fp9gh3Y4PKc8=";
 
         # Get the exact Rust toolchain specified in rust-toolchain.toml
         rustToolchain = fenix.packages.${system}.fromToolchainFile {
