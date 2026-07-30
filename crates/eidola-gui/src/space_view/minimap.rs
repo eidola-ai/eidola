@@ -101,6 +101,85 @@ pub(crate) fn drag_scroll(m: f32, grab: f32, scale: f32, floor: f32) -> f32 {
     (-t0 / scale).clamp(floor, 0.0)
 }
 
+/// Characters of post text a minimap cell's accessible label carries.
+const LABEL_MAX_CHARS: usize = 56;
+
+/// A post's text as a screen reader should hear it: embed markers resolved
+/// away, markdown punctuation dropped, whitespace folded, truncated on a word
+/// boundary.
+///
+/// The minimap's labels are the only place a post's *text* reaches assistive
+/// technology today, and they used to be `content.chars().take(56)` — raw. So
+/// VoiceOver read the wire format aloud ("You: That's the sentence I keep
+/// snagging on: {{ embed 1 }} If") and cut mid-word with no ellipsis. Wave C
+/// will expose post bodies properly; until then this is what is heard.
+///
+/// Deliberately *not* a markdown renderer: it drops the delimiters that are
+/// pure punctuation to the ear (block markers at a line's head, emphasis and
+/// code runs) and leaves everything else — including link and image syntax —
+/// alone rather than guessing. Pure, so it is unit-tested without a window.
+pub(crate) fn spoken_snippet(
+    content: &str,
+    references: &[eidola_app_core::PostReference],
+    max: usize,
+) -> String {
+    let without_embeds = super::references::strip_embed_blocks(content, references);
+    let plain: Vec<String> = without_embeds
+        .lines()
+        .map(|line| strip_emphasis(strip_block_markers(line.trim())))
+        .collect();
+    super::references::snippet_to(&plain.join(" "), max)
+}
+
+/// Drop a line's leading markdown block markers — headings, blockquotes,
+/// bullets, ordered-list numbers — repeatedly, so `"> # Heading"` reduces
+/// too. Mirrors app-core's `derive_space_title`, which does the same job for
+/// auto-titles (it is private there, and this is a GUI presentation concern).
+fn strip_block_markers(line: &str) -> &str {
+    let mut s = line;
+    loop {
+        let mut t = s.trim_start_matches(['#', '>']).trim_start();
+        for marker in ["- ", "* ", "+ "] {
+            if let Some(rest) = t.strip_prefix(marker) {
+                t = rest.trim_start();
+            }
+        }
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0
+            && let Some(rest) = t[digits..]
+                .strip_prefix(". ")
+                .or_else(|| t[digits..].strip_prefix(") "))
+        {
+            t = rest.trim_start();
+        }
+        if t == s {
+            return s;
+        }
+        s = t;
+    }
+}
+
+/// Drop emphasis and code delimiters. `*` and backticks go unconditionally
+/// (they are never word characters); `_` only when it isn't between two word
+/// characters, so `snake_case` survives while `_emphasis_` does not.
+fn strip_emphasis(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '*' | '`' => {}
+            '_' => {
+                let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric());
+                if word(chars.get(i.wrapping_sub(1)).filter(|_| i > 0)) && word(chars.get(i + 1)) {
+                    out.push(c);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 impl SpaceView {
     /// Record a scroll event for the minimap's show/hide. `moved` is whether the
     /// position actually changed. Called for every scroll event, whichever
@@ -190,14 +269,7 @@ impl SpaceView {
                 let Some(p) = self.posts.get(i) else {
                     return "Post".to_string();
                 };
-                let snippet: String = p
-                    .content
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .chars()
-                    .take(56)
-                    .collect();
+                let snippet = spoken_snippet(&p.content, &p.references, LABEL_MAX_CHARS);
                 if snippet.is_empty() {
                     p.byline.to_string()
                 } else {
@@ -601,6 +673,58 @@ mod tests {
     const SCALE: f32 = VIEWPORT_H / TOTAL_H; // 0.25
     // Scroll floor: window_h - total = -1500 (most-negative valid page y).
     const FLOOR: f32 = VIEWPORT_H - TOTAL_H; // -1500
+
+    fn reference(ordinal: i64, snippet: &str) -> eidola_app_core::PostReference {
+        eidola_app_core::PostReference {
+            ordinal,
+            antecedent_action_id: "act".into(),
+            content_block_id: Some("blk".into()),
+            range_start: Some(0),
+            range_end: Some(1),
+            snippet: Some(snippet.to_string()),
+            annotation: None,
+        }
+    }
+
+    #[test]
+    fn spoken_snippet_drops_markdown_and_embed_markers() {
+        assert_eq!(
+            spoken_snippet(
+                "**This week: the shepherd's bargain.** In *Republic* I,",
+                &[],
+                56
+            ),
+            "This week: the shepherd's bargain. In Republic I,"
+        );
+        // Block markers at a line head, however stacked.
+        assert_eq!(spoken_snippet("> # A heading", &[], 56), "A heading");
+        assert_eq!(spoken_snippet("1. first thing", &[], 56), "first thing");
+        // A recognized embed block is resolved away, not read as wire syntax.
+        let quoted = "That's the sentence I keep snagging on:\n\n{{ embed 1 }}\n\nIf so, then";
+        let spoken = spoken_snippet(quoted, &[reference(1, "quoted passage")], 56);
+        assert!(!spoken.contains("embed"), "got {spoken:?}");
+        assert!(spoken.starts_with("That's the sentence"), "got {spoken:?}");
+        // An *unmapped* marker is literal text and stays literal (the same
+        // rule the editor and the wire follow).
+        assert!(spoken_snippet(quoted, &[], 56).contains("{{ embed 1 }}"));
+    }
+
+    #[test]
+    fn spoken_snippet_truncates_on_a_word_boundary() {
+        let long = "word ".repeat(40);
+        let out = spoken_snippet(&long, &[], 56);
+        assert!(out.ends_with('…'), "got {out:?}");
+        assert!(out.trim_end_matches('…').ends_with("word"), "got {out:?}");
+        assert!(out.chars().count() <= 57, "got {out:?}");
+    }
+
+    #[test]
+    fn spoken_snippet_keeps_underscores_inside_words() {
+        assert_eq!(
+            spoken_snippet("call snake_case not _this_", &[], 56),
+            "call snake_case not this"
+        );
+    }
 
     #[test]
     fn minimap_y_maps_linearly_to_document() {

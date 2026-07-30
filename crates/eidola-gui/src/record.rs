@@ -1033,8 +1033,11 @@ impl RecordView {
             .probe(
                 format!("record/attestation/{dix}"),
                 gpui::Role::ListItem,
-                format!("Attestation {}", truncate_middle(&a.hash, 44)),
+                format!("Attestation {}", spoken_hash(&a.hash)),
             )
+            // The whole hash is still reachable — as the node's value, which
+            // AT reads on request rather than as part of the row's name.
+            .aria_value(a.hash.clone())
             .on_click(cx.listener(move |this, _, _, cx| this.open_attestation(hash.clone(), cx)))
             .child(
                 h_flex()
@@ -1662,6 +1665,19 @@ fn hex_dump(bytes: &[u8]) -> String {
 
 /// Middle-ellipsis truncation for hashes and nonces: keeps both ends, which
 /// is what you compare when eyeballing identifiers.
+/// A hash short enough to *hear*: the leading eight characters, elided. A
+/// 44-character middle-truncated hex label is announced character by
+/// character and is unusable as a name — the full value stays reachable as
+/// the element's accessible *value* (see the attestation row).
+fn spoken_hash(hash: &str) -> String {
+    let head: String = hash.chars().take(8).collect();
+    if head.chars().count() < hash.chars().count() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 fn truncate_middle(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
