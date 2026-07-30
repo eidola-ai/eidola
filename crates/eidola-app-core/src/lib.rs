@@ -3779,9 +3779,11 @@ impl Inner {
         // consolidation event. A rolling verbatim window would churn bytes at
         // the elision boundary every turn, which is precisely the cache
         // invariant the trunk must keep — growth here is append-only.
-        let mut own_traces: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        // Messages and their action ids come out of the same splice below, so
+        // the context assembly records the composition that was actually sent.
+        type TraceMessages = (Vec<serde_json::Value>, Vec<String>);
+        let mut own_traces: std::collections::HashMap<String, TraceMessages> =
             std::collections::HashMap::new();
-        let mut replayed_trace_ids: Vec<String> = Vec::new();
         let mut seen_traces: std::collections::HashSet<String> = std::collections::HashSet::new();
         // One cheap read gates the per-inference lookups: a space that has
         // never run a tool — the overwhelming majority — pays a single
@@ -3791,8 +3793,7 @@ impl Inner {
                 let blocks = db::assembly_trace_blocks(&db_conn, inference_id).await?;
                 let (msgs, ids) = trace_messages(&blocks, &mut seen_traces);
                 if !msgs.is_empty() {
-                    own_traces.insert(inference_id.clone(), msgs);
-                    replayed_trace_ids.extend(ids);
+                    own_traces.insert(inference_id.clone(), (msgs, ids));
                 }
             }
         }
@@ -3843,13 +3844,28 @@ impl Inner {
         // `eidola_common::prompt_charge` walk covers their bytes on both sides
         // by construction (a `tool_calls` entry is charged whole; a `tool`
         // message's result is charged as content).
+        //
+        // `context_action_ids` is built in this same loop and in this same
+        // order: the assembly record is the *ordered composition of the
+        // prompt*, so a replayed trace must occupy the position it occupied on
+        // the wire — between the post it answered and the answer it produced —
+        // rather than being appended after the conversation. (This turn's own
+        // rounds are appended by the loop, which is where they were sent.)
         let mut messages: Vec<serde_json::Value> = Vec::with_capacity(posts.len() + 2);
+        let mut context_action_ids: Vec<String> = Vec::with_capacity(posts.len());
         messages.push(serde_json::json!({"role": "system", "content": system_content}));
         for (action_id, m) in &posts {
-            if let Some(trace) = own_traces.remove(action_id) {
+            if let Some((trace, trace_ids)) = own_traces.remove(action_id) {
                 messages.extend(trace);
+                context_action_ids.extend(trace_ids);
             }
             messages.push(serde_json::json!({"role": m.role, "content": m.content}));
+            // The assembly is keyed by action, so an id is recorded once even
+            // if it somehow rendered twice (the position sequence is the
+            // record's own ordering, not a message count).
+            if !context_action_ids.contains(action_id) {
+                context_action_ids.push(action_id.clone());
+            }
         }
 
         // The trailing map: appended *after* the post being answered, carrying
@@ -3953,8 +3969,7 @@ impl Inner {
             inf_item_id,
             inf_supersedes,
             inf_reply_to,
-            context_rows,
-            replayed_trace_ids,
+            context_action_ids,
             trace_action_ids: Vec::new(),
             trace_reply_to: inf_reply_to_for_trace,
             messages,
@@ -6384,6 +6399,25 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Test-only seam: an inference's context assembly, in `position` order —
+    /// the ordered composition of the prompt that produced it, which is what
+    /// lets a test pin that the record matches the messages actually sent
+    /// (traces included, at their real positions).
+    #[doc(hidden)]
+    pub async fn test_context_assembly(
+        &self,
+        inference_action_id: String,
+    ) -> Result<Vec<String>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                db::context_assembly_actions(&conn, &inference_action_id).await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Test-only seam: drain the spaces with a summary pass pending, so a test
     /// can assert that a write *scheduled* one without waiting out the
     /// debounce. Draining also disarms those passes (each checks its own stamp
@@ -7054,14 +7088,16 @@ struct TurnPrep {
     inf_item_id: String,
     inf_supersedes: Option<String>,
     inf_reply_to: Option<String>,
-    /// The context rows fed upstream, recorded as the context assembly.
-    context_rows: Vec<db::SpaceActionRow>,
-    /// The responder's own **prior** trace actions this turn replayed into its
-    /// messages array (task 33). They were fed upstream, so they belong in
-    /// this inference's context assembly like everything else that was —
-    /// which is also what lets the *next* turn attribute each trace to the
-    /// turn that produced it (first occurrence on the spine wins).
-    replayed_trace_ids: Vec<String>,
+    /// The actions fed upstream at preparation, **in the order their messages
+    /// were sent** — the posts of the spine with each one's replayed trace
+    /// rounds (task 33) spliced in ahead of the answer they produced. Built by
+    /// the same loop that builds `messages`, so the context assembly this
+    /// becomes is the ordered composition of the prompt rather than a
+    /// re-derivation of it. (Replayed traces belong in the record for the same
+    /// reason everything else here does — they were fed — and their presence
+    /// is what lets the *next* turn attribute each trace to the turn that
+    /// produced it: first occurrence on the spine wins.)
+    context_action_ids: Vec<String>,
     /// The `tool_call` / `tool_result` actions this turn wrote, in order.
     /// They were fed upstream too (as the in-flight `assistant`/`tool`
     /// messages), so `persist_turn` records them in the context assembly
@@ -7593,7 +7629,11 @@ impl TurnPrep {
                 .await?;
         }
 
-        // Record context assembly: exactly the actions fed into this inference.
+        // Record context assembly: exactly the actions fed into this
+        // inference, **in the order they were sent** — the prepared
+        // composition (posts with each one's replayed traces spliced in ahead
+        // of it), then this turn's own rounds, which is where the loop
+        // appended them live.
         let context_assembly_id = Uuid::now_v7().to_string();
         db::insert_context_assembly(
             &self.db_conn,
@@ -7606,17 +7646,11 @@ impl TurnPrep {
         )
         .await?;
 
-        let mut fed_ids: Vec<String> = Vec::new();
-        for r in &self.context_rows {
-            if !fed_ids.contains(&r.action_id) {
-                fed_ids.push(r.action_id.clone());
-            }
-        }
+        let mut fed_ids: Vec<String> = self.context_action_ids.clone();
         // A tool loop's own rounds were fed upstream too (as the in-flight
         // assistant/`tool` messages), so they belong in the assembly record —
         // "exactly the actions fed into this inference" stays literally true.
-        // So were the responder's replayed prior rounds (task 33).
-        for id in self.replayed_trace_ids.iter().chain(&self.trace_action_ids) {
+        for id in &self.trace_action_ids {
             if !fed_ids.contains(id) {
                 fed_ids.push(id.clone());
             }
