@@ -928,6 +928,11 @@ pub enum ChatStreamEvent {
 // ============================================================================
 
 struct Inner {
+    /// A handle back to this same `Inner`, so a durable write can hand a
+    /// background chore to the runtime without routing through `AppCore` (see
+    /// [`Inner::spawn_branch_summaries`]). `Weak` because `Inner` owns it:
+    /// a strong self-reference would leak the database lock forever.
+    self_ref: std::sync::Weak<Inner>,
     config_path: PathBuf,
     data_dir: PathBuf,
     db: tokio::sync::OnceCell<turso::Database>,
@@ -951,6 +956,14 @@ struct Inner {
     /// pool), or waits bounded for an in-flight refund. Held only around the
     /// provisioning step in `prepare_turn`; the HTTP request runs outside it.
     spend_gate: tokio::sync::Mutex<()>,
+    /// Serializes background branch-summary passes (see [`summaries`]). One
+    /// pass at a time, and each re-reads the cache inside the gate, so a burst
+    /// of posts collapses into one generation per branch.
+    summary_gate: tokio::sync::Mutex<()>,
+    /// Space id → the most recent summary trigger's timestamp: the trailing
+    /// debounce that keeps an exchange (the post, then the answer it draws)
+    /// from summarizing the same branch twice.
+    summary_triggers: Mutex<std::collections::HashMap<String, i64>>,
     /// The tool registry a turn's bounded tool-calling loop runs (see
     /// [`tools`]). **Empty by default**, which is what keeps every request
     /// byte-identical to the pre-tools shape: `prepare_turn` snapshots this
@@ -3059,6 +3072,9 @@ impl Inner {
         if is_new_space || auto_titled {
             self.bus.emit(Change::SpaceIndex);
         }
+        // The post is committed and emitted; anything a grown branch needs
+        // summarized happens behind it, never in front of it.
+        self.spawn_branch_summaries(&space_id);
 
         Ok(PostResult {
             space_id,
@@ -3695,10 +3711,24 @@ impl Inner {
         // Built from exactly the materials the GUI renders, so threading and
         // post rendering have one path each. Also the tools' data source: their
         // results are this snapshot (stale-ok by contract).
-        let thread = Arc::new(ThreadSnapshot::new(
+        let thread = ThreadSnapshot::new(
             build_post_tree(db::get_space_tree_data(&db_conn, &space_id).await?),
             now,
-        ));
+        );
+        // Branch summaries are **read** here and nowhere else in the turn path:
+        // whatever the background summarizer has committed is rendered, and a
+        // missing or lagging one costs the turn nothing (see [`summaries`]). A
+        // linear space never even asks.
+        let thread = Arc::new(if thread.has_forks() {
+            let stored = db::current_branch_summaries(&db_conn, &space_id)
+                .await?
+                .into_iter()
+                .map(|s| (s.branch_item_id, s.text))
+                .collect();
+            thread.with_summaries(stored)
+        } else {
+            thread
+        });
         // A Revise turn must not learn about the generation it replaces (nor
         // anything downstream of it) — the same rule `get_upstream_context`
         // applies to the messages, applied to the map.
@@ -4200,7 +4230,12 @@ impl Inner {
                 }
             }
             match outcome? {
-                RoundOutcome::Final(result) => return Ok(result),
+                RoundOutcome::Final(result) => {
+                    // The turn is committed and emitted; a branch that grew by
+                    // this response is summarized behind it (see [`summaries`]).
+                    self.spawn_branch_summaries(&result.space_id);
+                    return Ok(result);
+                }
                 RoundOutcome::ToolRound => continue,
             }
         }
@@ -4627,7 +4662,12 @@ impl Inner {
                 }
             }
             match outcome? {
-                RoundOutcome::Final(result) => return Ok(result),
+                RoundOutcome::Final(result) => {
+                    // The turn is committed and emitted; a branch that grew by
+                    // this response is summarized behind it (see [`summaries`]).
+                    self.spawn_branch_summaries(&result.space_id);
+                    return Ok(result);
+                }
                 RoundOutcome::ToolRound => continue,
             }
         }
@@ -5501,7 +5541,8 @@ impl AppCore {
         Ok(Self {
             runtime,
             bus: bus.clone(),
-            inner: Arc::new(Inner {
+            inner: Arc::new_cyclic(|self_ref| Inner {
+                self_ref: self_ref.clone(),
                 config_path: config_dir.join("config.toml"),
                 data_dir,
                 db: tokio::sync::OnceCell::new(),
@@ -5510,6 +5551,8 @@ impl AppCore {
                 bus,
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
+                summary_gate: tokio::sync::Mutex::new(()),
+                summary_triggers: Mutex::new(std::collections::HashMap::new()),
                 tools: std::sync::RwLock::new(tools::ToolRegistry::new()),
                 tool_incapable_backends: std::sync::RwLock::new(std::collections::HashSet::new()),
                 http_override,
@@ -6289,6 +6332,21 @@ impl AppCore {
                 let conn = inner.db_conn().await?;
                 db::raw_space_actions(&conn, &space_id).await
             })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Test-only seam: run one branch-summary pass to completion.
+    ///
+    /// Production triggers this in the background after a post or a turn
+    /// commits ([`summaries`]); awaiting the same pass is what makes its
+    /// effects assertable. The pass is serialized and re-checks its cache
+    /// inside the gate, so racing a background trigger cannot double-generate.
+    #[doc(hidden)]
+    pub async fn test_refresh_branch_summaries(&self, space_id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.refresh_branch_summaries(&space_id).await })
             .await
             .map_err(join_err)?
     }
@@ -8536,14 +8594,14 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
 // fine — it lives at the tail by design. What must not move is anything above
 // it, and nothing here does.
 //
-// # What is *not* here
+// # The summary line
 //
-// Checkpoint 3 of the task — LLM-written branch summaries, lazily generated and
-// cached by the branch's tip action id, stored as versioned `checkpoint` items —
-// is deferred to a follow-up. Its hook is `ThreadSnapshot::branch_entry`: the
-// summary would become an extra, optional field on [`BranchEntry`] rendered
-// after the structural line, with the structural entry staying as the
-// always-present fallback. Nothing else about the map or the tools changes.
+// Checkpoint 3's LLM-written branch summaries (`summaries`) hang off
+// `ThreadSnapshot::branch_entry`: an optional `BranchEntry::summary` rendered
+// on its own line after the structural one, which stays the always-present
+// fallback. They are generated in the background and only *read* here — a
+// missing or lagging summary changes nothing about the map's structure, and
+// nothing about the tools.
 // ---------------------------------------------------------------------------
 
 /// The opening delimiter of the trailing thread-map message. XML-ish because
@@ -8610,10 +8668,11 @@ struct BranchEntry {
     /// First line of the branch's opening post, via the auto-title heuristic
     /// ([`derive_space_title`]). `None` for a post with no presentable text.
     opening: Option<String>,
-    // Checkpoint 3 hooks here: `summary: Option<String>` — an LLM-written
-    // précis of the branch, cached by its tip action id and rendered after the
-    // structural line. The structural entry above is the always-present
-    // fallback, so the map never depends on a summarizer being available.
+    /// An LLM-written précis of the branch, rendered on its own line after the
+    /// structural one (see [`summaries`]). `None` whenever the summarizer is
+    /// off, unavailable, or has not caught up — the structural entry above is
+    /// the always-present fallback, so the map never depends on it.
+    summary: Option<String>,
 }
 
 /// A fork point and the branches at it.
@@ -8652,6 +8711,10 @@ struct ThreadSnapshot {
     /// The turn's timestamp — every relative time in this snapshot is measured
     /// from it, so one turn's map and tool results never disagree.
     now: i64,
+    /// Branch-root **item** id → stored summary (see [`summaries`]). Empty
+    /// unless a caller attached one with [`ThreadSnapshot::with_summaries`];
+    /// every entry renders as an extra line under its structural one.
+    summaries: std::collections::HashMap<String, String>,
 }
 
 impl ThreadSnapshot {
@@ -8695,7 +8758,16 @@ impl ThreadSnapshot {
             by_handle,
             roots,
             now,
+            summaries: std::collections::HashMap::new(),
         }
+    }
+
+    /// Attach stored branch summaries, keyed by branch-root item id (see
+    /// [`summaries`]). Purely additive: entries without one keep exactly the
+    /// structural line they had.
+    fn with_summaries(mut self, summaries: std::collections::HashMap<String, String>) -> Self {
+        self.summaries = summaries;
+        self
     }
 
     /// Pre-order walk of the subtree rooted at `idx` (the node itself first).
@@ -8726,7 +8798,83 @@ impl ThreadSnapshot {
             posts: sub.len(),
             last_activity,
             opening: derive_space_title(&self.texts[idx]),
+            summary: self.summaries.get(&self.nodes[idx].item_id).cloned(),
         }
+    }
+
+    /// Whether the space branches at all — the cheap in-memory test that keeps
+    /// a linear space from paying for a summary lookup it can never render.
+    fn has_forks(&self) -> bool {
+        self.roots.len() > 1
+            || self
+                .nodes
+                .iter()
+                .any(|n| self.children.get(&n.action_id).is_some_and(|k| k.len() > 1))
+    }
+
+    /// Every fork point in the space as `(anchor, branch node indices)`. The
+    /// single source of the branch set: [`Self::all_forks`] renders it and
+    /// [`Self::branch_roots`] flattens it, so the map and the summarizer can
+    /// never disagree about what a branch is.
+    fn fork_groups(&self) -> Vec<(ForkAnchor, Vec<usize>)> {
+        let mut out = Vec::new();
+        if self.roots.len() > 1 {
+            out.push((ForkAnchor::SpaceStart, self.roots.clone()));
+        }
+        for (i, n) in self.nodes.iter().enumerate() {
+            let Some(kids) = self.children.get(&n.action_id) else {
+                continue;
+            };
+            if kids.len() < 2 {
+                continue;
+            }
+            out.push((ForkAnchor::Post(self.handles[i].clone()), kids.clone()));
+        }
+        out
+    }
+
+    /// Every branch root in the space — exactly the posts that can head a map
+    /// entry, which is exactly what the summarizer summarizes.
+    fn branch_roots(&self) -> Vec<usize> {
+        self.fork_groups()
+            .into_iter()
+            .flat_map(|(_, b)| b)
+            .collect()
+    }
+
+    /// The branch's identity and current state (see [`summaries::BranchKey`]).
+    /// The tip is the subtree's newest post — ties broken by action id so the
+    /// key is a function of the data, not of iteration order.
+    fn branch_key(&self, idx: usize) -> summaries::BranchKey {
+        let sub = self.subtree(idx);
+        let tip = sub
+            .iter()
+            .max_by(|&&a, &&b| {
+                (self.nodes[a].created_at, &self.nodes[a].action_id)
+                    .cmp(&(self.nodes[b].created_at, &self.nodes[b].action_id))
+            })
+            .copied()
+            .unwrap_or(idx);
+        summaries::BranchKey {
+            root_item_id: self.nodes[idx].item_id.clone(),
+            root_action_id: self.nodes[idx].action_id.clone(),
+            tip_action_id: self.nodes[tip].action_id.clone(),
+            posts: sub.len(),
+            handle: self.handles[idx].clone(),
+        }
+    }
+
+    /// The branch's posts in render order, oldest first, capped — the
+    /// summarizer's reading material.
+    fn branch_posts(&self, idx: usize, limit: usize) -> Vec<summaries::SummaryPost> {
+        self.subtree(idx)
+            .into_iter()
+            .take(limit)
+            .map(|i| summaries::SummaryPost {
+                author: self.nodes[i].participant.label.clone(),
+                text: self.texts[i].clone(),
+            })
+            .collect()
     }
 
     /// The fork points on `spine` (deduped context action ids, root → the post
@@ -8794,26 +8942,13 @@ impl ThreadSnapshot {
     /// `list_branches` reports: the whole structure, not just the forks on the
     /// conversation the model was handed.
     fn all_forks(&self) -> Vec<ForkPoint> {
-        let mut out = Vec::new();
-        if self.roots.len() > 1 {
-            out.push(ForkPoint {
-                at: ForkAnchor::SpaceStart,
-                branches: self.roots.iter().map(|&r| self.branch_entry(r)).collect(),
-            });
-        }
-        for (i, n) in self.nodes.iter().enumerate() {
-            let Some(kids) = self.children.get(&n.action_id) else {
-                continue;
-            };
-            if kids.len() < 2 {
-                continue;
-            }
-            out.push(ForkPoint {
-                at: ForkAnchor::Post(self.handles[i].clone()),
-                branches: kids.iter().map(|&k| self.branch_entry(k)).collect(),
-            });
-        }
-        out
+        self.fork_groups()
+            .into_iter()
+            .map(|(at, branches)| ForkPoint {
+                at,
+                branches: branches.iter().map(|&k| self.branch_entry(k)).collect(),
+            })
+            .collect()
     }
 
     /// Render fork entries into `out`, one blank-line-separated group per fork.
@@ -8842,6 +8977,11 @@ impl ThreadSnapshot {
                         "(no text)".to_string()
                     }),
                 ));
+                // The LLM-written précis, when one has been generated, on its
+                // own indented line under the structural one it never replaces.
+                if let Some(summary) = &b.summary {
+                    out.push_str(&format!("      {}\n", one_line(summary)));
+                }
             }
         }
     }

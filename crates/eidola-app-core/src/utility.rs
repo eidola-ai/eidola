@@ -16,14 +16,12 @@
 //!
 //! # The two-phase seam
 //!
-//! [`Inner::resolve_utility_target`] answers *where would this go and does it
-//! bill* — cheap, no engine start, no network. [`Inner::utility_completion`]
-//! then opens the route (leasing or starting an engine, building the client,
-//! placing a hold for a remote call), makes the call, and settles.
-//!
-//! The split is what lets a caller refuse to spend **before** anything is
-//! started: the branch summarizer generates only against a zero-spend target
-//! (see [`UtilityTarget::spends`]), and finds that out without loading a model.
+//! [`Inner::resolve_utility_target`] answers *where would this go* — cheap, no
+//! engine start, no network, so an unresolvable model reference degrades before
+//! anything is started. [`Inner::utility_completion`] then opens the route
+//! (leasing or starting an engine, building the client, placing a hold for a
+//! remote call), makes the call, and settles. The summarizer uses that split to
+//! decide what is stale before it starts an engine at all.
 
 use crate::error::AppError;
 use crate::{
@@ -42,15 +40,6 @@ pub(crate) struct UtilityTarget {
     pub(crate) canonical: String,
     /// What to call this chore in a diagnostic ("router", "branch summary").
     pub(crate) chore: &'static str,
-}
-
-impl UtilityTarget {
-    /// Whether a call against this target bills the user's account. Only the
-    /// remote `eidola` backend does; engine-backed and `openai` backends carry
-    /// no Eidola charge.
-    pub(crate) fn spends(&self) -> bool {
-        self.kind == backends::BackendKind::Eidola
-    }
 }
 
 /// An opened route: everything one HTTP call needs, plus the engine lease that
