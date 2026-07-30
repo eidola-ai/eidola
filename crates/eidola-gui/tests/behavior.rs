@@ -4150,6 +4150,87 @@ fn space_edit_and_regenerate_supersede_in_flight_load(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_declined_turn_does_not_attach_its_reasoning_to_another_post(cx: &mut TestAppContext) {
+    // The agent-side decline checkpoint: a declined turn wrote no post, so its
+    // `response_action_id` is `None`. `merge_from_db`'s `None`-action fallback
+    // attaches captured reasoning to the *last assistant message*, which would
+    // put the declining agent's private thinking under another agent's reply.
+    // A decline must drop the capture instead.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = fixture_assistant_post("a2", "agent-c already answered");
+    a2.parent_action_id = Some("a1".into());
+    let tree = vec![fixture_user_post("a1", "the question"), a2];
+
+    // A turn streams reasoning and then declines.
+    let seq = cx
+        .update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.set_post_tree_for_test(tree.clone(), cx);
+                s.push_streaming_turn_for_test(
+                    Some("agent-b".into()),
+                    Some("a1".into()),
+                    eidola_gui::space::StreamingResponse {
+                        reasoning: "agent-b's private deliberation".into(),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(seq, tree.clone(), true, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.post_reasoning_for_test(1),
+            None,
+            "a decline must not hang its reasoning on another agent's post"
+        );
+    });
+
+    // Control: the *same* finalize on an ordinary (non-declined) turn does
+    // attach — so the assertion above is about the decline, not about the
+    // capture never landing.
+    let seq = cx
+        .update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.push_streaming_turn_for_test(
+                    Some("agent-b".into()),
+                    Some("a1".into()),
+                    eidola_gui::space::StreamingResponse {
+                        reasoning: "agent-b's private deliberation".into(),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(seq, tree.clone(), false, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.post_reasoning_for_test(1),
+            Some(("agent-b's private deliberation".to_string(), false)),
+            "an ordinary turn still attaches its reasoning to the post it wrote"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_post_reasoning_projection_toggles(cx: &mut TestAppContext) {
     // Reasoning re-attached to a finalized post survives into the render
     // snapshot, and `Space::toggle_message_reasoning` flips the disclosure —

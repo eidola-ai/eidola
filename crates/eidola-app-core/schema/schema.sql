@@ -206,6 +206,15 @@ CREATE TABLE space (
     -- Seeded from the template a space is instantiated from (default 4);
     -- the PoC for the future copy-from-template space-settings surface.
     cascade_limit     INTEGER NOT NULL DEFAULT 4,
+    -- The may-decline router's model (task 22): a qualified
+    -- `<model>@<backend>` reference to the small model that filters the
+    -- *mechanical* notify set down to who should actually respond.
+    -- NULL (the default) means the feature is OFF — the mechanical
+    -- notify policies decide alone and no router call is ever made.
+    -- Copied from the template a space is instantiated from, exactly like
+    -- cascade_limit. A local (engine-backed) reference is free; a remote
+    -- one bills a normal inference per triggering post.
+    router_model      TEXT,
     created_at        INTEGER NOT NULL,
     archived_at       INTEGER
 );
@@ -220,13 +229,15 @@ CREATE TABLE space (
 -- two types (template_from_space), never a type mutation.
 --
 -- A template OWNS participant rows exactly like a space does
--- (participant.scope = 'template'); cascade_limit is copied into a
--- space at instantiation. removed_at is the soft delete.
+-- (participant.scope = 'template'); cascade_limit and router_model are
+-- copied into a space at instantiation. removed_at is the soft delete.
 -- ============================================================
 CREATE TABLE space_template (
     id            TEXT PRIMARY KEY,            -- UUIDv7 (well-known for the seeded default)
     title         TEXT NOT NULL,
     cascade_limit INTEGER NOT NULL DEFAULT 4,
+    -- The may-decline router model (see space.router_model). NULL = off.
+    router_model  TEXT,
     created_at    INTEGER NOT NULL,
     removed_at    INTEGER                      -- soft delete
 );

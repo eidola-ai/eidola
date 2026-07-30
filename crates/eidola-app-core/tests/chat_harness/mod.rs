@@ -130,6 +130,14 @@ pub enum ChatBehavior {
     /// chunk. Pins that streamed calls preserve provider fields (as blocking
     /// calls do) and that the merge rule is last-wins.
     ToolRoundsStreamingWithExtras(u64),
+    /// Blocking: the model answers with a single call to the **decline** tool
+    /// (`eidola_app_core::decline::DeclineTool`), carrying [`DECLINE_REASON`].
+    /// The agent-side decline checkpoint should end the turn here — no
+    /// inference, no post.
+    DeclineBlocking,
+    /// SSE twin of [`ChatBehavior::DeclineBlocking`] — the streaming path a
+    /// driven `respond_stream_as` turn takes.
+    DeclineStreaming,
     /// Blocking: reject any request whose body carries a `tools` field with
     /// llama.cpp's own 500 (`"tools param requires --jinja flag"`), and answer
     /// normally otherwise.
@@ -151,9 +159,54 @@ pub enum ChatBehavior {
     ToolScript,
 }
 
+/// The reason the decline behaviours state; asserted on the persisted
+/// `decision` action's text block.
+pub const DECLINE_REASON: &str = "Nothing to add here.";
+
+/// The decline tool's name — matches `eidola_app_core::decline::DECLINE_TOOL_NAME`.
+pub const DECLINE_TOOL: &str = "decline";
+
 /// The tool name the tool-calling behaviours call — matches
 /// `eidola_app_core::tools::EchoTool`.
 pub const TOOL_NAME: &str = "echo";
+
+/// The engine slug the may-decline router tests register against the mock
+/// (`test_register_loaded_local_model("local", ROUTER_SLUG, mock.port())`).
+pub const ROUTER_SLUG: &str = "router";
+
+/// The qualified model reference a space's `router_model` is set to in the
+/// router tests. Engine-backed backends send the canonical qualified id as the
+/// wire model, so this is exactly what the mock sees in the request body — the
+/// key it dispatches the router arm on.
+pub const ROUTER_MODEL: &str = "router@local";
+
+/// A **remote** (eidola-backend) router model, advertised by the mock's
+/// catalog alongside [`MODEL`] with the same trivial pricing. Lets the tests
+/// exercise the router's spend path (a remote router bills a normal
+/// inference) while still dispatching separately from the turns.
+pub const ROUTER_REMOTE_MODEL: &str = "router-remote";
+
+/// How the mock answers a chat request for [`ROUTER_MODEL`] — the may-decline
+/// router's scripted seam. Every arm keeps the *turn* behaviour
+/// ([`ChatBehavior`]) untouched, so one mock serves both roles in one test.
+#[derive(Clone, Debug)]
+pub enum RouterBehavior {
+    /// Not router-aware: a request for the router model is answered like any
+    /// other chat request. The default, and what every pre-router test sees.
+    Passthrough,
+    /// 200 JSON completion whose assistant content is exactly this string —
+    /// the scripted routing decision (e.g. `{"notify": [1]}`), or deliberate
+    /// garbage for the degrade-on-malformed-output row.
+    Reply(String),
+    /// Non-2xx error body — the router is reachable but refuses. Exercises
+    /// degrade-on-failure.
+    Fail(u16),
+    /// Send a 200 response head promising a body, then drop the connection
+    /// without writing it: the request was **accepted**, so a remote router's
+    /// credential hold is already placed, but the body read fails. Exercises
+    /// the refund-settlement path on a post-send body-read failure.
+    DropBody,
+}
 
 /// The `(tool_name, arguments_json)` calls [`ChatBehavior::ToolScript`] asks
 /// for. Shared + interior-mutable so a test can fill it in after building its
@@ -179,6 +232,8 @@ pub enum RefundMode {
 #[derive(Clone)]
 pub struct MockConfig {
     pub chat: ChatBehavior,
+    /// How a request for [`ROUTER_MODEL`] is answered (see [`RouterBehavior`]).
+    pub router: RouterBehavior,
     pub refund: RefundMode,
     /// Account available balance returned by `/v1/account/balances`.
     pub balance: i64,
@@ -195,6 +250,7 @@ impl Default for MockConfig {
     fn default() -> Self {
         Self {
             chat: ChatBehavior::OkBlocking,
+            router: RouterBehavior::Passthrough,
             refund: RefundMode::Succeed,
             balance: 10_000_000,
             models_status: None,
@@ -649,22 +705,59 @@ async fn handle_conn(
             // 1-based index of this chat request — the tool-calling
             // behaviours script their answer per round.
             let hit = chat_hits.fetch_add(1, Ordering::SeqCst) + 1;
-            if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) {
+            let parsed = serde_json::from_slice::<serde_json::Value>(&req.body).ok();
+            let is_router = parsed
+                .as_ref()
+                .and_then(|b| b.get("model"))
+                .and_then(|m| m.as_str())
+                .is_some_and(|m| m == ROUTER_MODEL || m == ROUTER_REMOTE_MODEL);
+            if let Some(body) = parsed {
                 chat_bodies.lock().unwrap().push(body);
             }
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
             let parsed: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-            handle_chat(
-                &mut stream,
-                &issuer,
-                &config,
-                req.auth.as_deref(),
-                hit,
-                &parsed,
-            )
-            .await?;
+            // A request for the router model is answered by the router arm
+            // (unless the mock is not router-aware), leaving `ChatBehavior`
+            // free to script the *turns* in the same test.
+            match (is_router, &config.router) {
+                (true, RouterBehavior::Reply(content)) => {
+                    let body = serde_json::json!({
+                        "choices": [{ "message": { "role": "assistant", "content": content } }],
+                        "usage": { "prompt_tokens": 7, "completion_tokens": 3 },
+                    });
+                    write_json(&mut stream, 200, &body.to_string()).await?;
+                }
+                (true, RouterBehavior::Fail(status)) => {
+                    write_json(&mut stream, *status, &error_body("router unavailable")).await?;
+                }
+                (true, RouterBehavior::DropBody) => {
+                    // Headers promise 64 bytes; none arrive and the connection
+                    // closes, so the client's body read errors after the
+                    // request was accepted.
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\n\
+                              Content-Type: application/json\r\n\
+                              Content-Length: 64\r\n\
+                              Connection: close\r\n\r\n",
+                        )
+                        .await?;
+                    stream.flush().await?;
+                }
+                _ => {
+                    handle_chat(
+                        &mut stream,
+                        &issuer,
+                        &config,
+                        req.auth.as_deref(),
+                        hit,
+                        &parsed,
+                    )
+                    .await?;
+                }
+            }
         }
         _ => {
             write_json(&mut stream, 404, &error_body("not found")).await?;
@@ -852,6 +945,14 @@ async fn handle_chat(
             write_json(stream, 200, &body.to_string()).await
         }
         ChatBehavior::ToolCallsNotAnArrayStreaming => write_sse_bad_tool_calls_stream(stream).await,
+        ChatBehavior::DeclineBlocking => {
+            let mut body = tool_call_body(&decline_call_object());
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::DeclineStreaming => write_sse_decline_stream(stream).await,
         ChatBehavior::RejectTools => {
             if request.get("tools").is_some() {
                 return write_json(
@@ -960,6 +1061,38 @@ fn tool_call_object(round: u64, arguments: &str) -> serde_json::Value {
         "type": "function",
         "function": { "name": TOOL_NAME, "arguments": arguments },
     })
+}
+
+fn decline_arguments() -> String {
+    serde_json::json!({ "reason": DECLINE_REASON }).to_string()
+}
+
+fn decline_call_object() -> serde_json::Value {
+    serde_json::json!({
+        "id": "call_decline",
+        "type": "function",
+        "function": { "name": DECLINE_TOOL, "arguments": decline_arguments() },
+    })
+}
+
+/// SSE stream carrying one whole `decline` call (the assembly path itself is
+/// pinned by the four-delta echo stream; this arm is about the checkpoint).
+async fn write_sse_decline_stream(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.write_all(sse_head().as_bytes()).await?;
+    stream.flush().await?;
+    let mut call = decline_call_object();
+    call["index"] = serde_json::json!(0);
+    let deltas = vec![
+        serde_json::json!({"choices":[{"delta":{"tool_calls":[call]}}]}),
+        serde_json::json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}}),
+    ];
+    for d in deltas {
+        stream.write_all(&sse_event(&d.to_string())).await?;
+    }
+    stream.write_all(&sse_event("[DONE]")).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 fn tool_call_body(call: &serde_json::Value) -> serde_json::Value {
@@ -1131,6 +1264,13 @@ fn models_body() -> String {
     serde_json::json!({
         "data": [{
             "id": MODEL,
+            "context_length": 8192u64,
+            "pricing": {
+                "per_prompt_token": { "value": 1u64, "scale_factor": 1u64 },
+                "per_completion_token": { "value": 1u64, "scale_factor": 1u64 }
+            }
+        }, {
+            "id": ROUTER_REMOTE_MODEL,
             "context_length": 8192u64,
             "pricing": {
                 "per_prompt_token": { "value": 1u64, "scale_factor": 1u64 },

@@ -685,9 +685,14 @@ fn openai_backend_models_come_from_listing_when_not_pinned() {
             .runtime()
             .block_on(core.backend_models("ext".into()))
             .expect("models");
-        // The mock lists gemma4-31b; through this backend it is qualified.
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "gemma4-31b@ext");
+        // The mock's catalog (gemma4-31b plus the router-test model) comes
+        // back qualified through this backend.
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["gemma4-31b@ext", "router-remote@ext"],
+            "every listed model is qualified with the backend id"
+        );
         // Generic listings publish no pricing — honest zeros.
         assert_eq!(models[0].context_length, 0);
         assert!(models[0].request_credits.is_none());
