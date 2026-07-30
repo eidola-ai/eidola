@@ -2246,3 +2246,176 @@ fn a_post_after_a_trace_ending_turn_threads_under_the_last_post() {
         assert!(tree.iter().all(|n| !n.is_branch));
     });
 }
+
+/// A `tool_calls` value that is present and non-null but **not an array** is
+/// structurally unusable — there is nothing to execute and nothing that can be
+/// written as a `tool_use` block. It must take the same honest `ToolLoop` exit
+/// as a call with no id, never be read as "the model requested no tools" and
+/// persisted as a successful (empty) answer.
+#[test]
+fn non_array_tool_calls_fails_the_turn_rather_than_answering_empty() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolCallsNotAnArray,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("break it".into(), MODEL.into(), None))
+            .expect_err("a non-array tool_calls must fail the turn");
+        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        assert!(
+            matches!(err.root(), AppError::ToolLoop { .. }),
+            "expected a typed ToolLoop error, got {err:?}"
+        );
+        assert_eq!(mock.chat_hits(), 1);
+
+        // Critically: no `inference` was persisted. The bug this pins would
+        // have committed an empty answer as a successful turn.
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(space_id.clone()))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(kinds, vec!["user_input"]);
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space_id)),
+            "got {changes:?}"
+        );
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+    });
+}
+
+/// The streaming twin: a `delta.tool_calls` that is present and non-null but
+/// not an array takes the same exit.
+#[test]
+fn non_array_streamed_tool_calls_fails_the_turn() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolCallsNotAnArrayStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let mut rx = core.subscribe_changes();
+
+        let (tx, _rx_events) = tokio::sync::mpsc::unbounded_channel();
+        let err = core
+            .runtime()
+            .block_on(core.chat_stream("break it".into(), MODEL.into(), None, tx))
+            .expect_err("a non-array delta.tool_calls must fail the turn");
+        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        assert!(
+            matches!(err.root(), AppError::ToolLoop { .. }),
+            "expected a typed ToolLoop error, got {err:?}"
+        );
+        assert_eq!(mock.chat_hits(), 1);
+
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(space_id.clone()))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(kinds, vec!["user_input"]);
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space_id)),
+            "got {changes:?}"
+        );
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+    });
+}
+
+/// …but an explicit `"tool_calls": null` means "no tools" and stays an
+/// ordinary success. Some providers always emit the key; rejecting that would
+/// break every turn against them.
+#[test]
+fn explicitly_null_tool_calls_is_an_ordinary_completion() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolCallsNull,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("a null tool_calls is not an error");
+        assert_eq!(result.content, chat_harness::TOOL_FINAL_CONTENT);
+
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(result.space_id))
+            .expect("raw actions");
+        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(kinds, vec!["user_input", "inference"]);
+    });
+}
+
+/// Streamed tool calls honor the same provider-field preservation contract as
+/// blocking ones: the follow-up assistant message replays every field the
+/// provider sent, not just the canonical `id` / `type` / `function` triple.
+///
+/// Also pins the merge rule for fields that arrive more than once — **last
+/// non-null wins**, shallow, at both levels — and that the streaming-only
+/// `index` framing key is not replayed.
+#[test]
+fn streamed_tool_calls_preserve_provider_specific_fields() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsStreamingWithExtras(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let (tx, _rx_events) = tokio::sync::mpsc::unbounded_channel();
+        let result = core
+            .runtime()
+            .block_on(core.chat_stream("use the tool".into(), MODEL.into(), None, tx))
+            .expect("streaming tool turn succeeds");
+        assert_eq!(result.content, chat_harness::TOOL_FINAL_CONTENT);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        let msgs = bodies[1]["messages"].as_array().expect("messages");
+        let call = &msgs[msgs.len() - 2]["tool_calls"][0];
+
+        // Canonical fields still assembled from their fragments.
+        assert_eq!(call["id"], tool_call_id(1));
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], TOOL_NAME);
+        assert_eq!(call["function"]["arguments"], r#"{"text":"round-1"}"#);
+
+        // Provider fields survive — including a nested object, which no
+        // concatenating merge could reproduce.
+        assert_eq!(
+            call["trace"]["span"], "s1",
+            "a structured provider field must be replayed intact: {call}"
+        );
+        // Restated fields take the latest value (last-wins), at both levels.
+        assert_eq!(
+            call["provider_tag"], "beta",
+            "a restated top-level provider field is last-wins: {call}"
+        );
+        assert_eq!(
+            call["function"]["cache_key"], "k2",
+            "a restated function-level provider field is last-wins: {call}"
+        );
+
+        // `index` is the SSE fragment key, not part of the assembled call.
+        assert!(
+            call.get("index").is_none(),
+            "the streaming framing key must not be replayed: {call}"
+        );
+    });
+}

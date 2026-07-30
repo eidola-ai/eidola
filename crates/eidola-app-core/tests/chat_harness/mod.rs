@@ -112,6 +112,24 @@ pub enum ChatBehavior {
     /// The bad arguments are a *model* mistake, so the loop reports them back
     /// as a tool error and carries on.
     ToolCallBadArguments,
+    /// Blocking: `tool_calls` is present and non-null but **not an array** (an
+    /// object here). Structurally unusable — there is no call to execute and
+    /// none to persist — so it must fail the turn, not read as "no tools".
+    ToolCallsNotAnArray,
+    /// SSE: a `delta.tool_calls` that is present and non-null but not an array
+    /// (a string here). The streaming twin of
+    /// [`ChatBehavior::ToolCallsNotAnArray`].
+    ToolCallsNotAnArrayStreaming,
+    /// Blocking: an ordinary completion that spells `tool_calls` explicitly as
+    /// `null`. Some providers always emit the key; `null` means "no tools" and
+    /// must stay an ordinary success.
+    ToolCallsNull,
+    /// SSE twin of [`ChatBehavior::ToolRoundsStreaming`] whose deltas also
+    /// carry **provider-specific** fields, at the tool-call level and inside
+    /// `function`, one of them restated with a different value in a later
+    /// chunk. Pins that streamed calls preserve provider fields (as blocking
+    /// calls do) and that the merge rule is last-wins.
+    ToolRoundsStreamingWithExtras(u64),
 }
 
 /// The tool name the tool-calling behaviours call — matches
@@ -688,12 +706,70 @@ async fn handle_chat(
         }
         ChatBehavior::ToolRoundsStreaming(rounds) => {
             if hit <= rounds {
-                write_sse_tool_stream(stream, hit).await
+                write_sse_tool_stream(stream, hit, false).await
             } else {
                 write_sse_stream(stream, true, TOOL_FINAL_CONTENT).await
             }
         }
+        ChatBehavior::ToolRoundsStreamingWithExtras(rounds) => {
+            if hit <= rounds {
+                write_sse_tool_stream(stream, hit, true).await
+            } else {
+                write_sse_stream(stream, true, TOOL_FINAL_CONTENT).await
+            }
+        }
+        ChatBehavior::ToolCallsNotAnArray => {
+            let mut body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": serde_json::Value::Null,
+                    // An object, not an array — structurally unusable.
+                    "tool_calls": { "id": tool_call_id(1), "function": {
+                        "name": TOOL_NAME, "arguments": "{}" } },
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::ToolCallsNull => {
+            let mut body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": TOOL_FINAL_CONTENT,
+                    "tool_calls": serde_json::Value::Null,
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::ToolCallsNotAnArrayStreaming => write_sse_bad_tool_calls_stream(stream).await,
     }
+}
+
+/// SSE stream whose single delta carries a non-null, non-array `tool_calls`.
+async fn write_sse_bad_tool_calls_stream(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.write_all(sse_head().as_bytes()).await?;
+    stream.flush().await?;
+    let delta = serde_json::json!({
+        "choices": [{ "delta": { "tool_calls": "definitely not an array" } }]
+    });
+    stream.write_all(&sse_event(&delta.to_string())).await?;
+    stream
+        .write_all(&sse_event(
+            &serde_json::json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}})
+                .to_string(),
+        ))
+        .await?;
+    stream.write_all(&sse_event("[DONE]")).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 /// The answer text the tool-calling behaviours give once they stop calling.
@@ -737,26 +813,56 @@ fn tool_call_body(call: &serde_json::Value) -> serde_json::Value {
 /// the first half of the function name, the second half of the name, then the
 /// arguments string in two pieces. Nothing is a complete JSON value on its own,
 /// which is exactly what the client's per-index accumulator has to survive.
-async fn write_sse_tool_stream(stream: &mut TcpStream, round: u64) -> std::io::Result<()> {
-    let head = "HTTP/1.1 200 OK\r\n\
-                Content-Type: text/event-stream\r\n\
-                Transfer-Encoding: chunked\r\n\
-                Connection: close\r\n\r\n";
-    stream.write_all(head.as_bytes()).await?;
+async fn write_sse_tool_stream(
+    stream: &mut TcpStream,
+    round: u64,
+    extras: bool,
+) -> std::io::Result<()> {
+    stream.write_all(sse_head().as_bytes()).await?;
     stream.flush().await?;
 
     let args = tool_arguments(round);
     let (args_a, args_b) = args.split_at(args.len() / 2);
     let (name_a, name_b) = TOOL_NAME.split_at(2);
 
+    // Chunk 1 introduces the call plus provider fields at both levels
+    // (including a nested object, which no concatenating merge could survive);
+    // chunk 3 restates two of them with new values, pinning last-wins.
+    let (extra_1, fn_extra_1, extra_3, fn_extra_3) = if extras {
+        (
+            serde_json::json!({ "provider_tag": "alpha", "trace": { "span": "s1" } }),
+            serde_json::json!({ "cache_key": "k1" }),
+            serde_json::json!({ "provider_tag": "beta" }),
+            serde_json::json!({ "cache_key": "k2" }),
+        )
+    } else {
+        (
+            serde_json::json!({}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+    };
+
+    let mut call_1 = serde_json::json!({
+        "index": 0, "id": tool_call_id(round), "type": "function"
+    });
+    merge_into(&mut call_1, &extra_1);
+    let mut fn_1 = serde_json::json!({ "name": name_a });
+    merge_into(&mut fn_1, &fn_extra_1);
+    call_1["function"] = fn_1;
+
+    let mut call_3 = serde_json::json!({ "index": 0 });
+    merge_into(&mut call_3, &extra_3);
+    let mut fn_3 = serde_json::json!({ "arguments": args_a });
+    merge_into(&mut fn_3, &fn_extra_3);
+    call_3["function"] = fn_3;
+
     let deltas = vec![
-        serde_json::json!({"choices":[{"delta":{"tool_calls":[
-            {"index":0,"id":tool_call_id(round),"type":"function",
-             "function":{"name":name_a}}]}}]}),
+        serde_json::json!({"choices":[{"delta":{"tool_calls":[call_1]}}]}),
         serde_json::json!({"choices":[{"delta":{"tool_calls":[
             {"index":0,"function":{"name":name_b}}]}}]}),
-        serde_json::json!({"choices":[{"delta":{"tool_calls":[
-            {"index":0,"function":{"arguments":args_a}}]}}]}),
+        serde_json::json!({"choices":[{"delta":{"tool_calls":[call_3]}}]}),
         serde_json::json!({"choices":[{"delta":{"tool_calls":[
             {"index":0,"function":{"arguments":args_b}}]}}]}),
         serde_json::json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}}),
@@ -768,6 +874,22 @@ async fn write_sse_tool_stream(stream: &mut TcpStream, round: u64) -> std::io::R
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())
+}
+
+fn merge_into(target: &mut serde_json::Value, extra: &serde_json::Value) {
+    let (Some(t), Some(e)) = (target.as_object_mut(), extra.as_object()) else {
+        return;
+    };
+    for (k, v) in e {
+        t.insert(k.clone(), v.clone());
+    }
+}
+
+fn sse_head() -> &'static str {
+    "HTTP/1.1 200 OK\r\n\
+     Content-Type: text/event-stream\r\n\
+     Transfer-Encoding: chunked\r\n\
+     Connection: close\r\n\r\n"
 }
 
 /// One chunked SSE `data:` event.
