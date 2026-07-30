@@ -278,6 +278,12 @@ impl Render for SettingsView {
                     crate::chrome::round_tl_client_corner(v_flex(), window),
                     window,
                 )
+                .id("settings-nav")
+                // The band's items are already `Role::Tab`; naming their
+                // container makes them a set rather than five loose tabs
+                // hanging off the window root.
+                .probe("settings/nav", gpui::Role::TabList, "Settings sections")
+                .aria_orientation(gpui::Orientation::Vertical)
                 .w(NAV_WIDTH)
                 .h_full()
                 .flex_none()
@@ -298,6 +304,15 @@ impl Render for SettingsView {
             // content width.
             .child(
                 v_flex()
+                    .id("settings-content")
+                    // The pane's landmark, named for the pane it holds — the
+                    // one place AT can jump past the nav band to the settings
+                    // themselves.
+                    .probe(
+                        "settings/content",
+                        gpui::Role::Main,
+                        format!("{} settings", effective.label()),
+                    )
                     .relative()
                     .flex_1()
                     .h_full()

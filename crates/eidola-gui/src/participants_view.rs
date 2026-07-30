@@ -989,6 +989,7 @@ impl ParticipantsView {
         let pid = p.id.clone();
         let pid2 = p.id.clone();
         let label = p.label.clone();
+        let verb_subject = p.label.clone();
 
         // Secondary line: for an agent, "model · backend"; for the human, the
         // model line is meaningless (people don't have a model), so it is
@@ -1054,19 +1055,21 @@ impl ParticipantsView {
             .child(
                 h_flex()
                     .gap_1()
-                    .child(ghost_button(
+                    .child(ghost_button_labeled(
                         SharedString::from(format!("edit-{pid}")),
                         SharedString::from(format!("participants/{pid}/edit")),
                         "Edit",
+                        format!("Edit {verb_subject}"),
                         false,
                         cx,
                         cx.listener(move |this, _, window, cx| this.begin_edit(&pid, window, cx)),
                     ))
                     .when(can_remove, |el| {
-                        el.child(ghost_button(
+                        el.child(ghost_button_labeled(
                             SharedString::from(format!("remove-{pid2}")),
                             SharedString::from(format!("participants/{pid2}/remove")),
                             "Remove",
+                            format!("Remove {verb_subject}"),
                             false,
                             cx,
                             cx.listener(move |this, _, _, cx| this.remove(&pid2, cx)),
@@ -1411,10 +1414,27 @@ pub(crate) fn ghost_button(
     cx: &gpui::App,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    ghost_button_labeled(id, probe_name, label, label, primary, cx, on_click)
+}
+
+/// [`ghost_button`] with the accessible name spelled separately from the
+/// visible one — for the repeated verbs (Edit / Remove / …) whose row supplies
+/// the subject the label is otherwise missing. Sighted readers get the subject
+/// from the row; a screen reader hears five identical "Edit"s without it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ghost_button_labeled(
+    id: SharedString,
+    probe_name: SharedString,
+    label: &'static str,
+    aria: impl Into<SharedString>,
+    primary: bool,
+    cx: &gpui::App,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
     let theme = cx.theme();
     let el = div()
         .id(id)
-        .probe(probe_name, gpui::Role::Button, label)
+        .probe(probe_name, gpui::Role::Button, aria)
         .cursor_pointer()
         .px_2p5()
         .py_1()

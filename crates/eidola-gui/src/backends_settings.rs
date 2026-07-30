@@ -1375,6 +1375,12 @@ impl Render for BackendsSettingsView {
         // The internal tab strip: Eidola · Local · External.
         col = col.child(
             h_flex()
+                .id("backends-tabs")
+                .probe(
+                    "settings/backends/tabs",
+                    gpui::Role::TabList,
+                    "Backend kinds",
+                )
                 .w_full()
                 .gap_5()
                 .pb_2()
@@ -1867,7 +1873,7 @@ impl BackendsSettingsView {
         let mut verbs = h_flex().gap_3().flex_none().text_xs().child(copy_verb(
             SharedString::from(format!("eidola-measurement-{slug}-copy")),
             format!("settings/backends/eidola/measurements/{slug}/copy"),
-            format!("Copy measurement {}", m.snp),
+            format!("Copy measurement {}", hex_summary(&m.snp)),
             triple.clone(),
             cx,
         ));
@@ -1875,7 +1881,10 @@ impl BackendsSettingsView {
             MeasurementRole::Pinned => {}
             MeasurementRole::Override(idx) => {
                 let snp = m.snp.clone();
-                let aria = format!("Untrust measurement {snp}");
+                // Short in the name, whole in the value: a 64-character hex
+                // string as an accessible *name* is read out character by
+                // character every time the element is focused.
+                let aria = format!("Untrust measurement {}", hex_summary(&snp));
                 verbs =
                     verbs.child(
                         quiet_verb(
@@ -1889,6 +1898,7 @@ impl BackendsSettingsView {
                             gpui::Role::Button,
                             aria,
                         )
+                        .aria_value(m.snp.clone())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.untrust_measurement(snp.clone(), cx)
                         })),
@@ -2167,6 +2177,9 @@ fn copy_verb(
     div()
         .id(id)
         .probe(probe_name, gpui::Role::Button, aria)
+        // The name says *what* is copied, short enough to hear; the value
+        // carries the payload itself for AT that reads it on request.
+        .aria_value(value.clone())
         .flex_none()
         .text_xs()
         .cursor_pointer()

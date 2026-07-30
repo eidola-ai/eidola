@@ -67,6 +67,334 @@ fn library_rows_probe_with_indexed_names(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+// ---------------------------------------------------------------------------
+// Landmarks — the containers that give the tree a shape.
+//
+// Before these, every affordance hung directly off the window root (role-less
+// containers collapse, so children attach to the nearest role-bearing
+// ancestor). Each test asserts the container's *role*, which is what the
+// macOS adapter turns into an `AXLandmark*` / `AXList` a screen reader can
+// navigate by.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn library_listing_is_a_named_list(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![space_info("s1", Some("Tides and the moon"))];
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(&entries, "library/list", gpui::Role::List, "Spaces");
+    assert_probe(
+        &entries,
+        "library/row/0",
+        gpui::Role::ListItem,
+        "Tides and the moon",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn settings_nav_and_content_are_landmarks(cx: &mut TestAppContext) {
+    use eidola_gui::settings::{SettingsPane, SettingsView};
+
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/nav",
+        gpui::Role::TabList,
+        "Settings sections",
+    );
+    // The content landmark is named for the pane it holds, so switching panes
+    // renames it rather than leaving one anonymous "Main".
+    assert_probe(
+        &entries,
+        "settings/content",
+        gpui::Role::Main,
+        "General settings",
+    );
+
+    view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/content",
+        gpui::Role::Main,
+        "Backends settings",
+    );
+    assert_probe(
+        &entries,
+        "settings/backends/tabs",
+        gpui::Role::TabList,
+        "Backend kinds",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn record_strip_and_body_are_landmarks(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+
+    // Empty section: the body is a named region, not a list of nothing.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "record/sections",
+        gpui::Role::TabList,
+        "Record sections",
+    );
+    assert_probe(&entries, "record/body", gpui::Role::Region, "Attestations");
+
+    // Populated: the body becomes the `List` parent the rows belong to.
+    view.update(cx, |v, _| {
+        v.set_attestations_for_test(vec![stub_attestation("att-hash-1")], false);
+    });
+    let entries = fresh_entries(cx, window);
+    assert_probe(&entries, "record/body", gpui::Role::List, "Attestations");
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn space_window_landmarks_name_conversation_and_map(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/conversation",
+        gpui::Role::Main,
+        "Conversation",
+    );
+    // The minimap is the window's table of contents — a navigation landmark,
+    // so its position at the end of the reading order is reachable rather
+    // than a burial. (The literal child reorder is blocked by the composer's
+    // paint-order dependency; see AGENTS.md → Accessibility.)
+    assert_probe(
+        &entries,
+        "space/minimap",
+        gpui::Role::Navigation,
+        "Conversation map",
+    );
+    assert_probe(
+        &entries,
+        "space/composer",
+        gpui::Role::TextInput,
+        "Message composer",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+// ---------------------------------------------------------------------------
+// Label quality — a probe's label is what a screen reader says, so these
+// assert the *wording*, not just that a probe exists. Every case below is a
+// finding from the task-12a audit (§S8).
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn row_verbs_name_the_row_they_act_on(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            space_info("s1", Some("Tides and the moon")),
+            space_info("s2", Some("Borrow checker")),
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+    // The verbs are hover-revealed; force the hover the snapshot tests use.
+    view.update(cx, |v, _| v.set_hovered_for_test(Some(1)));
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/1/rename",
+        gpui::Role::Button,
+        "Rename Borrow checker",
+    );
+    assert_probe(
+        &entries,
+        "library/row/1/archive",
+        gpui::Role::Button,
+        "Archive Borrow checker",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn participant_row_verbs_name_the_participant(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some(probe_participants());
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ParticipantsView::new(stores, "demo".into(), None, window, cx))
+    });
+
+    // Repeated "Edit"/"Remove" with nothing to distinguish them is exactly the
+    // audit's context-free-label finding; the row's subject supplies it.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "participants/agent-1/edit",
+        gpui::Role::Button,
+        "Edit Assistant",
+    );
+    assert_probe(
+        &entries,
+        "participants/agent-1/remove",
+        gpui::Role::Button,
+        "Remove Assistant",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn appearance_and_text_size_chips_carry_their_group(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    // "Auto" / "System" / "Day" / "Night" say nothing on their own — the
+    // group label they sit beside is a node-less `div`.
+    assert_probe(
+        &entries,
+        "settings/general/appearance/auto",
+        gpui::Role::Button,
+        "Day & night: Auto",
+    );
+    assert_probe(
+        &entries,
+        "settings/general/time-of-day/on",
+        gpui::Role::Button,
+        "Time of day: On",
+    );
+    // The current scale is likewise invisible to AT, so the chips carry it.
+    assert_probe(
+        &entries,
+        "settings/general/text-size/larger",
+        gpui::Role::Button,
+        "Larger text, currently 100%",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn minimap_labels_read_as_prose_not_markdown(cx: &mut TestAppContext) {
+    // The minimap cells are the only place a post's *text* reaches assistive
+    // technology today, and they used to carry raw markdown and raw
+    // `{{ embed N }}` wire syntax cut mid-word at 56 characters.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![probe_post(
+                    "a1",
+                    "**This week: the shepherd's bargain.** In *Republic* I, the argument turns.",
+                )],
+                cx,
+            )
+        });
+    });
+
+    let entries = fresh_entries(cx, window);
+    let (_, cell) = entries
+        .iter()
+        .find(|(n, _)| n == "space/minimap/cell/0/0")
+        .unwrap_or_else(|| {
+            let names: Vec<&String> = entries.iter().map(|(n, _)| n).collect();
+            panic!("minimap cell probe missing; recorded: {names:?}");
+        });
+    assert!(
+        !cell.label.contains('*'),
+        "minimap label still carries markdown: {:?}",
+        cell.label
+    );
+    assert!(
+        cell.label.contains("This week: the shepherd's bargain."),
+        "minimap label lost the prose: {:?}",
+        cell.label
+    );
+    // Truncated on a word boundary, with an ellipsis — never mid-word.
+    assert!(
+        cell.label.ends_with('…'),
+        "minimap label should be truncated here: {:?}",
+        cell.label
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn hash_labels_are_short_enough_to_hear(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+    view.update(cx, |v, _| {
+        v.set_attestations_for_test(
+            vec![stub_attestation(
+                "1122334455667788112233445566778811223344556677881122334455667788",
+            )],
+            false,
+        );
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "record/attestation/0",
+        gpui::Role::ListItem,
+        "Attestation 11223344…",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn disabled_probes_record_nothing(cx: &mut TestAppContext) {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -103,6 +431,41 @@ fn fresh_names(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<String> 
         .into_iter()
         .map(|(n, _)| n)
         .collect()
+}
+
+/// Like [`fresh_names`], but keeping each recorded entry so a test can assert
+/// the **role** and **label** a probe applied — not merely that it exists.
+///
+/// This is as deep as the regression gate reaches at the current gpui pin:
+/// `Window`'s emitted AccessKit `TreeUpdate` is crate-private, so nothing here
+/// (or in the driver) can observe tree *shape*, node parentage, or the aria
+/// attributes that don't pass through `.probe()` — `aria_position_in_set`,
+/// `aria_size_of_set`, `aria_value`, `aria_selected`. The probe registry is a
+/// faithful enumeration of the node set with its roles and names, and that is
+/// the whole seam. See `AGENTS.md` → Accessibility for the removal trigger.
+fn fresh_entries(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+) -> Vec<(String, probe::ProbeEntry)> {
+    probe::clear_window(window.window_id().as_u64());
+    draw(cx, window);
+    probe::window_entries(window.window_id().as_u64())
+}
+
+/// Assert that `name` was recorded with the given role and label.
+#[track_caller]
+fn assert_probe(
+    entries: &[(String, probe::ProbeEntry)],
+    name: &str,
+    role: gpui::Role,
+    label: &str,
+) {
+    let Some((_, entry)) = entries.iter().find(|(n, _)| n == name) else {
+        let names: Vec<&String> = entries.iter().map(|(n, _)| n).collect();
+        panic!("probe {name:?} missing; recorded: {names:?}");
+    };
+    assert_eq!(entry.role, role, "probe {name:?} role");
+    assert_eq!(entry.label.as_ref(), label, "probe {name:?} label");
 }
 
 /// Force a frame on a test window. `window.refresh()` marks it dirty; the
@@ -602,6 +965,48 @@ fn stub_spend(request_id: &str) -> SpendTrailEntry {
         space_title: Some("A space".into()),
         linkability: None,
     }
+}
+
+#[gpui::test]
+fn listing_rows_are_positioned_among_data_rows_only(cx: &mut TestAppContext) {
+    // `aria_position_in_set` / `aria_size_of_set` don't pass through `.probe()`,
+    // so the view exposes what it would report. The trap this guards: the
+    // display model interleaves spending group headers and a trailing
+    // load-more row, so positioning by *display* index announces the first
+    // spending entry as "2 of N" and counts the button as an extra item.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+
+    // Attestations with `has_more`: the load-more row must not inflate the set.
+    view.update(cx, |v, _| {
+        v.set_attestations_for_test(
+            vec![stub_attestation("att-1"), stub_attestation("att-2")],
+            true,
+        );
+    });
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.row_set_metadata_for_test(), vec![(1, 2), (2, 2)]);
+    });
+
+    // Spending groups by credential: two nonces means two interleaved headers,
+    // and the data rows must still read 1..=N contiguously.
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Spending, cx);
+        let mut second = stub_spend("req-2");
+        second.credential_nonce = "nonce-2".into();
+        let mut third = stub_spend("req-3");
+        third.credential_nonce = "nonce-2".into();
+        v.set_spending_for_test(vec![stub_spend("req-1"), second, third], true);
+    });
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.row_set_metadata_for_test(), vec![(1, 3), (2, 3), (3, 3)]);
+    });
+
+    probe::set_probes_enabled(false);
 }
 
 #[gpui::test]
