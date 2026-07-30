@@ -1375,6 +1375,12 @@ impl Render for BackendsSettingsView {
         // The internal tab strip: Eidola · Local · External.
         col = col.child(
             h_flex()
+                .id("backends-tabs")
+                .probe(
+                    "settings/backends/tabs",
+                    gpui::Role::TabList,
+                    "Backend kinds",
+                )
                 .w_full()
                 .gap_5()
                 .pb_2()

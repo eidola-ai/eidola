@@ -235,7 +235,12 @@ impl SpaceView {
         let clearance = crate::chrome::corner_clearance(window);
         let mut container = div()
             .id("space-minimap")
-            .probe("space/minimap", gpui::Role::Group, "Conversation map")
+            // A navigation landmark, not a plain group: the strip *is* this
+            // window's table of contents, and `Navigation` maps to
+            // `AXLandmarkNavigation`, so AT can jump straight to it — which is
+            // what makes its position at the end of the reading order right
+            // rather than a burial (see AGENTS.md → Accessibility).
+            .probe("space/minimap", gpui::Role::Navigation, "Conversation map")
             .absolute()
             .top_0()
             .bottom_0()

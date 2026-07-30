@@ -67,6 +67,149 @@ fn library_rows_probe_with_indexed_names(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+// ---------------------------------------------------------------------------
+// Landmarks — the containers that give the tree a shape.
+//
+// Before these, every affordance hung directly off the window root (role-less
+// containers collapse, so children attach to the nearest role-bearing
+// ancestor). Each test asserts the container's *role*, which is what the
+// macOS adapter turns into an `AXLandmark*` / `AXList` a screen reader can
+// navigate by.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn library_listing_is_a_named_list(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![space_info("s1", Some("Tides and the moon"))];
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(&entries, "library/list", gpui::Role::List, "Spaces");
+    assert_probe(
+        &entries,
+        "library/row/0",
+        gpui::Role::ListItem,
+        "Tides and the moon",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn settings_nav_and_content_are_landmarks(cx: &mut TestAppContext) {
+    use eidola_gui::settings::{SettingsPane, SettingsView};
+
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/nav",
+        gpui::Role::TabList,
+        "Settings sections",
+    );
+    // The content landmark is named for the pane it holds, so switching panes
+    // renames it rather than leaving one anonymous "Main".
+    assert_probe(
+        &entries,
+        "settings/content",
+        gpui::Role::Main,
+        "General settings",
+    );
+
+    view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/content",
+        gpui::Role::Main,
+        "Backends settings",
+    );
+    assert_probe(
+        &entries,
+        "settings/backends/tabs",
+        gpui::Role::TabList,
+        "Backend kinds",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn record_strip_and_body_are_landmarks(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+
+    // Empty section: the body is a named region, not a list of nothing.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "record/sections",
+        gpui::Role::TabList,
+        "Record sections",
+    );
+    assert_probe(&entries, "record/body", gpui::Role::Region, "Attestations");
+
+    // Populated: the body becomes the `List` parent the rows belong to.
+    view.update(cx, |v, _| {
+        v.set_attestations_for_test(vec![stub_attestation("att-hash-1")], false);
+    });
+    let entries = fresh_entries(cx, window);
+    assert_probe(&entries, "record/body", gpui::Role::List, "Attestations");
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn space_window_landmarks_name_conversation_and_map(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/conversation",
+        gpui::Role::Main,
+        "Conversation",
+    );
+    // The minimap is the window's table of contents — a navigation landmark,
+    // so its position at the end of the reading order is reachable rather
+    // than a burial. (The literal child reorder is blocked by the composer's
+    // paint-order dependency; see AGENTS.md → Accessibility.)
+    assert_probe(
+        &entries,
+        "space/minimap",
+        gpui::Role::Navigation,
+        "Conversation map",
+    );
+    assert_probe(
+        &entries,
+        "space/composer",
+        gpui::Role::TextInput,
+        "Message composer",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn disabled_probes_record_nothing(cx: &mut TestAppContext) {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -103,6 +246,41 @@ fn fresh_names(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<String> 
         .into_iter()
         .map(|(n, _)| n)
         .collect()
+}
+
+/// Like [`fresh_names`], but keeping each recorded entry so a test can assert
+/// the **role** and **label** a probe applied — not merely that it exists.
+///
+/// This is as deep as the regression gate reaches at the current gpui pin:
+/// `Window`'s emitted AccessKit `TreeUpdate` is crate-private, so nothing here
+/// (or in the driver) can observe tree *shape*, node parentage, or the aria
+/// attributes that don't pass through `.probe()` — `aria_position_in_set`,
+/// `aria_size_of_set`, `aria_value`, `aria_selected`. The probe registry is a
+/// faithful enumeration of the node set with its roles and names, and that is
+/// the whole seam. See `AGENTS.md` → Accessibility for the removal trigger.
+fn fresh_entries(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+) -> Vec<(String, probe::ProbeEntry)> {
+    probe::clear_window(window.window_id().as_u64());
+    draw(cx, window);
+    probe::window_entries(window.window_id().as_u64())
+}
+
+/// Assert that `name` was recorded with the given role and label.
+#[track_caller]
+fn assert_probe(
+    entries: &[(String, probe::ProbeEntry)],
+    name: &str,
+    role: gpui::Role,
+    label: &str,
+) {
+    let Some((_, entry)) = entries.iter().find(|(n, _)| n == name) else {
+        let names: Vec<&String> = entries.iter().map(|(n, _)| n).collect();
+        panic!("probe {name:?} missing; recorded: {names:?}");
+    };
+    assert_eq!(entry.role, role, "probe {name:?} role");
+    assert_eq!(entry.label.as_ref(), label, "probe {name:?} label");
 }
 
 /// Force a frame on a test window. `window.refresh()` marks it dirty; the
