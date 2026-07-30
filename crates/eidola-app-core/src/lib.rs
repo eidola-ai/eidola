@@ -6381,7 +6381,7 @@ struct TurnPrep {
     /// that snapshot. Every round's charge estimate and every round's wire
     /// request read this one array, exactly as they both read `messages` —
     /// the schemas are part of the prompt the model reads, so the pricing
-    /// contract charges their bytes (see `prompt_charge_inputs`).
+    /// contract charges their bytes (see `eidola_common::prompt_charge`).
     tool_schemas: Vec<serde_json::Value>,
     /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
     /// for every non-spend backend. Kept so a later round can re-estimate.
@@ -7342,73 +7342,15 @@ async fn execute_tool_calls(
     out
 }
 
-/// Byte length of a JSON value measured as text: its own bytes when it is a
-/// string (the OpenAI shape for a tool call's `arguments`), otherwise its
-/// compact JSON serialization.
-///
-/// Shared rule with the server (`eidola-server`'s `json_text_bytes`).
-fn json_text_bytes(value: &serde_json::Value) -> u64 {
-    match value.as_str() {
-        Some(s) => s.len() as u64,
-        None => serde_json::to_string(value).map(|s| s.len()).unwrap_or(0) as u64,
-    }
-}
-
-/// The shared client/server pricing inputs for one request: the `messages`
-/// array plus the `tools` array the same request advertises.
-///
-/// Gathered through [`eidola_common::PromptCharge`], which defines *what
-/// counts*, and deliberately identical to the server's
-/// `chargeable_prompt_tokens_for` walk over its parsed
-/// `ChatCompletionRequest`:
-///
-/// * every message contributes its per-message allowance plus its `content`
-///   **string**'s bytes (an assistant message that only called tools has no
-///   content string and contributes zero there; a `tool` result message
-///   contributes its content like any other);
-/// * every `tool_calls` entry on a message contributes its compact JSON
-///   serialization — the whole entry, because the whole entry is what gets
-///   replayed upstream on every round of a tool loop;
-/// * every advertised tool schema contributes its compact JSON
-///   serialization, once per request — the chat template re-injects it into
-///   the prompt on every round.
-///
-/// Both sides computing the same function of the same request is what makes
-/// hold ≥ charge structural; the tripwire lives in `eidola-server`'s
-/// `client_and_server_prompt_terms_agree` and the pinned fixture in
-/// `eidola_common`'s `cross_crate_tool_round_fixture`.
-fn prompt_charge_inputs(
-    messages: &[serde_json::Value],
-    tool_schemas: &[serde_json::Value],
-) -> eidola_common::PromptCharge {
-    let mut charge = eidola_common::PromptCharge::new();
-    for message in messages {
-        charge.add_message(
-            message
-                .get("content")
-                .and_then(|c| c.as_str())
-                .map(|s| s.len() as u64)
-                .unwrap_or(0),
-        );
-        if let Some(calls) = message.get("tool_calls").and_then(|c| c.as_array()) {
-            for call in calls {
-                charge.add_tool_call(json_text_bytes(call));
-            }
-        }
-    }
-    for tool in tool_schemas {
-        charge.add_tool_definition(json_text_bytes(tool));
-    }
-    charge
-}
-
 /// The worst-case charge in credits for one request over `messages` and the
 /// `tool_schemas` that request advertises.
 ///
 /// `pricing` is `(prompt_rate, completion_rate, scale_factor)` from the model
-/// catalog. The prompt side is the shared contract
-/// (`eidola_common::PromptCharge` → `chargeable_prompt_tokens`); the
-/// completion side is the full `max_completion_tokens` ceiling.
+/// catalog. The prompt side is the shared contract's **single walk**,
+/// `eidola_common::prompt_charge` — the same function the server calls over
+/// the same request, which is what makes hold ≥ charge structural rather
+/// than a property two crates must keep agreeing on. The completion side is
+/// the full `max_completion_tokens` ceiling.
 fn estimate_charge_credits(
     messages: &[serde_json::Value],
     tool_schemas: &[serde_json::Value],
@@ -7416,7 +7358,8 @@ fn estimate_charge_credits(
     pricing: (u128, u128, u128),
 ) -> u128 {
     let (prompt_rate, completion_rate, sf) = pricing;
-    let chargeable_prompt = prompt_charge_inputs(messages, tool_schemas).chargeable_prompt_tokens();
+    let chargeable_prompt =
+        eidola_common::prompt_charge(messages, Some(tool_schemas)).chargeable_prompt_tokens();
     let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
     let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
     prompt_credits + completion_credits
@@ -8992,14 +8935,13 @@ mod tests {
 
     // --- the shared pricing contract's tool-calling extension ------------
 
-    /// The cross-crate pricing fixture, walked from the client's side.
+    /// app-core's agreement test for the shared pricing contract.
     ///
-    /// The same logical request is pinned three times: here (app-core's walk
-    /// over its `serde_json::Value` messages), in `eidola-server`'s
-    /// `tool_round_fixture_charges_the_pinned_contract_value` (the server's
-    /// walk over the parsed struct), and in `eidola_common`'s
-    /// `cross_crate_tool_round_fixture` (the arithmetic). All three must
-    /// produce 230 chargeable prompt tokens.
+    /// The canonical pin lives in `eidola_common`'s
+    /// `cross_crate_tool_round_fixture`; this reconstructs the same logical
+    /// request in app-core's **own** representation — the `serde_json::Value`
+    /// messages and tool schemas a turn actually puts on the wire — and must
+    /// reach the same 230 chargeable prompt tokens.
     #[test]
     fn prompt_charge_matches_the_shared_contract_fixture() {
         let messages = vec![
@@ -9024,104 +8966,15 @@ mod tests {
             }
         })];
 
-        assert_eq!(
-            json_text_bytes(&tools[0]),
-            154,
-            "the fixture's schema must stay 154 bytes"
-        );
-        assert_eq!(
-            json_text_bytes(&messages[1]["tool_calls"][0]),
-            93,
-            "the fixture's call entry must stay 93 bytes"
-        );
-
-        let charge = prompt_charge_inputs(&messages, &tools);
+        // Fed through the *shared* walk, exactly as `estimate_charge_credits`
+        // does — so this proves app-core hands the contract a well-formed
+        // view of the request it really sends, which is the part no test
+        // inside eidola-common can see.
+        let charge = eidola_common::prompt_charge(&messages, Some(&tools));
         assert_eq!(charge.message_count(), 3);
         // 13 content + 93 tool-call + 154 schema bytes.
         assert_eq!(charge.total_content_bytes(), 260);
         assert_eq!(charge.chargeable_prompt_tokens(), 230);
-    }
-
-    /// The whole `tool_calls` entry is charged, not just
-    /// `function.{name,arguments}`: the client replays the provider's call
-    /// object verbatim — id, `type` and any provider extension included —
-    /// and those bytes reach the upstream, where a template like Mistral's
-    /// renders the call id straight into the prompt.
-    #[test]
-    fn tool_call_framing_bytes_are_charged() {
-        let call = |id: &str| {
-            vec![serde_json::json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": id, "type": "function",
-                    "function": {"name": "calc", "arguments": "{}"}
-                }]
-            })]
-        };
-        let short = prompt_charge_inputs(&call("c"), &[]);
-        let realistic = prompt_charge_inputs(&call("call_9tK2mQz7Xb4LpR1vN8sYcE0d"), &[]);
-        assert!(
-            realistic.total_content_bytes() > short.total_content_bytes(),
-            "a longer call id is more forwarded bytes and must cost more"
-        );
-
-        let with_extension = prompt_charge_inputs(
-            &[serde_json::json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": "c", "type": "function",
-                    "function": {"name": "calc", "arguments": "{}"},
-                    "provider_extra": {"trace": "0123456789abcdef"}
-                }]
-            })],
-            &[],
-        );
-        assert!(
-            with_extension.total_content_bytes() > short.total_content_bytes(),
-            "a forwarded provider extension must not ride free"
-        );
-    }
-
-    /// A request with neither `tools` nor `tool_calls` charges exactly what it
-    /// charged before the extension — the shape of nearly all traffic.
-    #[test]
-    fn a_tool_less_request_is_unaffected_by_the_extension() {
-        let messages = vec![
-            serde_json::json!({"role": "system", "content": "be brief"}),
-            serde_json::json!({"role": "user", "content": "héllo wörld"}),
-        ];
-        let charge = prompt_charge_inputs(&messages, &[]);
-        let bytes: u64 = messages
-            .iter()
-            .map(|m| m["content"].as_str().unwrap().len() as u64)
-            .sum();
-        assert_eq!(
-            charge.chargeable_prompt_tokens(),
-            eidola_common::chargeable_prompt_tokens(bytes, messages.len() as u64)
-        );
-    }
-
-    /// An off-spec `arguments` object (rather than the string the OpenAI shape
-    /// mandates) is measured as its compact serialization — the same rule the
-    /// server applies, so the two sides still agree.
-    #[test]
-    fn non_string_tool_call_arguments_are_measured_as_json() {
-        let value = serde_json::json!({"expr": "2+2"});
-        assert_eq!(json_text_bytes(&value), 14);
-        let messages = vec![serde_json::json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [{"id": "c", "function": {"name": "ca", "arguments": value}}]
-        })];
-        // The whole entry is measured; the off-spec object still round-trips
-        // to the identical bytes on the server, which is what matters.
-        let charge = prompt_charge_inputs(&messages, &[]);
-        assert_eq!(
-            charge.total_content_bytes(),
-            json_text_bytes(&messages[0]["tool_calls"][0])
-        );
     }
 
     // --- tool-call shape + streamed provider-field preservation ----------
