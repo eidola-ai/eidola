@@ -4,7 +4,7 @@
 //! selection.
 
 use gpui::{AppContext, Entity, px, size};
-use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownEditorState, Selection};
+use gpui_markdown_editor::{EditorState, EmbedMap, MarkdownEditor, MarkdownEditorState, Selection};
 
 use super::harness::Snapshots;
 
@@ -43,6 +43,24 @@ impl gpui::Render for EditorHarness {
         _: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
         MarkdownEditor::new(&self.state)
+    }
+}
+
+/// Read-only host — the surface embeds are compared against. An embed's
+/// mapped content goes through `render_readonly`, so a *disabled* editor over
+/// the same markdown is the apples-to-apples control (an editable one would
+/// flip whatever construct hosts the cursor into edit mode).
+struct ReadonlyHarness {
+    state: Entity<MarkdownEditorState>,
+}
+
+impl gpui::Render for ReadonlyHarness {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        MarkdownEditor::new(&self.state).disabled(true)
     }
 }
 
@@ -706,7 +724,176 @@ pub fn register(s: &mut Snapshots) {
             })
         },
     );
+
+    register_embed_audit(s);
 }
+
+/// The embed-fidelity audit: every markdown construct the editor supports,
+/// rendered twice — once as ordinary top-level content (the *control*) and
+/// once as the mapped content of an embed block. The pair is the evidence:
+/// an embed is supposed to look like the control, inset in a quote container.
+///
+/// One family per corpus so a regression is legible in a single image rather
+/// than buried in a kitchen sink.
+fn register_embed_audit(s: &mut Snapshots) {
+    for (name, corpus, h) in EMBED_AUDIT_CORPORA {
+        let win = size(px(720.), px(*h));
+        s.add(
+            format!("embed_audit_{name}_control"),
+            win,
+            move |window, cx| {
+                cx.new(|cx| {
+                    let state = EditorState {
+                        markdown: (*corpus).into(),
+                        selection: Selection::Cursor(0),
+                        ..Default::default()
+                    };
+                    ReadonlyHarness {
+                        state: cx.new(|cx| MarkdownEditorState::with_state(state, window, cx)),
+                    }
+                })
+            },
+        );
+        s.add(
+            format!("embed_audit_{name}_embedded"),
+            win,
+            move |window, cx| {
+                cx.new(|cx| {
+                    let state = EditorState {
+                        markdown: "{{ embed 1 }}".into(),
+                        selection: Selection::Cursor(0),
+                        embeds: EmbedMap::new([(1u64, (*corpus).to_string())]),
+                    };
+                    ReadonlyHarness {
+                        state: cx.new(|cx| MarkdownEditorState::with_state(state, window, cx)),
+                    }
+                })
+            },
+        );
+    }
+}
+
+/// `(family, markdown, window height)`.
+const EMBED_AUDIT_CORPORA: &[(&str, &str, f32)] = &[
+    (
+        "headings",
+        "# Heading one\n\n\
+         Body under one.\n\n\
+         ## Heading two\n\n\
+         ### Heading three\n\n\
+         Trailing paragraph.",
+        340.,
+    ),
+    (
+        "unordered_list",
+        "- first item\n\
+         - second item\n\
+         - third item with enough words that it soft-wraps at this measure and continues\n",
+        220.,
+    ),
+    (
+        "unordered_list_nested",
+        "- outer one\n  - inner one\n  - inner two\n    - deepest\n- outer two\n",
+        220.,
+    ),
+    (
+        "ordered_list",
+        "8. eight\n9. nine\n10. ten\n11. eleven\n",
+        200.,
+    ),
+    (
+        "ordered_list_nested",
+        "1. outer one\n   1. inner one\n   2. inner two\n2. outer two\n",
+        200.,
+    ),
+    (
+        "task_list",
+        "- [x] done item\n- [ ] todo item\n- plain sibling\n",
+        180.,
+    ),
+    (
+        "loose_list",
+        "- first paragraph of item one\n\n  second paragraph of item one\n\n- item two\n",
+        220.,
+    ),
+    (
+        "inline_styles",
+        "Plain **bold**, *italic*, ***both***, ~~struck~~, `inline code`, and a\n\
+         [link to somewhere](https://example.com) in one paragraph.\n\n\
+         Escapes and entities: \\*not italic\\* and &copy; and &#x2014; dash.",
+        220.,
+    ),
+    (
+        "hard_break",
+        "first line\\\nsecond line after a backslash break\n\n\
+         third line  \nfourth line after a two-space break\n",
+        200.,
+    ),
+    (
+        "code_fence",
+        "Before the fence.\n\n\
+         ```rust\n\
+         fn main() {\n    println!(\"hello\");\n}\n\
+         ```\n\n\
+         After the fence.",
+        280.,
+    ),
+    (
+        "table",
+        "| Feature | Status |\n\
+         | :-- | --: |\n\
+         | **Bold** cell | `code` |\n\
+         | plain | ~~cut~~ |\n",
+        220.,
+    ),
+    (
+        "blockquote",
+        "> quoted line one\n> quoted line two\n>\n> > nested deeper\n\n\
+         after the quote",
+        240.,
+    ),
+    (
+        "thematic_break",
+        "above the rule\n\n---\n\nbelow the rule",
+        200.,
+    ),
+    (
+        "math",
+        "Inline $x^2 + y^2$ in a sentence.\n\n$$\n\\frac{a}{b}\n$$\n\nafter the math.",
+        260.,
+    ),
+    // Tall inline math on a *non-final* visual row of a soft-wrapped
+    // paragraph. KNOWN DEFECT — this case currently renders wrong, in the
+    // live editor and the embed alike: `compute_math_row_extra` is a
+    // per-*logical*-line overshoot, but the row layout multiplies it into
+    // the height (`(line_height + extra) * wrap_count`) while the shaped
+    // line is still painted with `row_height: line_height`, so gpui strides
+    // its visual rows by the bare `line_height` (`line.rs`'s
+    // `glyph_origin.y += line_height` at each wrap boundary). Two visible
+    // consequences: the construct overlaps the glyphs of the row beneath
+    // it, and `(wrap_count - 1) * extra` of reserved space piles up as dead
+    // air after the whole logical line. Kept as the reproduction for the
+    // fix; see the audit note for the measured numbers.
+    (
+        "wrapped_math",
+        "A paragraph whose tall $\\frac{\\frac{\\frac{a}{b}}{\\frac{c}{d}}}{\\frac{e}{f}}$ \
+         appears early on, and which then continues with enough further words that the \
+         logical line must soft-wrap several times at this measure — so the tall \
+         construct sits on the first visual row while ordinary text keeps flowing \
+         onto the rows below it.",
+        260.,
+    ),
+    (
+        "list_with_code",
+        "- item with a fence:\n\n  ```\n  let x = 1;\n  ```\n\n- plain item\n",
+        260.,
+    ),
+    (
+        "quote_with_list",
+        "> - quoted bullet one\n> - quoted bullet two\n>\n> tail paragraph\n",
+        220.,
+    ),
+];
 
 /// Build an editor whose cursor is placed inside `needle` (3 chars in, by
 /// default). Panics if `needle` isn't found — keeps the cases honest.
