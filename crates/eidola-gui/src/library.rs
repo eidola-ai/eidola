@@ -314,7 +314,7 @@ impl LibraryView {
                         .probe(
                             format!("library/row/{idx}/rename"),
                             gpui::Role::Button,
-                            "Rename",
+                            format!("Rename {row_label}"),
                         )
                         .debug_selector(move || format!("rename-pencil-{idx}"))
                         .on_mouse_down(
@@ -353,7 +353,7 @@ impl LibraryView {
                         .probe(
                             format!("library/row/{idx}/archive"),
                             gpui::Role::Button,
-                            "Archive",
+                            format!("Archive {row_label}"),
                         )
                         .debug_selector(move || format!("archive-x-{idx}"))
                         .on_mouse_down(

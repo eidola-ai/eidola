@@ -523,7 +523,7 @@ impl SpaceView {
             .probe(
                 "space/draft/inactive",
                 gpui::Role::Button,
-                "Draft — click to edit",
+                "Draft — open to edit",
             )
             // Re-activate on click (byline/gutter clicks that miss the editor);
             // `on_click` (mouse-up) so the focus sticks — focusing during

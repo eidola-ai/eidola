@@ -27,8 +27,8 @@ use gpui_component::{
 };
 
 use crate::participants_view::{
-    NOTIFY_POLICIES, error_banner, field_label, ghost_button, load_error_panel, mode_chip,
-    model_field,
+    NOTIFY_POLICIES, error_banner, field_label, ghost_button, ghost_button_labeled,
+    load_error_panel, mode_chip, model_field,
 };
 use crate::probe::Probe as _;
 use crate::stores::{ConfigStore, Stores, TemplatesStore};
@@ -429,6 +429,7 @@ impl TemplatesSettingsView {
         let id_edit = t.id.clone();
         let id_default = t.id.clone();
         let id_remove = t.id.clone();
+        let subject = t.title.clone();
         let names: Vec<String> = t.participants.iter().map(|p| p.label.clone()).collect();
         let summary = format!(
             "cascade {} · {}",
@@ -487,21 +488,23 @@ impl TemplatesSettingsView {
                     .flex_wrap()
                     .justify_end()
                     .when(!is_default, |el| {
-                        el.child(ghost_button(
+                        el.child(ghost_button_labeled(
                             SharedString::from(format!("tmpl-default-{id_default}")),
                             SharedString::from(format!(
                                 "settings/templates/{id_default}/set-default"
                             )),
                             "Set as default",
+                            format!("Set {subject} as the default template"),
                             false,
                             cx,
                             cx.listener(move |this, _, _, cx| this.set_default(&id_default, cx)),
                         ))
                     })
-                    .child(ghost_button(
+                    .child(ghost_button_labeled(
                         SharedString::from(format!("tmpl-edit-{id_edit}")),
                         SharedString::from(format!("settings/templates/{id_edit}/edit")),
                         "Edit",
+                        format!("Edit {subject}"),
                         false,
                         cx,
                         cx.listener(move |this, _, window, cx| {
@@ -509,10 +512,11 @@ impl TemplatesSettingsView {
                         }),
                     ))
                     .when(!is_builtin, |el| {
-                        el.child(ghost_button(
+                        el.child(ghost_button_labeled(
                             SharedString::from(format!("tmpl-remove-{id_remove}")),
                             SharedString::from(format!("settings/templates/{id_remove}/remove")),
                             "Remove",
+                            format!("Remove {subject}"),
                             false,
                             cx,
                             cx.listener(move |this, _, _, cx| this.remove_template(&id_remove, cx)),
@@ -553,10 +557,11 @@ impl TemplatesSettingsView {
             h_flex()
                 .gap_2()
                 .items_center()
-                .child(ghost_button(
+                .child(ghost_button_labeled(
                     "cascade-dec".into(),
                     "settings/templates/editor/cascade/dec".into(),
                     "−",
+                    "Decrease cascade limit",
                     false,
                     cx,
                     cx.listener(|this, _, _, cx| this.cascade_inc(-1, cx)),
@@ -568,10 +573,11 @@ impl TemplatesSettingsView {
                         .text_sm()
                         .child(SharedString::from(draft.cascade_limit.to_string())),
                 )
-                .child(ghost_button(
+                .child(ghost_button_labeled(
                     "cascade-inc".into(),
                     "settings/templates/editor/cascade/inc".into(),
                     "+",
+                    "Increase cascade limit",
                     false,
                     cx,
                     cx.listener(|this, _, _, cx| this.cascade_inc(1, cx)),
@@ -660,10 +666,11 @@ impl TemplatesSettingsView {
                             )
                             .child(Input::new(&p.label)),
                     )
-                    .child(ghost_button(
+                    .child(ghost_button_labeled(
                         SharedString::from(format!("tp-remove-{idx}")),
                         SharedString::from(format!("settings/templates/participant/{idx}/remove")),
                         "Remove",
+                        format!("Remove participant {}", idx + 1),
                         false,
                         cx,
                         cx.listener(move |this, _, _, cx| this.remove_participant(idx, cx)),
