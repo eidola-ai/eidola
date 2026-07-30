@@ -892,3 +892,318 @@ fn submit_with_references_carries_the_quote_to_the_wire() {
         );
     });
 }
+
+// ===========================================================================
+// May-decline router (task 22)
+//
+// The router is just another HTTP call, so the harness scripts it exactly like
+// a turn: `RouterBehavior` answers requests whose wire model is
+// `chat_harness::ROUTER_MODEL`, leaving `ChatBehavior` free to script the turns
+// in the same test. The router model is registered as a *local* engine pointed
+// at the mock, which is both the intended production shape (a local router is
+// free) and what makes "no spend, no Wallet emission" a real assertion.
+//
+// Whether the router decides *well* is a judgment question — an offline eval
+// over a golden set of (post, cards, slice) → expected notify set, scored
+// against candidate models and prompts. That is deliberately not here: real
+// model output is not deterministic across machines (Metal vs CPU kernels), so
+// CI never gates on it.
+// ===========================================================================
+
+/// Point the space's `router_model` at a "loaded" local engine served by the
+/// mock, so the router call is a real HTTP round-trip on the zero-spend path.
+fn enable_router(core: &AppCore, mock: &chat_harness::MockServer, space: &str) {
+    core.test_register_loaded_local_model("local", chat_harness::ROUTER_SLUG, mock.port());
+    core.runtime()
+        .block_on(
+            core.set_space_router_model(space.to_string(), Some(chat_harness::ROUTER_MODEL.into())),
+        )
+        .expect("set router model");
+}
+
+/// The chat requests the mock saw that were *router* calls.
+fn router_calls(mock: &chat_harness::MockServer) -> Vec<serde_json::Value> {
+    mock.chat_bodies()
+        .into_iter()
+        .filter(|b| b["model"] == chat_harness::ROUTER_MODEL)
+        .collect()
+}
+
+fn drain(
+    rx: &mut tokio::sync::broadcast::Receiver<eidola_app_core::changes::Change>,
+) -> Vec<eidola_app_core::changes::Change> {
+    let mut out = Vec::new();
+    while let Ok(c) = rx.try_recv() {
+        out.push(c);
+    }
+    out
+}
+
+/// A space with two auto-notified agents and a human post in it. Returns
+/// `(space_id, post_action_id)`.
+fn space_with_two_candidates(core: &AppCore) -> (String, String) {
+    let space = core
+        .runtime()
+        .block_on(core.create_space(None))
+        .expect("space")
+        .id;
+    // Born with You + the seeded default agent (policy 'human'); add a second
+    // agent so the router has a genuine choice to make.
+    add_agent(core, &space, "All-Agent", MODEL, "all", None);
+    let post = core
+        .runtime()
+        .block_on(core.post("How do tides work?".into(), Some(space.clone())))
+        .expect("post");
+    (space, post.action_id)
+}
+
+fn mechanical_turns(core: &AppCore, space: &str, post: &str) -> Vec<eidola_app_core::PlannedTurn> {
+    match core
+        .runtime()
+        .block_on(core.plan_notifications(space.to_string(), post.to_string()))
+        .expect("mechanical plan")
+    {
+        NotificationPlan::Turns(t) => t,
+        other => panic!("expected Turns, got {other:?}"),
+    }
+}
+
+fn refine(core: &AppCore, space: &str, post: &str, plan: NotificationPlan) -> NotificationPlan {
+    core.runtime()
+        .block_on(core.refine_notifications(space.to_string(), post.to_string(), plan))
+        .expect("refine")
+}
+
+#[test]
+fn router_selection_drops_the_participants_it_did_not_choose() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            router: chat_harness::RouterBehavior::Reply(r#"{"notify": [1]}"#.into()),
+            ..MockConfig::default()
+        });
+        let (space, post) = space_with_two_candidates(&core);
+        enable_router(&core, &mock, &space);
+
+        let mechanical = mechanical_turns(&core, &space, &post);
+        assert_eq!(mechanical.len(), 2, "both policies fire on a human post");
+
+        let mut rx = core.subscribe_changes();
+        let refined = refine(
+            &core,
+            &space,
+            &post,
+            NotificationPlan::Turns(mechanical.clone()),
+        );
+
+        // Exactly the first candidate survives — and it survives *unchanged*,
+        // cascade_depth included: the router filters the set, it never
+        // rewrites the turns (PlannedTurn equality covers the depth math).
+        assert_eq!(
+            refined,
+            NotificationPlan::Turns(vec![mechanical[0].clone()]),
+            "the router drops candidate 2 and leaves candidate 1 untouched"
+        );
+
+        // A declined participant costs nothing: no turn was driven, so no post
+        // and no spend — and the router itself is local, so no Wallet either.
+        assert_eq!(router_calls(&mock).len(), 1, "exactly one router call");
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|c| matches!(c, eidola_app_core::changes::Change::Wallet)),
+            "a local router spends nothing; got {events:?}"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.get_space_messages(space.clone()))
+                .expect("messages")
+                .len(),
+            1,
+            "only the human post — nobody was driven"
+        );
+    });
+}
+
+#[test]
+fn router_can_choose_nobody() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            router: chat_harness::RouterBehavior::Reply(r#"{"notify": []}"#.into()),
+            ..MockConfig::default()
+        });
+        let (space, post) = space_with_two_candidates(&core);
+        enable_router(&core, &mock, &space);
+
+        let mechanical = mechanical_turns(&core, &space, &post);
+        assert_eq!(mechanical.len(), 2);
+        assert_eq!(
+            refine(&core, &space, &post, NotificationPlan::Turns(mechanical)),
+            NotificationPlan::Turns(Vec::new()),
+            "an empty selection is a valid decision: zero turns"
+        );
+    });
+}
+
+#[test]
+fn an_unreachable_router_degrades_to_the_mechanical_set() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            router: chat_harness::RouterBehavior::Fail(500),
+            ..MockConfig::default()
+        });
+        let (space, post) = space_with_two_candidates(&core);
+        enable_router(&core, &mock, &space);
+
+        let mechanical = mechanical_turns(&core, &space, &post);
+        assert_eq!(
+            refine(
+                &core,
+                &space,
+                &post,
+                NotificationPlan::Turns(mechanical.clone())
+            ),
+            NotificationPlan::Turns(mechanical),
+            "a post is never blocked on the router: the failure mode is extra \
+             notifications, not lost ones"
+        );
+    });
+}
+
+#[test]
+fn unusable_router_output_degrades_to_the_mechanical_set() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            router: chat_harness::RouterBehavior::Reply(
+                "I reckon the second one should take this.".into(),
+            ),
+            ..MockConfig::default()
+        });
+        let (space, post) = space_with_two_candidates(&core);
+        enable_router(&core, &mock, &space);
+
+        let mechanical = mechanical_turns(&core, &space, &post);
+        assert_eq!(
+            refine(
+                &core,
+                &space,
+                &post,
+                NotificationPlan::Turns(mechanical.clone())
+            ),
+            NotificationPlan::Turns(mechanical),
+            "prose instead of JSON degrades rather than guessing"
+        );
+    });
+}
+
+#[test]
+fn an_unset_router_model_is_never_invoked() {
+    run(|| {
+        // The default: no `router_model` on the space — the feature is off.
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig::default());
+        let (space, post) = space_with_two_candidates(&core);
+
+        let mechanical = mechanical_turns(&core, &space, &post);
+        assert_eq!(
+            refine(
+                &core,
+                &space,
+                &post,
+                NotificationPlan::Turns(mechanical.clone())
+            ),
+            NotificationPlan::Turns(mechanical)
+        );
+        assert!(
+            router_calls(&mock).is_empty(),
+            "off means off: not one HTTP call"
+        );
+
+        // And the same through `submit`, the production path.
+        let result = core
+            .runtime()
+            .block_on(core.submit("and another thing".into(), Some(space), None))
+            .expect("submit");
+        assert!(matches!(result.plan, NotificationPlan::Turns(_)));
+        assert!(router_calls(&mock).is_empty());
+    });
+}
+
+#[test]
+fn a_paused_plan_never_reaches_the_router() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            router: chat_harness::RouterBehavior::Reply(r#"{"notify": []}"#.into()),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let tmpl = core
+            .runtime()
+            .block_on(core.create_template(
+                "Cascade".into(),
+                1,
+                vec![eidola_app_core::NewTemplateParticipant {
+                    label: "Chatter".into(),
+                    model_ref: Some(MODEL.into()),
+                    notify_policy: "all".into(),
+                    ..Default::default()
+                }],
+            ))
+            .expect("template");
+        core.set_default_template(tmpl.id.clone()).expect("default");
+        let space = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+        enable_router(&core, &mock, &space);
+        let chatter = agent_id(&core, &space, "Chatter");
+
+        let u1 = core
+            .runtime()
+            .block_on(core.post("start".into(), Some(space.clone())))
+            .expect("post");
+        let i1 = drive_as(&core, &space, &chatter, &u1.action_id)
+            .expect("i1")
+            .response_action_id
+            .expect("i1 id");
+
+        // Depth 1 == the limit: the cascade guard speaks first and the router
+        // is not consulted at all.
+        let plan = core
+            .runtime()
+            .block_on(core.plan_notifications(space.clone(), i1.clone()))
+            .expect("plan");
+        assert!(matches!(plan, NotificationPlan::Paused { .. }));
+        assert_eq!(refine(&core, &space, &i1, plan.clone()), plan);
+        assert!(
+            router_calls(&mock).is_empty(),
+            "the guard short-circuits before any router call"
+        );
+    });
+}
+
+#[test]
+fn an_explicit_ask_bypasses_the_router_entirely() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            // The router would notify nobody…
+            router: chat_harness::RouterBehavior::Reply(r#"{"notify": []}"#.into()),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (space, post) = space_with_two_candidates(&core);
+        enable_router(&core, &mock, &space);
+        let agent = agent_id(&core, &space, "All-Agent");
+
+        // …but an explicit ask consults no guards and no router.
+        let result = drive_as(&core, &space, &agent, &post).expect("explicit ask runs");
+        assert!(result.response_action_id.is_some());
+        assert!(
+            router_calls(&mock).is_empty(),
+            "respond_stream_as never routes through the router"
+        );
+    });
+}

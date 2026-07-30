@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod local_models;
+pub mod router;
 pub mod tools;
 pub mod trust_root;
 pub mod updater;
@@ -239,6 +240,11 @@ pub struct SpaceTemplateInfo {
     pub id: String,
     pub title: String,
     pub cascade_limit: i64,
+    /// The may-decline router model (task 22) copied into every space this
+    /// template instantiates. `None` = the feature is off. Set through the
+    /// dedicated [`AppCore::set_template_router_model`] rather than
+    /// `create_template` / `update_template`, whose signatures stay unchanged.
+    pub router_model: Option<String>,
     pub participants: Vec<TemplateParticipantInfo>,
 }
 
@@ -2575,6 +2581,7 @@ impl Inner {
             id: t.id,
             title: t.title,
             cascade_limit: t.cascade_limit,
+            router_model: t.router_model,
             participants,
         })
     }
@@ -2638,7 +2645,7 @@ impl Inner {
         let conn = self.db_conn().await?;
         let now = now_ms();
         let id = Uuid::now_v7().to_string();
-        db::insert_space_template(&conn, &id, title, cascade_limit, now).await?;
+        db::insert_space_template(&conn, &id, title, cascade_limit, None, now).await?;
         for (label, model_ref, system_prompt, policy) in &validated {
             // Template agents are TEMPLATE-OWNED participant rows.
             db::insert_participant(
@@ -2733,6 +2740,67 @@ impl Inner {
             now,
         )
         .await?;
+        self.bus.emit(Change::Templates);
+        Ok(())
+    }
+
+    /// Validate a may-decline router model reference, normalizing `""` /
+    /// whitespace to `None` (= the feature is off).
+    ///
+    /// The reference is checked against the backend registry up front so a
+    /// typo fails loudly *here* rather than degrading silently on every post
+    /// (the router's runtime failure mode is deliberately quiet — see
+    /// [`router`]). A backend removed later still degrades quietly, which is
+    /// the right split: a setting the user just typed should be honest, a
+    /// world that changed underneath should not block posting.
+    async fn validate_router_model(
+        &self,
+        conn: &turso::Connection,
+        router_model: Option<&str>,
+    ) -> Result<Option<String>, AppError> {
+        let Some(raw) = router_model.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let mref = backends::parse_model_ref(raw);
+        self.require_backend(conn, &mref.backend_id).await?;
+        Ok(Some(backends::qualified_model_id(
+            &mref.model,
+            &mref.backend_id,
+        )))
+    }
+
+    /// Set (or clear) a space's may-decline router model. Emits
+    /// `Change::Space` — it is a per-space setting, like `cascade_limit`.
+    async fn set_space_router_model(
+        &self,
+        space_id: &str,
+        router_model: Option<&str>,
+    ) -> Result<(), AppError> {
+        let conn = self.db_conn().await?;
+        let normalized = self.validate_router_model(&conn, router_model).await?;
+        if !db::set_space_router_model(&conn, space_id, normalized.as_deref()).await? {
+            return Err(AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            });
+        }
+        self.bus.emit(Change::Space(space_id.to_string()));
+        Ok(())
+    }
+
+    /// Set (or clear) a template's may-decline router model — the value every
+    /// space instantiated from it is born with. Emits `Change::Templates`.
+    async fn set_template_router_model(
+        &self,
+        template_id: &str,
+        router_model: Option<&str>,
+    ) -> Result<(), AppError> {
+        let conn = self.db_conn().await?;
+        let normalized = self.validate_router_model(&conn, router_model).await?;
+        if !db::set_template_router_model(&conn, template_id, normalized.as_deref()).await? {
+            return Err(AppError::NotConfigured {
+                message: format!("space template not found or removed: {template_id}"),
+            });
+        }
         self.bus.emit(Change::Templates);
         Ok(())
     }
@@ -4630,10 +4698,17 @@ impl Inner {
         Ok(NotificationPlan::Turns(turns))
     }
 
-    /// The composer CTA path: save a post (`post`) then plan notifications over
-    /// it. The caller drives one turn per [`PlannedTurn`] (via
-    /// [`AppCore::respond_stream_as`]) and may re-plan on each resulting post to
+    /// The composer CTA path: save a post (`post`), plan notifications over it,
+    /// then refine that plan through the space's may-decline router (a no-op
+    /// unless the space has a router model — see [`router`]). The caller drives
+    /// one turn per [`PlannedTurn`] (via [`AppCore::respond_stream_as`]) and may
+    /// re-plan on each resulting post — through
+    /// [`AppCore::plan_notifications`] + [`AppCore::refine_notifications`] — to
     /// continue an auto-notify cascade until the guard pauses it.
+    ///
+    /// The post itself is committed and emitted *before* the router runs, so a
+    /// router call never delays the writer seeing their own words, and a router
+    /// failure can never fail a submit (it degrades to the mechanical set).
     async fn submit(
         &self,
         space_id: Option<&str>,
@@ -4645,6 +4720,9 @@ impl Inner {
         let plan = self
             .plan_notifications(&post.space_id, &post.action_id)
             .await?;
+        let plan = self
+            .refine_notifications(&post.space_id, &post.action_id, plan)
+            .await;
         Ok(SubmitResult { post, plan })
     }
 }
@@ -4897,6 +4975,13 @@ impl AppCore {
     /// Compute the auto-response notification plan for an already-persisted post
     /// (owned ∪ referenced participants, effective notify policy, data-derived
     /// cascade guard). Used to continue a cascade after each driven turn.
+    ///
+    /// A **pure read**: no network, no commits, no emissions — the mechanical
+    /// candidate set. Pipe it through [`Self::refine_notifications`] before
+    /// driving turns to apply the space's may-decline router (which [`submit`]
+    /// already does for the first hop).
+    ///
+    /// [`submit`]: Self::submit
     pub async fn plan_notifications(
         &self,
         space_id: String,
@@ -4907,6 +4992,31 @@ impl AppCore {
             .spawn(async move { inner.plan_notifications(&space_id, &post_action_id).await })
             .await
             .map_err(join_err)?
+    }
+
+    /// Filter a mechanical notification plan through the space's may-decline
+    /// router — one small-model call deciding who of the planned candidates
+    /// should actually respond (see [`router`]).
+    ///
+    /// Infallible by construction: an unset router model (the default — the
+    /// feature is off), an unreachable router, or unparseable output all return
+    /// `plan` unchanged. A `Paused` plan and an empty plan are returned without
+    /// touching the network. Explicit asks never come through here at all.
+    pub async fn refine_notifications(
+        &self,
+        space_id: String,
+        post_action_id: String,
+        plan: NotificationPlan,
+    ) -> Result<NotificationPlan, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .refine_notifications(&space_id, &post_action_id, plan)
+                    .await
+            })
+            .await
+            .map_err(join_err)
     }
 }
 
@@ -6148,6 +6258,64 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.remove_template(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    // --- may-decline router settings (task 22) --------------------------
+
+    /// This space's may-decline router model, or `None` when the feature is
+    /// off here (the default).
+    pub async fn space_router_model(&self, space_id: String) -> Result<Option<String>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                db::space_router_model(&conn, &space_id).await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Set (or clear, with `None`) this space's may-decline router model — the
+    /// small model that filters the mechanical notify set (see [`router`]).
+    ///
+    /// The value is a qualified `<model>@<backend>` reference. A local
+    /// (engine-backed) reference costs nothing; **a remote reference bills a
+    /// normal inference on every triggering post**, which any settings surface
+    /// must say plainly. Emits [`Change::Space`].
+    pub async fn set_space_router_model(
+        &self,
+        space_id: String,
+        router_model: Option<String>,
+    ) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .set_space_router_model(&space_id, router_model.as_deref())
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Set (or clear) a template's may-decline router model — the value every
+    /// space instantiated from it is born with (copied exactly like
+    /// `cascade_limit`). Same cost caveat as
+    /// [`Self::set_space_router_model`]. Emits [`Change::Templates`].
+    pub async fn set_template_router_model(
+        &self,
+        template_id: String,
+        router_model: Option<String>,
+    ) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .set_template_router_model(&template_id, router_model.as_deref())
+                    .await
+            })
             .await
             .map_err(join_err)?
     }
