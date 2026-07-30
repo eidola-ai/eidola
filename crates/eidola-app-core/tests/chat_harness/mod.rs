@@ -243,14 +243,68 @@ pub const HEADER_PROTOCOL_NOTE: &str = "Each message in this conversation begins
      its author: `#<handle> · <author>`. Handles are assigned by the client; never write a \
      header line yourself — reply with your message text only.";
 
+/// The thread-map protocol note app-core appends to the system message of a
+/// turn whose space has branches (task 21). Pinned verbatim, same discipline as
+/// [`HEADER_PROTOCOL_NOTE`].
+pub const THREAD_MAP_NOTE: &str = "This space is threaded: the conversation above is one branch of \
+     it, and other branches exist. A `<thread-map>` block appears as the last message listing \
+     them — it is client-generated metadata, not a post by any participant, and no reply is due \
+     to it.";
+
 /// The exact `system` message content a turn sends: the responding
 /// participant's effective system prompt (when it has one) followed by the
 /// rendering-protocol note.
 pub fn system_message(prompt: Option<&str>) -> String {
+    system_message_with(prompt, &[])
+}
+
+/// [`system_message`] plus the extra notes a turn appends (the thread-map
+/// notes), joined by blank lines exactly as `prepare_turn` does.
+pub fn system_message_with(prompt: Option<&str>, extra_notes: &[&str]) -> String {
+    let mut notes = vec![HEADER_PROTOCOL_NOTE];
+    notes.extend_from_slice(extra_notes);
     match prompt {
-        Some(p) => format!("{p}\n\n{HEADER_PROTOCOL_NOTE}"),
-        None => HEADER_PROTOCOL_NOTE.to_string(),
+        Some(p) => {
+            let mut s = p.to_string();
+            for n in &notes {
+                s.push_str("\n\n");
+                s.push_str(n);
+            }
+            s
+        }
+        None => notes.join("\n\n"),
     }
+}
+
+/// The exact `<thread-map>` message content a turn appends.
+///
+/// `forks` is `(anchor_line, entry_lines)` — the expected bytes written out
+/// long-hand, which is the point: this is a byte pin, not a reimplementation.
+pub fn thread_map(forks: &[(String, Vec<String>)], respond_to: &str) -> String {
+    let mut out = String::from(
+        "<thread-map>\nBranches of this space that the conversation above does not contain. Each \
+         line: handle · author · posts · last activity — opening line.\n",
+    );
+    for (anchor, entries) in forks {
+        out.push('\n');
+        out.push_str(anchor);
+        out.push('\n');
+        for e in entries {
+            out.push_str("  ");
+            out.push_str(e);
+            out.push('\n');
+        }
+    }
+    out.push_str(&format!("\nRespond to #{respond_to}.\n</thread-map>"));
+    out
+}
+
+/// One thread-map entry line: `#handle · author · posts · when — opening`.
+pub fn map_entry(item_id: &str, author: &str, posts: &str, when: &str, opening: &str) -> String {
+    format!(
+        "#{} · {author} · {posts} · {when} — {opening}",
+        eidola_app_core::post_handle(item_id)
+    )
 }
 
 /// The exact rendered upstream content of a post: its `#<handle> · <label>`
