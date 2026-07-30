@@ -1830,6 +1830,134 @@ fn each_tool_round_acquires_its_own_hold() {
     });
 }
 
+/// The server's walk of the pricing contract, replicated over a raw request
+/// body — a copy of `eidola-server`'s `handlers::chargeable_prompt_tokens_for`
+/// (which reads the same JSON, parsed into `ChatCompletionRequest`).
+///
+/// This is the *other* side of the shared `eidola_common::PromptCharge`
+/// contract. app-core cannot depend on the server crate, so the tripwire is a
+/// deliberate replica: if the two walks ever diverge, this test and the
+/// server's own `client_and_server_prompt_terms_agree` both have to be edited,
+/// which is exactly the review moment a pricing change deserves.
+fn server_chargeable_prompt_tokens(body: &serde_json::Value) -> u64 {
+    fn text_bytes(v: &serde_json::Value) -> u64 {
+        match v.as_str() {
+            Some(s) => s.len() as u64,
+            None => serde_json::to_string(v).map(|s| s.len()).unwrap_or(0) as u64,
+        }
+    }
+    let mut charge = eidola_common::PromptCharge::new();
+    for message in body["messages"].as_array().expect("messages array") {
+        charge.add_message(
+            message
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.len() as u64)
+                .unwrap_or(0),
+        );
+        for call in message
+            .get("tool_calls")
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let function = call.get("function");
+            charge.add_tool_call(
+                function
+                    .and_then(|f| f.get("name"))
+                    .map(text_bytes)
+                    .unwrap_or(0),
+                function
+                    .and_then(|f| f.get("arguments"))
+                    .map(text_bytes)
+                    .unwrap_or(0),
+            );
+        }
+    }
+    for tool in body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .into_iter()
+        .flatten()
+    {
+        charge.add_tool_definition(text_bytes(tool));
+    }
+    charge.chargeable_prompt_tokens()
+}
+
+/// **The pricing regression for the primary (eidola) backend.** Every round's
+/// hold is computed over the exact bytes that round put on the wire —
+/// including the advertised `tools` schema and the assistant's replayed
+/// `tool_calls`, which the pre-task-25 contract counted as zero. Recomputing
+/// the server's side of the contract from the recorded bodies must reproduce
+/// each hold exactly, which is what makes hold ≥ charge structural for a tool
+/// turn rather than merely likely.
+///
+/// The harness prices the model at 1 credit per token, scale factor 1, so
+/// `hold = chargeable_prompt_tokens + max_completion_tokens` — the credits on
+/// the rows are directly comparable to the contract's token counts.
+#[test]
+fn a_tool_rounds_hold_covers_the_tool_bytes_it_sends() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("tool turn succeeds");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2, "two rounds");
+
+        // The second round genuinely carries the shapes that used to be free.
+        assert!(bodies[1]["tools"].as_array().is_some_and(|t| !t.is_empty()));
+        assert!(
+            bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m.get("tool_calls").is_some()),
+            "round 2 must replay the assistant's tool call"
+        );
+
+        // Hold ≥ charge, exactly: the sum of the holds equals the sum of the
+        // server's recomputation over the same bodies.
+        let expected: u64 = bodies
+            .iter()
+            .map(|b| {
+                server_chargeable_prompt_tokens(b)
+                    + b["max_completion_tokens"].as_u64().expect("ceiling")
+            })
+            .sum();
+        assert_eq!(
+            result.credits_charged as u64, expected,
+            "each round's hold must equal the contract over its own wire bytes"
+        );
+
+        // And the extension is load-bearing: the old content-only walk of
+        // round 2 would have under-counted the very bytes that were sent.
+        let mut content_only = eidola_common::PromptCharge::new();
+        for message in bodies[1]["messages"].as_array().unwrap() {
+            content_only.add_message(
+                message
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0),
+            );
+        }
+        assert!(
+            content_only.chargeable_prompt_tokens() < server_chargeable_prompt_tokens(&bodies[1]),
+            "the tools schema and replayed tool call must contribute chargeable bytes"
+        );
+    });
+}
+
 /// The SSE twin: a tool call assembled from four partial deltas (function name
 /// in two pieces, arguments in two) drives exactly the same loop.
 #[test]
