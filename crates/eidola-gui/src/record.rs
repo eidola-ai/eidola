@@ -630,6 +630,22 @@ impl Render for RecordView {
         // overlay indicator (shown only while scrolling) binds to the surface
         // the user is actually scrolling: the non-virtualized bodies share
         // `detail_scroll`; each virtualized listing carries its own.
+        //
+        // The body's landmark: a `List` while a listing renders (the
+        // `uniform_list` itself can't carry a role — it implements
+        // `InteractiveElement` but not `StatefulInteractiveElement`, where
+        // gpui's aria builders live), otherwise a plain named region for the
+        // detail / empty / loading shapes.
+        let (body_role, body_label) = if self.detail.is_some() {
+            (gpui::Role::Region, "Entry detail")
+        } else if self.detail_pending.is_some() {
+            (gpui::Role::Region, "Loading entry")
+        } else if self.current_listing_is_empty() {
+            (gpui::Role::Region, self.section.label())
+        } else {
+            (gpui::Role::List, self.section.label())
+        };
+
         let (body, scrollbar): (gpui::AnyElement, gpui::AnyElement) = if self.detail.is_some() {
             (
                 scroll_wrap(self.render_detail(cx), &self.detail_scroll).into_any_element(),
@@ -684,6 +700,8 @@ impl Render for RecordView {
             // be a child of the scrolling element, or it scrolls away).
             .child(
                 v_flex()
+                    .id("record-body")
+                    .probe("record/body", body_role, body_label)
                     .relative()
                     .flex_1()
                     .w_full()
@@ -784,7 +802,16 @@ impl RecordView {
         // The strip *is* the titlebar: make its empty areas (and gaps between
         // the section tabs) drag the window. The tabs/refresh keep their own
         // clicks — a plain click never arms a move.
-        crate::titlebar::make_draggable(strip.id("record-strip"), "record-strip", window, cx)
+        crate::titlebar::make_draggable(
+            strip.id("record-strip").probe(
+                "record/sections",
+                gpui::Role::TabList,
+                "Record sections",
+            ),
+            "record-strip",
+            window,
+            cx,
+        )
     }
 
     fn list_frame(&self) -> Div {
@@ -890,17 +917,20 @@ impl RecordView {
             RecordSection::Requests => &self.requests.display,
             RecordSection::Spending => &self.spending.display,
         };
+        let total = display.len();
         range
             .filter_map(|dix| display.get(dix).copied().map(|row| (dix, row)))
             .map(|(dix, row)| match (section, row) {
                 (RecordSection::Attestations, DisplayRow::Data(i)) => {
-                    self.render_attestation_row(dix, i, cx)
+                    self.render_attestation_row(dix, i, total, cx)
                 }
                 (RecordSection::Requests, DisplayRow::Data(i)) => {
-                    self.render_request_row(dix, i, cx)
+                    self.render_request_row(dix, i, total, cx)
                 }
                 (RecordSection::Spending, DisplayRow::Header(i)) => self.render_spend_header(i, cx),
-                (RecordSection::Spending, DisplayRow::Data(i)) => self.render_spend_row(i, cx),
+                (RecordSection::Spending, DisplayRow::Data(i)) => {
+                    self.render_spend_row(dix, i, total, cx)
+                }
                 (_, DisplayRow::LoadMore) => self.render_load_more_row(cx),
                 // No other (section, row) combinations are produced by the
                 // display builders.
@@ -917,11 +947,17 @@ impl RecordView {
         &self,
         id: (&'static str, usize),
         dix: usize,
+        total: usize,
         cx: &Context<Self>,
     ) -> gpui::Stateful<Div> {
         let theme = cx.theme();
         let mut row = v_flex()
             .id(id)
+            // `uniform_list` renders only the visible window, so without the
+            // set metadata AT perceives a page of eleven rows as the whole
+            // listing.
+            .aria_position_in_set(dix + 1)
+            .aria_size_of_set(total)
             .w_full()
             .h(ROW_H)
             .justify_center()
@@ -974,7 +1010,13 @@ impl RecordView {
 
     // --- Attestations -----------------------------------------------------
 
-    fn render_attestation_row(&self, dix: usize, i: usize, cx: &Context<Self>) -> gpui::AnyElement {
+    fn render_attestation_row(
+        &self,
+        dix: usize,
+        i: usize,
+        total: usize,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme();
         let a = &self.attestations.rows[i];
         let hash = a.hash.clone();
@@ -987,7 +1029,7 @@ impl RecordView {
             plural(a.connection_count, "connection"),
             format_bytes(a.doc_bytes),
         );
-        self.row_shell(("attestation", dix), dix, cx)
+        self.row_shell(("attestation", dix), dix, total, cx)
             .probe(
                 format!("record/attestation/{dix}"),
                 gpui::Role::ListItem,
@@ -1055,7 +1097,13 @@ impl RecordView {
 
     // --- Requests -----------------------------------------------------------
 
-    fn render_request_row(&self, dix: usize, i: usize, cx: &Context<Self>) -> gpui::AnyElement {
+    fn render_request_row(
+        &self,
+        dix: usize,
+        i: usize,
+        total: usize,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme();
         let r = &self.requests.rows[i];
         let id = r.id.clone();
@@ -1090,7 +1138,7 @@ impl RecordView {
         }
         sub_parts.push(fmt_utc(r.request_at, false));
 
-        self.row_shell(("request", dix), dix, cx)
+        self.row_shell(("request", dix), dix, total, cx)
             .probe(
                 format!("record/request/{dix}"),
                 gpui::Role::ListItem,
@@ -1304,7 +1352,13 @@ impl RecordView {
     }
 
     /// A spending data row (clicks through to the request detail).
-    fn render_spend_row(&self, i: usize, cx: &Context<Self>) -> gpui::AnyElement {
+    fn render_spend_row(
+        &self,
+        dix: usize,
+        i: usize,
+        total: usize,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme();
         let e = &self.spending.rows[i];
         let id = e.request_id.clone();
@@ -1324,6 +1378,8 @@ impl RecordView {
 
         v_flex()
             .id(("spend", i))
+            .aria_position_in_set(dix + 1)
+            .aria_size_of_set(total)
             .probe(
                 format!("record/spend/{i}"),
                 gpui::Role::ListItem,

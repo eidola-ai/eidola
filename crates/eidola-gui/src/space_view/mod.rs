@@ -1863,6 +1863,13 @@ impl Render for SpaceView {
                     ))
                     .child(
                         v_flex()
+                            .id("space-conversation")
+                            // The window's main landmark. Named here rather
+                            // than on the scroll container so the probe's
+                            // absolute canvas can't reach into the scrollable
+                            // extent. What it *contains* is Wave C's job —
+                            // today it is the branch dots, bands and asks.
+                            .probe("space/conversation", gpui::Role::Main, "Conversation")
                             .w_full()
                             .pt(px(doc_reserve))
                             .pb(px(floating_pad))
