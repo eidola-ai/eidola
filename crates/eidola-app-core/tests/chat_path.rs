@@ -25,7 +25,8 @@ mod chat_harness;
 
 use chat_harness::{
     ChatBehavior, DEFAULT_AGENT_LABEL, HUMAN_LABEL, MODEL, MockConfig, MockServer, RefundMode,
-    flat_messages, headed, system_message, with_account,
+    THREAD_MAP_NOTE, flat_messages, headed, map_entry, system_message, system_message_with,
+    thread_map, with_account,
 };
 use eidola_app_core::changes::Change;
 use eidola_app_core::error::AppError;
@@ -799,6 +800,12 @@ fn branch_reply_sends_only_its_branch_context() {
         // ancestry of the new post — never the sibling turn (u2/i2). Exact
         // bytes: every message headed, and the responding agent's own prior
         // answer (and only it) rendered `assistant`.
+        //
+        // The sibling turn is *named* rather than shown: the space now branches
+        // at i1, so the turn carries a trailing thread map (task 21). That is
+        // the whole point — the model learns the branch exists without its
+        // bytes entering the trunk.
+        let u2_item = item_id_of(&core, &first.space_id, "And why two per day?");
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 3, "two spine turns + one branch reply");
         assert_eq!(
@@ -806,7 +813,7 @@ fn branch_reply_sends_only_its_branch_context() {
             vec![
                 (
                     "system".to_string(),
-                    system_message(Some(SEEDED_SYSTEM_PROMPT))
+                    system_message_with(Some(SEEDED_SYSTEM_PROMPT), &[THREAD_MAP_NOTE])
                 ),
                 (
                     "user".to_string(),
@@ -820,9 +827,272 @@ fn branch_reply_sends_only_its_branch_context() {
                     "user".to_string(),
                     headed(&branch_item, HUMAN_LABEL, "What about spring tides?")
                 ),
+                (
+                    "user".to_string(),
+                    thread_map(
+                        &[(
+                            format!("at #{}", eidola_app_core::post_handle(&i1_item)),
+                            vec![map_entry(
+                                &u2_item,
+                                HUMAN_LABEL,
+                                "2 posts",
+                                "just now",
+                                "And why two per day?",
+                            )],
+                        )],
+                        &eidola_app_core::post_handle(&branch_item),
+                    )
+                ),
             ],
-            "branch reply context = system prompt + the branch's ancestry only"
+            "branch reply context = system prompt + the branch's ancestry + the trailing map"
         );
+    });
+}
+
+// ===========================================================================
+// Thread map (task 21)
+// ===========================================================================
+
+/// Take one streaming turn, optionally branching at `reply_to`. The
+/// thread-map tests all build multi-post fixtures, so this keeps them readable.
+fn turn(
+    core: &AppCore,
+    prompt: &str,
+    space: Option<String>,
+    reply_to: Option<String>,
+) -> eidola_app_core::ChatResult {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+    core.runtime()
+        .block_on(core.chat_stream_reply(prompt.to_string(), MODEL.into(), space, reply_to, tx))
+        .unwrap_or_else(|e| panic!("turn {prompt:?} failed: {e}"))
+}
+
+/// The linear common case sends **no** map, no map note, and no `tools` field —
+/// byte-identical to what it sent before task 21. This is the pin that keeps
+/// the overwhelming majority of turns (and their upstream prefix caches)
+/// untouched by the feature.
+#[test]
+fn a_linear_space_sends_no_thread_map_and_no_tools() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = turn(&core, "How do tides work?", None, None);
+        turn(
+            &core,
+            "And why two per day?",
+            Some(first.space_id.clone()),
+            None,
+        );
+
+        for body in mock.chat_bodies() {
+            assert!(
+                body.get("tools").is_none(),
+                "a linear space attaches no tools: {body}"
+            );
+            let msgs = flat_messages(&body);
+            assert_eq!(
+                msgs[0].1,
+                system_message(Some(SEEDED_SYSTEM_PROMPT)),
+                "the system message is untouched without a map"
+            );
+            assert!(
+                msgs.iter().all(|(_, c)| !c.contains("<thread-map>")),
+                "no map block anywhere: {msgs:#?}"
+            );
+        }
+    });
+}
+
+/// A branched space's turn carries the map as its **last** message, naming
+/// every branch the spine does not contain: the fork it hangs off (by handle),
+/// the branch's author, post count, recency, and opening line. Dormant branches
+/// get short entries — never omission.
+#[test]
+fn a_branched_space_appends_a_thread_map_as_the_last_message() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // u1 -> i1 -> u2 -> i2, then a branch off i1.
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        turn(&core, "And why two per day?", Some(space.clone()), None);
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let i1 = tree[1].action_id.clone();
+        let i1_item = tree[1].item_id.clone();
+        let i2 = tree[3].action_id.clone();
+
+        turn(
+            &core,
+            "What about spring tides?",
+            Some(space.clone()),
+            Some(i1),
+        );
+        let branch_item = item_id_of(&core, &space, "What about spring tides?");
+
+        // Now take a turn back on the ORIGINAL spine (replying to i2), so the
+        // branch is what the turn cannot see.
+        turn(&core, "Anything else?", Some(space.clone()), Some(i2));
+        let last_item = item_id_of(&core, &space, "Anything else?");
+
+        let bodies = mock.chat_bodies();
+        let msgs = flat_messages(&bodies[3]);
+
+        // The map is the LAST message — the placement decision. Everything
+        // above it is conversation.
+        assert_eq!(
+            msgs.last().expect("a message").clone(),
+            (
+                "user".to_string(),
+                thread_map(
+                    &[(
+                        format!("at #{}", eidola_app_core::post_handle(&i1_item)),
+                        vec![map_entry(
+                            &branch_item,
+                            HUMAN_LABEL,
+                            // The branch's own ask plus the answer it drew.
+                            "2 posts",
+                            "just now",
+                            "What about spring tides?",
+                        )],
+                    )],
+                    &eidola_app_core::post_handle(&last_item),
+                ),
+            ),
+        );
+        assert_eq!(
+            msgs[0].1,
+            system_message_with(Some(SEEDED_SYSTEM_PROMPT), &[THREAD_MAP_NOTE]),
+            "the map note joins the system message; the tools note does not \
+             (the eidola backend cannot carry a `tools` field yet)"
+        );
+        assert!(
+            bodies[3].get("tools").is_none(),
+            "no tools on the eidola path until task 25: {}",
+            bodies[3]
+        );
+    });
+}
+
+/// The cache invariant, as byte equality.
+///
+/// Two things are pinned, and they are different strengths on purpose:
+///
+/// * **The conversation trunk is unconditionally identical** across every turn
+///   in the space — the posts up to the fork are the same bytes in the same
+///   order whether the turn is on branch A, on branch B, or on a linear space
+///   that has not branched yet. Nothing a branch does may move a shared byte.
+/// * **The full prefix, system message included, is identical across sibling
+///   branches** once both see a branched space. The system message flips
+///   exactly once per space — when the space first branches and the map note
+///   joins it — and is byte-stable from then on, which is why the two sibling
+///   turns below share it and the pre-branch turn does not.
+///
+/// All the per-turn volatility (which branches exist, how recently they moved)
+/// is in the trailing map, where recompute is cheap by construction.
+#[test]
+fn sibling_branch_turns_send_identical_trunk_bytes() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // Trunk: u1 -> i1. Then two sibling branches off i1.
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let i1 = tree[1].action_id.clone();
+
+        let branch_a = turn(
+            &core,
+            "What about spring tides?",
+            Some(space.clone()),
+            Some(i1.clone()),
+        );
+        turn(
+            &core,
+            "And what about neap tides?",
+            Some(space.clone()),
+            Some(i1.clone()),
+        );
+
+        // A third turn, back on branch A now that B exists — the genuine
+        // sibling of branch B's turn (both see the same branched space).
+        turn(
+            &core,
+            "Go on.",
+            Some(space.clone()),
+            branch_a.response_action_id.clone(),
+        );
+
+        let bodies = mock.chat_bodies();
+        let a = flat_messages(&bodies[1]); // branch A forked a linear space
+        let b = flat_messages(&bodies[2]); // branch B, space now branched
+        let c = flat_messages(&bodies[3]); // branch A continues, space branched
+
+        // The conversation trunk — the posts before the fork — is the same
+        // bytes in all three, including the pre-branch turn.
+        assert_eq!(&a[1..3], &b[1..3], "posts before the fork: A vs B");
+        assert_eq!(
+            &a[1..3],
+            &c[1..3],
+            "posts before the fork: A vs A-continued"
+        );
+
+        // Sibling turns over the branched space share the WHOLE prefix,
+        // system message included.
+        assert_eq!(
+            &b[..3],
+            &c[..3],
+            "sibling branches share every byte up to the fork, system message included"
+        );
+
+        // The one-time flip: A's turn predates the branch, so it carries
+        // neither the map note nor a map.
+        assert_eq!(
+            a[0].1,
+            system_message(Some(SEEDED_SYSTEM_PROMPT)),
+            "the pre-branch turn's system message is the pre-task-21 one"
+        );
+        assert!(
+            a.iter().all(|(_, c)| !c.contains("<thread-map>")),
+            "branch A forked a linear space: no map yet"
+        );
+
+        // And in both branched turns the map is the LAST message — all the
+        // volatility at the tail.
+        for msgs in [&b, &c] {
+            assert!(
+                msgs.last()
+                    .expect("a message")
+                    .1
+                    .starts_with("<thread-map>"),
+                "the map is the last message: {msgs:#?}"
+            );
+            assert_eq!(
+                msgs.iter()
+                    .filter(|(_, c)| c.starts_with("<thread-map>"))
+                    .count(),
+                1,
+                "exactly one map block"
+            );
+        }
     });
 }
 
