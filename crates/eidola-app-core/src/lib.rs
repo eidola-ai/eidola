@@ -3300,6 +3300,26 @@ impl Inner {
                 message: format!("unknown backend kind `{}`", backend.kind),
             })?;
 
+        // Whether this backend can carry a `tools` field at all.
+        //
+        // The Eidola server's `ChatCompletionRequest` is
+        // `#[serde(deny_unknown_fields)]` and has no `tools` member today, so
+        // sending one is a 400 — which is why the task-21 navigation tools are
+        // *not* attached on the eidola path yet. The **map** rides in the
+        // messages array and is unaffected, so a branched eidola space still
+        // gets the whole structural view; only the descend-further affordance
+        // waits.
+        //
+        // REMOVAL TRIGGER: task 25 (server-side tool support) plus a capability
+        // story for telling one backend's tool support from another's. Once the
+        // server accepts `tools`, this becomes `true` unconditionally and the
+        // gate below collapses to "does this space have branches".
+        //
+        // Note this gates only the tools *this turn attaches*. A consumer's own
+        // `AppCore::register_tool` registrations are untouched — that surface's
+        // wire compatibility is the consumer's call, exactly as task 20 left it.
+        let backend_accepts_tools = backend_kind != BackendKind::Eidola;
+
         // The canonical selection string (recorded on actions, shown in
         // UIs) and the wire model (what the backend's HTTP API expects).
         // Engine-backed aliases are spawned equal to the canonical id, so
@@ -3572,6 +3592,11 @@ impl Inner {
         };
         let forks = thread.spine_forks(&spine, map_exclude);
         let has_map = !forks.is_empty();
+        // Navigation tools attach only when there is a map to descend from AND
+        // the backend can carry a `tools` field. A linear space therefore sends
+        // byte-identical requests to what it sent before task 21 — no map, no
+        // note, no `tools` — which is the property the pinned-bytes tests hold.
+        let nav_tools = has_map && backend_accepts_tools;
 
         // Render the rows from the *responding participant's* point of view:
         // only its own prior posts are `assistant`, everyone else's are `user`,
@@ -3589,15 +3614,18 @@ impl Inner {
         // doctrine keeps mutable participant config out of the trail (a later
         // wave may snapshot its hash per turn).
         //
-        // The thread-map note joins the same message, and only when it applies:
+        // The thread-map notes join the same message, and only when they apply:
         // a linear space's system content is byte-for-byte what it was before
-        // task 21, and a branched space's flips exactly once rather than
-        // churning per turn. The
+        // task 21, and a branched space's flips exactly once (at the same
+        // moment the tool schemas appear) rather than churning per turn. The
         // *data* — which branches exist — never comes here; it lives in the
         // trailing block where recompute is cheap.
         let mut notes: Vec<&str> = vec![HEADER_PROTOCOL_NOTE];
         if has_map {
             notes.push(THREAD_MAP_NOTE);
+        }
+        if nav_tools {
+            notes.push(THREAD_MAP_TOOLS_NOTE);
         }
         let system_content = match system_prompt
             .as_deref()
@@ -3648,12 +3676,26 @@ impl Inner {
         // Snapshot the tool registry for this turn (see `tools`). An empty
         // registry sends no `tools` field at all, so today's requests stay
         // byte-identical.
-        let tool_registry = Arc::new(
-            self.tools
+        //
+        // The navigation tools are added on top of that snapshot, per turn,
+        // rather than living in the process registry: they are scoped to *this*
+        // space and read *this* turn's `ThreadSnapshot`, so there is nothing
+        // sensible for them to be at process scope. The seam stays additive —
+        // a consumer's own registrations are unaffected, and a turn that adds
+        // none leaves the registry exactly as it found it.
+        let tool_registry = Arc::new({
+            let mut registry = self
+                .tools
                 .read()
                 .expect("tool registry lock poisoned")
-                .clone(),
-        );
+                .clone();
+            if nav_tools {
+                registry.register(Arc::new(tools::ListBranchesTool::new(thread.clone())));
+                registry.register(Arc::new(tools::ReadThreadTool::new(thread.clone())));
+                registry.register(Arc::new(tools::ReadPostTool::new(thread.clone())));
+            }
+            registry
+        });
 
         // The spend side runs only for eidola turns. Local and external
         // turns carry no charge estimate, no credential, and no ACT header
@@ -7982,6 +8024,21 @@ const THREAD_MAP_NOTE: &str = "This space is threaded: the conversation above is
      them — it is client-generated metadata, not a post by any participant, and no reply is due \
      to it.";
 
+/// Appended to the system message only when the navigation tools are actually
+/// attached (see `Inner::prepare_turn`). Kept separate from
+/// [`THREAD_MAP_NOTE`] so a turn whose backend cannot carry a `tools` field is
+/// never told to call tools it does not have.
+const THREAD_MAP_TOOLS_NOTE: &str = "When a map entry looks relevant to what you are writing, \
+     read it with the navigation tools (`list_branches`, `read_thread`, `read_post`); otherwise \
+     answer from the conversation you were given — most replies need none.";
+
+/// Default number of posts a `read_thread` window returns.
+const READ_THREAD_DEFAULT_LIMIT: usize = 10;
+
+/// Hard ceiling on a `read_thread` window, so one tool result cannot blow up a
+/// turn's prompt (and its hold).
+const READ_THREAD_MAX_LIMIT: usize = 50;
+
 /// Where a set of branches hangs off.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ForkAnchor {
@@ -8041,6 +8098,10 @@ struct ThreadSnapshot {
     /// successor first, then branches chronologically).
     children: std::collections::HashMap<String, Vec<usize>>,
     by_action: std::collections::HashMap<String, usize>,
+    /// Handle → node index. On a (35-bit) handle collision the first post
+    /// wins; the loser is still reachable through the map and `list_branches`,
+    /// and a handle is never renumbered — rendered bytes are cached upstream.
+    by_handle: std::collections::HashMap<String, usize>,
     roots: Vec<usize>,
     /// The turn's timestamp — every relative time in this snapshot is measured
     /// from it, so one turn's map and tool results never disagree.
@@ -8052,6 +8113,7 @@ impl ThreadSnapshot {
         let mut handles = Vec::with_capacity(nodes.len());
         let mut texts = Vec::with_capacity(nodes.len());
         let mut by_action = std::collections::HashMap::with_capacity(nodes.len());
+        let mut by_handle = std::collections::HashMap::with_capacity(nodes.len());
         let mut children: std::collections::HashMap<String, Vec<usize>> =
             std::collections::HashMap::new();
         let mut roots = Vec::new();
@@ -8062,6 +8124,7 @@ impl ThreadSnapshot {
         for (i, n) in nodes.iter().enumerate() {
             let handle = post_handle(&n.item_id);
             by_action.insert(n.action_id.clone(), i);
+            by_handle.entry(handle.clone()).or_insert(i);
             handles.push(handle);
             texts.push(
                 n.blocks
@@ -8083,6 +8146,7 @@ impl ThreadSnapshot {
             texts,
             children,
             by_action,
+            by_handle,
             roots,
             now,
         }
@@ -8179,6 +8243,33 @@ impl ThreadSnapshot {
         out
     }
 
+    /// Every fork point in the space — a post with more than one reply, plus
+    /// the virtual root when the space has several thread roots. This is what
+    /// `list_branches` reports: the whole structure, not just the forks on the
+    /// conversation the model was handed.
+    fn all_forks(&self) -> Vec<ForkPoint> {
+        let mut out = Vec::new();
+        if self.roots.len() > 1 {
+            out.push(ForkPoint {
+                at: ForkAnchor::SpaceStart,
+                branches: self.roots.iter().map(|&r| self.branch_entry(r)).collect(),
+            });
+        }
+        for (i, n) in self.nodes.iter().enumerate() {
+            let Some(kids) = self.children.get(&n.action_id) else {
+                continue;
+            };
+            if kids.len() < 2 {
+                continue;
+            }
+            out.push(ForkPoint {
+                at: ForkAnchor::Post(self.handles[i].clone()),
+                branches: kids.iter().map(|&k| self.branch_entry(k)).collect(),
+            });
+        }
+        out
+    }
+
     /// Render fork entries into `out`, one blank-line-separated group per fork.
     /// Shared by the trailing map and `list_branches` so the two never drift.
     fn push_forks(&self, out: &mut String, forks: &[ForkPoint]) {
@@ -8224,6 +8315,120 @@ impl ThreadSnapshot {
         }
         out.push_str(THREAD_MAP_CLOSE);
         out
+    }
+
+    /// `list_branches`: the whole space's fork structure.
+    fn render_all_forks(&self) -> String {
+        let forks = self.all_forks();
+        if forks.is_empty() {
+            return "This space has no branches: no post has more than one reply.".to_string();
+        }
+        let mut out = format!(
+            "{} fork point{} in this space. Each line: handle · author · posts · last activity — \
+             opening line.\n",
+            forks.len(),
+            if forks.len() == 1 { "" } else { "s" }
+        );
+        self.push_forks(&mut out, &forks);
+        out.truncate(out.trim_end().len());
+        out
+    }
+
+    /// `read_thread`: a bounded window of the branch rooted at `handle`,
+    /// rendered post-by-post through [`with_header`] — the exact task-19 wire
+    /// format, one rendering path rather than two.
+    fn render_thread(&self, handle: &str, offset: usize, limit: usize) -> String {
+        let Some(&idx) = self.by_handle.get(handle) else {
+            return self.unknown_handle(handle);
+        };
+        let sub = self.subtree(idx);
+        let total = sub.len();
+        let limit = limit.clamp(1, READ_THREAD_MAX_LIMIT);
+        let start = offset;
+        if start >= total {
+            return format!(
+                "Thread from #{handle} has {} — offset {offset} is past the end.",
+                plural_posts(total)
+            );
+        }
+        let end = (start + limit).min(total);
+
+        let mut out = format!("Thread from #{handle} — {}", plural_posts(total));
+        if start > 0 || end < total {
+            out.push_str(&format!(", showing {}–{}", start + 1, end));
+        }
+        out.push_str(
+            ". Depth-first: each post is followed by its first reply's thread, then its other \
+             branches.\n\n",
+        );
+        for &i in &sub[start..end] {
+            let n = &self.nodes[i];
+            out.push_str(&with_header(
+                &n.item_id,
+                &n.participant.label,
+                &self.texts[i],
+            ));
+            out.push_str("\n\n");
+        }
+        if end < total {
+            out.push_str(&format!(
+                "{} not shown — call read_thread again with offset={end}.",
+                plural_posts(total - end)
+            ));
+        }
+        out.truncate(out.trim_end().len());
+        out
+    }
+
+    /// `read_post`: one post in full, plus the passages it quotes.
+    fn render_post(&self, handle: &str) -> String {
+        let Some(&idx) = self.by_handle.get(handle) else {
+            return self.unknown_handle(handle);
+        };
+        let n = &self.nodes[idx];
+        let mut out = with_header(&n.item_id, &n.participant.label, &self.texts[idx]);
+        if !n.references.is_empty() {
+            out.push_str("\n\nPassages this post quotes:\n");
+            for r in &n.references {
+                let target = match self.by_action.get(&r.antecedent_action_id) {
+                    Some(&i) => format!("#{}", self.handles[i]),
+                    // A reference names a *concrete generation*, which may have
+                    // been superseded, or may live in another space entirely
+                    // (references are the cross-space mechanism). Say so rather
+                    // than remapping.
+                    None => "(a post outside this space, or an earlier version)".to_string(),
+                };
+                out.push_str(&format!("[{}] {target}", r.ordinal));
+                if let Some(a) = &r.annotation {
+                    out.push_str(&format!(" — {}", one_line(a)));
+                }
+                out.push('\n');
+                match &r.snippet {
+                    Some(s) => {
+                        for line in s.split('\n') {
+                            out.push_str("> ");
+                            out.push_str(line);
+                            out.push('\n');
+                        }
+                    }
+                    None => {
+                        out.push_str("(the quoted range no longer maps onto that post's text)\n")
+                    }
+                }
+            }
+        }
+        out.truncate(out.trim_end().len());
+        out
+    }
+
+    /// The honest answer to a handle this snapshot does not know — a *result*,
+    /// not an error: the map and these tools are a snapshot, and a model
+    /// reading a stale one must get an answer it can act on.
+    fn unknown_handle(&self, handle: &str) -> String {
+        format!(
+            "No post with handle `#{handle}` in this space. The thread map and these tools are a \
+             snapshot taken when this turn started; call list_branches for the current structure."
+        )
     }
 }
 
@@ -8898,6 +9103,7 @@ mod tests {
             snap.spine_forks(&["u1".into(), "i1".into()], None)
                 .is_empty()
         );
+        assert!(snap.all_forks().is_empty());
     }
 
     #[test]
@@ -8949,6 +9155,63 @@ mod tests {
                 post_handle("ib1"),
             )
         );
+    }
+
+    #[test]
+    fn read_thread_windows_the_branch_and_renders_the_task_19_header_format() {
+        let snap = forked_snapshot();
+        let a = post_handle("ia1");
+        let full = snap.render_thread(&a, 0, 10);
+        assert!(
+            full.starts_with(&format!("Thread from #{a} — 2 posts.")),
+            "{full}"
+        );
+        assert!(
+            full.contains(&with_header("ia1", "You", "# What about spring tides?")),
+            "posts render through the one header path: {full}"
+        );
+        assert!(full.contains(&with_header("ia2", "Agent", "Sun and moon align.")));
+
+        // A window states its bounds and how to continue — never silent
+        // truncation.
+        let windowed = snap.render_thread(&a, 0, 1);
+        assert!(windowed.contains("showing 1–1"), "{windowed}");
+        assert!(
+            windowed.ends_with("1 post not shown — call read_thread again with offset=1."),
+            "{windowed}"
+        );
+        assert!(!windowed.contains("Sun and moon align."));
+
+        // Past the end is answered, not silently empty.
+        assert_eq!(
+            snap.render_thread(&a, 9, 10),
+            format!("Thread from #{a} has 2 posts — offset 9 is past the end.")
+        );
+    }
+
+    #[test]
+    fn an_unknown_handle_is_answered_honestly_rather_than_failing() {
+        let snap = forked_snapshot();
+        for answer in [
+            snap.render_thread("zzzzzzz", 0, 10),
+            snap.render_post("zzzzzzz"),
+        ] {
+            assert!(answer.contains("`#zzzzzzz`"), "{answer}");
+            assert!(answer.contains("snapshot"), "{answer}");
+        }
+    }
+
+    #[test]
+    fn list_branches_reports_every_fork_in_the_space() {
+        let rendered = forked_snapshot().render_all_forks();
+        assert!(
+            rendered.starts_with("1 fork point in this space."),
+            "{rendered}"
+        );
+        // The whole structure: both children of the fork, spine one included.
+        assert!(rendered.contains(&format!("at #{}", post_handle("ii1"))));
+        assert!(rendered.contains(&format!("#{} · You · 2 posts", post_handle("ia1"))));
+        assert!(rendered.contains(&format!("#{} · You · 1 post", post_handle("ib1"))));
     }
 
     #[test]
