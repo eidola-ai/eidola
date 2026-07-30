@@ -1830,49 +1830,20 @@ fn each_tool_round_acquires_its_own_hold() {
     });
 }
 
-/// The server's walk of the pricing contract, replicated over a raw request
-/// body — a copy of `eidola-server`'s `handlers::chargeable_prompt_tokens_for`
-/// (which reads the same JSON, parsed into `ChatCompletionRequest`).
+/// The contract's chargeable prompt tokens for a recorded wire body.
 ///
-/// This is the *other* side of the shared `eidola_common::PromptCharge`
-/// contract. app-core cannot depend on the server crate, so the tripwire is a
-/// deliberate replica: if the two walks ever diverge, this test and the
-/// server's own `client_and_server_prompt_terms_agree` both have to be edited,
-/// which is exactly the review moment a pricing change deserves.
-fn server_chargeable_prompt_tokens(body: &serde_json::Value) -> u64 {
-    fn text_bytes(v: &serde_json::Value) -> u64 {
-        match v.as_str() {
-            Some(s) => s.len() as u64,
-            None => serde_json::to_string(v).map(|s| s.len()).unwrap_or(0) as u64,
-        }
-    }
-    let mut charge = eidola_common::PromptCharge::new();
-    for message in body["messages"].as_array().expect("messages array") {
-        charge.add_message(
-            message
-                .get("content")
-                .and_then(|c| c.as_str())
-                .map(|s| s.len() as u64)
-                .unwrap_or(0),
-        );
-        for call in message
-            .get("tool_calls")
-            .and_then(|c| c.as_array())
-            .into_iter()
-            .flatten()
-        {
-            charge.add_tool_call(text_bytes(call));
-        }
-    }
-    for tool in body
+/// Calls `eidola_common::prompt_charge` — **the** walk, the same one the
+/// server runs over the request it receives. Before the walk was
+/// consolidated this function was a hand-maintained replica of the server's
+/// version; now it is the request-shaped adapter only, so the test measures
+/// what the server will actually charge rather than what a copy believes.
+fn contract_prompt_tokens(body: &serde_json::Value) -> u64 {
+    let messages = body["messages"].as_array().expect("messages array");
+    let tools = body
         .get("tools")
         .and_then(|t| t.as_array())
-        .into_iter()
-        .flatten()
-    {
-        charge.add_tool_definition(text_bytes(tool));
-    }
-    charge.chargeable_prompt_tokens()
+        .map(Vec::as_slice);
+    eidola_common::prompt_charge(messages, tools).chargeable_prompt_tokens()
 }
 
 /// **The pricing regression for the primary (eidola) backend.** Every round's
@@ -1920,8 +1891,7 @@ fn a_tool_rounds_hold_covers_the_tool_bytes_it_sends() {
         let expected: u64 = bodies
             .iter()
             .map(|b| {
-                server_chargeable_prompt_tokens(b)
-                    + b["max_completion_tokens"].as_u64().expect("ceiling")
+                contract_prompt_tokens(b) + b["max_completion_tokens"].as_u64().expect("ceiling")
             })
             .sum();
         assert_eq!(
@@ -1942,7 +1912,7 @@ fn a_tool_rounds_hold_covers_the_tool_bytes_it_sends() {
             );
         }
         assert!(
-            content_only.chargeable_prompt_tokens() < server_chargeable_prompt_tokens(&bodies[1]),
+            content_only.chargeable_prompt_tokens() < contract_prompt_tokens(&bodies[1]),
             "the tools schema and replayed tool call must contribute chargeable bytes"
         );
     });

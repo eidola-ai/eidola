@@ -2690,6 +2690,9 @@ dependencies = [
 [[package]]
 name = "eidola-common"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "eidola-devtools"

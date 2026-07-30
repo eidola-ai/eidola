@@ -67,50 +67,37 @@ pub async fn list_models(
 // Billing helpers
 // ---------------------------------------------------------------------------
 
-/// Byte length of a JSON value measured as text: its own bytes when it is a
-/// string (the OpenAI shape for `arguments`), otherwise its compact JSON
-/// serialization.
-///
-/// Shared rule with the client (`eidola-app-core`'s `json_text_bytes`) — see
-/// [`chargeable_prompt_tokens_for`].
-fn json_text_bytes(value: &serde_json::Value) -> u64 {
-    match value.as_str() {
-        Some(s) => s.len() as u64,
-        None => serde_json::to_string(value).map(|s| s.len()).unwrap_or(0) as u64,
-    }
-}
-
 /// Extract the shared pricing contract's inputs from a request and compute
 /// its chargeable prompt tokens.
 ///
-/// The inputs are gathered through [`eidola_common::PromptCharge`], which
-/// defines *what counts*: every message (its per-message allowance plus its
-/// `content` bytes), every assistant `tool_calls` entry (its compact JSON
-/// serialization), and every advertised `tools` entry (likewise). The client
-/// walks its own request shape through the same API and must arrive at the
-/// same numbers — the tripwire is
-/// `client_and_server_prompt_terms_agree` below.
+/// The walk itself is [`eidola_common::prompt_charge`] — the single
+/// implementation the client calls too, which is what makes "both sides
+/// compute the same function of the same request" structural rather than a
+/// convention two crates maintain in parallel. The only server-side work is
+/// handing it the request's `messages` and `tools` arrays as JSON.
+///
+/// The `to_value` conversion is deliberate and cheap in context: this runs
+/// two or three times per chat completion, against a request the server
+/// already fully re-serializes to forward upstream, on the far side of an
+/// LLM call. Reconstructing the walk over the typed struct to avoid it would
+/// reintroduce exactly the drift the consolidation removed.
 fn chargeable_prompt_tokens_for(request: &ChatCompletionRequest) -> u64 {
-    let mut charge = eidola_common::PromptCharge::new();
-
-    for message in &request.messages {
-        charge.add_message(message.content_byte_len() as u64);
-        for call in message.tool_calls.iter().flatten() {
-            // The *whole* entry: the proxy forwards it verbatim (id, type
-            // and provider extensions included) and cannot know which of
-            // those fields the upstream chat template renders into the
-            // prompt, so it charges what it forwards.
-            charge.add_tool_call(json_text_bytes(call));
-        }
-    }
-
-    // The advertised tool schemas: re-injected into the prompt by the chat
-    // template on every round, so charged once per request.
-    for tool in request.tools.iter().flatten() {
-        charge.add_tool_definition(json_text_bytes(tool));
-    }
-
-    charge.chargeable_prompt_tokens()
+    let Ok(value) = serde_json::to_value(request) else {
+        // Unreachable in practice (the request was deserialized from JSON and
+        // every field is serializable). Falling back to the message count
+        // alone keeps the constants' floor rather than charging nothing.
+        return eidola_common::chargeable_prompt_tokens(0, request.messages.len() as u64);
+    };
+    let messages = value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|m| m.as_slice())
+        .unwrap_or(&[]);
+    let tools = value
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(Vec::as_slice);
+    eidola_common::prompt_charge(messages, tools).chargeable_prompt_tokens()
 }
 
 /// The effective completion-token ceiling for a request: its
@@ -978,12 +965,13 @@ mod tests {
         // Tool call:     93 (the whole entry, compact JSON).
         // Tool schema:   154 (compact JSON).
         // ceil(260*2/3) + 8*3 + 32 = 174 + 24 + 32 = 230.
-        let call_bytes = json_text_bytes(&req.messages[1].tool_calls.as_ref().unwrap()[0]);
+        let call_bytes =
+            eidola_common::json_text_bytes(&req.messages[1].tool_calls.as_ref().unwrap()[0]);
         assert_eq!(
             call_bytes, 93,
             "the fixture's call entry must stay 93 bytes"
         );
-        let tool_bytes = json_text_bytes(&req.tools.as_ref().unwrap()[0]);
+        let tool_bytes = eidola_common::json_text_bytes(&req.tools.as_ref().unwrap()[0]);
         assert_eq!(tool_bytes, 154, "the fixture's schema must stay 154 bytes");
         assert_eq!(chargeable_prompt_tokens_for(&req), 230);
     }
