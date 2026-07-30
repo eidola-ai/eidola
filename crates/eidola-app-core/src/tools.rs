@@ -192,9 +192,226 @@ impl Tool for EchoTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Navigation tools (task 21)
+//
+// The three tools a branched space's turn gets, so a model that reads a thread
+// map entry and wants more can descend. They are deliberately tiny and
+// deliberately **read-only over a snapshot**: each holds an `Arc` of the
+// `ThreadSnapshot` `prepare_turn` built for this turn, so a result is a
+// point-in-time view (stale-ok — the same contract a file-reading agent harness
+// gives its model) and the tools need no database handle, no lifetime, and no
+// synchronization.
+//
+// Handle → id resolution is harness-side: the snapshot derives `post_handle`
+// over the space's items and matches. A handle it does not know is answered
+// honestly *in the result* — the map is a snapshot and a model reading a stale
+// one must get something it can act on, not a failed turn.
+//
+// Attachment is `prepare_turn`'s job, and it is gated: only when the space
+// actually has branches (so a linear space stays byte-identical to pre-task-21)
+// and only when the backend can carry a `tools` field at all. See the
+// `backend_accepts_tools` comment there for the removal trigger.
+// ---------------------------------------------------------------------------
+
+/// Normalize a model-supplied handle: trim, drop a leading `#`, lowercase.
+/// Handles are lowercase base32 by construction, so this only ever recovers
+/// from the model's own formatting.
+fn normalize_handle(raw: &str) -> String {
+    raw.trim().trim_start_matches('#').trim().to_lowercase()
+}
+
+/// Read the required `handle` argument.
+fn handle_arg(arguments: &serde_json::Value) -> Result<String, ToolError> {
+    match arguments.get("handle").and_then(|v| v.as_str()) {
+        Some(h) if !normalize_handle(h).is_empty() => Ok(normalize_handle(h)),
+        _ => Err(ToolError::new(
+            "`handle` is required and must be a post handle string, e.g. \"#a2c4e6g\"",
+        )),
+    }
+}
+
+/// Read an optional non-negative integer argument.
+fn usize_arg(arguments: &serde_json::Value, name: &str, default: usize) -> usize {
+    arguments
+        .get(name)
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(default)
+}
+
+/// `list_branches` — the whole space's fork structure.
+pub(crate) struct ListBranchesTool {
+    snapshot: Arc<crate::ThreadSnapshot>,
+}
+
+impl ListBranchesTool {
+    pub(crate) fn new(snapshot: Arc<crate::ThreadSnapshot>) -> Self {
+        Self { snapshot }
+    }
+}
+
+impl Tool for ListBranchesTool {
+    fn name(&self) -> &str {
+        "list_branches"
+    }
+
+    fn description(&self) -> &str {
+        "List every fork point in this space and the branches at it. The thread map you were \
+         given covers only the forks on the conversation you can see; this covers the whole \
+         space. A snapshot taken when this turn started."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+        })
+    }
+
+    fn call<'a>(&'a self, _arguments: serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async move { Ok(self.snapshot.render_all_forks()) })
+    }
+}
+
+/// `read_thread` — a bounded window of one branch.
+pub(crate) struct ReadThreadTool {
+    snapshot: Arc<crate::ThreadSnapshot>,
+}
+
+impl ReadThreadTool {
+    pub(crate) fn new(snapshot: Arc<crate::ThreadSnapshot>) -> Self {
+        Self { snapshot }
+    }
+}
+
+impl Tool for ReadThreadTool {
+    fn name(&self) -> &str {
+        "read_thread"
+    }
+
+    fn description(&self) -> &str {
+        "Read a branch: the post with the given handle and everything below it, depth-first, in \
+         the same format as the conversation above. Bounded — the result says how many posts \
+         exist and how to page through them. A snapshot taken when this turn started."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "handle": {
+                    "type": "string",
+                    "description": "Handle of the post to read from, e.g. \"#a2c4e6g\".",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": format!(
+                        "How many posts to return (default {}, maximum {}).",
+                        crate::READ_THREAD_DEFAULT_LIMIT, crate::READ_THREAD_MAX_LIMIT,
+                    ),
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "How many posts to skip (default 0).",
+                },
+            },
+            "required": ["handle"],
+        })
+    }
+
+    fn call<'a>(&'a self, arguments: serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let handle = handle_arg(&arguments)?;
+            let limit = usize_arg(&arguments, "limit", crate::READ_THREAD_DEFAULT_LIMIT);
+            let offset = usize_arg(&arguments, "offset", 0);
+            Ok(self.snapshot.render_thread(&handle, offset, limit))
+        })
+    }
+}
+
+/// `read_post` — one post in full, plus the passages it quotes.
+pub(crate) struct ReadPostTool {
+    snapshot: Arc<crate::ThreadSnapshot>,
+}
+
+impl ReadPostTool {
+    pub(crate) fn new(snapshot: Arc<crate::ThreadSnapshot>) -> Self {
+        Self { snapshot }
+    }
+}
+
+impl Tool for ReadPostTool {
+    fn name(&self) -> &str {
+        "read_post"
+    }
+
+    fn description(&self) -> &str {
+        "Read one post in full by handle, together with any passages it quotes from other posts. \
+         A snapshot taken when this turn started."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "handle": {
+                    "type": "string",
+                    "description": "Handle of the post to read, e.g. \"#a2c4e6g\".",
+                },
+            },
+            "required": ["handle"],
+        })
+    }
+
+    fn call<'a>(&'a self, arguments: serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let handle = handle_arg(&arguments)?;
+            Ok(self.snapshot.render_post(&handle))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handle_arguments_are_normalized_and_validated() {
+        assert_eq!(
+            handle_arg(&serde_json::json!({"handle": " #A2C4E6G "})).unwrap(),
+            "a2c4e6g"
+        );
+        assert_eq!(
+            handle_arg(&serde_json::json!({"handle": "a2c4e6g"})).unwrap(),
+            "a2c4e6g"
+        );
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"handle": ""}),
+            serde_json::json!({"handle": "#"}),
+            serde_json::json!({"handle": 7}),
+        ] {
+            assert!(handle_arg(&bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn optional_integer_arguments_fall_back_to_defaults() {
+        assert_eq!(usize_arg(&serde_json::json!({}), "limit", 10), 10);
+        assert_eq!(usize_arg(&serde_json::json!({"limit": 3}), "limit", 10), 3);
+        // A negative or non-numeric value is the model's mistake; falling back
+        // to the default keeps the call useful instead of failing it.
+        assert_eq!(
+            usize_arg(&serde_json::json!({"limit": -3}), "limit", 10),
+            10
+        );
+        assert_eq!(
+            usize_arg(&serde_json::json!({"limit": "many"}), "limit", 10),
+            10
+        );
+    }
 
     #[test]
     fn empty_registry_reports_empty() {

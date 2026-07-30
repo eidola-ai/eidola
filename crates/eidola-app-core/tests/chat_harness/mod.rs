@@ -130,11 +130,29 @@ pub enum ChatBehavior {
     /// chunk. Pins that streamed calls preserve provider fields (as blocking
     /// calls do) and that the merge rule is last-wins.
     ToolRoundsStreamingWithExtras(u64),
+    /// Blocking: the next chat request answers with **one round requesting
+    /// every call currently in [`MockConfig::tool_script`]**, consuming the
+    /// script; later requests answer normally.
+    ///
+    /// Exists for the task-21 navigation tools, whose arguments are post
+    /// handles that only exist once the fixture space has been built — so the
+    /// script is set at runtime rather than at mock construction.
+    ToolScript,
 }
 
 /// The tool name the tool-calling behaviours call — matches
 /// `eidola_app_core::tools::EchoTool`.
 pub const TOOL_NAME: &str = "echo";
+
+/// The `(tool_name, arguments_json)` calls [`ChatBehavior::ToolScript`] asks
+/// for. Shared + interior-mutable so a test can fill it in after building its
+/// fixture (see [`tool_script`]).
+pub type ToolScript = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+/// A fresh, empty [`ToolScript`].
+pub fn tool_script() -> ToolScript {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
 
 /// Whether the refund endpoints (inline + recovery) actually mint a successor
 /// credential, or fail. Lets refund-recovery-succeeds vs -fails be selected.
@@ -158,6 +176,8 @@ pub struct MockConfig {
     /// the original PR #218 screenshot failed on) before the turn's own error
     /// wrapping exists.
     pub models_status: Option<u16>,
+    /// The calls [`ChatBehavior::ToolScript`] serves (ignored otherwise).
+    pub tool_script: ToolScript,
 }
 
 impl Default for MockConfig {
@@ -167,6 +187,7 @@ impl Default for MockConfig {
             refund: RefundMode::Succeed,
             balance: 10_000_000,
             models_status: None,
+            tool_script: tool_script(),
         }
     }
 }
@@ -250,6 +271,12 @@ pub const THREAD_MAP_NOTE: &str = "This space is threaded: the conversation abov
      it, and other branches exist. A `<thread-map>` block appears as the last message listing \
      them — it is client-generated metadata, not a post by any participant, and no reply is due \
      to it.";
+
+/// Appended after [`THREAD_MAP_NOTE`] only when the navigation tools actually
+/// attach (i.e. the backend can carry a `tools` field).
+pub const THREAD_MAP_TOOLS_NOTE: &str = "When a map entry looks relevant to what you are writing, \
+     read it with the navigation tools (`list_branches`, `read_thread`, `read_post`); otherwise \
+     answer from the conversation you were given — most replies need none.";
 
 /// The exact `system` message content a turn sends: the responding
 /// participant's effective system prompt (when it has one) followed by the
@@ -803,6 +830,46 @@ async fn handle_chat(
             write_json(stream, 200, &body.to_string()).await
         }
         ChatBehavior::ToolCallsNotAnArrayStreaming => write_sse_bad_tool_calls_stream(stream).await,
+        ChatBehavior::ToolScript => {
+            // Consume the script: the round that serves it asks for every
+            // scripted call at once (so one turn can exercise several tools),
+            // and every later request answers normally.
+            let script: Vec<(String, String)> =
+                std::mem::take(&mut *config.tool_script.lock().unwrap());
+            let mut body = if script.is_empty() {
+                serde_json::json!({
+                    "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": TOOL_FINAL_CONTENT,
+                    } }],
+                    "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                })
+            } else {
+                let calls: Vec<serde_json::Value> = script
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, arguments))| {
+                        serde_json::json!({
+                            "id": tool_call_id(i as u64 + 1),
+                            "type": "function",
+                            "function": { "name": name, "arguments": arguments },
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": serde_json::Value::Null,
+                        "tool_calls": calls,
+                    } }],
+                    "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                })
+            };
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
     }
 }
 

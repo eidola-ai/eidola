@@ -25,8 +25,8 @@ mod chat_harness;
 
 use chat_harness::{
     ChatBehavior, DEFAULT_AGENT_LABEL, HUMAN_LABEL, MODEL, MockConfig, MockServer, RefundMode,
-    THREAD_MAP_NOTE, flat_messages, headed, map_entry, system_message, system_message_with,
-    thread_map, with_account,
+    THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, flat_messages, headed, map_entry, system_message,
+    system_message_with, thread_map, with_account,
 };
 use eidola_app_core::changes::Change;
 use eidola_app_core::error::AppError;
@@ -1093,6 +1093,187 @@ fn sibling_branch_turns_send_identical_trunk_bytes() {
                 "exactly one map block"
             );
         }
+    });
+}
+
+// ===========================================================================
+// Navigation tools (task 21)
+//
+// These run over an `openai` backend rather than the eidola one, because that
+// is the real production gate: `prepare_turn` attaches the navigation tools
+// only when the space has branches AND the backend can carry a `tools` field,
+// and the Eidola server rejects unknown body fields today (see
+// `backend_accepts_tools`). Testing through the gate rather than around it is
+// what makes the eidola-path assertion above meaningful.
+// ===========================================================================
+
+/// An `openai` backend pointed at the mock — no account, no spend.
+fn external_backend(core: &AppCore, base_url: &str) {
+    core.runtime()
+        .block_on(core.add_backend(eidola_app_core::NewBackend {
+            id: "ext".into(),
+            kind: eidola_app_core::BackendKind::OpenAi,
+            display_name: String::new(),
+            base_url: Some(base_url.to_string()),
+            api_key: None,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+        }))
+        .expect("add backend");
+}
+
+/// The three navigation tools are advertised on a branched space's turn, and a
+/// round of real calls — including a deliberately stale handle — round-trips
+/// through the task-20 loop and comes back to the model as tool *results*.
+#[test]
+fn navigation_tools_round_trip_through_the_turn_loop() {
+    run(|| {
+        let script = chat_harness::tool_script();
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolScript,
+            tool_script: script.clone(),
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        let model = "qwen3-8b@ext";
+
+        // u1 -> i1 -> u2 -> i2, plus a branch post off i1 (saved, not asked —
+        // `post_reply` makes no request, so the mock's script stays untouched).
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), model.into(), None))
+            .expect("first turn");
+        let space = first.space_id.clone();
+        core.runtime()
+            .block_on(core.chat(
+                "And why two per day?".into(),
+                model.into(),
+                Some(space.clone()),
+            ))
+            .expect("second turn");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let i1 = tree[1].action_id.clone();
+        let u2_item = tree[2].item_id.clone();
+        let i2_item = tree[3].item_id.clone();
+        let i1_item = tree[1].item_id.clone();
+        core.runtime()
+            .block_on(core.post_reply(
+                "What about spring tides?".into(),
+                Some(space.clone()),
+                Some(i1),
+            ))
+            .expect("branch post");
+
+        // Now ask on the branch. The space forks at i1, so the map is present
+        // and the tools attach.
+        *script.lock().unwrap() = vec![
+            ("list_branches".into(), "{}".into()),
+            (
+                "read_thread".into(),
+                serde_json::json!({
+                    "handle": format!("#{}", eidola_app_core::post_handle(&u2_item)),
+                    "limit": 1,
+                })
+                .to_string(),
+            ),
+            (
+                "read_post".into(),
+                serde_json::json!({ "handle": eidola_app_core::post_handle(&i2_item) }).to_string(),
+            ),
+            (
+                "read_post".into(),
+                serde_json::json!({ "handle": "#zzzzzzz" }).to_string(),
+            ),
+        ];
+        let result = core
+            .runtime()
+            .block_on(core.chat("Tell me more.".into(), model.into(), Some(space.clone())))
+            .expect("the tool round-trip must not fail the turn");
+        assert_eq!(result.content, chat_harness::TOOL_FINAL_CONTENT);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 4, "two fixture turns + two rounds");
+
+        // Round 1 advertises exactly the three navigation tools.
+        let advertised: Vec<String> = bodies[2]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(advertised, ["list_branches", "read_thread", "read_post"]);
+        assert!(
+            flat_messages(&bodies[2])[0]
+                .1
+                .contains(THREAD_MAP_TOOLS_NOTE),
+            "the tools note only joins the system message when the tools attach"
+        );
+
+        // Round 2 replays the results the model reads.
+        let results: Vec<String> = flat_messages(&bodies[3])
+            .into_iter()
+            .filter(|(role, _)| role == "tool")
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(results.len(), 4, "one result per call, in order");
+
+        // list_branches: the whole space's structure, not just the map's.
+        assert!(
+            results[0].starts_with("1 fork point in this space."),
+            "{}",
+            results[0]
+        );
+        assert!(
+            results[0].contains(&format!("at #{}", eidola_app_core::post_handle(&i1_item))),
+            "{}",
+            results[0]
+        );
+
+        // read_thread: a bounded window, rendered in the task-19 header format,
+        // stating honestly what it did not show.
+        let u2_handle = eidola_app_core::post_handle(&u2_item);
+        assert!(
+            results[1].starts_with(&format!("Thread from #{u2_handle} — 2 posts, showing 1–1")),
+            "{}",
+            results[1]
+        );
+        assert!(
+            results[1].contains(&headed(&u2_item, HUMAN_LABEL, "And why two per day?")),
+            "one rendering path — the exact wire header format: {}",
+            results[1]
+        );
+        assert!(
+            results[1].ends_with("1 post not shown — call read_thread again with offset=1."),
+            "{}",
+            results[1]
+        );
+
+        // read_post: one post in full.
+        assert!(
+            results[2].starts_with(&format!("#{} · ", eidola_app_core::post_handle(&i2_item))),
+            "{}",
+            results[2]
+        );
+        assert!(
+            results[2].contains(chat_harness::TOOL_FINAL_CONTENT),
+            "{}",
+            results[2]
+        );
+
+        // A stale handle is answered honestly IN THE RESULT — the map is a
+        // snapshot, and reading a stale one must not burn the turn.
+        assert!(results[3].contains("`#zzzzzzz`"), "{}", results[3]);
+        assert!(results[3].contains("snapshot"), "{}", results[3]);
+        assert!(
+            !results[3].starts_with("error:"),
+            "a stale handle is an answer, not a tool error: {}",
+            results[3]
+        );
     });
 }
 
