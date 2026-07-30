@@ -565,6 +565,13 @@ pub struct SpaceView {
     /// A minimal honest error band (e.g. a submit failing before onboarding
     /// exists). Full onboarding is a later, separate window.
     pub(crate) error: Option<String>,
+
+    /// The window title last pushed to the platform (and to the a11y root
+    /// node), so an unchanged title never re-enters AppKit every frame. The
+    /// title tracks the space's Library title, which arrives after the first
+    /// exchange auto-titles it and changes again on rename — hence a render
+    /// concern rather than a one-shot at window open.
+    pub(crate) window_title: Option<SharedString>,
 }
 
 impl SpaceView {
@@ -598,6 +605,16 @@ impl SpaceView {
             cx.subscribe_in(&space, window, Self::on_space_event),
             cx.observe(&window_input, |_, _, cx| cx.notify()),
             cx.observe(&stores.config, |_, _, cx| cx.notify()),
+            // The space index carries the title — the window's name (see
+            // `sync_window_title`), which arrives only once the first
+            // exchange auto-titles the space and changes again on rename.
+            // `observe_in` (not plain `observe`) because the title has to be
+            // written *before* the frame this notify schedules — see
+            // `sync_window_title`.
+            cx.observe_in(&stores.spaces, window, |this, _, window, cx| {
+                this.sync_window_title(window, cx);
+                cx.notify();
+            }),
             // The space's participants feed the separator Ask menus, the
             // streaming bylines, and the cascade notice's ask affordances.
             cx.observe(&stores.participants, |_, _, cx| cx.notify()),
@@ -678,9 +695,12 @@ impl SpaceView {
             minimap_bounds: Rc::new(Cell::new(None)),
             minimap_drag: None,
             error: None,
+            window_title: None,
         };
         this.rebuild(cx);
         this.ensure_participants(cx);
+        // Name the window before its first frame; the observer keeps it current.
+        this.sync_window_title(window, cx);
         if is_blank {
             // The blank notebook: a root draft, focused and ready.
             this.create_draft(None, window, cx);
@@ -1850,6 +1870,13 @@ impl Render for SpaceView {
                     ))
                     .child(
                         v_flex()
+                            .id("space-conversation")
+                            // The window's main landmark. Named here rather
+                            // than on the scroll container so the probe's
+                            // absolute canvas can't reach into the scrollable
+                            // extent. What it *contains* is Wave C's job —
+                            // today it is the branch dots, bands and asks.
+                            .probe("space/conversation", gpui::Role::Main, "Conversation")
                             .w_full()
                             .pt(px(doc_reserve))
                             .pb(px(floating_pad))
@@ -2525,6 +2552,54 @@ impl SpaceView {
                     .child(actions),
             )
             .into_any_element()
+    }
+
+    /// The space's title as the Library index knows it — the same source
+    /// `open_participants` uses for its subtitle. `None` for a blank ⌘N space
+    /// or one the index hasn't caught up with.
+    fn space_title(&self, cx: &gpui::App) -> Option<SharedString> {
+        let space_id = self.space.read(cx).id()?.to_string();
+        self.stores
+            .spaces
+            .read(cx)
+            .list()
+            .iter()
+            .find(|s| s.id == space_id)
+            .and_then(|s| s.title.clone())
+            .map(SharedString::from)
+    }
+
+    /// Name the window after the conversation it holds, so VoiceOver's window
+    /// chooser and the macOS Window menu can tell two spaces apart. Guarded on
+    /// change — the title only moves when the space is auto-titled or renamed.
+    ///
+    /// **Called from the `stores.spaces` observer, never from `render`.**
+    /// `Window::draw_roots` builds the frame's AccessKit root node — label and
+    /// all — in `a11y.begin_frame()` *before* prepainting the root element, so
+    /// a title written during `render` lands after that frame's root was
+    /// already built from the previous one; and `set_window_title` marks
+    /// nothing dirty, so no follow-up frame is scheduled. The platform title
+    /// (Window menu, switcher) would update at once while the *accessible*
+    /// root kept the stale name until some unrelated redraw. Writing it in the
+    /// observer — which runs before the frame its own `notify` schedules —
+    /// gets both from one pass.
+    fn sync_window_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self
+            .space_title(cx)
+            .unwrap_or_else(|| SharedString::from("New Space"));
+        if self.window_title.as_ref() == Some(&title) {
+            return;
+        }
+        window.set_window_title(&title);
+        self.window_title = Some(title);
+    }
+
+    /// Test-only: the title last pushed to the window. `gpui`'s `TestWindow`
+    /// doesn't implement `get_title`, so `Window::window_title()` reads back
+    /// empty — this field is the only observable end of the call.
+    #[doc(hidden)]
+    pub fn window_title_for_test(&self) -> Option<&str> {
+        self.window_title.as_deref()
     }
 
     /// Space → Participants…: open the Participants window for this space. A

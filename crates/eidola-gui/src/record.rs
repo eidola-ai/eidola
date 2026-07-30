@@ -630,6 +630,22 @@ impl Render for RecordView {
         // overlay indicator (shown only while scrolling) binds to the surface
         // the user is actually scrolling: the non-virtualized bodies share
         // `detail_scroll`; each virtualized listing carries its own.
+        //
+        // The body's landmark: a `List` while a listing renders (the
+        // `uniform_list` itself can't carry a role — it implements
+        // `InteractiveElement` but not `StatefulInteractiveElement`, where
+        // gpui's aria builders live), otherwise a plain named region for the
+        // detail / empty / loading shapes.
+        let (body_role, body_label) = if self.detail.is_some() {
+            (gpui::Role::Region, "Entry detail")
+        } else if self.detail_pending.is_some() {
+            (gpui::Role::Region, "Loading entry")
+        } else if self.current_listing_is_empty() {
+            (gpui::Role::Region, self.section.label())
+        } else {
+            (gpui::Role::List, self.section.label())
+        };
+
         let (body, scrollbar): (gpui::AnyElement, gpui::AnyElement) = if self.detail.is_some() {
             (
                 scroll_wrap(self.render_detail(cx), &self.detail_scroll).into_any_element(),
@@ -684,6 +700,8 @@ impl Render for RecordView {
             // be a child of the scrolling element, or it scrolls away).
             .child(
                 v_flex()
+                    .id("record-body")
+                    .probe("record/body", body_role, body_label)
                     .relative()
                     .flex_1()
                     .w_full()
@@ -784,7 +802,16 @@ impl RecordView {
         // The strip *is* the titlebar: make its empty areas (and gaps between
         // the section tabs) drag the window. The tabs/refresh keep their own
         // clicks — a plain click never arms a move.
-        crate::titlebar::make_draggable(strip.id("record-strip"), "record-strip", window, cx)
+        crate::titlebar::make_draggable(
+            strip.id("record-strip").probe(
+                "record/sections",
+                gpui::Role::TabList,
+                "Record sections",
+            ),
+            "record-strip",
+            window,
+            cx,
+        )
     }
 
     fn list_frame(&self) -> Div {
@@ -909,6 +936,49 @@ impl RecordView {
             .collect()
     }
 
+    /// The `(position, size)` a listing row reports to assistive technology:
+    /// its 1-based index among the section's **loaded data rows**, and how
+    /// many of those there are.
+    ///
+    /// Deliberately *not* the display index or `display.len()`. The display
+    /// model interleaves spending group headers and a trailing load-more
+    /// affordance, so those would announce the first spending entry as "2 of
+    /// N" and count the button as an extra item. Both display builders push
+    /// `Data(idx)` in `rows` order, so the data index is already contiguous.
+    ///
+    /// `size` is the *loaded* count, not the server-side total: with
+    /// `has_more` there are more rows behind the load-more affordance and
+    /// gpui offers no way to say "unknown". The loaded count is what the list
+    /// actually contains, which is the honest answer available.
+    fn row_set_metadata(&self, section: RecordSection, row_index: usize) -> (usize, usize) {
+        let loaded = match section {
+            RecordSection::Attestations => self.attestations.rows.len(),
+            RecordSection::Requests => self.requests.rows.len(),
+            RecordSection::Spending => self.spending.rows.len(),
+        };
+        (row_index + 1, loaded)
+    }
+
+    /// Test-only: the `(position, size)` every data row of the current
+    /// section would report, in display order. `aria_*` attributes don't pass
+    /// through `.probe()`, so walking the real display model through the real
+    /// rule is the only seam that can pin them.
+    #[doc(hidden)]
+    pub fn row_set_metadata_for_test(&self) -> Vec<(usize, usize)> {
+        let display = match self.section {
+            RecordSection::Attestations => &self.attestations.display,
+            RecordSection::Requests => &self.requests.display,
+            RecordSection::Spending => &self.spending.display,
+        };
+        display
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Data(i) => Some(self.row_set_metadata(self.section, *i)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// One fixed-height listing row shell: the hover background, click target,
     /// hairline top rule (between rows), and `ROW_H` height shared by every
     /// row kind. `dix` is the display index (so the first *visible* row in a
@@ -987,12 +1057,18 @@ impl RecordView {
             plural(a.connection_count, "connection"),
             format_bytes(a.doc_bytes),
         );
+        let (pos, size) = self.row_set_metadata(RecordSection::Attestations, i);
         self.row_shell(("attestation", dix), dix, cx)
+            .aria_position_in_set(pos)
+            .aria_size_of_set(size)
             .probe(
                 format!("record/attestation/{dix}"),
                 gpui::Role::ListItem,
-                format!("Attestation {}", truncate_middle(&a.hash, 44)),
+                format!("Attestation {}", spoken_hash(&a.hash)),
             )
+            // The whole hash is still reachable — as the node's value, which
+            // AT reads on request rather than as part of the row's name.
+            .aria_value(a.hash.clone())
             .on_click(cx.listener(move |this, _, _, cx| this.open_attestation(hash.clone(), cx)))
             .child(
                 h_flex()
@@ -1090,7 +1166,10 @@ impl RecordView {
         }
         sub_parts.push(fmt_utc(r.request_at, false));
 
+        let (pos, size) = self.row_set_metadata(RecordSection::Requests, i);
         self.row_shell(("request", dix), dix, cx)
+            .aria_position_in_set(pos)
+            .aria_size_of_set(size)
             .probe(
                 format!("record/request/{dix}"),
                 gpui::Role::ListItem,
@@ -1306,6 +1385,7 @@ impl RecordView {
     /// A spending data row (clicks through to the request detail).
     fn render_spend_row(&self, i: usize, cx: &Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme();
+        let (pos, size) = self.row_set_metadata(RecordSection::Spending, i);
         let e = &self.spending.rows[i];
         let id = e.request_id.clone();
         let mut sub_parts: Vec<String> = Vec::new();
@@ -1324,6 +1404,8 @@ impl RecordView {
 
         v_flex()
             .id(("spend", i))
+            .aria_position_in_set(pos)
+            .aria_size_of_set(size)
             .probe(
                 format!("record/spend/{i}"),
                 gpui::Role::ListItem,
@@ -1606,6 +1688,19 @@ fn hex_dump(bytes: &[u8]) -> String {
 
 /// Middle-ellipsis truncation for hashes and nonces: keeps both ends, which
 /// is what you compare when eyeballing identifiers.
+/// A hash short enough to *hear*: the leading eight characters, elided. A
+/// 44-character middle-truncated hex label is announced character by
+/// character and is unusable as a name — the full value stays reachable as
+/// the element's accessible *value* (see the attestation row).
+fn spoken_hash(hash: &str) -> String {
+    let head: String = hash.chars().take(8).collect();
+    if head.chars().count() < hash.chars().count() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 fn truncate_middle(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
