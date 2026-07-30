@@ -927,6 +927,9 @@ struct Inner {
     /// entirely when the snapshot is empty. Consumers register through
     /// [`AppCore::register_tool`]; tasks 21/22 plug in here.
     tools: std::sync::RwLock<tools::ToolRegistry>,
+    /// Backends observed, this process, to reject a request carrying a `tools`
+    /// field — see `Inner::backend_rejects_tools`.
+    tool_incapable_backends: std::sync::RwLock<std::collections::HashSet<String>>,
     /// Test-only HTTP client override. When `Some`, [`Inner::build_client`]
     /// returns a clone of this client *instead of* constructing the
     /// attesting client, letting integration tests drive `chat`/`chat_stream`
@@ -3300,6 +3303,46 @@ impl Inner {
                 message: format!("unknown backend kind `{}`", backend.kind),
             })?;
 
+        // Whether this backend can be offered a `tools` field at all.
+        //
+        // Two conditions, and the second is the important one.
+        //
+        // **Statically excluded: eidola.** The server's
+        // `ChatCompletionRequest` is `#[serde(deny_unknown_fields)]` with no
+        // `tools` member, so sending one is a certain 400. Removal trigger:
+        // task 25 (server-side tool support). The **map** rides in the messages
+        // array and is unaffected either way, so a branched eidola space still
+        // gets the whole structural view; only the descend-further affordance
+        // waits.
+        //
+        // **Everything else is a guess until proven, so it is *learned*, not
+        // assumed from the kind.** Backend kind does not establish
+        // tool-calling capability, and this is not hypothetical: llama.cpp
+        // returns HTTP 500 `tools param requires --jinja flag` without
+        // `--jinja`, and *with* `--jinja` still 500s with a template-render
+        // crash when the model's tool block uses Jinja filters it lacks (a
+        // mainstream case — Qwen3 Coder does exactly this). A generic
+        // OpenAI-compatible endpoint may reject the field outright. Since this
+        // turn attaches tools *automatically* the moment a space branches,
+        // assuming capability would mean "branching your conversation breaks
+        // every turn on this model", with no opt-out and triggered by a core
+        // UX action. So a backend that has rejected a `tools` field this
+        // process is remembered and simply not offered them again (the turn
+        // that discovered it degraded and carried on — see the round loop).
+        //
+        // Deliberately in-process and not persisted: it is an *observation*,
+        // not configuration. No column, no setting to get wrong, nothing to
+        // migrate, and a backend that gains tool support (a rebuilt engine, a
+        // different model, an upgraded proxy) is re-probed on the next restart
+        // rather than being written off forever. The real per-backend
+        // capability flag stays genuinely deferred.
+        //
+        // Note this gates only the tools *this turn attaches*. A consumer's own
+        // `AppCore::register_tool` registrations are untouched — that surface's
+        // wire compatibility is the consumer's call, exactly as task 20 left it.
+        let backend_accepts_tools =
+            backend_kind != BackendKind::Eidola && !self.backend_rejects_tools(&backend.id);
+
         // The canonical selection string (recorded on actions, shown in
         // UIs) and the wire model (what the backend's HTTP API expects).
         // Engine-backed aliases are spawned equal to the canonical id, so
@@ -3542,6 +3585,42 @@ impl Inner {
         // author quoted, not an opaque marker. Charge estimation below runs on
         // the expanded array, so the hold covers the expanded bytes.
         let context_rows = self.expand_context_embeds(&db_conn, context_rows).await?;
+
+        // ---- Thread map (task 21) -----------------------------------------
+        //
+        // The spine this turn is being shown: the deduped context action ids,
+        // root → the post being answered. Everything hanging off it that the
+        // spine does not contain is what the model cannot see, and the trailing
+        // map is where it is told about it (see the `ThreadSnapshot` module
+        // comment for the cache reasoning behind the tail placement).
+        let mut spine: Vec<String> = Vec::new();
+        for row in &context_rows {
+            if spine.last().map(String::as_str) != Some(row.action_id.as_str()) {
+                spine.push(row.action_id.clone());
+            }
+        }
+        // Built from exactly the materials the GUI renders, so threading and
+        // post rendering have one path each. Also the tools' data source: their
+        // results are this snapshot (stale-ok by contract).
+        let thread = Arc::new(ThreadSnapshot::new(
+            build_post_tree(db::get_space_tree_data(&db_conn, &space_id).await?),
+            now,
+        ));
+        // A Revise turn must not learn about the generation it replaces (nor
+        // anything downstream of it) — the same rule `get_upstream_context`
+        // applies to the messages, applied to the map.
+        let map_exclude = match mode {
+            ResponseMode::Revise => Some(target_action_id),
+            ResponseMode::Reply => None,
+        };
+        let forks = thread.spine_forks(&spine, map_exclude);
+        let has_map = !forks.is_empty();
+        // Navigation tools attach only when there is a map to descend from AND
+        // the backend can carry a `tools` field. A linear space therefore sends
+        // byte-identical requests to what it sent before task 21 — no map, no
+        // note, no `tools` — which is the property the pinned-bytes tests hold.
+        let nav_tools = has_map && backend_accepts_tools;
+
         // Render the rows from the *responding participant's* point of view:
         // only its own prior posts are `assistant`, everyone else's are `user`,
         // and every message carries its uniform `#<handle> · <label>` header
@@ -3557,13 +3636,34 @@ impl Inner {
         // construction. Neither is persisted as an action — the forensics
         // doctrine keeps mutable participant config out of the trail (a later
         // wave may snapshot its hash per turn).
+        //
+        // The thread-map notes join the same message, and only when they apply:
+        // a linear space's system content is byte-for-byte what it was before
+        // task 21, and a branched space's flips exactly once (at the same
+        // moment the tool schemas appear) rather than churning per turn. The
+        // *data* — which branches exist — never comes here; it lives in the
+        // trailing block where recompute is cheap.
+        let mut notes: Vec<&str> = vec![HEADER_PROTOCOL_NOTE];
+        if has_map {
+            notes.push(THREAD_MAP_NOTE);
+        }
+        if nav_tools {
+            notes.push(THREAD_MAP_TOOLS_NOTE);
+        }
         let system_content = match system_prompt
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            Some(sp) => format!("{sp}\n\n{HEADER_PROTOCOL_NOTE}"),
-            None => HEADER_PROTOCOL_NOTE.to_string(),
+            Some(sp) => {
+                let mut s = sp.to_string();
+                for note in &notes {
+                    s.push_str("\n\n");
+                    s.push_str(note);
+                }
+                s
+            }
+            None => notes.join("\n\n"),
         };
         prior_messages.insert(
             0,
@@ -3572,6 +3672,20 @@ impl Inner {
                 content: system_content,
             },
         );
+
+        // The trailing map: appended *after* the post being answered, carrying
+        // an explicit `Respond to #h.` pointer. Exactly one message is volatile
+        // this way, so a re-request of the same turn reuses the whole prefix
+        // including the post it answers. Role `user` because a trailing
+        // `system` message is unsupported by many chat templates; the block's
+        // delimiters and the system note both say plainly that it is not a post.
+        if has_map {
+            let respond_to = context_rows.last().map(|r| post_handle(&r.item_id));
+            prior_messages.push(SpaceMessage {
+                role: "user".to_string(),
+                content: thread.render_map(&forks, respond_to.as_deref()),
+            });
+        }
 
         // The OpenAI messages array — built *before* the charge estimate so
         // both the estimate and the wire request read one array. Rounds 2+ of
@@ -3585,12 +3699,33 @@ impl Inner {
         // Snapshot the tool registry for this turn (see `tools`). An empty
         // registry sends no `tools` field at all, so today's requests stay
         // byte-identical.
-        let tool_registry = Arc::new(
+        //
+        // The navigation tools are added on top of that snapshot, per turn,
+        // rather than living in the process registry: they are scoped to *this*
+        // space and read *this* turn's `ThreadSnapshot`, so there is nothing
+        // sensible for them to be at process scope. The seam stays additive —
+        // a consumer's own registrations are unaffected, and a turn that adds
+        // none leaves the registry exactly as it found it.
+        //
+        // The pre-attach snapshot is kept alongside: if the backend turns out
+        // to reject a `tools` field, the round loop withdraws what this turn
+        // added and retries against exactly the registry the consumer asked
+        // for (see `TurnPrep::withdraw_auto_tools`).
+        let consumer_tools = Arc::new(
             self.tools
                 .read()
                 .expect("tool registry lock poisoned")
                 .clone(),
         );
+        let tool_registry = if nav_tools {
+            let mut registry = (*consumer_tools).clone();
+            registry.register(Arc::new(tools::ListBranchesTool::new(thread.clone())));
+            registry.register(Arc::new(tools::ReadThreadTool::new(thread.clone())));
+            registry.register(Arc::new(tools::ReadPostTool::new(thread.clone())));
+            Arc::new(registry)
+        } else {
+            consumer_tools.clone()
+        };
 
         // The spend side runs only for eidola turns. Local and external
         // turns carry no charge estimate, no credential, and no ACT header
@@ -3642,6 +3777,8 @@ impl Inner {
             trace_reply_to: inf_reply_to_for_trace,
             messages,
             tools: tool_registry,
+            consumer_tools,
+            auto_tools: nav_tools,
             remote_pricing,
             budget,
             charge_credits,
@@ -3781,6 +3918,47 @@ impl Inner {
         Ok(())
     }
 
+    /// Has this backend rejected a request carrying a `tools` field during
+    /// this process's lifetime? See the gate in `prepare_turn` for why this is
+    /// learned rather than assumed from the backend's kind.
+    fn backend_rejects_tools(&self, backend_id: &str) -> bool {
+        self.tool_incapable_backends
+            .read()
+            .expect("tool capability memo lock poisoned")
+            .contains(backend_id)
+    }
+
+    /// Record that `backend_id` rejects a `tools` field, so later turns skip
+    /// straight to the toolless request instead of paying the probe again.
+    ///
+    /// Called **only when the toolless retry succeeded** — that is the evidence
+    /// the `tools` field was the cause. A round that fails both with and
+    /// without tools was failing for some other reason (an overloaded model, a
+    /// bad key), and must not silently cost the backend its tool support for
+    /// the rest of the process.
+    fn remember_tool_incapable(&self, backend_id: &str) {
+        self.tool_incapable_backends
+            .write()
+            .expect("tool capability memo lock poisoned")
+            .insert(backend_id.to_string());
+    }
+
+    /// Should this round-1 failure be retried with the turn's own tools
+    /// withdrawn?
+    ///
+    /// Round 1 only: from round 2 the messages array carries `tool_calls` /
+    /// `tool` entries that cannot be replayed to an endpoint without a `tools`
+    /// field, and a round past the first proves the endpoint accepted one.
+    /// `auto_tools` only: a consumer's registrations are an explicit opt-in and
+    /// stay, failing honestly as task 20 decided. Any upstream status counts —
+    /// llama.cpp answers 500 for both of its tool-rejection shapes, so keying
+    /// on 4xx alone would miss the common case; the cost of guessing wrong is
+    /// one extra request, and `remember_tool_incapable` is not reached unless
+    /// the retry actually succeeds.
+    fn should_degrade_tools(&self, prep: &TurnPrep, round: usize, err: &AppError) -> bool {
+        round == 1 && prep.auto_tools && matches!(err.root(), AppError::Server { .. })
+    }
+
     /// `Reply` → a new child item replying to the target; `Revise` → a new
     /// generation of the target's item (regenerate / agent edit).
     ///
@@ -3832,7 +4010,28 @@ impl Inner {
         // is by far the largest state machine in the crate, and keeping it on
         // the heap keeps the turn off the worker stack.
         for round in 1..=MAX_TURN_ROUNDS {
-            match Box::pin(self.run_turn_round(&mut prep, round)).await? {
+            let mut outcome = Box::pin(self.run_turn_round(&mut prep, round)).await;
+            // Degrade-on-rejection: a backend that refuses the `tools` field
+            // gets one toolless retry of this round rather than turning "the
+            // user branched their conversation" into a broken turn. The map is
+            // untouched — it rides the messages array.
+            if let Err(e) = &outcome
+                && self.should_degrade_tools(&prep, round, e)
+            {
+                prep.withdraw_auto_tools();
+                // The failed attempt consumed its hold (and recovered its
+                // refund), so the retry acquires a fresh one — exactly what a
+                // tool round does. A no-op for the non-spend backends this can
+                // actually reach today.
+                self.begin_next_round(&mut prep)
+                    .await
+                    .map_err(|e| prep.wrap(e))?;
+                outcome = Box::pin(self.run_turn_round(&mut prep, round)).await;
+                if outcome.is_ok() {
+                    self.remember_tool_incapable(&prep.backend_id);
+                }
+            }
+            match outcome? {
                 RoundOutcome::Final(result) => return Ok(result),
                 RoundOutcome::ToolRound => continue,
             }
@@ -4051,6 +4250,37 @@ impl Inner {
         }
 
         // --- the final round ---------------------------------------------
+
+        // Tool-rejection degrade (see `should_degrade_tools`): when the loop is
+        // about to retry this round with the turn's own tools withdrawn, return
+        // *before* persisting the inference. An error generation written here
+        // would consume the turn's item identity — a fresh `Reply` item's only
+        // root (`idx_one_root_per_item`), or the `Revise` successor slot
+        // (`idx_one_successor_per_action`) — and the retry could then not write
+        // its answer at all. The transport trail still records the rejected
+        // request, which is the forensically interesting half: it carries the
+        // exact `tools` field the endpoint refused. Same predicate as the
+        // loop's, so "did not persist" and "will retry" cannot disagree.
+        if !status.is_success() {
+            let rejected = AppError::Server {
+                status: status.as_u16(),
+                message: parse_server_error_message(&response_text),
+            };
+            if self.should_degrade_tools(prep, round, &rejected) {
+                prep.insert_unattached_request(
+                    &request_body_json,
+                    request_at,
+                    response_at,
+                    status.as_u16(),
+                    response_text.as_bytes().to_vec(),
+                )
+                .await?;
+                self.bus.emit(Change::Space(prep.space_id.clone()));
+                self.bus.emit(Change::Record);
+                return Err(prep.wrap(rejected));
+            }
+        }
+
         let response_action_id = prep
             .persist_turn(
                 if status.is_success() {
@@ -4205,7 +4435,23 @@ impl Inner {
                 .map_err(|e| e.into_chat_failed(space_id))?;
 
         for round in 1..=MAX_TURN_ROUNDS {
-            match Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await? {
+            let mut outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
+            // Degrade-on-rejection — see the blocking twin. A rejected request
+            // is answered before any SSE body, so nothing was streamed to the
+            // caller and the retry is invisible to it.
+            if let Err(e) = &outcome
+                && self.should_degrade_tools(&prep, round, e)
+            {
+                prep.withdraw_auto_tools();
+                self.begin_next_round(&mut prep)
+                    .await
+                    .map_err(|e| prep.wrap(e))?;
+                outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
+                if outcome.is_ok() {
+                    self.remember_tool_incapable(&prep.backend_id);
+                }
+            }
+            match outcome? {
                 RoundOutcome::Final(result) => return Ok(result),
                 RoundOutcome::ToolRound => continue,
             }
@@ -4691,12 +4937,31 @@ impl AppCore {
     /// tool of the same name. A turn snapshots the registry in `prepare_turn`,
     /// so registering mid-turn never changes the tool set a turn already
     /// advertised to the model.
-    pub fn register_tool(&self, tool: std::sync::Arc<dyn tools::Tool>) {
+    ///
+    /// **Refuses [`tools::RESERVED_TOOL_NAMES`]** — the turn-scoped navigation
+    /// tools a branched turn attaches to its own snapshot. Without this a
+    /// consumer's registration would be accepted, work on every linear turn,
+    /// and then be silently replaced by the built-in the moment a space
+    /// branched (the turn layers its tools onto the snapshot, and
+    /// `ToolRegistry::register` is last-write-wins) — the advertised schema and
+    /// the executed implementation diverging on exactly the turns the feature
+    /// exists for. Refusing at registration time makes that unrepresentable.
+    pub fn register_tool(&self, tool: std::sync::Arc<dyn tools::Tool>) -> Result<(), AppError> {
+        let name = tool.name().to_string();
+        if tools::is_reserved_tool_name(&name) {
+            return Err(AppError::NotConfigured {
+                message: format!(
+                    "`{name}` is reserved for Eidola's thread-navigation tools and cannot be \
+                     registered; pick another name"
+                ),
+            });
+        }
         self.inner
             .tools
             .write()
             .expect("tool registry lock poisoned")
             .register(tool);
+        Ok(())
     }
 
     /// The names of the currently registered tools (registration order).
@@ -4984,6 +5249,7 @@ impl AppCore {
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
                 tools: std::sync::RwLock::new(tools::ToolRegistry::new()),
+                tool_incapable_backends: std::sync::RwLock::new(std::collections::HashSet::new()),
                 http_override,
                 _db_lock: db_lock,
             }),
@@ -6364,6 +6630,14 @@ struct TurnPrep {
     /// The tool registry snapshot for this turn (see [`tools`]). Empty ⇒ the
     /// request body carries no `tools` field at all.
     tools: Arc<tools::ToolRegistry>,
+    /// The registry as it stood *before* this turn attached its navigation
+    /// tools — what a tool-rejection degrade falls back to.
+    consumer_tools: Arc<tools::ToolRegistry>,
+    /// Whether this turn attached the navigation tools itself. Only tools the
+    /// turn added are the turn's to withdraw: a consumer's registrations are
+    /// an explicit opt-in whose wire compatibility is the consumer's call, so
+    /// they are never silently dropped.
+    auto_tools: bool,
     /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
     /// for every non-spend backend. Kept so a later round can re-estimate.
     remote_pricing: Option<(u128, u128, u128)>,
@@ -6403,6 +6677,16 @@ impl TurnPrep {
         AppError::ChatFailed {
             space_id: self.space_id.clone(),
             source: Box::new(source),
+        }
+    }
+
+    /// Withdraw the navigation tools this turn attached, falling back to the
+    /// registry the consumer configured. Idempotent, and a no-op for a turn
+    /// that attached none — a consumer's own tools are never dropped.
+    fn withdraw_auto_tools(&mut self) {
+        if self.auto_tools {
+            self.tools = self.consumer_tools.clone();
+            self.auto_tools = false;
         }
     }
 
@@ -7511,15 +7795,28 @@ fn base32_lower(bytes: &[u8], len: usize) -> String {
 /// embedded newline would otherwise inject a second paragraph attributed to
 /// that author.
 fn message_header(item_id: &str, label: &str) -> String {
-    let label: String = label
-        .chars()
-        .map(|c| if is_forbidden_in_label(c) { ' ' } else { c })
-        .collect();
     format!(
         "#{}{HEADER_SEPARATOR}{}",
         post_handle(item_id),
-        label.trim()
+        one_line(label)
     )
+}
+
+/// Flatten `s` onto a single line: every character `validate_label` forbids
+/// (control characters, U+2028/U+2029) becomes a space, then the result is
+/// trimmed.
+///
+/// Used wherever text is spliced into a line-structured wire payload — the
+/// `#<handle> · <label>` message header and the thread map's entry lines. Both
+/// make "this is one line" a promise to the *wire*, so it is enforced where the
+/// bytes are built and cannot be broken later by a write path that forgets the
+/// rule.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if is_forbidden_in_label(c) { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Prefix `text` with its post header, separated by a blank line so the header
@@ -7836,6 +8133,507 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
     }
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Thread map + navigation snapshot (task 21)
+//
+// `get_upstream_context` scopes a turn to its own branch, so without help the
+// model cannot know that sibling branches exist at all. The thread map is the
+// deterministic, structural answer: a clearly-delimited block appended at the
+// **tail** of the assembled context naming every fork point on the turn's spine
+// and the branches hanging off it.
+//
+// # Cache doctrine (why the map is where it is)
+//
+// Prefix caches key on exact token prefixes, so three invariants govern the
+// placement:
+//
+// 1. **Trunk bytes identical across sibling branches** — two branches share
+//    cache up to their fork.
+// 2. **Trunk bytes stable over time** — append-only growth reuses cache.
+// 3. **All volatile data at the tail**, where recompute is cheap by
+//    construction.
+//
+// Branch metadata is therefore *never* interleaved inline at fork points (live
+// content there would invalidate every sibling from the fork on). The map is a
+// single trailing message, placed **after** the post being answered rather than
+// before it, and carrying an explicit `Respond to #h.` pointer. That choice is
+// deliberate: with the map last, exactly one message is volatile, so a
+// re-request of the same turn (retry, regenerate, a second agent answering the
+// same post) reuses the whole conversation prefix *including* the post it
+// answers. Placing the map before the final post would make positions N-1 and N
+// both recompute for no gain.
+//
+// The *content* is volatile (relative timestamps, growing branches) and that is
+// fine — it lives at the tail by design. What must not move is anything above
+// it, and nothing here does.
+//
+// # What is *not* here
+//
+// Checkpoint 3 of the task — LLM-written branch summaries, lazily generated and
+// cached by the branch's tip action id, stored as versioned `checkpoint` items —
+// is deferred to a follow-up. Its hook is `ThreadSnapshot::branch_entry`: the
+// summary would become an extra, optional field on [`BranchEntry`] rendered
+// after the structural line, with the structural entry staying as the
+// always-present fallback. Nothing else about the map or the tools changes.
+// ---------------------------------------------------------------------------
+
+/// The opening delimiter of the trailing thread-map message. XML-ish because
+/// the block must read as unmistakably *not* a post — the same signal Claude
+/// Code's tail-side `<system-reminder>` injection uses.
+const THREAD_MAP_OPEN: &str = "<thread-map>";
+
+/// The closing delimiter of the trailing thread-map message.
+const THREAD_MAP_CLOSE: &str = "</thread-map>";
+
+/// The map block's one-line legend, explaining its entry format.
+const THREAD_MAP_LEGEND: &str = "Branches of this space that the conversation above does not \
+     contain. Each line: handle · author · posts · last activity — opening line.";
+
+/// Appended to the turn's system message **only when the turn carries a map**.
+///
+/// This is protocol explanation, never branch data: the volatile part (which
+/// branches exist) stays in the trailing block. It flips exactly once per space
+/// — at the moment the space first branches, which is also the moment the tool
+/// schemas appear — and is byte-stable thereafter, so a linear space's system
+/// message is untouched and a branched one's does not churn per turn.
+const THREAD_MAP_NOTE: &str = "This space is threaded: the conversation above is one branch of \
+     it, and other branches exist. A `<thread-map>` block appears as the last message listing \
+     them — it is client-generated metadata, not a post by any participant, and no reply is due \
+     to it.";
+
+/// Appended to the system message only when the navigation tools are actually
+/// attached (see `Inner::prepare_turn`). Kept separate from
+/// [`THREAD_MAP_NOTE`] so a turn whose backend cannot carry a `tools` field is
+/// never told to call tools it does not have.
+const THREAD_MAP_TOOLS_NOTE: &str = "When a map entry looks relevant to what you are writing, \
+     read it with the navigation tools (`list_branches`, `read_thread`, `read_post`); otherwise \
+     answer from the conversation you were given — most replies need none.";
+
+/// Default number of posts a `read_thread` window returns.
+const READ_THREAD_DEFAULT_LIMIT: usize = 10;
+
+/// Hard ceiling on a `read_thread` window, so one tool result cannot blow up a
+/// turn's prompt (and its hold).
+const READ_THREAD_MAX_LIMIT: usize = 50;
+
+/// Where a set of branches hangs off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ForkAnchor {
+    /// A concrete post, named by its handle.
+    Post(String),
+    /// The space itself has several thread roots — they are siblings of a
+    /// virtual root, with no post to anchor to.
+    SpaceStart,
+}
+
+/// One branch hanging off a fork point: its root post plus the structural
+/// signals the model needs to decide whether to descend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BranchEntry {
+    /// Handle of the branch's first post.
+    handle: String,
+    /// That post's author (effective label in this space).
+    author: String,
+    /// Posts in the whole branch subtree (current generations only).
+    posts: usize,
+    /// Newest `created_at` anywhere in the subtree.
+    last_activity: i64,
+    /// First line of the branch's opening post, via the auto-title heuristic
+    /// ([`derive_space_title`]). `None` for a post with no presentable text.
+    opening: Option<String>,
+    // Checkpoint 3 hooks here: `summary: Option<String>` — an LLM-written
+    // précis of the branch, cached by its tip action id and rendered after the
+    // structural line. The structural entry above is the always-present
+    // fallback, so the map never depends on a summarizer being available.
+}
+
+/// A fork point and the branches at it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ForkPoint {
+    at: ForkAnchor,
+    branches: Vec<BranchEntry>,
+}
+
+/// An immutable, whole-space view of a space's threaded posts.
+///
+/// Built once per turn in `prepare_turn` from exactly the same materials the
+/// GUI renders (`db::get_space_tree_data` → [`build_post_tree`]), so there is
+/// one threading path and one rendering path — the navigation tools render
+/// posts through [`with_header`], byte-for-byte the task-19 wire format.
+///
+/// It is also what the navigation tools read: results are a **snapshot** taken
+/// when the turn started (stale-ok, the same contract a file-reading agent
+/// harness gives its model), which is why the tools need no database handle and
+/// are trivially `Send + Sync`.
+struct ThreadSnapshot {
+    nodes: Vec<PostNode>,
+    /// `post_handle(item_id)` per node, positionally aligned with `nodes`.
+    handles: Vec<String>,
+    /// Concatenated `text` blocks per node, positionally aligned with `nodes`.
+    texts: Vec<String>,
+    /// Parent action id → child node indices, in render order (the spine's
+    /// successor first, then branches chronologically).
+    children: std::collections::HashMap<String, Vec<usize>>,
+    by_action: std::collections::HashMap<String, usize>,
+    /// Handle → node index. On a (35-bit) handle collision the first post
+    /// wins; the loser is still reachable through the map and `list_branches`,
+    /// and a handle is never renumbered — rendered bytes are cached upstream.
+    by_handle: std::collections::HashMap<String, usize>,
+    roots: Vec<usize>,
+    /// The turn's timestamp — every relative time in this snapshot is measured
+    /// from it, so one turn's map and tool results never disagree.
+    now: i64,
+}
+
+impl ThreadSnapshot {
+    fn new(nodes: Vec<PostNode>, now: i64) -> Self {
+        let mut handles = Vec::with_capacity(nodes.len());
+        let mut texts = Vec::with_capacity(nodes.len());
+        let mut by_action = std::collections::HashMap::with_capacity(nodes.len());
+        let mut by_handle = std::collections::HashMap::with_capacity(nodes.len());
+        let mut children: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut roots = Vec::new();
+
+        // `nodes` arrives in `build_post_tree`'s pre-order, so collecting
+        // children in iteration order preserves the spine-first, then
+        // chronological-branches ordering the render already established.
+        for (i, n) in nodes.iter().enumerate() {
+            let handle = post_handle(&n.item_id);
+            by_action.insert(n.action_id.clone(), i);
+            by_handle.entry(handle.clone()).or_insert(i);
+            handles.push(handle);
+            texts.push(
+                n.blocks
+                    .iter()
+                    .filter(|b| b.block_type == "text")
+                    .filter_map(|b| b.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(""),
+            );
+            match &n.parent_action_id {
+                Some(p) => children.entry(p.clone()).or_default().push(i),
+                None => roots.push(i),
+            }
+        }
+
+        Self {
+            nodes,
+            handles,
+            texts,
+            children,
+            by_action,
+            by_handle,
+            roots,
+            now,
+        }
+    }
+
+    /// Pre-order walk of the subtree rooted at `idx` (the node itself first).
+    fn subtree(&self, idx: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut stack = vec![idx];
+        while let Some(i) = stack.pop() {
+            out.push(i);
+            if let Some(kids) = self.children.get(&self.nodes[i].action_id) {
+                for k in kids.iter().rev() {
+                    stack.push(*k);
+                }
+            }
+        }
+        out
+    }
+
+    fn branch_entry(&self, idx: usize) -> BranchEntry {
+        let sub = self.subtree(idx);
+        let last_activity = sub
+            .iter()
+            .map(|&i| self.nodes[i].created_at)
+            .max()
+            .unwrap_or(self.nodes[idx].created_at);
+        BranchEntry {
+            handle: self.handles[idx].clone(),
+            author: self.nodes[idx].participant.label.clone(),
+            posts: sub.len(),
+            last_activity,
+            opening: derive_space_title(&self.texts[idx]),
+        }
+    }
+
+    /// The fork points on `spine` (deduped context action ids, root → the post
+    /// being answered) together with the branches that spine does **not**
+    /// contain — i.e. exactly what this turn cannot see.
+    ///
+    /// `exclude` drops one child subtree entirely: on a `Revise` (regenerate)
+    /// turn it is the generation being replaced, which `get_upstream_context`
+    /// already withholds from the messages. Advertising it in the map would
+    /// hand the model back its own prior output through the side door.
+    fn spine_forks(&self, spine: &[String], exclude: Option<&str>) -> Vec<ForkPoint> {
+        let mut out = Vec::new();
+
+        // Sibling thread roots: a space with several roots renders them as
+        // branches of a virtual root, so they are branches the spine misses
+        // with no post to anchor to.
+        if let Some(first) = spine.first()
+            && let Some(&fidx) = self.by_action.get(first)
+            && self.nodes[fidx].parent_action_id.is_none()
+            && self.roots.len() > 1
+        {
+            let branches: Vec<BranchEntry> = self
+                .roots
+                .iter()
+                .filter(|&&r| r != fidx && Some(self.nodes[r].action_id.as_str()) != exclude)
+                .map(|&r| self.branch_entry(r))
+                .collect();
+            if !branches.is_empty() {
+                out.push(ForkPoint {
+                    at: ForkAnchor::SpaceStart,
+                    branches,
+                });
+            }
+        }
+
+        for (pos, action_id) in spine.iter().enumerate() {
+            let Some(&idx) = self.by_action.get(action_id) else {
+                continue;
+            };
+            let Some(kids) = self.children.get(action_id) else {
+                continue;
+            };
+            let successor = spine.get(pos + 1).map(String::as_str);
+            let branches: Vec<BranchEntry> = kids
+                .iter()
+                .filter(|&&k| {
+                    let id = self.nodes[k].action_id.as_str();
+                    Some(id) != successor && Some(id) != exclude
+                })
+                .map(|&k| self.branch_entry(k))
+                .collect();
+            if !branches.is_empty() {
+                out.push(ForkPoint {
+                    at: ForkAnchor::Post(self.handles[idx].clone()),
+                    branches,
+                });
+            }
+        }
+
+        out
+    }
+
+    /// Every fork point in the space — a post with more than one reply, plus
+    /// the virtual root when the space has several thread roots. This is what
+    /// `list_branches` reports: the whole structure, not just the forks on the
+    /// conversation the model was handed.
+    fn all_forks(&self) -> Vec<ForkPoint> {
+        let mut out = Vec::new();
+        if self.roots.len() > 1 {
+            out.push(ForkPoint {
+                at: ForkAnchor::SpaceStart,
+                branches: self.roots.iter().map(|&r| self.branch_entry(r)).collect(),
+            });
+        }
+        for (i, n) in self.nodes.iter().enumerate() {
+            let Some(kids) = self.children.get(&n.action_id) else {
+                continue;
+            };
+            if kids.len() < 2 {
+                continue;
+            }
+            out.push(ForkPoint {
+                at: ForkAnchor::Post(self.handles[i].clone()),
+                branches: kids.iter().map(|&k| self.branch_entry(k)).collect(),
+            });
+        }
+        out
+    }
+
+    /// Render fork entries into `out`, one blank-line-separated group per fork.
+    /// Shared by the trailing map and `list_branches` so the two never drift.
+    fn push_forks(&self, out: &mut String, forks: &[ForkPoint]) {
+        for f in forks {
+            out.push('\n');
+            match &f.at {
+                ForkAnchor::Post(h) => {
+                    out.push_str("at #");
+                    out.push_str(h);
+                }
+                ForkAnchor::SpaceStart => out.push_str("at the start of this space"),
+            }
+            out.push('\n');
+            for b in &f.branches {
+                out.push_str(&format!(
+                    "  #{} · {} · {} · {} — {}\n",
+                    b.handle,
+                    one_line(&b.author),
+                    plural_posts(b.posts),
+                    relative_time_ms(b.last_activity, self.now),
+                    b.opening.as_deref().map(one_line).unwrap_or_else(|| {
+                        // No silent stripping: a text-less branch still gets a
+                        // line, it just has nothing to quote.
+                        "(no text)".to_string()
+                    }),
+                ));
+            }
+        }
+    }
+
+    /// The trailing map message's content: the delimited block naming every
+    /// fork on the turn's spine, and the explicit pointer back to the post
+    /// being answered (the placement decision — see the module comment above).
+    fn render_map(&self, forks: &[ForkPoint], respond_to: Option<&str>) -> String {
+        let mut out = String::new();
+        out.push_str(THREAD_MAP_OPEN);
+        out.push('\n');
+        out.push_str(THREAD_MAP_LEGEND);
+        out.push('\n');
+        self.push_forks(&mut out, forks);
+        if let Some(h) = respond_to {
+            out.push_str(&format!("\nRespond to #{h}.\n"));
+        }
+        out.push_str(THREAD_MAP_CLOSE);
+        out
+    }
+
+    /// `list_branches`: the whole space's fork structure.
+    fn render_all_forks(&self) -> String {
+        let forks = self.all_forks();
+        if forks.is_empty() {
+            return "This space has no branches: no post has more than one reply.".to_string();
+        }
+        let mut out = format!(
+            "{} fork point{} in this space. Each line: handle · author · posts · last activity — \
+             opening line.\n",
+            forks.len(),
+            if forks.len() == 1 { "" } else { "s" }
+        );
+        self.push_forks(&mut out, &forks);
+        out.truncate(out.trim_end().len());
+        out
+    }
+
+    /// `read_thread`: a bounded window of the branch rooted at `handle`,
+    /// rendered post-by-post through [`with_header`] — the exact task-19 wire
+    /// format, one rendering path rather than two.
+    fn render_thread(&self, handle: &str, offset: usize, limit: usize) -> String {
+        let Some(&idx) = self.by_handle.get(handle) else {
+            return self.unknown_handle(handle);
+        };
+        let sub = self.subtree(idx);
+        let total = sub.len();
+        let limit = limit.clamp(1, READ_THREAD_MAX_LIMIT);
+        let start = offset;
+        if start >= total {
+            return format!(
+                "Thread from #{handle} has {} — offset {offset} is past the end.",
+                plural_posts(total)
+            );
+        }
+        let end = (start + limit).min(total);
+
+        let mut out = format!("Thread from #{handle} — {}", plural_posts(total));
+        if start > 0 || end < total {
+            out.push_str(&format!(", showing {}–{}", start + 1, end));
+        }
+        out.push_str(
+            ". Depth-first: each post is followed by its first reply's thread, then its other \
+             branches.\n\n",
+        );
+        for &i in &sub[start..end] {
+            let n = &self.nodes[i];
+            out.push_str(&with_header(
+                &n.item_id,
+                &n.participant.label,
+                &self.texts[i],
+            ));
+            out.push_str("\n\n");
+        }
+        if end < total {
+            out.push_str(&format!(
+                "{} not shown — call read_thread again with offset={end}.",
+                plural_posts(total - end)
+            ));
+        }
+        out.truncate(out.trim_end().len());
+        out
+    }
+
+    /// `read_post`: one post in full, plus the passages it quotes.
+    fn render_post(&self, handle: &str) -> String {
+        let Some(&idx) = self.by_handle.get(handle) else {
+            return self.unknown_handle(handle);
+        };
+        let n = &self.nodes[idx];
+        let mut out = with_header(&n.item_id, &n.participant.label, &self.texts[idx]);
+        if !n.references.is_empty() {
+            out.push_str("\n\nPassages this post quotes:\n");
+            for r in &n.references {
+                let target = match self.by_action.get(&r.antecedent_action_id) {
+                    Some(&i) => format!("#{}", self.handles[i]),
+                    // A reference names a *concrete generation*, which may have
+                    // been superseded, or may live in another space entirely
+                    // (references are the cross-space mechanism). Say so rather
+                    // than remapping.
+                    None => "(a post outside this space, or an earlier version)".to_string(),
+                };
+                out.push_str(&format!("[{}] {target}", r.ordinal));
+                if let Some(a) = &r.annotation {
+                    out.push_str(&format!(" — {}", one_line(a)));
+                }
+                out.push('\n');
+                match &r.snippet {
+                    Some(s) => {
+                        for line in s.split('\n') {
+                            out.push_str("> ");
+                            out.push_str(line);
+                            out.push('\n');
+                        }
+                    }
+                    None => {
+                        out.push_str("(the quoted range no longer maps onto that post's text)\n")
+                    }
+                }
+            }
+        }
+        out.truncate(out.trim_end().len());
+        out
+    }
+
+    /// The honest answer to a handle this snapshot does not know — a *result*,
+    /// not an error: the map and these tools are a snapshot, and a model
+    /// reading a stale one must get an answer it can act on.
+    fn unknown_handle(&self, handle: &str) -> String {
+        format!(
+            "No post with handle `#{handle}` in this space. The thread map and these tools are a \
+             snapshot taken when this turn started; call list_branches for the current structure."
+        )
+    }
+}
+
+/// `"1 post"` / `"4 posts"`.
+fn plural_posts(n: usize) -> String {
+    if n == 1 {
+        "1 post".to_string()
+    } else {
+        format!("{n} posts")
+    }
+}
+
+/// Coarse, human relative time. Deliberately bucketed: the map is recomputed
+/// every turn, and a precise timestamp would churn its bytes for no reader
+/// benefit while a bucket stays stable for minutes or hours at a time.
+fn relative_time_ms(then: i64, now: i64) -> String {
+    let secs = (now - then).max(0) / 1000;
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
 }
 
 /// Maximum length of an auto-derived space title, in characters.
@@ -8390,6 +9188,243 @@ mod tests {
                 required: 1
             })
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Thread map (task 21)
+    // -----------------------------------------------------------------
+
+    /// A `PostNode` fixture: only the fields the snapshot reads.
+    fn tn(action: &str, item: &str, parent: Option<&str>, label: &str, text: &str) -> PostNode {
+        PostNode {
+            action_id: action.to_string(),
+            item_id: item.to_string(),
+            parent_action_id: parent.map(String::from),
+            participant: PostParticipant {
+                kind: "human".to_string(),
+                label: label.to_string(),
+            },
+            action_type: "user_input".to_string(),
+            generation: 0,
+            generation_count: 1,
+            is_current: true,
+            model: None,
+            credits_consumed: None,
+            relation: parent.map(|_| "reply".to_string()),
+            depth: 0,
+            is_branch: false,
+            blocks: vec![PostBlock {
+                id: format!("{action}-b0"),
+                block_type: "text".to_string(),
+                text: Some(text.to_string()),
+                tool_name: None,
+                tool_call_id: None,
+                data: None,
+            }],
+            references: Vec::new(),
+            created_at: 0,
+        }
+    }
+
+    /// `u1 → i1`, and `i1` forks into branch A (`a1 → a2`) and branch B (`b1`).
+    /// Pre-order, exactly as `build_post_tree` emits it.
+    fn forked_snapshot() -> ThreadSnapshot {
+        ThreadSnapshot::new(
+            vec![
+                tn("u1", "iu1", None, "You", "How do tides work?"),
+                tn("i1", "ii1", Some("u1"), "Agent", "Because of the moon."),
+                tn("a1", "ia1", Some("i1"), "You", "# What about spring tides?"),
+                tn("a2", "ia2", Some("a1"), "Agent", "Sun and moon align."),
+                tn("b1", "ib1", Some("i1"), "You", "And neap tides?"),
+            ],
+            0,
+        )
+    }
+
+    #[test]
+    fn spine_forks_names_only_the_branches_the_spine_misses() {
+        let snap = forked_snapshot();
+        // Walking branch A: the fork at i1 must name branch B, and not the
+        // spine's own successor.
+        let forks = snap.spine_forks(&["u1".into(), "i1".into(), "a1".into(), "a2".into()], None);
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].at, ForkAnchor::Post(post_handle("ii1")));
+        assert_eq!(forks[0].branches.len(), 1);
+        let b = &forks[0].branches[0];
+        assert_eq!(b.handle, post_handle("ib1"));
+        assert_eq!(b.author, "You");
+        assert_eq!(b.posts, 1);
+        assert_eq!(b.opening.as_deref(), Some("And neap tides?"));
+
+        // Walking branch B: the mirror image — branch A, with its whole
+        // subtree counted.
+        let forks = snap.spine_forks(&["u1".into(), "i1".into(), "b1".into()], None);
+        assert_eq!(forks[0].branches.len(), 1);
+        assert_eq!(forks[0].branches[0].handle, post_handle("ia1"));
+        assert_eq!(forks[0].branches[0].posts, 2, "the branch's whole subtree");
+        assert_eq!(
+            forks[0].branches[0].opening.as_deref(),
+            Some("What about spring tides?"),
+            "the opening line reuses the auto-title heuristic (markdown stripped)"
+        );
+    }
+
+    #[test]
+    fn a_linear_spine_has_no_forks() {
+        let snap = ThreadSnapshot::new(
+            vec![
+                tn("u1", "iu1", None, "You", "hello"),
+                tn("i1", "ii1", Some("u1"), "Agent", "hi"),
+            ],
+            0,
+        );
+        assert!(
+            snap.spine_forks(&["u1".into(), "i1".into()], None)
+                .is_empty()
+        );
+        assert!(snap.all_forks().is_empty());
+    }
+
+    #[test]
+    fn a_revise_turn_is_not_told_about_the_generation_it_replaces() {
+        let snap = forked_snapshot();
+        // Regenerating branch A's opening post: the spine stops before it, and
+        // the excluded subtree must not surface as a "branch" at the fork —
+        // that would hand the model back the very output Revise withholds.
+        let forks = snap.spine_forks(&["u1".into(), "i1".into()], Some("a1"));
+        assert_eq!(forks.len(), 1);
+        assert_eq!(
+            forks[0]
+                .branches
+                .iter()
+                .map(|b| b.handle.as_str())
+                .collect::<Vec<_>>(),
+            vec![post_handle("ib1")],
+            "only the genuine sibling branch"
+        );
+    }
+
+    #[test]
+    fn sibling_thread_roots_are_branches_with_no_post_to_anchor_to() {
+        let snap = ThreadSnapshot::new(
+            vec![
+                tn("r1", "ir1", None, "You", "first thread"),
+                tn("r2", "ir2", None, "You", "second thread"),
+            ],
+            0,
+        );
+        let forks = snap.spine_forks(&["r1".into()], None);
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].at, ForkAnchor::SpaceStart);
+        assert_eq!(forks[0].branches[0].handle, post_handle("ir2"));
+    }
+
+    #[test]
+    fn the_rendered_map_names_every_branch_and_points_at_the_post_to_answer() {
+        let snap = forked_snapshot();
+        let forks = snap.spine_forks(&["u1".into(), "i1".into(), "b1".into()], None);
+        let map = snap.render_map(&forks, Some(&post_handle("ib1")));
+        assert_eq!(
+            map,
+            format!(
+                "<thread-map>\n{THREAD_MAP_LEGEND}\n\nat #{}\n  #{} · You · 2 posts · just now — \
+                 What about spring tides?\n\nRespond to #{}.\n</thread-map>",
+                post_handle("ii1"),
+                post_handle("ia1"),
+                post_handle("ib1"),
+            )
+        );
+    }
+
+    #[test]
+    fn read_thread_windows_the_branch_and_renders_the_task_19_header_format() {
+        let snap = forked_snapshot();
+        let a = post_handle("ia1");
+        let full = snap.render_thread(&a, 0, 10);
+        assert!(
+            full.starts_with(&format!("Thread from #{a} — 2 posts.")),
+            "{full}"
+        );
+        assert!(
+            full.contains(&with_header("ia1", "You", "# What about spring tides?")),
+            "posts render through the one header path: {full}"
+        );
+        assert!(full.contains(&with_header("ia2", "Agent", "Sun and moon align.")));
+
+        // A window states its bounds and how to continue — never silent
+        // truncation.
+        let windowed = snap.render_thread(&a, 0, 1);
+        assert!(windowed.contains("showing 1–1"), "{windowed}");
+        assert!(
+            windowed.ends_with("1 post not shown — call read_thread again with offset=1."),
+            "{windowed}"
+        );
+        assert!(!windowed.contains("Sun and moon align."));
+
+        // Past the end is answered, not silently empty.
+        assert_eq!(
+            snap.render_thread(&a, 9, 10),
+            format!("Thread from #{a} has 2 posts — offset 9 is past the end.")
+        );
+    }
+
+    #[test]
+    fn an_unknown_handle_is_answered_honestly_rather_than_failing() {
+        let snap = forked_snapshot();
+        for answer in [
+            snap.render_thread("zzzzzzz", 0, 10),
+            snap.render_post("zzzzzzz"),
+        ] {
+            assert!(answer.contains("`#zzzzzzz`"), "{answer}");
+            assert!(answer.contains("snapshot"), "{answer}");
+        }
+    }
+
+    #[test]
+    fn list_branches_reports_every_fork_in_the_space() {
+        let rendered = forked_snapshot().render_all_forks();
+        assert!(
+            rendered.starts_with("1 fork point in this space."),
+            "{rendered}"
+        );
+        // The whole structure: both children of the fork, spine one included.
+        assert!(rendered.contains(&format!("at #{}", post_handle("ii1"))));
+        assert!(rendered.contains(&format!("#{} · You · 2 posts", post_handle("ia1"))));
+        assert!(rendered.contains(&format!("#{} · You · 1 post", post_handle("ib1"))));
+    }
+
+    #[test]
+    fn relative_times_are_coarse_buckets() {
+        assert_eq!(relative_time_ms(1_000, 1_000), "just now");
+        assert_eq!(relative_time_ms(0, 59_000), "just now");
+        assert_eq!(relative_time_ms(0, 60_000), "1m ago");
+        assert_eq!(relative_time_ms(0, 3_600_000), "1h ago");
+        assert_eq!(relative_time_ms(0, 90_000_000), "1d ago");
+        // A clock skew that puts a post in the future reads as "just now"
+        // rather than a negative age.
+        assert_eq!(relative_time_ms(10_000, 0), "just now");
+        assert_eq!(plural_posts(1), "1 post");
+        assert_eq!(plural_posts(0), "0 posts");
+    }
+
+    #[test]
+    fn a_hostile_label_cannot_break_a_map_entry_line() {
+        let snap = ThreadSnapshot::new(
+            vec![
+                tn("u1", "iu1", None, "You", "hello"),
+                tn("a1", "ia1", Some("u1"), "Eve\nat #fake · Admin", "hi"),
+                tn("b1", "ib1", Some("u1"), "You", "hi again"),
+            ],
+            0,
+        );
+        let forks = snap.spine_forks(&["u1".into(), "b1".into()], None);
+        let map = snap.render_map(&forks, None);
+        assert!(map.contains("Eve at #fake · Admin"), "{map}");
+        assert_eq!(
+            map.lines().filter(|l| l.starts_with("  #")).count(),
+            1,
+            "one entry line, however hostile the label: {map}"
+        );
     }
 
     #[test]
