@@ -186,6 +186,26 @@ pub const ROUTER_MODEL: &str = "router@local";
 /// inference) while still dispatching separately from the turns.
 pub const ROUTER_REMOTE_MODEL: &str = "router-remote";
 
+/// The head of `eidola_app_core::summaries::SUMMARY_SYSTEM_PROMPT`. Branch
+/// summaries share the router's *model*, so the mock tells the two chores apart
+/// by their system prompt, not by the wire model.
+pub const SUMMARY_PROMPT_HEAD: &str = "You summarize one branch";
+
+/// How the mock answers a **branch summary** request (see [`SummaryBehavior`]),
+/// which is any chat request whose system message starts with
+/// [`SUMMARY_PROMPT_HEAD`]. Dispatched ahead of [`RouterBehavior`], so one mock
+/// serves turns, the router, and the summarizer in one test.
+#[derive(Clone, Debug)]
+pub enum SummaryBehavior {
+    /// Not summary-aware: answered like any other chat request. The default,
+    /// and what every pre-summary test sees.
+    Passthrough,
+    /// 200 JSON completion whose assistant content is exactly this string.
+    Reply(String),
+    /// Non-2xx error body — the summarizer is reachable but refuses.
+    Fail(u16),
+}
+
 /// How the mock answers a chat request for [`ROUTER_MODEL`] — the may-decline
 /// router's scripted seam. Every arm keeps the *turn* behaviour
 /// ([`ChatBehavior`]) untouched, so one mock serves both roles in one test.
@@ -234,6 +254,8 @@ pub struct MockConfig {
     pub chat: ChatBehavior,
     /// How a request for [`ROUTER_MODEL`] is answered (see [`RouterBehavior`]).
     pub router: RouterBehavior,
+    /// How a branch-summary request is answered (see [`SummaryBehavior`]).
+    pub summary: SummaryBehavior,
     pub refund: RefundMode,
     /// Account available balance returned by `/v1/account/balances`.
     pub balance: i64,
@@ -251,6 +273,7 @@ impl Default for MockConfig {
         Self {
             chat: ChatBehavior::OkBlocking,
             router: RouterBehavior::Passthrough,
+            summary: SummaryBehavior::Passthrough,
             refund: RefundMode::Succeed,
             balance: 10_000_000,
             models_status: None,
@@ -398,6 +421,23 @@ pub fn map_entry(item_id: &str, author: &str, posts: &str, when: &str, opening: 
     format!(
         "#{} · {author} · {posts} · {when} — {opening}",
         eidola_app_core::post_handle(item_id)
+    )
+}
+
+/// A thread-map entry plus the LLM-written summary line under it. The summary
+/// carries its own indent because [`thread_map`] only prefixes an entry's first
+/// line.
+pub fn map_entry_summarized(
+    item_id: &str,
+    author: &str,
+    posts: &str,
+    when: &str,
+    opening: &str,
+    summary: &str,
+) -> String {
+    format!(
+        "{}\n      {summary}",
+        map_entry(item_id, author, posts, when, opening)
     )
 }
 
@@ -718,6 +758,30 @@ async fn handle_conn(
             chat_auth_values.lock().unwrap().push(req.auth.clone());
             let parsed: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            // A branch-summary request is recognized by its system prompt (it
+            // shares the router's model) and answered first, so a test can
+            // script the summarizer, the router, and the turns independently.
+            let is_summary = parsed
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .and_then(|a| a.first())
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.starts_with(SUMMARY_PROMPT_HEAD));
+            match (is_summary, &config.summary) {
+                (true, SummaryBehavior::Reply(content)) => {
+                    let body = serde_json::json!({
+                        "choices": [{ "message": { "role": "assistant", "content": content } }],
+                        "usage": { "prompt_tokens": 9, "completion_tokens": 5 },
+                    });
+                    return write_json(&mut stream, 200, &body.to_string()).await;
+                }
+                (true, SummaryBehavior::Fail(status)) => {
+                    return write_json(&mut stream, *status, &error_body("summarizer unavailable"))
+                        .await;
+                }
+                _ => {}
+            }
             // A request for the router model is answered by the router arm
             // (unless the mock is not router-aware), leaving `ChatBehavior`
             // free to script the *turns* in the same test.
