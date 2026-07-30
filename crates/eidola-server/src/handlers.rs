@@ -78,7 +78,7 @@ fn chargeable_prompt_tokens_for(request: &ChatCompletionRequest) -> u64 {
     let total_content_bytes: u64 = request
         .messages
         .iter()
-        .map(|m| m.content.byte_len() as u64)
+        .map(|m| m.content_byte_len() as u64)
         .sum();
     eidola_common::chargeable_prompt_tokens(total_content_bytes, request.messages.len() as u64)
 }
