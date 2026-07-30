@@ -177,6 +177,8 @@ The `justfile` is the primary development interface. Run `just` to see all avail
 - `just check` — clippy, rustfmt, and `rumdl check` over committed markdown (see `.rumdl.toml`). Run `just lint-md-fix` to apply auto-fixable formatting.
 - `just dev` / `just services` / `just down` — container-based development workflows (see Compose files above).
 
+**Dev profile:** the root `Cargo.toml` optimizes *dependencies* at `opt-level = 2` in dev builds (`[profile.dev.package."*"]`) while our own crates stay unoptimized. Dependencies are recompiled almost never and executed constantly, so this buys 8-17x faster frames in the GUI (measured with `crates/eidola-gui/tests/record_perf.rs`) and halves the debug binary, for ~90 s of one-time cold-build cost and no measured effect on incremental rebuilds. What it costs is debugging *inside* a dependency — stepping is unreliable and dependency locals often read "optimized out"; backtraces are unaffected. The full measurements and the companion settings that were rejected are in the comment block above the profile.
+
 ## Conventions
 
 - Pure Rust dependencies preferred (for cross-compilation)
