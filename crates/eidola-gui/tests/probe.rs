@@ -1757,6 +1757,7 @@ fn probe_templates() -> Vec<SpaceTemplateInfo> {
             id: eidola_app_core::DEFAULT_TEMPLATE_ID.into(),
             title: "Default".into(),
             cascade_limit: 4,
+            router_model: None,
             participants: vec![TemplateParticipantInfo {
                 id: "t-1".into(),
                 label: "Assistant".into(),
@@ -1769,6 +1770,7 @@ fn probe_templates() -> Vec<SpaceTemplateInfo> {
             id: "tmpl-research".into(),
             title: "Research".into(),
             cascade_limit: 6,
+            router_model: None,
             participants: Vec::new(),
         },
     ]
