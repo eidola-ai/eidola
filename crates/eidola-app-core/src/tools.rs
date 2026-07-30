@@ -109,8 +109,16 @@ impl ToolRegistry {
     }
 
     /// Register a tool, replacing any earlier registration of the same name
-    /// (last write wins — a consumer overriding a built-in is a feature, and a
-    /// duplicate name would otherwise be an ambiguous wire schema).
+    /// (last write wins — a duplicate name would otherwise be an ambiguous
+    /// wire schema).
+    ///
+    /// This is the raw mechanism, and it is also what `prepare_turn` uses to
+    /// layer a turn's navigation tools onto its registry snapshot. The
+    /// *reservation* of those names lives at the public seam
+    /// ([`crate::AppCore::register_tool`]), which is the only path by which a
+    /// consumer can reach the process registry — so a collision is refused
+    /// loudly at registration time rather than resolved silently, on branched
+    /// turns only, by whichever write happened to be last.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
         self.tools.retain(|t| t.name() != name);
@@ -152,6 +160,23 @@ impl ToolRegistry {
             })
             .collect()
     }
+}
+
+/// Tool names [`crate::AppCore::register_tool`] refuses.
+///
+/// These are the turn-scoped navigation tools `prepare_turn` attaches to a
+/// branched turn (see below). They are protocol surface, not ordinary
+/// built-ins: the thread map's system note promises the model these three
+/// names with these semantics, and each reads the turn's own `ThreadSnapshot`
+/// — something a process-scoped consumer registration structurally cannot
+/// supply. Reserving them keeps "what the model was promised" and "what
+/// executes" the same object on every turn, instead of silently diverging the
+/// moment a space branches.
+pub const RESERVED_TOOL_NAMES: [&str; 3] = ["list_branches", "read_thread", "read_post"];
+
+/// Whether `name` is reserved for the turn-scoped navigation tools.
+pub fn is_reserved_tool_name(name: &str) -> bool {
+    RESERVED_TOOL_NAMES.contains(&name)
 }
 
 /// A trivial tool that returns its `text` argument verbatim.
@@ -376,6 +401,32 @@ impl Tool for ReadPostTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_navigation_tool_names_are_reserved() {
+        for t in [
+            Arc::new(ListBranchesTool::new(Arc::new(crate::ThreadSnapshot::new(
+                Vec::new(),
+                0,
+            )))) as Arc<dyn Tool>,
+            Arc::new(ReadThreadTool::new(Arc::new(crate::ThreadSnapshot::new(
+                Vec::new(),
+                0,
+            )))),
+            Arc::new(ReadPostTool::new(Arc::new(crate::ThreadSnapshot::new(
+                Vec::new(),
+                0,
+            )))),
+        ] {
+            assert!(
+                is_reserved_tool_name(t.name()),
+                "{} must be reserved",
+                t.name()
+            );
+        }
+        assert!(!is_reserved_tool_name("echo"));
+        assert_eq!(RESERVED_TOOL_NAMES.len(), 3);
+    }
 
     #[test]
     fn handle_arguments_are_normalized_and_validated() {

@@ -927,6 +927,9 @@ struct Inner {
     /// entirely when the snapshot is empty. Consumers register through
     /// [`AppCore::register_tool`]; tasks 21/22 plug in here.
     tools: std::sync::RwLock<tools::ToolRegistry>,
+    /// Backends observed, this process, to reject a request carrying a `tools`
+    /// field — see `Inner::backend_rejects_tools`.
+    tool_incapable_backends: std::sync::RwLock<std::collections::HashSet<String>>,
     /// Test-only HTTP client override. When `Some`, [`Inner::build_client`]
     /// returns a clone of this client *instead of* constructing the
     /// attesting client, letting integration tests drive `chat`/`chat_stream`
@@ -3300,25 +3303,45 @@ impl Inner {
                 message: format!("unknown backend kind `{}`", backend.kind),
             })?;
 
-        // Whether this backend can carry a `tools` field at all.
+        // Whether this backend can be offered a `tools` field at all.
         //
-        // The Eidola server's `ChatCompletionRequest` is
-        // `#[serde(deny_unknown_fields)]` and has no `tools` member today, so
-        // sending one is a 400 — which is why the task-21 navigation tools are
-        // *not* attached on the eidola path yet. The **map** rides in the
-        // messages array and is unaffected, so a branched eidola space still
+        // Two conditions, and the second is the important one.
+        //
+        // **Statically excluded: eidola.** The server's
+        // `ChatCompletionRequest` is `#[serde(deny_unknown_fields)]` with no
+        // `tools` member, so sending one is a certain 400. Removal trigger:
+        // task 25 (server-side tool support). The **map** rides in the messages
+        // array and is unaffected either way, so a branched eidola space still
         // gets the whole structural view; only the descend-further affordance
         // waits.
         //
-        // REMOVAL TRIGGER: task 25 (server-side tool support) plus a capability
-        // story for telling one backend's tool support from another's. Once the
-        // server accepts `tools`, this becomes `true` unconditionally and the
-        // gate below collapses to "does this space have branches".
+        // **Everything else is a guess until proven, so it is *learned*, not
+        // assumed from the kind.** Backend kind does not establish
+        // tool-calling capability, and this is not hypothetical: llama.cpp
+        // returns HTTP 500 `tools param requires --jinja flag` without
+        // `--jinja`, and *with* `--jinja` still 500s with a template-render
+        // crash when the model's tool block uses Jinja filters it lacks (a
+        // mainstream case — Qwen3 Coder does exactly this). A generic
+        // OpenAI-compatible endpoint may reject the field outright. Since this
+        // turn attaches tools *automatically* the moment a space branches,
+        // assuming capability would mean "branching your conversation breaks
+        // every turn on this model", with no opt-out and triggered by a core
+        // UX action. So a backend that has rejected a `tools` field this
+        // process is remembered and simply not offered them again (the turn
+        // that discovered it degraded and carried on — see the round loop).
+        //
+        // Deliberately in-process and not persisted: it is an *observation*,
+        // not configuration. No column, no setting to get wrong, nothing to
+        // migrate, and a backend that gains tool support (a rebuilt engine, a
+        // different model, an upgraded proxy) is re-probed on the next restart
+        // rather than being written off forever. The real per-backend
+        // capability flag stays genuinely deferred.
         //
         // Note this gates only the tools *this turn attaches*. A consumer's own
         // `AppCore::register_tool` registrations are untouched — that surface's
         // wire compatibility is the consumer's call, exactly as task 20 left it.
-        let backend_accepts_tools = backend_kind != BackendKind::Eidola;
+        let backend_accepts_tools =
+            backend_kind != BackendKind::Eidola && !self.backend_rejects_tools(&backend.id);
 
         // The canonical selection string (recorded on actions, shown in
         // UIs) and the wire model (what the backend's HTTP API expects).
@@ -3683,19 +3706,26 @@ impl Inner {
         // sensible for them to be at process scope. The seam stays additive —
         // a consumer's own registrations are unaffected, and a turn that adds
         // none leaves the registry exactly as it found it.
-        let tool_registry = Arc::new({
-            let mut registry = self
-                .tools
+        //
+        // The pre-attach snapshot is kept alongside: if the backend turns out
+        // to reject a `tools` field, the round loop withdraws what this turn
+        // added and retries against exactly the registry the consumer asked
+        // for (see `TurnPrep::withdraw_auto_tools`).
+        let consumer_tools = Arc::new(
+            self.tools
                 .read()
                 .expect("tool registry lock poisoned")
-                .clone();
-            if nav_tools {
-                registry.register(Arc::new(tools::ListBranchesTool::new(thread.clone())));
-                registry.register(Arc::new(tools::ReadThreadTool::new(thread.clone())));
-                registry.register(Arc::new(tools::ReadPostTool::new(thread.clone())));
-            }
-            registry
-        });
+                .clone(),
+        );
+        let tool_registry = if nav_tools {
+            let mut registry = (*consumer_tools).clone();
+            registry.register(Arc::new(tools::ListBranchesTool::new(thread.clone())));
+            registry.register(Arc::new(tools::ReadThreadTool::new(thread.clone())));
+            registry.register(Arc::new(tools::ReadPostTool::new(thread.clone())));
+            Arc::new(registry)
+        } else {
+            consumer_tools.clone()
+        };
 
         // The spend side runs only for eidola turns. Local and external
         // turns carry no charge estimate, no credential, and no ACT header
@@ -3747,6 +3777,8 @@ impl Inner {
             trace_reply_to: inf_reply_to_for_trace,
             messages,
             tools: tool_registry,
+            consumer_tools,
+            auto_tools: nav_tools,
             remote_pricing,
             budget,
             charge_credits,
@@ -3886,6 +3918,47 @@ impl Inner {
         Ok(())
     }
 
+    /// Has this backend rejected a request carrying a `tools` field during
+    /// this process's lifetime? See the gate in `prepare_turn` for why this is
+    /// learned rather than assumed from the backend's kind.
+    fn backend_rejects_tools(&self, backend_id: &str) -> bool {
+        self.tool_incapable_backends
+            .read()
+            .expect("tool capability memo lock poisoned")
+            .contains(backend_id)
+    }
+
+    /// Record that `backend_id` rejects a `tools` field, so later turns skip
+    /// straight to the toolless request instead of paying the probe again.
+    ///
+    /// Called **only when the toolless retry succeeded** — that is the evidence
+    /// the `tools` field was the cause. A round that fails both with and
+    /// without tools was failing for some other reason (an overloaded model, a
+    /// bad key), and must not silently cost the backend its tool support for
+    /// the rest of the process.
+    fn remember_tool_incapable(&self, backend_id: &str) {
+        self.tool_incapable_backends
+            .write()
+            .expect("tool capability memo lock poisoned")
+            .insert(backend_id.to_string());
+    }
+
+    /// Should this round-1 failure be retried with the turn's own tools
+    /// withdrawn?
+    ///
+    /// Round 1 only: from round 2 the messages array carries `tool_calls` /
+    /// `tool` entries that cannot be replayed to an endpoint without a `tools`
+    /// field, and a round past the first proves the endpoint accepted one.
+    /// `auto_tools` only: a consumer's registrations are an explicit opt-in and
+    /// stay, failing honestly as task 20 decided. Any upstream status counts —
+    /// llama.cpp answers 500 for both of its tool-rejection shapes, so keying
+    /// on 4xx alone would miss the common case; the cost of guessing wrong is
+    /// one extra request, and `remember_tool_incapable` is not reached unless
+    /// the retry actually succeeds.
+    fn should_degrade_tools(&self, prep: &TurnPrep, round: usize, err: &AppError) -> bool {
+        round == 1 && prep.auto_tools && matches!(err.root(), AppError::Server { .. })
+    }
+
     /// `Reply` → a new child item replying to the target; `Revise` → a new
     /// generation of the target's item (regenerate / agent edit).
     ///
@@ -3937,7 +4010,28 @@ impl Inner {
         // is by far the largest state machine in the crate, and keeping it on
         // the heap keeps the turn off the worker stack.
         for round in 1..=MAX_TURN_ROUNDS {
-            match Box::pin(self.run_turn_round(&mut prep, round)).await? {
+            let mut outcome = Box::pin(self.run_turn_round(&mut prep, round)).await;
+            // Degrade-on-rejection: a backend that refuses the `tools` field
+            // gets one toolless retry of this round rather than turning "the
+            // user branched their conversation" into a broken turn. The map is
+            // untouched — it rides the messages array.
+            if let Err(e) = &outcome
+                && self.should_degrade_tools(&prep, round, e)
+            {
+                prep.withdraw_auto_tools();
+                // The failed attempt consumed its hold (and recovered its
+                // refund), so the retry acquires a fresh one — exactly what a
+                // tool round does. A no-op for the non-spend backends this can
+                // actually reach today.
+                self.begin_next_round(&mut prep)
+                    .await
+                    .map_err(|e| prep.wrap(e))?;
+                outcome = Box::pin(self.run_turn_round(&mut prep, round)).await;
+                if outcome.is_ok() {
+                    self.remember_tool_incapable(&prep.backend_id);
+                }
+            }
+            match outcome? {
                 RoundOutcome::Final(result) => return Ok(result),
                 RoundOutcome::ToolRound => continue,
             }
@@ -4156,6 +4250,37 @@ impl Inner {
         }
 
         // --- the final round ---------------------------------------------
+
+        // Tool-rejection degrade (see `should_degrade_tools`): when the loop is
+        // about to retry this round with the turn's own tools withdrawn, return
+        // *before* persisting the inference. An error generation written here
+        // would consume the turn's item identity — a fresh `Reply` item's only
+        // root (`idx_one_root_per_item`), or the `Revise` successor slot
+        // (`idx_one_successor_per_action`) — and the retry could then not write
+        // its answer at all. The transport trail still records the rejected
+        // request, which is the forensically interesting half: it carries the
+        // exact `tools` field the endpoint refused. Same predicate as the
+        // loop's, so "did not persist" and "will retry" cannot disagree.
+        if !status.is_success() {
+            let rejected = AppError::Server {
+                status: status.as_u16(),
+                message: parse_server_error_message(&response_text),
+            };
+            if self.should_degrade_tools(prep, round, &rejected) {
+                prep.insert_unattached_request(
+                    &request_body_json,
+                    request_at,
+                    response_at,
+                    status.as_u16(),
+                    response_text.as_bytes().to_vec(),
+                )
+                .await?;
+                self.bus.emit(Change::Space(prep.space_id.clone()));
+                self.bus.emit(Change::Record);
+                return Err(prep.wrap(rejected));
+            }
+        }
+
         let response_action_id = prep
             .persist_turn(
                 if status.is_success() {
@@ -4310,7 +4435,23 @@ impl Inner {
                 .map_err(|e| e.into_chat_failed(space_id))?;
 
         for round in 1..=MAX_TURN_ROUNDS {
-            match Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await? {
+            let mut outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
+            // Degrade-on-rejection — see the blocking twin. A rejected request
+            // is answered before any SSE body, so nothing was streamed to the
+            // caller and the retry is invisible to it.
+            if let Err(e) = &outcome
+                && self.should_degrade_tools(&prep, round, e)
+            {
+                prep.withdraw_auto_tools();
+                self.begin_next_round(&mut prep)
+                    .await
+                    .map_err(|e| prep.wrap(e))?;
+                outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
+                if outcome.is_ok() {
+                    self.remember_tool_incapable(&prep.backend_id);
+                }
+            }
+            match outcome? {
                 RoundOutcome::Final(result) => return Ok(result),
                 RoundOutcome::ToolRound => continue,
             }
@@ -4796,12 +4937,31 @@ impl AppCore {
     /// tool of the same name. A turn snapshots the registry in `prepare_turn`,
     /// so registering mid-turn never changes the tool set a turn already
     /// advertised to the model.
-    pub fn register_tool(&self, tool: std::sync::Arc<dyn tools::Tool>) {
+    ///
+    /// **Refuses [`tools::RESERVED_TOOL_NAMES`]** — the turn-scoped navigation
+    /// tools a branched turn attaches to its own snapshot. Without this a
+    /// consumer's registration would be accepted, work on every linear turn,
+    /// and then be silently replaced by the built-in the moment a space
+    /// branched (the turn layers its tools onto the snapshot, and
+    /// `ToolRegistry::register` is last-write-wins) — the advertised schema and
+    /// the executed implementation diverging on exactly the turns the feature
+    /// exists for. Refusing at registration time makes that unrepresentable.
+    pub fn register_tool(&self, tool: std::sync::Arc<dyn tools::Tool>) -> Result<(), AppError> {
+        let name = tool.name().to_string();
+        if tools::is_reserved_tool_name(&name) {
+            return Err(AppError::NotConfigured {
+                message: format!(
+                    "`{name}` is reserved for Eidola's thread-navigation tools and cannot be \
+                     registered; pick another name"
+                ),
+            });
+        }
         self.inner
             .tools
             .write()
             .expect("tool registry lock poisoned")
             .register(tool);
+        Ok(())
     }
 
     /// The names of the currently registered tools (registration order).
@@ -5089,6 +5249,7 @@ impl AppCore {
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
                 tools: std::sync::RwLock::new(tools::ToolRegistry::new()),
+                tool_incapable_backends: std::sync::RwLock::new(std::collections::HashSet::new()),
                 http_override,
                 _db_lock: db_lock,
             }),
@@ -6469,6 +6630,14 @@ struct TurnPrep {
     /// The tool registry snapshot for this turn (see [`tools`]). Empty ⇒ the
     /// request body carries no `tools` field at all.
     tools: Arc<tools::ToolRegistry>,
+    /// The registry as it stood *before* this turn attached its navigation
+    /// tools — what a tool-rejection degrade falls back to.
+    consumer_tools: Arc<tools::ToolRegistry>,
+    /// Whether this turn attached the navigation tools itself. Only tools the
+    /// turn added are the turn's to withdraw: a consumer's registrations are
+    /// an explicit opt-in whose wire compatibility is the consumer's call, so
+    /// they are never silently dropped.
+    auto_tools: bool,
     /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
     /// for every non-spend backend. Kept so a later round can re-estimate.
     remote_pricing: Option<(u128, u128, u128)>,
@@ -6508,6 +6677,16 @@ impl TurnPrep {
         AppError::ChatFailed {
             space_id: self.space_id.clone(),
             source: Box::new(source),
+        }
+    }
+
+    /// Withdraw the navigation tools this turn attached, falling back to the
+    /// registry the consumer configured. Idempotent, and a no-op for a turn
+    /// that attached none — a consumer's own tools are never dropped.
+    fn withdraw_auto_tools(&mut self) {
+        if self.auto_tools {
+            self.tools = self.consumer_tools.clone();
+            self.auto_tools = false;
         }
     }
 
