@@ -2528,6 +2528,157 @@ pub async fn insert_text_content_block(
     Ok(())
 }
 
+/// Insert a `tool_use` content block — one tool call the model requested.
+///
+/// The schema requires both `tool_name` and `tool_call_id` on this block type
+/// (and forbids `media_data`); the raw argument string is stored verbatim in
+/// `data`, so the Record shows exactly what the model asked for, valid JSON or
+/// not.
+pub async fn insert_tool_use_content_block(
+    conn: &Connection,
+    id: &str,
+    action_id: &str,
+    ordinal: i64,
+    tool_name: &str,
+    tool_call_id: &str,
+    arguments: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO content_block \
+         (id, action_id, ordinal, block_type, tool_name, tool_call_id, data) \
+         VALUES (?1, ?2, ?3, 'tool_use', ?4, ?5, ?6)",
+        (
+            Value::Text(id.to_string()),
+            Value::Text(action_id.to_string()),
+            Value::Integer(ordinal),
+            Value::Text(tool_name.to_string()),
+            Value::Text(tool_call_id.to_string()),
+            Value::Text(arguments.to_string()),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert tool_use content_block: {e}"),
+    })?;
+    Ok(())
+}
+
+/// Insert a `tool_result` content block — what the harness handed back for one
+/// call. Keyed by `tool_call_id` (the schema requires it and forbids
+/// `tool_name` here); `text_content` is exactly the text the model was shown,
+/// including an honest error line when the tool failed.
+pub async fn insert_tool_result_content_block(
+    conn: &Connection,
+    id: &str,
+    action_id: &str,
+    ordinal: i64,
+    tool_call_id: &str,
+    text_content: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO content_block \
+         (id, action_id, ordinal, block_type, tool_call_id, text_content) \
+         VALUES (?1, ?2, ?3, 'tool_result', ?4, ?5)",
+        (
+            Value::Text(id.to_string()),
+            Value::Text(action_id.to_string()),
+            Value::Integer(ordinal),
+            Value::Text(tool_call_id.to_string()),
+            Value::Text(text_content.to_string()),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert tool_result content_block: {e}"),
+    })?;
+    Ok(())
+}
+
+/// A raw action row plus its content blocks and structural reply parent —
+/// **including the trace types** (`tool_call` / `tool_result`) that the render
+/// views deliberately collapse out.
+///
+/// Exposed for the chat-path tests behind `AppCore::test_space_actions`: the
+/// tool loop's durable rows are invisible to `get_space_tree` by design, so
+/// asserting on them needs a view that doesn't filter. It is a plain SELECT —
+/// no production caller, and nothing here that a future Record surface
+/// couldn't reuse.
+#[derive(Debug, Clone)]
+pub struct RawActionRow {
+    pub id: String,
+    pub action_type: String,
+    pub status: String,
+    pub model: Option<String>,
+    pub credits_consumed: Option<i64>,
+    pub reply_to: Option<String>,
+    pub blocks: Vec<RawBlockRow>,
+}
+
+/// One content block of a [`RawActionRow`].
+#[derive(Debug, Clone)]
+pub struct RawBlockRow {
+    pub block_type: String,
+    pub text_content: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub data: Option<String>,
+}
+
+/// Every action in a space, oldest first, with its blocks and reply parent.
+pub async fn raw_space_actions(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Vec<RawActionRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.id, a.action_type, a.status, a.model, a.credits_consumed, \
+                    (SELECT aa.antecedent_action_id FROM action_antecedent aa \
+                      WHERE aa.action_id = a.id AND aa.relation = 'reply') \
+             FROM action a WHERE a.space_id = ?1 ORDER BY a.created_at ASC, a.id ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut out: Vec<RawActionRow> = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(RawActionRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            action_type: row.get::<String>(1).map_err(AppError::db)?,
+            status: row.get::<String>(2).map_err(AppError::db)?,
+            model: row.get::<Option<String>>(3).map_err(AppError::db)?,
+            credits_consumed: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+            reply_to: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            blocks: Vec::new(),
+        });
+    }
+    for action in out.iter_mut() {
+        let mut stmt = conn
+            .prepare(
+                "SELECT block_type, text_content, tool_name, tool_call_id, data \
+                 FROM content_block WHERE action_id = ?1 ORDER BY ordinal ASC",
+            )
+            .await
+            .map_err(AppError::db)?;
+        let mut rows = stmt
+            .query([Value::Text(action.id.clone())])
+            .await
+            .map_err(AppError::db)?;
+        while let Some(row) = rows.next().await.map_err(AppError::db)? {
+            action.blocks.push(RawBlockRow {
+                block_type: row.get::<String>(0).map_err(AppError::db)?,
+                text_content: row.get::<Option<String>>(1).map_err(AppError::db)?,
+                tool_name: row.get::<Option<String>>(2).map_err(AppError::db)?,
+                tool_call_id: row.get::<Option<String>>(3).map_err(AppError::db)?,
+                data: row.get::<Option<String>>(4).map_err(AppError::db)?,
+            });
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Layer 2 — Semantic: System prompt operations
 // ---------------------------------------------------------------------------
@@ -3155,14 +3306,20 @@ pub async fn last_action_in_space(
     conn: &Connection,
     space_id: &str,
 ) -> Result<Option<String>, AppError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id FROM action \
-             WHERE space_id = ?1 AND status IN ('complete', 'cancelled') \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .await
-        .map_err(AppError::db)?;
+    // The tail is the last **post**, not the last row. Trace actions
+    // (`tool_call` / `tool_result`) are written into a space by a tool-calling
+    // turn and can be the newest rows in it — a turn that ended at the round
+    // cap leaves a `tool_result` as the literal last action. Replying to one
+    // would give the next post a parent that no rendered view contains,
+    // orphaning it into a second thread root. Restricting to post types keeps
+    // "the space's tail" meaning what every reader means by it.
+    let sql = format!(
+        "SELECT id FROM action \
+         WHERE space_id = ?1 AND status IN ('complete', 'cancelled') \
+           AND action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY created_at DESC LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt
         .query([Value::Text(space_id.to_string())])
         .await

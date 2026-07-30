@@ -42,10 +42,29 @@
 //! | `chat` — non-2xx response, after `insert_request` | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record` | `chat_path.rs` (`non_2xx_emits_record_and_space_*`) |
 //! | `chat_stream` — non-2xx response, after `insert_request` inside that branch | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record`; `Wallet` if refund recovered | `chat_path.rs` (`streaming_non_2xx_*`, `non_2xx_with_refund_recovery_*`, `non_2xx_with_failed_refund_recovery_*`) |
 //!
+//! | `run_turn`/`run_turn_stream` — tool round persisted, then the **round cap** binds | The posted user turn; every executed round's `tool_call` + `tool_result` actions and request rows; the capped round's `tool_call` + request row (its tools are deliberately *not* executed) | `Space(id)`, `Record`; `Wallet` at each round's spend start; **error is `AppError::ToolLoop`, wrapped with the space id** | `chat_path.rs` (`round_cap_ends_the_turn_honestly_with_the_rounds_persisted`) |
+//! | `run_turn`/`run_turn_stream` — tool round persisted, then **`begin_next_round` fails** (budget exceeded / provisioning) | The posted user turn; every completed round's `tool_call` + `tool_result` actions and request rows | `Space(id)`, `Record`; `Wallet` at each round's spend start; error wraps the space id | `chat_path.rs` (`budget_exceeded_mid_loop_fails_with_the_first_round_persisted`) |
+//! | `run_turn`/`run_turn_stream` — **structurally unusable `tool_calls`** (no call id / no function name, or a present-but-non-array `tool_calls` / `delta.tool_calls`; an absent or explicitly `null` value is an ordinary no-tools completion) | The posted user turn; the round's raw request row, attached to **no action** (nothing could be written as a `tool_use` block) | `Space(id)`, `Record`; **error is `AppError::ToolLoop`**, wrapped with the space id | `chat_path.rs` (`structurally_malformed_tool_call_fails_the_turn_honestly`) |
+//!
 //! `SpaceIndex?` = emitted by `post` when the listing changed (new space /
 //! auto-title); `run_turn` never emits it. Plain `?` on intervening local-DB
 //! action/content/antecedent inserts stays *unemitted* — internal-consistency
 //! (kill-`-9`-class) failures, not durable partial state to reconcile.
+//!
+//! **Tool-calling turns add three exit points and no mid-loop emissions.**
+//! `run_turn` / `run_turn_stream` are bounded loops (at most
+//! `MAX_TURN_ROUNDS` model requests). A *successful* tool round is not an exit
+//! point: it commits `tool_call` / `tool_result` actions and a request row and
+//! then keeps going, **emitting nothing**. That is deliberate and safe —
+//! `get_space_tree` filters trace action types out of the render, so no
+//! subscriber's view of the thread is stale while the loop runs, and every
+//! terminal exit (success, non-2xx, the three rows above) emits `Space(id)` +
+//! `Record`, which covers all the rounds committed before it. The `Wallet`
+//! emission is *per round*, not per turn: the ACT protocol consumes a
+//! credential per request, so each round acquires its own hold under
+//! `spend_gate` and each `insert_pre_credential_refund` emits. `SpaceIndex` is
+//! still never emitted by a turn. A turn with an empty tool registry can only
+//! ever take one iteration, so every pre-existing row above is untouched.
 //!
 //! **Reasoning is durable, and adds no exit point.** A turn whose upstream
 //! emitted thinking (`delta.reasoning_content` / `delta.reasoning` on the
