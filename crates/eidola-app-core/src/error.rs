@@ -100,6 +100,25 @@ pub enum AppError {
     #[error("update error: {message}")]
     Update { message: String },
 
+    /// A turn's bounded tool-calling loop could not finish honestly.
+    ///
+    /// Two causes, both deliberately *not* silent truncations:
+    ///
+    /// * the round cap (`MAX_TURN_ROUNDS`) was reached while the model was
+    ///   still asking for tools — the turn produced no final answer, and
+    ///   pretending the last tool request was one would be a lie;
+    /// * the model's `tool_calls` were structurally unusable (no call id, no
+    ///   function name), so there is nothing to execute or to persist as a
+    ///   `tool_use` block.
+    ///
+    /// Everything that *did* happen up to that point (each round's `tool_call`
+    /// / `tool_result` actions and its raw request row) is committed before
+    /// this is returned, and the error is wrapped as
+    /// [`AppError::ChatFailed`] by the turn's call site like every other
+    /// post-persist failure.
+    #[error("tool loop error: {message}")]
+    ToolLoop { message: String },
+
     /// A chat failed *after* its space was persisted (or, for an existing
     /// space, after the user's turn was committed). Carries the `space_id` so
     /// a blank window's `Space` entity (id=`None` until now) can learn its
