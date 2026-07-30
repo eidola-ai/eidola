@@ -4314,6 +4314,11 @@ impl Inner {
         let mut full_reasoning = String::new();
         let mut tool_call_acc: std::collections::BTreeMap<u64, StreamingToolCall> =
             std::collections::BTreeMap::new();
+        // A structurally unusable `delta.tool_calls` (present, non-null, not an
+        // array) is stashed rather than raised inline: the SSE pump must still
+        // drain so the raw exchange is recorded on the same exit path as a
+        // malformed assembled call.
+        let mut tool_call_shape_error: Option<AppError> = None;
         let mut input_tokens: Option<i64> = None;
         let mut output_tokens: Option<i64> = None;
         let mut response_buf: Vec<u8> = Vec::new();
@@ -4401,8 +4406,23 @@ impl Inner {
                     // Tool calls stream in pieces; fold each delta into the
                     // per-index accumulator (nothing is forwarded to the
                     // caller — tool rounds are invisible pauses in v1).
-                    if let Some(deltas) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                        accumulate_tool_call_deltas(&mut tool_call_acc, deltas);
+                    // Absent/null is "no calls in this chunk"; anything
+                    // non-array is structurally unusable and fails the turn
+                    // (see `read_tool_calls`), never silently ignored.
+                    match delta.get("tool_calls") {
+                        None | Some(serde_json::Value::Null) => {}
+                        Some(serde_json::Value::Array(deltas)) => {
+                            accumulate_tool_call_deltas(&mut tool_call_acc, deltas);
+                        }
+                        Some(other) => {
+                            tool_call_shape_error.get_or_insert_with(|| AppError::ToolLoop {
+                                message: format!(
+                                    "the model streamed a `tool_calls` delta that is not an \
+                                     array ({})",
+                                    json_type_name(other)
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -4425,7 +4445,11 @@ impl Inner {
         // A tool round settles its hold here, before the next round's.
         let _ = prep.try_refund_recovery().await;
 
-        let tool_calls = match finish_streaming_tool_calls(tool_call_acc) {
+        let assembled = match tool_call_shape_error {
+            Some(e) => Err(e),
+            None => finish_streaming_tool_calls(tool_call_acc),
+        };
+        let tool_calls = match assembled {
             Ok(calls) => calls,
             Err(e) => {
                 prep.insert_unattached_request(
@@ -7075,33 +7099,112 @@ fn parse_tool_call(value: &serde_json::Value) -> Result<ParsedToolCall, AppError
     })
 }
 
-/// Read the `tool_calls` array off a blocking response's `message` object.
-/// Absent or empty ⇒ no tool round (the ordinary completion).
+/// Read a `tool_calls` value into calls, distinguishing the three shapes that
+/// matter.
+///
+/// * **Absent or `null`** ⇒ no tool round. `null` is deliberately tolerated:
+///   plenty of OpenAI-compatible servers always emit the key and spell "none"
+///   as `null`, and rejecting that would break every turn against them.
+/// * **An array** (possibly empty) ⇒ those calls; empty is likewise no round.
+/// * **Anything else** ⇒ [`AppError::ToolLoop`]. A present, non-null,
+///   non-array value is *structurally unusable* — there is no call to execute
+///   and none that could be written as a `tool_use` block — so it takes the
+///   same honest exit as a call with no id. Reading it as "the model requested
+///   no tools" would persist an often-empty completion as a successful answer,
+///   which is exactly the silent truncation the loop promises never to do.
+fn read_tool_calls(value: Option<&serde_json::Value>) -> Result<Vec<ParsedToolCall>, AppError> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(arr)) => arr.iter().map(parse_tool_call).collect(),
+        Some(other) => Err(AppError::ToolLoop {
+            message: format!(
+                "the model returned a `tool_calls` value that is not an array ({})",
+                json_type_name(other)
+            ),
+        }),
+    }
+}
+
+/// Read the `tool_calls` off a blocking response's `message` object.
 fn parse_tool_calls_blocking(
     message: Option<&serde_json::Value>,
 ) -> Result<Vec<ParsedToolCall>, AppError> {
-    let Some(arr) = message
-        .and_then(|m| m.get("tool_calls"))
-        .and_then(|v| v.as_array())
-    else {
-        return Ok(Vec::new());
-    };
-    arr.iter().map(parse_tool_call).collect()
+    read_tool_calls(message.and_then(|m| m.get("tool_calls")))
 }
+
+/// The JSON type of a value, for honest error messages.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// The tool-call keys this assembler understands. Everything else in a delta
+/// entry is a provider extension and is carried through untouched.
+const TOOL_CALL_CANONICAL_KEYS: [&str; 4] = ["index", "id", "type", "function"];
+
+/// The `function` keys this assembler understands (see above).
+const TOOL_CALL_FUNCTION_CANONICAL_KEYS: [&str; 2] = ["name", "arguments"];
 
 /// Incremental assembly state for one streamed tool call.
 ///
 /// SSE splits a tool call across chunks: the first delta typically carries the
 /// `index`, `id`, `type` and function `name`, and every later delta at the same
 /// index carries another slice of the `arguments` string. Nothing is
-/// guaranteed to arrive whole, so each field is concatenated rather than
-/// assigned.
+/// guaranteed to arrive whole, so each canonical field is concatenated rather
+/// than assigned.
+///
+/// **Provider fields are preserved too.** The blocking path replays a call
+/// object verbatim (`ParsedToolCall::raw`), so a streamed call must reach the
+/// follow-up request just as complete — otherwise a backend whose extension
+/// metadata is load-bearing works when blocking and breaks when streaming.
+/// `extra` / `function_extra` collect every non-canonical key at their level.
 #[derive(Default, Clone, Debug)]
 struct StreamingToolCall {
     id: String,
     name: String,
     arguments: String,
     call_type: String,
+    /// Non-canonical keys seen at the tool-call level.
+    extra: serde_json::Map<String, serde_json::Value>,
+    /// Non-canonical keys seen inside `function`.
+    function_extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Merge a delta's non-canonical keys into an accumulator.
+///
+/// **The rule is shallow, last-non-null-wins.** Concatenation — right for the
+/// canonical string fields, which the provider fragments deliberately — is
+/// wrong here: we have no fragmentation contract for a field we don't know,
+/// and gluing together two halves of a structured value (or two restatements
+/// of a scalar) corrupts it. Between the two assignment orders, last-wins is
+/// the one that matches how a delta stream works: later chunks refine earlier
+/// state, so the final value is the intended one, and a field sent once (the
+/// overwhelmingly common case) is identical either way.
+///
+/// Genuine per-chunk *conflicts* are deliberately not reconciled or reported:
+/// with no schema for an unknown field we cannot tell a refinement from a
+/// contradiction, and inventing a policy would be guessing. `null` values are
+/// skipped so an explicit "unset" never erases a real earlier value.
+fn merge_extra_fields(
+    into: &mut serde_json::Map<String, serde_json::Value>,
+    source: Option<&serde_json::Value>,
+    canonical: &[&str],
+) {
+    let Some(obj) = source.and_then(|v| v.as_object()) else {
+        return;
+    };
+    for (key, value) in obj {
+        if canonical.contains(&key.as_str()) || value.is_null() {
+            continue;
+        }
+        into.insert(key.clone(), value.clone());
+    }
 }
 
 /// Fold one streamed `delta.tool_calls` array into the per-index accumulator.
@@ -7124,6 +7227,7 @@ fn accumulate_tool_call_deltas(
         if let Some(t) = d.get("type").and_then(|v| v.as_str()) {
             entry.call_type.push_str(t);
         }
+        merge_extra_fields(&mut entry.extra, Some(d), &TOOL_CALL_CANONICAL_KEYS);
         if let Some(f) = d.get("function") {
             if let Some(name) = f.get("name").and_then(|v| v.as_str()) {
                 entry.name.push_str(name);
@@ -7131,26 +7235,45 @@ fn accumulate_tool_call_deltas(
             if let Some(args) = f.get("arguments").and_then(|v| v.as_str()) {
                 entry.arguments.push_str(args);
             }
+            merge_extra_fields(
+                &mut entry.function_extra,
+                Some(f),
+                &TOOL_CALL_FUNCTION_CANONICAL_KEYS,
+            );
         }
     }
 }
 
 /// Finalize the streamed accumulator into [`ParsedToolCall`]s, in index order.
+///
+/// The rebuilt object carries the accumulated provider fields alongside the
+/// canonical ones, so the follow-up request replays a streamed call as
+/// completely as the blocking path replays a whole one. `index` is
+/// deliberately *not* replayed: it is the SSE fragment key, not part of the
+/// call — a non-streaming `tool_calls` entry has no such field.
 fn finish_streaming_tool_calls(
     acc: std::collections::BTreeMap<u64, StreamingToolCall>,
 ) -> Result<Vec<ParsedToolCall>, AppError> {
     acc.into_values()
         .map(|c| {
             let call_type = if c.call_type.is_empty() {
-                "function".to_string()
+                serde_json::Value::String("function".to_string())
             } else {
-                c.call_type
+                serde_json::Value::String(c.call_type)
             };
-            parse_tool_call(&serde_json::json!({
-                "id": c.id,
-                "type": call_type,
-                "function": { "name": c.name, "arguments": c.arguments },
-            }))
+            // Provider fields first, canonical fields last: the canonical keys
+            // are excluded from `extra` by construction, but writing them last
+            // makes the precedence explicit rather than incidental.
+            let mut function = c.function_extra;
+            function.insert("name".into(), serde_json::Value::String(c.name));
+            function.insert("arguments".into(), serde_json::Value::String(c.arguments));
+
+            let mut object = c.extra;
+            object.insert("id".into(), serde_json::Value::String(c.id));
+            object.insert("type".into(), call_type);
+            object.insert("function".into(), serde_json::Value::Object(function));
+
+            parse_tool_call(&serde_json::Value::Object(object))
         })
         .collect()
 }
@@ -8813,6 +8936,109 @@ mod tests {
     /// Strip-on-receipt removes a leading header-shaped line (and the blank
     /// line under it) — but leaves ordinary content, including markdown
     /// headings, untouched.
+    // --- tool-call shape + streamed provider-field preservation ----------
+
+    #[test]
+    fn absent_or_null_tool_calls_read_as_no_tool_round() {
+        assert!(read_tool_calls(None).unwrap().is_empty());
+        assert!(
+            read_tool_calls(Some(&serde_json::Value::Null))
+                .unwrap()
+                .is_empty(),
+            "an explicit null means `no tools`, which plenty of \
+             OpenAI-compatible servers always spell out"
+        );
+        assert!(
+            read_tool_calls(Some(&serde_json::json!([])))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn non_array_tool_calls_is_structurally_unusable() {
+        // Present, non-null and not an array: there is no call to execute and
+        // none that could be written as a `tool_use` block, so this must fail
+        // rather than read as "the model requested no tools" (which would
+        // persist an empty completion as a successful answer).
+        for bad in [
+            serde_json::json!({ "id": "call_1" }),
+            serde_json::json!("nope"),
+            serde_json::json!(7),
+            serde_json::json!(true),
+        ] {
+            let err = read_tool_calls(Some(&bad)).expect_err("must be rejected");
+            assert!(
+                matches!(err, AppError::ToolLoop { .. }),
+                "expected ToolLoop for {bad}, got {err:?}"
+            );
+        }
+    }
+
+    /// A streamed call must reach the follow-up request as complete as a
+    /// blocking one — the blocking path replays the object verbatim, so a
+    /// backend whose extension metadata is load-bearing must not work when
+    /// blocking and break when streaming.
+    #[test]
+    fn streamed_tool_calls_carry_provider_fields_through_reassembly() {
+        let mut acc = std::collections::BTreeMap::new();
+        accumulate_tool_call_deltas(
+            &mut acc,
+            &[serde_json::json!({
+                "index": 0, "id": "call_", "type": "func",
+                "provider_tag": "alpha", "trace": { "span": "s1" },
+                "function": { "name": "ec", "cache_key": "k1" }
+            })],
+        );
+        accumulate_tool_call_deltas(
+            &mut acc,
+            &[serde_json::json!({
+                "index": 0, "id": "1", "type": "tion",
+                "provider_tag": "beta",
+                "function": { "name": "ho", "arguments": "{}", "cache_key": "k2" }
+            })],
+        );
+        let calls = finish_streaming_tool_calls(acc).expect("assembles");
+        assert_eq!(calls.len(), 1);
+        let raw = &calls[0].raw;
+
+        // Canonical fields concatenate (they are fragmented on purpose).
+        assert_eq!(raw["id"], "call_1");
+        assert_eq!(raw["type"], "function");
+        assert_eq!(raw["function"]["name"], "echo");
+        assert_eq!(raw["function"]["arguments"], "{}");
+
+        // Provider fields survive, structured values intact…
+        assert_eq!(raw["trace"]["span"], "s1");
+        // …and a restated one takes the latest value at both levels:
+        // concatenating an unknown field would corrupt it, and later chunks
+        // refine earlier state, so last-wins is the honest rule.
+        assert_eq!(raw["provider_tag"], "beta");
+        assert_eq!(raw["function"]["cache_key"], "k2");
+
+        // `index` is the SSE fragment key, not part of the call — a
+        // non-streaming `tool_calls` entry has no such field.
+        assert!(raw.get("index").is_none(), "got {raw}");
+    }
+
+    #[test]
+    fn a_null_provider_field_never_erases_an_earlier_value() {
+        let mut acc = std::collections::BTreeMap::new();
+        accumulate_tool_call_deltas(
+            &mut acc,
+            &[serde_json::json!({
+                "index": 0, "id": "c1", "provider_tag": "alpha",
+                "function": { "name": "echo", "arguments": "{}" }
+            })],
+        );
+        accumulate_tool_call_deltas(
+            &mut acc,
+            &[serde_json::json!({ "index": 0, "provider_tag": null })],
+        );
+        let calls = finish_streaming_tool_calls(acc).expect("assembles");
+        assert_eq!(calls[0].raw["provider_tag"], "alpha");
+    }
+
     #[test]
     fn strip_leading_header_removes_only_header_shaped_lines() {
         assert_eq!(
