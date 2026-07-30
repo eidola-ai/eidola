@@ -7,3 +7,11 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Contract fidelity, not convenience: the pricing contract's *walk* (which
+# parts of a chat-completion request count, and how each is measured) must be
+# one implementation, or the client and server drift. Both consumers already
+# carry serde_json 1 — this adds no code, trust, or compile time to any
+# binary. Declared featureless on purpose: see `json_text_bytes` on why
+# `preserve_order` cannot skew the measure, and the crate docs for the rule
+# that governs any future dependency here.
+serde_json = { version = "1", default-features = false, features = ["std"] }

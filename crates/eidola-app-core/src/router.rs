@@ -486,7 +486,10 @@ impl Inner {
         let auth_value = match pricing {
             None => external_auth,
             Some(pricing) => {
-                let charge = estimate_charge_credits(&messages, MAX_COMPLETION_TOKENS, pricing);
+                // A router call advertises no tools, so the tool-schema term
+                // of the pricing contract is the empty slice.
+                let charge =
+                    estimate_charge_credits(&messages, &[], MAX_COMPLETION_TOKENS, pricing);
                 if charge == 0 {
                     return Err(AppError::Credential {
                         message: "computed router charge is zero — model pricing may be missing"
