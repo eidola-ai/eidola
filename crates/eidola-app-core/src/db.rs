@@ -2932,6 +2932,33 @@ pub async fn insert_context_assembly_action(
     Ok(())
 }
 
+/// The actions an inference's context assembly records, in `position` order —
+/// the ordered composition of the prompt that produced it.
+pub async fn context_assembly_actions(
+    conn: &Connection,
+    inference_action_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT caa.action_id \
+             FROM context_assembly ca \
+             JOIN context_assembly_action caa ON caa.context_assembly_id = ca.id \
+             WHERE ca.action_id = ?1 \
+             ORDER BY caa.position ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(inference_action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(out)
+}
+
 /// One tool-payload content block of a **trace** action recorded in some
 /// inference's context assembly — the rows a later turn of the same
 /// participant replays as its own first-person memory (task 33).
