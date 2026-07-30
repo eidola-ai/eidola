@@ -85,29 +85,22 @@ fn json_text_bytes(value: &serde_json::Value) -> u64 {
 ///
 /// The inputs are gathered through [`eidola_common::PromptCharge`], which
 /// defines *what counts*: every message (its per-message allowance plus its
-/// `content` bytes), every assistant `tool_calls` entry (function name plus
-/// raw `arguments`), and every advertised `tools` entry (its compact JSON
-/// serialization). The client walks its own request shape through the same
-/// API and must arrive at the same numbers — the tripwire is
+/// `content` bytes), every assistant `tool_calls` entry (its compact JSON
+/// serialization), and every advertised `tools` entry (likewise). The client
+/// walks its own request shape through the same API and must arrive at the
+/// same numbers — the tripwire is
 /// `client_and_server_prompt_terms_agree` below.
 fn chargeable_prompt_tokens_for(request: &ChatCompletionRequest) -> u64 {
     let mut charge = eidola_common::PromptCharge::new();
 
     for message in &request.messages {
         charge.add_message(message.content_byte_len() as u64);
-        // Tool calls the client replayed verbatim: the model reads the
-        // function name and the raw argument payload, so both are charged.
         for call in message.tool_calls.iter().flatten() {
-            let function = call.get("function");
-            let name = function
-                .and_then(|f| f.get("name"))
-                .map(json_text_bytes)
-                .unwrap_or(0);
-            let arguments = function
-                .and_then(|f| f.get("arguments"))
-                .map(json_text_bytes)
-                .unwrap_or(0);
-            charge.add_tool_call(name, arguments);
+            // The *whole* entry: the proxy forwards it verbatim (id, type
+            // and provider extensions included) and cannot know which of
+            // those fields the upstream chat template renders into the
+            // prompt, so it charges what it forwards.
+            charge.add_tool_call(json_text_bytes(call));
         }
     }
 
@@ -957,7 +950,7 @@ mod tests {
     /// `cross_crate_tool_round_fixture` (the arithmetic), and in
     /// `eidola-app-core`'s `prompt_charge_matches_the_shared_contract_fixture`
     /// (the client's walk over its `serde_json::Value` messages). All three
-    /// must produce 180 chargeable prompt tokens; change one and the other
+    /// must produce 230 chargeable prompt tokens; change one and the other
     /// two fail.
     const TOOL_ROUND_FIXTURE: &str = r#"{
         "model": "test-model",
@@ -982,12 +975,17 @@ mod tests {
     fn tool_round_fixture_charges_the_pinned_contract_value() {
         let req: ChatCompletionRequest = serde_json::from_str(TOOL_ROUND_FIXTURE).unwrap();
         // Content bytes: 12 ("what is 2+2?") + 0 (null) + 1 ("4") = 13.
-        // Tool call:     4 ("calc") + 14 ("{\"expr\":\"2+2\"}")   = 18.
+        // Tool call:     93 (the whole entry, compact JSON).
         // Tool schema:   154 (compact JSON).
-        // ceil(185*2/3) + 8*3 + 32 = 124 + 24 + 32 = 180.
+        // ceil(260*2/3) + 8*3 + 32 = 174 + 24 + 32 = 230.
+        let call_bytes = json_text_bytes(&req.messages[1].tool_calls.as_ref().unwrap()[0]);
+        assert_eq!(
+            call_bytes, 93,
+            "the fixture's call entry must stay 93 bytes"
+        );
         let tool_bytes = json_text_bytes(&req.tools.as_ref().unwrap()[0]);
         assert_eq!(tool_bytes, 154, "the fixture's schema must stay 154 bytes");
-        assert_eq!(chargeable_prompt_tokens_for(&req), 180);
+        assert_eq!(chargeable_prompt_tokens_for(&req), 230);
     }
 
     #[test]
@@ -1008,10 +1006,54 @@ mod tests {
         }))
         .unwrap();
 
-        // 4 name bytes + 14 argument bytes ⇒ ceil(18*2/3) = 12 more tokens.
+        // The whole 88-byte entry ⇒ ceil(88*2/3) = 59 more tokens.
         assert_eq!(
             chargeable_prompt_tokens_for(&with_call) - chargeable_prompt_tokens_for(&without),
-            12
+            59
+        );
+    }
+
+    #[test]
+    fn tool_call_framing_bytes_are_charged() {
+        // The proxy forwards the *whole* call entry upstream, and the chat
+        // template — which the proxy cannot see — decides what it renders
+        // into the prompt. Mistral's renders the call id; Qwen's and
+        // Llama's don't. Charging only `function.{name,arguments}` would let
+        // the id, the `type`, and any provider extension ride free while
+        // still counting toward upstream `prompt_tokens`, which the clamp
+        // then discards. So the whole entry is measured.
+        let with_long_id = |id: &str| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                    {"id": id, "type": "function",
+                     "function": {"name": "calc", "arguments": "{}"}}
+                ]}],
+            }))
+            .unwrap()
+        };
+
+        let short = with_long_id("c");
+        let realistic = with_long_id("call_9tK2mQz7Xb4LpR1vN8sYcE0d");
+        assert!(
+            chargeable_prompt_tokens_for(&realistic) > chargeable_prompt_tokens_for(&short),
+            "a longer call id is more forwarded bytes and must cost more"
+        );
+
+        // A provider extension field on the entry counts too — it is
+        // forwarded verbatim by the same pass-through rule.
+        let with_extension: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c", "type": "function",
+                 "function": {"name": "calc", "arguments": "{}"},
+                 "provider_extra": {"trace": "0123456789abcdef"}}
+            ]}],
+        }))
+        .unwrap();
+        assert!(
+            chargeable_prompt_tokens_for(&with_extension) > chargeable_prompt_tokens_for(&short),
+            "a forwarded provider extension must not ride free"
         );
     }
 
@@ -1079,7 +1121,7 @@ mod tests {
         let req: ChatCompletionRequest = serde_json::from_str(TOOL_ROUND_FIXTURE).unwrap();
         let model = test_model();
         let chargeable = chargeable_prompt_tokens_for(&req);
-        assert_eq!(chargeable, 180);
+        assert_eq!(chargeable, 230);
 
         // Upstream reports 150 real prompt tokens — above a content-only
         // ceiling (13 bytes ⇒ ceil(26/3) + 24 + 32 = 65), below the extended
