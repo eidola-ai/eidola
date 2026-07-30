@@ -779,6 +779,14 @@
           },
           "role": {
             "$ref": "#/components/schemas/Role"
+          },
+          "tool_calls": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {},
+            "description": "Tool calls the model asked for. Relayed to the client **verbatim**\n(raw `Value`s) so the ids and any provider extension fields survive —\nthe client replays these objects unchanged on its follow-up request,\nand a narrower struct here would silently drop what it doesn't model,\nexactly the defect the `reasoning*` fields above were added to fix."
           }
         }
       },
@@ -1008,6 +1016,17 @@
             "format": "float",
             "description": "Sampling temperature between 0 and 2."
           },
+          "tool_choice": {
+            "description": "How the model should choose among `tools` (`\"none\"` / `\"auto\"` /\n`\"required\"`, or a `{\"type\":\"function\", …}` object). Opaque\npass-through for the same reason as [`Self::tools`]."
+          },
+          "tools": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {},
+            "description": "Tool (function) definitions the model may call.\n\n**Opaque pass-through.** Each entry is forwarded upstream verbatim:\nthe server never executes a tool and has no reason to understand the\nJSON Schema inside `function.parameters`, while modelling it would\nmean rejecting (via this struct's `deny_unknown_fields`) every\nprovider extension a client legitimately sends. Keeping the entries\nas raw `Value`s is also what lets the pricing contract measure\nexactly the bytes that go on the wire — see\n`handlers::chargeable_prompt_tokens_for`."
+          },
           "top_p": {
             "type": [
               "number",
@@ -1190,6 +1209,14 @@
                 "$ref": "#/components/schemas/Role"
               }
             ]
+          },
+          "tool_calls": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {},
+            "description": "Streamed tool-call deltas, relayed **verbatim** as raw `Value`s.\n\nNothing about a streamed tool call is guaranteed to arrive whole: the\nid, the function name and the `arguments` string all arrive in\nfragments keyed by the entry's `index`, and the client reassembles\nthem. The proxy therefore must not model, reorder, or normalize these\nentries — including the streaming-only `index` framing key, which the\nclient's accumulator needs. Same rule as `reasoning*` above: a field\nthis struct does not name is dropped on re-serialization."
           }
         }
       },
@@ -1438,7 +1465,8 @@
         "enum": [
           "stop",
           "length",
-          "content_filter"
+          "content_filter",
+          "tool_calls"
         ]
       },
       "GetAccountResponse": {
@@ -1661,13 +1689,19 @@
         "type": "object",
         "description": "A message in the conversation.",
         "required": [
-          "role",
-          "content"
+          "role"
         ],
         "properties": {
           "content": {
-            "$ref": "#/components/schemas/MessageContent",
-            "description": "The content of the message."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MessageContent",
+                "description": "The content of the message.\n\nNullable since tool calling: an assistant message that only called\ntools carries `\"content\": null`. The key is deliberately **always\nserialized** (no `skip_serializing_if`) — several chat templates\nrequire it to exist, and clients send the explicit `null` for that\nreason, so dropping it on the way upstream would change the request."
+              }
+            ]
           },
           "name": {
             "type": [
@@ -1679,6 +1713,21 @@
           "role": {
             "$ref": "#/components/schemas/Role",
             "description": "The role of the message author."
+          },
+          "tool_call_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The id of the tool call this message answers (`role: \"tool\"` only)."
+          },
+          "tool_calls": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {},
+            "description": "Tool calls the assistant made, replayed by the client verbatim on the\nfollow-up request.\n\n**Opaque pass-through**, like [`ChatCompletionRequest::tools`]: the\nclient is required to replay the provider's own call objects\nunchanged (ids and any provider extension fields intact), so the\nserver must not normalize them through a narrower struct."
           }
         },
         "additionalProperties": false
@@ -1956,7 +2005,8 @@
         "enum": [
           "system",
           "user",
-          "assistant"
+          "assistant",
+          "tool"
         ]
       },
       "ScaledPrice": {
