@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod local_models;
+pub mod tools;
 pub mod trust_root;
 pub mod updater;
 pub mod updates;
@@ -919,6 +920,13 @@ struct Inner {
     /// pool), or waits bounded for an in-flight refund. Held only around the
     /// provisioning step in `prepare_turn`; the HTTP request runs outside it.
     spend_gate: tokio::sync::Mutex<()>,
+    /// The tool registry a turn's bounded tool-calling loop runs (see
+    /// [`tools`]). **Empty by default**, which is what keeps every request
+    /// byte-identical to the pre-tools shape: `prepare_turn` snapshots this
+    /// once per turn, and `TurnPrep::request_body` omits the `tools` field
+    /// entirely when the snapshot is empty. Consumers register through
+    /// [`AppCore::register_tool`]; tasks 21/22 plug in here.
+    tools: std::sync::RwLock<tools::ToolRegistry>,
     /// Test-only HTTP client override. When `Some`, [`Inner::build_client`]
     /// returns a clone of this client *instead of* constructing the
     /// attesting client, letting integration tests drive `chat`/`chat_stream`
@@ -3505,6 +3513,14 @@ impl Inner {
                 (item_id, Some(target_action_id.to_string()), reply_to)
             }
         };
+        // Where a tool round's trace attaches. Tool traces hang off the post
+        // the turn answers (or the trace they follow), deliberately NOT off
+        // the inference: the inference may never exist (a round-cap or
+        // budget exit ends the turn without one), and `get_space_tree` filters
+        // trace action types out of the render, so a trace chain hanging from
+        // a post simply disappears from the thread while staying fully
+        // resolvable in the Record.
+        let inf_reply_to_for_trace = inf_reply_to.clone();
 
         // Assemble the **upstream thread** of this turn, each item at its most
         // recent version (`get_upstream_context`): a Reply walks from the post
@@ -3557,6 +3573,25 @@ impl Inner {
             },
         );
 
+        // The OpenAI messages array — built *before* the charge estimate so
+        // both the estimate and the wire request read one array. Rounds 2+ of
+        // a tool loop append to exactly this vector, which is what keeps their
+        // holds computed over the same bytes the request carries.
+        let messages: Vec<serde_json::Value> = prior_messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
+
+        // Snapshot the tool registry for this turn (see `tools`). An empty
+        // registry sends no `tools` field at all, so today's requests stay
+        // byte-identical.
+        let tool_registry = Arc::new(
+            self.tools
+                .read()
+                .expect("tool registry lock poisoned")
+                .clone(),
+        );
+
         // The spend side runs only for eidola turns. Local and external
         // turns carry no charge estimate, no credential, and no ACT header
         // (an openai backend's bearer key rides in `external_auth` instead)
@@ -3564,135 +3599,24 @@ impl Inner {
         // onboarding.
         let (charge_credits, spend, auth_value) = match remote_pricing {
             None => (0u128, None, external_auth),
-            Some((prompt_rate, completion_rate, sf)) => {
-                // Estimate the charge from the assembled context. The prompt
-                // side is the shared client/server pricing contract
-                // (`eidola_common::chargeable_prompt_tokens`): a content-byte
-                // term at the safe cost factor plus per-message and
-                // per-request constants. The server computes the identical
-                // function of the identical `messages` array as its
-                // pre-flight minimum and clamps its charged prompt tokens to
-                // it, so this hold covers the server's charge by
-                // construction.
-                let total_content_bytes: u64 =
-                    prior_messages.iter().map(|m| m.content.len() as u64).sum();
-                let chargeable_prompt = eidola_common::chargeable_prompt_tokens(
-                    total_content_bytes,
-                    prior_messages.len() as u64,
-                );
-
-                let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
-                let completion_credits =
-                    (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
-                let charge_credits = prompt_credits + completion_credits;
-
+            Some(pricing) => {
+                let charge_credits =
+                    estimate_charge_credits(&messages, max_completion_tokens, pricing);
                 if charge_credits == 0 {
                     return Err(wrap(AppError::Credential {
                         message: "computed charge is zero — model pricing may be missing".into(),
                     }));
                 }
-
-                // Spend budget ceiling for this turn.
-                if let Some(b) = budget
-                    && charge_credits as i64 > b
-                {
-                    return Err(wrap(AppError::Credential {
-                        message: format!(
-                            "estimated charge {charge_credits} exceeds the turn budget {b}"
-                        ),
-                    }));
-                }
-
-                // ACT provisioning queue: serialize acquire → spend-proof →
-                // flip-to-`spending` across concurrent turns so two turns fired
-                // at once can never both spend the same credential. The gate is
-                // held only through `insert_pre_credential_refund` below (the
-                // point the credential becomes `spending`); the HTTP request
-                // runs after `prepare_turn` returns, outside the gate.
-                let _spend_guard = self.spend_gate.lock().await;
-                let cred = self
-                    .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
+                // Spend budget ceiling — checked *per round*, so a tool loop's
+                // later rounds re-check it against their own (grown) estimate.
+                check_turn_budget(charge_credits, budget).map_err(wrap)?;
+                let (spend, auth_value) = self
+                    .acquire_spend(&cfg, &db_conn, charge_credits, now)
                     .await
                     .map_err(wrap)?;
-
-                let credit_token =
-                    CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
-                        message: format!("failed to decode credential: {e}"),
-                    })?;
-                let public_key = PublicKey::from_cbor(&cred.public_key_data).map_err(|e| {
-                    AppError::Credential {
-                        message: format!("failed to decode public key: {e}"),
-                    }
-                })?;
-
-                let params = params_from_domain_separator(cfg.domain_separator())?;
-
-                let charge_scalar =
-                    credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
-                        message: format!("invalid charge amount: {e:?}"),
-                    })?;
-                let (spend_proof, pre_refund) = credit_token
-                    .prove_spend::<128>(&params, charge_scalar, OsRng)
-                    .map_err(|e| AppError::Credential {
-                        message: format!("failed to create spend proof: {e:?}"),
-                    })?;
-
-                let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
-                    message: format!("failed to encode pre_refund: {e}"),
-                })?;
-                let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
-                    message: format!("failed to encode spend proof: {e}"),
-                })?;
-                let pre_cred_id = Uuid::now_v7().to_string();
-                db::insert_pre_credential_refund(
-                    &db_conn,
-                    &pre_cred_id,
-                    &cred.nonce,
-                    &cred.issuer_key_id,
-                    &pre_refund_cbor,
-                    charge_credits as i64,
-                    &spend_proof_cbor,
-                    now,
-                )
-                .await?;
-                // Credential flipped to "spending" — wallet state changed
-                // regardless of whether the rest of the operation succeeds.
-                self.bus.emit(Change::Wallet);
-
-                let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
-                let challenge_digest = compute_challenge_digest();
-
-                let mut token_bytes = Vec::new();
-                token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
-                token_bytes.extend_from_slice(&challenge_digest);
-                token_bytes.extend_from_slice(&issuer_key_hash);
-                token_bytes.extend_from_slice(&spend_proof_cbor);
-
-                let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
-                let auth_value = format!("PrivateToken token=\"{token_b64}\"");
-
-                (
-                    charge_credits,
-                    Some(SpendPrep {
-                        cred,
-                        public_key,
-                        params,
-                        spend_proof,
-                        pre_refund,
-                        pre_cred_id,
-                    }),
-                    Some(auth_value),
-                )
+                (charge_credits, Some(spend), Some(auth_value))
             }
         };
-
-        // Build the messages array from the assembled context. The posted user
-        // turn is already part of it (post persisted it); the agent's response
-        // is appended as a new action at persist time.
-        let messages: Vec<serde_json::Value> = prior_messages
-            .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
-            .collect();
 
         Ok(TurnPrep {
             db_conn,
@@ -3714,23 +3638,173 @@ impl Inner {
             inf_supersedes,
             inf_reply_to,
             context_rows,
+            trace_action_ids: Vec::new(),
+            trace_reply_to: inf_reply_to_for_trace,
             messages,
+            tools: tool_registry,
+            remote_pricing,
+            budget,
             charge_credits,
+            total_credits: charge_credits,
             spend,
             auth_value,
         })
     }
 
-    /// `Reply` → a new child item replying to the target; `Revise` → a new
-    /// generation of the target's item (regenerate / agent edit). `budget`, if
-    /// set, caps the estimated charge for this turn — the spend ceiling a future
-    /// multi-inference agent loop will check per iteration.
+    /// Acquire the credential spend for one request: the ACT provisioning
+    /// queue's acquire → spend-proof → flip-to-`spending` step, plus the
+    /// `Authorization` header value it produces.
     ///
-    /// v1 drives a single inference, shaped as one turn so the tool loop slots
-    /// in later as additional actions in the same chain. Preparation and
-    /// persistence are shared with the streaming twin (`prepare_turn` /
-    /// [`TurnPrep::persist_turn`]); this transport reads one JSON body and
-    /// takes the inline-refund fast path.
+    /// Factored out of `prepare_turn` because a tool loop needs it **once per
+    /// round**: the ACT protocol consumes a credential per request (the spend
+    /// proof is bound to that credential and that charge, and the server
+    /// answers with a refund that mints its successor), so a hold cannot be
+    /// reused across rounds — each round acquires its own. The `spend_gate`
+    /// discipline therefore applies per round too, which is exactly what this
+    /// keeps intact.
+    ///
+    /// Emits `Change::Wallet` after `insert_pre_credential_refund` — the
+    /// credential is in `spending` state from that instant regardless of
+    /// whether the rest of the round succeeds.
+    async fn acquire_spend(
+        &self,
+        cfg: &Config,
+        db_conn: &turso::Connection,
+        charge_credits: u128,
+        now: i64,
+    ) -> Result<(SpendPrep, String), AppError> {
+        // ACT provisioning queue: serialize acquire → spend-proof →
+        // flip-to-`spending` across concurrent turns so two turns fired at
+        // once can never both spend the same credential. The gate is held only
+        // through `insert_pre_credential_refund` below (the point the
+        // credential becomes `spending`); the HTTP request runs outside it.
+        let _spend_guard = self.spend_gate.lock().await;
+        let cred = self
+            .ensure_spendable_credential(cfg, db_conn, charge_credits as i64)
+            .await?;
+
+        let credit_token =
+            CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
+                message: format!("failed to decode credential: {e}"),
+            })?;
+        let public_key =
+            PublicKey::from_cbor(&cred.public_key_data).map_err(|e| AppError::Credential {
+                message: format!("failed to decode public key: {e}"),
+            })?;
+
+        let params = params_from_domain_separator(cfg.domain_separator())?;
+
+        let charge_scalar =
+            credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
+                message: format!("invalid charge amount: {e:?}"),
+            })?;
+        let (spend_proof, pre_refund) = credit_token
+            .prove_spend::<128>(&params, charge_scalar, OsRng)
+            .map_err(|e| AppError::Credential {
+                message: format!("failed to create spend proof: {e:?}"),
+            })?;
+
+        let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode pre_refund: {e}"),
+        })?;
+        let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode spend proof: {e}"),
+        })?;
+        let pre_cred_id = Uuid::now_v7().to_string();
+        db::insert_pre_credential_refund(
+            db_conn,
+            &pre_cred_id,
+            &cred.nonce,
+            &cred.issuer_key_id,
+            &pre_refund_cbor,
+            charge_credits as i64,
+            &spend_proof_cbor,
+            now,
+        )
+        .await?;
+        // Credential flipped to "spending" — wallet state changed regardless
+        // of whether the rest of the operation succeeds.
+        self.bus.emit(Change::Wallet);
+
+        let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
+        let challenge_digest = compute_challenge_digest();
+
+        let mut token_bytes = Vec::new();
+        token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+        token_bytes.extend_from_slice(&challenge_digest);
+        token_bytes.extend_from_slice(&issuer_key_hash);
+        token_bytes.extend_from_slice(&spend_proof_cbor);
+
+        let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
+        let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+
+        Ok((
+            SpendPrep {
+                cred,
+                public_key,
+                params,
+                spend_proof,
+                pre_refund,
+                pre_cred_id,
+            },
+            auth_value,
+        ))
+    }
+
+    /// Begin the next round of a turn's tool loop: re-estimate the charge over
+    /// the **grown** messages array, re-check the per-turn `budget` against it,
+    /// and acquire a fresh hold (see [`Inner::acquire_spend`] for why a hold
+    /// cannot be reused).
+    ///
+    /// Non-spend turns (local / llamacpp / openai backends) fall through
+    /// untouched — they have no pricing, so a round costs nothing to start.
+    async fn begin_next_round(&self, prep: &mut TurnPrep) -> Result<(), AppError> {
+        let Some(pricing) = prep.remote_pricing else {
+            return Ok(());
+        };
+        let cfg = self.load_config();
+        let charge_credits =
+            estimate_charge_credits(&prep.messages, prep.max_completion_tokens, pricing);
+        if charge_credits == 0 {
+            return Err(AppError::Credential {
+                message: "computed charge is zero — model pricing may be missing".into(),
+            });
+        }
+        check_turn_budget(charge_credits, prep.budget)?;
+        let (spend, auth_value) = self
+            .acquire_spend(&cfg, &prep.db_conn, charge_credits, prep.now)
+            .await?;
+        prep.charge_credits = charge_credits;
+        prep.total_credits += charge_credits;
+        prep.spend = Some(spend);
+        prep.auth_value = Some(auth_value);
+        Ok(())
+    }
+
+    /// `Reply` → a new child item replying to the target; `Revise` → a new
+    /// generation of the target's item (regenerate / agent edit).
+    ///
+    /// **The turn is a bounded agentic loop.** Each iteration is one HTTP
+    /// request: the model either answers (the loop ends, persisting the
+    /// `inference`) or asks for tools (the round is persisted as a
+    /// `tool_call` / `tool_result` pair, the results are appended to the
+    /// messages array, and the next round runs). At most
+    /// [`MAX_TURN_ROUNDS`] requests are issued; reaching the cap with the model
+    /// still asking for tools ends the turn with [`AppError::ToolLoop`] rather
+    /// than passing off a tool request as an answer. A turn with an empty tool
+    /// registry can only ever take one iteration, so nothing about the
+    /// single-inference path changes.
+    ///
+    /// `budget`, if set, caps the estimated charge of **each round** — a later
+    /// round re-estimates over the grown messages array and re-checks it (the
+    /// "ceiling a multi-inference agent loop checks per iteration" the
+    /// parameter was introduced for). Each round also acquires its own ACT
+    /// hold: the protocol consumes a credential per request, so holds cannot be
+    /// reused (see [`Inner::acquire_spend`]).
+    ///
+    /// Preparation and persistence are shared with the streaming twin
+    /// (`prepare_turn` / [`TurnPrep::persist_turn`]); this transport reads one
+    /// JSON body per round and takes the inline-refund fast path.
     async fn run_turn(
         &self,
         space_id: &str,
@@ -3743,10 +3817,55 @@ impl Inner {
         // runs, so every setup failure inside it — client build, `/v1/models`
         // fetch, attestation flush, all *before* the turn's own `wrap` closure
         // — must still carry the space id for blank-space adoption / Retry.
-        let mut prep = self
-            .prepare_turn(space_id, selector, target_action_id, mode, budget)
-            .await
-            .map_err(|e| e.into_chat_failed(space_id))?;
+        // Boxed: `prepare_turn` is a large future (client construction, catalog
+        // fetch, context assembly, credential spend) and the turn loop holds it
+        // live across the whole round. Keeping it on the heap keeps the turn's
+        // own state machine — already the largest in the crate — off the worker
+        // stack.
+        let mut prep =
+            Box::pin(self.prepare_turn(space_id, selector, target_action_id, mode, budget))
+                .await
+                .map_err(|e| e.into_chat_failed(space_id))?;
+
+        // One iteration per model request. `run_turn_round` is boxed: the
+        // per-round future (request, SSE-free body read, refund, persistence)
+        // is by far the largest state machine in the crate, and keeping it on
+        // the heap keeps the turn off the worker stack.
+        for round in 1..=MAX_TURN_ROUNDS {
+            match Box::pin(self.run_turn_round(&mut prep, round)).await? {
+                RoundOutcome::Final(result) => return Ok(result),
+                RoundOutcome::ToolRound => continue,
+            }
+        }
+
+        // Unreachable: the last round either returns a final result or exits
+        // with `AppError::ToolLoop` (the `round == MAX_TURN_ROUNDS` guard), so
+        // the loop never runs out.
+        unreachable!("the tool loop returns on its last round")
+    }
+
+    /// One round of the blocking turn loop: send the request, read the JSON
+    /// body, settle the refund, and either persist the round as a tool round
+    /// (returning [`RoundOutcome::ToolRound`] once the next round's hold is in
+    /// place) or persist the `inference` and finish.
+    ///
+    /// Emissions stay here, at the transport's exit points — extracting the
+    /// round from `run_turn` moved the code, not the contract.
+    async fn run_turn_round(
+        &self,
+        prep: &mut TurnPrep,
+        round: usize,
+    ) -> Result<RoundOutcome, AppError> {
+        // `post` already emitted the user turn's `Space(id)` + `SpaceIndex`
+        // before this turn began. On an error exit we re-signal the space so
+        // subscribers refresh (idempotent); `SpaceIndex` is not re-emitted
+        // here — the listing changes (new space / auto-title) were post's, and
+        // a failed request doesn't add an item. Call before any error exit
+        // between here and the request-row insert.
+        let space_for_emit = prep.space_id.clone();
+        let emit_user_turn = || {
+            self.bus.emit(Change::Space(space_for_emit.clone()));
+        };
 
         let request_body_json = prep.request_body(false);
         let request_at = now_ms();
@@ -3763,17 +3882,6 @@ impl Inner {
         }
         let chat_result = request.send().await;
         let response_at = now_ms();
-
-        // `post` already emitted the user turn's `Space(id)` + `SpaceIndex`
-        // before this turn began. On a run_turn error exit we re-signal the
-        // space so subscribers refresh (idempotent); `SpaceIndex` is not
-        // re-emitted here — the listing changes (new space / auto-title) were
-        // post's, and a failed request doesn't add an item. Call before any
-        // error exit between here and the request-row insert.
-        let space_for_emit = prep.space_id.clone();
-        let emit_user_turn = || {
-            self.bus.emit(Change::Space(space_for_emit.clone()));
-        };
 
         let (status, response_text, body) = match chat_result {
             Ok(resp) => {
@@ -3818,7 +3926,8 @@ impl Inner {
         // Process the refund token from the response. If none is present,
         // attempt recovery from the server (best-effort — the final Wallet
         // emission below covers a written successor). Local turns have no
-        // spend, hence nothing to refund.
+        // spend, hence nothing to refund. A tool round settles its own hold
+        // here, before the next round acquires a fresh one.
         if prep.spend.is_some() {
             match body.get("refund") {
                 Some(refund_obj) => {
@@ -3869,6 +3978,79 @@ impl Inner {
             .unwrap_or("")
             .to_string();
 
+        // Tool calls only continue the loop on a successful response; a
+        // non-2xx body is handled below exactly as it always was.
+        let tool_calls = if status.is_success() {
+            match parse_tool_calls_blocking(message) {
+                Ok(calls) => calls,
+                Err(e) => {
+                    // Structurally unusable tool calls: nothing to execute,
+                    // nothing that can be written as a `tool_use` block.
+                    // Record the raw exchange (no action to attach it to)
+                    // so the Record still shows what came back, then fail
+                    // the turn honestly.
+                    prep.insert_unattached_request(
+                        &request_body_json,
+                        request_at,
+                        response_at,
+                        status.as_u16(),
+                        response_text.as_bytes().to_vec(),
+                    )
+                    .await?;
+                    self.bus.emit(Change::Space(prep.space_id.clone()));
+                    self.bus.emit(Change::Record);
+                    return Err(prep.wrap(e));
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        if !tool_calls.is_empty() {
+            // --- a tool round -------------------------------------------
+            prep.persist_tool_call_action(
+                &tool_calls,
+                &response_reasoning,
+                &response_content,
+                input_tokens,
+                output_tokens,
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_text.as_bytes().to_vec(),
+            )
+            .await?;
+
+            if round == MAX_TURN_ROUNDS {
+                // The cap binds *before* executing tools whose results
+                // could never be sent — the request is persisted, the work
+                // is not wasted, and the turn ends saying so.
+                self.bus.emit(Change::Space(prep.space_id.clone()));
+                self.bus.emit(Change::Record);
+                return Err(prep.wrap(AppError::ToolLoop {
+                    message: format!(
+                        "the model was still requesting tools after {MAX_TURN_ROUNDS} rounds"
+                    ),
+                }));
+            }
+
+            let outcomes = execute_tool_calls(&prep.tools, &tool_calls).await;
+            prep.persist_tool_result_action(&outcomes).await?;
+            prep.append_tool_round_messages(&tool_calls, &outcomes);
+
+            // Next round: re-estimate over the grown array, re-check the
+            // budget, acquire a fresh hold. A failure here leaves every
+            // committed round durable.
+            if let Err(e) = self.begin_next_round(prep).await {
+                self.bus.emit(Change::Space(prep.space_id.clone()));
+                self.bus.emit(Change::Record);
+                return Err(prep.wrap(e));
+            }
+            return Ok(RoundOutcome::ToolRound);
+        }
+
+        // --- the final round ---------------------------------------------
         let response_action_id = prep
             .persist_turn(
                 if status.is_success() {
@@ -3909,15 +4091,15 @@ impl Inner {
         }
         self.bus.emit(Change::Record);
 
-        Ok(ChatResult {
-            space_id: prep.space_id,
+        Ok(RoundOutcome::Final(ChatResult {
+            space_id: prep.space_id.clone(),
             content: response_content,
-            model: prep.model,
+            model: prep.model.clone(),
             input_tokens,
             output_tokens,
-            credits_charged: prep.charge_credits as i64,
+            credits_charged: prep.total_credits as i64,
             response_action_id: Some(response_action_id),
-        })
+        }))
     }
 
     /// Save a turn and request a (blocking) response in one gesture — the
@@ -3969,9 +4151,9 @@ impl Inner {
     }
 
     /// Streaming counterpart to `run_turn` — same shared preparation and
-    /// persistence (`prepare_turn` / [`TurnPrep::persist_turn`]), but sends
-    /// `stream: true` upstream and forwards each SSE chunk to `sender` as it
-    /// arrives.
+    /// persistence (`prepare_turn` / [`TurnPrep::persist_turn`]), the same
+    /// bounded tool loop, but sends `stream: true` upstream and forwards each
+    /// SSE chunk to `sender` as it arrives.
     ///
     /// Reasoning shape: we accept both `delta.reasoning_content` (OpenAI-style
     /// extension used by some providers) and `delta.reasoning` (vLLM's
@@ -3979,11 +4161,26 @@ impl Inner {
     /// fields are ignored — if Tinfoil's upstream uses a third spelling, the
     /// thinking section will simply stay empty until we adapt.
     ///
+    /// Tool-call shape: `delta.tool_calls` arrives in pieces (id and function
+    /// name in the first delta for an index, the `arguments` string across as
+    /// many later deltas as the provider likes), so each round assembles them
+    /// per index and only decides whether it was a tool round once the stream
+    /// closes — see [`accumulate_tool_call_deltas`].
+    ///
+    /// **Tool rounds are invisible pauses in the stream** (v1 decision): no new
+    /// [`ChatStreamEvent`] variants, no round markers. Content deltas are still
+    /// forwarded verbatim in every round, so the emission contract is exactly
+    /// what it was; a model that narrates before calling a tool has that
+    /// narration streamed and then persisted on the round's `tool_call` action
+    /// (where the render collapses it out), which is the one visible seam of
+    /// the v1 simplification.
+    ///
     /// Refund handling differs from `run_turn` only in *where* the refund
     /// token comes from: SSE responses have no inline body to carry it, so we
     /// always go through the `/v1/credentials/refund` recovery endpoint
-    /// after the stream ends. The credential is left in `pre_credential`
-    /// state until that recovery completes, same as the network-error path.
+    /// after each round's stream ends. The credential is left in
+    /// `pre_credential` state until that recovery completes, same as the
+    /// network-error path.
     #[allow(clippy::too_many_arguments)]
     async fn run_turn_stream(
         &self,
@@ -3994,15 +4191,48 @@ impl Inner {
         budget: Option<i64>,
         sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> Result<ChatResult, AppError> {
-        use futures_util::StreamExt;
-
         // Setup failures (client build / `/v1/models` fetch / attestation
         // flush) happen before the turn's inline `wrap` closure — carry the
         // already-persisted space id so they wrap like every later exit.
-        let mut prep = self
-            .prepare_turn(space_id, selector, target_action_id, mode, budget)
-            .await
-            .map_err(|e| e.into_chat_failed(space_id))?;
+        // Boxed: `prepare_turn` is a large future (client construction, catalog
+        // fetch, context assembly, credential spend) and the turn loop holds it
+        // live across the whole round. Keeping it on the heap keeps the turn's
+        // own state machine — already the largest in the crate — off the worker
+        // stack.
+        let mut prep =
+            Box::pin(self.prepare_turn(space_id, selector, target_action_id, mode, budget))
+                .await
+                .map_err(|e| e.into_chat_failed(space_id))?;
+
+        for round in 1..=MAX_TURN_ROUNDS {
+            match Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await? {
+                RoundOutcome::Final(result) => return Ok(result),
+                RoundOutcome::ToolRound => continue,
+            }
+        }
+
+        unreachable!("the tool loop returns on its last round")
+    }
+
+    /// One round of the streaming turn loop: send the request, pump the SSE
+    /// body (forwarding content/reasoning deltas and assembling any
+    /// `tool_calls`), recover the refund, and either persist the round as a
+    /// tool round or persist the `inference` and finish.
+    async fn run_turn_stream_round(
+        &self,
+        prep: &mut TurnPrep,
+        round: usize,
+        sender: &tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<RoundOutcome, AppError> {
+        use futures_util::StreamExt;
+
+        // post already emitted the user turn's Space(id) + SpaceIndex; on an
+        // error exit we re-signal the space (idempotent refresh). SpaceIndex is
+        // post's concern, not re-emitted here.
+        let space_for_emit = prep.space_id.clone();
+        let emit_user_turn = || {
+            self.bus.emit(Change::Space(space_for_emit.clone()));
+        };
 
         // No `stream_options` here — the server unconditionally sets
         // `include_usage: true` when forwarding the streaming request
@@ -4022,14 +4252,6 @@ impl Inner {
             request = request.header("Authorization", auth_value);
         }
         let chat_result = request.send().await;
-
-        // post already emitted the user turn's Space(id) + SpaceIndex; on a
-        // run_turn_stream error exit we re-signal the space (idempotent
-        // refresh). SpaceIndex is post's concern, not re-emitted here.
-        let space_for_emit = prep.space_id.clone();
-        let emit_user_turn = || {
-            self.bus.emit(Change::Space(space_for_emit.clone()));
-        };
 
         let resp = match chat_result {
             Ok(resp) => {
@@ -4063,27 +4285,12 @@ impl Inner {
                 // Successor credential written — wallet state updated.
                 self.bus.emit(Change::Wallet);
             }
-            db::insert_request(
-                &prep.db_conn,
-                &db::Request {
-                    id: Uuid::now_v7().to_string(),
-                    connection_id: prep.connection_id.clone(),
-                    action_id: None,
-                    method: "POST".to_string(),
-                    path: "/v1/chat/completions".to_string(),
-                    request_headers: None,
-                    request_body: Some(request_body_json.to_string().into_bytes()),
-                    response_status: Some(status.as_u16() as i64),
-                    response_headers: None,
-                    response_body: Some(response_text.as_bytes().to_vec()),
-                    request_at,
-                    response_at: Some(now_ms()),
-                    duration_ms: Some(now_ms() - request_at),
-                    error: None,
-                    credential_nonce: prep.credential_nonce(),
-                    created_at: now_ms(),
-                    backend_id: Some(prep.backend_id.clone()),
-                },
+            prep.insert_unattached_request(
+                &request_body_json,
+                request_at,
+                now_ms(),
+                status.as_u16(),
+                response_text.as_bytes().to_vec(),
             )
             .await?;
             // Request row committed; Wallet was emitted at spend start (and
@@ -4105,6 +4312,8 @@ impl Inner {
         let mut buf: Vec<u8> = Vec::new();
         let mut full_content = String::new();
         let mut full_reasoning = String::new();
+        let mut tool_call_acc: std::collections::BTreeMap<u64, StreamingToolCall> =
+            std::collections::BTreeMap::new();
         let mut input_tokens: Option<i64> = None;
         let mut output_tokens: Option<i64> = None;
         let mut response_buf: Vec<u8> = Vec::new();
@@ -4188,6 +4397,13 @@ impl Inner {
                             let _ = sender.send(ChatStreamEvent::ReasoningDelta(text.to_string()));
                         }
                     }
+
+                    // Tool calls stream in pieces; fold each delta into the
+                    // per-index accumulator (nothing is forwarded to the
+                    // caller — tool rounds are invisible pauses in v1).
+                    if let Some(deltas) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                        accumulate_tool_call_deltas(&mut tool_call_acc, deltas);
+                    }
                 }
             }
 
@@ -4206,8 +4422,65 @@ impl Inner {
 
         // SSE carries no inline refund — always consult the recovery endpoint
         // (best-effort; the final Wallet emission below covers a successor).
+        // A tool round settles its hold here, before the next round's.
         let _ = prep.try_refund_recovery().await;
 
+        let tool_calls = match finish_streaming_tool_calls(tool_call_acc) {
+            Ok(calls) => calls,
+            Err(e) => {
+                prep.insert_unattached_request(
+                    &request_body_json,
+                    request_at,
+                    response_at,
+                    status.as_u16(),
+                    response_buf,
+                )
+                .await?;
+                self.bus.emit(Change::Space(prep.space_id.clone()));
+                self.bus.emit(Change::Record);
+                return Err(prep.wrap(e));
+            }
+        };
+
+        if !tool_calls.is_empty() {
+            // --- a tool round -------------------------------------------
+            prep.persist_tool_call_action(
+                &tool_calls,
+                &full_reasoning,
+                &full_content,
+                input_tokens,
+                output_tokens,
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_buf,
+            )
+            .await?;
+
+            if round == MAX_TURN_ROUNDS {
+                self.bus.emit(Change::Space(prep.space_id.clone()));
+                self.bus.emit(Change::Record);
+                return Err(prep.wrap(AppError::ToolLoop {
+                    message: format!(
+                        "the model was still requesting tools after {MAX_TURN_ROUNDS} rounds"
+                    ),
+                }));
+            }
+
+            let outcomes = execute_tool_calls(&prep.tools, &tool_calls).await;
+            prep.persist_tool_result_action(&outcomes).await?;
+            prep.append_tool_round_messages(&tool_calls, &outcomes);
+
+            if let Err(e) = self.begin_next_round(prep).await {
+                self.bus.emit(Change::Space(prep.space_id.clone()));
+                self.bus.emit(Change::Record);
+                return Err(prep.wrap(e));
+            }
+            return Ok(RoundOutcome::ToolRound);
+        }
+
+        // --- the final round ---------------------------------------------
         let response_action_id = prep
             .persist_turn(
                 "complete",
@@ -4232,15 +4505,15 @@ impl Inner {
         }
         self.bus.emit(Change::Record);
 
-        Ok(ChatResult {
-            space_id: prep.space_id,
+        Ok(RoundOutcome::Final(ChatResult {
+            space_id: prep.space_id.clone(),
             content: full_content,
-            model: prep.model,
+            model: prep.model.clone(),
             input_tokens,
             output_tokens,
-            credits_charged: prep.charge_credits as i64,
+            credits_charged: prep.total_credits as i64,
             response_action_id: Some(response_action_id),
-        })
+        }))
     }
 
     /// Save a turn and request a streaming response in one gesture (the GUI's
@@ -4384,6 +4657,34 @@ pub struct AppCore {
 impl AppCore {
     pub fn runtime(&self) -> &tokio::runtime::Runtime {
         &self.runtime
+    }
+
+    /// Register a tool the turn loop may call (see [`tools`]).
+    ///
+    /// The registry starts **empty**, and an empty registry sends no `tools`
+    /// field upstream — so registering the first tool is the moment a process
+    /// opts into tool-calling wire format. Registration replaces any earlier
+    /// tool of the same name. A turn snapshots the registry in `prepare_turn`,
+    /// so registering mid-turn never changes the tool set a turn already
+    /// advertised to the model.
+    pub fn register_tool(&self, tool: std::sync::Arc<dyn tools::Tool>) {
+        self.inner
+            .tools
+            .write()
+            .expect("tool registry lock poisoned")
+            .register(tool);
+    }
+
+    /// The names of the currently registered tools (registration order).
+    pub fn registered_tools(&self) -> Vec<String> {
+        self.inner
+            .tools
+            .read()
+            .expect("tool registry lock poisoned")
+            .names()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 
     /// Streaming chat. Pushes incremental `ChatStreamEvent`s through
@@ -4658,6 +4959,7 @@ impl AppCore {
                 bus,
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
+                tools: std::sync::RwLock::new(tools::ToolRegistry::new()),
                 http_override,
                 _db_lock: db_lock,
             }),
@@ -5389,6 +5691,56 @@ impl AppCore {
         );
     }
 
+    /// Test-only seam: `chat` with an explicit per-round spend `budget`.
+    ///
+    /// The `budget` parameter is threaded through `run_turn` but no production
+    /// entry point sets it yet (it exists for the agent loop's per-iteration
+    /// ceiling — see [`MAX_TURN_ROUNDS`]). This exposes it so the chat-path
+    /// tests can pin the mid-loop budget exit, which is otherwise unreachable.
+    #[doc(hidden)]
+    pub async fn test_chat_with_budget(
+        &self,
+        prompt: String,
+        model: String,
+        space_id: Option<String>,
+        budget: i64,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let posted = inner.post(space_id.as_deref(), &prompt, None, &[]).await?;
+                inner
+                    .run_turn(
+                        &posted.space_id,
+                        TurnSelector::Model(model),
+                        &posted.action_id,
+                        ResponseMode::Reply,
+                        Some(budget),
+                    )
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Test-only seam: every action in a space with its blocks and reply
+    /// parent — **including** the `tool_call` / `tool_result` trace rows that
+    /// [`Self::get_space_tree`] collapses out of the render by design.
+    #[doc(hidden)]
+    pub async fn test_space_actions(
+        &self,
+        space_id: String,
+    ) -> Result<Vec<db::RawActionRow>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                db::raw_space_actions(&conn, &space_id).await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Test-only seam: pin the engine-pool memory budget so eviction tests
     /// are deterministic on any machine.
     #[doc(hidden)]
@@ -5970,10 +6322,37 @@ struct TurnPrep {
     inf_reply_to: Option<String>,
     /// The context rows fed upstream, recorded as the context assembly.
     context_rows: Vec<db::SpaceActionRow>,
-    /// The OpenAI messages array built from `context_rows`.
+    /// The `tool_call` / `tool_result` actions this turn wrote, in order.
+    /// They were fed upstream too (as the in-flight `assistant`/`tool`
+    /// messages), so `persist_turn` records them in the context assembly
+    /// alongside `context_rows`.
+    trace_action_ids: Vec<String>,
+    /// Where the next tool-round trace action attaches: the post the turn
+    /// answers for round 1, then each round's `tool_result` action. `None`
+    /// only when the turn's target had no reply antecedent at all.
+    trace_reply_to: Option<String>,
+    /// The OpenAI messages array. Built from `context_rows` at preparation and
+    /// **grown in place** by the tool loop: each round appends the assistant
+    /// message carrying its `tool_calls` (verbatim) plus one `tool` message per
+    /// result. Every round's charge estimate and wire request read this one
+    /// array, so the hold always covers the bytes actually sent.
     messages: Vec<serde_json::Value>,
-    /// Estimated hold for this turn. Always `0` when `spend` is `None`.
+    /// The tool registry snapshot for this turn (see [`tools`]). Empty ⇒ the
+    /// request body carries no `tools` field at all.
+    tools: Arc<tools::ToolRegistry>,
+    /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
+    /// for every non-spend backend. Kept so a later round can re-estimate.
+    remote_pricing: Option<(u128, u128, u128)>,
+    /// The per-turn spend ceiling, checked **per round** against that round's
+    /// own estimate over the grown messages array.
+    budget: Option<i64>,
+    /// Estimated hold for the *current* round. Always `0` when `spend` is
+    /// `None`.
     charge_credits: u128,
+    /// Sum of every round's hold — what `ChatResult::credits_charged` reports.
+    /// Equal to `charge_credits` for a single-round turn, so nothing changes
+    /// for the common case.
+    total_credits: u128,
     /// The in-flight credential spend — `None` for local turns, which have
     /// no billing. Its absence disables the ACT header, the refund
     /// machinery, and the `Wallet` emissions throughout the transports.
@@ -6003,13 +6382,21 @@ impl TurnPrep {
         }
     }
 
-    /// The chat request body for this turn.
+    /// The chat request body for the current round of this turn.
+    ///
+    /// `tools` is emitted **only** when the turn's registry snapshot holds at
+    /// least one tool. That omission is load-bearing: a registry-less install
+    /// sends exactly the bytes it sent before tool support existed, so
+    /// upstream prefix caches — and every pinned-bytes test — are undisturbed.
     fn request_body(&self, stream: bool) -> serde_json::Value {
         let mut body = serde_json::json!({
             "model": self.wire_model,
             "messages": self.messages,
             "max_completion_tokens": self.max_completion_tokens,
         });
+        if !self.tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(self.tools.schemas());
+        }
         if stream {
             body["stream"] = serde_json::Value::Bool(true);
             // The Eidola server forces `include_usage` upstream regardless
@@ -6081,6 +6468,258 @@ impl TurnPrep {
     /// Record.
     fn credential_nonce(&self) -> Option<String> {
         self.spend.as_ref().map(|s| s.cred.nonce.clone())
+    }
+
+    /// Record a raw request/response with **no action to attach it to**.
+    ///
+    /// Used where a round produced nothing persistable as an action — the
+    /// structurally-malformed `tool_calls` exit, and the streaming non-2xx arm
+    /// (which has the same shape). The Record still shows the exchange, which
+    /// is the whole point of keeping raw bodies.
+    async fn insert_unattached_request(
+        &self,
+        request_body_json: &serde_json::Value,
+        request_at: i64,
+        response_at: i64,
+        http_status: u16,
+        response_body: Vec<u8>,
+    ) -> Result<(), AppError> {
+        db::insert_request(
+            &self.db_conn,
+            &db::Request {
+                id: Uuid::now_v7().to_string(),
+                connection_id: self.connection_id.clone(),
+                action_id: None,
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                request_headers: None,
+                request_body: Some(request_body_json.to_string().into_bytes()),
+                response_status: Some(http_status as i64),
+                response_headers: None,
+                response_body: Some(response_body),
+                request_at,
+                response_at: Some(response_at),
+                duration_ms: Some(response_at - request_at),
+                error: None,
+                credential_nonce: self.credential_nonce(),
+                created_at: now_ms(),
+                backend_id: Some(self.backend_id.clone()),
+            },
+        )
+        .await
+    }
+
+    /// Persist one **tool round**: the model's tool-requesting output as a
+    /// `tool_call` action (with its raw request row) and, when the loop goes on
+    /// to execute them, the harness's answers as a `tool_result` action.
+    ///
+    /// Threading: both hang off `trace_reply_to` — the post the turn answers
+    /// for the first round, then the previous round's `tool_result`. They are
+    /// deliberately *not* children of the inference (which may never exist:
+    /// the round cap and the budget gate both end turns without one), and
+    /// because `get_space_tree` keeps only post-bearing action types the whole
+    /// chain collapses out of the rendered thread for free while staying fully
+    /// resolvable in the Record.
+    ///
+    /// Content blocks, in reading order: the round's `thinking` and `text`
+    /// output when the model produced any alongside its calls, then one
+    /// `tool_use` block per call (`tool_name` + `tool_call_id` + the raw
+    /// arguments string in `data`).
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_call_action(
+        &mut self,
+        calls: &[ParsedToolCall],
+        reasoning: &str,
+        content: &str,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        request_body_json: &serde_json::Value,
+        request_at: i64,
+        response_at: i64,
+        http_status: u16,
+        response_body: Vec<u8>,
+    ) -> Result<String, AppError> {
+        let action_id = Uuid::now_v7().to_string();
+        db::insert_action(
+            &self.db_conn,
+            &db::ActionEntry {
+                id: action_id.clone(),
+                space_id: self.space_id.clone(),
+                // The requesting agent authors its own tool calls.
+                participant_id: self.model_participant_id.clone(),
+                participant_scope: self.model_participant_scope.clone(),
+                item_id: Uuid::now_v7().to_string(),
+                supersedes_action_id: None,
+                action_type: "tool_call".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: Some(self.model.clone()),
+                input_tokens,
+                output_tokens,
+                // This round's own hold — each round is a separate priced
+                // request, so each round's action carries its own charge.
+                credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
+                created_at: now_ms(),
+            },
+        )
+        .await?;
+        if let Some(ref ante) = self.trace_reply_to {
+            db::insert_action_antecedent(&self.db_conn, &action_id, ante, 0, "reply").await?;
+        }
+
+        let mut ordinal: i64 = 0;
+        if !reasoning.is_empty() {
+            db::insert_text_content_block(
+                &self.db_conn,
+                &Uuid::now_v7().to_string(),
+                &action_id,
+                ordinal,
+                "thinking",
+                reasoning,
+            )
+            .await?;
+            ordinal += 1;
+        }
+        if !content.is_empty() {
+            db::insert_text_content_block(
+                &self.db_conn,
+                &Uuid::now_v7().to_string(),
+                &action_id,
+                ordinal,
+                "text",
+                content,
+            )
+            .await?;
+            ordinal += 1;
+        }
+        for call in calls {
+            db::insert_tool_use_content_block(
+                &self.db_conn,
+                &Uuid::now_v7().to_string(),
+                &action_id,
+                ordinal,
+                &call.name,
+                &call.id,
+                &call.arguments,
+            )
+            .await?;
+            ordinal += 1;
+        }
+
+        db::insert_request(
+            &self.db_conn,
+            &db::Request {
+                id: Uuid::now_v7().to_string(),
+                connection_id: self.connection_id.clone(),
+                action_id: Some(action_id.clone()),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                request_headers: None,
+                request_body: Some(request_body_json.to_string().into_bytes()),
+                response_status: Some(http_status as i64),
+                response_headers: None,
+                response_body: Some(response_body),
+                request_at,
+                response_at: Some(response_at),
+                duration_ms: Some(response_at - request_at),
+                error: None,
+                credential_nonce: self.credential_nonce(),
+                created_at: now_ms(),
+                backend_id: Some(self.backend_id.clone()),
+            },
+        )
+        .await?;
+
+        self.trace_action_ids.push(action_id.clone());
+        self.trace_reply_to = Some(action_id.clone());
+        Ok(action_id)
+    }
+
+    /// Persist a round's executed tool results as one `tool_result` action
+    /// (one `tool_result` content block per call, keyed by `tool_call_id`).
+    /// The action's status is `error` when any tool in the round failed, so the
+    /// Record shows the failure without the loop having to stop for it.
+    async fn persist_tool_result_action(
+        &mut self,
+        outcomes: &[ToolOutcome],
+    ) -> Result<String, AppError> {
+        let action_id = Uuid::now_v7().to_string();
+        let status = if outcomes.iter().all(|o| o.ok) {
+            "complete"
+        } else {
+            "error"
+        };
+        db::insert_action(
+            &self.db_conn,
+            &db::ActionEntry {
+                id: action_id.clone(),
+                space_id: self.space_id.clone(),
+                // Recorded against the agent the results are for: the harness
+                // is not a participant, and an action must be authored by a
+                // global or space-owned participant (the pinned composite
+                // echo). The `tool_result` action type is what marks it as
+                // harness work rather than the agent's own words.
+                participant_id: self.model_participant_id.clone(),
+                participant_scope: self.model_participant_scope.clone(),
+                item_id: Uuid::now_v7().to_string(),
+                supersedes_action_id: None,
+                action_type: "tool_result".to_string(),
+                status: status.to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                // Tools run locally — no inference was purchased.
+                credits_consumed: None,
+                created_at: now_ms(),
+            },
+        )
+        .await?;
+        if let Some(ref ante) = self.trace_reply_to {
+            db::insert_action_antecedent(&self.db_conn, &action_id, ante, 0, "reply").await?;
+        }
+        for (ordinal, outcome) in outcomes.iter().enumerate() {
+            db::insert_tool_result_content_block(
+                &self.db_conn,
+                &Uuid::now_v7().to_string(),
+                &action_id,
+                ordinal as i64,
+                &outcome.call_id,
+                &outcome.content,
+            )
+            .await?;
+        }
+        self.trace_action_ids.push(action_id.clone());
+        self.trace_reply_to = Some(action_id.clone());
+        Ok(action_id)
+    }
+
+    /// Grow the in-flight messages array by one completed tool round: the
+    /// assistant message carrying the model's `tool_calls` **verbatim**,
+    /// followed by one `tool` message per result.
+    ///
+    /// The tool messages are deliberately **raw** — no `#<handle> · <label>`
+    /// header. Headers identify *posts* by their author; a tool result is
+    /// neither a post nor authored by a participant, and a fake header would
+    /// invite the model to address it as one. The assistant message keeps its
+    /// own content verbatim too, because the follow-up request must present
+    /// the exact call objects the model emitted.
+    fn append_tool_round_messages(&mut self, calls: &[ParsedToolCall], outcomes: &[ToolOutcome]) {
+        let mut assistant = serde_json::json!({
+            "role": "assistant",
+            "tool_calls": calls.iter().map(|c| c.raw.clone()).collect::<Vec<_>>(),
+        });
+        // Some templates require the key to exist; `null` is the OpenAI shape
+        // for "the assistant said nothing but called tools".
+        assistant["content"] = serde_json::Value::Null;
+        self.messages.push(assistant);
+        for outcome in outcomes {
+            self.messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": outcome.call_id,
+                "content": outcome.content,
+            }));
+        }
     }
 
     /// Persist the turn's durable rows — the inference action (per the attach
@@ -6155,6 +6794,14 @@ impl TurnPrep {
         for r in &self.context_rows {
             if !fed_ids.contains(&r.action_id) {
                 fed_ids.push(r.action_id.clone());
+            }
+        }
+        // A tool loop's own rounds were fed upstream too (as the in-flight
+        // assistant/`tool` messages), so they belong in the assembly record —
+        // "exactly the actions fed into this inference" stays literally true.
+        for id in &self.trace_action_ids {
+            if !fed_ids.contains(id) {
+                fed_ids.push(id.clone());
             }
         }
         for (pos, aid) in fed_ids.iter().enumerate() {
@@ -6335,6 +6982,279 @@ async fn recover_refund(
 // ============================================================================
 // Free-standing helpers
 // ============================================================================
+
+// ---------------------------------------------------------------------------
+// Tool-calling turns
+// ---------------------------------------------------------------------------
+
+/// The maximum number of **model requests** one turn may issue.
+///
+/// A turn without tools issues exactly one, so this only ever binds a tool
+/// loop. Eight is deliberately a small fixed constant, not a setting: it caps
+/// the worst-case spend of a single ask at eight holds while leaving ample room
+/// for the multi-hop navigation task 21 has in mind. Reaching it with the model
+/// still asking for tools ends the turn with [`AppError::ToolLoop`] — the
+/// rounds that did happen stay persisted, and no half-finished round is passed
+/// off as an answer.
+pub const MAX_TURN_ROUNDS: usize = 8;
+
+/// What one round of a turn's bounded loop produced.
+enum RoundOutcome {
+    /// The model answered: the `inference` action is persisted and the turn is
+    /// over.
+    Final(ChatResult),
+    /// The model asked for tools: the round's `tool_call` / `tool_result`
+    /// actions are persisted, the results are appended to the messages array,
+    /// and the next round's hold is already in place.
+    ToolRound,
+}
+
+/// One tool call as the model requested it.
+#[derive(Clone, Debug)]
+struct ParsedToolCall {
+    /// The call id the `tool` result message must echo.
+    id: String,
+    /// The tool name the registry resolves.
+    name: String,
+    /// The raw arguments **string** exactly as the model produced it. Parsed
+    /// as JSON at execution time; a parse failure is reported back to the
+    /// model as a tool error, not raised as a turn failure.
+    arguments: String,
+    /// The verbatim tool-call object, replayed unchanged in the follow-up
+    /// request's assistant message. Preserving it byte-for-byte (rather than
+    /// re-serializing our parse) is what keeps provider-specific fields and
+    /// id formats intact across the round boundary.
+    raw: serde_json::Value,
+}
+
+/// The outcome of executing one [`ParsedToolCall`].
+#[derive(Clone, Debug)]
+struct ToolOutcome {
+    call_id: String,
+    /// What the model is shown as the tool result — the tool's output, or an
+    /// honest error line.
+    content: String,
+    ok: bool,
+}
+
+/// Read one tool-call object into a [`ParsedToolCall`].
+///
+/// `id` and `function.name` are required: without them there is nothing to
+/// execute and nothing to persist (the schema's `tool_use` block requires both
+/// a `tool_name` and a `tool_call_id`), so a malformed object is a turn
+/// failure rather than something to paper over. `function.arguments` defaults
+/// to `""` — an argument-less call is legitimate, and *invalid* argument JSON
+/// is a model mistake handled at execution time.
+fn parse_tool_call(value: &serde_json::Value) -> Result<ParsedToolCall, AppError> {
+    let id = value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::ToolLoop {
+            message: "the model returned a tool call with no `id`".into(),
+        })?;
+    let name = value
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::ToolLoop {
+            message: format!("the model returned a tool call (`{id}`) with no function name"),
+        })?;
+    let arguments = value
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(ParsedToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments,
+        raw: value.clone(),
+    })
+}
+
+/// Read the `tool_calls` array off a blocking response's `message` object.
+/// Absent or empty ⇒ no tool round (the ordinary completion).
+fn parse_tool_calls_blocking(
+    message: Option<&serde_json::Value>,
+) -> Result<Vec<ParsedToolCall>, AppError> {
+    let Some(arr) = message
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|v| v.as_array())
+    else {
+        return Ok(Vec::new());
+    };
+    arr.iter().map(parse_tool_call).collect()
+}
+
+/// Incremental assembly state for one streamed tool call.
+///
+/// SSE splits a tool call across chunks: the first delta typically carries the
+/// `index`, `id`, `type` and function `name`, and every later delta at the same
+/// index carries another slice of the `arguments` string. Nothing is
+/// guaranteed to arrive whole, so each field is concatenated rather than
+/// assigned.
+#[derive(Default, Clone, Debug)]
+struct StreamingToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+    call_type: String,
+}
+
+/// Fold one streamed `delta.tool_calls` array into the per-index accumulator.
+///
+/// Entries without an explicit `index` fall back to their position in the
+/// array — some providers omit it when only one call is in flight.
+fn accumulate_tool_call_deltas(
+    acc: &mut std::collections::BTreeMap<u64, StreamingToolCall>,
+    deltas: &[serde_json::Value],
+) {
+    for (pos, d) in deltas.iter().enumerate() {
+        let index = d
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(pos as u64);
+        let entry = acc.entry(index).or_default();
+        if let Some(id) = d.get("id").and_then(|v| v.as_str()) {
+            entry.id.push_str(id);
+        }
+        if let Some(t) = d.get("type").and_then(|v| v.as_str()) {
+            entry.call_type.push_str(t);
+        }
+        if let Some(f) = d.get("function") {
+            if let Some(name) = f.get("name").and_then(|v| v.as_str()) {
+                entry.name.push_str(name);
+            }
+            if let Some(args) = f.get("arguments").and_then(|v| v.as_str()) {
+                entry.arguments.push_str(args);
+            }
+        }
+    }
+}
+
+/// Finalize the streamed accumulator into [`ParsedToolCall`]s, in index order.
+fn finish_streaming_tool_calls(
+    acc: std::collections::BTreeMap<u64, StreamingToolCall>,
+) -> Result<Vec<ParsedToolCall>, AppError> {
+    acc.into_values()
+        .map(|c| {
+            let call_type = if c.call_type.is_empty() {
+                "function".to_string()
+            } else {
+                c.call_type
+            };
+            parse_tool_call(&serde_json::json!({
+                "id": c.id,
+                "type": call_type,
+                "function": { "name": c.name, "arguments": c.arguments },
+            }))
+        })
+        .collect()
+}
+
+/// Execute a round's tool calls, in order, against the turn's registry.
+///
+/// Never fails: an unknown tool, unparseable arguments, or a tool's own error
+/// all become an honest error *result* the model reads on the next round.
+/// That is the agent-harness contract (the same one a file-reading tool gives
+/// a model), and it is why a mistaken tool name doesn't burn a turn.
+async fn execute_tool_calls(
+    registry: &tools::ToolRegistry,
+    calls: &[ParsedToolCall],
+) -> Vec<ToolOutcome> {
+    let mut out = Vec::with_capacity(calls.len());
+    for call in calls {
+        let (content, ok) = match registry.get(&call.name) {
+            None => (
+                format!(
+                    "error: unknown tool `{}` — available tools: {}",
+                    call.name,
+                    registry.names().join(", ")
+                ),
+                false,
+            ),
+            Some(tool) => {
+                let args: Result<serde_json::Value, _> = if call.arguments.trim().is_empty() {
+                    Ok(serde_json::json!({}))
+                } else {
+                    serde_json::from_str(&call.arguments)
+                };
+                match args {
+                    Err(e) => (format!("error: arguments are not valid JSON: {e}"), false),
+                    Ok(args) => match tool.call(args).await {
+                        Ok(result) => (result, true),
+                        Err(e) => (format!("error: {e}"), false),
+                    },
+                }
+            }
+        };
+        out.push(ToolOutcome {
+            call_id: call.id.clone(),
+            content,
+            ok,
+        });
+    }
+    out
+}
+
+/// The shared client/server pricing inputs for a messages array: the summed
+/// UTF-8 byte length of each entry's `content` **string** plus the entry count.
+///
+/// Deliberately identical to the server's `chargeable_prompt_tokens_for`
+/// (which reads `Message::content`), including for the tool-loop shapes: an
+/// assistant message carrying `tool_calls` has no content string and
+/// contributes zero bytes, and a `tool` result message contributes its content
+/// like any other. Both sides computing the same function of the same array is
+/// what makes hold ≥ charge structural.
+fn messages_charge_inputs(messages: &[serde_json::Value]) -> (u64, u64) {
+    let bytes = messages
+        .iter()
+        .map(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.len() as u64)
+                .unwrap_or(0)
+        })
+        .sum();
+    (bytes, messages.len() as u64)
+}
+
+/// The worst-case charge in credits for one request over `messages`.
+///
+/// `pricing` is `(prompt_rate, completion_rate, scale_factor)` from the model
+/// catalog. The prompt side is the shared contract
+/// (`eidola_common::chargeable_prompt_tokens`); the completion side is the
+/// full `max_completion_tokens` ceiling.
+fn estimate_charge_credits(
+    messages: &[serde_json::Value],
+    max_completion_tokens: u32,
+    pricing: (u128, u128, u128),
+) -> u128 {
+    let (prompt_rate, completion_rate, sf) = pricing;
+    let (total_content_bytes, message_count) = messages_charge_inputs(messages);
+    let chargeable_prompt =
+        eidola_common::chargeable_prompt_tokens(total_content_bytes, message_count);
+    let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
+    let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
+    prompt_credits + completion_credits
+}
+
+/// The per-round spend ceiling check. `budget` caps *each* request's estimated
+/// charge, which is exactly the "ceiling a multi-inference agent loop checks
+/// per iteration" the parameter was introduced for.
+fn check_turn_budget(charge_credits: u128, budget: Option<i64>) -> Result<(), AppError> {
+    if let Some(b) = budget
+        && charge_credits as i64 > b
+    {
+        return Err(AppError::Credential {
+            message: format!("estimated charge {charge_credits} exceeds the turn budget {b}"),
+        });
+    }
+    Ok(())
+}
 
 /// Canonicalize a model reference to its `<model>@<backend-id>` form (the bare
 /// `eidola` default stays bare), so a participant's stored `model_ref` and a
