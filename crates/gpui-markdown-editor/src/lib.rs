@@ -32,11 +32,12 @@ pub mod table;
 pub mod update;
 
 pub use editor::{
-    Backspace, Copy, Cut, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward,
-    DeleteWordForward, DocumentEnd, DocumentStart, Down, EmbedChromeCounts, End, Enter, Home, Left,
-    MarkdownEditor, MarkdownEditorState, Paste, PastePlain, Redo, Right, SelectAll,
-    ShiftDocumentEnd, ShiftDocumentStart, ShiftDown, ShiftEnd, ShiftHome, ShiftLeft, ShiftRight,
-    ShiftTab, ShiftUp, ShiftWordLeft, ShiftWordRight, Tab, Undo, Up, WordLeft, WordRight, init,
+    Backspace, ContextMenuHandler, Copy, Cut, Delete, DeleteToLineEnd, DeleteToLineStart,
+    DeleteWordBackward, DeleteWordForward, DocumentEnd, DocumentStart, Down, EditorCommand,
+    EmbedChromeCounts, End, Enter, Home, Left, MarkdownEditor, MarkdownEditorState, Paste,
+    PastePlain, Redo, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown, ShiftEnd,
+    ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft, ShiftWordRight, Tab, Undo,
+    Up, WordLeft, WordRight, init,
 };
 pub use embed::{EmbedMap, embed_marker, parse_embed_text};
 pub use event::{EditorEvent, MarkdownEditorEvent};

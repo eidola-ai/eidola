@@ -32,6 +32,7 @@ use std::collections::HashSet;
 
 use crate::loadable::Loadable;
 
+use super::context_menu::ContextTarget;
 use super::layout::body_width;
 use super::model::{self, TreeNode};
 
@@ -992,7 +993,8 @@ impl SpaceView {
             // `body_h` already carries the half-pad breath (folded into
             // `content` by `record_height` below), so the editor's excess starts
             // right under the last line — no dead strip.
-            .child(
+            .child({
+                let menu_editor = editor.clone();
                 MarkdownEditor::new(&editor)
                     // The footnote rail below shares the bar's height, so the
                     // editor's runway floor is the bar minus the rail — the
@@ -1002,8 +1004,19 @@ impl SpaceView {
                     // (`clipped_tail`), so the rail lands on the *visible*
                     // edge instead of below it.
                     .style(prose_style(cx))
-                    .min_height(px((body_h - draft_rail_h - clipped_tail).max(0.0))),
-            )
+                    .min_height(px((body_h - draft_rail_h - clipped_tail).max(0.0)))
+                    // The editable context menu (Cut / Copy / Paste / Select All).
+                    .on_context_menu(cx.listener(
+                        move |this, at: &gpui::Point<gpui::Pixels>, _, cx| {
+                            this.open_context_menu(
+                                *at,
+                                menu_editor.clone(),
+                                ContextTarget::Editable,
+                                cx,
+                            );
+                        },
+                    ))
+            })
             // The draft's pending quotes, as footnotes — the same rail a
             // posted exchange carries, right where it will be once posted.
             // The draft's pending quotes, as footnotes, bracketed by the two
@@ -1077,12 +1090,14 @@ impl SpaceView {
             .bg(theme.background)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
-                    // An open band menu absorbs the first Escape; the next
+                    // An open menu absorbs the first Escape; the next
                     // deactivates the draft (deleting it if an empty fork) and
                     // moves focus off the editor to the view root, so a kept
                     // draft reads as exited (no stray cursor) until it's
                     // clicked back into.
-                    if this.band_menu.is_some() {
+                    if this.close_context_menu(cx) {
+                        // consumed
+                    } else if this.band_menu.is_some() {
                         this.band_menu = None;
                         cx.notify();
                     } else {

@@ -25,6 +25,7 @@
 //! {"cmd":"windows"}
 //! {"cmd":"elements","window":1}                          // named probe targets
 //! {"cmd":"click","window":1,"target":"chat/model-label"} // or "x"/"y"; alt/command/shift bools
+//!   //   optional "button":"right" for the context-menu gesture
 //! {"cmd":"drag","window":1,"from_x":300,"from_y":320,"to_x":560,"to_y":660} // press-move-release
 //!   //   optional "click_count":2|3 (double/triple-click selection); "hold":true pumps frames at
 //!   //   `to` so host autoscroll-while-selecting runs before release
@@ -134,6 +135,10 @@ mod driver {
             command: bool,
             #[serde(default)]
             shift: bool,
+            /// `"right"` opens a context menu (the app's own — see the space
+            /// view's `context_menu`); anything else is an ordinary left click.
+            #[serde(default)]
+            button: Option<String>,
         },
         Drag {
             window: u64,
@@ -1655,6 +1660,7 @@ mod driver {
                     alt,
                     command,
                     shift,
+                    button,
                 } => {
                     let pos = self.position(cx, window, target.as_deref(), x, y)?;
                     let handle = self.window(window)?;
@@ -1664,7 +1670,22 @@ mod driver {
                         shift,
                         ..Default::default()
                     };
-                    cx.simulate_click(handle, pos, modifiers);
+                    if button.as_deref() == Some("right") {
+                        // The context-menu gesture is a right *press* — that
+                        // is what the editor listens for.
+                        cx.simulate_event(
+                            handle,
+                            MouseDownEvent {
+                                button: MouseButton::Right,
+                                position: pos,
+                                modifiers,
+                                click_count: 1,
+                                first_mouse: false,
+                            },
+                        );
+                    } else {
+                        cx.simulate_click(handle, pos, modifiers);
+                    }
                     Ok(json!({"clicked": {"x": pos.x.as_f32(), "y": pos.y.as_f32()}}))
                 }
 
