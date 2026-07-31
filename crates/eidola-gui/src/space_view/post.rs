@@ -175,9 +175,14 @@ impl SpaceView {
             ));
         if editing_this {
             // Escape restores the pre-edit text and exits the session. The
-            // row (an ancestor of the focused editor) sees the key first.
+            // row (an ancestor of the focused editor) sees the key first —
+            // which is exactly why it must yield to an open context menu
+            // (`context_menu_absorbs_escape`): a right-click inside the
+            // session then Escape-to-dismiss would otherwise throw the
+            // unsaved edit away on the same press that closed the menu. The
+            // root closes it; the next Escape reaches this handler.
             row = row.on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
-                if ev.keystroke.key == "escape" {
+                if ev.keystroke.key == "escape" && !this.context_menu_absorbs_escape() {
                     this.cancel_edit(window, cx);
                 }
             }));
