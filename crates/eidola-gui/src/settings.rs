@@ -35,7 +35,7 @@ use crate::wallet::WalletView;
 /// Vertical reserve at the top of the nav band so the macOS traffic lights
 /// (at `point(14, 11)` per `lib.rs::transparent_titlebar`) / the Linux CSD
 /// window controls sit on empty chrome rather than over the first nav item.
-const NAV_TOP_RESERVE: gpui::Pixels = gpui::px(44.);
+const NAV_TOP_RESERVE: gpui::Pixels = crate::titlebar::DRAG_BAND_HEIGHT;
 
 /// Width of the nav band. Narrow on purpose — three words, not a sidebar.
 const NAV_WIDTH: gpui::Pixels = gpui::px(132.);

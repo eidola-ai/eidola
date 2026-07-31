@@ -36,6 +36,22 @@
 
 use std::cell::Cell;
 
+use crate::overlay::{Contain as _, Overlay};
+
+/// **The drag band's height — one constant for every window.**
+///
+/// The band is a hit target the user cannot see, so its height being uniform is
+/// what makes "grab the top of any window" mean the same thing everywhere. It
+/// also has to clear the macOS traffic lights (`traffic_light_position` puts
+/// them at y=11, ~12px tall) and the Linux CSD control cluster.
+///
+/// Settings used to reserve 44px here while every other window used 36 — an
+/// 8px strip of extra dead space that, once the band started *blocking* the
+/// mouse (task 32), swallowed the top of the Backends pane's tab strip and made
+/// the tabs unclickable. The panes carry their own heading padding; the band
+/// does not fake it for them.
+pub const DRAG_BAND_HEIGHT: gpui::Pixels = gpui::px(36.);
+
 use gpui::{
     App, Div, InteractiveElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Stateful, Styled, Window, div, prelude::FluentBuilder,
@@ -68,7 +84,10 @@ pub(crate) fn make_draggable(
     );
     let on_down = armed.clone();
     let on_up = armed.clone();
-    el.block_mouse_except_scroll()
+    // Translucent chrome over live content — see `crate::overlay`: the press
+    // is the band's own (the window move), while a wheel gesture that starts
+    // in it is plainly aimed at the page showing through and passes down.
+    el.contain_mouse(Overlay::Fade)
         .on_mouse_down(
             MouseButton::Left,
             move |ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {

@@ -7694,3 +7694,129 @@ fn space_composer_context_menu_offers_paste_only_when_there_is_text_to_paste(
         );
     });
 }
+
+/// REGRESSION: the floating composer is an **opaque interactive surface** over
+/// the page, so a press inside it must belong to it alone. It didn't: gpui
+/// reports every hitbox under the cursor, so a drag-select in the composer also
+/// landed in the post scrolled beneath it — selecting that post's text, and
+/// (because a readonly post mid-drag-selection drives the page's
+/// selection-autoscroll) scrolling the page up and down while you dragged.
+#[gpui::test]
+fn space_composer_drag_is_contained_and_does_not_scroll_the_page(cx: &mut TestAppContext) {
+    let long = (1..=16)
+        .map(|i| {
+            format!(
+                "Paragraph {i}. Sunlight is a fairly even mix across the visible spectrum, \
+                 and as it crosses the atmosphere it meets molecules far smaller than its \
+                 wavelength."
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("comp".into()));
+    view.update(cx, |v, cx| {
+        v.space().update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("p1", &long)], cx)
+        });
+    });
+    cx.run_until_parked();
+    open_space_draft(&view, window, cx, Some("p1"));
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(680.)));
+    vcx.run_until_parked();
+    let composer = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the branch tail opens a draft composer");
+    composer.update(&mut vcx, |e, cx| {
+        e.set_value("a draft being edited".to_string(), cx)
+    });
+    // Park the page at the top so the composer's slot sits far below the fold
+    // and the bar renders *floating* over the post rather than docked under it.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    view.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.composer_overlayed_for_test()),
+        "fixture drift: the composer must be floating over the page for this repro"
+    );
+
+    // A point that is inside the composer's own painted text **and** over the
+    // post's painted text — the bug only exists where the two overlap, so the
+    // point is derived from real geometry rather than assumed (and the search
+    // failing is a loud fixture-drift panic, which is what gives this test its
+    // teeth).
+    let lines = |e: &Entity<gpui_markdown_editor::MarkdownEditorState>,
+                 vcx: &VisualTestContext|
+     -> Vec<(f32, f32, f32)> {
+        e.read_with(vcx, |e, _| {
+            e.debug_line_geometry()
+                .iter()
+                .flat_map(|(_, l)| l.iter().copied())
+                .collect()
+        })
+    };
+    let composer_lines = lines(&composer, &vcx);
+    let post = view
+        .read_with(&vcx, |v, _| v.post_body_editor_for_test("p1"))
+        .expect("p1's editor");
+    let post_lines = lines(&post, &vcx);
+    let at = composer_lines
+        .iter()
+        .find_map(|&(x, cy, ch)| {
+            post_lines
+                .iter()
+                .find(|&&(_, py, ph)| py < cy + ch && cy < py + ph)
+                .map(|&(_, py, ph)| {
+                    let top = cy.max(py);
+                    let bottom = (cy + ch).min(py + ph);
+                    gpui::point(px(x + 30.0), px((top + bottom) / 2.0))
+                })
+        })
+        .unwrap_or_else(|| {
+            panic!("fixture drift: composer {composer_lines:?} never overlaps post {post_lines:?}")
+        });
+
+    let before_scroll = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    let end = gpui::point(at.x + px(220.), at.y + px(4.));
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: at,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(gpui::MouseMoveEvent {
+        position: end,
+        pressed_button: Some(gpui::MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    vcx.run_until_parked();
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: end,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        let sel = v
+            .post_body_editor_for_test("p1")
+            .expect("p1's editor")
+            .read(cx)
+            .selection();
+        assert_eq!(
+            sel.lower_bound(),
+            sel.upper_bound(),
+            "a drag inside the composer must leave the post beneath unselected, got {sel:?}"
+        );
+        assert_eq!(
+            v.page_scroll_offset_y_for_test(),
+            before_scroll,
+            "and must not drive the page's selection-autoscroll"
+        );
+    });
+}

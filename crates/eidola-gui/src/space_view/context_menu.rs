@@ -47,6 +47,7 @@ use gpui::{
 use gpui_component::{ActiveTheme, v_flex};
 use gpui_markdown_editor::{EditorCommand, MarkdownEditorState};
 
+use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
 
 use super::SpaceView;
@@ -373,7 +374,7 @@ impl SpaceView {
                     ContextTarget::Post { .. } => "Post menu",
                 },
             )
-            .occlude()
+            .contain_mouse(Overlay::Popover)
             .absolute()
             .left(left)
             .top(top)

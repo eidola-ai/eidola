@@ -11,6 +11,7 @@ pub mod general;
 pub mod library;
 pub mod loadable;
 pub mod onboarding;
+pub mod overlay;
 pub mod participants_view;
 mod plans;
 pub mod probe;

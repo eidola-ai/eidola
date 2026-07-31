@@ -14,6 +14,8 @@ use gpui_markdown_editor::MarkdownEditor;
 
 use crate::probe::Probe as _;
 
+use crate::overlay::{Contain as _, Overlay};
+
 use super::context_menu::ContextTarget;
 use super::layout::body_width;
 use super::model::{NodeSrc, TreeNode};
@@ -828,7 +830,7 @@ impl SpaceView {
                     gpui::Role::Group,
                     "Reply or ask a participant",
                 )
-                .occlude()
+                .contain_mouse(Overlay::Popover)
                 .items_center()
                 .gap_1()
                 .px_1()
