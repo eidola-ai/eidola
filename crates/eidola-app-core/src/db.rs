@@ -17,7 +17,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 3;
+const LATEST_VERSION: i64 = 4;
 
 /// Well-known id of the shared human "You" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -2666,6 +2666,256 @@ pub async fn current_branch_summaries(
             item_id: row.get::<String>(2).map_err(AppError::db)?,
             summarized_action_id: row.get::<String>(3).map_err(AppError::db)?,
             text,
+        });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2 — Semantic: Agent memory (see [`crate::memory`])
+// ---------------------------------------------------------------------------
+
+/// `action_type` of one generation of a memory block. Not a post type, so
+/// every render, tree and context query collapses it out for free.
+pub const MEMORY_ACTION_TYPE: &str = "memory";
+
+/// A memory block's identity row (`memory_block`). Its *contents* live on the
+/// item's action generations; this is who owns it, what it is called, and
+/// where it applies.
+#[derive(Clone, Debug)]
+pub struct MemoryBlockRow {
+    pub item_id: String,
+    pub root_action_id: String,
+    pub owner_participant_id: String,
+    pub owner_scope: String,
+    pub name: String,
+    /// `core` (loads wherever the owner goes) or `space` (loads in
+    /// `space_id` only). Addressing, never ownership.
+    pub scope: String,
+    /// Residence: the space the block is about, and where its actions live.
+    pub space_id: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One block as a turn loads it: the identity plus the current generation's
+/// text.
+#[derive(Clone, Debug)]
+pub struct MemoryEntryRow {
+    pub item_id: String,
+    pub name: String,
+    pub scope: String,
+    pub space_id: String,
+    pub action_id: String,
+    pub text: String,
+    pub updated_at: i64,
+}
+
+/// One generation of a block, for inspection.
+#[derive(Clone, Debug)]
+pub struct MemoryRevisionRow {
+    pub action_id: String,
+    /// Who wrote *this* generation. The owner is on the block; this is the
+    /// author, which is what tells a self-revision from a human correction.
+    pub author_participant_id: String,
+    pub created_at: i64,
+    pub text: String,
+}
+
+pub async fn insert_memory_block(conn: &Connection, row: &MemoryBlockRow) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO memory_block (item_id, root_action_id, owner_participant_id, owner_scope, \
+         name, scope, space_id, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        (
+            Value::Text(row.item_id.clone()),
+            Value::Text(row.root_action_id.clone()),
+            Value::Text(row.owner_participant_id.clone()),
+            Value::Text(row.owner_scope.clone()),
+            Value::Text(row.name.clone()),
+            Value::Text(row.scope.clone()),
+            Value::Text(row.space_id.clone()),
+            Value::Integer(row.created_at),
+            Value::Integer(row.updated_at),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert memory block: {e}"),
+    })?;
+    Ok(())
+}
+
+/// Record a revision against an existing block: its scope may move (`core` ⇄
+/// `space`) and its `updated_at` advances. The contents are the new
+/// generation's, so nothing else here changes.
+pub async fn touch_memory_block(
+    conn: &Connection,
+    item_id: &str,
+    scope: &str,
+    updated_at: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE memory_block SET scope = ?2, updated_at = ?3 WHERE item_id = ?1",
+        (
+            Value::Text(item_id.to_string()),
+            Value::Text(scope.to_string()),
+            Value::Integer(updated_at),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to update memory block: {e}"),
+    })?;
+    Ok(())
+}
+
+fn memory_block_row(row: &turso::Row) -> Result<MemoryBlockRow, AppError> {
+    Ok(MemoryBlockRow {
+        item_id: row.get::<String>(0).map_err(AppError::db)?,
+        root_action_id: row.get::<String>(1).map_err(AppError::db)?,
+        owner_participant_id: row.get::<String>(2).map_err(AppError::db)?,
+        owner_scope: row.get::<String>(3).map_err(AppError::db)?,
+        name: row.get::<String>(4).map_err(AppError::db)?,
+        scope: row.get::<String>(5).map_err(AppError::db)?,
+        space_id: row.get::<String>(6).map_err(AppError::db)?,
+        created_at: row.get::<i64>(7).map_err(AppError::db)?,
+        updated_at: row.get::<i64>(8).map_err(AppError::db)?,
+    })
+}
+
+const MEMORY_BLOCK_COLUMNS: &str = "item_id, root_action_id, owner_participant_id, owner_scope, \
+                                    name, scope, space_id, created_at, updated_at";
+
+/// The owner's block of that name, wherever it resides. Names are unique per
+/// owner, so this is the upsert key `remember` addresses.
+pub async fn memory_block_by_name(
+    conn: &Connection,
+    owner_participant_id: &str,
+    name: &str,
+) -> Result<Option<MemoryBlockRow>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {MEMORY_BLOCK_COLUMNS} FROM memory_block \
+             WHERE owner_participant_id = ?1 AND name = ?2"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(owner_participant_id.to_string()),
+            Value::Text(name.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(memory_block_row(&row)?)),
+    }
+}
+
+/// Every block an owner has, newest-updated first — the inspection read (and
+/// the block-count budget's denominator).
+pub async fn memory_blocks_owned(
+    conn: &Connection,
+    owner_participant_id: &str,
+) -> Result<Vec<MemoryBlockRow>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {MEMORY_BLOCK_COLUMNS} FROM memory_block \
+             WHERE owner_participant_id = ?1 ORDER BY updated_at DESC, name ASC"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(owner_participant_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(memory_block_row(&row)?);
+    }
+    Ok(out)
+}
+
+/// **The loading rule**: the participant's `core` blocks plus the blocks about
+/// `space_id`, each at its current generation, core first then by name.
+///
+/// The order is a function of the data (not of write order), so a turn's bytes
+/// only move when the memory itself does.
+pub async fn participant_memory(
+    conn: &Connection,
+    owner_participant_id: &str,
+    space_id: &str,
+) -> Result<Vec<MemoryEntryRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.item_id, m.name, m.scope, m.space_id, ic.current_action_id, \
+                    cb.text_content, m.updated_at \
+             FROM memory_block m \
+             JOIN item_current ic \
+               ON ic.space_id = m.space_id AND ic.item_id = m.item_id \
+             LEFT JOIN content_block cb \
+               ON cb.action_id = ic.current_action_id AND cb.ordinal = 0 \
+             WHERE m.owner_participant_id = ?1 \
+               AND (m.scope = 'core' OR m.space_id = ?2) \
+             ORDER BY CASE m.scope WHEN 'core' THEN 0 ELSE 1 END, m.name ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(owner_participant_id.to_string()),
+            Value::Text(space_id.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        let text: Option<String> = row.get(5).map_err(AppError::db)?;
+        let Some(text) = text else { continue };
+        out.push(MemoryEntryRow {
+            item_id: row.get::<String>(0).map_err(AppError::db)?,
+            name: row.get::<String>(1).map_err(AppError::db)?,
+            scope: row.get::<String>(2).map_err(AppError::db)?,
+            space_id: row.get::<String>(3).map_err(AppError::db)?,
+            action_id: row.get::<String>(4).map_err(AppError::db)?,
+            text,
+            updated_at: row.get::<i64>(6).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Every generation of a block, oldest first — the revision history the
+/// inspector reads (and the authorship trail).
+pub async fn memory_revisions(
+    conn: &Connection,
+    item_id: &str,
+) -> Result<Vec<MemoryRevisionRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.id, a.participant_id, a.created_at, cb.text_content \
+             FROM action a \
+             LEFT JOIN content_block cb ON cb.action_id = a.id AND cb.ordinal = 0 \
+             WHERE a.item_id = ?1 ORDER BY a.created_at ASC, a.id ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(item_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(MemoryRevisionRow {
+            action_id: row.get::<String>(0).map_err(AppError::db)?,
+            author_participant_id: row.get::<String>(1).map_err(AppError::db)?,
+            created_at: row.get::<i64>(2).map_err(AppError::db)?,
+            text: row
+                .get::<Option<String>>(3)
+                .map_err(AppError::db)?
+                .unwrap_or_default(),
         });
     }
     Ok(out)
