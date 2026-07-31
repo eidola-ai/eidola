@@ -2162,9 +2162,66 @@ impl Inner {
         Ok(build_post_tree(data))
     }
 
+    /// [`Self::references_to`], filtered to the referring posts
+    /// `viewer_participant_id` could actually follow: those in spaces it is a
+    /// member of (task 37's inbound-exposure decision).
+    ///
+    /// Inbound exposure is the reverse direction of rule 3: rule 3 makes a
+    /// reference public *within the space that made it*, and says nothing about
+    /// the quoted space, where an unfiltered backlink would announce the
+    /// existence of a conversation the viewer has no part in. Filtering per
+    /// viewer keeps "you can see it" and "you can open it" the same set, which
+    /// is also the only rendering a UI can make honest — a backlink that cannot
+    /// be followed is noise at best.
+    ///
+    /// Same-space backlinks are unaffected: a viewer is a member of the space
+    /// it is reading, so the wave-2 source highlights see exactly what they saw.
+    async fn references_to_visible_to(
+        &self,
+        action_id: &str,
+        viewer_participant_id: &str,
+    ) -> Result<Vec<IncomingReference>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::references_to(&db_conn, action_id).await?;
+        let mut out = Vec::new();
+        // Referrers cluster in few spaces; one membership read per distinct
+        // space, not per row.
+        let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        for r in rows {
+            let visible = match seen.get(&r.space_id) {
+                Some(v) => *v,
+                None => {
+                    let v =
+                        db::is_space_member(&db_conn, &r.space_id, viewer_participant_id).await?;
+                    seen.insert(r.space_id.clone(), v);
+                    v
+                }
+            };
+            if !visible {
+                continue;
+            }
+            out.push(IncomingReference {
+                action_id: r.action_id,
+                space_id: r.space_id,
+                ordinal: r.ordinal,
+                content_block_id: r.content_block_id,
+                range_start: r.range_start,
+                range_end: r.range_end,
+                annotation: r.annotation,
+                created_at: r.created_at,
+            });
+        }
+        Ok(out)
+    }
+
     /// Every current-generation post referencing `action_id` (the concrete
     /// generation — references never remap to tips), with the quoted ranges.
     /// Pure read; the reverse index behind the wave-2 source highlights.
+    ///
+    /// **Unfiltered** — it reports referrers in every space. That is right for
+    /// the same-space highlight it was built for; a surface that may show
+    /// *cross-space* backlinks wants [`Self::references_to_visible_to`], which
+    /// shows a viewer only the referrers it could follow.
     async fn references_to(&self, action_id: &str) -> Result<Vec<IncomingReference>, AppError> {
         let db_conn = self.db_conn().await?;
         let rows = db::references_to(&db_conn, action_id).await?;
@@ -2322,24 +2379,44 @@ impl Inner {
     }
 
     /// Validate a [`ReferenceSpec`] against the database — the pre-write gate
-    /// for `post(..., references)` and `edit_post` replication. Checks, in
-    /// order: the antecedent action exists (any space — references are the
-    /// schema's cross-space knowledge mechanism); range/`content_block_id`
-    /// pairing (a range requires a block, both range ends together); the
-    /// block belongs to the antecedent action; and the byte range maps
-    /// honestly onto the block's text ([`quote_snippet`]). Typed
-    /// [`AppError::NotConfigured`] on every violation.
+    /// for `post(..., references)`. Checks, in order: the antecedent action
+    /// exists (any space — references are the schema's cross-space knowledge
+    /// mechanism); **`author_participant_id` is a member of the antecedent's
+    /// space** (task 37 rule 1 — you may quote what you can read);
+    /// range/`content_block_id` pairing (a range requires a block, both range
+    /// ends together); the block belongs to the antecedent action; and the byte
+    /// range maps honestly onto the block's text ([`quote_snippet`]). Typed
+    /// [`AppError::NotConfigured`] on every violation except the membership one,
+    /// which is [`AppError::NotAParticipant`] (non-leaking by construction).
+    ///
+    /// **This gates creation, not replication.** `edit_post` copies the tip's
+    /// existing reference edges onto the new generation without coming through
+    /// here, and that is deliberate: quoting *copies* the excerpt to the new
+    /// audience (rule 2), so by the time an edit happens the passage is already
+    /// public in this space — append-only, forever. Re-checking would make
+    /// editing your own post fail because you later left the source space,
+    /// costing an author their edit surface and buying no privacy back.
     async fn validate_reference_spec(
         &self,
         conn: &turso::Connection,
+        author_participant_id: &str,
         spec: &ReferenceSpec,
     ) -> Result<(), AppError> {
-        if db::action_item_and_space(conn, &spec.antecedent_action_id)
-            .await?
-            .is_none()
-        {
+        let Some((_, source_space_id)) =
+            db::action_item_and_space(conn, &spec.antecedent_action_id).await?
+        else {
             return Err(AppError::NotConfigured {
                 message: format!("referenced action not found: {}", spec.antecedent_action_id),
+            });
+        };
+        // Rule 1: only a participant of the referenced space may create a
+        // reference to it. Membership is the ACL (task 36), so the fix is an
+        // ordinary grant and a retry — no special machinery, no new concept.
+        // The refusal names nothing about that space (see `NotAParticipant`).
+        if !db::is_space_member(conn, &source_space_id, author_participant_id).await? {
+            return Err(AppError::NotAParticipant {
+                participant_id: author_participant_id.to_string(),
+                action_id: spec.antecedent_action_id.clone(),
             });
         }
         if spec.range_start.is_some() != spec.range_end.is_some() {
@@ -3162,9 +3239,13 @@ impl Inner {
 
         // Validate every reference before any write (pure error, no
         // emission). Unlike `reply_to`, a reference may point at an action in
-        // ANY space (the schema's cross-space knowledge mechanism).
+        // ANY space (the schema's cross-space knowledge mechanism) — provided
+        // the author takes part there (task 37 rule 1). The author is the
+        // shared "You", which the default template references into every
+        // space, so the single-user case is unaffected.
         for spec in references {
-            self.validate_reference_spec(&db_conn, spec).await?;
+            self.validate_reference_spec(&db_conn, &user_participant_id, spec)
+                .await?;
         }
 
         let (space_id, space_title, is_new_space) = if let Some(sid) = space_id {
@@ -4150,7 +4231,16 @@ impl Inner {
             if nav_tools {
                 registry.register(Arc::new(tools::ListBranchesTool::new(thread.clone())));
                 registry.register(Arc::new(tools::ReadThreadTool::new(thread.clone())));
-                registry.register(Arc::new(tools::ReadPostTool::new(thread.clone())));
+                // `read_post` also follows a quote into the space it came
+                // from, which is membership-gated per call — so unlike its two
+                // siblings it is bound to the responding participant and needs
+                // a handle back to the core (task 37).
+                registry.register(Arc::new(tools::ReadPostTool::new(
+                    thread.clone(),
+                    self.self_ref.clone(),
+                    model_participant_id.clone(),
+                    space_id.clone(),
+                )));
             }
             if memory_tool {
                 registry.register(Arc::new(memory::RememberTool::new(
@@ -6934,6 +7024,31 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.references_to(&action_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// [`Self::references_to`] filtered per viewer: only the referring posts
+    /// `viewer_participant_id` takes part in — the referrers it could actually
+    /// follow (task 37's inbound-exposure rule). A cross-space-aware surface
+    /// wants this one; a same-space highlight sees the same rows either way,
+    /// since a viewer is a member of the space it is reading. Pure read; emits
+    /// nothing.
+    ///
+    /// For the human surfaces the viewer is `db::HUMAN_PARTICIPANT_ID` — the
+    /// shared "You" the default template references into every space.
+    pub async fn references_to_visible_to(
+        &self,
+        action_id: String,
+        viewer_participant_id: String,
+    ) -> Result<Vec<IncomingReference>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .references_to_visible_to(&action_id, &viewer_participant_id)
+                    .await
+            })
             .await
             .map_err(join_err)?
     }

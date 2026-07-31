@@ -1679,6 +1679,131 @@ pub async fn notebook_space_for(
     }
 }
 
+/// Whether a participant is a member of one space — **owned row ∪ live
+/// reference row**, the same membership definition [`participant_spaces`] and
+/// [`space_participants`] read from their two sides, asked of a single space.
+/// This is the cross-space ACL (task 37): reference *creation* and reference
+/// *following* both gate on it.
+///
+/// Deliberately **not** filtered on `space.archived_at`: archiving is a Library
+/// visibility choice, not a departure. A member of an archived space is still a
+/// member, and quoting or following into one is exactly as permitted as it was
+/// the day before it was archived. (`participant_spaces` filters archived spaces
+/// because it renders a *listing*.)
+pub async fn is_space_member(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+) -> Result<bool, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM participant p \
+                 WHERE p.id = ?2 AND p.owner_space_id = ?1 AND p.removed_at IS NULL \
+             ) OR EXISTS ( \
+                 SELECT 1 FROM space_participant r \
+                 WHERE r.participant_id = ?2 AND r.space_id = ?1 AND r.left_at IS NULL \
+             )",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(false),
+        Some(row) => Ok(row.get::<i64>(0).map_err(AppError::db)? != 0),
+    }
+}
+
+/// One post read through a `reference` edge (task 37's membership-gated
+/// follow): everything needed to render it in the wire format, for an action
+/// that may live in another space — so it is a **concrete generation** read by
+/// id, not a tree walk. `space_title` is `None` for an untitled space.
+#[derive(Clone, Debug)]
+pub struct ReferencedPostRow {
+    pub space_id: String,
+    pub space_title: Option<String>,
+    pub item_id: String,
+    /// Effective label of the author in *its own* space (the override applies
+    /// where the post was written, which is where it is being read from).
+    pub participant_label: String,
+    pub action_type: String,
+    /// The action's `text` blocks, concatenated in ordinal order (`thinking`
+    /// and tool blocks are never part of the readable transcript).
+    pub text: String,
+}
+
+/// Read one action as a referenced post. `None` when the action doesn't exist.
+///
+/// The caller is responsible for the membership gate — this is the read that
+/// runs *after* it passes.
+pub async fn referenced_post(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<ReferencedPostRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.space_id, s.title, a.item_id, \
+                    COALESCE(sp.override_label, p.label), a.action_type \
+             FROM action a \
+             JOIN space s ON s.id = a.space_id \
+             JOIN participant p ON p.id = a.participant_id \
+             LEFT JOIN space_participant sp \
+                    ON sp.space_id = a.space_id AND sp.participant_id = a.participant_id \
+             WHERE a.id = ?1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let Some(row) = rows.next().await.map_err(AppError::db)? else {
+        return Ok(None);
+    };
+    let space_id = row.get::<String>(0).map_err(AppError::db)?;
+    let space_title = row.get::<Option<String>>(1).map_err(AppError::db)?;
+    let item_id = row.get::<String>(2).map_err(AppError::db)?;
+    let participant_label = row.get::<String>(3).map_err(AppError::db)?;
+    let action_type = row.get::<String>(4).map_err(AppError::db)?;
+
+    // The readable transcript is `text` blocks only — the same rule both
+    // context queries apply, so a persisted `thinking` block stays a
+    // render-side disclosure and never travels through a follow.
+    let mut stmt = conn
+        .prepare(
+            "SELECT text_content FROM content_block \
+             WHERE action_id = ?1 AND block_type = 'text' \
+             ORDER BY ordinal ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut text = String::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        if let Some(t) = row.get::<Option<String>>(0).map_err(AppError::db)? {
+            text.push_str(&t);
+        }
+    }
+
+    Ok(Some(ReferencedPostRow {
+        space_id,
+        space_title,
+        item_id,
+        participant_label,
+        action_type,
+        text,
+    }))
+}
+
 /// Every space a participant is a member of — **owned rows ∪ live references**,
 /// the same membership definition [`space_participants`] reads from the other
 /// side. This is the boundary for everything cross-space: task 36's
