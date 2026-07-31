@@ -3,6 +3,7 @@ pub mod changes;
 pub mod config;
 pub mod db;
 pub mod decline;
+pub mod discovery;
 pub mod error;
 pub mod local_models;
 pub mod memory;
@@ -202,6 +203,22 @@ impl ParticipantInfo {
             reference: None,
         }
     }
+}
+
+/// What [`AppCore::promote_participant`] did: the participant is unchanged in
+/// identity (same id — that is the whole point of in-place promotion), so what
+/// the caller needs back is where it now lives.
+#[derive(Clone, Debug)]
+pub struct PromotionOutcome {
+    /// The promoted participant — the *same* id it had as a space-owned agent.
+    pub participant_id: String,
+    /// The space it was owned by, which now references it as a member. Its
+    /// effective config there is byte-identical to before (NULL overrides).
+    pub home_space_id: String,
+    /// The agent's private notebook space, created by the promotion. Hidden
+    /// from the Library listing; the residence of core memory blocks it writes
+    /// from now on.
+    pub notebook_space_id: String,
 }
 
 /// A new agent participant to add to a space (agents only — the human is the
@@ -2585,6 +2602,166 @@ impl Inner {
         Ok(())
     }
 
+    /// Add an existing **global** participant to a space as a member — the
+    /// other half of promotion (task 36), and what makes "one identity, many
+    /// spaces" reachable at all.
+    ///
+    /// A reference row with NULL overrides, so the agent arrives with exactly
+    /// its own config; "your role in this room" is the existing per-membership
+    /// override surface (`set_space_participant_override`). Idempotent — adding
+    /// a member twice is not an error, and re-adding one that left rejoins it.
+    async fn add_global_participant(
+        &self,
+        space_id: &str,
+        participant_id: &str,
+    ) -> Result<ParticipantInfo, AppError> {
+        let conn = self.db_conn().await?;
+        db::get_space(&conn, space_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            })?;
+        let row = db::get_participant(&conn, participant_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("participant not found: {participant_id}"),
+            })?;
+        if row.scope != "global" {
+            return Err(AppError::Config {
+                message: format!(
+                    "{} belongs to one space; share it first so it can take part in others",
+                    row.label
+                ),
+            });
+        }
+        // "Don't add a removed global to a space" is an app-layer rule (the
+        // row survives so forensic references resolve, but it is retired).
+        if row.removed_at.is_some() {
+            return Err(AppError::Config {
+                message: format!("{} has been retired and cannot rejoin a space", row.label),
+            });
+        }
+        // Eidola-the-harness authors on its own behalf and is deliberately a
+        // member of nowhere; making it one would put it in notify sets.
+        if participant_id == db::SYSTEM_PARTICIPANT_ID {
+            return Err(AppError::Config {
+                message: "Eidola itself is not a conversation participant".into(),
+            });
+        }
+        db::ensure_space_participant(&conn, space_id, participant_id, &row.role, now_ms()).await?;
+        self.bus.emit(Change::Participants);
+        let member = db::space_participants(&conn, space_id)
+            .await?
+            .into_iter()
+            .find(|m| m.participant_id == participant_id)
+            .ok_or_else(|| AppError::Internal {
+                message: "participant vanished after joining".into(),
+            })?;
+        Ok(ParticipantInfo::from_effective(member))
+    }
+
+    /// Promote a space-owned agent to a **global** identity — one colleague in
+    /// many conversations (task 36).
+    ///
+    /// In place: the same row, the same id, so authorship, provenance and
+    /// memory continuity are structural rather than stitched. The mechanics
+    /// (scope flip + echo cascade + home-space membership + notebook space)
+    /// live in [`db::promote_participant_tx`], all in one transaction; this is
+    /// the gate on *what* may be promoted.
+    ///
+    /// **Promotion is one-way.** Demotion would strand memberships (rows in
+    /// other spaces with no owner) and memory (blocks whose residence is a
+    /// space the agent no longer belongs to); retirement is the existing
+    /// soft-remove. It is enforced by there being no API for it: no update
+    /// surface writes `participant.scope` (`update_participant_config` touches
+    /// only the config columns), and this entry point refuses a participant
+    /// that is not a live space-owned agent — so every conceivable "demote"
+    /// call is a typed error rather than a partial write.
+    async fn promote_participant(
+        &self,
+        participant_id: &str,
+    ) -> Result<PromotionOutcome, AppError> {
+        let conn = self.db_conn().await?;
+        let row = db::get_participant(&conn, participant_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("participant not found: {participant_id}"),
+            })?;
+        if row.removed_at.is_some() {
+            return Err(AppError::NotConfigured {
+                message: format!("participant {participant_id} has been removed"),
+            });
+        }
+        if participant_id == db::HUMAN_PARTICIPANT_ID {
+            return Err(AppError::Config {
+                message: "the human participant is already shared across every space".into(),
+            });
+        }
+        match row.scope.as_str() {
+            "global" => {
+                return Err(AppError::Config {
+                    message: format!(
+                        "{} is already a shared agent; promotion is one-way and there is no \
+                         demotion — remove it from a space instead",
+                        row.label
+                    ),
+                });
+            }
+            "template" => {
+                return Err(AppError::Config {
+                    message: format!(
+                        "{} belongs to a space template, not a space. Promote the agent from a \
+                         space it is actually working in",
+                        row.label
+                    ),
+                });
+            }
+            _ => {}
+        }
+        if row.kind != "agent" {
+            return Err(AppError::Config {
+                message: format!(
+                    "only an agent can be shared across spaces (this is a {})",
+                    row.kind
+                ),
+            });
+        }
+        let home_space_id = row
+            .owner_space_id
+            .clone()
+            .ok_or_else(|| AppError::Internal {
+                message: "space-owned participant has no owner space".into(),
+            })?;
+
+        let notebook_space_id = Uuid::now_v7().to_string();
+        let notebook_title = format!("{} — notebook", row.label);
+        db::promote_participant_tx(
+            &conn,
+            participant_id,
+            &home_space_id,
+            &row.role,
+            &notebook_space_id,
+            &notebook_title,
+            now_ms(),
+        )
+        .await?;
+
+        // `Change::Participants` and nothing else. The home space's membership
+        // changed (owned → referenced) and a global appeared in the library —
+        // both that variant. `SpaceIndex` is deliberately NOT emitted: the one
+        // new space is a notebook, which `list_spaces` excludes unconditionally,
+        // so the Library listing provably did not change and emitting it would
+        // be a spurious invalidation of a store that reads nothing new
+        // (STATE.md's 1:1 variant↔store rule).
+        self.bus.emit(Change::Participants);
+
+        Ok(PromotionOutcome {
+            participant_id: participant_id.to_string(),
+            home_space_id,
+            notebook_space_id,
+        })
+    }
+
     async fn remove_space_participant(
         &self,
         space_id: &str,
@@ -3791,6 +3968,21 @@ impl Inner {
         };
         let memory_tool = memory_on && backend_accepts_tools;
 
+        // ---- Cross-space discovery (task 36) ------------------------------
+        //
+        // A **global** agent is one identity in several conversations, and its
+        // context is branch-scoped like everyone's — so without this it cannot
+        // know the others exist. The gate is structural rather than a process
+        // opt-in: a global agent exists only because a human promoted one, so
+        // an install that has not promoted anything sends byte-identical
+        // requests for exactly the reason a linear space does (see
+        // [`discovery`] for why it deliberately does not ride the memory
+        // opt-in). The backend must still be able to carry a `tools` field.
+        // Both selector paths already guarantee the responder is an agent
+        // (`resolve_explicit_participant` refuses any other kind; the model
+        // path resolves or mints one), so the scope is the whole test.
+        let spaces_tool = model_participant_scope == "global" && backend_accepts_tools;
+
         // Render the rows from the *responding participant's* point of view:
         // only its own prior posts are `assistant`, everyone else's are `user`,
         // and every message carries its uniform `#<handle> · <label>` header
@@ -3859,6 +4051,11 @@ impl Inner {
         // cannot carry tools still reads its notes.
         if memory_tool {
             notes.push(memory::MEMORY_NOTE);
+        }
+        // Likewise the global-agent note: it flips exactly once, at promotion,
+        // and is byte-stable thereafter.
+        if spaces_tool {
+            notes.push(discovery::GLOBAL_AGENT_NOTE);
         }
         let mut system_content = match system_prompt
             .as_deref()
@@ -3951,7 +4148,7 @@ impl Inner {
                 .expect("tool registry lock poisoned")
                 .clone(),
         );
-        let auto_tools = nav_tools || memory_tool;
+        let auto_tools = nav_tools || memory_tool || spaces_tool;
         let tool_registry = if auto_tools {
             let mut registry = (*consumer_tools).clone();
             if nav_tools {
@@ -3966,6 +4163,13 @@ impl Inner {
                     model_participant_scope.clone(),
                     space_id.clone(),
                     thread.clone(),
+                )));
+            }
+            if spaces_tool {
+                registry.register(Arc::new(discovery::ListMySpacesTool::new(
+                    self.self_ref.clone(),
+                    model_participant_id.clone(),
+                    space_id.clone(),
                 )));
             }
             Arc::new(registry)
@@ -6824,6 +7028,65 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Add an existing global participant to a space (a shared agent joining
+    /// another conversation — the read side of promotion). Idempotent. Emits
+    /// [`Change::Participants`].
+    pub async fn add_global_participant(
+        &self,
+        space_id: String,
+        participant_id: String,
+    ) -> Result<ParticipantInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .add_global_participant(&space_id, &participant_id)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Share a space-owned agent across spaces: promote it to a **global**
+    /// identity, in place (task 36).
+    ///
+    /// The participant keeps its id, its posts, its provenance and its memory
+    /// — promotion moves no data. The space it came from keeps it as a member
+    /// with NULL overrides, so its persona there is preserved byte-for-byte.
+    /// A private notebook space is created for it at the same time (hidden
+    /// from [`Self::list_spaces`]; the residence of the core memory blocks it
+    /// writes from now on).
+    ///
+    /// **One-way**: there is no demotion. Typed errors for a participant that
+    /// is already global, belongs to a template, is the shared human, is not
+    /// an agent, or is unknown/removed. Emits [`Change::Participants`].
+    pub async fn promote_participant(
+        &self,
+        participant_id: String,
+    ) -> Result<PromotionOutcome, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.promote_participant(&participant_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The private notebook space of a global agent, if it has one — the door
+    /// the agent-management surface opens for inspection. Pure read.
+    pub async fn notebook_space_id(
+        &self,
+        participant_id: String,
+    ) -> Result<Option<String>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                db::notebook_space_for(&conn, &participant_id).await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
     /// "Override here": set per-membership overrides for a **referenced global**
     /// participant — this space only, leaving the shared global's own config
     /// untouched (vs [`Self::update_space_participant`]'s "edit everywhere").
@@ -9498,7 +9761,7 @@ impl ThreadSnapshot {
 }
 
 /// `"1 post"` / `"4 posts"`.
-fn plural_posts(n: usize) -> String {
+pub(crate) fn plural_posts(n: usize) -> String {
     if n == 1 {
         "1 post".to_string()
     } else {
@@ -9509,7 +9772,7 @@ fn plural_posts(n: usize) -> String {
 /// Coarse, human relative time. Deliberately bucketed: the map is recomputed
 /// every turn, and a precise timestamp would churn its bytes for no reader
 /// benefit while a bucket stays stable for minutes or hours at a time.
-fn relative_time_ms(then: i64, now: i64) -> String {
+pub(crate) fn relative_time_ms(then: i64, now: i64) -> String {
     let secs = (now - then).max(0) / 1000;
     if secs < 60 {
         "just now".to_string()
@@ -9533,7 +9796,7 @@ const SNIPPET_MAX_CHARS: usize = 120;
 /// bullets, blockquotes, numbered lists) and surrounding emphasis
 /// characters, then truncate to ~64 chars on a word boundary (appending an
 /// ellipsis when truncated). Returns `None` if nothing presentable is left.
-fn derive_space_title(prompt: &str) -> Option<String> {
+pub(crate) fn derive_space_title(prompt: &str) -> Option<String> {
     let line = prompt.lines().map(str::trim).find(|l| !l.is_empty())?;
 
     // Strip leading block markers, repeatedly — "> # Heading" etc.

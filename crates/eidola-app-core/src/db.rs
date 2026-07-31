@@ -17,7 +17,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 4;
+const LATEST_VERSION: i64 = 5;
 
 /// Well-known id of the shared human "You" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -1545,6 +1545,195 @@ pub async fn delete_template_owned_participants(
     Ok(())
 }
 
+// --- promotion (task 36): space-owned agent → global identity --------------
+
+/// Promote a space-owned agent to a **global** identity, in place and in one
+/// transaction. Same row, same id — so authorship, provenance and memory
+/// continuity are structural rather than stitched. Copy-projection was
+/// rejected: it fragments past posts, memory blocks and reference edges across
+/// two identities, which is the opposite of what promotion exists to create.
+///
+/// Three writes, all or nothing:
+///
+/// 1. `owner_space_id → NULL`, `scope → 'global'` on the participant row. The
+///    pinned `participant_scope` echo on every past `action` and every
+///    `memory_block` follows via `ON UPDATE CASCADE` — see the schema comments
+///    there and `turso_enforcement_smoke` case (e).
+/// 2. A `space_participant` reference row for the **former owner space**, with
+///    NULL overrides. Ownership no longer implies membership, and NULL
+///    overrides mean the effective config (`COALESCE(override, config)`) is
+///    byte-identical to what it was: the space's persona is preserved exactly.
+/// 3. The agent's private **notebook space** (`space.notebook_participant_id`),
+///    referenced into by the agent itself, hidden from the Library listing.
+///
+/// The caller has already validated *what* may be promoted (kind, scope, the
+/// shared "You", removal); this is the mechanics.
+pub async fn promote_participant_tx(
+    conn: &Connection,
+    participant_id: &str,
+    home_space_id: &str,
+    role: &str,
+    notebook_space_id: &str,
+    notebook_title: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    match promote_participant_tx_body(
+        conn,
+        participant_id,
+        home_space_id,
+        role,
+        notebook_space_id,
+        notebook_title,
+        now,
+    )
+    .await
+    {
+        Ok(()) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn promote_participant_tx_body(
+    conn: &Connection,
+    participant_id: &str,
+    home_space_id: &str,
+    role: &str,
+    notebook_space_id: &str,
+    notebook_title: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    // Both key columns move in one statement: the three-way scope/owner CHECK
+    // must hold at statement end, and the cascade fires off the (id, scope)
+    // parent key.
+    let n = conn
+        .execute(
+            "UPDATE participant SET scope = 'global', owner_space_id = NULL \
+             WHERE id = ?1 AND scope = 'space'",
+            (Value::Text(participant_id.to_string()),),
+        )
+        .await
+        .map_err(AppError::db)?;
+    if n == 0 {
+        return Err(AppError::Database {
+            message: format!("participant {participant_id} was not a space-owned row to promote"),
+        });
+    }
+    insert_space_participant(conn, home_space_id, participant_id, role, now).await?;
+    insert_notebook_space(conn, notebook_space_id, participant_id, notebook_title, now).await?;
+    insert_space_participant(conn, notebook_space_id, participant_id, "owner", now).await?;
+    Ok(())
+}
+
+/// Create an agent's private notebook space. A real space in every respect —
+/// only `notebook_participant_id` distinguishes it, which is what the Library
+/// listing filters on and what the agent-management surface will look it up by.
+pub async fn insert_notebook_space(
+    conn: &Connection,
+    id: &str,
+    participant_id: &str,
+    title: &str,
+    created_at: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO space (id, parent_space_id, title, linkability, \
+                            notebook_participant_id, created_at) \
+         VALUES (?1, NULL, ?2, 'unlinked', ?3, ?4)",
+        (
+            Value::Text(id.to_string()),
+            Value::Text(title.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Integer(created_at),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert notebook space: {e}"),
+    })?;
+    Ok(())
+}
+
+/// The notebook space of a global agent, if it has one.
+pub async fn notebook_space_for(
+    conn: &Connection,
+    participant_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM space WHERE notebook_participant_id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(participant_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// Every space a participant is a member of — **owned rows ∪ live references**,
+/// the same membership definition [`space_participants`] reads from the other
+/// side. This is the boundary for everything cross-space: task 36's
+/// `list_my_spaces` reaches exactly these and nothing else.
+///
+/// Rows carry the same activity signals as [`list_spaces`], and notebooks are
+/// **included** — an agent's own notebook is one of its spaces.
+pub async fn participant_spaces(
+    conn: &Connection,
+    participant_id: &str,
+) -> Result<Vec<SpaceListRow>, AppError> {
+    let sql = format!(
+        "SELECT s.id, s.title, s.created_at, s.archived_at, \
+                COALESCE(MAX(a.created_at), s.created_at) AS last_activity_at, \
+                COUNT(a.id) AS message_count \
+         FROM space s \
+         LEFT JOIN action a ON a.space_id = s.id \
+              AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
+              AND a.status IN ('complete', 'cancelled') \
+              AND NOT EXISTS ( \
+                  SELECT 1 FROM action sup WHERE sup.supersedes_action_id = a.id \
+              ) \
+         WHERE s.archived_at IS NULL \
+           AND ( \
+               EXISTS ( \
+                   SELECT 1 FROM participant p \
+                   WHERE p.id = ?1 AND p.owner_space_id = s.id AND p.removed_at IS NULL \
+               ) \
+               OR EXISTS ( \
+                   SELECT 1 FROM space_participant r \
+                   WHERE r.participant_id = ?1 AND r.space_id = s.id AND r.left_at IS NULL \
+               ) \
+           ) \
+         GROUP BY s.id, s.title, s.created_at, s.archived_at \
+         ORDER BY last_activity_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(participant_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(SpaceListRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            title: row.get::<Option<String>>(1).map_err(AppError::db)?,
+            created_at: row.get::<i64>(2).map_err(AppError::db)?,
+            archived_at: row.get::<Option<i64>>(3).map_err(AppError::db)?,
+            last_activity_at: row.get::<i64>(4).map_err(AppError::db)?,
+            message_count: row.get::<i64>(5).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
 // --- reference tables (references to globals + overrides) -------------------
 
 /// Reference a global into a space (pinned `participant_scope='global'`, no
@@ -3030,6 +3219,12 @@ pub async fn insert_tool_result_content_block(
 pub struct RawActionRow {
     pub id: String,
     pub action_type: String,
+    /// The acting participant, with the pinned composite echo of its scope.
+    /// The echo is a constraint device, not a historical claim — task 36's
+    /// in-place promotion rewrites it across an agent's whole trail via
+    /// `ON UPDATE CASCADE` while `participant_id`, the identity, never moves.
+    pub participant_id: String,
+    pub participant_scope: String,
     pub status: String,
     pub model: Option<String>,
     pub credits_consumed: Option<i64>,
@@ -3056,7 +3251,8 @@ pub async fn raw_space_actions(
         .prepare(
             "SELECT a.id, a.action_type, a.status, a.model, a.credits_consumed, \
                     (SELECT aa.antecedent_action_id FROM action_antecedent aa \
-                      WHERE aa.action_id = a.id AND aa.relation = 'reply') \
+                      WHERE aa.action_id = a.id AND aa.relation = 'reply'), \
+                    a.participant_id, a.participant_scope \
              FROM action a WHERE a.space_id = ?1 ORDER BY a.created_at ASC, a.id ASC",
         )
         .await
@@ -3074,6 +3270,8 @@ pub async fn raw_space_actions(
             model: row.get::<Option<String>>(3).map_err(AppError::db)?,
             credits_consumed: row.get::<Option<i64>>(4).map_err(AppError::db)?,
             reply_to: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            participant_id: row.get::<String>(6).map_err(AppError::db)?,
+            participant_scope: row.get::<String>(7).map_err(AppError::db)?,
             blocks: Vec::new(),
         });
     }
@@ -3358,10 +3556,15 @@ pub async fn list_spaces(
     conn: &Connection,
     include_archived: bool,
 ) -> Result<Vec<SpaceListRow>, AppError> {
+    // Notebook spaces are excluded unconditionally: this is the Library
+    // listing, and an agent's notebook is reached from that agent's
+    // management surface, not from the list of the human's conversations.
+    // `include_archived` is about archival, an orthogonal axis — so it does
+    // not surface notebooks either.
     let filter = if include_archived {
-        ""
+        "WHERE s.notebook_participant_id IS NULL "
     } else {
-        "WHERE s.archived_at IS NULL "
+        "WHERE s.notebook_participant_id IS NULL AND s.archived_at IS NULL "
     };
     let sql = format!(
         "SELECT s.id, s.title, s.created_at, s.archived_at, \
@@ -4573,8 +4776,11 @@ mod tests {
     /// under this exact turso build: (a) single-column FK violations error;
     /// (b) composite/tuple FK violations error; (c) MATCH-SIMPLE NULL-skip (a
     /// NULL child column skips the composite FK — must NOT error); (d) CHECK
-    /// violations error. Also confirms the pragma is load-bearing (default-off
-    /// lets a dangling FK through).
+    /// violations error; (e) `ON UPDATE CASCADE` on a composite FK really
+    /// cascades — a parent `(id, scope)` update rewrites the child echo
+    /// columns (task 36's in-place promotion rests on exactly this).
+    /// Also confirms the pragma is load-bearing (default-off lets a dangling
+    /// FK through).
     #[tokio::test]
     async fn turso_enforcement_smoke() {
         let db = Builder::new_local(":memory:").build().await.unwrap();
@@ -4689,6 +4895,62 @@ mod tests {
         conn.execute("INSERT INTO checked (id, v) VALUES ('k2', 'a')", ())
             .await
             .expect("(d) a satisfied CHECK must be accepted");
+
+        // (e) ON UPDATE CASCADE on a composite FK. Task 36 promotes an agent
+        // in place — the same participant row flips scope 'space' → 'global' —
+        // and the pinned echo on every past `action` (and `memory_block`) must
+        // follow declaratively rather than by an app-layer rewrite. Prove the
+        // cascade fires on the *scope* half of the tuple, which is the half
+        // promotion mutates.
+        conn.execute_batch(
+            "CREATE TABLE child_cascade (
+                 id TEXT PRIMARY KEY,
+                 parent_id TEXT NOT NULL,
+                 parent_scope TEXT NOT NULL,
+                 FOREIGN KEY (parent_id, parent_scope) REFERENCES parent (id, scope)
+                     ON UPDATE CASCADE);",
+        )
+        .await
+        .unwrap();
+        conn.execute("INSERT INTO parent (id, scope) VALUES ('p2', 'space')", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO child_cascade (id, parent_id, parent_scope) VALUES ('e1', 'p2', 'space')",
+            (),
+        )
+        .await
+        .unwrap();
+        // A second child on a DIFFERENT parent, to prove the cascade is scoped
+        // to the updated row rather than blanket-rewriting the column.
+        conn.execute(
+            "INSERT INTO child_cascade (id, parent_id, parent_scope) VALUES ('e2', 'p1', 'global')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("UPDATE parent SET scope = 'global' WHERE id = 'p2'", ())
+            .await
+            .expect("(e) the parent scope update itself must succeed");
+
+        let mut stmt = conn
+            .prepare("SELECT id, parent_scope FROM child_cascade ORDER BY id")
+            .await
+            .unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        let mut seen: Vec<(String, String)> = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            seen.push((row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("e1".to_string(), "global".to_string()),
+                ("e2".to_string(), "global".to_string()),
+            ],
+            "(e) ON UPDATE CASCADE must rewrite the echo of the updated parent \
+             ('e1' space → global) and leave every other child alone"
+        );
     }
 
     #[tokio::test]
