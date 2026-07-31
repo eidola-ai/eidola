@@ -1383,9 +1383,10 @@ impl Render for BackendsSettingsView {
         }
 
         // The internal tab strip: Eidola · Local · External — gpui-component's
-        // `TabBar` in its default styling. `selected_index` drives the visual
-        // selection; each `Tab` keeps its own click handler (TabBar only
-        // overrides those when the bar itself carries an `on_click`).
+        // `TabBar` in its **segmented** variant. `selected_index` drives the
+        // visual selection (and the segmented indicator that slides to it);
+        // each `Tab` keeps its own click handler (TabBar only overrides those
+        // when the bar itself carries an `on_click`).
         let selected = [
             BackendsTab::Eidola,
             BackendsTab::Local,
@@ -1405,6 +1406,7 @@ impl Render for BackendsSettingsView {
                 .w_full()
                 .child(
                     TabBar::new("backends-tab-bar")
+                        .segmented()
                         .selected_index(selected)
                         .child(self.tab_item(BackendsTab::Eidola, cx))
                         .child(self.tab_item(BackendsTab::Local, cx))
