@@ -461,8 +461,12 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
 /// Returns `(posts, traces)` — the rendered tree plus the parallel trace index
 /// `AppCore::space_traces` returns. It carries both anchors the disclosure has
 /// to handle: an answered turn's rounds hanging under its own reply (including
-/// a navigation-tool descent), and a **decline** hanging under the post it
+/// a navigation-tool descent), and **declines** hanging under the post they
 /// answered — the gap, where no post was written at all.
+///
+/// The last post carries three of them — two agents bowing out, one of them
+/// twice — which is the case a single aggregated line could not render
+/// honestly: it would have to pick one byline for all three.
 pub fn trace_posts() -> (Vec<PostNode>, Vec<eidola_app_core::PostTrace>) {
     use eidola_app_core::{PostTrace, TraceEntry};
 
@@ -510,6 +514,7 @@ pub fn trace_posts() -> (Vec<PostNode>, Vec<eidola_app_core::PostTrace>) {
     follow_up.created_at = 3;
 
     let answered = PostTrace {
+        id: "turn-gemma".into(),
         anchor_action_id: "t2".into(),
         participant_label: "Gemma".into(),
         unanswered: false,
@@ -551,6 +556,7 @@ pub fn trace_posts() -> (Vec<PostNode>, Vec<eidola_app_core::PostTrace>) {
 
     // The gap: a turn that ran, looked, and wrote nothing.
     let declined = PostTrace {
+        id: "turn-mara".into(),
         anchor_action_id: "t3".into(),
         participant_label: "Mara".into(),
         unanswered: true,
@@ -570,5 +576,63 @@ pub fn trace_posts() -> (Vec<PostNode>, Vec<eidola_app_core::PostTrace>) {
         ],
     };
 
-    (vec![ask, answer, follow_up], vec![answered, declined])
+    // A second participant bows out of the same post — the fan-out case. Each
+    // turn is its own line, so neither agent's activity is credited to the
+    // other.
+    let also_declined = PostTrace {
+        id: "turn-ferris".into(),
+        anchor_action_id: "t3".into(),
+        participant_label: "Ferris".into(),
+        unanswered: true,
+        entries: vec![
+            TraceEntry::Tool {
+                action_id: "tc5".into(),
+                request_id: Some("req-5".into()),
+                call_id: "call_5".into(),
+                name: "list_branches".into(),
+                arguments: "{}".into(),
+                result: Some("2 branches at #h91b02e".into()),
+            },
+            TraceEntry::Declined {
+                action_id: "d2".into(),
+                reason: Some("Mara was in that branch, not me.".into()),
+            },
+        ],
+    };
+
+    // ...and Mara, asked again, bows out again. Two turns by one agent under
+    // one post: nothing but the turn's own identity tells them apart.
+    let declined_again = PostTrace {
+        id: "turn-mara-2".into(),
+        anchor_action_id: "t3".into(),
+        participant_label: "Mara".into(),
+        unanswered: true,
+        entries: vec![
+            TraceEntry::Tool {
+                action_id: "tc6".into(),
+                request_id: Some("req-6".into()),
+                call_id: "call_6".into(),
+                name: "read_post".into(),
+                arguments: "{\"handle\":\"h3f2a9c\"}".into(),
+                result: Some("#h3f2a9c · you — \"pin top-p at 0.9\"".into()),
+            },
+            TraceEntry::Tool {
+                action_id: "tc7".into(),
+                request_id: Some("req-7".into()),
+                call_id: "call_7".into(),
+                name: "decline".into(),
+                arguments: "{\"reason\":\"Still nothing to add.\"}".into(),
+                result: Some("Declined. This turn ends without a reply.".into()),
+            },
+            TraceEntry::Declined {
+                action_id: "d3".into(),
+                reason: Some("Still nothing to add.".into()),
+            },
+        ],
+    };
+
+    (
+        vec![ask, answer, follow_up],
+        vec![answered, declined, also_declined, declined_again],
+    )
 }

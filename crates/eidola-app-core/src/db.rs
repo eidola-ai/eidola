@@ -3655,6 +3655,18 @@ pub async fn context_assembly_actions(
     Ok(out)
 }
 
+/// Ordinal of a `decision`'s `reference` edge to the **root of its own turn's
+/// trace chain** — which turn declined (see [`crate::decline`]).
+///
+/// A decision's ordinal 0 is its structural `reply` edge to the post it
+/// declines, which is deliberately *not* the trace chain: a decision is about
+/// the post, not about the rounds. That leaves the rounds and the decision of
+/// one turn with no durable link between them, which matters as soon as a
+/// participant declines the same post twice — so the link is written as a real
+/// relation, the same way a branch summary carries its keys
+/// ([`BRANCH_SUMMARY_ROOT_ORDINAL`]) rather than packing them into a string.
+pub const DECLINE_TRACE_ORDINAL: i64 = 1;
+
 /// One trace action of a space — a `tool_call`, `tool_result` or `decision`
 /// row with everything the space UI's audit disclosure needs (task 34).
 ///
@@ -3687,15 +3699,26 @@ pub struct TraceActionRow {
     pub produced_by: Option<String>,
     /// The raw exchange this round is recorded under — the Record deep link.
     pub request_id: Option<String>,
+    /// A `decision`'s `reference` edge to the **root of its own turn's trace
+    /// chain** ([`DECLINE_TRACE_ORDINAL`]) — the durable link that says which
+    /// turn declined.
+    ///
+    /// A decision hangs off the *post* it declines, not off the chain (task
+    /// 22), so nothing structural would otherwise tie it to the rounds it ran
+    /// — and a participant may decline the same post more than once. `None`
+    /// on every non-`decision` row (a round's own chain root is reachable by
+    /// walking its `reply_to` edges).
+    pub turn_root: Option<String>,
     pub blocks: Vec<RawBlockRow>,
 }
 
 /// Every trace action in a space, oldest first, with its content blocks.
 ///
 /// One read backs the whole disclosure: attribution (`produced_by`), the gap
-/// anchor (`reply_to` / `reply_to_current`), the payload (`blocks`) and the
-/// Record link (`request_id`). Ordering is the actions' own, so a turn's
-/// rounds come back in the order they ran.
+/// anchor (`reply_to` / `reply_to_current`), turn identity for a decision
+/// (`turn_root`), the payload (`blocks`) and the Record link (`request_id`).
+/// Ordering is the actions' own, so a turn's rounds come back in the order
+/// they ran.
 pub async fn space_trace_rows(
     conn: &Connection,
     space_id: &str,
@@ -3718,7 +3741,10 @@ pub async fn space_trace_rows(
                       WHERE caa.action_id = a.id AND inf.action_type = 'inference' \
                       ORDER BY inf.created_at ASC, inf.id ASC LIMIT 1), \
                     (SELECT r.id FROM request r WHERE r.action_id = a.id \
-                      ORDER BY r.created_at ASC LIMIT 1) \
+                      ORDER BY r.created_at ASC LIMIT 1), \
+                    (SELECT aa3.antecedent_action_id FROM action_antecedent aa3 \
+                      WHERE aa3.action_id = a.id AND aa3.relation = 'reference' \
+                        AND aa3.ordinal = ?2) \
              FROM action a \
              JOIN participant p ON p.id = a.participant_id \
              LEFT JOIN space_participant sp \
@@ -3730,7 +3756,10 @@ pub async fn space_trace_rows(
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
-        .query([Value::Text(space_id.to_string())])
+        .query([
+            Value::Text(space_id.to_string()),
+            Value::Integer(DECLINE_TRACE_ORDINAL),
+        ])
         .await
         .map_err(AppError::db)?;
     let mut out: Vec<TraceActionRow> = Vec::new();
@@ -3748,6 +3777,7 @@ pub async fn space_trace_rows(
             reply_to_current: row.get::<Option<String>>(6).map_err(AppError::db)?,
             produced_by: row.get::<Option<String>>(7).map_err(AppError::db)?,
             request_id: row.get::<Option<String>>(8).map_err(AppError::db)?,
+            turn_root: row.get::<Option<String>>(9).map_err(AppError::db)?,
             blocks: Vec::new(),
         });
     }
