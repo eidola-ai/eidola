@@ -44,6 +44,26 @@ pub type EmbedClickHandler = Rc<dyn Fn(u64, &mut Window, &mut App)>;
 /// containing the clicked offset. The editor never interprets the keys.
 pub type HighlightClickHandler = Rc<dyn Fn(&[u64], &mut Window, &mut App)>;
 
+/// Host callback for a **context-menu gesture** (right mouse-down) inside the
+/// editor: receives the window-coordinate position the menu should open at.
+/// The editor opens no menu of its own — it has no opinion about what belongs
+/// in one — it only reports the gesture, having first placed the caret (see
+/// `MarkdownEditorState::on_right_mouse_down`).
+pub type ContextMenuHandler = Rc<dyn Fn(&Point<Pixels>, &mut Window, &mut App)>;
+
+/// A clipboard/selection command a host can run **programmatically** — the
+/// same operations the keymap's `Cut`/`Copy`/`Paste`/`SelectAll` actions
+/// perform, reachable without a keystroke and without the focus/responder
+/// chain. This is what lets a host drive its own context menu over an editor
+/// that isn't focused (a read-only post body).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EditorCommand {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
 /// Submit-intent action carrying the modifier state at the time Enter was
 /// pressed (mirrors gpui-component's `input::Enter`). The host binds the
 /// modified chords — `cmd-enter`, `cmd-shift-enter` — to this with the
@@ -322,6 +342,9 @@ pub struct MarkdownEditorState {
     /// Host callback for a plain click on highlighted text. Synced from the
     /// element's `.on_highlight_click(..)` prop each frame.
     pub(crate) on_highlight_click: Option<HighlightClickHandler>,
+    /// Host callback for a right mouse-down (the context-menu gesture).
+    /// Synced from the element's `.on_context_menu(..)` prop each frame.
+    pub(crate) on_context_menu: Option<ContextMenuHandler>,
     /// The source offset of an in-progress press that started on highlighted
     /// text (single click, no shift). Consumed on mouse-up: if the press
     /// resolved as a plain click (the selection is still collapsed — no drag
@@ -418,6 +441,7 @@ impl MarkdownEditorState {
             on_embed_click: None,
             highlights: crate::highlight::HighlightSet::default(),
             on_highlight_click: None,
+            on_context_menu: None,
             highlight_press: None,
             is_selecting: false,
             select_mode: SelectMode::Char,
@@ -1507,6 +1531,47 @@ impl MarkdownEditorState {
         self.dispatch(EditorEvent::DeleteToLineEnd, cx);
     }
 
+    /// Run a clipboard/selection command programmatically — the host-driven
+    /// twin of the keymap actions, for a UI that issues the command itself (a
+    /// context menu) rather than routing a keystroke through the focused
+    /// element. `Cut` and `Paste` are refused on a read-only editor, exactly
+    /// as their action handlers are (they're never registered there).
+    pub fn perform(&mut self, command: EditorCommand, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            EditorCommand::Cut if !self.disabled => self.cut(&Cut, window, cx),
+            EditorCommand::Paste if !self.disabled => self.paste(&Paste, window, cx),
+            EditorCommand::Cut | EditorCommand::Paste => {}
+            EditorCommand::Copy => self.copy(&Copy, window, cx),
+            EditorCommand::SelectAll => self.select_all(&SelectAll, window, cx),
+        }
+    }
+
+    /// Whether `command`'s preconditions are met on this editor right now —
+    /// the **enablement twin** of [`Self::perform`], and it lives beside it
+    /// deliberately: a host that decides which verbs to offer by re-deriving
+    /// the conditions itself will eventually advertise one `perform` then
+    /// declines. `Cut`/`Paste` need an editable editor, `Cut`/`Copy` a
+    /// non-empty selection, and `Paste` **text on the clipboard** — without
+    /// which `perform` returns having touched nothing at all. `SelectAll` has
+    /// no precondition; selecting all of an empty document is the degenerate
+    /// case of a command that works, not a verb that does nothing.
+    pub fn can_perform(&self, command: EditorCommand, cx: &App) -> bool {
+        match command {
+            EditorCommand::Cut => {
+                !self.disabled && !self.state.selection.selection_range().is_empty()
+            }
+            EditorCommand::Copy => !self.state.selection.selection_range().is_empty(),
+            EditorCommand::Paste => {
+                !self.disabled
+                    && cx
+                        .read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .is_some_and(|text| !text.is_empty())
+            }
+            EditorCommand::SelectAll => true,
+        }
+    }
+
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         let len = self.state.markdown.len();
         self.dispatch(EditorEvent::SetSelection(Selection::range(0, len)), cx);
@@ -1589,6 +1654,30 @@ impl MarkdownEditorState {
             && !self.highlights.keys_at(offset).is_empty())
         .then_some(offset);
         self.begin_selection(offset, event.click_count, event.modifiers.shift, cx);
+    }
+
+    /// The context-menu gesture (right mouse-down). The editor opens no menu:
+    /// it places the caret and hands the position to the host's
+    /// `on_context_menu` callback.
+    ///
+    /// **Caret placement follows the platform convention**, and it is what
+    /// makes a host's "Paste" land where the user pointed: a press *inside* the
+    /// current selection leaves it alone (that selection is what Cut/Copy will
+    /// act on), a press outside collapses the caret to the clicked offset.
+    fn on_right_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cb) = self.on_context_menu.clone() else {
+            return;
+        };
+        let offset = self.offset_for_position(event.position);
+        if !self.state.selection.selection_range().contains(&offset) {
+            self.dispatch(EditorEvent::SetSelection(Selection::cursor(offset)), cx);
+        }
+        cb(&event.position, window, cx);
     }
 
     /// The rendered embed block under `position` (window coordinates), if
@@ -2020,6 +2109,7 @@ pub struct MarkdownEditor {
     min_height: Option<Pixels>,
     on_embed_click: Option<EmbedClickHandler>,
     on_highlight_click: Option<HighlightClickHandler>,
+    on_context_menu: Option<ContextMenuHandler>,
 }
 
 impl MarkdownEditor {
@@ -2032,6 +2122,7 @@ impl MarkdownEditor {
             min_height: None,
             on_embed_click: None,
             on_highlight_click: None,
+            on_context_menu: None,
         }
     }
 
@@ -2089,6 +2180,20 @@ impl MarkdownEditor {
         self.on_highlight_click = Some(Rc::new(callback));
         self
     }
+
+    /// Host callback for the context-menu gesture (right mouse-down):
+    /// receives the window-coordinate position a menu should open at. The
+    /// editor places the caret first (a press outside the selection collapses
+    /// to it, a press inside keeps the selection) and opens nothing itself —
+    /// what belongs in the menu is the host's business. Registered on
+    /// read-only editors too. Without this prop a right-click does nothing.
+    pub fn on_context_menu(
+        mut self,
+        callback: impl Fn(&Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_context_menu = Some(Rc::new(callback));
+        self
+    }
 }
 
 impl RenderOnce for MarkdownEditor {
@@ -2098,10 +2203,12 @@ impl RenderOnce for MarkdownEditor {
         // during paint; `frame_input_handler_set` re-arms IME registration.
         let embed_cb = self.on_embed_click.clone();
         let highlight_cb = self.on_highlight_click.clone();
+        let context_menu_cb = self.on_context_menu.clone();
         self.state.update(cx, |st, _| {
             st.disabled = self.disabled;
             st.on_embed_click = embed_cb;
             st.on_highlight_click = highlight_cb;
+            st.on_context_menu = context_menu_cb;
             st.last_blocks.clear();
             st.frame_input_handler_set = false;
             st.last_bounds = None;
@@ -2210,7 +2317,14 @@ impl RenderOnce for MarkdownEditor {
                 MouseButton::Left,
                 window.listener_for(&state, MarkdownEditorState::on_mouse_up),
             )
-            .on_mouse_move(window.listener_for(&state, MarkdownEditorState::on_mouse_move));
+            .on_mouse_move(window.listener_for(&state, MarkdownEditorState::on_mouse_move))
+            // The context-menu gesture, registered on read-only editors too:
+            // a post body offers Select All / Copy / Quote even though it
+            // rejects edits.
+            .on_mouse_down(
+                MouseButton::Right,
+                window.listener_for(&state, MarkdownEditorState::on_right_mouse_down),
+            );
 
         // Mutating handlers are registered only when editable.
         if !disabled {

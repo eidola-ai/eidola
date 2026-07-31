@@ -35,7 +35,7 @@ actions!(library, [CancelRename]);
 /// lights, or hosting the Linux CSD window controls + drag strip (same
 /// pattern as `space_view::TITLE_BAR_RESERVE`; the window uses the shared
 /// transparent titlebar from `lib.rs::transparent_titlebar`).
-const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
+const TITLE_BAR_RESERVE: gpui::Pixels = crate::titlebar::DRAG_BAND_HEIGHT;
 
 /// Fixed row height for the virtualized listing. Rows are single-line by
 /// design (title + relative date), so `uniform_list`'s single-measure layout
@@ -454,11 +454,7 @@ impl Render for LibraryView {
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .pt(TITLE_BAR_RESERVE)
-            // Absolute drag band over the traffic-light reserve. It sits above
-            // the empty top padding, so both the empty and populated paths get
-            // a draggable titlebar without affecting flow layout.
-            .child(drag_band);
+            .pt(TITLE_BAR_RESERVE);
 
         // Chapter-style heading: a small italic label between hairline
         // rules, echoing the chat's chapter delimiters so the library reads
@@ -562,6 +558,11 @@ impl Render for LibraryView {
         // a `relative` column capped at the prose measure holds the list plus
         // the overlay strip as siblings, so the indicator appears where the
         // scrollable content actually is on a wide window.
+        // The drag band, over the traffic-light reserve, is appended **last**:
+        // a blocking hitbox only suppresses hitboxes registered before it (see
+        // `crate::overlay`), so a band painted first contains nothing. It is
+        // absolute, so flow layout is unaffected either way.
+        let root = root.child(drag_band);
         root.child(
             h_flex().w_full().flex_1().min_h_0().justify_center().child(
                 div()

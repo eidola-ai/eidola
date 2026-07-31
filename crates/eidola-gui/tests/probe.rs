@@ -981,6 +981,159 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// Task 28: the post context menu is a menu in the a11y tree, and every row
+/// it offers is a probed, driver-clickable `MenuItem`.
+#[gpui::test]
+fn space_context_menu_probes_its_rows(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores,
+                Some("demo".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the quick brown fox")], cx)
+        });
+    });
+    draw(cx, window);
+
+    // Open the menu over the post with its whole body selected, so it offers
+    // the read-only set in full.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            let len = v
+                .post_body_editor_for_test("a1")
+                .map(|e| e.read(cx).value().len())
+                .unwrap_or(0);
+            v.select_in_post_for_test("a1", 0..len, cx);
+            v.open_context_menu_for_test("a1", cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/context-menu",
+        gpui::Role::Menu,
+        "Post menu",
+    );
+    for (slug, label) in [
+        ("copy", "Copy"),
+        ("quote", "Quote"),
+        ("quote-in-reply", "Quote in Reply"),
+        ("select-all", "Select All"),
+    ] {
+        assert_probe(
+            &entries,
+            &format!("space/context-menu/{slug}"),
+            gpui::Role::MenuItem,
+            label,
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+/// Task 29: while a turn waits for its **engine** to warm, the streaming leaf
+/// leads with "Loading model…" — the same quiet line, in the same slot, as
+/// "Thinking…". It is a readout (`Role::Label`), not a control, and it is
+/// keyed on the *correlation*, not on "some model somewhere is loading": the
+/// responding participant's effective model must be the one warming.
+#[gpui::test]
+fn space_streaming_turn_reads_loading_model_while_its_engine_warms(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let warming = |status: eidola_app_core::LocalModelStatus| eidola_app_core::LocalModelsState {
+        engine_path: Some("/opt/eidola/llama-server".into()),
+        external: Vec::new(),
+        models: vec![eidola_app_core::LocalModelInfo {
+            id: "gemma-4-E4B_q4_0-it@local".into(),
+            slug: "gemma-4-E4B_q4_0-it".into(),
+            display_name: "Gemma 4 E4B".into(),
+            file_name: "gemma-4-E4B_q4_0-it.gguf".into(),
+            size_bytes: Some(5_154_939_136),
+            source_url: None,
+            status,
+            last_error: None,
+        }],
+    };
+    let scene = |cx: &mut TestAppContext, status: eidola_app_core::LocalModelStatus| {
+        let stores = stub_stores(cx, |s| {
+            s.config_state = Some(probe_config_state());
+            s.local_models = Some(warming(status));
+            let (space_id, mut people) = probe_participants();
+            // The responding agent runs the engine-served model above.
+            if let Some(agent) = people.iter_mut().find(|p| p.kind == "agent") {
+                agent.model_ref = Some("gemma-4-E4B_q4_0-it@local".into());
+            }
+            s.participants = Some((space_id, people));
+        });
+        let (window, view) = open_view(cx, |window, cx| {
+            cx.new(|cx| {
+                SpaceView::new(
+                    stores,
+                    Some("demo".into()),
+                    WindowInput::new(cx),
+                    window,
+                    cx,
+                )
+            })
+        });
+        let space = view.read_with(cx, |v, _| v.space().clone());
+        cx.update(|cx| {
+            space.update(cx, |s, cx| {
+                s.set_post_tree_for_test(vec![probe_post("a1", "a seeded root post")], cx);
+                s.push_streaming_turn_for_test(
+                    Some("agent-1".into()),
+                    Some("a1".into()),
+                    Default::default(),
+                    cx,
+                );
+            });
+        });
+        window
+    };
+
+    let window = scene(cx, eidola_app_core::LocalModelStatus::Loading);
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/streaming/1/loading",
+        gpui::Role::Label,
+        "Loading model…",
+    );
+
+    // Once the engine is serving, the readout is gone — the silence is the
+    // model thinking, and saying otherwise would be a lie.
+    let window = scene(
+        cx,
+        eidola_app_core::LocalModelStatus::Loaded {
+            port: 51_432,
+            context_tokens: 8192,
+            pinned: false,
+        },
+    );
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.iter().any(|n| n.ends_with("/loading")),
+        "a loaded engine must show no loading readout; recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn space_composer_alt_reveals_post_quiet_probe(cx: &mut TestAppContext) {
     // Holding ⌥ reveals the quiet verb (post without notifying anyone) beside
@@ -2716,4 +2869,42 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
             && names.contains(&"space/highlight/picker/1".to_string()),
         "each candidate is a probed choice: {names:?}"
     );
+}
+
+/// REGRESSION: the Settings window's drag band reserved 44px while every other
+/// window used 36 — purely to fake the top padding the Backends pane lacked.
+/// Once the band began *blocking* the mouse (task 32), that extra strip sat
+/// over the pane's tab strip and the Eidola/Local/External tabs stopped being
+/// clickable. The band is now the shared `DRAG_BAND_HEIGHT` everywhere and the
+/// pane carries its own "Backends" title, so every tab paints clear of it.
+#[gpui::test]
+fn settings_backends_tabs_paint_clear_of_the_drag_band(cx: &mut TestAppContext) {
+    use eidola_gui::settings::{SettingsPane, SettingsView};
+
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+
+    let entries = fresh_entries(cx, window);
+    // The band's own hitbox spans the window's full width from y=0, so a tab
+    // whose top is inside it is a tab the band swallows.
+    let band = eidola_gui::titlebar::DRAG_BAND_HEIGHT.as_f32();
+    for slug in ["eidola", "local", "external"] {
+        let name = format!("settings/backends/tab/{slug}");
+        let (_, entry) = entries
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("probe {name:?} missing"));
+        let top = entry.bounds.origin.y.as_f32();
+        assert!(
+            top >= band,
+            "tab {slug:?} paints at y={top}, inside the {band}px drag band that blocks the mouse"
+        );
+    }
+
+    probe::set_probes_enabled(false);
 }
