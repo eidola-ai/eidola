@@ -707,3 +707,202 @@ fn a_template_built_from_a_space_carries_the_shared_agent_by_reference() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Promotion while a turn is in flight
+//
+// A turn spans HTTP round trips: `prepare_turn` resolves the responding
+// participant, then the turn awaits the model, then it writes. Promotion flips
+// that participant's scope in between. Any scope captured at preparation time
+// is therefore a value that can go stale before it is written — and the pinned
+// composite echo is exactly such a value.
+//
+// This reproduced as a hard failure: the turn died with "failed to insert
+// action: FOREIGN KEY constraint failed", losing the model's completed
+// response and stranding a `tool_call` with no result. The cure is structural
+// rather than a guard — `db::insert_action` / `db::insert_memory_block` derive
+// the echo from the participant id inside their own single statement, so there
+// is no captured value and no read-then-write window (turso is single-writer,
+// so a promotion cannot interleave within the statement). `ActionEntry` and
+// `NewMemoryBlock` have no scope field at all: the stale state is
+// unrepresentable, not merely unlikely.
+// ---------------------------------------------------------------------------
+
+/// A consumer tool that promotes its agent **from inside a turn** — precisely
+/// between the turn's preparation and its remaining writes. Deterministic
+/// where a wall-clock thread race would not be, and strictly more adversarial:
+/// it lands in the narrowest window there is.
+struct PromoteMidTurn {
+    core: std::sync::Weak<AppCore>,
+    participant: std::sync::Mutex<Option<String>>,
+}
+
+impl eidola_app_core::tools::Tool for PromoteMidTurn {
+    fn name(&self) -> &str {
+        "promote_now"
+    }
+    fn description(&self) -> &str {
+        "Promote this agent to a shared identity, right now."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}, "required": []})
+    }
+    fn call<'a>(&'a self, _a: serde_json::Value) -> eidola_app_core::tools::ToolFuture<'a> {
+        Box::pin(async move {
+            let core = self.core.upgrade().expect("core outlives the turn");
+            let id = self
+                .participant
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("participant id set");
+            core.promote_participant(id).await.map_err(|e| {
+                eidola_app_core::tools::ToolError::new(format!("promote failed: {e}"))
+            })?;
+            Ok("promoted".to_string())
+        })
+    }
+}
+
+/// Promotion mid-turn must not cost the turn its answer. The response
+/// persists, with the **post-promotion** scope, and no FK error reaches the
+/// caller.
+#[test]
+fn a_promotion_mid_turn_does_not_lose_the_response() {
+    run(|| {
+        let script = tool_script();
+        let (_mock, core, _dir) = setup(script.clone());
+        let core = std::sync::Arc::new(core);
+
+        let space = core
+            .runtime()
+            .block_on(core.chat("Hello.".into(), MODEL.into(), None))
+            .expect("a first turn")
+            .space_id;
+        let agent = agent_id(&core, &space);
+
+        core.register_tool(std::sync::Arc::new(PromoteMidTurn {
+            core: std::sync::Arc::downgrade(&core),
+            participant: std::sync::Mutex::new(Some(agent.clone())),
+        }))
+        .expect("register");
+
+        // Round 1 asks for the tool (which promotes); round 2 answers. Every
+        // write after the tool ran — the tool result, the inference — is a
+        // write whose captured scope would now be stale.
+        *script.lock().unwrap() = vec![("promote_now".into(), "{}".into())];
+        let result = core
+            .runtime()
+            .block_on(core.chat(
+                "Promote yourself, then answer.".into(),
+                MODEL.into(),
+                Some(space.clone()),
+            ))
+            .expect("the turn survives a promotion landing mid-flight");
+        assert!(
+            result.response_action_id.is_some(),
+            "the model's answer was persisted, not lost"
+        );
+
+        // The promotion really did land mid-turn…
+        assert_eq!(
+            member(&core, &space, &agent).expect("member").scope,
+            "global"
+        );
+        // …and every action in the space — those written before it, and those
+        // written after — carries a consistent echo.
+        let rows = actions(&core, &space);
+        assert!(
+            rows.iter()
+                .filter(|a| a.participant_id == agent)
+                .all(|a| a.participant_scope == "global"),
+            "post-promotion writes used the current scope, earlier ones cascaded: {rows:#?}"
+        );
+        // The trace is whole: the tool round has both halves, and the answer
+        // followed it (the reproduction stranded a `tool_call` with no result).
+        let types: Vec<&str> = rows.iter().map(|a| a.action_type.as_str()).collect();
+        assert_eq!(
+            types,
+            [
+                "user_input",
+                "inference",
+                "user_input",
+                "tool_call",
+                "tool_result",
+                "inference"
+            ],
+            "no partial trace: {rows:#?}"
+        );
+    });
+}
+
+/// The same race on the memory path: a `remember` after a mid-turn promotion
+/// writes its action **and** its `memory_block` identity row — the failure
+/// mode being an action committed with no block row to name it. The new core
+/// block also honours what the agent *is now*, residing in the notebook the
+/// promotion just created rather than in the space the turn started in.
+#[test]
+fn a_promotion_mid_turn_does_not_strand_a_memory_write() {
+    run(|| {
+        let script = tool_script();
+        let (_mock, core, _dir) = setup(script.clone());
+        let core = std::sync::Arc::new(core);
+        core.set_memory_enabled(true);
+
+        let space = core
+            .runtime()
+            .block_on(core.chat("Hello.".into(), MODEL.into(), None))
+            .expect("a first turn")
+            .space_id;
+        let agent = agent_id(&core, &space);
+
+        core.register_tool(std::sync::Arc::new(PromoteMidTurn {
+            core: std::sync::Arc::downgrade(&core),
+            participant: std::sync::Mutex::new(Some(agent.clone())),
+        }))
+        .expect("register");
+
+        // One round, two calls, in order: promote, then write memory.
+        *script.lock().unwrap() = vec![
+            ("promote_now".into(), "{}".into()),
+            (
+                "remember".into(),
+                serde_json::json!({
+                    "block": "about you",
+                    "text": "You prefer terse answers.",
+                    "scope": "core",
+                })
+                .to_string(),
+            ),
+        ];
+        core.runtime()
+            .block_on(core.chat(
+                "Promote yourself, then take a note.".into(),
+                MODEL.into(),
+                Some(space.clone()),
+            ))
+            .expect("the turn survives");
+
+        let held = blocks(&core, &agent);
+        assert_eq!(held.len(), 1, "the block row was written: {held:#?}");
+        assert_eq!(held[0].owner_scope, "global");
+        assert_eq!(held[0].text, "You prefer terse answers.");
+        // Residence follows what the agent is *now*, not what it was when the
+        // turn was prepared.
+        let notebook = core
+            .runtime()
+            .block_on(core.notebook_space_id(agent.clone()))
+            .expect("lookup")
+            .expect("a notebook");
+        assert_eq!(
+            held[0].space_id, notebook,
+            "the core block landed in the notebook the promotion created"
+        );
+        // No orphan: the block's own action is in the notebook and resolvable.
+        assert!(
+            actions(&core, &notebook)
+                .iter()
+                .any(|a| a.action_type == "memory" && a.participant_scope == "global")
+        );
+    });
+}
