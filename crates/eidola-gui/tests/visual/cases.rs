@@ -92,7 +92,8 @@ fn register_space(s: &mut Snapshots) {
     });
 
     // Trace visibility: an answered turn's tool rounds expanded under its own
-    // reply, and a decline hanging in the gap under the post it answered.
+    // reply, and three declines stacked in the gap under the post they
+    // answered — one quiet line per turn, each naming its own agent.
     s.add("space_traces", size(px(860.), px(760.)), |window, cx| {
         let core = stub_stores_with_config(cx);
         cx.new(|cx| {
@@ -101,7 +102,8 @@ fn register_space(s: &mut Snapshots) {
             view.space().update(cx, |sp, cx| {
                 sp.set_post_tree_for_test(posts, cx);
                 sp.seed_traces_for_test(traces);
-                sp.toggle_trace("t2", cx);
+                sp.toggle_trace("turn-gemma", cx);
+                sp.toggle_trace("turn-mara-2", cx);
             });
             view
         })

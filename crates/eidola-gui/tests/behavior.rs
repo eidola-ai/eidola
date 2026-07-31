@@ -8040,6 +8040,7 @@ fn space_trace_disclosure_is_collapsed_until_asked(cx: &mut TestAppContext) {
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, _| {
             s.seed_traces_for_test(vec![PostTrace {
+                id: "t1".into(),
                 anchor_action_id: "a2".into(),
                 participant_label: "kimi-k2".into(),
                 unanswered: false,
@@ -8065,19 +8066,27 @@ fn space_trace_disclosure_is_collapsed_until_asked(cx: &mut TestAppContext) {
             "the reply anchors its turn's trace"
         );
         assert!(s.traces_for("a1").is_empty(), "the ask anchors nothing");
-        assert!(!s.trace_expanded("a2"));
+        assert!(!s.trace_expanded("t1"));
     });
 
+    // Expansion is keyed on the *turn*, not the post it hangs under — several
+    // turns can land on one post, and opening one must not open its siblings.
     cx.update_window(window, |_, _, cx| {
-        space.update(cx, |s, cx| s.toggle_trace("a2", cx));
+        space.update(cx, |s, cx| s.toggle_trace("t1", cx));
     })
     .unwrap();
-    space.read_with(cx, |s, _| assert!(s.trace_expanded("a2")));
+    space.read_with(cx, |s, _| {
+        assert!(s.trace_expanded("t1"));
+        assert!(
+            !s.trace_expanded("a2"),
+            "the anchor is not a disclosure key"
+        );
+    });
     cx.update_window(window, |_, _, cx| {
-        space.update(cx, |s, cx| s.toggle_trace("a2", cx));
+        space.update(cx, |s, cx| s.toggle_trace("t1", cx));
     })
     .unwrap();
-    space.read_with(cx, |s, _| assert!(!s.trace_expanded("a2")));
+    space.read_with(cx, |s, _| assert!(!s.trace_expanded("t1")));
 }
 
 #[gpui::test]
@@ -8091,6 +8100,7 @@ fn space_decline_renders_in_the_gap_under_the_post_it_answered(cx: &mut TestAppC
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, _| {
             s.seed_traces_for_test(vec![PostTrace {
+                id: "t2".into(),
                 anchor_action_id: "a1".into(),
                 participant_label: "Mara".into(),
                 unanswered: true,
@@ -8129,12 +8139,13 @@ fn space_trace_row_deep_links_into_the_record(cx: &mut TestAppContext) {
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, cx| {
             s.seed_traces_for_test(vec![PostTrace {
+                id: "t3".into(),
                 anchor_action_id: "a2".into(),
                 participant_label: "kimi-k2".into(),
                 unanswered: false,
                 entries: vec![trace_tool("read_post", "{}", Some("ok"), Some("req-7"))],
             }]);
-            s.toggle_trace("a2", cx);
+            s.toggle_trace("t3", cx);
         });
     })
     .unwrap();
@@ -8172,6 +8183,7 @@ fn space_change_invalidates_the_trace_index(cx: &mut TestAppContext) {
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, _| {
             s.seed_traces_for_test(vec![PostTrace {
+                id: "t4".into(),
                 anchor_action_id: "a1".into(),
                 participant_label: "Mara".into(),
                 unanswered: true,

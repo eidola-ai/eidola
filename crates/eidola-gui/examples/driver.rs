@@ -479,7 +479,7 @@ mod driver {
             },
             Scene {
                 name: "space_traces",
-                description: "Space view: trace disclosures — an answered turn's tool rounds collapsed under its reply, and a decline hanging in the gap under the post it answered",
+                description: "Space view: trace disclosures — an answered turn's tool rounds under its reply, and three declines stacked in the gap under the post they answered (two agents, one of them asked twice)",
                 default_size: size(px(860.), px(760.)),
                 build: |window, cx| {
                     let stores = ready_stores(cx);
