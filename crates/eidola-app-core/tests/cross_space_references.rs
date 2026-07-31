@@ -552,3 +552,229 @@ fn inbound_references_are_filtered_to_referrers_the_viewer_takes_part_in() {
         assert_eq!(after.len(), 1, "membership reveals it, like every follow");
     });
 }
+
+// ===========================================================================
+// What a reference may name (PR #261 review)
+//
+// Membership answers *whose* material you may reach. This answers *what kind*
+// of material a quote may name at all — and the two are independent: a
+// participant of this very space may read every post in it and still must not
+// be handed another participant's first-person tool trace, its decision, its
+// memory block, or any post's `thinking` block. Those are not transcript, and
+// the reference edge was the one place they could be laundered into one.
+//
+// Both ends are pinned: refused at creation (invalid state unrepresentable),
+// and withheld by every read path for an edge that arrives below that gate.
+// ===========================================================================
+
+/// A memory block is a real action with real text in this very space, owned by
+/// the agent that wrote it. Quoting it would republish it to everyone here.
+#[test]
+fn a_reference_to_a_non_post_action_is_refused_with_zero_trace() {
+    run(|| {
+        let script = tool_script();
+        let (_mock, core, _dir) = setup(script.clone());
+        core.set_memory_enabled(true);
+
+        let opening = turn(&core, "Tell me about tides.", None);
+        let space = opening.space_id.clone();
+        let agent = agent_id(&core, &space);
+
+        *script.lock().unwrap() = vec![(
+            "remember".into(),
+            serde_json::json!({
+                "block": "about-this-space",
+                "text": "Mike gets impatient when I hedge.",
+            })
+            .to_string(),
+        )];
+        turn(&core, "Noted?", Some(space.clone()));
+        let memory_action = core
+            .runtime()
+            .block_on(core.memory_blocks(agent))
+            .expect("memory")[0]
+            .revisions[0]
+            .action_id
+            .clone();
+
+        let before = core
+            .runtime()
+            .block_on(core.test_space_actions(space.clone()))
+            .expect("actions")
+            .len();
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "About what you wrote to yourself:".into(),
+                Some(space.clone()),
+                None,
+                vec![ReferenceSpec {
+                    antecedent_action_id: memory_action.clone(),
+                    content_block_id: None,
+                    range_start: None,
+                    range_end: None,
+                    annotation: None,
+                }],
+            ))
+            .expect_err("a memory block is not a post");
+        assert!(
+            matches!(&err, AppError::NotConfigured { message }
+                if message.contains("is a memory, not a post")),
+            "{err:?}"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.test_space_actions(space))
+                .expect("actions")
+                .len(),
+            before,
+            "a refused reference must leave no trace"
+        );
+        assert!(drain(&mut rx).is_empty(), "a refused post must not emit");
+    });
+}
+
+/// The other axis, and the one reachable through wholly public API: a
+/// `thinking` block is a post's block, and `get_space_tree` hands out its id.
+/// Both context queries filter reasoning out of the wire by block type; a
+/// quote must not be the way back in.
+#[test]
+fn quoting_a_thinking_block_is_refused() {
+    run(|| {
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig::default());
+        chat_harness::with_account(&core);
+
+        let res = core
+            .runtime()
+            .block_on(core.chat("hello".into(), chat_harness::MODEL.into(), None))
+            .expect("chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id.clone()))
+            .expect("tree");
+        let inference = tree
+            .iter()
+            .find(|n| n.action_type == "inference")
+            .expect("an inference");
+        let thinking = inference
+            .blocks
+            .iter()
+            .find(|b| b.block_type == "thinking")
+            .expect("a thinking block");
+
+        let err = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "You wrote:\n\n{{ embed 1 }}".into(),
+                Some(res.space_id),
+                None,
+                vec![ReferenceSpec {
+                    antecedent_action_id: inference.action_id.clone(),
+                    content_block_id: Some(thinking.id.clone()),
+                    range_start: Some(0),
+                    range_end: Some(thinking.text.as_deref().unwrap().len() as i64),
+                    annotation: None,
+                }],
+            ))
+            .expect_err("reasoning is not quotable");
+        assert!(
+            matches!(&err, AppError::NotConfigured { message }
+                if message.contains("is a thinking block")),
+            "{err:?}"
+        );
+    });
+}
+
+/// Belt, for an edge written below the gate. Every read path must withhold the
+/// passage on its own account: the upstream expansion (which needs no tool call
+/// and no membership — the dangerous one), the rendered reference list that
+/// `read_post` prints, and the follow itself.
+#[test]
+fn an_unvalidated_reference_to_a_non_post_is_withheld_by_every_read() {
+    run(|| {
+        let script = tool_script();
+        let (mock, core, _dir) = setup(script.clone());
+        core.set_memory_enabled(true);
+
+        let opening = turn(&core, "Tell me about tides.", None);
+        let space = opening.space_id.clone();
+        let agent = agent_id(&core, &space);
+        let first_post = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree")[0]
+            .action_id
+            .clone();
+        // Branched, so the navigation tools attach and the follow is reachable.
+        reply(&core, "Another angle entirely.", &space, &first_post);
+
+        const SECRET: &str = "Mike gets impatient when I hedge.";
+        *script.lock().unwrap() = vec![(
+            "remember".into(),
+            serde_json::json!({ "block": "about-this-space", "text": SECRET }).to_string(),
+        )];
+        turn(&core, "Noted?", Some(space.clone()));
+        let memory_action = core
+            .runtime()
+            .block_on(core.memory_blocks(agent))
+            .expect("memory")[0]
+            .revisions[0]
+            .action_id
+            .clone();
+
+        // A post carrying an embed marker, and — below the gate — the edge the
+        // gate would have refused.
+        let quoting = post(&core, "About this:\n\n{{ embed 1 }}", Some(space.clone()));
+        core.runtime()
+            .block_on(core.test_insert_unvalidated_reference(
+                quoting.action_id.clone(),
+                memory_action,
+                1,
+            ))
+            .expect("the unvalidated edge");
+
+        // (1) The render withholds the passage — the edge still exists.
+        let node = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree")
+            .into_iter()
+            .find(|n| n.action_id == quoting.action_id)
+            .expect("the quoting post");
+        assert_eq!(node.references.len(), 1, "existence stays public");
+        assert_eq!(
+            node.references[0].snippet, None,
+            "the passage is withheld: {:?}",
+            node.references[0].snippet
+        );
+
+        // (2) The upstream expansion leaves the marker literal rather than
+        // expanding a trace into the next reader's context.
+        script_follow(&script, &post_handle(&quoting.item_id), 1);
+        turn(&core, "What did that quote?", Some(space));
+        // Asserted on the quoting post's own rendered message: the marker must
+        // still be literal. (A blanket "SECRET appears nowhere" would be wrong
+        // — the agent legitimately reads its *own* memory at the head of its
+        // own turn; what must not happen is the quote republishing it as
+        // conversation.)
+        let quoted_message = mock
+            .chat_bodies()
+            .iter()
+            .flat_map(|b| flat_messages(b).into_iter().map(|(_, c)| c))
+            .find(|c| c.contains("About this:"))
+            .expect("the quoting post was sent");
+        assert!(
+            quoted_message.contains("{{ embed 1 }}"),
+            "an unquotable edge leaves its marker literal: {quoted_message}"
+        );
+        assert!(
+            !quoted_message.contains(SECRET),
+            "a non-post reference must never expand into upstream context: {quoted_message}"
+        );
+
+        // (3) The follow refuses to render it, without saying what it is.
+        let followed = last_tool_result(&mock);
+        assert_eq!(followed, "That quote does not point at a readable post.");
+    });
+}
