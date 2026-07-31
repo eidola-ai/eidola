@@ -379,7 +379,6 @@ impl Inner {
                 id: action_id.clone(),
                 space_id: space_id.to_string(),
                 participant_id: db::SYSTEM_PARTICIPANT_ID.to_string(),
-                participant_scope: "global".to_string(),
                 item_id,
                 supersedes_action_id: supersedes,
                 action_type: "checkpoint".to_string(),

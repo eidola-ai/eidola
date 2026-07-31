@@ -138,6 +138,24 @@
 //! Covered by the `*_emit_participants` / `*_emits_templates` /
 //! `space_born_with_template_participants` tests below.
 //!
+//! **Global agents (task 36).** `promote_participant` is one transaction —
+//! the scope flip (whose pinned `participant_scope` echo cascades onto every
+//! past `action` and `memory_block`), the home space's reference row, and the
+//! agent's notebook space — and emits **`Change::Participants` only**. Not
+//! `SpaceIndex`: the one space it creates is a notebook, which `list_spaces`
+//! excludes unconditionally, so the Library listing provably did not change
+//! and emitting it would spuriously invalidate a store that reads nothing new
+//! (STATE.md's 1:1 variant↔store rule). `add_global_participant` (a shared
+//! agent joining another space) emits `Change::Participants` like the rest of
+//! the membership CRUD; it is idempotent, and a re-join of an existing member
+//! still emits (the write is an upsert, not a no-op check). Memory is
+//! untouched by promotion — no block moves, so nothing memory-shaped emits.
+//! Both are refusal-first: every typed error (already global, template-scoped,
+//! the shared human, unknown, retired, not-a-global) is decided before any
+//! write and emits nothing. Covered by `global_agents.rs`
+//! (`promotion_is_in_place_and_the_scope_echo_cascades` pins the emission set;
+//! `promotion_is_one_way_and_refuses_everything_else` pins the refusals).
+//!
 //! **Orchestration (Participants v1, wave 2).** `submit` = `post` +
 //! `plan_notifications`; `plan_notifications` is a **pure read** (participant +
 //! cascade-depth SELECTs) — **it commits nothing and emits nothing**, so
