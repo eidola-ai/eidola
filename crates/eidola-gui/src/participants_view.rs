@@ -35,7 +35,7 @@ use crate::actions::CloseWindow;
 use crate::probe::Probe as _;
 use crate::stores::{ParticipantsStore, Stores};
 
-const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
+const TITLE_BAR_RESERVE: gpui::Pixels = crate::titlebar::DRAG_BAND_HEIGHT;
 
 /// The three notify-policy values with their human labels. The stored value is
 /// the schema enum (`explicit`/`human`/`all`); the label is what a person reads
@@ -820,8 +820,7 @@ impl Render for ParticipantsView {
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .pt(TITLE_BAR_RESERVE)
-            .child(drag_band);
+            .pt(TITLE_BAR_RESERVE);
 
         // Chapter-style heading: "Participants" + the space title, between
         // hairline rules — the same book voice as the Library.
@@ -975,7 +974,9 @@ impl Render for ParticipantsView {
             );
         }
 
-        root.child(self.wrap_body(body, window))
+        // The drag band goes on **last** — a blocking hitbox only suppresses
+        // hitboxes registered before it (see `crate::overlay`).
+        root.child(self.wrap_body(body, window)).child(drag_band)
     }
 }
 
