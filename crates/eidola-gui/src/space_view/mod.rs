@@ -1359,6 +1359,52 @@ impl SpaceView {
             .unwrap_or_else(|| "Eidola".into())
     }
 
+    /// Whether a streaming turn is waiting on its **engine**, not on the model:
+    /// the responding participant's effective model is engine-served (the
+    /// managed `local` store or a `llamacpp` backend) and that model is
+    /// currently warming (`LocalModelStatus::Loading`).
+    ///
+    /// Correlated entirely in the GUI, from two snapshots we already hold and
+    /// already re-render on — the participant's `model_ref` (`ParticipantsStore`)
+    /// and the engine's status (`LocalModelsStore`, refreshed on
+    /// `Change::LocalModels`, which app-core emits the moment a request-triggered
+    /// load reserves its engine). A turn against a remote backend, an unknown
+    /// participant, or a stub turn with no participant is never "loading".
+    pub(crate) fn turn_engine_is_warming(
+        &self,
+        participant_id: Option<&str>,
+        cx: &gpui::App,
+    ) -> bool {
+        let Some(pid) = participant_id else {
+            return false;
+        };
+        let Some(space_id) = self.space.read(cx).id() else {
+            return false;
+        };
+        let Some(model) = self
+            .stores
+            .participants
+            .read(cx)
+            .list(space_id)
+            .iter()
+            .find(|p| p.id == pid)
+            .and_then(|p| p.model_ref.clone())
+        else {
+            return false;
+        };
+        let want = eidola_app_core::parse_model_ref(&model);
+        let local = self.stores.local_models.read(cx);
+        local
+            .models()
+            .iter()
+            .chain(local.external().iter().flat_map(|b| b.models.iter()))
+            .filter(|m| {
+                let have = eidola_app_core::parse_model_ref(&m.id);
+                have.model == want.model && have.backend_id == want.backend_id
+            })
+            .any(|m| matches!(m.status, eidola_app_core::LocalModelStatus::Loading))
+    }
+
     /// React to a semantic `SpaceEvent`: re-snapshot + re-render, surface a
     /// typed failure as the recovery notice (and a paused cascade as its
     /// quiet notice), and clear the error on success.

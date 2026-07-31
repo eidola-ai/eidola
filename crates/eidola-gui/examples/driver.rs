@@ -362,6 +362,55 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_model_loading",
+                description: "Space view: a turn waiting on its local engine — the streaming leaf reads \"Loading model…\" (task 29) instead of an unexplained silence",
+                default_size: size(px(860.), px(760.)),
+                build: |window, cx| {
+                    // The responding agent runs an engine-served model that is
+                    // still warming, which is exactly the correlation the
+                    // readout is keyed on.
+                    let stores = stub_stores(cx, |s| {
+                        s.config_state = Some(config_state(true));
+                        s.eidola_trust = Some(eidola_trust());
+                        s.models = models();
+                        s.backends = backends();
+                        s.templates = templates_fixture();
+                        let mut local = local_models_state();
+                        for m in &mut local.models {
+                            if m.id == "gemma-4-E4B_q4_0-it@local" {
+                                m.status = eidola_app_core::LocalModelStatus::Loading;
+                            }
+                        }
+                        s.local_models = Some(local);
+                        let (space_id, mut people) = participants_fixture();
+                        if let Some(agent) = people.iter_mut().find(|p| p.id == "agent-assistant") {
+                            agent.model_ref = Some("gemma-4-E4B_q4_0-it@local".into());
+                        }
+                        s.participants = Some((space_id, people));
+                    });
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_messages_for_test(conversation(), cx);
+                        s.push_streaming_turn_for_test(
+                            Some("agent-assistant".into()),
+                            None,
+                            eidola_gui::space::StreamingResponse::default(),
+                            cx,
+                        );
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_branches",
                 description: "Space view: a branched post tree with docked tail drafts (kitchen-sink fixture)",
                 default_size: size(px(900.), px(700.)),
