@@ -981,6 +981,71 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// Task 28: the post context menu is a menu in the a11y tree, and every row
+/// it offers is a probed, driver-clickable `MenuItem`.
+#[gpui::test]
+fn space_context_menu_probes_its_rows(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores,
+                Some("demo".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the quick brown fox")], cx)
+        });
+    });
+    draw(cx, window);
+
+    // Open the menu over the post with its whole body selected, so it offers
+    // the read-only set in full.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            let len = v
+                .post_body_editor_for_test("a1")
+                .map(|e| e.read(cx).value().len())
+                .unwrap_or(0);
+            v.select_in_post_for_test("a1", 0..len, cx);
+            v.open_context_menu_for_test("a1", cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/context-menu",
+        gpui::Role::Menu,
+        "Post menu",
+    );
+    for (slug, label) in [
+        ("copy", "Copy"),
+        ("quote", "Quote"),
+        ("quote-in-reply", "Quote in Reply"),
+        ("select-all", "Select All"),
+    ] {
+        assert_probe(
+            &entries,
+            &format!("space/context-menu/{slug}"),
+            gpui::Role::MenuItem,
+            label,
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
 /// Task 29: while a turn waits for its **engine** to warm, the streaming leaf
 /// leads with "Loading model…" — the same quiet line, in the same slot, as
 /// "Thinking…". It is a readout (`Role::Label`), not a control, and it is

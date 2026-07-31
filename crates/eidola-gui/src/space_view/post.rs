@@ -14,6 +14,7 @@ use gpui_markdown_editor::MarkdownEditor;
 
 use crate::probe::Probe as _;
 
+use super::context_menu::ContextTarget;
 use super::layout::body_width;
 use super::model::{NodeSrc, TreeNode};
 use super::{
@@ -235,13 +236,31 @@ impl SpaceView {
             // into this post's incoming-reference list — the editor never
             // learns what they mean, and hands them back verbatim on a click.
             let node_id = node.id.clone();
+            // The context menu: read-only while the post is settled (Select
+            // All / Copy / the quote pair), the editable set during an Edit
+            // session. The target carries the node id so Quote can resolve the
+            // selection to this post's generation + block.
+            let menu_node = node.id.clone();
+            let menu_editor = editor.clone();
             col = col.child(
                 MarkdownEditor::new(editor)
                     .style(prose_style(cx))
                     .disabled(!editing)
                     .on_highlight_click(cx.listener(move |this, keys: &[u64], window, cx| {
                         this.on_highlight_click(node_id.clone(), keys, window, cx);
-                    })),
+                    }))
+                    .on_context_menu(cx.listener(
+                        move |this, at: &gpui::Point<gpui::Pixels>, _, cx| {
+                            let target = if editing {
+                                ContextTarget::Editable
+                            } else {
+                                ContextTarget::Post {
+                                    node_id: Some(menu_node.clone()),
+                                }
+                            };
+                            this.open_context_menu(*at, menu_editor.clone(), target, cx);
+                        },
+                    )),
             );
         }
         // The footnote rail — the post's references, rendered *outside* the
@@ -652,10 +671,24 @@ impl SpaceView {
             }
         }
         if let Some(editor) = self.streaming_bodies.get(&seq) {
+            // A streaming reply is read-only content with no persisted post
+            // behind it yet, so its menu offers Select All / Copy and never
+            // the quote pair (`node_id: None`).
+            let menu_editor = editor.clone();
             col = col.child(
                 MarkdownEditor::new(editor)
                     .style(prose_style(cx))
-                    .disabled(true),
+                    .disabled(true)
+                    .on_context_menu(cx.listener(
+                        move |this, at: &gpui::Point<gpui::Pixels>, _, cx| {
+                            this.open_context_menu(
+                                *at,
+                                menu_editor.clone(),
+                                ContextTarget::Post { node_id: None },
+                                cx,
+                            );
+                        },
+                    )),
             );
         }
         col.into_any_element()

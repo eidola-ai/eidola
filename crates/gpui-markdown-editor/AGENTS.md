@@ -325,6 +325,15 @@ Markdown markers (`#`, `*`, `` ` ``, etc.) are *not* pre-escaped. The contract i
 
 `copy` / `cut` tag every clipboard write with `ClipboardItem::new_string_with_metadata(text, CLIPBOARD_SENTINEL)`. `paste` reads the metadata back to set `internal: true`. The sentinel literal is intentionally crate-namespaced (`gpui-markdown-editor`), not app-namespaced — this crate carries no Eidola-specific symbols.
 
+### Host-driven commands + the context-menu gesture
+
+Two small additive seams let a host build its own menu over an editor without duplicating any of the above:
+
+- **`MarkdownEditorState::perform(EditorCommand, window, cx)`** runs `Cut` / `Copy` / `Paste` / `SelectAll` programmatically — the same code the keymap actions reach, minus the responder chain, which a *read-only* editor (a rendered post body) is not on. `Cut` and `Paste` are refused while `disabled`, exactly as their action handlers are (they're never registered there), so a host cannot mutate a read-only surface through this door.
+- **`MarkdownEditor::on_context_menu(cb)`** reports a right mouse-down with the window-coordinate position a menu should open at. The editor opens nothing itself — what belongs in a menu is the host's business — but it *does* place the caret first, on the platform convention: a press **inside** the current selection leaves it alone (that selection is what Cut/Copy will act on), a press **outside** collapses the caret to the clicked offset, which is what makes a host's "Paste" land where the user pointed. Registered on read-only editors too. Without the prop, a right-click does nothing.
+
+**The callback fires from inside the editor's own `update`**, so a host must not read the editor entity synchronously in it (that re-enters the entity and panics); defer by a turn. The app's `space_view::context_menu` does exactly that, and its doc comment says why.
+
 ### Deferred: rich-content paste (Phase 3b/3c)
 
 Real HTML / RTF passthrough depends on a gpui-side `ClipboardEntry::Html(String)` (or a generic `ClipboardEntry::MimeData { mime, bytes }`) variant that doesn't exist yet — gpui's clipboard layer flattens to a single plaintext flavor. Once the gpui change lands, the natural next step is an HTML → Markdown converter (lean walker over a tag-soup parser, covering the subset browsers actually emit: `<p>`, `<h1..h6>`, `<a>`, `<strong>`, `<em>`, `<code>`, `<pre>`, `<ul>/<ol>/<li>`, `<blockquote>`, `<img>`). Its output feeds into the Phase 2 pipeline. Heuristic markdown detection on plaintext was considered and rejected — too many surprising false positives, and the user-triggered Plain paste action is a better UX answer.
