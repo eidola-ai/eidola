@@ -416,7 +416,6 @@ impl Inner {
     pub(crate) async fn remember(
         &self,
         owner_participant_id: &str,
-        owner_scope: &str,
         space_id: &str,
         req: RememberRequest,
     ) -> Result<MemoryOutcome, AppError> {
@@ -446,7 +445,13 @@ impl Inner {
         // space — it travels with the identity — so it resides in that agent's
         // private notebook, which is exactly what the notebook exists for.
         // Everything else, global or not, stays where it was written.
-        let new_residence = if req.scope == SCOPE_CORE && owner_scope == "global" {
+        // The owner's scope is read **here**, not carried from the turn: a
+        // promotion can land mid-turn, and residence should follow what the
+        // agent is now rather than what it was when the turn was prepared.
+        let owner_is_global = db::get_participant(&conn, owner_participant_id)
+            .await?
+            .is_some_and(|p| p.scope == "global");
+        let new_residence = if req.scope == SCOPE_CORE && owner_is_global {
             db::notebook_space_for(&conn, owner_participant_id)
                 .await?
                 .unwrap_or_else(|| space_id.to_string())
@@ -482,7 +487,6 @@ impl Inner {
                 // the owner, and is the field a later human correction would
                 // differ in.
                 participant_id: owner_participant_id.to_string(),
-                participant_scope: owner_scope.to_string(),
                 item_id: item_id.clone(),
                 supersedes_action_id: supersedes,
                 action_type: db::MEMORY_ACTION_TYPE.to_string(),
@@ -532,11 +536,10 @@ impl Inner {
             None => {
                 db::insert_memory_block(
                     &conn,
-                    &db::MemoryBlockRow {
+                    &db::NewMemoryBlock {
                         item_id: item_id.clone(),
                         root_action_id: action_id.clone(),
                         owner_participant_id: owner_participant_id.to_string(),
-                        owner_scope: owner_scope.to_string(),
                         name: name.clone(),
                         scope: req.scope.clone(),
                         space_id: residence.clone(),
@@ -573,7 +576,6 @@ impl Inner {
 pub(crate) struct RememberTool {
     inner: Weak<Inner>,
     owner_participant_id: String,
-    owner_scope: String,
     space_id: String,
     snapshot: Arc<ThreadSnapshot>,
 }
@@ -582,14 +584,12 @@ impl RememberTool {
     pub(crate) fn new(
         inner: Weak<Inner>,
         owner_participant_id: String,
-        owner_scope: String,
         space_id: String,
         snapshot: Arc<ThreadSnapshot>,
     ) -> Self {
         Self {
             inner,
             owner_participant_id,
-            owner_scope,
             space_id,
             snapshot,
         }
@@ -705,7 +705,6 @@ impl Tool for RememberTool {
             let outcome = inner
                 .remember(
                     &self.owner_participant_id,
-                    &self.owner_scope,
                     &self.space_id,
                     RememberRequest {
                         name,
