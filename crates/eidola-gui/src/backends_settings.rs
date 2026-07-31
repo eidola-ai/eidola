@@ -59,6 +59,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     label::Label,
     switch::Switch,
+    tab::{Tab, TabBar},
     v_flex,
 };
 
@@ -461,34 +462,27 @@ impl BackendsSettingsView {
         }
     }
 
-    /// One tab in the internal strip (quiet text, active = underline).
-    fn tab_item(&self, tab: BackendsTab, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+    /// One tab in the internal strip.
+    ///
+    /// The strip is gpui-component's `TabBar` in its default styling rather
+    /// than a hand-rolled row — one fewer bespoke control to keep in step with
+    /// the theme. `Tab` implements `StatefulInteractiveElement + ParentElement`,
+    /// so it carries our `.probe(..)` annotation directly and the probe names
+    /// (`settings/backends/tab/{slug}`) are unchanged; the element id has to be
+    /// written through `Interactivity` because `InteractiveElement::id` returns
+    /// a `Stateful<Tab>`, which `TabBar::child` (an `Into<Tab>`) cannot take —
+    /// and without an id gpui builds no AccessKit node for the role we set.
+    fn tab_item(&self, tab: BackendsTab, cx: &mut Context<Self>) -> Tab {
         let active = self.tab == tab;
-        let mut item = div()
-            .id(tab.slug())
-            .probe(
-                format!("settings/backends/tab/{}", tab.slug()),
-                gpui::Role::Tab,
-                tab.label(),
-            )
-            .aria_selected(active)
-            .cursor_pointer()
-            .pb_1()
-            .border_b_2()
-            .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx)))
-            .child(tab.label());
-        if active {
-            item = item
-                .border_color(theme.primary)
-                .text_color(theme.foreground);
-        } else {
-            item = item
-                .border_color(gpui::transparent_black())
-                .text_color(theme.muted_foreground)
-                .hover(|s| s.text_color(theme.foreground));
-        }
-        item
+        let mut item = Tab::new().label(tab.label());
+        item.interactivity().element_id = Some(gpui::ElementId::from(tab.slug()));
+        item.probe(
+            format!("settings/backends/tab/{}", tab.slug()),
+            gpui::Role::Tab,
+            tab.label(),
+        )
+        .aria_selected(active)
+        .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx)))
     }
 
     // -- Operations (public so behavior tests share the click paths) --------
@@ -1349,13 +1343,29 @@ impl Render for BackendsSettingsView {
         // Copy the colors we need up front — `tab_item` takes `&mut Context`
         // (for its click listener), so we can't hold a `cx.theme()` borrow
         // across the tab-strip build.
-        let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
         let backends: Vec<BackendInfo> = self.backends.read(cx).list().to_vec();
         let backends_op_error = self.backends.read(cx).op_error().map(|s| s.to_string());
         let local_op_error = self.local_models.read(cx).op_error().map(|s| s.to_string());
 
-        let mut col = v_flex().id("backends-pane").px_6().py_5().gap_4().w_full();
+        let mut col = v_flex()
+            .id("backends-pane")
+            .px_6()
+            .py_5()
+            .gap_4()
+            .w_full()
+            // The pane's own title, in the voice Wallet ("Credentials") and
+            // Templates ("Space Templates") already use. It is also what keeps
+            // the tab strip clear of the window's drag band: the band used to
+            // be 44px here purely to fake this padding, and once it started
+            // blocking the mouse that made the tabs unclickable.
+            .child(
+                div()
+                    .text_color(muted)
+                    .text_sm()
+                    .font_medium()
+                    .child("Backends"),
+            );
 
         // Honest operation errors, pinned at the top of the pane.
         for (probe_name, err) in [
@@ -1372,9 +1382,21 @@ impl Render for BackendsSettingsView {
             }
         }
 
-        // The internal tab strip: Eidola · Local · External.
+        // The internal tab strip: Eidola · Local · External — gpui-component's
+        // `TabBar` in its **segmented** variant. `selected_index` drives the
+        // visual selection (and the segmented indicator that slides to it);
+        // each `Tab` keeps its own click handler (TabBar only overrides those
+        // when the bar itself carries an `on_click`).
+        let selected = [
+            BackendsTab::Eidola,
+            BackendsTab::Local,
+            BackendsTab::External,
+        ]
+        .iter()
+        .position(|t| *t == self.tab)
+        .unwrap_or(0);
         col = col.child(
-            h_flex()
+            div()
                 .id("backends-tabs")
                 .probe(
                     "settings/backends/tabs",
@@ -1382,13 +1404,14 @@ impl Render for BackendsSettingsView {
                     "Backend kinds",
                 )
                 .w_full()
-                .gap_5()
-                .pb_2()
-                .border_b_1()
-                .border_color(border)
-                .child(self.tab_item(BackendsTab::Eidola, cx))
-                .child(self.tab_item(BackendsTab::Local, cx))
-                .child(self.tab_item(BackendsTab::External, cx)),
+                .child(
+                    TabBar::new("backends-tab-bar")
+                        .segmented()
+                        .selected_index(selected)
+                        .child(self.tab_item(BackendsTab::Eidola, cx))
+                        .child(self.tab_item(BackendsTab::Local, cx))
+                        .child(self.tab_item(BackendsTab::External, cx)),
+                ),
         );
 
         if backends.is_empty() {

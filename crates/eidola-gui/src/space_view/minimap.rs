@@ -17,6 +17,7 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
+use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
 
 use super::model::{NodeSrc, TreeNode};
@@ -482,6 +483,15 @@ impl SpaceView {
             .pt(clearance)
             .pb(clearance)
             .w(MINIMAP_WIDTH);
+        // Translucent chrome over live content (see `crate::overlay`), and
+        // **only while the map is up**: a press on a visible cell is the map's
+        // own (it navigates or drags), but a faded-out 36px strip must contain
+        // nothing at all or it would swallow clicks on the post gutters beneath
+        // it. The wheel always passes through — this strip *is* the page's
+        // scroll indicator.
+        if interactive {
+            container = container.contain_mouse(Overlay::Fade);
+        }
 
         let levels = self.selected_levels(roots, page_width);
         // The same top headroom the scrollable document uses (zero for an empty

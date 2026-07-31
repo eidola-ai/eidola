@@ -14,6 +14,9 @@ use gpui_markdown_editor::MarkdownEditor;
 
 use crate::probe::Probe as _;
 
+use crate::overlay::{Contain as _, Overlay};
+
+use super::context_menu::ContextTarget;
 use super::layout::body_width;
 use super::model::{NodeSrc, TreeNode};
 use super::{
@@ -174,9 +177,14 @@ impl SpaceView {
             ));
         if editing_this {
             // Escape restores the pre-edit text and exits the session. The
-            // row (an ancestor of the focused editor) sees the key first.
+            // row (an ancestor of the focused editor) sees the key first —
+            // which is exactly why it must yield to an open context menu
+            // (`context_menu_absorbs_escape`): a right-click inside the
+            // session then Escape-to-dismiss would otherwise throw the
+            // unsaved edit away on the same press that closed the menu. The
+            // root closes it; the next Escape reaches this handler.
             row = row.on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
-                if ev.keystroke.key == "escape" {
+                if ev.keystroke.key == "escape" && !this.context_menu_absorbs_escape() {
                     this.cancel_edit(window, cx);
                 }
             }));
@@ -235,13 +243,31 @@ impl SpaceView {
             // into this post's incoming-reference list — the editor never
             // learns what they mean, and hands them back verbatim on a click.
             let node_id = node.id.clone();
+            // The context menu: read-only while the post is settled (Select
+            // All / Copy / the quote pair), the editable set during an Edit
+            // session. The target carries the node id so Quote can resolve the
+            // selection to this post's generation + block.
+            let menu_node = node.id.clone();
+            let menu_editor = editor.clone();
             col = col.child(
                 MarkdownEditor::new(editor)
                     .style(prose_style(cx))
                     .disabled(!editing)
                     .on_highlight_click(cx.listener(move |this, keys: &[u64], window, cx| {
                         this.on_highlight_click(node_id.clone(), keys, window, cx);
-                    })),
+                    }))
+                    .on_context_menu(cx.listener(
+                        move |this, at: &gpui::Point<gpui::Pixels>, _, cx| {
+                            let target = if editing {
+                                ContextTarget::Editable
+                            } else {
+                                ContextTarget::Post {
+                                    node_id: Some(menu_node.clone()),
+                                }
+                            };
+                            this.open_context_menu(*at, menu_editor.clone(), target, cx);
+                        },
+                    )),
             );
         }
         // The footnote rail — the post's references, rendered *outside* the
@@ -587,18 +613,45 @@ impl SpaceView {
     /// answer, rendered through that turn's editor in `streaming_bodies`
     /// (synced to the live content each frame in `render`). Several turns can
     /// render at once, each with its own editor and disclosure.
+    ///
+    /// A turn whose engine is still warming leads with **"Loading model…"** —
+    /// the same quiet line in the same slot as "Thinking…", because it answers
+    /// the same question (what is this silence?) with the honest reason. It is
+    /// a readout, not a control: no click, `Role::Label`.
     fn render_streaming_body(&self, seq: u64, bw: gpui::Pixels, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let streaming = self
+        let turn = self
             .space
             .read(cx)
             .streams()
             .iter()
             .find(|t| t.seq == seq)
+            .cloned();
+        let streaming = turn
+            .as_ref()
             .map(|t| t.response.clone())
             .unwrap_or_default();
+        let warming = self
+            .turn_engine_is_warming(turn.as_ref().and_then(|t| t.participant_id.as_deref()), cx);
 
         let mut col = v_flex().w(bw).gap_2();
+        if warming {
+            col = col.child(
+                h_flex()
+                    .id(SharedString::from(format!("space-loading-model-{seq}")))
+                    .probe(
+                        format!("space/streaming/{seq}/loading"),
+                        gpui::Role::Label,
+                        "Loading model…",
+                    )
+                    .self_start()
+                    .px_1()
+                    .ml_neg_1()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Loading model…"),
+            );
+        }
         if !streaming.reasoning.is_empty() {
             let (label, aria) = thinking_labels(true, streaming.expanded);
             col = col.child(
@@ -625,10 +678,24 @@ impl SpaceView {
             }
         }
         if let Some(editor) = self.streaming_bodies.get(&seq) {
+            // A streaming reply is read-only content with no persisted post
+            // behind it yet, so its menu offers Select All / Copy and never
+            // the quote pair (`node_id: None`).
+            let menu_editor = editor.clone();
             col = col.child(
                 MarkdownEditor::new(editor)
                     .style(prose_style(cx))
-                    .disabled(true),
+                    .disabled(true)
+                    .on_context_menu(cx.listener(
+                        move |this, at: &gpui::Point<gpui::Pixels>, _, cx| {
+                            this.open_context_menu(
+                                *at,
+                                menu_editor.clone(),
+                                ContextTarget::Post { node_id: None },
+                                cx,
+                            );
+                        },
+                    )),
             );
         }
         col.into_any_element()
@@ -763,7 +830,7 @@ impl SpaceView {
                     gpui::Role::Group,
                     "Reply or ask a participant",
                 )
-                .occlude()
+                .contain_mouse(Overlay::Popover)
                 .items_center()
                 .gap_1()
                 .px_1()

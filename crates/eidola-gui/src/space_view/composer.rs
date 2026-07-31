@@ -32,6 +32,9 @@ use std::collections::HashSet;
 
 use crate::loadable::Loadable;
 
+use crate::overlay::{Contain as _, Overlay};
+
+use super::context_menu::ContextTarget;
 use super::layout::body_width;
 use super::model::{self, TreeNode};
 
@@ -992,7 +995,8 @@ impl SpaceView {
             // `body_h` already carries the half-pad breath (folded into
             // `content` by `record_height` below), so the editor's excess starts
             // right under the last line — no dead strip.
-            .child(
+            .child({
+                let menu_editor = editor.clone();
                 MarkdownEditor::new(&editor)
                     // The footnote rail below shares the bar's height, so the
                     // editor's runway floor is the bar minus the rail — the
@@ -1002,8 +1006,19 @@ impl SpaceView {
                     // (`clipped_tail`), so the rail lands on the *visible*
                     // edge instead of below it.
                     .style(prose_style(cx))
-                    .min_height(px((body_h - draft_rail_h - clipped_tail).max(0.0))),
-            )
+                    .min_height(px((body_h - draft_rail_h - clipped_tail).max(0.0)))
+                    // The editable context menu (Cut / Copy / Paste / Select All).
+                    .on_context_menu(cx.listener(
+                        move |this, at: &gpui::Point<gpui::Pixels>, _, cx| {
+                            this.open_context_menu(
+                                *at,
+                                menu_editor.clone(),
+                                ContextTarget::Editable,
+                                cx,
+                            );
+                        },
+                    ))
+            })
             // The draft's pending quotes, as footnotes — the same rail a
             // posted exchange carries, right where it will be once posted.
             // The draft's pending quotes, as footnotes, bracketed by the two
@@ -1075,14 +1090,28 @@ impl SpaceView {
             .top(px(bar_top))
             .h(px(quad_h))
             .bg(theme.background)
+            // **The composer contains the mouse** (see `crate::overlay`). It is
+            // an opaque surface painted over the page — and the one you type
+            // into — so a press inside it is its own. Without this the press
+            // also landed in the post scrolled beneath, which both selected
+            // that post's text and put it into drag-selection, driving the
+            // page's selection-autoscroll: dragging over your own draft
+            // scrolled the window. `Scrolling`, not `Popover`, because the
+            // wheel must still reach the handler below, which decides between
+            // the composer's own scroll and moving the page toward the dock.
+            .contain_mouse(Overlay::Scrolling)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
-                    // An open band menu absorbs the first Escape; the next
+                    // An open menu absorbs the first Escape; the next
                     // deactivates the draft (deleting it if an empty fork) and
                     // moves focus off the editor to the view root, so a kept
                     // draft reads as exited (no stray cursor) until it's
-                    // clicked back into.
-                    if this.band_menu.is_some() {
+                    // clicked back into. The context menu is only *yielded* to
+                    // here — the view root closes it (see
+                    // `context_menu_absorbs_escape`).
+                    if this.context_menu_absorbs_escape() {
+                        // absorbed
+                    } else if this.band_menu.is_some() {
                         this.band_menu = None;
                         cx.notify();
                     } else {

@@ -5751,6 +5751,103 @@ fn space_readonly_selection_sticks_on_noncanonical_post(cx: &mut TestAppContext)
     });
 }
 
+/// REGRESSION (task 32): a press on the transparent title band — the gesture
+/// that drags the *window* — must not also land in the post scrolled under it.
+/// It did: gpui's hit test reports every hitbox under the cursor, and the band
+/// neither blocked the mouse nor painted after the page, so the press reached
+/// the post's `MarkdownEditor` and the window move dragged out a text
+/// selection with it. The fix is at the shared chrome layer
+/// (`titlebar::make_draggable` → `block_mouse_except_scroll`, which only
+/// suppresses what was painted *before* the strip) plus painting the space
+/// view's band after the page it covers.
+#[gpui::test]
+fn space_title_band_press_does_not_select_the_post_beneath(cx: &mut TestAppContext) {
+    let long = (1..=14)
+        .map(|i| {
+            format!(
+                "Paragraph {i}. Sunlight is a fairly even mix across the visible spectrum, \
+                 and as it crosses the atmosphere it meets molecules far smaller than its \
+                 wavelength."
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let nodes = vec![fixture_user_post("s1", &long)];
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("sel".into()));
+    view.update(cx, |v, cx| {
+        v.space()
+            .update(cx, |s, cx| s.set_post_tree_for_test(nodes, cx));
+    });
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(680.)));
+    vcx.run_until_parked();
+    // Scroll the post up so its text runs under the 36px title band.
+    view.update(&mut vcx, |v, cx| {
+        v.scroll_page_by_for_test(-240.);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // Aim at a point inside the band that real geometry says is painted post
+    // text, rather than hardcoding metrics: `BAND_Y` sits within the 36px
+    // reserve, and some painted line must span it.
+    const BAND_Y: f32 = 18.0;
+    let x = view
+        .read_with(&vcx, |v, cx| {
+            v.post_body_editor_for_test("s1").and_then(|e| {
+                e.read(cx)
+                    .debug_line_geometry()
+                    .iter()
+                    .flat_map(|(_, lines)| lines.iter().copied())
+                    .find(|(_, y, h)| *y <= BAND_Y && y + h > BAND_Y)
+                    .map(|(x, _, _)| x)
+            })
+        })
+        .unwrap_or_else(|| {
+            let g = view.read_with(&vcx, |v, cx| {
+                v.post_body_editor_for_test("s1")
+                    .map(|e| e.read(cx).debug_line_geometry())
+            });
+            panic!("fixture drift: no post text under the title band; geometry = {g:?}")
+        });
+
+    let start = gpui::point(px(x + 30.0), px(BAND_Y));
+    let end = gpui::point(px(x + 200.0), px(300.0));
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: start,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(gpui::MouseMoveEvent {
+        position: end,
+        pressed_button: Some(gpui::MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: end,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        let editor = v.post_body_editor_for_test("s1").expect("s1's editor");
+        let sel = editor.read(cx).selection();
+        assert_eq!(
+            sel.lower_bound(),
+            sel.upper_bound(),
+            "a drag begun in the title band must leave the post unselected, got {sel:?}"
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Participants v1 — the Participants view + Space Templates pane (real core)
 // ---------------------------------------------------------------------------
@@ -7177,6 +7274,549 @@ fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppConte
             "the docked rail lands on the bar's *visible* bottom edge — not \
              clipped off below it (the bug), and not floated up above it \
              (an over-correction): rail bottom {bottom}, window {win}"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Post context menus (task 28) — the pointer route to the verbs that already
+// exist on the keyboard and in the Edit menu.
+// ---------------------------------------------------------------------------
+
+/// Right-click at `position` in `window`, the way a real pointer does — the
+/// editor's own right-mouse-down handler is what opens the menu.
+fn right_click(vcx: &mut VisualTestContext, position: Point<gpui::Pixels>) {
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Right,
+        position,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.run_until_parked();
+}
+
+/// A point inside the active composer's first painted line.
+fn point_in_composer(view: &Entity<SpaceView>, vcx: &VisualTestContext) -> Point<gpui::Pixels> {
+    let (x, y, h) = view
+        .read_with(vcx, |v, cx| {
+            v.composer_state_for_test().and_then(|e| {
+                e.read(cx)
+                    .debug_line_geometry()
+                    .first()
+                    .and_then(|(_, lines)| lines.first().copied())
+            })
+        })
+        .expect("the composer's first painted line");
+    gpui::point(px(x + 20.0), px(y + h.min(20.0) / 2.0))
+}
+
+/// A point inside post `node_id`'s first painted line.
+fn point_in_post(
+    view: &Entity<SpaceView>,
+    vcx: &VisualTestContext,
+    node_id: &str,
+) -> Point<gpui::Pixels> {
+    let (x, y, h) = view
+        .read_with(vcx, |v, cx| {
+            v.post_body_editor_for_test(node_id).and_then(|e| {
+                e.read(cx)
+                    .debug_line_geometry()
+                    .first()
+                    .and_then(|(_, lines)| lines.first().copied())
+            })
+        })
+        .expect("the post's first painted line");
+    gpui::point(px(x + 20.0), px(y + h.min(20.0) / 2.0))
+}
+
+#[gpui::test]
+fn space_post_context_menu_offers_select_all_then_the_selection_verbs(cx: &mut TestAppContext) {
+    // A read-only post affords Select All always; a live selection adds Copy,
+    // and a *quotable* one adds the Edit menu's own quote pair. Nothing is
+    // greyed — the menu builds only rows that do something.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.run_until_parked();
+    let at = point_in_post(&view, &vcx, "a1");
+
+    right_click(&mut vcx, at);
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.context_menu_items_for_test(),
+            Some(vec!["Select All".to_string()]),
+            "an unselected read-only post offers only Select All"
+        );
+    });
+
+    // Escape closes it (the composer's key handler consumes the first press).
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.context_menu_items_for_test().is_none(),
+            "Escape dismisses the menu"
+        );
+    });
+
+    // A press *outside* a selection collapses the caret to it — the platform
+    // convention, and what makes a host's Paste land where the user pointed —
+    // so the menu that opens is the unselected one.
+    view.update(&mut vcx, |v, cx| {
+        v.select_in_post_for_test("a1", 12..19, cx)
+    });
+    vcx.run_until_parked();
+    right_click(&mut vcx, at);
+    view.read_with(&vcx, |v, cx| {
+        let sel = v
+            .post_body_editor_for_test("a1")
+            .expect("a1's editor")
+            .read(cx)
+            .selection();
+        assert!(
+            sel.is_collapsed(),
+            "a press outside the selection places the caret there, got {sel:?}"
+        );
+        assert_eq!(
+            v.context_menu_items_for_test(),
+            Some(vec!["Select All".to_string()]),
+            "and the menu that opens is the unselected one"
+        );
+    });
+
+    // A press *inside* a quotable selection keeps it: Copy plus the quote
+    // pair, then Select All. (Dismiss first — an open menu occludes what it
+    // covers, so a second press on the same spot would land on the menu.)
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    select_whole_post(&view, &mut vcx, "a1");
+    right_click(&mut vcx, at);
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.context_menu_items_for_test(),
+            Some(vec![
+                "Copy".to_string(),
+                "Quote".to_string(),
+                "Quote in Reply".to_string(),
+                "Select All".to_string(),
+            ]),
+            "a quotable selection adds Copy and the Edit menu's quote pair"
+        );
+    });
+}
+
+/// Select a post's whole body, so any point in it is inside the selection.
+fn select_whole_post(view: &Entity<SpaceView>, vcx: &mut VisualTestContext, node_id: &str) {
+    let len = view
+        .read_with(vcx, |v, cx| {
+            v.post_body_editor_for_test(node_id)
+                .map(|e| e.read(cx).value().len())
+        })
+        .expect("the post's editor");
+    let id = node_id.to_string();
+    view.update(vcx, |v, cx| v.select_in_post_for_test(&id, 0..len, cx));
+    vcx.run_until_parked();
+}
+
+#[gpui::test]
+fn space_post_context_menu_copies_and_selects_through_the_editor(cx: &mut TestAppContext) {
+    // The clipboard verbs run the editor's own commands (the `perform` seam),
+    // so the menu and ⌘C/⌘A cannot drift.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.run_until_parked();
+    let at = point_in_post(&view, &vcx, "a1");
+
+    select_whole_post(&view, &mut vcx, "a1");
+    right_click(&mut vcx, at);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.activate_context_item_for_test("copy", window, cx));
+        });
+    });
+    vcx.update(|_, cx| {
+        let item = cx.read_from_clipboard().expect("Copy wrote the clipboard");
+        assert_eq!(item.text().as_deref(), Some("the quick brown fox"));
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.context_menu_items_for_test().is_none(),
+            "choosing a row closes the menu"
+        );
+    });
+
+    // Select All runs on the post's own editor, read-only and all.
+    right_click(&mut vcx, at);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.activate_context_item_for_test("select-all", window, cx));
+        });
+    });
+    view.read_with(&vcx, |v, cx| {
+        let editor = v.post_body_editor_for_test("a1").expect("a1's editor");
+        let sel = editor.read(cx).selection();
+        assert_eq!(
+            (sel.lower_bound(), sel.upper_bound()),
+            (0, "the quick brown fox".len()),
+            "Select All covers the whole post"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_post_context_menu_quote_reuses_the_edit_menu_handler(cx: &mut TestAppContext) {
+    // "Quote" is the Edit menu's own handler, not a parallel path: the same
+    // pending reference lands on the active draft at ordinal 1.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.run_until_parked();
+    let at = point_in_post(&view, &vcx, "a1");
+    select_whole_post(&view, &mut vcx, "a1");
+
+    right_click(&mut vcx, at);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.activate_context_item_for_test("quote", window, cx));
+        });
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "the quick brown fox".to_string())],
+            "the menu's Quote attaches exactly what Edit > Quote attaches"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_composer_context_menu_offers_the_editable_verbs(cx: &mut TestAppContext) {
+    // An editable editor affords Paste and Select All always; Cut and Copy
+    // join them once something is selected (an affordance appears when it is
+    // actionable — the house rule the per-post verbs already follow).
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    cx.run_until_parked();
+    set_space_composer_text(&view, window, cx, "a draft in progress");
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.run_until_parked();
+    let composer = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("a blank space opens with its composer");
+    let at = point_in_composer(&view, &vcx);
+
+    // Paste is clipboard-gated (see the test below), so seed one to keep this
+    // test about the *selection* facts it is asserting.
+    vcx.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("pasteable".to_string()));
+    });
+    right_click(&mut vcx, at);
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.context_menu_items_for_test(),
+            Some(vec!["Paste".to_string(), "Select All".to_string()]),
+            "with a collapsed caret, Cut and Copy have nothing to act on"
+        );
+    });
+    // Dismiss before re-opening: the menu occludes what it covers, so a
+    // second right-click on the same spot would land on the menu itself.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    let len = composer.read_with(&vcx, |e, _| e.value().len());
+    composer.update(&mut vcx, |e, cx| {
+        e.apply_event_for_test(
+            gpui_markdown_editor::EditorEvent::SetSelection(
+                gpui_markdown_editor::Selection::range(0, len),
+            ),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    right_click(&mut vcx, at);
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.context_menu_items_for_test(),
+            Some(vec![
+                "Cut".to_string(),
+                "Copy".to_string(),
+                "Paste".to_string(),
+                "Select All".to_string(),
+            ]),
+            "a selection in an editable editor affords the full clipboard set"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_edit_session_escape_dismisses_the_menu_before_cancelling(cx: &mut TestAppContext) {
+    // A right-click inside an inline Edit session opens the editable menu.
+    // The first Escape must dismiss *only* the menu — the unsaved edit is the
+    // thing at risk, and the post row's Escape handler is an inner element in
+    // the dispatch path, so without a guard it cancels the session (restoring
+    // the pre-edit buffer) on the very same press.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    })
+    .unwrap();
+    let editor = view
+        .read_with(cx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post's body editor");
+    cx.update_window(window, |_, _, cx| {
+        editor.update(cx, |e, cx| e.set_value("half-typed edit".to_string(), cx));
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.run_until_parked();
+    let at = point_in_post(&view, &vcx, "a1");
+
+    right_click(&mut vcx, at);
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.context_menu_items_for_test().is_some(),
+            "a right-click inside the session opens a menu over its editor"
+        );
+    });
+
+    // First Escape: the menu goes, the session and its typing stay.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.context_menu_items_for_test().is_none(),
+            "the first Escape dismisses the menu"
+        );
+        assert_eq!(
+            v.editing_action_id_for_test(),
+            Some("a1".to_string()),
+            "and leaves the edit session alive"
+        );
+    });
+    vcx.update(|_, cx| {
+        assert_eq!(
+            editor.read(cx).value(),
+            "half-typed edit",
+            "the unsaved edit survives dismissing the menu"
+        );
+    });
+
+    // Second Escape: now the session cancels and the buffer is restored.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.editing_action_id_for_test(),
+            None,
+            "the second Escape cancels the edit"
+        );
+    });
+    vcx.update(|_, cx| {
+        assert_eq!(editor.read(cx).value(), "the quick brown fox");
+    });
+}
+
+#[gpui::test]
+fn space_composer_context_menu_offers_paste_only_when_there_is_text_to_paste(
+    cx: &mut TestAppContext,
+) {
+    // Paste is resolved against the clipboard at open time, like the menu's
+    // other two facts: `MarkdownEditorState::paste` returns without touching
+    // the buffer when the clipboard holds no text, so an unconditional row
+    // would be a visible affordance that does nothing — the one thing this
+    // menu promises never to show.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    cx.run_until_parked();
+    set_space_composer_text(&view, window, cx, "a draft in progress");
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.run_until_parked();
+    let at = point_in_composer(&view, &vcx);
+
+    // Nothing on the clipboard: no Paste row.
+    right_click(&mut vcx, at);
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.context_menu_items_for_test(),
+            Some(vec!["Select All".to_string()]),
+            "an empty clipboard affords no Paste"
+        );
+    });
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    // Text on the clipboard: the row appears.
+    vcx.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("pasteable".to_string()));
+    });
+    right_click(&mut vcx, at);
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.context_menu_items_for_test(),
+            Some(vec!["Paste".to_string(), "Select All".to_string()]),
+            "text on the clipboard affords Paste"
+        );
+    });
+}
+
+/// REGRESSION: the floating composer is an **opaque interactive surface** over
+/// the page, so a press inside it must belong to it alone. It didn't: gpui
+/// reports every hitbox under the cursor, so a drag-select in the composer also
+/// landed in the post scrolled beneath it — selecting that post's text, and
+/// (because a readonly post mid-drag-selection drives the page's
+/// selection-autoscroll) scrolling the page up and down while you dragged.
+#[gpui::test]
+fn space_composer_drag_is_contained_and_does_not_scroll_the_page(cx: &mut TestAppContext) {
+    let long = (1..=16)
+        .map(|i| {
+            format!(
+                "Paragraph {i}. Sunlight is a fairly even mix across the visible spectrum, \
+                 and as it crosses the atmosphere it meets molecules far smaller than its \
+                 wavelength."
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("comp".into()));
+    view.update(cx, |v, cx| {
+        v.space().update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("p1", &long)], cx)
+        });
+    });
+    cx.run_until_parked();
+    open_space_draft(&view, window, cx, Some("p1"));
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(680.)));
+    vcx.run_until_parked();
+    let composer = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the branch tail opens a draft composer");
+    composer.update(&mut vcx, |e, cx| {
+        e.set_value("a draft being edited".to_string(), cx)
+    });
+    // Park the page at the top so the composer's slot sits far below the fold
+    // and the bar renders *floating* over the post rather than docked under it.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    view.update(&mut vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.composer_overlayed_for_test()),
+        "fixture drift: the composer must be floating over the page for this repro"
+    );
+
+    // A point that is inside the composer's own painted text **and** over the
+    // post's painted text — the bug only exists where the two overlap, so the
+    // point is derived from real geometry rather than assumed (and the search
+    // failing is a loud fixture-drift panic, which is what gives this test its
+    // teeth).
+    let lines = |e: &Entity<gpui_markdown_editor::MarkdownEditorState>,
+                 vcx: &VisualTestContext|
+     -> Vec<(f32, f32, f32)> {
+        e.read_with(vcx, |e, _| {
+            e.debug_line_geometry()
+                .iter()
+                .flat_map(|(_, l)| l.iter().copied())
+                .collect()
+        })
+    };
+    let composer_lines = lines(&composer, &vcx);
+    let post = view
+        .read_with(&vcx, |v, _| v.post_body_editor_for_test("p1"))
+        .expect("p1's editor");
+    let post_lines = lines(&post, &vcx);
+    let at = composer_lines
+        .iter()
+        .find_map(|&(x, cy, ch)| {
+            post_lines
+                .iter()
+                .find(|&&(_, py, ph)| py < cy + ch && cy < py + ph)
+                .map(|&(_, py, ph)| {
+                    let top = cy.max(py);
+                    let bottom = (cy + ch).min(py + ph);
+                    gpui::point(px(x + 30.0), px((top + bottom) / 2.0))
+                })
+        })
+        .unwrap_or_else(|| {
+            panic!("fixture drift: composer {composer_lines:?} never overlaps post {post_lines:?}")
+        });
+
+    let before_scroll = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    let end = gpui::point(at.x + px(220.), at.y + px(4.));
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: at,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(gpui::MouseMoveEvent {
+        position: end,
+        pressed_button: Some(gpui::MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    vcx.run_until_parked();
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: end,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        let sel = v
+            .post_body_editor_for_test("p1")
+            .expect("p1's editor")
+            .read(cx)
+            .selection();
+        assert_eq!(
+            sel.lower_bound(),
+            sel.upper_bound(),
+            "a drag inside the composer must leave the post beneath unselected, got {sel:?}"
+        );
+        assert_eq!(
+            v.page_scroll_offset_y_for_test(),
+            before_scroll,
+            "and must not drive the page's selection-autoscroll"
         );
     });
 }
