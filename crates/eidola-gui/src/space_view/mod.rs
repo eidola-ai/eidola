@@ -953,6 +953,13 @@ impl SpaceView {
         self.docked_caret_slot_offset.get()
     }
 
+    /// The document's top reserve — so a test can state a document position
+    /// relative to it instead of restating the constant.
+    #[doc(hidden)]
+    pub fn doc_reserve_for_test(&self) -> f32 {
+        self.doc_reserve()
+    }
+
     /// How many posts currently have a *measured* (not estimated) height in the
     /// layout cache — equals the post count once the warm pass has run.
     #[doc(hidden)]
