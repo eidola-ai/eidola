@@ -5751,6 +5751,103 @@ fn space_readonly_selection_sticks_on_noncanonical_post(cx: &mut TestAppContext)
     });
 }
 
+/// REGRESSION (task 32): a press on the transparent title band — the gesture
+/// that drags the *window* — must not also land in the post scrolled under it.
+/// It did: gpui's hit test reports every hitbox under the cursor, and the band
+/// neither blocked the mouse nor painted after the page, so the press reached
+/// the post's `MarkdownEditor` and the window move dragged out a text
+/// selection with it. The fix is at the shared chrome layer
+/// (`titlebar::make_draggable` → `block_mouse_except_scroll`, which only
+/// suppresses what was painted *before* the strip) plus painting the space
+/// view's band after the page it covers.
+#[gpui::test]
+fn space_title_band_press_does_not_select_the_post_beneath(cx: &mut TestAppContext) {
+    let long = (1..=14)
+        .map(|i| {
+            format!(
+                "Paragraph {i}. Sunlight is a fairly even mix across the visible spectrum, \
+                 and as it crosses the atmosphere it meets molecules far smaller than its \
+                 wavelength."
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let nodes = vec![fixture_user_post("s1", &long)];
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("sel".into()));
+    view.update(cx, |v, cx| {
+        v.space()
+            .update(cx, |s, cx| s.set_post_tree_for_test(nodes, cx));
+    });
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(680.)));
+    vcx.run_until_parked();
+    // Scroll the post up so its text runs under the 36px title band.
+    view.update(&mut vcx, |v, cx| {
+        v.scroll_page_by_for_test(-240.);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // Aim at a point inside the band that real geometry says is painted post
+    // text, rather than hardcoding metrics: `BAND_Y` sits within the 36px
+    // reserve, and some painted line must span it.
+    const BAND_Y: f32 = 18.0;
+    let x = view
+        .read_with(&vcx, |v, cx| {
+            v.post_body_editor_for_test("s1").and_then(|e| {
+                e.read(cx)
+                    .debug_line_geometry()
+                    .iter()
+                    .flat_map(|(_, lines)| lines.iter().copied())
+                    .find(|(_, y, h)| *y <= BAND_Y && y + h > BAND_Y)
+                    .map(|(x, _, _)| x)
+            })
+        })
+        .unwrap_or_else(|| {
+            let g = view.read_with(&vcx, |v, cx| {
+                v.post_body_editor_for_test("s1")
+                    .map(|e| e.read(cx).debug_line_geometry())
+            });
+            panic!("fixture drift: no post text under the title band; geometry = {g:?}")
+        });
+
+    let start = gpui::point(px(x + 30.0), px(BAND_Y));
+    let end = gpui::point(px(x + 200.0), px(300.0));
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: start,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(gpui::MouseMoveEvent {
+        position: end,
+        pressed_button: Some(gpui::MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: end,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        let editor = v.post_body_editor_for_test("s1").expect("s1's editor");
+        let sel = editor.read(cx).selection();
+        assert_eq!(
+            sel.lower_bound(),
+            sel.upper_bound(),
+            "a drag begun in the title band must leave the post unselected, got {sel:?}"
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Participants v1 — the Participants view + Space Templates pane (real core)
 // ---------------------------------------------------------------------------
