@@ -164,17 +164,24 @@ impl ToolRegistry {
 
 /// Tool names [`crate::AppCore::register_tool`] refuses.
 ///
-/// These are the turn-scoped navigation tools `prepare_turn` attaches to a
-/// branched turn (see below). They are protocol surface, not ordinary
-/// built-ins: the thread map's system note promises the model these three
-/// names with these semantics, and each reads the turn's own `ThreadSnapshot`
-/// — something a process-scoped consumer registration structurally cannot
+/// These are the **turn-scoped** tools `prepare_turn` attaches on top of the
+/// process-registry snapshot: the navigation tools of a branched turn (see
+/// below) and task 35's `remember`. They are protocol surface, not ordinary
+/// built-ins — a system note promises the model these names with these
+/// semantics, and each is bound to something only the turn has (its own
+/// `ThreadSnapshot`; for `remember`, the responding participant's identity and
+/// residence space) that a process-scoped registration structurally cannot
 /// supply. Reserving them keeps "what the model was promised" and "what
 /// executes" the same object on every turn, instead of silently diverging the
-/// moment a space branches.
-pub const RESERVED_TOOL_NAMES: [&str; 3] = ["list_branches", "read_thread", "read_post"];
+/// moment a space branches or memory is switched on.
+pub const RESERVED_TOOL_NAMES: [&str; 4] = [
+    "list_branches",
+    "read_thread",
+    "read_post",
+    crate::memory::REMEMBER_TOOL_NAME,
+];
 
-/// Whether `name` is reserved for the turn-scoped navigation tools.
+/// Whether `name` is reserved for a turn-scoped tool.
 pub fn is_reserved_tool_name(name: &str) -> bool {
     RESERVED_TOOL_NAMES.contains(&name)
 }
@@ -425,7 +432,11 @@ mod tests {
             );
         }
         assert!(!is_reserved_tool_name("echo"));
-        assert_eq!(RESERVED_TOOL_NAMES.len(), 3);
+        // Task 35's `remember` is reserved for the same reason: it is bound to
+        // the turn's responding participant, which the process registry has no
+        // way to express.
+        assert!(is_reserved_tool_name(crate::memory::REMEMBER_TOOL_NAME));
+        assert_eq!(RESERVED_TOOL_NAMES.len(), 4);
     }
 
     #[test]

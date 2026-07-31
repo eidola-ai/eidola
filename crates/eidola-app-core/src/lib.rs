@@ -5,6 +5,7 @@ pub mod db;
 pub mod decline;
 pub mod error;
 pub mod local_models;
+pub mod memory;
 pub mod router;
 pub mod summaries;
 pub mod tools;
@@ -964,6 +965,16 @@ struct Inner {
     /// debounce that keeps an exchange (the post, then the answer it draws)
     /// from summarizing the same branch twice.
     summary_triggers: Mutex<std::collections::HashMap<String, i64>>,
+    /// Serializes memory revisions (see [`memory`]). Two concurrent turns of
+    /// one participant revising one block would otherwise both read the same
+    /// tip and race the unique-successor index.
+    memory_gate: tokio::sync::Mutex<()>,
+    /// Whether agent memory is switched on for this process (see [`memory`]).
+    /// **Off by default**: while it is off, no turn reads a participant's
+    /// memory and no turn attaches the `remember` tool, so requests stay
+    /// byte-identical to an install that has never heard of the feature.
+    /// Flipped by [`AppCore::set_memory_enabled`].
+    memory_enabled: std::sync::atomic::AtomicBool,
     /// The tool registry a turn's bounded tool-calling loop runs (see
     /// [`tools`]). **Empty by default**, which is what keeps every request
     /// byte-identical to the pre-tools shape: `prepare_turn` snapshots this
@@ -3759,6 +3770,27 @@ impl Inner {
         // note, no `tools` — which is the property the pinned-bytes tests hold.
         let nav_tools = has_map && backend_accepts_tools;
 
+        // ---- Agent memory (task 35) ---------------------------------------
+        //
+        // The whole feature is gated on the process opt-in, so an install that
+        // has not enabled it does not even read: no query, no bytes, no
+        // `tools` field — byte-identical requests. When it is on, the
+        // responding participant's own blocks (core + about this space, and
+        // **nobody else's**) render at the head, inside the system message,
+        // after the charter and the static notes. The `remember` tool attaches
+        // on the same terms the navigation tools do (the backend must be able
+        // to carry a `tools` field at all), and is bound to this participant
+        // and this residence space — which is exactly why it cannot live in
+        // the process registry (see [`memory`]).
+        let memory_on = self.memory_enabled();
+        let memory_entries = if memory_on {
+            self.load_memory(&db_conn, &model_participant_id, &space_id)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let memory_tool = memory_on && backend_accepts_tools;
+
         // Render the rows from the *responding participant's* point of view:
         // only its own prior posts are `assistant`, everyone else's are `user`,
         // and every message carries its uniform `#<handle> · <label>` header
@@ -3821,7 +3853,14 @@ impl Inner {
         if nav_tools {
             notes.push(THREAD_MAP_TOOLS_NOTE);
         }
-        let system_content = match system_prompt
+        // The memory note describes the affordance, so it appears exactly when
+        // the tool does; the `<memory>` block below appears exactly when there
+        // is something to show. They are independent — an agent whose backend
+        // cannot carry tools still reads its notes.
+        if memory_tool {
+            notes.push(memory::MEMORY_NOTE);
+        }
+        let mut system_content = match system_prompt
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -3836,6 +3875,14 @@ impl Inner {
             }
             None => notes.join("\n\n"),
         };
+        // Memory goes **last** in the system message. It is at the head of the
+        // prompt (identity governs what follows), and putting it after the
+        // static charter + notes keeps that prefix byte-stable, so a revision
+        // invalidates as little of the cache as the loading rule allows.
+        if !memory_entries.is_empty() {
+            system_content.push_str("\n\n");
+            system_content.push_str(&memory::render_memory(&memory_entries));
+        }
         // The OpenAI messages array — built *before* the charge estimate so
         // both the estimate and the wire request read one array. Rounds 2+ of
         // a tool loop append to exactly this vector, which is what keeps their
@@ -3886,12 +3933,13 @@ impl Inner {
         // registry sends no `tools` field at all, so today's requests stay
         // byte-identical.
         //
-        // The navigation tools are added on top of that snapshot, per turn,
-        // rather than living in the process registry: they are scoped to *this*
-        // space and read *this* turn's `ThreadSnapshot`, so there is nothing
-        // sensible for them to be at process scope. The seam stays additive —
-        // a consumer's own registrations are unaffected, and a turn that adds
-        // none leaves the registry exactly as it found it.
+        // The navigation tools and `remember` are added on top of that
+        // snapshot, per turn, rather than living in the process registry: they
+        // are scoped to *this* space and read *this* turn's `ThreadSnapshot`
+        // (and, for `remember`, *this* responding participant), so there is
+        // nothing sensible for them to be at process scope. The seam stays
+        // additive — a consumer's own registrations are unaffected, and a turn
+        // that adds none leaves the registry exactly as it found it.
         //
         // The pre-attach snapshot is kept alongside: if the backend turns out
         // to reject a `tools` field, the round loop withdraws what this turn
@@ -3903,11 +3951,23 @@ impl Inner {
                 .expect("tool registry lock poisoned")
                 .clone(),
         );
-        let tool_registry = if nav_tools {
+        let auto_tools = nav_tools || memory_tool;
+        let tool_registry = if auto_tools {
             let mut registry = (*consumer_tools).clone();
-            registry.register(Arc::new(tools::ListBranchesTool::new(thread.clone())));
-            registry.register(Arc::new(tools::ReadThreadTool::new(thread.clone())));
-            registry.register(Arc::new(tools::ReadPostTool::new(thread.clone())));
+            if nav_tools {
+                registry.register(Arc::new(tools::ListBranchesTool::new(thread.clone())));
+                registry.register(Arc::new(tools::ReadThreadTool::new(thread.clone())));
+                registry.register(Arc::new(tools::ReadPostTool::new(thread.clone())));
+            }
+            if memory_tool {
+                registry.register(Arc::new(memory::RememberTool::new(
+                    self.self_ref.clone(),
+                    model_participant_id.clone(),
+                    model_participant_scope.clone(),
+                    space_id.clone(),
+                    thread.clone(),
+                )));
+            }
             Arc::new(registry)
         } else {
             consumer_tools.clone()
@@ -3976,7 +4036,7 @@ impl Inner {
             tools: tool_registry,
             tool_schemas,
             consumer_tools,
-            auto_tools: nav_tools,
+            auto_tools,
             remote_pricing,
             budget,
             charge_credits,
@@ -5294,6 +5354,42 @@ impl AppCore {
         Ok(())
     }
 
+    /// Switch **agent memory** on or off for this process (see [`memory`]).
+    ///
+    /// Off by default, like every other agentic capability here. While it is
+    /// off no turn reads a participant's memory and no turn attaches the
+    /// `remember` tool, so requests are byte-identical to an install that has
+    /// never heard of the feature; switching it on later loads whatever was
+    /// already written. Process-scoped rather than persisted: it is the
+    /// consumer's opt-in, exactly like [`Self::register_tool`], and a UI that
+    /// wants a stored preference reads its own setting and calls this.
+    pub fn set_memory_enabled(&self, enabled: bool) {
+        self.inner
+            .memory_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether agent memory is switched on for this process.
+    pub fn memory_enabled(&self) -> bool {
+        self.inner.memory_enabled()
+    }
+
+    /// Everything one participant remembers, newest-updated first, each block
+    /// with its full revision trail (contents, author and provenance per
+    /// generation) — the inspection read. A pure read: it commits nothing and
+    /// emits nothing, and it is not gated on [`Self::set_memory_enabled`]
+    /// (what was written stays inspectable).
+    pub async fn memory_blocks(
+        &self,
+        participant_id: String,
+    ) -> Result<Vec<memory::MemoryBlockInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.memory_blocks(&participant_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
     /// The names of the currently registered tools (registration order).
     pub fn registered_tools(&self) -> Vec<String> {
         self.inner
@@ -5616,6 +5712,8 @@ impl AppCore {
                 spend_gate: tokio::sync::Mutex::new(()),
                 summary_gate: tokio::sync::Mutex::new(()),
                 summary_triggers: Mutex::new(std::collections::HashMap::new()),
+                memory_gate: tokio::sync::Mutex::new(()),
+                memory_enabled: std::sync::atomic::AtomicBool::new(false),
                 tools: std::sync::RwLock::new(tools::ToolRegistry::new()),
                 tool_incapable_backends: std::sync::RwLock::new(std::collections::HashSet::new()),
                 http_override,
@@ -9272,6 +9370,16 @@ impl ThreadSnapshot {
         }
         out.push_str(THREAD_MAP_CLOSE);
         out
+    }
+
+    /// The action a post handle names, if this snapshot knows it — how
+    /// `remember` turns the model's `sources: ["#h"]` into real provenance
+    /// edges. Same stale-ok contract as the navigation tools: a handle the
+    /// snapshot does not know is reported, never guessed at.
+    pub(crate) fn action_for_handle(&self, handle: &str) -> Option<&str> {
+        self.by_handle
+            .get(handle)
+            .map(|&i| self.nodes[i].action_id.as_str())
     }
 
     /// `list_branches`: the whole space's fork structure.

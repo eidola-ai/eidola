@@ -50,6 +50,14 @@
 //!
 //! | `refresh_branch_summaries` — one **branch summary** committed (the background chore behind a post or a turn; see `summaries`) | A `checkpoint` action authored by the global system participant, carrying the summary text and two `reference` edges (branch root, summarized tip); a regeneration **supersedes** the branch's prior summary within one item | `Space(id)` per committed summary. **No `SpaceIndex`** (nothing was posted) and **no `Record`** (a chore writes no request row). A pass that generates nothing — cache hit, no utility model, an unusable answer — emits nothing at all | `branch_summaries.rs` (`a_committed_summary_emits_space`) |
 //!
+//! | `remember` — one **memory block** committed mid-turn (task 35; the turn-scoped tool, see `memory`) | A `memory` action authored by the responding participant in the block's **residence** space, carrying the new contents and (optionally) `reference` edges to the posts it learned from; a revision **supersedes** that block's tip within one item, and a fresh block also inserts its `memory_block` identity row | `Space(residence)` per committed block. **No `SpaceIndex`** (nothing was posted) and **no `Record`** (the tool writes no request row; the round that carried the call writes its own). A refused call — name, size or the per-owner block ceiling — is decided **before any write** and emits nothing at all | `agent_memory.rs` (`a_committed_memory_block_emits_space`; the two budget tests pin the zero-trace refusals) |
+//!
+//! That is the one place a *successful* tool round emits: the round itself is
+//! still not an exit point (see below), but the tool's own durable write is a
+//! commit like any other. It is safe mid-loop for the same reason the round's
+//! trace rows are — `memory` is not a post type, so no subscriber's rendered
+//! thread changes underneath it.
+//!
 //! `SpaceIndex?` = emitted by `post` when the listing changed (new space /
 //! auto-title); `run_turn` never emits it. Plain `?` on intervening local-DB
 //! action/content/antecedent inserts stays *unemitted* — internal-consistency
