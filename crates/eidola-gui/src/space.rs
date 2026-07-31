@@ -393,9 +393,11 @@ pub struct Space {
     traces: Loadable<HashMap<String, Vec<PostTrace>>>,
     /// Supersede slot for the trace fetch.
     traces_task: Option<Task<()>>,
-    /// Which anchors' disclosures are open. Pure view state, but held here (as
-    /// `ChatMessageView::reasoning_expanded` is) so a reload — or the other
-    /// window on the same space — can't collapse one under the reader.
+    /// Which disclosures are open, by **turn** (`PostTrace::id`) — several
+    /// turns can hang under one post, so the anchor is not an identity. Pure
+    /// view state, but held here (as `ChatMessageView::reasoning_expanded` is)
+    /// so a reload — or the other window on the same space — can't collapse one
+    /// under the reader.
     traces_expanded: std::collections::HashSet<String>,
 }
 
@@ -594,15 +596,17 @@ impl Space {
             .unwrap_or(&[])
     }
 
-    /// Whether `anchor_action_id`'s disclosure is open.
-    pub fn trace_expanded(&self, anchor_action_id: &str) -> bool {
-        self.traces_expanded.contains(anchor_action_id)
+    /// Whether the turn `trace_id`'s ([`PostTrace::id`]) disclosure is open.
+    pub fn trace_expanded(&self, trace_id: &str) -> bool {
+        self.traces_expanded.contains(trace_id)
     }
 
-    /// Open/close a post's trace disclosure.
-    pub fn toggle_trace(&mut self, anchor_action_id: &str, cx: &mut Context<Self>) {
-        if !self.traces_expanded.remove(anchor_action_id) {
-            self.traces_expanded.insert(anchor_action_id.to_string());
+    /// Open/close one turn's trace disclosure. Keyed on the turn, not the post
+    /// it hangs under: a post can carry several turns' disclosures, and opening
+    /// one must not open the rest.
+    pub fn toggle_trace(&mut self, trace_id: &str, cx: &mut Context<Self>) {
+        if !self.traces_expanded.remove(trace_id) {
+            self.traces_expanded.insert(trace_id.to_string());
         }
         cx.notify();
     }

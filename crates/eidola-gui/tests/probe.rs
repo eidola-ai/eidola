@@ -2927,6 +2927,7 @@ fn space_probes_record_the_trace_disclosure(cx: &mut TestAppContext) {
         space.update(cx, |s, cx| {
             s.set_post_tree_for_test(vec![ask], cx);
             s.seed_traces_for_test(vec![eidola_app_core::PostTrace {
+                id: "t1".into(),
                 anchor_action_id: "a1".into(),
                 participant_label: "Mara".into(),
                 unanswered: true,
@@ -2950,24 +2951,28 @@ fn space_probes_record_the_trace_disclosure(cx: &mut TestAppContext) {
 
     // Collapsed: the toggle is there, its rows are not.
     let entries = fresh_entries(cx, window);
-    assert_probe(
+    assert_probe_value(
         &entries,
-        "space/post/0/trace",
+        "space/post/0/trace/0",
         gpui::Role::Button,
         "Show what this turn did",
+        "Mara — declined to respond · 1 tool call",
     );
     assert!(
-        !entries.iter().any(|(n, _)| n == "space/post/0/trace/1"),
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/post/0/trace/0/round/1"),
         "a collapsed disclosure reveals no rows"
     );
 
+    // Expansion is keyed on the turn, not on the post it hangs under.
     cx.update(|cx| {
-        space.update(cx, |s, cx| s.toggle_trace("a1", cx));
+        space.update(cx, |s, cx| s.toggle_trace("t1", cx));
     });
     let entries = fresh_entries(cx, window);
     assert_probe(
         &entries,
-        "space/post/0/trace",
+        "space/post/0/trace/0",
         gpui::Role::Button,
         "Hide what this turn did",
     );
@@ -2975,15 +2980,109 @@ fn space_probes_record_the_trace_disclosure(cx: &mut TestAppContext) {
     // decision has no exchange of its own, so it is a plain list item.
     assert_probe(
         &entries,
-        "space/post/0/trace/1",
+        "space/post/0/trace/0/round/1",
         gpui::Role::Link,
         "Round 1: read_thread — {\"handle\":\"h1\"} → 8 posts",
     );
     assert_probe(
         &entries,
-        "space/post/0/trace/2",
+        "space/post/0/trace/0/round/2",
         gpui::Role::ListItem,
         "Round 2: declined — nothing to add",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn space_probes_record_a_disclosure_per_turn(cx: &mut TestAppContext) {
+    // A fan-out puts several turns under one post, and a post can be declined
+    // twice by one agent. Each turn is its own quiet line, named for the
+    // participant that ran it — one aggregated line would credit everybody's
+    // activity to whichever turn happened to sort first.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let declined = |id: &str, label: &str, reason: &str| eidola_app_core::PostTrace {
+        id: id.into(),
+        anchor_action_id: "a1".into(),
+        participant_label: label.into(),
+        unanswered: true,
+        entries: vec![
+            eidola_app_core::TraceEntry::Tool {
+                action_id: format!("{id}-tc"),
+                request_id: Some(format!("{id}-req")),
+                call_id: "c1".into(),
+                name: "decline".into(),
+                arguments: "{}".into(),
+                result: Some("Declined.".into()),
+            },
+            eidola_app_core::TraceEntry::Declined {
+                action_id: format!("{id}-d"),
+                reason: Some(reason.into()),
+            },
+        ],
+    };
+
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "which branch settled it?")], cx);
+            s.seed_traces_for_test(vec![
+                declined("t-mara", "Mara", "not my area"),
+                declined("t-ferris", "Ferris", "Mara covered it"),
+            ]);
+        });
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/post/0/trace/0",
+        gpui::Role::Button,
+        "Show what this turn did",
+        "Mara — declined to respond · 1 tool call",
+    );
+    assert_probe_value(
+        &entries,
+        "space/post/0/trace/1",
+        gpui::Role::Button,
+        "Show what this turn did",
+        "Ferris — declined to respond · 1 tool call",
+    );
+
+    // Each opens on its own, and its rounds are its own.
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.toggle_trace("t-ferris", cx));
+    });
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/trace/0",
+        gpui::Role::Button,
+        "Show what this turn did",
+    );
+    assert_probe(
+        &entries,
+        "space/post/0/trace/1",
+        gpui::Role::Button,
+        "Hide what this turn did",
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/post/0/trace/0/round/1"),
+        "the turn that was not opened reveals nothing"
+    );
+    assert_probe(
+        &entries,
+        "space/post/0/trace/1/round/2",
+        gpui::Role::ListItem,
+        "Round 2: declined — Mara covered it",
     );
 
     probe::set_probes_enabled(false);
