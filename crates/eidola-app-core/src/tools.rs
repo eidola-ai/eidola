@@ -166,19 +166,22 @@ impl ToolRegistry {
 ///
 /// These are the **turn-scoped** tools `prepare_turn` attaches on top of the
 /// process-registry snapshot: the navigation tools of a branched turn (see
-/// below) and task 35's `remember`. They are protocol surface, not ordinary
-/// built-ins — a system note promises the model these names with these
-/// semantics, and each is bound to something only the turn has (its own
-/// `ThreadSnapshot`; for `remember`, the responding participant's identity and
-/// residence space) that a process-scoped registration structurally cannot
+/// below), task 35's `remember`, and task 36's `list_my_spaces`. They are
+/// protocol surface, not ordinary built-ins — a system note promises the model
+/// these names with these semantics, and each is bound to something only the
+/// turn has (its own `ThreadSnapshot`; for `remember`, the responding
+/// participant's identity and residence space; for `list_my_spaces`, the
+/// responding participant, whose membership *is* the boundary the tool
+/// enforces) that a process-scoped registration structurally cannot
 /// supply. Reserving them keeps "what the model was promised" and "what
 /// executes" the same object on every turn, instead of silently diverging the
 /// moment a space branches or memory is switched on.
-pub const RESERVED_TOOL_NAMES: [&str; 4] = [
+pub const RESERVED_TOOL_NAMES: [&str; 5] = [
     "list_branches",
     "read_thread",
     "read_post",
     crate::memory::REMEMBER_TOOL_NAME,
+    crate::discovery::LIST_MY_SPACES_TOOL_NAME,
 ];
 
 /// Whether `name` is reserved for a turn-scoped tool.
@@ -436,7 +439,12 @@ mod tests {
         // the turn's responding participant, which the process registry has no
         // way to express.
         assert!(is_reserved_tool_name(crate::memory::REMEMBER_TOOL_NAME));
-        assert_eq!(RESERVED_TOOL_NAMES.len(), 4);
+        // Task 36's `list_my_spaces` likewise: it is bound to the responding
+        // participant, and membership is the boundary it enforces.
+        assert!(is_reserved_tool_name(
+            crate::discovery::LIST_MY_SPACES_TOOL_NAME
+        ));
+        assert_eq!(RESERVED_TOOL_NAMES.len(), 5);
     }
 
     #[test]

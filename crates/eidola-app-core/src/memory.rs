@@ -36,8 +36,12 @@
 //! goes) or `space` (loads in its residence only). Scope is addressing, never
 //! co-ownership, which is what makes promoting an agent to a global identity
 //! (task 36) a no-op for its memory. Residence is the space the block is about;
-//! for a space-owned agent that is always its owner space, so v1 needs no
-//! separate residence concept.
+//! for a space-owned agent that is always the space it is standing in. A
+//! **global** agent's `core` blocks are about no space at all, so they reside
+//! in that agent's private notebook space (task 36) — which is what the
+//! notebook is for. Residence is decided once, when a block is created, and
+//! never moves: promotion therefore leaves every existing block exactly where
+//! it was, with the label it had.
 //!
 //! # The loading rule
 //!
@@ -304,6 +308,11 @@ pub struct MemoryBlockInfo {
     /// Residence — the space this block is about.
     pub space_id: String,
     pub owner_participant_id: String,
+    /// The owner's scope at the time of reading (`global` / `space`) — the
+    /// pinned composite echo, which task 36's promotion carries across every
+    /// block via `ON UPDATE CASCADE`. Owner and residence never move; only
+    /// this follows.
+    pub owner_scope: String,
     /// The current generation's contents.
     pub text: String,
     pub updated_at: i64,
@@ -379,6 +388,7 @@ impl Inner {
                 scope: block.scope,
                 space_id: block.space_id,
                 owner_participant_id: block.owner_participant_id,
+                owner_scope: block.owner_scope,
                 text: revisions.last().map(|r| r.text.clone()).unwrap_or_default(),
                 updated_at: block.updated_at,
                 revisions,
@@ -406,7 +416,6 @@ impl Inner {
     pub(crate) async fn remember(
         &self,
         owner_participant_id: &str,
-        owner_scope: &str,
         space_id: &str,
         req: RememberRequest,
     ) -> Result<MemoryOutcome, AppError> {
@@ -430,10 +439,32 @@ impl Inner {
             }));
         }
 
+        // Where a *new* block lives. A block resides in the space it is about,
+        // which for a space-owned agent is always the space it is standing in.
+        // For a **global** agent (task 36) a `core` block is not about any
+        // space — it travels with the identity — so it resides in that agent's
+        // private notebook, which is exactly what the notebook exists for.
+        // Everything else, global or not, stays where it was written.
+        // The owner's scope is read **here**, not carried from the turn: a
+        // promotion can land mid-turn, and residence should follow what the
+        // agent is now rather than what it was when the turn was prepared.
+        let owner_is_global = db::get_participant(&conn, owner_participant_id)
+            .await?
+            .is_some_and(|p| p.scope == "global");
+        let new_residence = if req.scope == SCOPE_CORE && owner_is_global {
+            db::notebook_space_for(&conn, owner_participant_id)
+                .await?
+                .unwrap_or_else(|| space_id.to_string())
+        } else {
+            space_id.to_string()
+        };
+
         let now = now_ms();
         let action_id = Uuid::now_v7().to_string();
         // Residence never moves: a block stays in the space it is about, so a
         // revision written from anywhere lands where the block already lives.
+        // (Which is also why promotion is a no-op for memory — an existing
+        // space block keeps its label *and* its home.)
         let (item_id, supersedes, residence, revision) = match &existing {
             Some(b) => {
                 let tip = db::current_tip_of_item(&conn, &b.space_id, &b.item_id)
@@ -444,12 +475,7 @@ impl Inner {
                 let revision = db::memory_revisions(&conn, &b.item_id).await?.len() + 1;
                 (b.item_id.clone(), Some(tip), b.space_id.clone(), revision)
             }
-            None => (
-                Uuid::now_v7().to_string(),
-                None,
-                space_id.to_string(),
-                1usize,
-            ),
+            None => (Uuid::now_v7().to_string(), None, new_residence, 1usize),
         };
 
         db::insert_action(
@@ -461,7 +487,6 @@ impl Inner {
                 // the owner, and is the field a later human correction would
                 // differ in.
                 participant_id: owner_participant_id.to_string(),
-                participant_scope: owner_scope.to_string(),
                 item_id: item_id.clone(),
                 supersedes_action_id: supersedes,
                 action_type: db::MEMORY_ACTION_TYPE.to_string(),
@@ -511,11 +536,10 @@ impl Inner {
             None => {
                 db::insert_memory_block(
                     &conn,
-                    &db::MemoryBlockRow {
+                    &db::NewMemoryBlock {
                         item_id: item_id.clone(),
                         root_action_id: action_id.clone(),
                         owner_participant_id: owner_participant_id.to_string(),
-                        owner_scope: owner_scope.to_string(),
                         name: name.clone(),
                         scope: req.scope.clone(),
                         space_id: residence.clone(),
@@ -552,7 +576,6 @@ impl Inner {
 pub(crate) struct RememberTool {
     inner: Weak<Inner>,
     owner_participant_id: String,
-    owner_scope: String,
     space_id: String,
     snapshot: Arc<ThreadSnapshot>,
 }
@@ -561,14 +584,12 @@ impl RememberTool {
     pub(crate) fn new(
         inner: Weak<Inner>,
         owner_participant_id: String,
-        owner_scope: String,
         space_id: String,
         snapshot: Arc<ThreadSnapshot>,
     ) -> Self {
         Self {
             inner,
             owner_participant_id,
-            owner_scope,
             space_id,
             snapshot,
         }
@@ -684,7 +705,6 @@ impl Tool for RememberTool {
             let outcome = inner
                 .remember(
                     &self.owner_participant_id,
-                    &self.owner_scope,
                     &self.space_id,
                     RememberRequest {
                         name,
