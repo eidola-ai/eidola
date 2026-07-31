@@ -1738,7 +1738,15 @@ pub struct ReferencedPostRow {
     pub text: String,
 }
 
-/// Read one action as a referenced post. `None` when the action doesn't exist.
+/// Read one action as a referenced post. `None` when the action doesn't exist
+/// **or is not a post**.
+///
+/// The post-type filter is defense in depth, not the primary gate: a reference
+/// may only be *created* against a post (`crate::Inner::validate_reference_spec`
+/// refuses anything else), but a reference edge that predates that gate — or
+/// arrives through some future writer below it — must not become a door into a
+/// first-person tool trace, a decision, or another participant's memory block.
+/// The follow reports "not a readable post" and stops.
 ///
 /// The caller is responsible for the membership gate — this is the read that
 /// runs *after* it passes.
@@ -1747,7 +1755,7 @@ pub async fn referenced_post(
     action_id: &str,
 ) -> Result<Option<ReferencedPostRow>, AppError> {
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT a.space_id, s.title, a.item_id, \
                     COALESCE(sp.override_label, p.label), a.action_type \
              FROM action a \
@@ -1755,8 +1763,8 @@ pub async fn referenced_post(
              JOIN participant p ON p.id = a.participant_id \
              LEFT JOIN space_participant sp \
                     ON sp.space_id = a.space_id AND sp.participant_id = a.participant_id \
-             WHERE a.id = ?1",
-        )
+             WHERE a.id = ?1 AND a.action_type IN ({POST_ACTION_TYPES_SQL})",
+        ))
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -2806,6 +2814,23 @@ pub struct ReferenceEdgeRow {
     /// `text_content` of the referenced content block, when the edge carries
     /// a `content_block_id` and that block has text.
     pub block_text: Option<String>,
+    /// Action type of the antecedent, and block type of the quoted block (when
+    /// there is one). Carried so a reader can apply the quotable rule —
+    /// [`is_post_action_type`] + [`QUOTABLE_BLOCK_TYPE`] — *without* the query
+    /// dropping rows: `edit_post` replicates whatever edges exist, and a
+    /// replication that silently lost one would rewrite history.
+    pub antecedent_action_type: String,
+    pub block_type: Option<String>,
+}
+
+impl ReferenceEdgeRow {
+    /// Whether this edge's quoted passage may be shown or sent — a post's
+    /// `text` block and nothing else (see [`crate::Inner::validate_reference_spec`]
+    /// for why an edge could be otherwise).
+    pub fn is_quotable(&self) -> bool {
+        is_post_action_type(&self.antecedent_action_type)
+            && self.block_type.as_deref() == Some(QUOTABLE_BLOCK_TYPE)
+    }
 }
 
 /// The `reference`-relation antecedents of an action, ordinal order. Used by
@@ -2818,8 +2843,10 @@ pub async fn reference_antecedents(
     let mut stmt = conn
         .prepare(
             "SELECT aa.ordinal, aa.antecedent_action_id, aa.content_block_id, \
-                    aa.range_start, aa.range_end, aa.annotation, cb.text_content \
+                    aa.range_start, aa.range_end, aa.annotation, cb.text_content, \
+                    ant.action_type, cb.block_type \
              FROM action_antecedent aa \
+             JOIN action ant ON ant.id = aa.antecedent_action_id \
              LEFT JOIN content_block cb ON cb.id = aa.content_block_id \
              WHERE aa.action_id = ?1 AND aa.relation = 'reference' \
              ORDER BY aa.ordinal ASC",
@@ -2840,20 +2867,23 @@ pub async fn reference_antecedents(
             range_end: row.get::<Option<i64>>(4).map_err(AppError::db)?,
             annotation: row.get::<Option<String>>(5).map_err(AppError::db)?,
             block_text: row.get::<Option<String>>(6).map_err(AppError::db)?,
+            antecedent_action_type: row.get::<String>(7).map_err(AppError::db)?,
+            block_type: row.get::<Option<String>>(8).map_err(AppError::db)?,
         });
     }
     Ok(out)
 }
 
-/// `(action_id, text_content)` of a content block, or `None` if the block
-/// doesn't exist. Used to validate that a [`crate::ReferenceSpec`]'s block
-/// belongs to its antecedent action and that its byte range is honest.
+/// `(action_id, block_type, text_content)` of a content block, or `None` if the
+/// block doesn't exist. Used to validate that a [`crate::ReferenceSpec`]'s block
+/// belongs to its antecedent action, is quotable at all
+/// ([`QUOTABLE_BLOCK_TYPE`]), and that its byte range is honest.
 pub async fn content_block_owner_text(
     conn: &Connection,
     content_block_id: &str,
-) -> Result<Option<(String, Option<String>)>, AppError> {
+) -> Result<Option<(String, String, Option<String>)>, AppError> {
     let mut stmt = conn
-        .prepare("SELECT action_id, text_content FROM content_block WHERE id = ?1")
+        .prepare("SELECT action_id, block_type, text_content FROM content_block WHERE id = ?1")
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -2864,7 +2894,60 @@ pub async fn content_block_owner_text(
         None => Ok(None),
         Some(row) => Ok(Some((
             row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<String>(1).map_err(AppError::db)?,
+            row.get::<Option<String>>(2).map_err(AppError::db)?,
+        ))),
+    }
+}
+
+/// `(id, text_content)` of an action's first content block, whatever its type.
+/// Test-only support for `AppCore::test_insert_unvalidated_reference`; the
+/// production reference path never needs to name a block it wasn't given.
+#[doc(hidden)]
+pub async fn first_content_block(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<(String, Option<String>)>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, text_content FROM content_block \
+             WHERE action_id = ?1 ORDER BY ordinal ASC LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some((
+            row.get::<String>(0).map_err(AppError::db)?,
             row.get::<Option<String>>(1).map_err(AppError::db)?,
+        ))),
+    }
+}
+
+/// `(space_id, action_type)` of an action, or `None` if it doesn't exist — what
+/// the reference gate needs to decide *where* a quote points and *what kind of
+/// thing* it points at, in one read.
+pub async fn action_space_and_type(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<(String, String)>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT space_id, action_type FROM action WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<String>(1).map_err(AppError::db)?,
         ))),
     }
 }
@@ -4054,6 +4137,21 @@ async fn reply_antecedent_tip(
 /// tool_call/tool_result/error gain a post render.)
 pub const POST_ACTION_TYPES_SQL: &str = "'user_input', 'inference'";
 
+/// The same set, for the checks that happen in Rust rather than in SQL — the
+/// reference gate (what a quote may name) and the read-side filters that back
+/// it up. Kept beside [`POST_ACTION_TYPES_SQL`] so the two cannot drift.
+pub const POST_ACTION_TYPES: [&str; 2] = ["user_input", "inference"];
+
+/// Whether an action type renders as a post.
+pub fn is_post_action_type(action_type: &str) -> bool {
+    POST_ACTION_TYPES.contains(&action_type)
+}
+
+/// The only block type a reference may quote, and the only one any context
+/// query sends upstream. A `thinking` block is a render-side disclosure and a
+/// `tool_use` / `tool_result` block is trace plumbing; neither is transcript.
+pub const QUOTABLE_BLOCK_TYPE: &str = "text";
+
 /// One renderable post — an item's current-generation action with its
 /// participant identity and derived generation number. Content blocks and
 /// antecedent edges come back separately (see [`SpaceTreeData`]).
@@ -4102,6 +4200,12 @@ pub struct AntecedentEdgeRow {
     /// `text_content` of the referenced content block (reference edges with a
     /// `content_block_id` only) — the raw material for snippet resolution.
     pub block_text: Option<String>,
+    /// Action type of the antecedent, and block type of the quoted block —
+    /// the quotable rule (a post's `text` block and nothing else), applied by
+    /// `build_post_tree` when it resolves the snippet. The *edge* still
+    /// renders (its existence is public); only the passage is withheld.
+    pub antecedent_action_type: String,
+    pub block_type: Option<String>,
 }
 
 /// The raw materials for one space's threaded-post render.
@@ -4199,7 +4303,8 @@ pub async fn get_space_tree_data(
     let edge_sql = format!(
         "SELECT aa.action_id, aa.antecedent_action_id, aa.ordinal, aa.relation, \
                 aa.range_start, aa.range_end, aa.annotation, \
-                ic.current_action_id, aa.content_block_id, qcb.text_content \
+                ic.current_action_id, aa.content_block_id, qcb.text_content, \
+                ant.action_type, qcb.block_type \
          FROM action_antecedent aa \
          JOIN action_resolved ar ON ar.action_id = aa.action_id \
          JOIN action ant ON ant.id = aa.antecedent_action_id \
@@ -4230,6 +4335,8 @@ pub async fn get_space_tree_data(
             antecedent_current_action_id: row.get::<Option<String>>(7).map_err(AppError::db)?,
             content_block_id: row.get::<Option<String>>(8).map_err(AppError::db)?,
             block_text: row.get::<Option<String>>(9).map_err(AppError::db)?,
+            antecedent_action_type: row.get::<String>(10).map_err(AppError::db)?,
+            block_type: row.get::<Option<String>>(11).map_err(AppError::db)?,
         });
     }
 

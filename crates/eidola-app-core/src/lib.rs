@@ -2396,19 +2396,40 @@ impl Inner {
     /// public in this space — append-only, forever. Re-checking would make
     /// editing your own post fail because you later left the source space,
     /// costing an author their edit surface and buying no privacy back.
+    ///
+    /// **A reference may only name a post, and only a post's `text` block**
+    /// (PR #261 review). Without that rule the edge is a hole through every
+    /// audience boundary the rest of the system maintains: a `tool_call`
+    /// action carries a turn's first-person narration, which task 33 replays
+    /// to its own author and to nobody else; a `decision`, a `memory` block and
+    /// a `checkpoint` summary are likewise not transcript; and a `thinking`
+    /// block is a render-side disclosure that both context queries filter out
+    /// of the wire *by block type*. A quote naming any of them would launder it
+    /// straight into every reader of the referencing space — through the
+    /// upstream embed expansion with no tool call at all. Refusing at creation
+    /// makes the state unrepresentable; the read paths filter too, for edges
+    /// written below this seam.
     async fn validate_reference_spec(
         &self,
         conn: &turso::Connection,
         author_participant_id: &str,
         spec: &ReferenceSpec,
     ) -> Result<(), AppError> {
-        let Some((_, source_space_id)) =
-            db::action_item_and_space(conn, &spec.antecedent_action_id).await?
+        let Some((source_space_id, source_action_type)) =
+            db::action_space_and_type(conn, &spec.antecedent_action_id).await?
         else {
             return Err(AppError::NotConfigured {
                 message: format!("referenced action not found: {}", spec.antecedent_action_id),
             });
         };
+        if !db::is_post_action_type(&source_action_type) {
+            return Err(AppError::NotConfigured {
+                message: format!(
+                    "action {} is a {source_action_type}, not a post — only posts can be quoted",
+                    spec.antecedent_action_id
+                ),
+            });
+        }
         // Rule 1: only a participant of the referenced space may create a
         // reference to it. Membership is the ACL (task 36), so the fix is an
         // ordinary grant and a retry — no special machinery, no new concept.
@@ -2432,11 +2453,21 @@ impl Inner {
             }
             return Ok(());
         };
-        let Some((owner_action, text)) = db::content_block_owner_text(conn, block_id).await? else {
+        let Some((owner_action, block_type, text)) =
+            db::content_block_owner_text(conn, block_id).await?
+        else {
             return Err(AppError::NotConfigured {
                 message: format!("referenced content block not found: {block_id}"),
             });
         };
+        if block_type != db::QUOTABLE_BLOCK_TYPE {
+            return Err(AppError::NotConfigured {
+                message: format!(
+                    "content block {block_id} is a {block_type} block — only a post's text can \
+                     be quoted"
+                ),
+            });
+        }
         if owner_action != spec.antecedent_action_id {
             return Err(AppError::NotConfigured {
                 message: format!(
@@ -2482,6 +2513,16 @@ impl Inner {
                 let refs = db::reference_antecedents(conn, &row.action_id).await?;
                 let mut map = std::collections::BTreeMap::new();
                 for r in refs {
+                    // Only a post's `text` block expands. This is the path that
+                    // needs no tool call and no membership — whatever it
+                    // expands goes straight into the next reader's context — so
+                    // it re-applies the quotable rule rather than trusting that
+                    // every edge came through `validate_reference_spec`. An
+                    // unquotable edge simply doesn't expand: its marker stays
+                    // literal, exactly like an unmapped ordinal.
+                    if !r.is_quotable() {
+                        continue;
+                    }
                     let (Some(rs), Some(re), Some(block_text)) =
                         (r.range_start, r.range_end, r.block_text.as_deref())
                     else {
@@ -6785,6 +6826,49 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Test-only seam: write a `reference` edge **below** the validation gate,
+    /// quoting the whole of the antecedent's first content block.
+    ///
+    /// This exists to model exactly one thing: an edge the create gate would
+    /// refuse today — one written before the gate landed, or by some future
+    /// writer below it. The read paths are supposed to withhold its passage
+    /// regardless of how it got there, and that claim is only testable if a
+    /// test can produce such an edge. There is no production caller and none
+    /// should be added: `post_with_references` is the seam that writes
+    /// references, and it validates.
+    #[doc(hidden)]
+    pub async fn test_insert_unvalidated_reference(
+        &self,
+        action_id: String,
+        antecedent_action_id: String,
+        ordinal: i64,
+    ) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                let block = db::first_content_block(&conn, &antecedent_action_id).await?;
+                let (block_id, range) = match block {
+                    Some((id, Some(text))) => (Some(id), Some((0i64, text.len() as i64))),
+                    Some((id, None)) => (Some(id), None),
+                    None => (None, None),
+                };
+                db::insert_reference_antecedent(
+                    &conn,
+                    &action_id,
+                    &antecedent_action_id,
+                    ordinal,
+                    block_id.as_deref(),
+                    range.map(|r| r.0),
+                    range.map(|r| r.1),
+                    None,
+                )
+                .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Test-only seam: an inference's context assembly, in `position` order —
     /// the ordered composition of the prompt that produced it, which is what
     /// lets a test pin that the record matches the messages actually sent
@@ -9130,9 +9214,17 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
             // Snippet resolution: the quoted block's text was joined into the
             // edge row; slice it by the stored byte range. A range that no
             // longer maps honestly resolves to `None` — never truncated or
-            // remapped.
+            // remapped. An edge naming something that isn't a post's `text`
+            // block resolves to `None` too: the reference still renders (its
+            // existence is public), but the passage is withheld — this feeds
+            // the footnote rail *and* `read_post`'s quote list, which is a
+            // model-facing surface.
+            let quotable = db::is_post_action_type(&e.antecedent_action_type)
+                && e.block_type.as_deref() == Some(db::QUOTABLE_BLOCK_TYPE);
             let snippet = match (e.range_start, e.range_end, e.block_text.as_deref()) {
-                (Some(rs), Some(re), Some(text)) => quote_snippet(text, rs, re).map(str::to_string),
+                (Some(rs), Some(re), Some(text)) if quotable => {
+                    quote_snippet(text, rs, re).map(str::to_string)
+                }
                 _ => None,
             };
             references_by_action
@@ -10803,6 +10895,8 @@ mod tests {
             range_end: None,
             annotation: None,
             block_text: None,
+            antecedent_action_type: "user_input".into(),
+            block_type: None,
         }
     }
 
@@ -11003,6 +11097,8 @@ mod tests {
                     range_end: Some(5),
                     annotation: Some("see here".into()),
                     block_text: Some("hello world".into()),
+                    antecedent_action_type: "user_input".into(),
+                    block_type: Some("text".into()),
                 },
             ],
         };

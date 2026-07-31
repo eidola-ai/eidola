@@ -486,7 +486,12 @@ impl ReadPostTool {
         };
         let row = match crate::db::referenced_post(&conn, &reference.antecedent_action_id).await {
             Ok(Some(row)) => row,
-            Ok(None) => return "That quoted post no longer exists.".to_string(),
+            // Gone, or never a post to begin with — `referenced_post` reads
+            // only post types, so a quote that somehow names a tool trace, a
+            // decision or a memory block lands here rather than rendering one.
+            // One answer for both: neither is followable and neither reveals
+            // anything.
+            Ok(None) => return "That quote does not point at a readable post.".to_string(),
             Err(_) => return "That quoted post could not be read.".to_string(),
         };
         // Rule 4: follow requires membership, re-read per call.
