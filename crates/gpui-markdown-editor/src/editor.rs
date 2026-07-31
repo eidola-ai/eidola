@@ -1546,6 +1546,32 @@ impl MarkdownEditorState {
         }
     }
 
+    /// Whether `command`'s preconditions are met on this editor right now —
+    /// the **enablement twin** of [`Self::perform`], and it lives beside it
+    /// deliberately: a host that decides which verbs to offer by re-deriving
+    /// the conditions itself will eventually advertise one `perform` then
+    /// declines. `Cut`/`Paste` need an editable editor, `Cut`/`Copy` a
+    /// non-empty selection, and `Paste` **text on the clipboard** — without
+    /// which `perform` returns having touched nothing at all. `SelectAll` has
+    /// no precondition; selecting all of an empty document is the degenerate
+    /// case of a command that works, not a verb that does nothing.
+    pub fn can_perform(&self, command: EditorCommand, cx: &App) -> bool {
+        match command {
+            EditorCommand::Cut => {
+                !self.disabled && !self.state.selection.selection_range().is_empty()
+            }
+            EditorCommand::Copy => !self.state.selection.selection_range().is_empty(),
+            EditorCommand::Paste => {
+                !self.disabled
+                    && cx
+                        .read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .is_some_and(|text| !text.is_empty())
+            }
+            EditorCommand::SelectAll => true,
+        }
+    }
+
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         let len = self.state.markdown.len();
         self.dispatch(EditorEvent::SetSelection(Selection::range(0, len)), cx);

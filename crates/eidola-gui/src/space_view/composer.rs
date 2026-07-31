@@ -1094,9 +1094,11 @@ impl SpaceView {
                     // deactivates the draft (deleting it if an empty fork) and
                     // moves focus off the editor to the view root, so a kept
                     // draft reads as exited (no stray cursor) until it's
-                    // clicked back into.
-                    if this.close_context_menu(cx) {
-                        // consumed
+                    // clicked back into. The context menu is only *yielded* to
+                    // here — the view root closes it (see
+                    // `context_menu_absorbs_escape`).
+                    if this.context_menu_absorbs_escape() {
+                        // absorbed
                     } else if this.band_menu.is_some() {
                         this.band_menu = None;
                         cx.notify();

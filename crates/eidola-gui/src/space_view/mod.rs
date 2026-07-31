@@ -1900,12 +1900,13 @@ impl Render for SpaceView {
                 d.on_action(cx.listener(Self::quote))
                     .on_action(cx.listener(Self::quote_in_reply))
             })
-            // Escape closes an open context menu wherever focus happens to
-            // be. The composer's own handler (an inner element, so it runs
-            // first) already consumes the key when it closes the menu; this
-            // is the path for a right-click on a post while nothing is being
-            // composed, where there is no composer element in the dispatch
-            // path at all. A no-op when no menu is open.
+            // **The sole owner of "Escape closes the context menu."** Key
+            // dispatch bubbles inner→outer, so the root runs *last* — after
+            // every inner Escape handler (the composer's, an edit session's)
+            // has yielded via [`Self::context_menu_absorbs_escape`]. One
+            // owner, consulted by one predicate, rather than a copy of the
+            // close per handler that each has to remember to make first. A
+            // no-op when no menu is open.
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
                 if ev.keystroke.key == "escape" {
                     this.close_context_menu(cx);

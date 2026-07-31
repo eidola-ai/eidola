@@ -9,12 +9,13 @@
 //!   always, and — only while that editor actually holds a selection — *Copy*,
 //!   plus *Quote* / *Quote in Reply* when the selection is a quotable one.
 //! - **An editable editor** (the composer, an inline Edit session): *Cut*,
-//!   *Copy*, *Paste*, *Select All* — with Cut and Copy offered only while
-//!   something is selected. The house rule is that an affordance appears when
-//!   it is actionable (the per-post verbs hide mid-stream for the same reason:
-//!   "dead verbs would lie"), and a *greyed* row would be the worse option
-//!   here — gpui exposes no `aria_disabled` at this pin, so a dimmed item
-//!   would read to assistive technology as a live one that does nothing.
+//!   *Copy*, *Paste*, *Select All* — Cut and Copy only while something is
+//!   selected, and *Paste* only while the clipboard actually holds text. The
+//!   house rule is that an affordance appears when it is actionable (the
+//!   per-post verbs hide mid-stream for the same reason: "dead verbs would
+//!   lie"), and a *greyed* row would be the worse option here — gpui exposes
+//!   no `aria_disabled` at this pin, so a dimmed item would read to assistive
+//!   technology as a live one that does nothing.
 //!
 //! **Nothing here is a parallel path.** The clipboard verbs run the editor's
 //! own commands through the additive `MarkdownEditorState::perform` seam (the
@@ -22,6 +23,14 @@
 //! a read-only post body isn't on), and the quote verbs call
 //! [`SpaceView::quote`] / [`SpaceView::quote_in_reply`] — the very handlers the
 //! Edit menu dispatches — so the two surfaces cannot drift.
+//!
+//! **Which rows exist comes from the same seam.** Every clipboard row is
+//! gated on `MarkdownEditorState::can_perform` — `perform`'s enablement twin,
+//! living beside it in the editor crate — rather than on conditions this
+//! module re-derives. That is what keeps "every displayed row is actionable"
+//! true by construction: a `Paste` gated on a locally-guessed condition is a
+//! row that survives right up until `perform` quietly declines it, which is
+//! precisely what an unconditional Paste did against an empty clipboard.
 //!
 //! **The quotable selection is refreshed at open time.** The editor places the
 //! caret before it reports the gesture (a press outside the selection collapses
@@ -54,14 +63,20 @@ pub(crate) enum ContextTarget {
     Editable,
 }
 
-/// The open context menu: where it sits, which editor it acts on, and the two
-/// facts (selection present, selection quotable) resolved at open time.
+/// The open context menu: where it sits, which editor it acts on, and the
+/// facts resolved at open time — the editor's own verdict on each clipboard
+/// command (`MarkdownEditorState::can_perform`) plus whether the selection is
+/// quotable.
 #[derive(Clone)]
 pub(crate) struct PostContextMenu {
     pub(crate) position: Point<Pixels>,
     pub(crate) editor: Entity<MarkdownEditorState>,
     pub(crate) target: ContextTarget,
-    pub(crate) has_selection: bool,
+    /// `can_perform` per clipboard command, asked once at open time — a menu
+    /// is a snapshot of a moment, exactly like `quotable` below.
+    pub(crate) can_cut: bool,
+    pub(crate) can_copy: bool,
+    pub(crate) can_paste: bool,
     pub(crate) quotable: bool,
 }
 
@@ -120,7 +135,16 @@ impl SpaceView {
         self.band_menu = None;
         self.highlight_picker = None;
 
-        let has_selection = !editor.read(cx).selection().is_collapsed();
+        // Ask the editor itself what each command could do — never re-derive
+        // the conditions here, or the menu will one day offer a verb the
+        // editor declines (which is exactly what an unconditional Paste row
+        // did against an empty clipboard).
+        let can = |command| editor.read(cx).can_perform(command, cx);
+        let (can_cut, can_copy, can_paste) = (
+            can(EditorCommand::Cut),
+            can(EditorCommand::Copy),
+            can(EditorCommand::Paste),
+        );
         // Re-resolve the post's quotable selection *now*: the editor just
         // moved the caret and its `SelectionChanged` has not been delivered
         // yet, so `post_selection` is a frame behind.
@@ -138,14 +162,30 @@ impl SpaceView {
             position,
             editor,
             target,
-            has_selection,
+            can_cut,
+            can_copy,
+            can_paste,
             quotable,
         });
         cx.notify();
     }
 
-    /// Close the menu if one is open. Returns whether anything closed, so the
-    /// composer's Escape handler can consume the key.
+    /// Whether an open menu should absorb this Escape — the one question every
+    /// **inner** Escape handler asks before acting on its own behalf (the
+    /// composer deactivating a draft, an inline Edit session cancelling).
+    ///
+    /// Key dispatch bubbles inner→outer, so those handlers all run *before*
+    /// the view root's. Closing the menu is therefore the root's job alone
+    /// (`SpaceView::render`); an inner handler only yields. That split is what
+    /// keeps "an open menu absorbs the first Escape" a single rule with a
+    /// single owner: a handler that forgets to *close* is harmless, where a
+    /// handler that forgets to *yield* silently cancels an unsaved edit on the
+    /// same press that dismissed the menu.
+    pub(crate) fn context_menu_absorbs_escape(&self) -> bool {
+        self.context_menu.is_some()
+    }
+
+    /// Close the menu if one is open. Returns whether anything closed.
     pub(crate) fn close_context_menu(&mut self, cx: &mut Context<Self>) -> bool {
         let was_open = self.context_menu.is_some();
         self.context_menu = None;
@@ -160,23 +200,27 @@ impl SpaceView {
         let mut items = Vec::new();
         match menu.target {
             ContextTarget::Editable => {
-                if menu.has_selection {
+                if menu.can_cut {
                     items.push(Item {
                         slug: "cut",
                         label: "Cut",
                         action: ItemAction::Command(EditorCommand::Cut),
                     });
+                }
+                if menu.can_copy {
                     items.push(Item {
                         slug: "copy",
                         label: "Copy",
                         action: ItemAction::Command(EditorCommand::Copy),
                     });
                 }
-                items.push(Item {
-                    slug: "paste",
-                    label: "Paste",
-                    action: ItemAction::Command(EditorCommand::Paste),
-                });
+                if menu.can_paste {
+                    items.push(Item {
+                        slug: "paste",
+                        label: "Paste",
+                        action: ItemAction::Command(EditorCommand::Paste),
+                    });
+                }
                 items.push(Item {
                     slug: "select-all",
                     label: "Select All",
@@ -184,9 +228,10 @@ impl SpaceView {
                 });
             }
             ContextTarget::Post { .. } => {
-                // Cut and Paste never appear here: they are not things a
-                // read-only body can ever do.
-                if menu.has_selection {
+                // Cut and Paste never appear here: `can_perform` refuses both
+                // on a read-only editor, so they are structurally impossible
+                // rather than merely omitted.
+                if menu.can_copy {
                     items.push(Item {
                         slug: "copy",
                         label: "Copy",

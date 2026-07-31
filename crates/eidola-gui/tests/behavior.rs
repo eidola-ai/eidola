@@ -7296,6 +7296,21 @@ fn right_click(vcx: &mut VisualTestContext, position: Point<gpui::Pixels>) {
     vcx.run_until_parked();
 }
 
+/// A point inside the active composer's first painted line.
+fn point_in_composer(view: &Entity<SpaceView>, vcx: &VisualTestContext) -> Point<gpui::Pixels> {
+    let (x, y, h) = view
+        .read_with(vcx, |v, cx| {
+            v.composer_state_for_test().and_then(|e| {
+                e.read(cx)
+                    .debug_line_geometry()
+                    .first()
+                    .and_then(|(_, lines)| lines.first().copied())
+            })
+        })
+        .expect("the composer's first painted line");
+    gpui::point(px(x + 20.0), px(y + h.min(20.0) / 2.0))
+}
+
 /// A point inside post `node_id`'s first painted line.
 fn point_in_post(
     view: &Entity<SpaceView>,
@@ -7514,15 +7529,13 @@ fn space_composer_context_menu_offers_the_editable_verbs(cx: &mut TestAppContext
     let composer = view
         .read_with(&vcx, |v, _| v.composer_state_for_test())
         .expect("a blank space opens with its composer");
-    let (x, y, h) = composer
-        .read_with(&vcx, |e, _| {
-            e.debug_line_geometry()
-                .first()
-                .and_then(|(_, lines)| lines.first().copied())
-        })
-        .expect("the composer's first painted line");
-    let at = gpui::point(px(x + 20.0), px(y + h.min(20.0) / 2.0));
+    let at = point_in_composer(&view, &vcx);
 
+    // Paste is clipboard-gated (see the test below), so seed one to keep this
+    // test about the *selection* facts it is asserting.
+    vcx.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("pasteable".to_string()));
+    });
     right_click(&mut vcx, at);
     view.read_with(&vcx, |v, _| {
         assert_eq!(
@@ -7557,6 +7570,127 @@ fn space_composer_context_menu_offers_the_editable_verbs(cx: &mut TestAppContext
                 "Select All".to_string(),
             ]),
             "a selection in an editable editor affords the full clipboard set"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_edit_session_escape_dismisses_the_menu_before_cancelling(cx: &mut TestAppContext) {
+    // A right-click inside an inline Edit session opens the editable menu.
+    // The first Escape must dismiss *only* the menu — the unsaved edit is the
+    // thing at risk, and the post row's Escape handler is an inner element in
+    // the dispatch path, so without a guard it cancels the session (restoring
+    // the pre-edit buffer) on the very same press.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    })
+    .unwrap();
+    let editor = view
+        .read_with(cx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post's body editor");
+    cx.update_window(window, |_, _, cx| {
+        editor.update(cx, |e, cx| e.set_value("half-typed edit".to_string(), cx));
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.run_until_parked();
+    let at = point_in_post(&view, &vcx, "a1");
+
+    right_click(&mut vcx, at);
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.context_menu_items_for_test().is_some(),
+            "a right-click inside the session opens a menu over its editor"
+        );
+    });
+
+    // First Escape: the menu goes, the session and its typing stay.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.context_menu_items_for_test().is_none(),
+            "the first Escape dismisses the menu"
+        );
+        assert_eq!(
+            v.editing_action_id_for_test(),
+            Some("a1".to_string()),
+            "and leaves the edit session alive"
+        );
+    });
+    vcx.update(|_, cx| {
+        assert_eq!(
+            editor.read(cx).value(),
+            "half-typed edit",
+            "the unsaved edit survives dismissing the menu"
+        );
+    });
+
+    // Second Escape: now the session cancels and the buffer is restored.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.editing_action_id_for_test(),
+            None,
+            "the second Escape cancels the edit"
+        );
+    });
+    vcx.update(|_, cx| {
+        assert_eq!(editor.read(cx).value(), "the quick brown fox");
+    });
+}
+
+#[gpui::test]
+fn space_composer_context_menu_offers_paste_only_when_there_is_text_to_paste(
+    cx: &mut TestAppContext,
+) {
+    // Paste is resolved against the clipboard at open time, like the menu's
+    // other two facts: `MarkdownEditorState::paste` returns without touching
+    // the buffer when the clipboard holds no text, so an unconditional row
+    // would be a visible affordance that does nothing — the one thing this
+    // menu promises never to show.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    cx.run_until_parked();
+    set_space_composer_text(&view, window, cx, "a draft in progress");
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.run_until_parked();
+    let at = point_in_composer(&view, &vcx);
+
+    // Nothing on the clipboard: no Paste row.
+    right_click(&mut vcx, at);
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.context_menu_items_for_test(),
+            Some(vec!["Select All".to_string()]),
+            "an empty clipboard affords no Paste"
+        );
+    });
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    // Text on the clipboard: the row appears.
+    vcx.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("pasteable".to_string()));
+    });
+    right_click(&mut vcx, at);
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.context_menu_items_for_test(),
+            Some(vec!["Paste".to_string(), "Select All".to_string()]),
+            "text on the clipboard affords Paste"
         );
     });
 }
