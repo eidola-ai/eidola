@@ -1860,7 +1860,6 @@ impl Render for SpaceView {
             .bg(bg)
             .font_family(font_family)
             .text_color(fg)
-            .child(self.render_title_bar(window, cx))
             .child({
                 let mut scroll = div()
                     .id("space-scroll")
@@ -1897,6 +1896,14 @@ impl Render for SpaceView {
                 scroll.style().restrict_scroll_to_axis = Some(true);
                 scroll
             })
+            // The title band paints **after** the page it covers: gpui's
+            // BoundsTree draw order is paint order, and a hitbox only blocks
+            // what was painted before it — so as a *first* child the band both
+            // sat under the posts (no fade) and let a press in the header reach
+            // the `MarkdownEditor` beneath it, which then dragged out a
+            // selection while the window moved (task 32). It stays ahead of the
+            // composer and minimap, which paint over it as before.
+            .child(self.render_title_bar(window, cx))
             .child(self.render_active_draft(&tree, page_width, window_h, window, cx))
             // The source-highlight picker: which of several posts that quoted
             // the clicked passage to visit. Above the composer, below the
