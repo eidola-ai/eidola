@@ -31,7 +31,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// The boxed future a [`Tool::call`] returns.
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>>;
@@ -366,14 +366,140 @@ impl Tool for ReadThreadTool {
     }
 }
 
-/// `read_post` — one post in full, plus the passages it quotes.
+/// The refusal a model reads when it follows a quote into a conversation it is
+/// not part of (task 37 rule 4).
+///
+/// **Non-leaking by construction, and it must stay that way.** It confirms only
+/// what the model already sees — that this post quotes something from elsewhere,
+/// which rule 3 makes public inside *this* space — and names no title, no
+/// participant and no content of the other conversation. It is also an ordinary
+/// tool *result*, not a turn failure: "I can see this was quoted from a
+/// conversation I'm not in" is exactly what the model should be able to say, and
+/// the fix is a human granting membership, after which the very next call
+/// resolves (tools re-check membership per call, so retry needs no machinery).
+pub const FOLLOW_DENIED: &str = "You do not take part in the conversation that passage was \
+     quoted from, so you cannot read it. What was quoted into this conversation is above — that \
+     excerpt is what was shared here. If you need more, say so: a human can add you to that \
+     conversation, and then this will work.";
+
+/// Render a post reached by following a quote (task 37). Pure over its inputs —
+/// these are wire bytes a model reads, so they are unit-tested.
+///
+/// The body goes through [`crate::with_header`], the same rendering path every
+/// other post takes. The one added line is provenance: which conversation this
+/// came from, or that it is a superseded version of a post in this one.
+pub(crate) fn render_followed_post(
+    row: &crate::db::ReferencedPostRow,
+    current_space_id: &str,
+) -> String {
+    let body = crate::with_header(&row.item_id, &row.participant_label, &row.text);
+    if row.space_id == current_space_id {
+        // Same space, but not in the snapshot: the quote named a generation
+        // that has since been edited or regenerated. References name concrete
+        // generations and are never remapped, so this is the honest answer.
+        return format!("An earlier version of a post in this conversation.\n\n{body}");
+    }
+    let title = row
+        .space_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(crate::one_line)
+        .or_else(|| crate::derive_space_title(&row.text))
+        .unwrap_or_else(|| "(untitled)".to_string());
+    format!("From another conversation you take part in — {title}.\n\n{body}")
+}
+
+/// `read_post` — one post in full, plus the passages it quotes; and, with
+/// `quote`, the post a quoted passage came from.
+///
+/// **Cross-space addressing goes through the reference edge, never a handle.**
+/// Handles are derived (`post_handle(item_id)`) and therefore global, but this
+/// snapshot only knows *this* space's, and that is the point: a model cannot
+/// name a post in another conversation, only *this* post's quote number — the
+/// ordinal that is already visible to every participant here (rule 3) as the
+/// footnote index and the `{{ embed N }}` marker. So the reachable set is
+/// exactly "what someone here already quoted", and the membership check decides
+/// whether it opens. Guessing is not a failure mode, it is unrepresentable.
 pub(crate) struct ReadPostTool {
     snapshot: Arc<crate::ThreadSnapshot>,
+    /// The core, for the cross-space follow's reads. `Weak`, like every other
+    /// turn-scoped tool, so a tool that outlived its turn cannot keep the
+    /// database open.
+    inner: Weak<crate::Inner>,
+    /// The responding participant — whose membership is re-read on every call,
+    /// which is what makes grant-then-retry work with no extra machinery.
+    participant_id: String,
+    current_space_id: String,
 }
 
 impl ReadPostTool {
-    pub(crate) fn new(snapshot: Arc<crate::ThreadSnapshot>) -> Self {
-        Self { snapshot }
+    pub(crate) fn new(
+        snapshot: Arc<crate::ThreadSnapshot>,
+        inner: Weak<crate::Inner>,
+        participant_id: String,
+        current_space_id: String,
+    ) -> Self {
+        Self {
+            snapshot,
+            inner,
+            participant_id,
+            current_space_id,
+        }
+    }
+
+    /// Follow reference `ordinal` of the post at `handle`.
+    async fn follow(&self, handle: &str, ordinal: i64) -> String {
+        let Some(&idx) = self.snapshot.by_handle.get(handle) else {
+            return self.snapshot.unknown_handle(handle);
+        };
+        let node = &self.snapshot.nodes[idx];
+        let Some(reference) = node.references.iter().find(|r| r.ordinal == ordinal) else {
+            let mut ordinals: Vec<String> = node
+                .references
+                .iter()
+                .map(|r| r.ordinal.to_string())
+                .collect();
+            ordinals.sort();
+            return if ordinals.is_empty() {
+                format!("Post #{handle} quotes nothing, so there is no quote {ordinal} to follow.")
+            } else {
+                format!(
+                    "Post #{handle} has no quote {ordinal}. It quotes: {}.",
+                    ordinals.join(", ")
+                )
+            };
+        };
+        // Already in this turn's snapshot: it is a current post of this space,
+        // which the model can read anyway — render it the ordinary way rather
+        // than taking a database round trip to say the same thing.
+        if let Some(&target) = self.snapshot.by_action.get(&reference.antecedent_action_id) {
+            return self
+                .snapshot
+                .render_post(&self.snapshot.handles[target].clone());
+        }
+        let Some(inner) = self.inner.upgrade() else {
+            return "That quoted post is unavailable in this turn.".to_string();
+        };
+        let Ok(conn) = inner.db_conn().await else {
+            return "That quoted post could not be read.".to_string();
+        };
+        let row = match crate::db::referenced_post(&conn, &reference.antecedent_action_id).await {
+            Ok(Some(row)) => row,
+            // Gone, or never a post to begin with — `referenced_post` reads
+            // only post types, so a quote that somehow names a tool trace, a
+            // decision or a memory block lands here rather than rendering one.
+            // One answer for both: neither is followable and neither reveals
+            // anything.
+            Ok(None) => return "That quote does not point at a readable post.".to_string(),
+            Err(_) => return "That quoted post could not be read.".to_string(),
+        };
+        // Rule 4: follow requires membership, re-read per call.
+        match crate::db::is_space_member(&conn, &row.space_id, &self.participant_id).await {
+            Ok(true) => render_followed_post(&row, &self.current_space_id),
+            Ok(false) => FOLLOW_DENIED.to_string(),
+            Err(_) => "That quoted post could not be read.".to_string(),
+        }
     }
 }
 
@@ -384,7 +510,9 @@ impl Tool for ReadPostTool {
 
     fn description(&self) -> &str {
         "Read one post in full by handle, together with any passages it quotes from other posts. \
-         A snapshot taken when this turn started."
+         Pass `quote` to read the post a quoted passage came from — which may be in another \
+         conversation, and only opens if you take part in it. A snapshot taken when this turn \
+         started."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -395,6 +523,11 @@ impl Tool for ReadPostTool {
                     "type": "string",
                     "description": "Handle of the post to read, e.g. \"#a2c4e6g\".",
                 },
+                "quote": {
+                    "type": "integer",
+                    "description": "Instead of the post itself, read the post its quote with this \
+                                    number came from (the number shown beside the quote).",
+                },
             },
             "required": ["handle"],
         })
@@ -403,7 +536,10 @@ impl Tool for ReadPostTool {
     fn call<'a>(&'a self, arguments: serde_json::Value) -> ToolFuture<'a> {
         Box::pin(async move {
             let handle = handle_arg(&arguments)?;
-            Ok(self.snapshot.render_post(&handle))
+            match arguments.get("quote").and_then(|v| v.as_i64()) {
+                Some(ordinal) => Ok(self.follow(&handle, ordinal).await),
+                None => Ok(self.snapshot.render_post(&handle)),
+            }
         })
     }
 }
@@ -423,10 +559,12 @@ mod tests {
                 Vec::new(),
                 0,
             )))),
-            Arc::new(ReadPostTool::new(Arc::new(crate::ThreadSnapshot::new(
-                Vec::new(),
-                0,
-            )))),
+            Arc::new(ReadPostTool::new(
+                Arc::new(crate::ThreadSnapshot::new(Vec::new(), 0)),
+                Weak::new(),
+                String::new(),
+                String::new(),
+            )),
         ] {
             assert!(
                 is_reserved_tool_name(t.name()),
@@ -514,5 +652,66 @@ mod tests {
         reg.register(Arc::new(EchoTool));
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.schemas().len(), 1);
+    }
+
+    fn referenced(space: &str, title: Option<&str>, text: &str) -> crate::db::ReferencedPostRow {
+        crate::db::ReferencedPostRow {
+            space_id: space.to_string(),
+            space_title: title.map(str::to_string),
+            item_id: "item-1".to_string(),
+            participant_label: "Ada".to_string(),
+            action_type: "inference".to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_followed_post_says_where_it_came_from_and_renders_as_a_post() {
+        let row = referenced("other", Some("Tides"), "Spring tides at syzygy.");
+        let rendered = render_followed_post(&row, "here");
+        assert_eq!(
+            rendered,
+            format!(
+                "From another conversation you take part in — Tides.\n\n{}",
+                crate::with_header("item-1", "Ada", "Spring tides at syzygy.")
+            )
+        );
+        // Same space ⇒ not another conversation, just a generation the current
+        // view no longer shows.
+        let rendered = render_followed_post(&referenced("here", None, "Older wording."), "here");
+        assert!(
+            rendered.starts_with("An earlier version of a post in this conversation.\n\n#"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_untitled_source_conversation_still_gets_a_name() {
+        let row = referenced(
+            "other",
+            Some("   "),
+            "# Why do tides lag the moon?\n\nBecause…",
+        );
+        let rendered = render_followed_post(&row, "here");
+        assert!(
+            rendered.starts_with(
+                "From another conversation you take part in — Why do tides lag \
+                                  the moon?."
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_follow_denial_names_nothing_about_the_conversation_it_refuses() {
+        // A guard on the constant itself: it may say *that* a passage was
+        // quoted from elsewhere (public here per rule 3) and must never grow a
+        // placeholder for anything else.
+        for leak in ['{', '}', '<', '>', '#'] {
+            assert!(
+                !FOLLOW_DENIED.contains(leak),
+                "the denial is a fixed sentence with no interpolation slot"
+            );
+        }
     }
 }

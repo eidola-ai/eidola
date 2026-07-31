@@ -56,6 +56,28 @@ pub enum AppError {
     #[error("terms acceptance required: {message}")]
     TermsAcceptanceRequired { message: String },
 
+    /// A participant tried to reach across a space boundary it is not a member
+    /// of: creating a reference to a post in a space it does not take part in
+    /// (rule 1 — "you may quote what you can read"), or following one into a
+    /// space it does not take part in (rule 4 — "follow requires membership").
+    /// Membership is the cross-space ACL (task 36); the fix is an ordinary
+    /// grant, so the caller can retry with no special machinery.
+    ///
+    /// **The payload must never leak the referenced space.** It confirms only
+    /// what the actor already knows — the action id it named, and its own
+    /// identity — and carries no space id, title, participant or content. That
+    /// is not decoration: existence is public *within the referencing space*
+    /// (rule 3), everything else about the referenced space is not, and this
+    /// error is rendered into tool results a model reads and into UI a
+    /// non-member sees. Anything added here is added to both.
+    #[error("not a participant of the conversation that post {action_id} belongs to")]
+    NotAParticipant {
+        /// The actor that was refused (a participant id).
+        participant_id: String,
+        /// The action the actor named — already known to it, so not a leak.
+        action_id: String,
+    },
+
     /// A local database operation failed.
     #[error("database error: {message}")]
     Database { message: String },
