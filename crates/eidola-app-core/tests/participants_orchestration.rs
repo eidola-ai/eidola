@@ -1443,3 +1443,53 @@ fn the_decline_name_alone_is_not_a_decline_without_the_tool_registered() {
         }
     });
 }
+
+#[test]
+fn space_traces_put_a_decline_in_the_gap_under_the_post_it_answered() {
+    run(|| {
+        // Task 34's read over task 22's decision: the turn wrote no post, so
+        // its disclosure hangs under the post it declined — the non-event is
+        // visible where the answer would have been, named for the agent that
+        // made it.
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::DeclineStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.register_tool(eidola_app_core::decline::decline_tool())
+            .expect("decline is not a reserved name");
+
+        let (space, post) = space_with_two_candidates(&core);
+        let agent = agent_id(&core, &space, "All-Agent");
+        let result = drive_as(&core, &space, &agent, &post).expect("declined turn still succeeds");
+        let declined = result.declined.clone().expect("the turn declined");
+
+        let traces = core
+            .runtime()
+            .block_on(core.space_traces(space.clone()))
+            .expect("trace read");
+        assert_eq!(traces.len(), 1, "one turn, one disclosure: {traces:?}");
+        let trace = &traces[0];
+        assert_eq!(
+            trace.anchor_action_id, post,
+            "the decline hangs under the post it answered"
+        );
+        assert!(trace.unanswered);
+        assert_eq!(
+            trace.participant_label, "All-Agent",
+            "and names whose non-event it was"
+        );
+        // The rounds it ran stay with it, and the decision is the last word.
+        assert!(matches!(
+            trace.entries.first(),
+            Some(eidola_app_core::TraceEntry::Tool { .. })
+        ));
+        match trace.entries.last() {
+            Some(eidola_app_core::TraceEntry::Declined { action_id, reason }) => {
+                assert_eq!(*action_id, declined.action_id);
+                assert_eq!(reason.as_deref(), Some(chat_harness::DECLINE_REASON));
+            }
+            other => panic!("expected the decision last, got {other:?}"),
+        }
+    });
+}

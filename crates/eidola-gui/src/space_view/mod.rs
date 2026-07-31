@@ -17,6 +17,7 @@
 //!   and the action gutter (Post / ⌥ Post quietly).
 //! - [`context_menu`] — the right-click menu over any of the space's editors.
 //! - [`minimap`] — the topology minimap.
+//! - [`traces`] — the per-post trace disclosure (what a turn actually did).
 //!
 //! Performance: only posts intersecting the viewport render the real
 //! `MarkdownEditor`; off-screen posts render as sized placeholders sized from
@@ -30,6 +31,7 @@ pub mod model;
 pub mod nav;
 pub mod post;
 pub mod references;
+pub mod traces;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -382,6 +384,11 @@ pub struct SpaceView {
     /// transcript from spawning one query per row on open; a frame of latency
     /// on a decoration is invisible.
     pub(crate) wants_incoming_refs: RefCell<HashSet<SharedString>>,
+    /// The last raw exchange this window asked the Record to open (a trace
+    /// row's Record link). Recorded before the `AppGlobal` guard so behavior
+    /// tests can assert the deep link without a real Record window — the
+    /// `Space::last_submitted_model` seam, applied to a cross-window verb.
+    pub(crate) last_record_request: Option<String>,
     /// One read-only editor per in-flight turn, synced to that turn's live
     /// streaming partial each frame and pruned when the turn ends. Keyed by
     /// [`StreamingTurn::seq`] so concurrent turns render side by side.
@@ -667,6 +674,7 @@ impl SpaceView {
             context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),
+            last_record_request: None,
             streaming_bodies: HashMap::new(),
             streaming_synced: HashMap::new(),
             drafts: Vec::new(),
@@ -1008,6 +1016,14 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn post_body_editor_for_test(&self, node_id: &str) -> Option<Entity<MarkdownEditorState>> {
         self.bodies.get(node_id).cloned()
+    }
+
+    /// The last raw exchange a trace row asked the Record to open. Recorded
+    /// before the `AppGlobal` guard, so a stub-store test sees the deep link
+    /// without a real Record window.
+    #[doc(hidden)]
+    pub fn last_record_request_for_test(&self) -> Option<&str> {
+        self.last_record_request.as_deref()
     }
 
     /// Drive the post-hover state (tests can't synthesize pointer moves).
@@ -1748,6 +1764,8 @@ impl Render for SpaceView {
         // Keep each post's embed map + highlight set current, and request the
         // incoming-reference index for the posts that rendered last frame.
         self.sync_references(cx);
+        // Ask the space for its trace index (idempotent; the entity owns it).
+        self.sync_traces(cx);
         // Keep a docked tail draft at the end of every branch (the always-present
         // composer that replaces the leaf "+").
         self.sync_tail_drafts(window, cx);

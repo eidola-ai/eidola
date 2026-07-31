@@ -20,7 +20,7 @@ use std::sync::Arc;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AppCore, AttestationDetail, AttestationInfo, ChatResult, ChatStreamEvent, IncomingReference,
-    NotificationPlan, PostNode, PostResult, ReferenceSpec, RequestDetail, RequestInfo,
+    NotificationPlan, PostNode, PostResult, PostTrace, ReferenceSpec, RequestDetail, RequestInfo,
     SpendTrailEntry, SubmitResult,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -181,6 +181,18 @@ pub fn references_to(
 ) -> oneshot::Receiver<Result<Vec<IncomingReference>, AppError>> {
     spawn_oneshot(core, move |core| async move {
         core.references_to(action_id).await
+    })
+}
+
+/// Every turn's operational trace in a space — the tool rounds and decline
+/// decisions the post tree collapses out, each anchored to a post the tree
+/// does render (task 34). Pure read.
+pub fn space_traces(
+    core: Arc<AppCore>,
+    space_id: String,
+) -> oneshot::Receiver<Result<Vec<PostTrace>, AppError>> {
+    spawn_oneshot(core, move |core| async move {
+        core.space_traces(space_id).await
     })
 }
 

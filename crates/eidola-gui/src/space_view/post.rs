@@ -275,6 +275,12 @@ impl SpaceView {
         if let Some(rail) = self.render_post_footnotes(i, node, editing, cx) {
             col = col.child(rail);
         }
+        // The trace disclosure — what the turn actually did. Last, and last on
+        // purpose: references belong to the post's own story, activity is
+        // operational detail subordinate to all of it.
+        if let Some(traces) = self.render_post_traces(i, node, cx) {
+            col = col.child(traces);
+        }
         col.into_any_element()
     }
 
