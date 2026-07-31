@@ -41,6 +41,7 @@ use gpui::{
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 use crate::actions::{Quote, QuoteInReply};
+use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
 
 use super::model::{NodeSrc, TreeNode};
@@ -1158,6 +1159,9 @@ impl SpaceView {
                 gpui::Role::Group,
                 "Posts quoting this passage",
             )
+            // An opaque popover over the page (see `crate::overlay`): a click
+            // on a row must not also land in the post beneath it.
+            .contain_mouse(Overlay::Popover)
             .absolute()
             .right(GUTTER_GAP)
             .bottom(px(96.))

@@ -32,6 +32,8 @@ use std::collections::HashSet;
 
 use crate::loadable::Loadable;
 
+use crate::overlay::{Contain as _, Overlay};
+
 use super::context_menu::ContextTarget;
 use super::layout::body_width;
 use super::model::{self, TreeNode};
@@ -1088,6 +1090,16 @@ impl SpaceView {
             .top(px(bar_top))
             .h(px(quad_h))
             .bg(theme.background)
+            // **The composer contains the mouse** (see `crate::overlay`). It is
+            // an opaque surface painted over the page — and the one you type
+            // into — so a press inside it is its own. Without this the press
+            // also landed in the post scrolled beneath, which both selected
+            // that post's text and put it into drag-selection, driving the
+            // page's selection-autoscroll: dragging over your own draft
+            // scrolled the window. `Scrolling`, not `Popover`, because the
+            // wheel must still reach the handler below, which decides between
+            // the composer's own scroll and moving the page toward the dock.
+            .contain_mouse(Overlay::Scrolling)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
                     // An open menu absorbs the first Escape; the next

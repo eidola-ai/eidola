@@ -46,6 +46,7 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditorState, MarkdownStyle};
 
 use crate::actions::CloseWindow;
+use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
 use crate::space::{ChatMessageView, Space, SpaceEvent};
 use crate::stores::Stores;
@@ -66,7 +67,7 @@ pub use crate::actions::{PostOnly, Send};
 
 /// Height reserved at the top of the window for the (transparent) titlebar —
 /// the macOS traffic-light band / the Linux CSD controls + drag strip.
-pub(crate) const TITLE_BAR_RESERVE: Pixels = px(36.);
+pub(crate) const TITLE_BAR_RESERVE: Pixels = crate::titlebar::DRAG_BAND_HEIGHT;
 
 /// Prose typography for narrative content — Newsreader at a book size/leading,
 /// distinct from the system UI font the theme uses for chrome. Matches the
@@ -2452,6 +2453,11 @@ impl SpaceView {
             .child(
                 v_flex()
                     .id("space-error-band")
+                    // Contained on the *card*, never on the transparent
+                    // full-width wrapper above (which spans the window and
+                    // would swallow clicks nowhere near the notice) — see
+                    // `crate::overlay`.
+                    .contain_mouse(Overlay::Popover)
                     // The notice was three unexplained buttons to a screen
                     // reader — "Dismiss", "Copy", "Retry" — because the message
                     // itself was a node-less `div`. The message rides as the
@@ -2607,6 +2613,9 @@ impl SpaceView {
             .child(
                 v_flex()
                     .id("space-cascade-band")
+                    // Contained on the card, not the full-width wrapper (see
+                    // the failure notice above and `crate::overlay`).
+                    .contain_mouse(Overlay::Popover)
                     // Same shape as the failure notice: the sentence is the
                     // value (the announcement channel), the label names the
                     // state. Muted, not danger — nothing failed.

@@ -22,7 +22,7 @@ const REPO_URL: &str = "https://github.com/eidola-ai/eidola";
 
 /// Vertical reserve for the macOS traffic lights / Linux CSD window
 /// controls (same pattern as all other windows with `transparent_titlebar`).
-const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
+const TITLE_BAR_RESERVE: gpui::Pixels = crate::titlebar::DRAG_BAND_HEIGHT;
 
 pub struct AboutView {
     focus_handle: FocusHandle,
@@ -124,12 +124,6 @@ impl Render for AboutView {
             .bg(theme.background)
             .text_color(theme.foreground)
             .pt(TITLE_BAR_RESERVE)
-            .child(crate::titlebar::drag_band(
-                "about-titlebar",
-                TITLE_BAR_RESERVE,
-                window,
-                cx,
-            ))
             // Centered column, capped at the prose measure.
             .child(
                 h_flex()
@@ -151,5 +145,13 @@ impl Render for AboutView {
                             .child(github_link),
                     ),
             )
+            // The drag band is the **last** child: a blocking hitbox only
+            // suppresses hitboxes registered before it (see `crate::overlay`).
+            .child(crate::titlebar::drag_band(
+                "about-titlebar",
+                TITLE_BAR_RESERVE,
+                window,
+                cx,
+            ))
     }
 }

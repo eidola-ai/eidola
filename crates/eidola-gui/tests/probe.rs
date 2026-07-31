@@ -2870,3 +2870,41 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
         "each candidate is a probed choice: {names:?}"
     );
 }
+
+/// REGRESSION: the Settings window's drag band reserved 44px while every other
+/// window used 36 — purely to fake the top padding the Backends pane lacked.
+/// Once the band began *blocking* the mouse (task 32), that extra strip sat
+/// over the pane's tab strip and the Eidola/Local/External tabs stopped being
+/// clickable. The band is now the shared `DRAG_BAND_HEIGHT` everywhere and the
+/// pane carries its own "Backends" title, so every tab paints clear of it.
+#[gpui::test]
+fn settings_backends_tabs_paint_clear_of_the_drag_band(cx: &mut TestAppContext) {
+    use eidola_gui::settings::{SettingsPane, SettingsView};
+
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+
+    let entries = fresh_entries(cx, window);
+    // The band's own hitbox spans the window's full width from y=0, so a tab
+    // whose top is inside it is a tab the band swallows.
+    let band = eidola_gui::titlebar::DRAG_BAND_HEIGHT.as_f32();
+    for slug in ["eidola", "local", "external"] {
+        let name = format!("settings/backends/tab/{slug}");
+        let (_, entry) = entries
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("probe {name:?} missing"));
+        let top = entry.bounds.origin.y.as_f32();
+        assert!(
+            top >= band,
+            "tab {slug:?} paints at y={top}, inside the {band}px drag band that blocks the mouse"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
