@@ -2607,13 +2607,16 @@ fn space_resize_above_column_cap_does_not_churn_height_cache(cx: &mut TestAppCon
 fn space_blank_composer_does_not_scroll(cx: &mut TestAppContext) {
     // REGRESSION: a brand-new space (just the composer) reserved a phantom
     // scroll range equal to the titlebar reserve. The document is laid out
-    // beneath a top reserve that holds the first post clear of the overlaid
-    // titlebar — but an empty notebook has no post above the composer, so that
-    // reserve was pure dead space (total = window + reserve). `doc_reserve` is
-    // now zero when there are no posts, so a sole composer fills the window
-    // exactly: no scroll until the content actually overflows. (Spaces *with*
-    // posts keep the reserve, so the docked composer still reaches the window
-    // top when scrolled to the bottom.)
+    // beneath a top reserve that holds whatever leads it clear of the overlaid
+    // titlebar, and the composer's slot used to claim a *whole* window under
+    // it, so the total came to window + reserve.
+    //
+    // The reserve itself is now unconditional (task 40 — a composer-only
+    // notebook needs the same headroom its first post will get, or posting
+    // moves the words; see `space_composer_text_sits_where_its_post_will_land`).
+    // What keeps this invariant is `standalone_slot_h`: a slot that stands
+    // alone claims one window *below* the reserve, so a sole composer plus the
+    // reserve is exactly one window — no scroll until the content overflows.
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, None);
     view.read_with(cx, |v, _| assert!(v.has_active_draft_for_test()));
@@ -2628,6 +2631,181 @@ fn space_blank_composer_does_not_scroll(cx: &mut TestAppContext) {
         "a blank space's sole composer should not reserve scroll (min_y = {min_y}, \
          expected ~0; the pre-fix bug parked it at -titlebar_reserve)"
     );
+}
+
+#[gpui::test]
+fn space_composer_text_sits_where_its_post_will_land(cx: &mut TestAppContext) {
+    // REGRESSION (task 40): the composer *becomes* the post, so the words in it
+    // must already sit where the post will render them — submitting must not
+    // move the text the user just typed.
+    //
+    // It moved by exactly `TITLE_BAR_RESERVE`: the document's top reserve
+    // existed only once there were posts, so a composer-only notebook laid its
+    // draft out a reserve higher than the post it was about to become, and the
+    // whole document dropped at the submit moment.
+    //
+    // Both positions are read off **painted line geometry** (the editor's own
+    // `debug_line_geometry`, in window coordinates), not recomputed from the
+    // padding constants the fix touches — so the test measures the same thing a
+    // scanline diff of the two renders would.
+    const ASK: &str = "Why is the sky blue?";
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.has_active_draft_for_test(),
+            "a blank ⌘N space opens with its composer"
+        )
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(760.)));
+    vcx.run_until_parked();
+
+    // The fresh, composer-only window: type the ask.
+    let draft_editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the blank space's composer");
+    vcx.update(|_, cx| {
+        draft_editor.update(cx, |e, cx| e.set_value(ASK.to_string(), cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let draft_top = view
+        .read_with(&vcx, |_, cx| first_painted_line_top(&draft_editor, cx))
+        .expect("the draft's first line is painted");
+    assert!(
+        !view.read_with(&vcx, |v, _| v.composer_overlayed_for_test()),
+        "a composer-only notebook docks into its slot — a floating bar would be \
+         measuring the transient state, not the one the post replaces"
+    );
+
+    // The submit moment: the words become a post and the draft is consumed
+    // (the space's own tail composer comes back empty beneath it).
+    vcx.update(|_, cx| {
+        draft_editor.update(cx, |e, cx| e.set_value(String::new(), cx));
+        view.update(cx, |v, cx| {
+            v.space().update(cx, |s, cx| {
+                s.set_post_tree_for_test(vec![fixture_user_post("a1", ASK)], cx)
+            });
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| view.update(cx, |v, _| v.scroll_page_to_top_for_test()));
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let post_editor = view
+        .read_with(&vcx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the posted ask's body editor");
+    let post_top = view
+        .read_with(&vcx, |_, cx| first_painted_line_top(&post_editor, cx))
+        .expect("the post's first line is painted");
+
+    assert!(
+        (draft_top - post_top).abs() < 0.5,
+        "the draft's first line must land exactly where the post's does — \
+         draft {draft_top}, post {post_top} (a {}px jump at submit)",
+        (post_top - draft_top).abs()
+    );
+}
+
+#[gpui::test]
+fn space_reply_draft_text_sits_where_its_post_will_land(cx: &mut TestAppContext) {
+    // The same continuity, one post in: a draft replying to an existing post
+    // lays its text out where that reply will render. This one held before task
+    // 40 (a space with posts always had its top reserve) — it is here because
+    // the *rule* is what matters: a docked composer's editor starts
+    // `POST_PAD_Y` below its slot top, exactly where a post's body starts below
+    // its own, so wherever the slot sits the words don't move when they're
+    // posted. Without it, only the blank-notebook case would be pinned and the
+    // shared rule could drift for every other draft.
+    const ASK: &str = "Why is the sky blue?";
+    const REPLY: &str = "And at sunset?";
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    view.update(cx, |v, cx| {
+        v.space().update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", ASK)], cx)
+        });
+    });
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(760.)));
+    vcx.run_until_parked();
+
+    // The tail draft under that post, with the follow-up typed into it.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a1".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    let draft_editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the tail draft is the active composer");
+    vcx.update(|_, cx| {
+        draft_editor.update(cx, |e, cx| e.set_value(REPLY.to_string(), cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| view.update(cx, |v, _| v.scroll_page_to_top_for_test()));
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        !view.read_with(&vcx, |v, _| v.composer_overlayed_for_test()),
+        "the draft's slot is well above the float line here, so it docks — a \
+         floating bar is the transient state, not the one the post replaces"
+    );
+    let draft_top = view
+        .read_with(&vcx, |_, cx| first_painted_line_top(&draft_editor, cx))
+        .expect("the draft's first line is painted");
+
+    // Posted: the reply takes the slot the draft occupied.
+    let mut a2 = fixture_user_post("a2", REPLY);
+    a2.parent_action_id = Some("a1".into());
+    vcx.update(|_, cx| {
+        draft_editor.update(cx, |e, cx| e.set_value(String::new(), cx));
+        view.update(cx, |v, cx| {
+            v.space().update(cx, |s, cx| {
+                s.set_post_tree_for_test(vec![fixture_user_post("a1", ASK), a2.clone()], cx)
+            });
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| view.update(cx, |v, _| v.scroll_page_to_top_for_test()));
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let post_editor = view
+        .read_with(&vcx, |v, _| v.post_body_editor_for_test("a2"))
+        .expect("the posted reply's body editor");
+    let post_top = view
+        .read_with(&vcx, |_, cx| first_painted_line_top(&post_editor, cx))
+        .expect("the reply's first line is painted");
+
+    assert!(
+        (draft_top - post_top).abs() < 0.5,
+        "a reply draft's first line must land exactly where the reply's does — \
+         draft {draft_top}, post {post_top}"
+    );
+}
+
+/// The window-space `y` of the first line an editor actually painted — the
+/// geometric stand-in for "first ink", read off the editor's own layout rather
+/// than recomputed from layout constants.
+fn first_painted_line_top(
+    editor: &Entity<gpui_markdown_editor::MarkdownEditorState>,
+    cx: &gpui::App,
+) -> Option<f32> {
+    editor
+        .read(cx)
+        .debug_line_geometry()
+        .first()
+        .and_then(|(_, lines)| lines.first().map(|(_, y, _)| *y))
 }
 
 #[gpui::test]
@@ -4216,18 +4394,25 @@ fn space_docked_composer_edit_scrolls_page_into_view(cx: &mut TestAppContext) {
     // content size (and races under parallel test load), so we assert the
     // frame-independent piece the branch recorded: the slot-relative offset it
     // folded in (`caret_doc_bottom − caret_content_bottom` = `page_slot_doc_top +
-    // editor_top_offset`). For a blank ⌘N space `page_slot_doc_top == 0` (no
-    // posts, the sole node is the draft leaf), so this must equal `POST_PAD_Y`
-    // (= 2·half_pad = 40px) — the editor's content-top offset within the slot.
-    // Before the fix it was 0, so the docked reveal aimed a pad-height too high
-    // and never fully revealed the line.
-    let slot_offset = view.read_with(&vcx, |v, _| v.docked_caret_slot_offset_for_test());
+    // editor_top_offset`). For a blank ⌘N space the sole node is the draft leaf,
+    // so `page_slot_doc_top` is just the document's top reserve and this must
+    // equal `reserve + POST_PAD_Y` (= 2·half_pad = 40px) — the editor's
+    // content-top offset within the slot. Before the fix the offset term was
+    // dropped, so the docked reveal aimed a pad-height too high and never fully
+    // revealed the line.
+    let (slot_offset, reserve) = view.read_with(&vcx, |v, _| {
+        (
+            v.docked_caret_slot_offset_for_test(),
+            v.doc_reserve_for_test(),
+        )
+    });
     let post_pad_y = 40.0_f32;
     assert!(
-        (slot_offset - post_pad_y).abs() < 1.0,
+        (slot_offset - (reserve + post_pad_y)).abs() < 1.0,
         "the docked reveal must fold the editor's {post_pad_y}px content-top \
          offset into the caret's document position (slot-relative offset was \
-         {slot_offset}; omitting it — a value near 0 — under-scrolls the line \
+         {slot_offset}, expected the {reserve}px top reserve plus that pad; \
+         omitting the pad — a value near {reserve} — under-scrolls the line \
          out of view)",
     );
 }

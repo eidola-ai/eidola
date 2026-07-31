@@ -208,28 +208,43 @@ impl SpaceView {
         POST_PAD_Y.as_f32() / 2.0
     }
 
-    /// The document's top reserve: headroom that holds the first post clear of
-    /// the (transparent, overlaid) titlebar. It exists **only when there are
-    /// posts** — an empty notebook (just the composer) has nothing above to
-    /// clear, so it gets no reserve and the composer fills the whole window with
-    /// no phantom scroll. Every scrollable-document computation (the scroll
-    /// range, the forest origin, the minimap, the dock math) reads this single
-    /// value, so "what's interactive" and "what's visible" stay in lockstep. The
-    /// titlebar's own visual height (the gradient overlay in `render_title_bar`)
-    /// is unconditionally [`TITLE_BAR_RESERVE`] and independent of this.
+    /// The document's top reserve: headroom that holds whatever leads the
+    /// document clear of the (transparent, overlaid) titlebar. It is
+    /// **unconditional** — a composer-only notebook is led by the composer, and
+    /// the words typed there have to sit exactly where they will sit once
+    /// they're a post, or posting moves them (task 40: the reserve appearing
+    /// with the first post shifted the whole document down by
+    /// [`TITLE_BAR_RESERVE`] at the submit moment). Every scrollable-document
+    /// computation (the scroll range, the forest origin, the minimap, the dock
+    /// math) reads this single value, so "what's interactive" and "what's
+    /// visible" stay in lockstep. The titlebar's own visual height (the
+    /// gradient overlay in `render_title_bar`) is the same constant and
+    /// independent of this.
     pub(crate) fn doc_reserve(&self) -> f32 {
-        if self.posts.is_empty() {
-            0.0
-        } else {
-            TITLE_BAR_RESERVE.as_f32()
-        }
+        TITLE_BAR_RESERVE.as_f32()
     }
 
-    /// A branch's trailing runway: at least a window tall (so the docked
-    /// composer can stand alone), or as tall as the composer's content if more.
+    /// The height a slot that **stands alone** claims: one window *below* the
+    /// document's top reserve.
+    ///
+    /// This is what keeps the reserve free: a lone composer plus the reserve is
+    /// then exactly one window, so an empty notebook still has nothing to
+    /// scroll (the phantom-scroll invariant the conditional reserve used to buy
+    /// by giving the composer no headroom at all), and at the end of a real
+    /// conversation the fully-docked composer comes to rest with its slot top
+    /// at the reserve — where a post's slot top sits — rather than sliding its
+    /// text up under the titlebar.
+    pub(crate) fn standalone_slot_h(&self, window_h: Pixels) -> f32 {
+        (window_h.as_f32() - self.doc_reserve()).max(0.0)
+    }
+
+    /// A branch's trailing runway: at least a standalone slot (so the docked
+    /// composer can stand alone below the reserve), or as tall as the
+    /// composer's content if more.
     pub(crate) fn runway_height(&self, window_h: Pixels) -> f32 {
         let content = self.composer_content_h.borrow().as_f32();
-        window_h.as_f32().max(Self::composer_chrome() + content)
+        self.standalone_slot_h(window_h)
+            .max(Self::composer_chrome() + content)
     }
 
     /// The in-flow slot height the draft reserves — the runway (the composer
@@ -252,7 +267,7 @@ impl SpaceView {
                 self.draft_slot_height(node, page_width, window_h)
             }
             // An inactive draft renders inline as an editable post, but reserves
-            // at least a full window (it's always the end of its branch), so
+            // at least a standalone slot (it's always the end of its branch), so
             // there's perfect continuity with the active draft's runway slot —
             // activating/deactivating it never resizes the layout. `min_h` on
             // the inline frame makes the measured height honour the same floor.
@@ -260,7 +275,7 @@ impl SpaceView {
                 .layout
                 .measured(&node.id)
                 .unwrap_or(0.0)
-                .max(window_h.as_f32()),
+                .max(self.standalone_slot_h(window_h)),
             NodeSrc::Streaming(_) => self
                 .layout
                 .measured(&node.id)
