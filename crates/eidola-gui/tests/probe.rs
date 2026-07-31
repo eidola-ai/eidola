@@ -2908,3 +2908,83 @@ fn settings_backends_tabs_paint_clear_of_the_drag_band(cx: &mut TestAppContext) 
 
     probe::set_probes_enabled(false);
 }
+
+#[gpui::test]
+fn space_probes_record_the_trace_disclosure(cx: &mut TestAppContext) {
+    // The trace disclosure is an affordance, so it is a probe target — and the
+    // annotation is also the driver's selector, so the labels have to say what
+    // the click does and what each round was.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let ask = probe_post("a1", "which branch settled it?");
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![ask], cx);
+            s.seed_traces_for_test(vec![eidola_app_core::PostTrace {
+                anchor_action_id: "a1".into(),
+                participant_label: "Mara".into(),
+                unanswered: true,
+                entries: vec![
+                    eidola_app_core::TraceEntry::Tool {
+                        action_id: "tc1".into(),
+                        request_id: Some("req-1".into()),
+                        call_id: "c1".into(),
+                        name: "read_thread".into(),
+                        arguments: "{\"handle\":\"h1\"}".into(),
+                        result: Some("8 posts".into()),
+                    },
+                    eidola_app_core::TraceEntry::Declined {
+                        action_id: "d1".into(),
+                        reason: Some("nothing to add".into()),
+                    },
+                ],
+            }]);
+        });
+    });
+
+    // Collapsed: the toggle is there, its rows are not.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/trace",
+        gpui::Role::Button,
+        "Show what this turn did",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "space/post/0/trace/1"),
+        "a collapsed disclosure reveals no rows"
+    );
+
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.toggle_trace("a1", cx));
+    });
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/trace",
+        gpui::Role::Button,
+        "Hide what this turn did",
+    );
+    // A round with a recorded exchange is a Link (it opens the Record); a
+    // decision has no exchange of its own, so it is a plain list item.
+    assert_probe(
+        &entries,
+        "space/post/0/trace/1",
+        gpui::Role::Link,
+        "Round 1: read_thread — {\"handle\":\"h1\"} → 8 posts",
+    );
+    assert_probe(
+        &entries,
+        "space/post/0/trace/2",
+        gpui::Role::ListItem,
+        "Round 2: declined — nothing to add",
+    );
+
+    probe::set_probes_enabled(false);
+}

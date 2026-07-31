@@ -36,7 +36,7 @@ use std::sync::Arc;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AppCore, ChatResult, ChatStreamEvent, IncomingReference, NotificationPlan, PostNode,
-    PostReference, ReferenceSpec, SpaceMessage,
+    PostReference, PostTrace, ReferenceSpec, SpaceMessage,
 };
 use gpui::{Context, EventEmitter, Task};
 use tokio::sync::{mpsc, oneshot};
@@ -381,6 +381,22 @@ pub struct Space {
     /// Per-key fetch slots for `incoming_refs`. Replacing an entry cancels
     /// that post's in-flight fetch and nothing else.
     incoming_ref_tasks: HashMap<String, Task<()>>,
+    /// **Trace disclosures**, keyed by the post they hang under: every turn's
+    /// tool rounds and decline decisions (`AppCore::space_traces`) — the
+    /// actions the post tree deliberately collapses out.
+    ///
+    /// Space-wide rather than per-post (unlike `incoming_refs`): one query
+    /// answers the whole space, and a turn's trace is by construction local to
+    /// the space that ran it. It lives on the shared entity for the same
+    /// reason the reverse index does — two windows on one space must disclose
+    /// the same activity, and `Change::Space` must refresh both.
+    traces: Loadable<HashMap<String, Vec<PostTrace>>>,
+    /// Supersede slot for the trace fetch.
+    traces_task: Option<Task<()>>,
+    /// Which anchors' disclosures are open. Pure view state, but held here (as
+    /// `ChatMessageView::reasoning_expanded` is) so a reload — or the other
+    /// window on the same space — can't collapse one under the reader.
+    traces_expanded: std::collections::HashSet<String>,
 }
 
 impl EventEmitter<SpaceEvent> for Space {}
@@ -405,6 +421,9 @@ impl Space {
             load_task: None,
             incoming_refs: HashMap::new(),
             incoming_ref_tasks: HashMap::new(),
+            traces: Loadable::NotLoaded,
+            traces_task: None,
+            traces_expanded: std::collections::HashSet::new(),
         }
     }
 
@@ -428,6 +447,9 @@ impl Space {
             load_task: None,
             incoming_refs: HashMap::new(),
             incoming_ref_tasks: HashMap::new(),
+            traces: Loadable::NotLoaded,
+            traces_task: None,
+            traces_expanded: std::collections::HashSet::new(),
         };
         space.load_transcript(cx);
         space
@@ -452,6 +474,9 @@ impl Space {
             load_task: None,
             incoming_refs: HashMap::new(),
             incoming_ref_tasks: HashMap::new(),
+            traces: Loadable::NotLoaded,
+            traces_task: None,
+            traces_expanded: std::collections::HashSet::new(),
         }
     }
 
@@ -553,6 +578,106 @@ impl Space {
     ) {
         self.incoming_refs
             .insert(action_id.into(), Loadable::loaded(refs));
+    }
+
+    // -- Trace disclosures (what the turn actually did) --------------------
+
+    /// The traces anchored to `action_id`, if the space's trace index has been
+    /// loaded. Empty slice while it hasn't — like the source highlights, a
+    /// disclosure that isn't there yet simply doesn't render (never a spinner
+    /// in the reading column).
+    pub fn traces_for(&self, action_id: &str) -> &[PostTrace] {
+        self.traces
+            .value()
+            .and_then(|m| m.get(action_id))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Whether `anchor_action_id`'s disclosure is open.
+    pub fn trace_expanded(&self, anchor_action_id: &str) -> bool {
+        self.traces_expanded.contains(anchor_action_id)
+    }
+
+    /// Open/close a post's trace disclosure.
+    pub fn toggle_trace(&mut self, anchor_action_id: &str, cx: &mut Context<Self>) {
+        if !self.traces_expanded.remove(anchor_action_id) {
+            self.traces_expanded.insert(anchor_action_id.to_string());
+        }
+        cx.notify();
+    }
+
+    /// Load the space's trace index if it hasn't been requested yet — the
+    /// lazy, idempotent fetch the view calls once per frame. A cell that is
+    /// loading, loaded, or failed is left alone (a failed disclosure must not
+    /// re-request every frame; the next `Change::Space` invalidates it).
+    pub fn ensure_traces(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.traces, Loadable::NotLoaded) {
+            return;
+        }
+        let Some(id) = self.id.clone() else {
+            // A blank space has nothing persisted to disclose. Left
+            // `NotLoaded`, so the index loads the moment its first exchange
+            // assigns an id.
+            return;
+        };
+        let Some(app_core) = self.app_core.clone() else {
+            // Stub mode: record an empty index so we don't re-enter each frame
+            // (a seeded fixture has already replaced it).
+            self.traces = Loadable::loaded(HashMap::new());
+            return;
+        };
+        self.traces = Loadable::Loading;
+        let rx = bridge::space_traces(app_core, id);
+        self.traces_task = Some(cx.spawn(async move |this, cx| {
+            let result = rx.await.unwrap_or_else(|_| {
+                Err(AppError::Internal {
+                    message: "trace lookup cancelled".into(),
+                })
+            });
+            this.update(cx, |this, cx| {
+                let indexed = result.map(|traces| {
+                    let mut index: HashMap<String, Vec<PostTrace>> = HashMap::new();
+                    for trace in traces {
+                        index
+                            .entry(trace.anchor_action_id.clone())
+                            .or_default()
+                            .push(trace);
+                    }
+                    index
+                });
+                this.traces = std::mem::take(&mut this.traces).resolve(indexed);
+                this.traces_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Drop the cached trace index (and cancel its in-flight fetch) so the next
+    /// render re-requests it. Unlike the reverse index this is scoped to *this*
+    /// space: a turn's rounds are written in the space that ran them.
+    pub fn invalidate_traces(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.traces, Loadable::NotLoaded) {
+            return;
+        }
+        self.traces = Loadable::NotLoaded;
+        self.traces_task = None;
+        cx.notify();
+    }
+
+    /// Test seam: seed the trace index without a backend, so behavior tests can
+    /// drive the disclosure against stub stores.
+    #[doc(hidden)]
+    pub fn seed_traces_for_test(&mut self, traces: Vec<PostTrace>) {
+        let mut index: HashMap<String, Vec<PostTrace>> = HashMap::new();
+        for trace in traces {
+            index
+                .entry(trace.anchor_action_id.clone())
+                .or_default()
+                .push(trace);
+        }
+        self.traces = Loadable::loaded(index);
     }
 
     /// Whether any response turn is currently streaming.

@@ -3655,6 +3655,127 @@ pub async fn context_assembly_actions(
     Ok(out)
 }
 
+/// One trace action of a space — a `tool_call`, `tool_result` or `decision`
+/// row with everything the space UI's audit disclosure needs (task 34).
+///
+/// The render views collapse these types out by design; this is the parallel
+/// read that puts them back, keyed off the posts already on screen.
+#[derive(Debug, Clone)]
+pub struct TraceActionRow {
+    pub id: String,
+    /// `tool_call` | `tool_result` | `decision`.
+    pub action_type: String,
+    pub created_at: i64,
+    pub participant_id: String,
+    /// The acting participant's **effective** label in this space.
+    pub participant_label: String,
+    /// The structural `reply` antecedent: the previous round for a chained
+    /// trace, the post the turn answered for a chain's first round and for
+    /// every `decision`.
+    pub reply_to: Option<String>,
+    /// `reply_to`'s item resolved to its **current generation** — where the
+    /// answered post now lives in the rendered tree.
+    pub reply_to_current: Option<String>,
+    /// The **earliest** inference whose context assembly recorded this action:
+    /// the turn that produced it. A later turn of the same participant replays
+    /// its own rounds (task 33) and so records them again, which is why the
+    /// earliest wins.
+    ///
+    /// `None` is the gap case the disclosure exists to make visible — a turn
+    /// that produced no post at all (a decline, a round-cap exit, a failure)
+    /// leaves its trace with no answer to attribute it to.
+    pub produced_by: Option<String>,
+    /// The raw exchange this round is recorded under — the Record deep link.
+    pub request_id: Option<String>,
+    pub blocks: Vec<RawBlockRow>,
+}
+
+/// Every trace action in a space, oldest first, with its content blocks.
+///
+/// One read backs the whole disclosure: attribution (`produced_by`), the gap
+/// anchor (`reply_to` / `reply_to_current`), the payload (`blocks`) and the
+/// Record link (`request_id`). Ordering is the actions' own, so a turn's
+/// rounds come back in the order they ran.
+pub async fn space_trace_rows(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Vec<TraceActionRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.id, a.action_type, a.created_at, a.participant_id, \
+                    COALESCE(sp.override_label, p.label), \
+                    (SELECT aa.antecedent_action_id FROM action_antecedent aa \
+                      WHERE aa.action_id = a.id AND aa.relation = 'reply'), \
+                    (SELECT ic.current_action_id \
+                       FROM action pa \
+                       JOIN item_current ic \
+                         ON ic.item_id = pa.item_id AND ic.space_id = pa.space_id \
+                      WHERE pa.id = (SELECT aa2.antecedent_action_id FROM action_antecedent aa2 \
+                                      WHERE aa2.action_id = a.id AND aa2.relation = 'reply')), \
+                    (SELECT ca.action_id FROM context_assembly ca \
+                       JOIN context_assembly_action caa ON caa.context_assembly_id = ca.id \
+                       JOIN action inf ON inf.id = ca.action_id \
+                      WHERE caa.action_id = a.id AND inf.action_type = 'inference' \
+                      ORDER BY inf.created_at ASC, inf.id ASC LIMIT 1), \
+                    (SELECT r.id FROM request r WHERE r.action_id = a.id \
+                      ORDER BY r.created_at ASC LIMIT 1) \
+             FROM action a \
+             JOIN participant p ON p.id = a.participant_id \
+             LEFT JOIN space_participant sp \
+               ON sp.space_id = a.space_id AND sp.participant_id = a.participant_id \
+             WHERE a.space_id = ?1 \
+               AND a.action_type IN ('tool_call', 'tool_result', 'decision') \
+             ORDER BY a.created_at ASC, a.id ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut out: Vec<TraceActionRow> = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(TraceActionRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            action_type: row.get::<String>(1).map_err(AppError::db)?,
+            created_at: row.get::<i64>(2).map_err(AppError::db)?,
+            participant_id: row.get::<String>(3).map_err(AppError::db)?,
+            participant_label: row
+                .get::<Option<String>>(4)
+                .map_err(AppError::db)?
+                .unwrap_or_default(),
+            reply_to: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            reply_to_current: row.get::<Option<String>>(6).map_err(AppError::db)?,
+            produced_by: row.get::<Option<String>>(7).map_err(AppError::db)?,
+            request_id: row.get::<Option<String>>(8).map_err(AppError::db)?,
+            blocks: Vec::new(),
+        });
+    }
+    for action in out.iter_mut() {
+        let mut stmt = conn
+            .prepare(
+                "SELECT block_type, text_content, tool_name, tool_call_id, data \
+                 FROM content_block WHERE action_id = ?1 ORDER BY ordinal ASC",
+            )
+            .await
+            .map_err(AppError::db)?;
+        let mut rows = stmt
+            .query([Value::Text(action.id.clone())])
+            .await
+            .map_err(AppError::db)?;
+        while let Some(row) = rows.next().await.map_err(AppError::db)? {
+            action.blocks.push(RawBlockRow {
+                block_type: row.get::<String>(0).map_err(AppError::db)?,
+                text_content: row.get::<Option<String>>(1).map_err(AppError::db)?,
+                tool_name: row.get::<Option<String>>(2).map_err(AppError::db)?,
+                tool_call_id: row.get::<Option<String>>(3).map_err(AppError::db)?,
+                data: row.get::<Option<String>>(4).map_err(AppError::db)?,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// One tool-payload content block of a **trace** action recorded in some
 /// inference's context assembly — the rows a later turn of the same
 /// participant replays as its own first-person memory (task 33).
