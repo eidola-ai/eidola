@@ -15,6 +15,7 @@
 //!   Reply-or-Ask menu).
 //! - [`composer`] — the floating/docking draft composer, the Post routing,
 //!   and the action gutter (Post / ⌥ Post quietly).
+//! - [`context_menu`] — the right-click menu over any of the space's editors.
 //! - [`minimap`] — the topology minimap.
 //!
 //! Performance: only posts intersecting the viewport render the real
@@ -22,6 +23,7 @@
 //! the cached layout, so per-frame text shaping is bounded to visible posts.
 
 pub mod composer;
+pub mod context_menu;
 pub mod layout;
 pub mod minimap;
 pub mod model;
@@ -362,6 +364,10 @@ pub struct SpaceView {
     /// quoted, awaiting a choice of which referencing post to visit. Window-
     /// local picker state, like the band menu.
     pub(crate) highlight_picker: Option<HighlightPicker>,
+    /// The open right-click menu over one of the space's editors, if any —
+    /// window-local transient state, like the band menu and the picker (one
+    /// open at a time; see [`context_menu`]).
+    pub(crate) context_menu: Option<context_menu::PostContextMenu>,
     /// Supersede slot for a cross-space navigation's home-space resolve. The
     /// work is a pure read whose only effect is opening a window, so a window
     /// closing mid-resolve strands nothing (STATE.md — owner = blast radius).
@@ -657,6 +663,7 @@ impl SpaceView {
             body_subs: HashMap::new(),
             post_selection: None,
             highlight_picker: None,
+            context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),
             streaming_bodies: HashMap::new(),
@@ -1893,6 +1900,17 @@ impl Render for SpaceView {
                 d.on_action(cx.listener(Self::quote))
                     .on_action(cx.listener(Self::quote_in_reply))
             })
+            // Escape closes an open context menu wherever focus happens to
+            // be. The composer's own handler (an inner element, so it runs
+            // first) already consumes the key when it closes the menu; this
+            // is the path for a right-click on a post while nothing is being
+            // composed, where there is no composer element in the dispatch
+            // path at all. A no-op when no menu is open.
+            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" {
+                    this.close_context_menu(cx);
+                }
+            }))
             // The window's single modifiers listener (see `WindowInput`): the
             // root is an ancestor of the focused composer, so it sees every
             // modifier transition and mirrors it into the shared entity for
@@ -1964,6 +1982,10 @@ impl Render for SpaceView {
             // defers; staying in the normal pass keeps both below late overlays
             // like the gpui dev inspector.
             .child(self.render_minimap(&tree, page_width, window_h, window, cx))
+            // The context menu is the last child of all: a menu opened at the
+            // pointer must sit above every surface it can be opened over,
+            // the minimap and the floating composer included.
+            .children(self.render_context_menu(window, cx))
     }
 }
 
