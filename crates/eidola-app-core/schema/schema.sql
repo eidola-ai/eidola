@@ -215,9 +215,26 @@ CREATE TABLE space (
     -- cascade_limit. A local (engine-backed) reference is free; a remote
     -- one bills a normal inference per triggering post.
     router_model      TEXT,
+    -- Notebook space (task 36): when set, this space IS that global
+    -- agent's private notebook — the residence of its core memory
+    -- blocks and the stage for self-dialogue. A real space, so
+    -- item space-scoping stays load-bearing and versioning,
+    -- references, rendering and the Record all work unchanged. One
+    -- column rather than a `kind` because both consumers need to
+    -- know *whose* it is, not merely that it is one: the default
+    -- Library listing hides it, and the agent-management surface
+    -- opens it. Created inside the promotion transaction; NULL for
+    -- every ordinary space. (Forward reference to `participant`,
+    -- which is defined below — FK targets resolve at DML time.)
+    notebook_participant_id TEXT REFERENCES participant(id),
     created_at        INTEGER NOT NULL,
     archived_at       INTEGER
 );
+
+-- One notebook per agent.
+CREATE UNIQUE INDEX idx_space_notebook_participant
+    ON space (notebook_participant_id)
+    WHERE notebook_participant_id IS NOT NULL;
 
 -- ============================================================
 -- Space template: a reusable blueprint for new spaces. A DB-backed
@@ -461,8 +478,18 @@ CREATE TABLE action (
     CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
     FOREIGN KEY (supersedes_action_id, supersedes_item_id)
         REFERENCES action (id, item_id),
+    -- ON UPDATE CASCADE carries task 36's in-place promotion: an agent
+    -- is promoted to a global identity by flipping scope 'space' →
+    -- 'global' on the SAME participant row, and the pinned echo on
+    -- every past action follows declaratively rather than by an
+    -- app-layer rewrite. This is legitimate, not a forensics edit: the
+    -- echo is a constraint device (its job — "authored by a
+    -- template-owned participant is unrepresentable" — holds just as
+    -- well afterwards), while participant_id, the actual identity in
+    -- the trail, never mutates. Proven under this turso build by
+    -- `turso_enforcement_smoke` case (e).
     FOREIGN KEY (participant_id, participant_scope)
-        REFERENCES participant (id, scope)
+        REFERENCES participant (id, scope) ON UPDATE CASCADE
 );
 
 CREATE INDEX idx_action_space ON action (space_id, created_at);
@@ -661,8 +688,13 @@ CREATE TABLE memory_block (
 
     UNIQUE (owner_participant_id, name),
     FOREIGN KEY (root_action_id, item_id) REFERENCES action (id, item_id),
+    -- Same cascade as `action`, and for the same reason: promoting an
+    -- agent that already holds memory must not fail the FK or strand a
+    -- stale echo. Memory is agent-owned, so promotion is a no-op for
+    -- it — the blocks keep their owner, their names, their scope
+    -- labels and their residence; only the echo moves.
     FOREIGN KEY (owner_participant_id, owner_scope)
-        REFERENCES participant (id, scope)
+        REFERENCES participant (id, scope) ON UPDATE CASCADE
 );
 
 CREATE INDEX idx_memory_block_owner
