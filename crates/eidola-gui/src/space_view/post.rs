@@ -587,18 +587,45 @@ impl SpaceView {
     /// answer, rendered through that turn's editor in `streaming_bodies`
     /// (synced to the live content each frame in `render`). Several turns can
     /// render at once, each with its own editor and disclosure.
+    ///
+    /// A turn whose engine is still warming leads with **"Loading model…"** —
+    /// the same quiet line in the same slot as "Thinking…", because it answers
+    /// the same question (what is this silence?) with the honest reason. It is
+    /// a readout, not a control: no click, `Role::Label`.
     fn render_streaming_body(&self, seq: u64, bw: gpui::Pixels, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let streaming = self
+        let turn = self
             .space
             .read(cx)
             .streams()
             .iter()
             .find(|t| t.seq == seq)
+            .cloned();
+        let streaming = turn
+            .as_ref()
             .map(|t| t.response.clone())
             .unwrap_or_default();
+        let warming = self
+            .turn_engine_is_warming(turn.as_ref().and_then(|t| t.participant_id.as_deref()), cx);
 
         let mut col = v_flex().w(bw).gap_2();
+        if warming {
+            col = col.child(
+                h_flex()
+                    .id(SharedString::from(format!("space-loading-model-{seq}")))
+                    .probe(
+                        format!("space/streaming/{seq}/loading"),
+                        gpui::Role::Label,
+                        "Loading model…",
+                    )
+                    .self_start()
+                    .px_1()
+                    .ml_neg_1()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Loading model…"),
+            );
+        }
         if !streaming.reasoning.is_empty() {
             let (label, aria) = thinking_labels(true, streaming.expanded);
             col = col.child(
