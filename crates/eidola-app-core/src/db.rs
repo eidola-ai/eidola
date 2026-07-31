@@ -2510,12 +2510,11 @@ pub async fn template_from_space(
 pub struct ActionEntry {
     pub id: String,
     pub space_id: String,
+    /// The acting participant. There is deliberately **no** scope field: the
+    /// pinned `(participant_id, participant_scope)` echo is derived from this
+    /// id inside [`insert_action`]'s own statement, so a caller cannot supply
+    /// a scope that has gone stale (see that function).
     pub participant_id: String,
-    /// The acting participant's scope — the pinned composite echo. Must be
-    /// `'global'` or `'space'` (an action can't be authored by a template-owned
-    /// participant); the tuple `(participant_id, participant_scope)` FK enforces
-    /// it against `participant(id, scope)`.
-    pub participant_scope: String,
     /// Stable identity shared by every generation of this item. For original
     /// (gen-0) work, mint a fresh UUIDv7; an edit/regeneration reuses the
     /// item_id of the action it supersedes.
@@ -2533,17 +2532,34 @@ pub struct ActionEntry {
     pub created_at: i64,
 }
 
+/// Insert one action.
+///
+/// **The pinned `participant_scope` echo is derived inside the statement**
+/// (`SELECT scope FROM participant WHERE id = ?`), never supplied by the
+/// caller. The echo is a *constraint device* that must equal the participant's
+/// scope at the instant of the write, and task 36 made that scope mutable: a
+/// promotion flips it mid-flight, so any scope a caller captured earlier — in
+/// a `TurnPrep` built before an HTTP round trip, in a turn-scoped tool — is a
+/// value that can go stale between capture and write. Reading it here, in the
+/// same single statement as the insert, makes staleness **unrepresentable**
+/// rather than merely unlikely: turso is single-writer, so a promotion cannot
+/// interleave *within* the statement, and there is no read-then-write window
+/// to lose a race in. A re-resolve before the call would only narrow that
+/// window; a lock would have to be held across an HTTP await.
+///
+/// `participant_scope` is `NOT NULL`, so an unknown participant fails loudly
+/// here instead of inserting a NULL echo (which MATCH SIMPLE would then skip).
 pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
          supersedes_action_id, supersedes_item_id, action_type, status, \
          intent, model, input_tokens, output_tokens, credits_consumed, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         VALUES (?1, ?2, ?3, (SELECT scope FROM participant WHERE id = ?3), \
+                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         (
             Value::Text(entry.id.clone()),
             Value::Text(entry.space_id.clone()),
             Value::Text(entry.participant_id.clone()),
-            Value::Text(entry.participant_scope.clone()),
             Value::Text(entry.item_id.clone()),
             opt_text(&entry.supersedes_action_id),
             // Denormalized supersedes item — always the row's own item (a
@@ -2868,9 +2884,28 @@ pub async fn current_branch_summaries(
 /// every render, tree and context query collapses it out for free.
 pub const MEMORY_ACTION_TYPE: &str = "memory";
 
-/// A memory block's identity row (`memory_block`). Its *contents* live on the
-/// item's action generations; this is who owns it, what it is called, and
-/// where it applies.
+/// A new memory block's identity row, as it is **written**. Its *contents*
+/// live on the item's action generations; this is who owns it, what it is
+/// called, and where it applies.
+#[derive(Clone, Debug)]
+pub struct NewMemoryBlock {
+    pub item_id: String,
+    pub root_action_id: String,
+    /// The owning agent. No scope field, for the same reason [`ActionEntry`]
+    /// has none — [`insert_memory_block`] derives the echo from this id.
+    pub owner_participant_id: String,
+    pub name: String,
+    /// `core` or `space` — the scope *label*, which is addressing and has
+    /// nothing to do with the owner's participant scope.
+    pub scope: String,
+    /// Residence: the space the block is about.
+    pub space_id: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One block's identity row as it is **read back** (the write shape is
+/// [`NewMemoryBlock`]).
 #[derive(Clone, Debug)]
 pub struct MemoryBlockRow {
     pub item_id: String,
@@ -2911,16 +2946,21 @@ pub struct MemoryRevisionRow {
     pub text: String,
 }
 
-pub async fn insert_memory_block(conn: &Connection, row: &MemoryBlockRow) -> Result<(), AppError> {
+/// Insert a block's identity row. Like [`insert_action`], the pinned
+/// `owner_scope` echo is **derived inside the statement** — [`NewMemoryBlock`]
+/// therefore has no scope field to get wrong, and a promotion landing between
+/// a revision's action write and this one can no longer strand the action
+/// without its block.
+pub async fn insert_memory_block(conn: &Connection, row: &NewMemoryBlock) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO memory_block (item_id, root_action_id, owner_participant_id, owner_scope, \
          name, scope, space_id, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, (SELECT scope FROM participant WHERE id = ?3), \
+                 ?4, ?5, ?6, ?7, ?8)",
         (
             Value::Text(row.item_id.clone()),
             Value::Text(row.root_action_id.clone()),
             Value::Text(row.owner_participant_id.clone()),
-            Value::Text(row.owner_scope.clone()),
             Value::Text(row.name.clone()),
             Value::Text(row.scope.clone()),
             Value::Text(row.space_id.clone()),
@@ -4953,6 +4993,60 @@ mod tests {
         );
     }
 
+    /// The idiom `insert_action` / `insert_memory_block` rely on to make a
+    /// stale scope echo unrepresentable: a scalar subquery inside `VALUES`,
+    /// reading the parent's *current* scope in the same statement as the
+    /// insert. Pins two properties of this turso build — the subquery is
+    /// supported and yields the live value, and an unknown parent yields NULL
+    /// into a `NOT NULL` column, i.e. a loud error rather than a NULL echo
+    /// that MATCH SIMPLE would silently skip.
+    #[tokio::test]
+    async fn a_scope_echo_can_be_derived_inside_the_insert() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
+        conn.execute_batch(
+            "CREATE TABLE p (id TEXT PRIMARY KEY, scope TEXT NOT NULL);
+             CREATE UNIQUE INDEX ux ON p(id, scope);
+             CREATE TABLE c (id TEXT PRIMARY KEY, pid TEXT NOT NULL, pscope TEXT NOT NULL,
+                 FOREIGN KEY (pid, pscope) REFERENCES p(id, scope) ON UPDATE CASCADE);",
+        )
+        .await
+        .unwrap();
+        conn.execute("INSERT INTO p VALUES ('p1', 'space')", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO c (id, pid, pscope) VALUES (?1, ?2, (SELECT scope FROM p WHERE id = ?2))",
+            (Value::Text("c1".into()), Value::Text("p1".into())),
+        )
+        .await
+        .expect("subquery in VALUES must work");
+        let mut stmt = conn
+            .prepare("SELECT pscope FROM c WHERE id = 'c1'")
+            .await
+            .unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        assert_eq!(
+            rows.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            "space"
+        );
+        // A missing parent yields NULL -> NOT NULL violation, i.e. a loud error.
+        let missing = conn.execute(
+            "INSERT INTO c (id, pid, pscope) VALUES (?1, ?2, (SELECT scope FROM p WHERE id = ?2))",
+            (Value::Text("c2".into()), Value::Text("nope".into())),
+        ).await;
+        assert!(
+            missing.is_err(),
+            "a missing participant must error, not insert NULL: {missing:?}"
+        );
+    }
+
     #[tokio::test]
     async fn fresh_install_creates_tables() {
         let db = open_memory_fresh().await;
@@ -5001,7 +5095,6 @@ mod tests {
                 id: action_id.clone(),
                 space_id: space_id.to_string(),
                 participant_id: participant_id.to_string(),
-                participant_scope: "global".to_string(),
                 item_id: uuid::Uuid::now_v7().to_string(),
                 supersedes_action_id: None,
                 action_type: "user_input".to_string(),
@@ -5134,7 +5227,6 @@ mod tests {
                     id: id.to_string(),
                     space_id: "space-t".to_string(),
                     participant_id: participant.to_string(),
-                    participant_scope: "global".to_string(),
                     item_id: item.to_string(),
                     supersedes_action_id: supersedes.map(String::from),
                     action_type: ty.to_string(),
@@ -5286,7 +5378,6 @@ mod tests {
             id: id.to_string(),
             space_id: "space-r".to_string(),
             participant_id: p.clone(),
-            participant_scope: "global".to_string(),
             item_id: "item-1".to_string(),
             supersedes_action_id: supersedes.map(String::from),
             action_type: "user_input".to_string(),
@@ -5377,7 +5468,6 @@ mod tests {
                 id: "act-1".into(),
                 space_id: "space-1".into(),
                 participant_id: agent,
-                participant_scope: "global".into(),
                 item_id: "item-1".into(),
                 supersedes_action_id: None,
                 action_type: "inference".into(),

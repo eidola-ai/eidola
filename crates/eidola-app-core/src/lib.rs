@@ -3194,8 +3194,6 @@ impl Inner {
                 id: action_id.clone(),
                 space_id: space_id.clone(),
                 participant_id: user_participant_id,
-                // The human "You" is a global participant.
-                participant_scope: "global".to_string(),
                 item_id: item_id.clone(),
                 supersedes_action_id: None,
                 action_type: "user_input".to_string(),
@@ -3340,8 +3338,6 @@ impl Inner {
                 id: new_action_id.clone(),
                 space_id: space_id.clone(),
                 participant_id: user_participant_id,
-                // The human "You" is a global participant.
-                participant_scope: "global".to_string(),
                 item_id: item_id.clone(),
                 supersedes_action_id: Some(tip),
                 action_type: "user_input".to_string(),
@@ -4160,7 +4156,6 @@ impl Inner {
                 registry.register(Arc::new(memory::RememberTool::new(
                     self.self_ref.clone(),
                     model_participant_id.clone(),
-                    model_participant_scope.clone(),
                     space_id.clone(),
                     thread.clone(),
                 )));
@@ -4228,7 +4223,6 @@ impl Inner {
             model: model.to_string(),
             wire_model,
             model_participant_id,
-            model_participant_scope,
             max_completion_tokens,
             inf_item_id,
             inf_supersedes,
@@ -7439,10 +7433,11 @@ struct TurnPrep {
     /// The model id the backend's HTTP API expects in the request body.
     /// Equals `model` except for openai backends (bare wire model).
     wire_model: String,
+    /// The acting agent participant. Deliberately **no** scope alongside it:
+    /// a turn spans HTTP round trips, and task 36's promotion can flip that
+    /// scope mid-flight — so the pinned echo is derived from this id inside
+    /// `db::insert_action`'s own statement rather than carried here.
     model_participant_id: String,
-    /// The acting agent participant's scope (`'space'` or `'global'`) — the
-    /// action's pinned composite echo.
-    model_participant_scope: String,
     max_completion_tokens: u32,
     /// The inference's attach plan (Reply → fresh item; Revise → a new
     /// generation superseding the target).
@@ -7715,7 +7710,6 @@ impl TurnPrep {
                 space_id: self.space_id.clone(),
                 // The requesting agent authors its own tool calls.
                 participant_id: self.model_participant_id.clone(),
-                participant_scope: self.model_participant_scope.clone(),
                 item_id: Uuid::now_v7().to_string(),
                 supersedes_action_id: None,
                 action_type: "tool_call".to_string(),
@@ -7828,7 +7822,6 @@ impl TurnPrep {
                 // echo). The `tool_result` action type is what marks it as
                 // harness work rather than the agent's own words.
                 participant_id: self.model_participant_id.clone(),
-                participant_scope: self.model_participant_scope.clone(),
                 item_id: Uuid::now_v7().to_string(),
                 supersedes_action_id: None,
                 action_type: "tool_result".to_string(),
@@ -7904,7 +7897,6 @@ impl TurnPrep {
                 id: action_id.clone(),
                 space_id: self.space_id.clone(),
                 participant_id: self.model_participant_id.clone(),
-                participant_scope: self.model_participant_scope.clone(),
                 item_id: Uuid::now_v7().to_string(),
                 supersedes_action_id: None,
                 action_type: "decision".to_string(),
@@ -7970,7 +7962,6 @@ impl TurnPrep {
                 id: inference_action_id.clone(),
                 space_id: self.space_id.clone(),
                 participant_id: self.model_participant_id.clone(),
-                participant_scope: self.model_participant_scope.clone(),
                 item_id: self.inf_item_id.clone(),
                 supersedes_action_id: self.inf_supersedes.clone(),
                 action_type: "inference".to_string(),
