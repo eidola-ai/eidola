@@ -15,6 +15,7 @@
 //!   Reply-or-Ask menu).
 //! - [`composer`] — the floating/docking draft composer, the Post routing,
 //!   and the action gutter (Post / ⌥ Post quietly).
+//! - [`context_menu`] — the right-click menu over any of the space's editors.
 //! - [`minimap`] — the topology minimap.
 //!
 //! Performance: only posts intersecting the viewport render the real
@@ -22,6 +23,7 @@
 //! the cached layout, so per-frame text shaping is bounded to visible posts.
 
 pub mod composer;
+pub mod context_menu;
 pub mod layout;
 pub mod minimap;
 pub mod model;
@@ -44,6 +46,7 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditorState, MarkdownStyle};
 
 use crate::actions::CloseWindow;
+use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
 use crate::space::{ChatMessageView, Space, SpaceEvent};
 use crate::stores::Stores;
@@ -64,7 +67,7 @@ pub use crate::actions::{PostOnly, Send};
 
 /// Height reserved at the top of the window for the (transparent) titlebar —
 /// the macOS traffic-light band / the Linux CSD controls + drag strip.
-pub(crate) const TITLE_BAR_RESERVE: Pixels = px(36.);
+pub(crate) const TITLE_BAR_RESERVE: Pixels = crate::titlebar::DRAG_BAND_HEIGHT;
 
 /// Prose typography for narrative content — Newsreader at a book size/leading,
 /// distinct from the system UI font the theme uses for chrome. Matches the
@@ -362,6 +365,10 @@ pub struct SpaceView {
     /// quoted, awaiting a choice of which referencing post to visit. Window-
     /// local picker state, like the band menu.
     pub(crate) highlight_picker: Option<HighlightPicker>,
+    /// The open right-click menu over one of the space's editors, if any —
+    /// window-local transient state, like the band menu and the picker (one
+    /// open at a time; see [`context_menu`]).
+    pub(crate) context_menu: Option<context_menu::PostContextMenu>,
     /// Supersede slot for a cross-space navigation's home-space resolve. The
     /// work is a pure read whose only effect is opening a window, so a window
     /// closing mid-resolve strands nothing (STATE.md — owner = blast radius).
@@ -657,6 +664,7 @@ impl SpaceView {
             body_subs: HashMap::new(),
             post_selection: None,
             highlight_picker: None,
+            context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),
             streaming_bodies: HashMap::new(),
@@ -1359,6 +1367,52 @@ impl SpaceView {
             .unwrap_or_else(|| "Eidola".into())
     }
 
+    /// Whether a streaming turn is waiting on its **engine**, not on the model:
+    /// the responding participant's effective model is engine-served (the
+    /// managed `local` store or a `llamacpp` backend) and that model is
+    /// currently warming (`LocalModelStatus::Loading`).
+    ///
+    /// Correlated entirely in the GUI, from two snapshots we already hold and
+    /// already re-render on — the participant's `model_ref` (`ParticipantsStore`)
+    /// and the engine's status (`LocalModelsStore`, refreshed on
+    /// `Change::LocalModels`, which app-core emits the moment a request-triggered
+    /// load reserves its engine). A turn against a remote backend, an unknown
+    /// participant, or a stub turn with no participant is never "loading".
+    pub(crate) fn turn_engine_is_warming(
+        &self,
+        participant_id: Option<&str>,
+        cx: &gpui::App,
+    ) -> bool {
+        let Some(pid) = participant_id else {
+            return false;
+        };
+        let Some(space_id) = self.space.read(cx).id() else {
+            return false;
+        };
+        let Some(model) = self
+            .stores
+            .participants
+            .read(cx)
+            .list(space_id)
+            .iter()
+            .find(|p| p.id == pid)
+            .and_then(|p| p.model_ref.clone())
+        else {
+            return false;
+        };
+        let want = eidola_app_core::parse_model_ref(&model);
+        let local = self.stores.local_models.read(cx);
+        local
+            .models()
+            .iter()
+            .chain(local.external().iter().flat_map(|b| b.models.iter()))
+            .filter(|m| {
+                let have = eidola_app_core::parse_model_ref(&m.id);
+                have.model == want.model && have.backend_id == want.backend_id
+            })
+            .any(|m| matches!(m.status, eidola_app_core::LocalModelStatus::Loading))
+    }
+
     /// React to a semantic `SpaceEvent`: re-snapshot + re-render, surface a
     /// typed failure as the recovery notice (and a paused cascade as its
     /// quiet notice), and clear the error on success.
@@ -1847,6 +1901,18 @@ impl Render for SpaceView {
                 d.on_action(cx.listener(Self::quote))
                     .on_action(cx.listener(Self::quote_in_reply))
             })
+            // **The sole owner of "Escape closes the context menu."** Key
+            // dispatch bubbles inner→outer, so the root runs *last* — after
+            // every inner Escape handler (the composer's, an edit session's)
+            // has yielded via [`Self::context_menu_absorbs_escape`]. One
+            // owner, consulted by one predicate, rather than a copy of the
+            // close per handler that each has to remember to make first. A
+            // no-op when no menu is open.
+            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" {
+                    this.close_context_menu(cx);
+                }
+            }))
             // The window's single modifiers listener (see `WindowInput`): the
             // root is an ancestor of the focused composer, so it sees every
             // modifier transition and mirrors it into the shared entity for
@@ -1860,7 +1926,6 @@ impl Render for SpaceView {
             .bg(bg)
             .font_family(font_family)
             .text_color(fg)
-            .child(self.render_title_bar(window, cx))
             .child({
                 let mut scroll = div()
                     .id("space-scroll")
@@ -1897,6 +1962,14 @@ impl Render for SpaceView {
                 scroll.style().restrict_scroll_to_axis = Some(true);
                 scroll
             })
+            // The title band paints **after** the page it covers: gpui's
+            // BoundsTree draw order is paint order, and a hitbox only blocks
+            // what was painted before it — so as a *first* child the band both
+            // sat under the posts (no fade) and let a press in the header reach
+            // the `MarkdownEditor` beneath it, which then dragged out a
+            // selection while the window moved (task 32). It stays ahead of the
+            // composer and minimap, which paint over it as before.
+            .child(self.render_title_bar(window, cx))
             .child(self.render_active_draft(&tree, page_width, window_h, window, cx))
             // The source-highlight picker: which of several posts that quoted
             // the clicked passage to visit. Above the composer, below the
@@ -1911,6 +1984,10 @@ impl Render for SpaceView {
             // defers; staying in the normal pass keeps both below late overlays
             // like the gpui dev inspector.
             .child(self.render_minimap(&tree, page_width, window_h, window, cx))
+            // The context menu is the last child of all: a menu opened at the
+            // pointer must sit above every surface it can be opened over,
+            // the minimap and the floating composer included.
+            .children(self.render_context_menu(window, cx))
     }
 }
 
@@ -2376,6 +2453,11 @@ impl SpaceView {
             .child(
                 v_flex()
                     .id("space-error-band")
+                    // Contained on the *card*, never on the transparent
+                    // full-width wrapper above (which spans the window and
+                    // would swallow clicks nowhere near the notice) — see
+                    // `crate::overlay`.
+                    .contain_mouse(Overlay::Popover)
                     // The notice was three unexplained buttons to a screen
                     // reader — "Dismiss", "Copy", "Retry" — because the message
                     // itself was a node-less `div`. The message rides as the
@@ -2531,6 +2613,9 @@ impl SpaceView {
             .child(
                 v_flex()
                     .id("space-cascade-band")
+                    // Contained on the card, not the full-width wrapper (see
+                    // the failure notice above and `crate::overlay`).
+                    .contain_mouse(Overlay::Popover)
                     // Same shape as the failure notice: the sentence is the
                     // value (the announcement channel), the label names the
                     // state. Muted, not danger — nothing failed.

@@ -19,8 +19,38 @@
 //! keeps painting, and the drag strip is unconditional window chrome), and no
 //! view field or constructor plumbing is needed. Mutation goes through the
 //! `Cell` without an entity update, so arming never triggers a re-render.
+//!
+//! **The strip captures the mouse** (`block_mouse_except_scroll`). A gpui
+//! mouse listener fires whenever its hitbox is *hovered*, and a plain overlay
+//! hitbox doesn't hide what it covers — so a press on the transparent header
+//! reached the content beneath it too: over a space's transcript the press
+//! landed in the post's `MarkdownEditor` and the drag that moved the window
+//! also dragged out a text selection (task 32). Blocking is the whole point of
+//! a header: everything painted before the strip stops being hovered while the
+//! pointer is in it, so the press belongs to the window move alone. `_except_scroll`
+//! is deliberate — the space view's band is a *fade* over live content, and a
+//! wheel gesture that starts under it must still scroll the page (hitboxes
+//! stay in the hit test for scroll, which is what `should_handle_scroll`
+//! reads). Children of the strip are painted after it and so are unaffected —
+//! the Record's section tabs keep their own clicks.
 
 use std::cell::Cell;
+
+use crate::overlay::{Contain as _, Overlay};
+
+/// **The drag band's height — one constant for every window.**
+///
+/// The band is a hit target the user cannot see, so its height being uniform is
+/// what makes "grab the top of any window" mean the same thing everywhere. It
+/// also has to clear the macOS traffic lights (`traffic_light_position` puts
+/// them at y=11, ~12px tall) and the Linux CSD control cluster.
+///
+/// Settings used to reserve 44px here while every other window used 36 — an
+/// 8px strip of extra dead space that, once the band started *blocking* the
+/// mouse (task 32), swallowed the top of the Backends pane's tab strip and made
+/// the tabs unclickable. The panes carry their own heading padding; the band
+/// does not fake it for them.
+pub const DRAG_BAND_HEIGHT: gpui::Pixels = gpui::px(36.);
 
 use gpui::{
     App, Div, InteractiveElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
@@ -54,46 +84,50 @@ pub(crate) fn make_draggable(
     );
     let on_down = armed.clone();
     let on_up = armed.clone();
-    el.on_mouse_down(
-        MouseButton::Left,
-        move |ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
-            // A press at the very window edge belongs to the CSD resize band
-            // (which reaches a few px inside the frame); arming a move there
-            // would race the resize the chrome backdrop is about to start.
-            // No-op off Linux (`in_resize_band` is always false there).
-            if crate::chrome::in_resize_band(window, ev.position) {
-                return;
-            }
-            on_down.read(cx).set(true);
-        },
-    )
-    .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _, cx| {
-        on_up.read(cx).set(false);
-    })
-    .on_mouse_move(move |_: &MouseMoveEvent, window: &mut Window, cx| {
-        if armed.read(cx).get() {
-            armed.read(cx).set(false);
-            window.start_window_move();
-        }
-    })
-    .on_double_click(|_, window, _| {
-        if cfg!(target_os = "macos") {
-            window.titlebar_double_click();
-        } else {
-            window.zoom_window();
-        }
-    })
-    // Right-click → the compositor's window menu (move / resize / workspace).
-    // Linux-only: `show_window_menu` is a no-op on macOS, so we skip registering
-    // a dead right-click hitbox over the drag strip there.
-    .when(!cfg!(target_os = "macos"), |el| {
-        el.on_mouse_down(
-            MouseButton::Right,
-            |ev: &MouseDownEvent, window: &mut Window, _| {
-                window.show_window_menu(ev.position);
+    // Translucent chrome over live content — see `crate::overlay`: the press
+    // is the band's own (the window move), while a wheel gesture that starts
+    // in it is plainly aimed at the page showing through and passes down.
+    el.contain_mouse(Overlay::Fade)
+        .on_mouse_down(
+            MouseButton::Left,
+            move |ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                // A press at the very window edge belongs to the CSD resize band
+                // (which reaches a few px inside the frame); arming a move there
+                // would race the resize the chrome backdrop is about to start.
+                // No-op off Linux (`in_resize_band` is always false there).
+                if crate::chrome::in_resize_band(window, ev.position) {
+                    return;
+                }
+                on_down.read(cx).set(true);
             },
         )
-    })
+        .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _, cx| {
+            on_up.read(cx).set(false);
+        })
+        .on_mouse_move(move |_: &MouseMoveEvent, window: &mut Window, cx| {
+            if armed.read(cx).get() {
+                armed.read(cx).set(false);
+                window.start_window_move();
+            }
+        })
+        .on_double_click(|_, window, _| {
+            if cfg!(target_os = "macos") {
+                window.titlebar_double_click();
+            } else {
+                window.zoom_window();
+            }
+        })
+        // Right-click → the compositor's window menu (move / resize / workspace).
+        // Linux-only: `show_window_menu` is a no-op on macOS, so we skip registering
+        // a dead right-click hitbox over the drag strip there.
+        .when(!cfg!(target_os = "macos"), |el| {
+            el.on_mouse_down(
+                MouseButton::Right,
+                |ev: &MouseDownEvent, window: &mut Window, _| {
+                    window.show_window_menu(ev.position);
+                },
+            )
+        })
 }
 
 /// A full-width, transparent drag band absolutely positioned over a window's
