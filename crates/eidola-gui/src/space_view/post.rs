@@ -546,11 +546,13 @@ impl SpaceView {
         let bw = px(body_width(page_width));
         let focus = editor.read(cx).focus_handle(cx);
         let id = node.id.clone();
-        // The editor fills the inline runway (the frame reserves a full window,
-        // minus its top/bottom padding), so a click in the blank space below the
-        // text lands inside the editor and resolves to document end — the same
-        // notes-editor affordance as the active composer, owned by the editor.
-        let editor_fill = px((window_h.as_f32() - 2.0 * POST_PAD_Y.as_f32()).max(0.0));
+        // The editor fills the inline runway (the frame reserves a standalone
+        // slot, minus its top/bottom padding), so a click in the blank space
+        // below the text lands inside the editor and resolves to document end —
+        // the same notes-editor affordance as the active composer, owned by the
+        // editor.
+        let slot_h = self.standalone_slot_h(window_h);
+        let editor_fill = px((slot_h - 2.0 * POST_PAD_Y.as_f32()).max(0.0));
 
         let byline_el = byline_gutter("You", theme.info, Some(DRAFT_BYLINE_OPACITY));
 
@@ -558,10 +560,10 @@ impl SpaceView {
             .relative()
             .w(page_width)
             // A draft is always the end of its branch, so reserve at least a
-            // full window — the same `max(natural, window)` runway the active
-            // composer docks into — so activating/deactivating it never shifts
-            // the layout (`node_height` reports the same height).
-            .min_h(window_h)
+            // standalone slot — the same `max(natural, standalone)` runway the
+            // active composer docks into — so activating/deactivating it never
+            // shifts the layout (`node_height` reports the same height).
+            .min_h(px(slot_h))
             .py(POST_PAD_Y)
             .justify_center()
             .items_start()

@@ -832,7 +832,7 @@ impl SpaceView {
             full_h,
             float_top,
             top_y,
-            self.doc_reserve(),
+            self.doc_reserve() + half_pad,
             docked,
         );
         let body_h = (bar_h - chrome).max(0.0);
@@ -1604,8 +1604,11 @@ fn record_height(
 
 /// The composer bar's **virtual** height: `float_bar_h` while floating, and,
 /// once docked, a ramp from there up to `full_h` (the whole content, at least a
-/// window) as the slot rises from the float line toward the document's top
-/// reserve.
+/// window) as the bar's top rises from the float line toward `dock_floor` — the
+/// lowest `top_y` the page can reach, i.e. the fully-docked bar top (the
+/// document's top reserve plus the slot's own half-pad; see
+/// [`SpaceView::standalone_slot_h`], which is what makes that the resting
+/// position).
 ///
 /// This is the *dock ramp*. It gives the docked composer its real geometry —
 /// `body_h = bar_h − chrome` is the scroll viewport, so as the bar grows
@@ -1626,13 +1629,13 @@ fn composer_bar_h(
     full_h: f32,
     float_top: f32,
     top_y: f32,
-    doc_reserve: f32,
+    dock_floor: f32,
     docked: bool,
 ) -> f32 {
     if !docked {
         return float_bar_h;
     }
-    let denom = (float_top - doc_reserve).max(1.0);
+    let denom = (float_top - dock_floor).max(1.0);
     let progress = ((float_top - top_y) / denom).clamp(0.0, 1.0);
     float_bar_h + progress * (full_h - float_bar_h)
 }
@@ -1837,14 +1840,15 @@ fn caret_into_view(
                 // `record_height` records a frame *behind* — so on the edit frame
                 // it can still reflect the pre-edit height and clamp the caret
                 // target back to the current offset. The docked runway is
-                // `max(window, chrome + content + half_pad)` and the document ends
+                // `max(standalone_slot, chrome + content + half_pad)` and the doc ends
                 // at `page_slot_doc_top + runway` (the slot is the on-path leaf,
                 // no trailing band / floating pad), so this reproduces exactly the
                 // `scroll_min_y` the *next* frame will settle to — letting the
                 // scroll land in one frame, the way the floating branch uses the
                 // fresh `natural` height. See `runway_height` / `placeholder_doc_top`.
                 let half_pad = POST_PAD_Y.as_f32() / 2.0;
-                let runway = window_h.max(SpaceView::composer_chrome() + natural + half_pad);
+                let standalone = view.read(cx).standalone_slot_h(px(window_h));
+                let runway = standalone.max(SpaceView::composer_chrome() + natural + half_pad);
                 let scroll_max = (page_slot_doc_top + runway - window_h).max(0.0);
                 view.update(cx, |this, _cx| {
                     this.composer_caret_scroll_pending.set(false);
@@ -2189,7 +2193,10 @@ mod tests {
     fn dock_ramp_reaches_the_full_content_height() {
         // A 760-tall window; the composer's content is taller than the window,
         // so `full_h` is the content and the bar must ramp all the way to it.
+        // The fully-docked bar top is the document's reserve plus the slot's
+        // half-pad — where the standalone runway brings the slot to rest.
         let (win, chrome, doc_reserve): (f32, f32, f32) = (760.0, 20.0, 36.0);
+        let dock_floor = doc_reserve + 20.0;
         let content: f32 = 1400.0;
         let full_h = (content + chrome).max(win);
         let float_bar_h = (content + chrome).min(0.5 * win);
@@ -2197,27 +2204,12 @@ mod tests {
 
         // Floating: the ramp is the identity.
         assert_eq!(
-            composer_bar_h(
-                float_bar_h,
-                full_h,
-                float_top,
-                float_top,
-                doc_reserve,
-                false
-            ),
+            composer_bar_h(float_bar_h, full_h, float_top, float_top, dock_floor, false),
             float_bar_h
         );
 
-        // Docked at its resting position — the slot top comes to rest at the
-        // document's top reserve, where progress is 1.
-        let bar_h = composer_bar_h(
-            float_bar_h,
-            full_h,
-            float_top,
-            doc_reserve,
-            doc_reserve,
-            true,
-        );
+        // Docked at its resting position — where progress is 1.
+        let bar_h = composer_bar_h(float_bar_h, full_h, float_top, dock_floor, dock_floor, true);
         assert!((bar_h - full_h).abs() < 0.01, "bar_h={bar_h}");
         // …which leaves the scroll viewport at least as tall as the content:
         // nothing left to scroll, so the eased offset clamps to the top.
@@ -2228,8 +2220,8 @@ mod tests {
             float_bar_h,
             full_h,
             float_top,
-            (float_top + doc_reserve) / 2.0,
-            doc_reserve,
+            (float_top + dock_floor) / 2.0,
+            dock_floor,
             true,
         );
         assert!(mid > float_bar_h && mid < full_h, "mid={mid}");
