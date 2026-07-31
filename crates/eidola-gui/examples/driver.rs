@@ -478,6 +478,30 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_traces",
+                description: "Space view: trace disclosures — an answered turn's tool rounds collapsed under its reply, and a decline hanging in the gap under the post it answered",
+                default_size: size(px(860.), px(760.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    let (posts, traces) = fixtures::trace_posts();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(posts, cx);
+                        s.seed_traces_for_test(traces);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_quote_draft",
                 description: "Space view: composing with a quote — a pending reference in the active draft (the embed block in the body, the footnote below it with its remove affordance)",
                 default_size: size(px(860.), px(760.)),

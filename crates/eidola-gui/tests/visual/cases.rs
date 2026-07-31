@@ -91,6 +91,22 @@ fn register_space(s: &mut Snapshots) {
         })
     });
 
+    // Trace visibility: an answered turn's tool rounds expanded under its own
+    // reply, and a decline hanging in the gap under the post it answered.
+    s.add("space_traces", size(px(860.), px(760.)), |window, cx| {
+        let core = stub_stores_with_config(cx);
+        cx.new(|cx| {
+            let view = SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+            let (posts, traces) = super::fixtures::trace_posts();
+            view.space().update(cx, |sp, cx| {
+                sp.set_post_tree_for_test(posts, cx);
+                sp.seed_traces_for_test(traces);
+                sp.toggle_trace("t2", cx);
+            });
+            view
+        })
+    });
+
     // Composing with a quote: the pending reference rendered as an embed block
     // inside the active draft, with its footnote (and remove affordance)
     // below.

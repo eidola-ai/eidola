@@ -3584,3 +3584,136 @@ fn streamed_tool_calls_preserve_provider_specific_fields() {
         );
     });
 }
+
+// ===========================================================================
+// Trace visibility (task 34) — the parallel read behind the space UI's
+// disclosure. These exercise the real SQL end to end; the grouping rules
+// themselves are unit-tested in `lib.rs`.
+// ===========================================================================
+
+#[test]
+fn space_traces_anchor_a_turns_rounds_on_the_answer_it_produced() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("tool turn succeeds");
+        let inference = result
+            .response_action_id
+            .clone()
+            .expect("the turn produced a post");
+
+        let traces = core
+            .runtime()
+            .block_on(core.space_traces(result.space_id.clone()))
+            .expect("trace read");
+        assert_eq!(traces.len(), 1, "one turn, one disclosure: {traces:?}");
+        let trace = &traces[0];
+        assert_eq!(
+            trace.anchor_action_id, inference,
+            "the disclosure hangs under the answer, not the ask"
+        );
+        assert!(!trace.unanswered);
+        assert_eq!(trace.entries.len(), 1);
+        match &trace.entries[0] {
+            eidola_app_core::TraceEntry::Tool {
+                name,
+                arguments,
+                result,
+                request_id,
+                ..
+            } => {
+                assert_eq!(name, TOOL_NAME);
+                assert_eq!(arguments, r#"{"text":"round-1"}"#);
+                assert_eq!(result.as_deref(), Some(tool_result_text(1).as_str()));
+                assert!(
+                    request_id.is_some(),
+                    "the round links through to its own raw exchange in the Record"
+                );
+            }
+            other => panic!("expected a tool round, got {other:?}"),
+        }
+
+        // A later turn of the same participant replays its own rounds (task
+        // 33) and records them in its assembly too — the round must still
+        // render once, under the turn that ran it.
+        let second = core
+            .runtime()
+            .block_on(core.chat(
+                "and again".into(),
+                MODEL.into(),
+                Some(result.space_id.clone()),
+            ))
+            .expect("second turn");
+        let traces = core
+            .runtime()
+            .block_on(core.space_traces(result.space_id.clone()))
+            .expect("trace read");
+        let anchors: Vec<&str> = traces.iter().map(|t| t.anchor_action_id.as_str()).collect();
+        assert!(
+            anchors.contains(&inference.as_str()),
+            "the first turn keeps its own rounds: {anchors:?}"
+        );
+        assert_eq!(
+            anchors.iter().filter(|a| **a == inference).count(),
+            1,
+            "and they are not duplicated onto the replaying turn: {anchors:?}"
+        );
+        assert!(second.response_action_id.is_some());
+    });
+}
+
+#[test]
+fn space_traces_anchor_a_capped_turn_on_the_post_it_answered() {
+    run(|| {
+        // The gap case: the round cap ends the turn with no inference at all,
+        // so its trace has no answer to hang under — it belongs to the post it
+        // was answering, which is exactly where the disclosure makes the
+        // non-event visible.
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(u64::MAX),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("loop forever".into(), MODEL.into(), None))
+            .expect_err("the round cap ends the turn");
+        let space_id = err
+            .chat_space_id()
+            .expect("the post is durable")
+            .to_string();
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space_id.clone()))
+            .expect("tree");
+        assert_eq!(tree.len(), 1, "only the human post survives the cap");
+        let post = tree[0].action_id.clone();
+
+        let traces = core
+            .runtime()
+            .block_on(core.space_traces(space_id))
+            .expect("trace read");
+        assert_eq!(traces.len(), 1, "one disclosure: {traces:?}");
+        assert_eq!(
+            traces[0].anchor_action_id, post,
+            "with no answer to hang under, it hangs under the ask"
+        );
+        assert!(traces[0].unanswered, "and says the turn left no post");
+        assert!(
+            traces[0].entries.len() > 1,
+            "every round it ran is listed: {:?}",
+            traces[0].entries
+        );
+    });
+}

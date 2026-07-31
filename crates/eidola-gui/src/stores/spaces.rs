@@ -167,7 +167,13 @@ impl SpacesStore {
         if let Some(weak) = self.registry.get(id)
             && let Some(entity) = weak.upgrade()
         {
-            entity.update(cx, |space, cx| space.on_space_changed(id, cx));
+            entity.update(cx, |space, cx| {
+                // Trace disclosures are space-local (a turn's rounds are
+                // written in the space that ran them), so only the changed
+                // space drops its index.
+                space.invalidate_traces(cx);
+                space.on_space_changed(id, cx);
+            });
         }
     }
 
