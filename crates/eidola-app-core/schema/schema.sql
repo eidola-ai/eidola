@@ -426,6 +426,11 @@ CREATE TABLE action (
                         'request',
                         'checkpoint',
                         'decision',
+                        -- One generation of an agent's memory block
+                        -- (task 35). Not a post type, so it collapses
+                        -- out of every render, tree and context query
+                        -- exactly like a tool trace.
+                        'memory',
                         'publish',
                         'system',
                         'error'
@@ -601,6 +606,70 @@ CREATE INDEX idx_content_block_tool
 
 CREATE INDEX idx_content_block_type
     ON content_block (block_type);
+
+-- ============================================================
+-- Memory block: an agent's own notes (task 35).
+--
+-- A block IS an item: its text and its authorship live on the
+-- item's action generations (action_type = 'memory'), so a
+-- revision supersedes exactly like an edited post, the whole
+-- history stays readable, and every revision records WHO wrote
+-- it — which is what distinguishes a self-revision from a human
+-- correction structurally rather than by convention.
+--
+-- This row carries what the generations cannot: the block's
+-- identity. Ownership and scope are deliberately separate:
+--
+--   owner_participant_id  the agent whose memory this is — ONE
+--                         owner, always, pinned by the same
+--                         (id, scope) composite echo `action`
+--                         uses. Blocks are never co-owned by a
+--                         space, which is what makes promoting
+--                         an agent to global (task 36) a no-op
+--                         for its memory.
+--   scope                 'core'  = load wherever the agent goes
+--                         'space' = load only in `space_id`
+--                         Scope is ADDRESSING, not ownership.
+--   space_id              residence: the space the block is
+--                         about, and where its actions live. For
+--                         a space-owned agent that is always its
+--                         owner space, so v1 needs no separate
+--                         residence concept (task 36 adds the
+--                         notebook space for a global's core
+--                         blocks).
+--
+-- Names are unique per OWNER, not per (owner, space): the
+-- `remember` tool addresses a block by name, so one namespace
+-- per agent is what makes "write the name again" unambiguously
+-- a revision of the same block, wherever the agent is standing.
+-- ============================================================
+CREATE TABLE memory_block (
+    item_id              TEXT PRIMARY KEY,
+    -- Generation 0 of that item. The pair FK proves the root
+    -- really is an action of this item.
+    root_action_id       TEXT NOT NULL,
+
+    owner_participant_id TEXT NOT NULL,
+    owner_scope          TEXT NOT NULL CHECK (owner_scope IN ('global', 'space')),
+
+    name                 TEXT NOT NULL,
+    scope                TEXT NOT NULL CHECK (scope IN ('core', 'space')) DEFAULT 'space',
+    space_id             TEXT NOT NULL REFERENCES space(id),
+
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL,
+
+    UNIQUE (owner_participant_id, name),
+    FOREIGN KEY (root_action_id, item_id) REFERENCES action (id, item_id),
+    FOREIGN KEY (owner_participant_id, owner_scope)
+        REFERENCES participant (id, scope)
+);
+
+CREATE INDEX idx_memory_block_owner
+    ON memory_block (owner_participant_id);
+
+CREATE INDEX idx_memory_block_space
+    ON memory_block (space_id);
 
 -- ============================================================
 -- System prompt: deduplicated by hash

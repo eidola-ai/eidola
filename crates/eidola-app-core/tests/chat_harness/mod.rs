@@ -393,6 +393,25 @@ pub fn system_message_with(prompt: Option<&str>, extra_notes: &[&str]) -> String
     }
 }
 
+/// The exact `<memory>` section a turn appends to its system message when the
+/// responding participant holds memory blocks (task 35).
+///
+/// `blocks` is `(name, scope_label, text)` where `scope_label` is rendered
+/// verbatim (`"core"` / `"this space"`) — the expected bytes written out
+/// long-hand, which is the point: a byte pin, not a reimplementation.
+pub fn memory_section(blocks: &[(&str, &str, &str)]) -> String {
+    let mut out = String::from(
+        "<memory>\nNotes you wrote for yourself in earlier turns. They are not part of the \
+         conversation and no one else is shown them. Core notes travel with you; the rest are \
+         about this space.\n",
+    );
+    for (name, scope, text) in blocks {
+        out.push_str(&format!("\n--- {name} ({scope}) ---\n{text}\n"));
+    }
+    out.push_str("</memory>");
+    out
+}
+
 /// The exact `<thread-map>` message content a turn appends.
 ///
 /// `forks` is `(anchor_line, entry_lines)` — the expected bytes written out
