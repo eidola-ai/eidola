@@ -762,6 +762,14 @@ fn edit_post_keeps_tree_position_and_rethreads_replies() {
 // zero durable trace. edit_post replicates references at their original
 // ordinals; edit_post_with_removals drops named ordinals (reply not
 // removable). references_to is a pure read (no emissions).
+//
+// Task 37 (cross-space permission model) adds **no exit point**: the
+// membership gate joins the same pre-write validation loop, so a refusal is
+// still a pure error with zero durable trace and no emission, and a permitted
+// reference still rides post's existing emissions. The follow side is a tool
+// result over pure reads, and the filtered reverse index
+// (`references_to_visible_to`) is a pure read like its unfiltered twin — all
+// of it exercised in `tests/cross_space_references.rs`.
 // ===========================================================================
 
 #[test]
