@@ -773,6 +773,7 @@ mod driver {
                     kind: "human".into(),
                     label: "You".into(),
                     model_ref: None,
+                    system_prompt: Some("Keep me honest and ask before assuming.".into()),
                     notify_policy: "explicit".into(),
                 }],
             },

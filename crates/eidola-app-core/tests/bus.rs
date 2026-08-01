@@ -1740,3 +1740,53 @@ fn template_from_space_projects_and_emits_templates() {
         );
     });
 }
+
+/// A referenced global's **effective** config includes its system prompt, and a
+/// per-membership override of it projects across with the reference — so the
+/// DTO must carry it. Dropping it made a template editor show an empty field
+/// where a live charter exists.
+#[test]
+fn template_from_space_carries_a_referenced_globals_system_prompt() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let space = core.runtime().block_on(core.create_space(None)).unwrap();
+        let sid = space.id.clone();
+
+        // Override the shared "You"'s prompt in this space only.
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                sid.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                eidola_app_core::ParticipantOverride {
+                    system_prompt: Some(Some("Answer only in questions.".into())),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+
+        let tmpl = core
+            .runtime()
+            .block_on(core.template_from_space(sid, "With A Charter".into()))
+            .unwrap();
+        assert_eq!(tmpl.referenced.len(), 1);
+        assert_eq!(
+            tmpl.referenced[0].system_prompt.as_deref(),
+            Some("Answer only in questions."),
+            "the referenced global's effective prompt rides in the DTO"
+        );
+
+        // And it survives a re-read of the registry, not just the create's return.
+        let listed = core
+            .runtime()
+            .block_on(core.list_space_templates())
+            .unwrap();
+        let re_read = listed
+            .iter()
+            .find(|t| t.id == tmpl.id)
+            .expect("template listed");
+        assert_eq!(
+            re_read.referenced[0].system_prompt.as_deref(),
+            Some("Answer only in questions.")
+        );
+    });
+}

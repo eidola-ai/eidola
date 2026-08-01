@@ -367,8 +367,18 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
         }
         // A per-space participant change carries no id, so re-read every cached
         // space's membership.
+        //
+        // It also reaches the **templates** registry, which is an amendment to
+        // the 1:1 variant↔store rule's letter in the service of its spirit: a
+        // `SpaceTemplateInfo` embeds its referenced globals' *effective* config
+        // (`SpaceTemplateInfo::referenced`), so an "edit everywhere" of a shared
+        // participant — which emits only `Change::Participants` — moves what a
+        // cached template snapshot says. The store reads participant config now,
+        // so it must hear about participant changes. (`Change::Config` already
+        // fans out to two stores for the same kind of reason.)
         Change::Participants => {
             stores.participants.update(cx, |s, cx| s.refresh_all(cx));
+            stores.templates.update(cx, |s, cx| s.refresh(cx));
         }
     }
 }

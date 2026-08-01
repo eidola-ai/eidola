@@ -2620,6 +2620,7 @@ fn probe_templates() -> Vec<SpaceTemplateInfo> {
                 kind: "human".into(),
                 label: "You".into(),
                 model_ref: None,
+                system_prompt: Some("Keep me honest.".into()),
                 notify_policy: "explicit".into(),
             }],
         },
@@ -2712,13 +2713,14 @@ fn templates_pane_router_probes_and_remote_cost_note(cx: &mut TestAppContext) {
         "Router model",
     );
     // The referenced global this template carries is listed read-only — named,
-    // with its config as the content, and no verbs.
+    // with its config as the content (its effective system prompt included, so
+    // a real charter is neither hidden nor silently dropped), and no verbs.
     assert_probe_value(
         &entries,
         "settings/templates/editor/referenced/0",
         gpui::Role::Label,
         "You — shared participant",
-        "Responds when asked",
+        "Responds when asked · Keep me honest.",
     );
     assert!(
         !entries

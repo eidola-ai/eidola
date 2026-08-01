@@ -285,6 +285,12 @@ pub struct TemplateReferencedParticipant {
     pub kind: String,
     pub label: String,
     pub model_ref: Option<String>,
+    /// The effective system prompt (`COALESCE(override, base)`) — carried, not
+    /// dropped: `template_from_space` preserves a per-membership prompt
+    /// override and instantiation honors it, so a template really can hold a
+    /// charter for a referenced global. Omitting it made the editor show an
+    /// empty field where a live instruction exists.
+    pub system_prompt: Option<String>,
     pub notify_policy: String,
 }
 
@@ -3148,6 +3154,7 @@ impl Inner {
                 kind: p.kind,
                 label: p.label,
                 model_ref: p.model_ref,
+                system_prompt: p.system_prompt,
                 notify_policy: p.notify_policy,
             })
             .collect();
@@ -7683,6 +7690,37 @@ impl AppCore {
             .spawn(async move {
                 inner
                     .set_template_router_model(&template_id, router_model.as_deref())
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Check a may-decline router reference **without writing anything** —
+    /// exactly the validation [`Self::set_space_router_model`] /
+    /// [`Self::set_template_router_model`] run, returning the normalized value
+    /// (`None` for empty = off).
+    ///
+    /// It exists because setting a router is deliberately a *separate* call
+    /// from `create_template` / `update_template` (task 22 keeps their
+    /// signatures free of it), so a caller composing "create, then set the
+    /// router" has a window where the create commits and the setter is refused
+    /// — a backend disabled or removed while the editor was open. Running this
+    /// first turns that into a zero-trace failure, and sharing the real
+    /// validator (rather than the caller re-deriving the rule from its own
+    /// backend snapshot) is what keeps the two from drifting apart.
+    ///
+    /// Pure read: commits nothing, emits nothing.
+    pub async fn validate_router_model(
+        &self,
+        router_model: Option<String>,
+    ) -> Result<Option<String>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                inner
+                    .validate_router_model(&conn, router_model.as_deref())
                     .await
             })
             .await
