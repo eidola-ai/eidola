@@ -18,7 +18,8 @@ use eidola_app_core::updates::{
 };
 use eidola_app_core::{
     AttestationDetail, AttestationInfo, BalancesResult, ConfigState, CredentialLifecycleInfo,
-    PostBlock, PostNode, PostParticipant, RequestDetail, RequestInfo, SpaceInfo, SpaceMessage,
+    PostBlock, PostNode, PostParticipant, PostTrace, RequestDetail, RequestInfo, SpaceInfo,
+    SpaceMessage, TraceEntry,
 };
 use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
@@ -8002,6 +8003,209 @@ fn space_composer_drag_is_contained_and_does_not_scroll_the_page(cx: &mut TestAp
             v.page_scroll_offset_y_for_test(),
             before_scroll,
             "and must not drive the page's selection-autoscroll"
+        );
+    });
+}
+
+// --- Trace visibility (task 34) -----------------------------------------
+
+/// One turn's tool round, as `AppCore::space_traces` reports it.
+fn trace_tool(name: &str, args: &str, result: Option<&str>, request: Option<&str>) -> TraceEntry {
+    TraceEntry::Tool {
+        action_id: format!("tc-{name}"),
+        request_id: request.map(str::to_string),
+        call_id: format!("call-{name}"),
+        name: name.into(),
+        arguments: args.into(),
+        result: result.map(str::to_string),
+    }
+}
+
+#[gpui::test]
+fn space_trace_disclosure_is_collapsed_until_asked(cx: &mut TestAppContext) {
+    // Quiet by default: a post that anchors activity carries one subordinate
+    // line and nothing else until it is opened. Expansion lives on the shared
+    // `Space` (like the thinking disclosure), so both windows on a space agree.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut a2 = fixture_assistant_post("a2", "the reply");
+    a2.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the ask"), a2],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, _| {
+            s.seed_traces_for_test(vec![PostTrace {
+                id: "t1".into(),
+                anchor_action_id: "a2".into(),
+                participant_label: "kimi-k2".into(),
+                unanswered: false,
+                entries: vec![
+                    trace_tool("list_branches", "{}", Some("2 branches"), Some("req-1")),
+                    trace_tool(
+                        "read_thread",
+                        "{\"handle\":\"h1\"}",
+                        Some("8 posts"),
+                        Some("req-2"),
+                    ),
+                ],
+            }]);
+        });
+    })
+    .unwrap();
+
+    // Collapsed: the disclosure exists but reveals nothing.
+    space.read_with(cx, |s, _| {
+        assert_eq!(
+            s.traces_for("a2").len(),
+            1,
+            "the reply anchors its turn's trace"
+        );
+        assert!(s.traces_for("a1").is_empty(), "the ask anchors nothing");
+        assert!(!s.trace_expanded("t1"));
+    });
+
+    // Expansion is keyed on the *turn*, not the post it hangs under — several
+    // turns can land on one post, and opening one must not open its siblings.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.toggle_trace("t1", cx));
+    })
+    .unwrap();
+    space.read_with(cx, |s, _| {
+        assert!(s.trace_expanded("t1"));
+        assert!(
+            !s.trace_expanded("a2"),
+            "the anchor is not a disclosure key"
+        );
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.toggle_trace("t1", cx));
+    })
+    .unwrap();
+    space.read_with(cx, |s, _| assert!(!s.trace_expanded("t1")));
+}
+
+#[gpui::test]
+fn space_decline_renders_in_the_gap_under_the_post_it_answered(cx: &mut TestAppContext) {
+    // The audit value of a decline is that a non-event is visible: the turn
+    // wrote no post, so its disclosure hangs under the post it *answered*.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", "the ask")]);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, _| {
+            s.seed_traces_for_test(vec![PostTrace {
+                id: "t2".into(),
+                anchor_action_id: "a1".into(),
+                participant_label: "Mara".into(),
+                unanswered: true,
+                entries: vec![TraceEntry::Declined {
+                    action_id: "d1".into(),
+                    reason: Some("not my area".into()),
+                }],
+            }]);
+        });
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        let traces = s.traces_for("a1");
+        assert_eq!(traces.len(), 1, "the decline hangs under the ask");
+        assert!(traces[0].unanswered, "and is marked as leaving no post");
+        assert_eq!(traces[0].participant_label, "Mara");
+    });
+}
+
+#[gpui::test]
+fn space_trace_row_deep_links_into_the_record(cx: &mut TestAppContext) {
+    // Disclosure, not duplication: a round's line links to its own raw
+    // exchange rather than re-rendering the payload in the reading column.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut a2 = fixture_assistant_post("a2", "the reply");
+    a2.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the ask"), a2],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_traces_for_test(vec![PostTrace {
+                id: "t3".into(),
+                anchor_action_id: "a2".into(),
+                participant_label: "kimi-k2".into(),
+                unanswered: false,
+                entries: vec![trace_tool("read_post", "{}", Some("ok"), Some("req-7"))],
+            }]);
+            s.toggle_trace("t3", cx);
+        });
+    })
+    .unwrap();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.last_record_request_for_test(), None)
+    });
+    // The row's own request id — read off the trace the view renders from —
+    // is what the link follows.
+    let request_id = space.read_with(cx, |s, _| match &s.traces_for("a2")[0].entries[0] {
+        TraceEntry::Tool { request_id, .. } => request_id.clone().expect("a recorded exchange"),
+        other => panic!("expected a tool round, got {other:?}"),
+    });
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.open_in_record(request_id, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.last_record_request_for_test(),
+            Some("req-7"),
+            "the round's line opens that round's request in the Record"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_change_invalidates_the_trace_index(cx: &mut TestAppContext) {
+    // A turn's rounds land with the turn, so a `Change::Space` must drop the
+    // cached index; the next frame re-requests it.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", "the ask")]);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, _| {
+            s.seed_traces_for_test(vec![PostTrace {
+                id: "t4".into(),
+                anchor_action_id: "a1".into(),
+                participant_label: "Mara".into(),
+                unanswered: true,
+                entries: vec![TraceEntry::Declined {
+                    action_id: "d1".into(),
+                    reason: None,
+                }],
+            }]);
+        });
+    })
+    .unwrap();
+    space.read_with(cx, |s, _| assert_eq!(s.traces_for("a1").len(), 1));
+
+    cx.update(|cx| {
+        stores
+            .spaces
+            .update(cx, |st, cx| st.notify_space_changed("s", cx));
+    });
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.traces_for("a1").is_empty(),
+            "the cached index is dropped on the space changing"
         );
     });
 }

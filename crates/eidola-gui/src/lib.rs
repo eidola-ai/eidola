@@ -73,6 +73,13 @@ struct AppGlobal {
     /// The single Record window, if open. Same singleton discipline as
     /// `settings_window`.
     record_window: Option<WindowHandle<Root>>,
+    /// The open Record window's view, weakly. Held beside the handle because
+    /// every window's root is a `gpui_component::Root` (see
+    /// [`try_focus_existing_singleton`]), so the view can't be recovered by
+    /// downcasting the handle — and a deep link into a *specific* raw exchange
+    /// (a space's trace row, task 34) has to reach the view, not just the
+    /// window.
+    record_view: Option<gpui::WeakEntity<RecordView>>,
     /// The single onboarding ("Get Started") window, if open. Same singleton
     /// discipline as `settings_window`.
     onboarding_window: Option<WindowHandle<Root>>,
@@ -141,6 +148,7 @@ pub fn run() {
             library_window: None,
             updates_window: None,
             record_window: None,
+            record_view: None,
             onboarding_window: None,
         });
 
@@ -854,18 +862,50 @@ fn open_record_window(cx: &mut App) {
     let bounds = centered_window_bounds(cx, 860., 640.);
     let opts = base_window_options(bounds, 560., 400.);
 
+    // The view is minted inside the window builder; capture it on the way out
+    // so a deep link can reach it later (see `AppGlobal::record_view`).
+    let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::WeakEntity<RecordView>>>> =
+        Default::default();
+    let sink = captured.clone();
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
         window.set_window_title("The Record");
         let view = cx.new(|cx| RecordView::new(stores.clone(), window, cx));
+        *sink.borrow_mut() = Some(view.downgrade());
         let view = chrome::ChromeRoot::wrap(view.into(), cx);
         cx.new(|cx| chrome::themed_root(view, window, cx))
     });
 
     if let Ok(handle) = handle {
-        cx.global_mut::<AppGlobal>().record_window = Some(handle);
+        let global = cx.global_mut::<AppGlobal>();
+        global.record_window = Some(handle);
+        global.record_view = captured.borrow().clone();
     }
     cx.activate(true);
+}
+
+/// Open the Record on one specific raw exchange — the deep link behind a
+/// space's trace rows (task 34). Raises the existing Record window when there
+/// is one (the singleton discipline) and opens it otherwise, then drives the
+/// view straight to that request's detail.
+///
+/// A no-op without `AppGlobal` (stub-store tests, the driver), which is why
+/// the caller records the request id before calling.
+pub fn open_record_request(cx: &mut App, request_id: String) {
+    if !cx.has_global::<AppGlobal>() {
+        return;
+    }
+    if !try_focus_existing_record(cx) {
+        open_record_window(cx);
+    }
+    let view = cx
+        .global::<AppGlobal>()
+        .record_view
+        .clone()
+        .and_then(|w| w.upgrade());
+    if let Some(view) = view {
+        view.update(cx, |view, cx| view.show_request(request_id, cx));
+    }
 }
 
 /// Open the onboarding window — the from-scratch "Get Started" flow, a

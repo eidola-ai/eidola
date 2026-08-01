@@ -674,6 +674,189 @@ pub struct IncomingReference {
     pub created_at: i64,
 }
 
+/// One turn's operational trace, as a space UI discloses it (task 34): the
+/// tool rounds it ran and, when it ended at the agent-side decline checkpoint,
+/// the decision it wrote.
+///
+/// The render tree deliberately collapses these actions out — they are not
+/// posts. This is the parallel view that puts them back, **anchored to a post
+/// already on screen** so `PostNode` and its virtualization are untouched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostTrace {
+    /// This **turn's** durable identity: the inference it produced, or — for a
+    /// turn that produced none — the root action of the trace chain it ran.
+    ///
+    /// Distinct from `anchor_action_id`, which several turns can share: a post
+    /// may be declined twice by one agent, and an inference may be both one
+    /// turn's answer and the post another turn declines. Stable across
+    /// reloads, so a UI can key per-turn state (an open disclosure) on it.
+    pub id: String,
+    /// The rendered post this trace hangs under:
+    /// - a turn that produced an answer → that **inference**'s action id
+    ///   (attribution is the turn's context assembly, per task 33);
+    /// - a turn that produced none → the **post it answered**, resolved to
+    ///   that item's current generation. That is the gap the disclosure exists
+    ///   to make visible: a decline, a round-cap exit, a failed loop.
+    pub anchor_action_id: String,
+    /// The participant that ran the turn (its effective label in this space).
+    pub participant_label: String,
+    /// `true` when the turn left no post behind — see `anchor_action_id`.
+    pub unanswered: bool,
+    /// The rounds, in the order they ran.
+    pub entries: Vec<TraceEntry>,
+}
+
+/// One human-meaningful line of a [`PostTrace`]. Raw payloads stay in the
+/// Record; these carry only what a summary line needs plus the id that links
+/// through to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TraceEntry {
+    /// One tool call and the result it was given back.
+    Tool {
+        /// The `tool_call` action the call belongs to.
+        action_id: String,
+        /// The raw exchange in the Record, when the round recorded one.
+        request_id: Option<String>,
+        call_id: String,
+        name: String,
+        /// The model's raw argument string.
+        arguments: String,
+        /// The result text the model was shown. `None` when the call was never
+        /// executed — the round cap withholds a capped round's tools, and the
+        /// honest rendering of that is "not run", not a blank.
+        result: Option<String>,
+    },
+    /// The agent declined to respond (task 22's `decision` action).
+    Declined {
+        action_id: String,
+        reason: Option<String>,
+    },
+}
+
+/// Group a space's raw trace actions into per-turn [`PostTrace`]s.
+///
+/// Pure over the rows so the grouping rules — assembly attribution, the
+/// chain walk to a gap's anchor, call/result pairing by id — are unit-testable
+/// without a database.
+///
+/// **One group is one turn**, and the key is a durable per-invocation
+/// identity, never the anchor: an answered turn keys on the inference it
+/// produced; an unanswered one keys on the root of its own trace chain (a
+/// `decision`, which hangs off the post rather than the chain, carries a
+/// `reference` edge naming that root — see [`db::DECLINE_TRACE_ORDINAL`]).
+/// Keying on `(anchor, participant)` instead merged every turn a participant
+/// ran against one post into a single disclosure, hiding how many times it was
+/// asked.
+fn assemble_post_traces(rows: Vec<db::TraceActionRow>) -> Vec<PostTrace> {
+    use std::collections::HashMap;
+
+    let index: HashMap<&str, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.id.as_str(), i))
+        .collect();
+
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, PostTrace> = HashMap::new();
+    // (group key, tool call id) → index of the entry awaiting its result.
+    let mut pending: HashMap<(String, String), usize> = HashMap::new();
+
+    for (i, row) in rows.iter().enumerate() {
+        let (key, anchor, unanswered) = match row.produced_by.as_deref() {
+            Some(inference) => (inference.to_string(), inference.to_string(), false),
+            None => {
+                // Walk the reply chain to its root — the first round — whose
+                // antecedent is the post the turn answered. Bounded by the row
+                // count so a malformed cycle can't spin.
+                let mut cur = i;
+                for _ in 0..rows.len() {
+                    let Some(parent) = rows[cur].reply_to.as_deref() else {
+                        break;
+                    };
+                    match index.get(parent) {
+                        Some(&j) => cur = j,
+                        None => break,
+                    }
+                }
+                let anchor = rows[cur]
+                    .reply_to_current
+                    .clone()
+                    .or_else(|| rows[cur].reply_to.clone());
+                // A rootless chain has no post to hang under; drop it rather
+                // than invent an anchor (it still lives in the Record).
+                let Some(anchor) = anchor else { continue };
+                // The chain root is the turn. A `decision` is not on that chain
+                // (task 22 threads it to the post it declines), so it names its
+                // turn's root explicitly; without that edge it can only be read
+                // as a turn of its own.
+                let key = match row.turn_root.clone() {
+                    Some(root) => root,
+                    None => rows[cur].id.clone(),
+                };
+                (key, anchor, true)
+            }
+        };
+
+        let group = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            PostTrace {
+                id: key.clone(),
+                anchor_action_id: anchor,
+                participant_label: row.participant_label.clone(),
+                unanswered,
+                entries: Vec::new(),
+            }
+        });
+
+        match row.action_type.as_str() {
+            "tool_call" => {
+                for block in row.blocks.iter().filter(|b| b.block_type == "tool_use") {
+                    let call_id = block.tool_call_id.clone().unwrap_or_default();
+                    pending.insert((key.clone(), call_id.clone()), group.entries.len());
+                    group.entries.push(TraceEntry::Tool {
+                        action_id: row.id.clone(),
+                        request_id: row.request_id.clone(),
+                        call_id,
+                        name: block.tool_name.clone().unwrap_or_default(),
+                        arguments: block.data.clone().unwrap_or_default(),
+                        result: None,
+                    });
+                }
+            }
+            "tool_result" => {
+                for block in row.blocks.iter().filter(|b| b.block_type == "tool_result") {
+                    let call_id = block.tool_call_id.clone().unwrap_or_default();
+                    let Some(&at) = pending.get(&(key.clone(), call_id)) else {
+                        continue;
+                    };
+                    if let Some(TraceEntry::Tool { result, .. }) = group.entries.get_mut(at) {
+                        *result = block.text_content.clone();
+                    }
+                }
+            }
+            "decision" => {
+                let reason = row
+                    .blocks
+                    .iter()
+                    .find(|b| b.block_type == "text")
+                    .and_then(|b| b.text_content.clone())
+                    .filter(|s| !s.trim().is_empty());
+                group.entries.push(TraceEntry::Declined {
+                    action_id: row.id.clone(),
+                    reason,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|k| groups.remove(&k))
+        .filter(|t| !t.entries.is_empty())
+        .collect()
+}
+
 /// One render-row of the threaded space — an item's current generation,
 /// flattened from the reply DAG into a list (so `list()` virtualization
 /// survives). The flattener (`build_post_tree`) encodes the spine-vs-branch
@@ -2238,6 +2421,16 @@ impl Inner {
                 created_at: r.created_at,
             })
             .collect())
+    }
+
+    /// Every turn's operational trace in a space, anchored to the post that
+    /// discloses it. See [`PostTrace`]. Pure read — commits nothing, emits
+    /// nothing.
+    async fn space_traces(&self, space_id: &str) -> Result<Vec<PostTrace>, AppError> {
+        let db_conn = self.db_conn().await?;
+        Ok(assemble_post_traces(
+            db::space_trace_rows(&db_conn, space_id).await?,
+        ))
     }
 
     /// Create a new space by instantiating the (live) default space template:
@@ -7112,6 +7305,17 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Every turn's operational trace in a space — the tool rounds and decline
+    /// decisions `get_space_tree` collapses out — each anchored to a post the
+    /// tree already renders. See [`PostTrace`].
+    pub async fn space_traces(&self, space_id: String) -> Result<Vec<PostTrace>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.space_traces(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
     /// [`Self::references_to`] filtered per viewer: only the referring posts
     /// `viewer_participant_id` takes part in — the referrers it could actually
     /// follow (task 37's inbound-exposure rule). A cross-space-aware surface
@@ -8084,6 +8288,16 @@ impl TurnPrep {
     /// is where the request row lives. The stated reason, when there is one, is
     /// its single `text` block.
     ///
+    /// That threading leaves the decision with no structural link to the rounds
+    /// its own turn ran, which is fine until a participant declines the same
+    /// post twice — then "the decisions and chains under this post, by this
+    /// agent" is several turns with nothing to tell them apart. So the decision
+    /// also carries a `reference` edge to the **root of its turn's trace
+    /// chain** ([`db::DECLINE_TRACE_ORDINAL`]): turn identity as a real
+    /// relation, the branch-summary precedent. The chain root always exists
+    /// here — the checkpoint fires after the round's `tool_call` action is
+    /// persisted, and the decline *is* one of that round's calls.
+    ///
     /// `get_space_tree` keeps only post-bearing action types, so a decision
     /// collapses out of the rendered thread exactly like a tool trace does —
     /// visible in the Record, invisible as a post. Rendering it as "saw this,
@@ -8111,6 +8325,16 @@ impl TurnPrep {
         .await?;
         if let Some(ref ante) = self.inf_reply_to {
             db::insert_action_antecedent(&self.db_conn, &action_id, ante, 0, "reply").await?;
+        }
+        if let Some(root) = self.trace_action_ids.first() {
+            db::insert_action_antecedent(
+                &self.db_conn,
+                &action_id,
+                root,
+                db::DECLINE_TRACE_ORDINAL,
+                "reference",
+            )
+            .await?;
         }
         if !reason.is_empty() {
             db::insert_text_content_block(
@@ -11464,6 +11688,390 @@ mod tests {
         );
         let calls = finish_streaming_tool_calls(acc).expect("assembles");
         assert_eq!(calls[0].raw["provider_tag"], "alpha");
+    }
+
+    // --- Trace assembly (task 34) -------------------------------------
+
+    fn trace_row(
+        id: &str,
+        action_type: &str,
+        reply_to: Option<&str>,
+        produced_by: Option<&str>,
+        blocks: Vec<db::RawBlockRow>,
+    ) -> db::TraceActionRow {
+        db::TraceActionRow {
+            id: id.into(),
+            action_type: action_type.into(),
+            created_at: 0,
+            participant_id: "p-agent".into(),
+            participant_label: "Gemma".into(),
+            reply_to: reply_to.map(str::to_string),
+            reply_to_current: reply_to.map(str::to_string),
+            produced_by: produced_by.map(str::to_string),
+            request_id: Some(format!("req-{id}")),
+            turn_root: None,
+            blocks,
+        }
+    }
+
+    /// A `decision` row as the decline checkpoint writes it: threaded to the
+    /// post it declines, naming the root of its own turn's chain.
+    fn decision_row(
+        id: &str,
+        post: &str,
+        turn_root: &str,
+        reason: Option<&str>,
+    ) -> db::TraceActionRow {
+        let mut row = trace_row(
+            id,
+            "decision",
+            Some(post),
+            None,
+            vec![db::RawBlockRow {
+                block_type: "text".into(),
+                text_content: reason.map(str::to_string),
+                tool_name: None,
+                tool_call_id: None,
+                data: None,
+            }],
+        );
+        row.turn_root = Some(turn_root.into());
+        row
+    }
+
+    fn use_block(name: &str, call: &str, args: &str) -> db::RawBlockRow {
+        db::RawBlockRow {
+            block_type: "tool_use".into(),
+            text_content: None,
+            tool_name: Some(name.into()),
+            tool_call_id: Some(call.into()),
+            data: Some(args.into()),
+        }
+    }
+
+    fn result_block(call: &str, text: &str) -> db::RawBlockRow {
+        db::RawBlockRow {
+            block_type: "tool_result".into(),
+            text_content: Some(text.into()),
+            tool_name: None,
+            tool_call_id: Some(call.into()),
+            data: None,
+        }
+    }
+
+    #[test]
+    fn a_turns_rounds_anchor_on_the_inference_that_produced_them() {
+        // Attribution is the context assembly: the rounds hang off the *post*
+        // the turn answered, but the answer is what the reader sees them under.
+        let traces = assemble_post_traces(vec![
+            trace_row(
+                "tc1",
+                "tool_call",
+                Some("post1"),
+                Some("inf1"),
+                vec![use_block("read_thread", "c1", "{\"handle\":\"h1\"}")],
+            ),
+            trace_row(
+                "tr1",
+                "tool_result",
+                Some("tc1"),
+                Some("inf1"),
+                vec![result_block("c1", "8 posts")],
+            ),
+        ]);
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].anchor_action_id, "inf1");
+        assert!(!traces[0].unanswered);
+        match &traces[0].entries[0] {
+            TraceEntry::Tool {
+                name,
+                arguments,
+                result,
+                request_id,
+                ..
+            } => {
+                assert_eq!(name, "read_thread");
+                assert_eq!(arguments, "{\"handle\":\"h1\"}");
+                assert_eq!(result.as_deref(), Some("8 posts"));
+                assert_eq!(request_id.as_deref(), Some("req-tc1"));
+            }
+            other => panic!("expected a tool round, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_replayed_round_stays_with_the_turn_that_ran_it() {
+        // A later turn of the same participant replays its own rounds and so
+        // records them in *its* assembly too (task 33). Earliest wins, so the
+        // round renders once, under the answer it produced.
+        let mut replayed = trace_row(
+            "tc1",
+            "tool_call",
+            Some("post1"),
+            Some("inf1"),
+            vec![use_block("echo", "c1", "{}")],
+        );
+        replayed.produced_by = Some("inf1".into()); // the producing turn
+        let traces = assemble_post_traces(vec![replayed]);
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].anchor_action_id, "inf1");
+    }
+
+    #[test]
+    fn a_turn_that_wrote_no_post_anchors_on_the_post_it_answered() {
+        // The gap. A decline hangs off the answered post directly; the rounds
+        // it ran chain behind the first one, and the walk finds the same post.
+        let traces = assemble_post_traces(vec![
+            trace_row(
+                "tc1",
+                "tool_call",
+                Some("post1"),
+                None,
+                vec![use_block("read_thread", "c1", "{}")],
+            ),
+            trace_row(
+                "tr1",
+                "tool_result",
+                Some("tc1"),
+                None,
+                vec![result_block("c1", "8 posts")],
+            ),
+            decision_row("d1", "post1", "tc1", Some("nothing to add")),
+        ]);
+        assert_eq!(traces.len(), 1, "one turn, one disclosure");
+        assert_eq!(traces[0].id, "tc1", "keyed on the turn's chain root");
+        assert_eq!(traces[0].anchor_action_id, "post1");
+        assert!(traces[0].unanswered);
+        assert_eq!(traces[0].entries.len(), 2);
+        // The chain walk is what puts the rounds in one group, which is also
+        // what lets the result pair with its call: a `tool_result` anchored on
+        // its `tool_call` instead of on the post would land in a group of its
+        // own and its text would be lost. The decision joins them because it
+        // names the chain root it belongs to.
+        assert!(matches!(
+            &traces[0].entries[0],
+            TraceEntry::Tool { result: Some(r), .. } if r == "8 posts"
+        ));
+        assert!(matches!(
+            &traces[0].entries[1],
+            TraceEntry::Declined { reason: Some(r), .. } if r == "nothing to add"
+        ));
+    }
+
+    #[test]
+    fn an_answered_posts_gap_anchor_follows_its_current_generation() {
+        // An edited post keeps its item, so a decline against the old
+        // generation still renders under the edit.
+        let mut row = trace_row("d1", "decision", Some("post1"), None, vec![]);
+        row.reply_to_current = Some("post1-v2".into());
+        row.blocks = vec![db::RawBlockRow {
+            block_type: "text".into(),
+            text_content: None,
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }];
+        let traces = assemble_post_traces(vec![row]);
+        assert_eq!(traces[0].anchor_action_id, "post1-v2");
+        assert!(matches!(
+            &traces[0].entries[0],
+            TraceEntry::Declined { reason: None, .. }
+        ));
+    }
+
+    #[test]
+    fn a_capped_round_keeps_its_call_with_no_result() {
+        // The round cap deliberately does not execute the round's tools, and
+        // the honest rendering of that is a call with nothing back.
+        let traces = assemble_post_traces(vec![trace_row(
+            "tc1",
+            "tool_call",
+            Some("post1"),
+            None,
+            vec![use_block("read_post", "c1", "{}")],
+        )]);
+        assert!(matches!(
+            &traces[0].entries[0],
+            TraceEntry::Tool { result: None, .. }
+        ));
+    }
+
+    #[test]
+    fn two_turns_answering_one_post_stay_separate_disclosures() {
+        let traces = assemble_post_traces(vec![
+            trace_row(
+                "tc1",
+                "tool_call",
+                Some("post1"),
+                Some("infA"),
+                vec![use_block("a", "c1", "{}")],
+            ),
+            trace_row(
+                "tc2",
+                "tool_call",
+                Some("post1"),
+                Some("infB"),
+                vec![use_block("b", "c2", "{}")],
+            ),
+        ]);
+        assert_eq!(traces.len(), 2);
+        assert_eq!(traces[0].anchor_action_id, "infA");
+        assert_eq!(traces[1].anchor_action_id, "infB");
+    }
+
+    #[test]
+    fn two_unanswered_turns_by_one_agent_on_one_post_stay_separate() {
+        // The reader asked again after a decline. Two turns ran against one
+        // post, by one participant, neither leaving a post — so neither the
+        // anchor nor the participant tells them apart. The chain root does,
+        // and the decision names the root it belongs to.
+        let traces = assemble_post_traces(vec![
+            trace_row(
+                "tc1",
+                "tool_call",
+                Some("post1"),
+                None,
+                vec![use_block("decline", "c1", "{}")],
+            ),
+            trace_row(
+                "tr1",
+                "tool_result",
+                Some("tc1"),
+                None,
+                vec![result_block("c1", "Declined.")],
+            ),
+            decision_row("d1", "post1", "tc1", Some("not my area")),
+            trace_row(
+                "tc2",
+                "tool_call",
+                Some("post1"),
+                None,
+                vec![use_block("decline", "c2", "{}")],
+            ),
+            trace_row(
+                "tr2",
+                "tool_result",
+                Some("tc2"),
+                None,
+                vec![result_block("c2", "Declined.")],
+            ),
+            decision_row("d2", "post1", "tc2", Some("still nothing")),
+        ]);
+        assert_eq!(traces.len(), 2, "two asks, two disclosures: {traces:?}");
+        assert_eq!(traces[0].id, "tc1");
+        assert_eq!(traces[1].id, "tc2");
+        for t in &traces {
+            assert_eq!(t.anchor_action_id, "post1");
+            assert!(t.unanswered);
+            assert_eq!(t.entries.len(), 2, "one round and one decision each");
+        }
+        assert!(matches!(
+            &traces[0].entries[1],
+            TraceEntry::Declined { reason: Some(r), .. } if r == "not my area"
+        ));
+        assert!(matches!(
+            &traces[1].entries[1],
+            TraceEntry::Declined { reason: Some(r), .. } if r == "still nothing"
+        ));
+    }
+
+    #[test]
+    fn a_decline_and_a_later_capped_chain_are_two_disclosures() {
+        // Same participant, same post, but only the first turn declined: the
+        // capped chain that follows has no decision at all, and merging them
+        // would report one turn that both declined and ran out of rounds.
+        let traces = assemble_post_traces(vec![
+            trace_row(
+                "tc1",
+                "tool_call",
+                Some("post1"),
+                None,
+                vec![use_block("decline", "c1", "{}")],
+            ),
+            decision_row("d1", "post1", "tc1", Some("not my area")),
+            trace_row(
+                "tc2",
+                "tool_call",
+                Some("post1"),
+                None,
+                vec![use_block("read_thread", "c2", "{}")],
+            ),
+            trace_row(
+                "tr2",
+                "tool_result",
+                Some("tc2"),
+                None,
+                vec![result_block("c2", "8 posts")],
+            ),
+            trace_row(
+                "tc3",
+                "tool_call",
+                Some("tr2"),
+                None,
+                vec![use_block("read_post", "c3", "{}")],
+            ),
+        ]);
+        assert_eq!(traces.len(), 2, "{traces:?}");
+        assert_eq!(traces[0].id, "tc1");
+        assert!(matches!(&traces[0].entries[1], TraceEntry::Declined { .. }));
+        assert_eq!(traces[1].id, "tc2", "the whole capped chain is one turn");
+        assert_eq!(traces[1].entries.len(), 2);
+        assert!(
+            !traces[1]
+                .entries
+                .iter()
+                .any(|e| matches!(e, TraceEntry::Declined { .. })),
+            "and it carries no decision of its own"
+        );
+    }
+
+    #[test]
+    fn an_answer_and_a_decline_of_it_are_two_disclosures_at_one_anchor() {
+        // One agent answers; another declines to follow up on that answer. Both
+        // hang under the same post — the inference — but they are two turns by
+        // two participants, and the reader must see both bylines.
+        let mut answered = trace_row(
+            "tc1",
+            "tool_call",
+            Some("post1"),
+            Some("inf1"),
+            vec![use_block("read_thread", "c1", "{}")],
+        );
+        answered.participant_label = "Gemma".into();
+        let mut round = trace_row(
+            "tc2",
+            "tool_call",
+            Some("inf1"),
+            None,
+            vec![use_block("decline", "c2", "{}")],
+        );
+        round.participant_id = "p-mara".into();
+        round.participant_label = "Mara".into();
+        let mut decision = decision_row("d1", "inf1", "tc2", Some("nothing to add"));
+        decision.participant_id = "p-mara".into();
+        decision.participant_label = "Mara".into();
+
+        let traces = assemble_post_traces(vec![answered, round, decision]);
+        assert_eq!(traces.len(), 2, "{traces:?}");
+        assert_eq!(traces[0].anchor_action_id, "inf1");
+        assert_eq!(traces[1].anchor_action_id, "inf1");
+        assert_eq!(traces[0].participant_label, "Gemma");
+        assert_eq!(traces[1].participant_label, "Mara");
+        assert!(!traces[0].unanswered);
+        assert!(traces[1].unanswered);
+    }
+
+    #[test]
+    fn a_rootless_chain_is_dropped_rather_than_anchored_by_guess() {
+        // Nothing to hang it under; it still lives in the Record.
+        let traces = assemble_post_traces(vec![trace_row(
+            "tc1",
+            "tool_call",
+            None,
+            None,
+            vec![use_block("a", "c1", "{}")],
+        )]);
+        assert!(traces.is_empty());
     }
 
     #[test]
