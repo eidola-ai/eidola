@@ -646,6 +646,7 @@ impl SpaceView {
                 format!("space/post/{i}/footnote/{}", row.index),
                 row,
                 marked,
+                !editing,
                 cx,
             );
             if editing {
@@ -750,6 +751,10 @@ impl SpaceView {
                 format!("space-draft-fn-{}-{}", draft.id, ordinal),
                 format!("space/draft/footnote/{}", row.index),
                 &row,
+                false,
+                // A draft's rail rows never navigate — the quoted post is not
+                // yet reachable from an unposted draft — so they are rows, not
+                // links; the re-embed and remove chips are the affordances.
                 false,
                 cx,
             );
@@ -857,12 +862,22 @@ impl SpaceView {
     /// One footnote row: the index, the attribution, and the passage — all in
     /// the quiet register. A reference whose stored range no longer maps says
     /// so plainly rather than guessing at a remap.
+    ///
+    /// `navigable` decides the **role**, which is what decides whether the row
+    /// is a tab stop — a rail row is a `Link` only where the caller actually
+    /// attaches the navigate handler (a post's rail at rest, never a draft's
+    /// and never one mid-edit-session, where the row carries only its removal
+    /// chip). `space_view::traces` already switches role the same way. Without
+    /// it those rows were focusable, activatable-looking `Link`s with no click
+    /// listener at all — the dead-tab-stop shape `crate::focus` exists to
+    /// prevent.
     fn footnote_row(
         &self,
         element_id: String,
         probe: String,
         row: &FootnoteRow,
         marked: bool,
+        navigable: bool,
         cx: &Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = cx.theme();
@@ -884,13 +899,21 @@ impl SpaceView {
         let aria = format!("Reference {}: {} — {}", row.index, row.byline, text);
         h_flex()
             .id(SharedString::from(element_id))
-            .probe(probe, gpui::Role::Link, aria)
+            .probe(
+                probe,
+                if navigable {
+                    gpui::Role::Link
+                } else {
+                    gpui::Role::ListItem
+                },
+                aria,
+            )
             .w_full()
             .items_baseline()
             .gap_1p5()
             .text_xs()
             .when(marked, |d| d.opacity(0.45))
-            .cursor_pointer()
+            .when(navigable, |d| d.cursor_pointer())
             .child(
                 div()
                     .flex_none()
