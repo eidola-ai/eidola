@@ -743,6 +743,7 @@ mod driver {
                     system_prompt: None,
                     notify_policy: "human".into(),
                 }],
+                referenced: Vec::new(),
             },
             SpaceTemplateInfo {
                 id: "tmpl-research".into(),
@@ -765,6 +766,15 @@ mod driver {
                         notify_policy: "human".into(),
                     },
                 ],
+                // Saved from a space, so it carries the shared "You" by
+                // reference — listed read-only in the editor.
+                referenced: vec![eidola_app_core::TemplateReferencedParticipant {
+                    id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+                    kind: "human".into(),
+                    label: "You".into(),
+                    model_ref: None,
+                    notify_policy: "explicit".into(),
+                }],
             },
         ]
     }

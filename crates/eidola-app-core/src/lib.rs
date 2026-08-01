@@ -267,6 +267,25 @@ pub struct SpaceTemplateInfo {
     /// `create_template` / `update_template`, whose signatures stay unchanged.
     pub router_model: Option<String>,
     pub participants: Vec<TemplateParticipantInfo>,
+    /// Global participants this template **references**
+    /// (`space_template_participant` rows), with their effective config
+    /// (`COALESCE(override, base)`). Additive beside `participants`, which stays
+    /// exactly the owned set every write path replaces: a reference is another
+    /// surface's row (the agent library / the shared "You"), so a template
+    /// editor may show it but never rewrites it here.
+    pub referenced: Vec<TemplateReferencedParticipant>,
+}
+
+/// One **global** participant a template references, with its effective config.
+/// Read-only from the template's side — `update_template` replaces owned rows
+/// only, and the shared config lives on the global itself.
+#[derive(Clone, Debug)]
+pub struct TemplateReferencedParticipant {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub model_ref: Option<String>,
+    pub notify_policy: String,
 }
 
 /// One agent participant a template OWNS (`scope='template'`).
@@ -3117,12 +3136,28 @@ impl Inner {
             .filter(|p| p.kind == "agent")
             .map(TemplateParticipantInfo::from_owned)
             .collect();
+        // Referenced globals (the shared "You" a space→template projection
+        // carries, and any shared agent) — invisible in `participants`, which is
+        // the owned set by construction.
+        let referenced = db::template_participants(conn, id)
+            .await?
+            .into_iter()
+            .filter(|p| p.source == "referenced")
+            .map(|p| TemplateReferencedParticipant {
+                id: p.participant_id,
+                kind: p.kind,
+                label: p.label,
+                model_ref: p.model_ref,
+                notify_policy: p.notify_policy,
+            })
+            .collect();
         Ok(SpaceTemplateInfo {
             id: t.id,
             title: t.title,
             cascade_limit: t.cascade_limit,
             router_model: t.router_model,
             participants,
+            referenced,
         })
     }
 

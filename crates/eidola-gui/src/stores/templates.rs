@@ -146,41 +146,68 @@ impl TemplatesStore {
         cx.notify();
     }
 
+    /// Create a template. `router_model` is the may-decline router reference
+    /// (`None` = off, the default); it rides through the dedicated
+    /// [`AppCore::set_template_router_model`] setter after the create, since
+    /// `create_template`'s signature deliberately doesn't carry it.
     pub fn create(
         &mut self,
         title: String,
         cascade_limit: i64,
         participants: Vec<NewTemplateParticipant>,
+        router_model: Option<String>,
         cx: &mut Context<Self>,
     ) {
         self.write_then_relist(cx, move |core| {
             Box::pin(async move {
-                bridge(core, move |c| async move {
+                let created = bridge(core.clone(), move |c| async move {
                     c.create_template(title, cascade_limit, participants).await
                 })
                 .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+                // Off is the default, so an unset router needs no second write.
+                if router_model.is_some() {
+                    let id = created.id.clone();
+                    bridge(core, move |c| async move {
+                        c.set_template_router_model(id, router_model).await
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+                Ok(())
             })
         });
     }
 
+    /// Update a template. `router_model` follows the "untouched field" idiom of
+    /// the other arguments: the outer `None` leaves the setting alone, `Some(r)`
+    /// writes it (`Some(None)` = off).
     pub fn update(
         &mut self,
         id: String,
         title: Option<String>,
         cascade_limit: Option<i64>,
         participants: Option<Vec<NewTemplateParticipant>>,
+        router_model: Option<Option<String>>,
         cx: &mut Context<Self>,
     ) {
         self.write_then_relist(cx, move |core| {
             Box::pin(async move {
-                bridge(core, move |c| async move {
-                    c.update_template(id, title, cascade_limit, participants)
+                let update_id = id.clone();
+                bridge(core.clone(), move |c| async move {
+                    c.update_template(update_id, title, cascade_limit, participants)
                         .await
                 })
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+                if let Some(router_model) = router_model {
+                    bridge(core, move |c| async move {
+                        c.set_template_router_model(id, router_model).await
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+                Ok(())
             })
         });
     }

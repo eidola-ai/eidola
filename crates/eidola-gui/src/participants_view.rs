@@ -46,6 +46,13 @@ pub(crate) const NOTIFY_POLICIES: [(&str, &str); 3] = [
     ("all", "to everything"),
 ];
 
+/// The system prompt a newly created agent participant starts from — a short,
+/// general-purpose charter rather than a persona, so the field arrives filled
+/// with something honest that a person can edit down or replace. Shared so
+/// every participant-creating surface offers the same starting point.
+pub const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are a participant in a shared conversation. Answer plainly, say when \
+     you are unsure, and keep replies as short as the question allows.";
+
 pub(crate) fn notify_label(policy: &str) -> &'static str {
     NOTIFY_POLICIES
         .iter()

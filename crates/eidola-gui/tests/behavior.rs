@@ -6287,6 +6287,195 @@ fn templates_pane_crud_and_set_default(cx: &mut TestAppContext) {
     drain_runtime(&core);
 }
 
+/// The router picker writes through `set_template_router_model`, and **Off**
+/// round-trips back to NULL — the default is a real choice, not a one-way door.
+#[gpui::test]
+fn templates_pane_router_model_writes_through_and_off_round_trips(cx: &mut TestAppContext) {
+    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    wait_until(cx, "templates load", |cx| {
+        stores.templates.read_with(cx, |s, _| !s.list().is_empty())
+    });
+    let default_id = eidola_app_core::DEFAULT_TEMPLATE_ID;
+
+    // The seeded template's router is unset — the draft reads Off.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit(default_id, window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.draft_router_model()),
+        Some(None),
+        "an unset router opens as Off"
+    );
+
+    // Pick a model and save: the setting lands on the template.
+    view.update(cx, |v, cx| v.set_router_model(Some("gemma4-31b"), cx));
+    view.update(cx, |v, cx| v.save(cx));
+    wait_until(cx, "router model persisted", |cx| {
+        stores.templates.read_with(cx, |s, _| {
+            s.list()
+                .iter()
+                .find(|t| t.id == default_id)
+                .and_then(|t| t.router_model.clone())
+                .is_some()
+        })
+    });
+    let stored = stores.templates.read_with(cx, |s, _| {
+        s.list()
+            .iter()
+            .find(|t| t.id == default_id)
+            .and_then(|t| t.router_model.clone())
+    });
+    assert_eq!(
+        stored.as_deref(),
+        Some("gemma4-31b"),
+        "the picked reference is what was written"
+    );
+
+    // Re-open: the draft is seeded from the stored value, and Off clears it.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit(default_id, window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.draft_router_model()),
+        Some(Some("gemma4-31b".to_string())),
+        "the editor reads back what it wrote"
+    );
+    view.update(cx, |v, cx| v.set_router_model(None, cx));
+    view.update(cx, |v, cx| v.save(cx));
+    wait_until(cx, "router model cleared", |cx| {
+        stores.templates.read_with(cx, |s, _| {
+            s.list()
+                .iter()
+                .find(|t| t.id == default_id)
+                .map(|t| t.router_model.is_none())
+                .unwrap_or(false)
+        })
+    });
+
+    drain_runtime(&core);
+}
+
+/// A new agent participant arrives with the shared default system prompt, and
+/// that prompt survives the save.
+#[gpui::test]
+fn templates_pane_new_agent_carries_the_default_system_prompt(cx: &mut TestAppContext) {
+    use eidola_gui::participants_view::DEFAULT_AGENT_SYSTEM_PROMPT;
+
+    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    wait_until(cx, "templates load", |cx| {
+        stores.templates.read_with(cx, |s, _| !s.list().is_empty())
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_create(window, cx));
+        // A second agent takes the same starting point.
+        view.update(cx, |v, cx| v.add_participant(window, cx));
+    })
+    .unwrap();
+    for idx in [0, 1] {
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.draft_participant_prompt(idx, cx))
+                .as_deref(),
+            Some(DEFAULT_AGENT_SYSTEM_PROMPT),
+            "new agent {idx} is prefilled with the default system prompt"
+        );
+    }
+
+    let title = view.read_with(cx, |v, _| v.draft_title_state()).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        title.update(cx, |s, cx| s.set_value("Prompted", window, cx));
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.save(cx));
+    wait_until(cx, "template created", |cx| {
+        stores
+            .templates
+            .read_with(cx, |s, _| s.list().iter().any(|t| t.title == "Prompted"))
+    });
+    let prompts = stores.templates.read_with(cx, |s, _| {
+        s.list()
+            .iter()
+            .find(|t| t.title == "Prompted")
+            .map(|t| {
+                t.participants
+                    .iter()
+                    .map(|p| p.system_prompt.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    assert_eq!(
+        prompts,
+        vec![
+            Some(DEFAULT_AGENT_SYSTEM_PROMPT.to_string()),
+            Some(DEFAULT_AGENT_SYSTEM_PROMPT.to_string())
+        ],
+        "the default prompt round-trips through the template update path"
+    );
+
+    drain_runtime(&core);
+}
+
+/// An edited system prompt round-trips through the template update path.
+#[gpui::test]
+fn templates_pane_system_prompt_round_trips(cx: &mut TestAppContext) {
+    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    wait_until(cx, "templates load", |cx| {
+        stores.templates.read_with(cx, |s, _| !s.list().is_empty())
+    });
+    let default_id = eidola_app_core::DEFAULT_TEMPLATE_ID;
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit(default_id, window, cx));
+    })
+    .unwrap();
+    let prompt = view
+        .read_with(cx, |v, _| v.draft_participant_prompt_state(0))
+        .expect("the seeded template owns one agent");
+    cx.update_window(window, |_, window, cx| {
+        prompt.update(cx, |s, cx| {
+            s.set_value("Answer only in questions.", window, cx)
+        });
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.save(cx));
+    wait_until(cx, "system prompt persisted", |cx| {
+        stores.templates.read_with(cx, |s, _| {
+            s.list()
+                .iter()
+                .find(|t| t.id == default_id)
+                .and_then(|t| t.participants.first())
+                .and_then(|p| p.system_prompt.clone())
+                .as_deref()
+                == Some("Answer only in questions.")
+        })
+    });
+
+    // Re-opening the editor seeds the field from what was stored.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit(default_id, window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.draft_participant_prompt(0, cx))
+            .as_deref(),
+        Some("Answer only in questions.")
+    );
+
+    drain_runtime(&core);
+}
+
 /// A failed initial participant load must render Retry (not a phantom-empty
 /// roster), and Retry must actually re-fetch. `ensure` declines once a `Failed`
 /// cell exists, so `retry_load` is the only path back.
