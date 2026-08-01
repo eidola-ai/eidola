@@ -299,6 +299,13 @@ async fn initialize(conn: &Connection) -> Result<(), AppError> {
 ///
 /// (Nothing here ever needs to backfill an existing database: schema changes
 /// bump [`LATEST_VERSION`] and old databases are refused, not migrated.)
+///
+/// **Partial-seed safety.** `conn.execute` autocommits, so a process exit
+/// between two seed writes leaves the earlier one committed. Every seed here is
+/// independently keyed on its own well-known id and therefore self-heals on the
+/// next open — *except* the template + agent pair, whose second row is keyed on
+/// the first's creation. That group, and only that group, is written in one
+/// transaction ([`ensure_default_template_tx`]).
 async fn ensure_default_participants(conn: &Connection) -> Result<(), AppError> {
     let now = crate::now_ms();
 
@@ -330,10 +337,45 @@ async fn ensure_default_participants(conn: &Connection) -> Result<(), AppError> 
     .await
     .map_err(AppError::db)?;
 
-    // The seeded "Default" space template (must exist before its owned agent's
-    // owner FK resolves). The rows-changed count is the creation signal: 0 means
-    // the template was already here, and everything about it from that moment
-    // on is the user's.
+    // The "Default" template and its agent — created together or not at all.
+    ensure_default_template_tx(conn, now).await
+}
+
+/// Create the "Default" template **and** its owned agent, atomically.
+///
+/// The two rows are one unit because the second is keyed on the first's
+/// *creation*, and `conn.execute` autocommits: without a transaction, a process
+/// exit (or a failing second write) between them would commit the template row
+/// alone and consume the creation signal — every later open would then see zero
+/// changes and skip the agent seed **permanently**, leaving new spaces with no
+/// assistant.
+///
+/// It is a transaction rather than a repair heuristic on purpose. The
+/// post-crash state ("template row, no owned agents, no user edits") is
+/// **indistinguishable** from a user who deliberately emptied the template, so
+/// any code that repaired it would resurrect exactly what
+/// [`ensure_default_participants`] exists to stop. Rolling back makes the state
+/// unrepresentable instead: there is nothing to detect, so nothing to
+/// misinterpret, and the seed simply stays retryable on the next open.
+async fn ensure_default_template_tx(conn: &Connection, now: i64) -> Result<(), AppError> {
+    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    match ensure_default_template_tx_body(conn, now).await {
+        Ok(()) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn ensure_default_template_tx_body(conn: &Connection, now: i64) -> Result<(), AppError> {
+    // The template row (must exist before its owned agent's owner FK resolves).
+    // The rows-changed count is the creation signal: 0 means the template was
+    // already here, and everything about it from that moment on is the user's.
     let template_created = conn
         .execute(
             "INSERT OR IGNORE INTO space_template \
@@ -347,29 +389,30 @@ async fn ensure_default_participants(conn: &Connection) -> Result<(), AppError> 
         .await
         .map_err(AppError::db)?
         > 0;
+    if !template_created {
+        return Ok(());
+    }
 
     // …owning a single template-scoped agent participant (label from the
     // model's friendly name, model = the compiled DEFAULT_MODEL, a generic
     // prompt, notify 'human') — written once, with the template, and never
-    // again. See this function's docs.
-    if template_created {
-        conn.execute(
-            "INSERT INTO participant \
-             (id, scope, owner_template_id, kind, label, model_ref, system_prompt, \
-              notify_policy, role, created_at) \
-             VALUES (?1, 'template', ?2, 'agent', ?3, ?4, ?5, 'human', 'member', ?6)",
-            (
-                Value::Text(DEFAULT_TEMPLATE_AGENT_ID.to_string()),
-                Value::Text(crate::config::DEFAULT_TEMPLATE_ID.to_string()),
-                Value::Text(default_agent_label(crate::config::DEFAULT_MODEL)),
-                Value::Text(crate::config::DEFAULT_MODEL.to_string()),
-                Value::Text(DEFAULT_AGENT_SYSTEM_PROMPT.to_string()),
-                Value::Integer(now),
-            ),
-        )
-        .await
-        .map_err(AppError::db)?;
-    }
+    // again. See `ensure_default_participants`.
+    conn.execute(
+        "INSERT INTO participant \
+         (id, scope, owner_template_id, kind, label, model_ref, system_prompt, \
+          notify_policy, role, created_at) \
+         VALUES (?1, 'template', ?2, 'agent', ?3, ?4, ?5, 'human', 'member', ?6)",
+        (
+            Value::Text(DEFAULT_TEMPLATE_AGENT_ID.to_string()),
+            Value::Text(crate::config::DEFAULT_TEMPLATE_ID.to_string()),
+            Value::Text(default_agent_label(crate::config::DEFAULT_MODEL)),
+            Value::Text(crate::config::DEFAULT_MODEL.to_string()),
+            Value::Text(DEFAULT_AGENT_SYSTEM_PROMPT.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
 
     Ok(())
 }
@@ -6168,6 +6211,73 @@ mod tests {
             vec!["Mine"],
             "the seed must not re-inject the default agent over the user's edit"
         );
+    }
+
+    /// Creating the Default template and its agent is **atomic**. Without
+    /// that, a failure between the two writes would commit the template row
+    /// alone and *consume the creation signal* — every later open would report
+    /// zero changes and skip the agent seed permanently, leaving new spaces
+    /// with no assistant and no way back (the state is indistinguishable from a
+    /// user who emptied the template on purpose, which
+    /// `a_reseed_does_not_refill_an_emptied_default_template` requires us to
+    /// respect). The failure is forced deterministically by squatting on the
+    /// seeded agent's id, so the plain `INSERT` hits a PK conflict.
+    #[tokio::test]
+    async fn a_failed_first_seed_leaves_no_half_created_template() {
+        // Schema only — `open_memory_migrated` does not seed.
+        let db = open_memory_migrated().await;
+        let conn = fk_conn(&db).await;
+
+        insert_participant(
+            &conn,
+            DEFAULT_TEMPLATE_AGENT_ID,
+            "global",
+            None,
+            None,
+            "agent",
+            "Squatter",
+            None,
+            None,
+            "explicit",
+            "member",
+            None,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        ensure_default_participants(&conn)
+            .await
+            .expect_err("the agent insert must fail on the id conflict");
+
+        assert!(
+            get_space_template(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+                .await
+                .unwrap()
+                .is_none(),
+            "a half-created template must roll back, not persist without its agent"
+        );
+
+        // …and the seed stays retryable: with the conflict gone, the next open
+        // creates both rows.
+        conn.execute(
+            "DELETE FROM participant WHERE id = ?1",
+            (Value::Text(DEFAULT_TEMPLATE_AGENT_ID.to_string()),),
+        )
+        .await
+        .unwrap();
+        ensure_default_participants(&conn).await.unwrap();
+
+        assert!(
+            get_space_template(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let owned = list_template_owned_participants(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+            .await
+            .unwrap();
+        assert_eq!(owned.len(), 1, "the retry seeds the agent too");
     }
 
     /// …and the same for an outright emptied template: absence is a choice.
