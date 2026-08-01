@@ -9691,3 +9691,18 @@ fn shift_click_and_drag_keeps_the_original_anchor(cx: &mut TestAppContext) {
         assert_eq!(e.selection(), Selection::range(4, 25));
     });
 }
+
+#[gpui::test]
+fn append_at_end_lands_after_the_text_with_the_caret_behind_it(cx: &mut TestAppContext) {
+    // The host seam for "the user started typing at something that isn't this
+    // editor" (the space view's type-to-compose jump, task 38). It appends at
+    // the document end and leaves the caret there — and, because the intent is
+    // *append*, it collapses an existing selection rather than replacing it.
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown("already here"));
+    dispatch(cx, handle, &editor, SelectAll);
+    editor.update(cx, |e, cx| e.append_at_end("x", cx));
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "already herex");
+        assert_eq!(e.cursor_offset(), "already herex".len());
+    });
+}
