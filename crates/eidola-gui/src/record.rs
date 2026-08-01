@@ -524,6 +524,15 @@ impl RecordView {
         ));
     }
 
+    /// Open a request's detail from *outside* the window — the deep link a
+    /// space's trace row follows into the raw exchange behind one tool round
+    /// (task 34). Selects the Requests section first, so backing out of the
+    /// detail lands on the listing the request belongs to.
+    pub fn show_request(&mut self, id: String, cx: &mut Context<Self>) {
+        self.select_section(RecordSection::Requests, cx);
+        self.open_request(id, cx);
+    }
+
     /// Back from a detail to the section listing. Dropping the detail task
     /// cancels an in-flight fetch, so a slow detail can't reopen after the
     /// user backed out.

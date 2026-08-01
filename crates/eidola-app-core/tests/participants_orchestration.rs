@@ -1443,3 +1443,108 @@ fn the_decline_name_alone_is_not_a_decline_without_the_tool_registered() {
         }
     });
 }
+
+#[test]
+fn space_traces_put_a_decline_in_the_gap_under_the_post_it_answered() {
+    run(|| {
+        // Task 34's read over task 22's decision: the turn wrote no post, so
+        // its disclosure hangs under the post it declined — the non-event is
+        // visible where the answer would have been, named for the agent that
+        // made it.
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::DeclineStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.register_tool(eidola_app_core::decline::decline_tool())
+            .expect("decline is not a reserved name");
+
+        let (space, post) = space_with_two_candidates(&core);
+        let agent = agent_id(&core, &space, "All-Agent");
+        let result = drive_as(&core, &space, &agent, &post).expect("declined turn still succeeds");
+        let declined = result.declined.clone().expect("the turn declined");
+
+        let traces = core
+            .runtime()
+            .block_on(core.space_traces(space.clone()))
+            .expect("trace read");
+        assert_eq!(traces.len(), 1, "one turn, one disclosure: {traces:?}");
+        let trace = &traces[0];
+        assert_eq!(
+            trace.anchor_action_id, post,
+            "the decline hangs under the post it answered"
+        );
+        assert!(trace.unanswered);
+        assert_eq!(
+            trace.participant_label, "All-Agent",
+            "and names whose non-event it was"
+        );
+        // The rounds it ran stay with it, and the decision is the last word.
+        assert!(matches!(
+            trace.entries.first(),
+            Some(eidola_app_core::TraceEntry::Tool { .. })
+        ));
+        match trace.entries.last() {
+            Some(eidola_app_core::TraceEntry::Declined { action_id, reason }) => {
+                assert_eq!(*action_id, declined.action_id);
+                assert_eq!(reason.as_deref(), Some(chat_harness::DECLINE_REASON));
+            }
+            other => panic!("expected the decision last, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn two_declines_by_one_agent_on_one_post_stay_separate_disclosures() {
+    run(|| {
+        // A reader asks the same agent again after it bowed out. Two turns
+        // ran, and each one's rounds and decision belong to *it* — merging
+        // them would hide how many times the agent was asked and answered
+        // with silence, which is exactly what the disclosure exists to show.
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::DeclineStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.register_tool(eidola_app_core::decline::decline_tool())
+            .expect("decline is not a reserved name");
+
+        let (space, post) = space_with_two_candidates(&core);
+        let agent = agent_id(&core, &space, "All-Agent");
+        let first = drive_as(&core, &space, &agent, &post).expect("first turn declines");
+        let second = drive_as(&core, &space, &agent, &post).expect("second turn declines");
+        let d1 = first.declined.expect("declined").action_id;
+        let d2 = second.declined.expect("declined").action_id;
+        assert_ne!(d1, d2, "two turns, two decisions");
+
+        let traces = core
+            .runtime()
+            .block_on(core.space_traces(space.clone()))
+            .expect("trace read");
+        assert_eq!(traces.len(), 2, "two turns, two disclosures: {traces:?}");
+        for trace in &traces {
+            assert_eq!(trace.anchor_action_id, post);
+            assert!(trace.unanswered);
+            assert_eq!(trace.participant_label, "All-Agent");
+            assert_eq!(
+                trace
+                    .entries
+                    .iter()
+                    .filter(|e| matches!(e, eidola_app_core::TraceEntry::Declined { .. }))
+                    .count(),
+                1,
+                "each disclosure carries exactly its own turn's decision"
+            );
+        }
+        let decisions: Vec<&str> = traces
+            .iter()
+            .flat_map(|t| t.entries.iter())
+            .filter_map(|e| match e {
+                eidola_app_core::TraceEntry::Declined { action_id, .. } => Some(action_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decisions, vec![d1.as_str(), d2.as_str()]);
+        assert_ne!(traces[0].id, traces[1].id, "and each turn has its own id");
+    });
+}

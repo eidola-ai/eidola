@@ -454,3 +454,185 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
 
     (vec![source_post, reply, branch], incoming)
 }
+
+/// The **trace-visibility** scene (task 34): a conversation whose activity is
+/// worth auditing.
+///
+/// Returns `(posts, traces)` — the rendered tree plus the parallel trace index
+/// `AppCore::space_traces` returns. It carries both anchors the disclosure has
+/// to handle: an answered turn's rounds hanging under its own reply (including
+/// a navigation-tool descent), and **declines** hanging under the post they
+/// answered — the gap, where no post was written at all.
+///
+/// The last post carries three of them — two agents bowing out, one of them
+/// twice — which is the case a single aggregated line could not render
+/// honestly: it would have to pick one byline for all three.
+pub fn trace_posts() -> (Vec<PostNode>, Vec<eidola_app_core::PostTrace>) {
+    use eidola_app_core::{PostTrace, TraceEntry};
+
+    let mut ask = fixture_post(
+        "t1",
+        "human",
+        "user",
+        "user_input",
+        "Which branch actually settled the sampling question? I've lost the thread.",
+        0,
+        false,
+        1,
+    );
+    ask.created_at = 1;
+
+    let mut answer = fixture_post(
+        "t2",
+        "agent",
+        "Gemma",
+        "inference",
+        "The one you opened off my second reply — **#h3f2a9c**, \"temperature vs. \
+         top-p\". It runs eight posts and ends with you agreeing to pin top-p at \
+         0.9 and leave temperature alone.\n\nThe other branch never came back to \
+         it; it drifted into evaluation harnesses.",
+        0,
+        false,
+        1,
+    );
+    answer.parent_action_id = Some("t1".into());
+    answer.relation = Some("reply".into());
+    answer.created_at = 2;
+
+    let mut follow_up = fixture_post(
+        "t3",
+        "human",
+        "user",
+        "user_input",
+        "Mara — you were in that branch. Does that match how you remember it?",
+        0,
+        false,
+        1,
+    );
+    follow_up.parent_action_id = Some("t2".into());
+    follow_up.relation = Some("reply".into());
+    follow_up.created_at = 3;
+
+    let answered = PostTrace {
+        id: "turn-gemma".into(),
+        anchor_action_id: "t2".into(),
+        participant_label: "Gemma".into(),
+        unanswered: false,
+        entries: vec![
+            TraceEntry::Tool {
+                action_id: "tc1".into(),
+                request_id: Some("req-1".into()),
+                call_id: "call_1".into(),
+                name: "list_branches".into(),
+                arguments: "{}".into(),
+                result: Some(
+                    "2 branches at #h91b02e — #h3f2a9c (8 posts, 2 days ago), \
+                     #h7c4411 (3 posts, 5 days ago)"
+                        .into(),
+                ),
+            },
+            TraceEntry::Tool {
+                action_id: "tc2".into(),
+                request_id: Some("req-2".into()),
+                call_id: "call_2".into(),
+                name: "read_thread".into(),
+                arguments: "{\"handle\":\"h3f2a9c\",\"limit\":20}".into(),
+                result: Some("posts 1–8 of 8 in #h3f2a9c".into()),
+            },
+            TraceEntry::Tool {
+                action_id: "tc3".into(),
+                request_id: Some("req-3".into()),
+                call_id: "call_3".into(),
+                name: "read_post".into(),
+                arguments: "{\"handle\":\"h7c4411\"}".into(),
+                result: Some(
+                    "#h7c4411 · Mara — \"Let's park sampling and talk about the \
+                     harness instead.\""
+                        .into(),
+                ),
+            },
+        ],
+    };
+
+    // The gap: a turn that ran, looked, and wrote nothing.
+    let declined = PostTrace {
+        id: "turn-mara".into(),
+        anchor_action_id: "t3".into(),
+        participant_label: "Mara".into(),
+        unanswered: true,
+        entries: vec![
+            TraceEntry::Tool {
+                action_id: "tc4".into(),
+                request_id: Some("req-4".into()),
+                call_id: "call_4".into(),
+                name: "read_thread".into(),
+                arguments: "{\"handle\":\"h3f2a9c\"}".into(),
+                result: Some("posts 1–8 of 8 in #h3f2a9c".into()),
+            },
+            TraceEntry::Declined {
+                action_id: "d1".into(),
+                reason: Some("Gemma's summary matches the branch; nothing to add.".into()),
+            },
+        ],
+    };
+
+    // A second participant bows out of the same post — the fan-out case. Each
+    // turn is its own line, so neither agent's activity is credited to the
+    // other.
+    let also_declined = PostTrace {
+        id: "turn-ferris".into(),
+        anchor_action_id: "t3".into(),
+        participant_label: "Ferris".into(),
+        unanswered: true,
+        entries: vec![
+            TraceEntry::Tool {
+                action_id: "tc5".into(),
+                request_id: Some("req-5".into()),
+                call_id: "call_5".into(),
+                name: "list_branches".into(),
+                arguments: "{}".into(),
+                result: Some("2 branches at #h91b02e".into()),
+            },
+            TraceEntry::Declined {
+                action_id: "d2".into(),
+                reason: Some("Mara was in that branch, not me.".into()),
+            },
+        ],
+    };
+
+    // ...and Mara, asked again, bows out again. Two turns by one agent under
+    // one post: nothing but the turn's own identity tells them apart.
+    let declined_again = PostTrace {
+        id: "turn-mara-2".into(),
+        anchor_action_id: "t3".into(),
+        participant_label: "Mara".into(),
+        unanswered: true,
+        entries: vec![
+            TraceEntry::Tool {
+                action_id: "tc6".into(),
+                request_id: Some("req-6".into()),
+                call_id: "call_6".into(),
+                name: "read_post".into(),
+                arguments: "{\"handle\":\"h3f2a9c\"}".into(),
+                result: Some("#h3f2a9c · you — \"pin top-p at 0.9\"".into()),
+            },
+            TraceEntry::Tool {
+                action_id: "tc7".into(),
+                request_id: Some("req-7".into()),
+                call_id: "call_7".into(),
+                name: "decline".into(),
+                arguments: "{\"reason\":\"Still nothing to add.\"}".into(),
+                result: Some("Declined. This turn ends without a reply.".into()),
+            },
+            TraceEntry::Declined {
+                action_id: "d3".into(),
+                reason: Some("Still nothing to add.".into()),
+            },
+        ],
+    };
+
+    (
+        vec![ask, answer, follow_up],
+        vec![answered, declined, also_declined, declined_again],
+    )
+}

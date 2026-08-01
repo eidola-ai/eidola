@@ -22,8 +22,12 @@
 //!   any other round (the trace stays honest — the model's reasoning, its call,
 //!   and the acknowledgement are all in the Record);
 //! * a **`decision` action** is written with the post the turn answers as its
-//!   antecedent, carrying the stated reason as its text — auditable, and
-//!   labeled training data for a future fine-tune;
+//!   `reply` antecedent, carrying the stated reason as its text — auditable,
+//!   and labeled training data for a future fine-tune. It also carries a
+//!   `reference` edge to the root of its own turn's trace chain
+//!   (`db::DECLINE_TRACE_ORDINAL`), which is the only durable thing tying the
+//!   decision to the rounds that led to it — the reply edge points at the post,
+//!   and one agent may decline the same post more than once;
 //! * the would-be post is **suppressed**: no `inference` action is written, and
 //!   [`crate::ChatResult::declined`] carries the reason so the caller knows the
 //!   turn ended in a decline rather than an empty answer;
