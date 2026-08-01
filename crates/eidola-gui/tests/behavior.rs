@@ -1707,7 +1707,7 @@ fn record_frame_work_is_constant_in_loaded_rows(cx: &mut TestAppContext) {
     // coarse timing comparison: ten pages must not cost meaningfully more per
     // frame than one.
     let stores = stub_stores_with_config(cx);
-    let (_window, view) = open_view(cx, |window, cx| {
+    let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| RecordView::new(stores.clone(), window, cx))
     });
 
@@ -1720,27 +1720,35 @@ fn record_frame_work_is_constant_in_loaded_rows(cx: &mut TestAppContext) {
     let visible = 0..12usize;
 
     // One page loaded.
-    let (one_window, one_total, one_dur) = view.update(cx, |v, cx| {
-        v.set_requests_for_test(one_page.clone(), true);
-        v.select_section(RecordSection::Requests, cx);
-        let start = std::time::Instant::now();
-        let mut n = 0;
-        for _ in 0..200 {
-            n = v.render_visible_window_for_test(visible.clone(), cx);
-        }
-        (n, v.display_len_for_test(), start.elapsed())
-    });
+    let (one_window, one_total, one_dur) = cx
+        .update_window(window, |_, win, cx| {
+            view.update(cx, |v, cx| {
+                v.set_requests_for_test(one_page.clone(), true);
+                v.select_section(RecordSection::Requests, cx);
+                let start = std::time::Instant::now();
+                let mut n = 0;
+                for _ in 0..200 {
+                    n = v.render_visible_window_for_test(visible.clone(), win, cx);
+                }
+                (n, v.display_len_for_test(), start.elapsed())
+            })
+        })
+        .unwrap();
 
     // Ten pages loaded.
-    let (ten_window, ten_total, ten_dur) = view.update(cx, |v, cx| {
-        v.set_requests_for_test(ten_pages.clone(), true);
-        let start = std::time::Instant::now();
-        let mut n = 0;
-        for _ in 0..200 {
-            n = v.render_visible_window_for_test(visible.clone(), cx);
-        }
-        (n, v.display_len_for_test(), start.elapsed())
-    });
+    let (ten_window, ten_total, ten_dur) = cx
+        .update_window(window, |_, win, cx| {
+            view.update(cx, |v, cx| {
+                v.set_requests_for_test(ten_pages.clone(), true);
+                let start = std::time::Instant::now();
+                let mut n = 0;
+                for _ in 0..200 {
+                    n = v.render_visible_window_for_test(visible.clone(), win, cx);
+                }
+                (n, v.display_len_for_test(), start.elapsed())
+            })
+        })
+        .unwrap();
 
     // The display model grew 10× …
     assert_eq!(one_total, 52, "one page = 51 rows + load-more");
@@ -8721,6 +8729,52 @@ fn space_tree_focus_follows_a_regenerated_post_and_clears_when_it_vanishes(
             v.tree_focus_for_test(),
             None,
             "a post that no longer exists releases focus"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_tree_focus_releases_when_the_conversation_loses_focus(cx: &mut TestAppContext) {
+    // `tree_focus` is bookkeeping; the window's focus is the truth. Tab away
+    // (or click the composer) and the post's manually-drawn ring kept
+    // painting beside the control that actually held focus — two apparent
+    // focus targets — with the post's hover-gated verbs still revealed on a
+    // post nobody was on. Observed from the real focus state at the head of
+    // render, so there is no exit to forget.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a1".to_string(), None)));
+        assert!(
+            v.post_affordances_revealed("a1"),
+            "focus reveals the post's verbs"
+        );
+    });
+
+    // Tab on: the conversation no longer holds the window's focus.
+    vcx.update(|window, cx| window.focus_next(cx));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            None,
+            "the ring is released with the focus that justified it"
+        );
+        assert!(
+            !v.post_affordances_revealed("a1"),
+            "…and so are the verbs it revealed"
         );
     });
 }

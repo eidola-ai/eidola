@@ -3266,7 +3266,7 @@ fn library_arrows_rove_the_listing_and_enter_opens_a_space(cx: &mut TestAppConte
     cx.update_window(window, |_, window, cx| window.focus_next(cx))
         .unwrap();
     let entries = fresh_entries(cx, window);
-    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), 0));
+    view.read_with(cx, |v, cx| assert_eq!(v.focused_row_for_test(cx), Some(0)));
     assert!(
         entries.iter().any(|(n, _)| n == "library/row/0/rename")
             && !entries.iter().any(|(n, _)| n == "library/row/1/rename"),
@@ -3275,7 +3275,7 @@ fn library_arrows_rove_the_listing_and_enter_opens_a_space(cx: &mut TestAppConte
 
     cx.simulate_keystrokes(window, "down");
     let entries = fresh_entries(cx, window);
-    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), 1));
+    view.read_with(cx, |v, cx| assert_eq!(v.focused_row_for_test(cx), Some(1)));
     assert_probe(
         &entries,
         "library/row/1/rename",
@@ -3288,16 +3288,24 @@ fn library_arrows_rove_the_listing_and_enter_opens_a_space(cx: &mut TestAppConte
     );
 
     cx.simulate_keystrokes(window, "end");
-    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), 2));
+    view.read_with(cx, |v, cx| assert_eq!(v.focused_row_for_test(cx), Some(2)));
     cx.simulate_keystrokes(window, "down");
-    view.read_with(cx, |v, _| {
-        assert_eq!(v.focused_row_for_test(), 2, "the last row is the end")
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.focused_row_for_test(cx),
+            Some(2),
+            "the last row is the end"
+        )
     });
     cx.simulate_keystrokes(window, "home");
-    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), 0));
+    view.read_with(cx, |v, cx| assert_eq!(v.focused_row_for_test(cx), Some(0)));
     cx.simulate_keystrokes(window, "up");
-    view.read_with(cx, |v, _| {
-        assert_eq!(v.focused_row_for_test(), 0, "the first row is the top")
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.focused_row_for_test(cx),
+            Some(0),
+            "the first row is the top"
+        )
     });
 
     cx.simulate_keystrokes(window, "down enter");
@@ -3307,5 +3315,148 @@ fn library_arrows_rove_the_listing_and_enter_opens_a_space(cx: &mut TestAppConte
             1,
             "Enter opened the row the cursor was on"
         );
+    });
+}
+
+/// Walk the window's whole Tab cycle and return how many distinct stops it
+/// contains. `focus_next` wraps, so a repeat ends the walk.
+fn tab_stop_count(cx: &mut TestAppContext, window: AnyWindowHandle) -> usize {
+    draw(cx, window);
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        let id = cx
+            .update_window(window, |_, window, cx| {
+                window.focus_next(cx);
+                window.focused(cx).map(|h| format!("{h:?}"))
+            })
+            .unwrap();
+        let Some(id) = id else { break };
+        if seen.contains(&id) {
+            break;
+        }
+        seen.push(id);
+    }
+    seen.len()
+}
+
+#[gpui::test]
+fn a_listing_contributes_one_tab_stop_regardless_of_row_count(cx: &mut TestAppContext) {
+    // The classification cure for `Role::ListItem`. `listitem` is a
+    // *structural* role, and treating it as interactive handed a tab stop to
+    // every static row (a declined trace round, a footnote with nowhere to
+    // navigate) while the clickable rows it was meant for live in
+    // `uniform_list`s, where a per-row stop can only ever reach the
+    // materialized window. Both listings rove instead — so the window's tab
+    // order does not grow with the data.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Requests, cx);
+        v.set_requests_for_test(vec![stub_request("req-1")], false);
+    });
+    let one = tab_stop_count(cx, window);
+
+    view.update(cx, |v, _| {
+        v.set_requests_for_test(
+            (1..=5).map(|i| stub_request(&format!("req-{i}"))).collect(),
+            false,
+        );
+    });
+    let five = tab_stop_count(cx, window);
+
+    assert_eq!(
+        one, five,
+        "five rows must contribute exactly what one row does: the listing's own stop"
+    );
+}
+
+#[gpui::test]
+fn record_arrows_rove_the_listing_and_enter_opens_a_detail(cx: &mut TestAppContext) {
+    // The Record's listings are virtualized too, so they take the Library's
+    // shape: one tab stop, a roving cursor, Enter opens the row it sits on.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Requests, cx);
+        v.set_requests_for_test(
+            (1..=3).map(|i| stub_request(&format!("req-{i}"))).collect(),
+            false,
+        );
+    });
+    draw(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.focus_listing_for_test(window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), Some(0)));
+
+    cx.simulate_keystrokes(window, "down");
+    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), Some(1)));
+    cx.simulate_keystrokes(window, "end");
+    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), Some(2)));
+    cx.simulate_keystrokes(window, "home");
+    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), Some(0)));
+
+    cx.simulate_keystrokes(window, "down enter");
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.detail_pending(),
+            Some("req-2"),
+            "Enter opened the detail of the row the cursor was on"
+        );
+    });
+}
+
+#[gpui::test]
+fn library_cursor_clamps_when_its_row_disappears(cx: &mut TestAppContext) {
+    // Rows come and go under a roving cursor — archive the one it sits on and
+    // a stored index points one past the end, where Enter is dead and no row
+    // draws the ring. The effective cursor is clamped on read instead, so it
+    // lands on the new last row and stays live.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            space_info("s1", Some("Tides and the moon")),
+            space_info("s2", Some("Borrow checker")),
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    cx.simulate_keystrokes(window, "end");
+    view.read_with(cx, |v, cx| assert_eq!(v.focused_row_for_test(cx), Some(1)));
+
+    view.update(cx, |v, cx| v.archive("s2".into(), cx));
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.focused_row_for_test(cx),
+            Some(0),
+            "the cursor lands on the new last row rather than past the end"
+        );
+    });
+
+    // …and it is still live: the row it now sits on opens.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0/rename",
+        gpui::Role::Button,
+        "Rename Tides and the moon",
+    );
+    cx.simulate_keystrokes(window, "enter");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.open_space_requests_for_test(), 1, "Enter still opens");
     });
 }

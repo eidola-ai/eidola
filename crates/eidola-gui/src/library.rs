@@ -72,9 +72,12 @@ pub struct LibraryView {
     /// inside the list, so Tab from the list reaches Rename then Archive for
     /// exactly that row.
     list_focus: FocusHandle,
-    /// The roving cursor: which row the keyboard is on. Always meaningful — it
-    /// simply isn't *shown* while the list doesn't hold focus — so entering the
-    /// listing lands on the first row.
+    /// The roving cursor: which row the keyboard is on. Read through
+    /// [`Self::cursor`], never directly — rows come and go under it (an
+    /// archive, a bus-driven re-list, a rename that reorders), so the stored
+    /// value is clamped at every use rather than chased at every mutation
+    /// site. Always meaningful once clamped; it simply isn't *shown* while the
+    /// list doesn't hold focus, so entering the listing lands on the first row.
     focused_row: usize,
     /// Test-only: how many times `open_space` has been invoked. Lets the
     /// pencil-propagation regression test prove that clicking the rename pencil
@@ -142,6 +145,20 @@ impl LibraryView {
         self.hovered
     }
 
+    /// The **effective** cursor: clamped into the current listing, and `None`
+    /// when the library is empty. Deriving it on read is what keeps a
+    /// shrinking listing honest — archive the last row while the cursor is on
+    /// it and the cursor lands on the new last row, rather than pointing one
+    /// past the end where Enter is dead and no row draws the ring.
+    fn cursor(&self, cx: &App) -> Option<usize> {
+        self.spaces
+            .read(cx)
+            .list()
+            .len()
+            .checked_sub(1)
+            .map(|last| self.focused_row.min(last))
+    }
+
     /// The listing's roving-focus key map: ↑/↓ move the cursor, Home/End take
     /// its ends, Enter opens the row it sits on. Returns `true` when it
     /// consumed the press.
@@ -161,17 +178,16 @@ impl LibraryView {
             return false;
         }
         let count = self.spaces.read(cx).list().len();
-        if count == 0 {
+        let (Some(last), Some(cursor)) = (count.checked_sub(1), self.cursor(cx)) else {
             return false;
-        }
-        let last = count - 1;
+        };
         let target = match ev.keystroke.key.as_str() {
-            "up" => self.focused_row.saturating_sub(1),
-            "down" => (self.focused_row + 1).min(last),
+            "up" => cursor.saturating_sub(1),
+            "down" => (cursor + 1).min(last),
             "home" => 0,
             "end" => last,
             "enter" => {
-                let Some(space) = self.spaces.read(cx).list().get(self.focused_row) else {
+                let Some(space) = self.spaces.read(cx).list().get(cursor) else {
                     return false;
                 };
                 let id = space.id.clone();
@@ -193,10 +209,10 @@ impl LibraryView {
         cx.notify();
     }
 
-    /// Test seam: where the roving cursor sits.
+    /// Test seam: where the roving cursor effectively sits.
     #[doc(hidden)]
-    pub fn focused_row_for_test(&self) -> usize {
-        self.focused_row
+    pub fn focused_row_for_test(&self, cx: &App) -> Option<usize> {
+        self.cursor(cx)
     }
 
     /// Archive a space. Called by the hover-revealed × button; public so
@@ -310,7 +326,8 @@ impl LibraryView {
         let keyboard_row = self
             .list_focus
             .contains_focused(window, cx)
-            .then_some(self.focused_row);
+            .then(|| self.cursor(cx))
+            .flatten();
         visible
             .into_iter()
             .map(|(idx, space)| {

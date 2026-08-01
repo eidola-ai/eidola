@@ -1775,6 +1775,10 @@ impl Render for SpaceView {
         let page_width = viewport.width;
         let window_h = viewport.height;
 
+        // Tree focus is *observed*, not merely bookkept: see
+        // `keyboard::sync_tree_focus`.
+        self.sync_tree_focus(window);
+
         // Window resize: branch offsets are absolute pixels but pages are a
         // window-width apart, so remap every offset by the stride ratio to keep
         // the selected branch (and exact position) invariant to width.

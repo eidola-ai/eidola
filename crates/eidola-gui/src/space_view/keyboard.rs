@@ -571,6 +571,41 @@ impl SpaceView {
         }
     }
 
+    /// Release tree focus once the conversation no longer holds the window's
+    /// focus. Called at the head of [`SpaceView::render`], which is the one
+    /// place with both `&mut self` and a `&Window` to ask.
+    ///
+    /// [`SpaceView::tree_focus`] is bookkeeping — where the *keyboard model*
+    /// thinks it is — while the window's focus is the truth, and Tab, a click
+    /// on the composer, or an inline edit session all move the latter without
+    /// telling the former. The post ring is drawn manually from the
+    /// bookkeeping (`post_row_holds_focus`), so a stale value paints a second
+    /// apparent focus target beside the real one, and the post's hover-gated
+    /// verbs stay revealed on a post nobody is on. Deriving from the real
+    /// state costs one comparison per frame and needs no clear-call at any of
+    /// the exits — which is the point: there is no exit to forget.
+    ///
+    /// **Only the post level is observed.** At the affordance level Tab walks
+    /// between the post's sibling verbs (the map promises it), and those verbs
+    /// hold gpui's *implicit* focus handles, which this crate never sees — so
+    /// "the affordance row still holds focus" is not an observable fact at
+    /// this pin, and clearing on `!affordance_focus.is_focused` would drop the
+    /// level on the very Tab the map advertises. That level draws no manual
+    /// ring (each verb wears gpui's own `:focus-visible`), so the bug this
+    /// fixes cannot occur there; a stale level ends at the next Escape.
+    pub(crate) fn sync_tree_focus(&mut self, window: &Window) {
+        if matches!(
+            self.tree_focus,
+            Some(TreeFocus {
+                level: FocusLevel::Post,
+                ..
+            })
+        ) && !self.post_focus.is_focused(window)
+        {
+            self.tree_focus = None;
+        }
+    }
+
     /// Carry keyboard tree focus across a generation change of the post it
     /// sits on — the [`SpaceView::rethread_drafts`] rule applied to the other
     /// window-local reference into the transcript.

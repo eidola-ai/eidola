@@ -19,8 +19,10 @@
 //!   posts are the space tree's arrow-key surface, and Tab is the
 //!   between-region device (see [`crate::space_view`]'s keyboard map).
 //! - everything else — landmarks (`Main` / `Navigation` / `Region` / `List` /
-//!   `TabList` / `Group` / `Menu`), static readouts (`Label`), alerts and
-//!   headings — is a container or a readout, never a focus target.
+//!   `TabList` / `Group` / `Menu`), **structure** (`ListItem`), static readouts
+//!   (`Label`), alerts and headings — is a container, a row or a readout, never
+//!   a focus target. See [`is_tab_stop`] for why `ListItem` counts as structure
+//!   even though plenty of our list rows are clickable.
 //!
 //! **An element that delegates its focus is never a focus target.**
 //! Role-derivation classifies the *role*, but many of our probes annotate
@@ -160,8 +162,27 @@ pub const POST_RING_OFFSET: Pixels = px(6.);
 
 /// Whether a role names an element that takes part in Tab navigation.
 ///
-/// Interactive affordances only. See the module docs for why `TextInput` is
-/// absent and why `Article` is focusable without being a stop.
+/// **Interactive roles only** — the ones whose whole meaning is "activate me".
+/// A role that merely names *structure* never becomes a tab stop, however
+/// clickable a particular instance of it happens to be, because the
+/// classification cannot see the instance: making a structural role a stop
+/// hands a tab stop to every *static* one too, and a focusable element with no
+/// click listener of its own is a stop gpui's Enter/Space can never activate
+/// (see the module docs).
+///
+/// [`Role::ListItem`] is the one that had to be taken back out. `listitem` is
+/// a structural role — the interactive members of a list are `ListBoxOption`,
+/// `Link`, `Button`, or the list's own roving cursor — and treating it as a
+/// stop made two things wrong at once: a *static* row (a declined tool round
+/// in a trace, a footnote rail entry with nowhere to navigate) became a stop
+/// that does nothing, and the *clickable* rows it was there for live in
+/// `uniform_list`s, where a per-row stop can only ever reach the materialized
+/// window anyway. Both listings (Library, Record) now rove instead, and a row
+/// that really is a link says `Link` — which `space_view::traces` already did,
+/// switching role by whether the round links anywhere.
+///
+/// See the module docs for why `TextInput` is absent and why `Article` is
+/// focusable without being a stop.
 pub fn is_tab_stop(role: Role) -> bool {
     matches!(
         role,
@@ -172,7 +193,6 @@ pub fn is_tab_stop(role: Role) -> bool {
             | Role::CheckBox
             | Role::RadioButton
             | Role::Switch
-            | Role::ListItem
             | Role::ListBoxOption
             | Role::MenuItem
             | Role::MenuItemCheckBox
@@ -251,7 +271,6 @@ mod tests {
             Role::Link,
             Role::Tab,
             Role::CheckBox,
-            Role::ListItem,
             Role::ListBoxOption,
             Role::MenuItem,
             Role::Slider,
@@ -260,6 +279,7 @@ mod tests {
             assert!(is_focusable(role));
         }
         for role in [
+            Role::ListItem,
             Role::Main,
             Role::Navigation,
             Role::Region,

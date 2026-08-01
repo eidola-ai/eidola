@@ -198,6 +198,21 @@ struct Listing<T> {
     /// list closure stays O(visible).
     display: Vec<DisplayRow>,
     scroll: UniformListScrollHandle,
+    /// **The listing is one tab stop with a roving cursor** — the Library's
+    /// shape, and the only one a virtualized list can have (`uniform_list`
+    /// materializes only the visible window, so a tab stop per row is a tab
+    /// order that cannot contain the rows you haven't scrolled to). The list
+    /// tracks this handle; ↑/↓/Home/End move [`Listing::cursor`] and Enter
+    /// opens the row it sits on. Per section, so switching sections restores
+    /// where you were.
+    list_focus: Option<FocusHandle>,
+    /// The roving cursor, as a **display** index (the flat model interleaves
+    /// spending group headers and the load-more row, and the cursor walks what
+    /// is rendered). Read through [`Listing::cursor`], never directly: rows
+    /// come and go under it — a refresh, an archive, a shrinking page — so the
+    /// stored value is clamped at every use rather than chased at every
+    /// mutation site.
+    focused_row: usize,
     /// Supersede slot for this section's page fetch. Replacing the `Listing`
     /// (refresh) drops the slot and cancels the in-flight task, so a
     /// superseded fetch can never land late and append stale or duplicate
@@ -215,12 +230,27 @@ impl<T> Default for Listing<T> {
             loading: false,
             display: Vec::new(),
             scroll: UniformListScrollHandle::new(),
+            list_focus: None,
+            focused_row: 0,
             task: None,
         }
     }
 }
 
 impl<T> Listing<T> {
+    /// The **effective** cursor: clamped into the current display model, and
+    /// `None` when there is nothing to point at. Deriving it on read is what
+    /// keeps a shrinking listing honest without a clamp at every mutation
+    /// site — archive the last row while the cursor is on it and the cursor
+    /// simply lands on the new last row rather than pointing past the end
+    /// (where Enter would be dead and no row would draw the ring).
+    fn cursor(&self) -> Option<usize> {
+        self.display
+            .len()
+            .checked_sub(1)
+            .map(|last| self.focused_row.min(last))
+    }
+
     /// Whether a trailing load-more row should be appended: when there are
     /// more pages, or a page fetch is currently in flight over existing rows
     /// (the in-flight row is honest — it maps to a real fetch task).
@@ -397,6 +427,143 @@ impl RecordView {
     /// Fetch the next page of the current section.
     pub fn load_more(&mut self, cx: &mut Context<Self>) {
         self.fetch_page(self.section, cx);
+    }
+
+    /// The current section's listing state, by the one accessor the roving
+    /// cursor needs (the three `Listing<T>`s have different row types, so the
+    /// cursor's `(len, cursor, display row)` view is what gets unified).
+    fn listing_shape(&self, section: RecordSection) -> (usize, Option<usize>, Option<DisplayRow>) {
+        macro_rules! shape {
+            ($l:expr) => {{
+                let cursor = $l.cursor();
+                (
+                    $l.display.len(),
+                    cursor,
+                    cursor.and_then(|i| $l.display.get(i).copied()),
+                )
+            }};
+        }
+        match section {
+            RecordSection::Attestations => shape!(self.attestations),
+            RecordSection::Requests => shape!(self.requests),
+            RecordSection::Spending => shape!(self.spending),
+        }
+    }
+
+    /// Move the current section's roving cursor and scroll it into view — the
+    /// scroll is what materializes an off-screen row, which is what makes one
+    /// tab stop equivalent to a per-row one.
+    fn focus_row(&mut self, idx: usize, cx: &mut Context<Self>) {
+        macro_rules! go {
+            ($l:expr) => {{
+                $l.focused_row = idx;
+                $l.scroll.scroll_to_item(idx, gpui::ScrollStrategy::Top);
+            }};
+        }
+        match self.section {
+            RecordSection::Attestations => go!(self.attestations),
+            RecordSection::Requests => go!(self.requests),
+            RecordSection::Spending => go!(self.spending),
+        }
+        cx.notify();
+    }
+
+    /// The listing's roving-focus key map: ↑/↓ move the cursor, Home/End take
+    /// its ends, Enter opens the row it sits on. Returns `true` when it
+    /// consumed the press.
+    ///
+    /// Gated on the list itself holding focus, not on containing it: the
+    /// load-more row inside it is an ordinary tab stop whose own activation
+    /// fires on key **up**, and a listener here would otherwise fetch a second
+    /// page on the key **down** of the same press.
+    fn handle_list_key(
+        &mut self,
+        ev: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let focused = match self.section {
+            RecordSection::Attestations => &self.attestations.list_focus,
+            RecordSection::Requests => &self.requests.list_focus,
+            RecordSection::Spending => &self.spending.list_focus,
+        };
+        if !focused.as_ref().is_some_and(|h| h.is_focused(window)) {
+            return false;
+        }
+        if ev.keystroke.modifiers.modified() {
+            return false;
+        }
+        let (len, cursor, row) = self.listing_shape(self.section);
+        let (Some(last), Some(cursor)) = (len.checked_sub(1), cursor) else {
+            return false;
+        };
+        let target = match ev.keystroke.key.as_str() {
+            "up" => cursor.saturating_sub(1),
+            "down" => (cursor + 1).min(last),
+            "home" => 0,
+            "end" => last,
+            "enter" => {
+                self.activate_row(row, cx);
+                return true;
+            }
+            _ => return false,
+        };
+        self.focus_row(target, cx);
+        true
+    }
+
+    /// Activate the cursor's row: a data row opens its detail, the load-more
+    /// row fetches the next page, a spending group header does nothing (it is
+    /// a caption, and saying so by no-op is more honest than skipping over it
+    /// while navigating).
+    fn activate_row(&mut self, row: Option<DisplayRow>, cx: &mut Context<Self>) {
+        let Some(DisplayRow::Data(i)) = row else {
+            if matches!(row, Some(DisplayRow::LoadMore)) {
+                self.load_more(cx);
+            }
+            return;
+        };
+        match self.section {
+            RecordSection::Attestations => {
+                if let Some(a) = self.attestations.rows.get(i) {
+                    let hash = a.hash.clone();
+                    self.open_attestation(hash, cx);
+                }
+            }
+            RecordSection::Requests => {
+                if let Some(r) = self.requests.rows.get(i) {
+                    let id = r.id.clone();
+                    self.open_request(id, cx);
+                }
+            }
+            RecordSection::Spending => {
+                if let Some(e) = self.spending.rows.get(i) {
+                    let id = e.request_id.clone();
+                    self.open_request(id, cx);
+                }
+            }
+        }
+    }
+
+    /// Test seam: where the current section's roving cursor sits.
+    #[doc(hidden)]
+    pub fn focused_row_for_test(&self) -> Option<usize> {
+        self.listing_shape(self.section).1
+    }
+
+    /// Test seam: put the window's focus on the current section's listing —
+    /// what a Tab into the `MAIN` region does. The handle is minted lazily in
+    /// `render_listing`, so this is a no-op until a listing has painted.
+    #[doc(hidden)]
+    pub fn focus_listing_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = match self.section {
+            RecordSection::Attestations => self.attestations.list_focus.clone(),
+            RecordSection::Requests => self.requests.list_focus.clone(),
+            RecordSection::Spending => self.spending.list_focus.clone(),
+        };
+        if let Some(handle) = handle {
+            window.focus(&handle, cx);
+        }
     }
 
     fn fetch_page(&mut self, section: RecordSection, cx: &mut Context<Self>) {
@@ -585,9 +752,10 @@ impl RecordView {
     pub fn render_visible_window_for_test(
         &self,
         range: std::ops::Range<usize>,
+        window: &Window,
         cx: &Context<Self>,
     ) -> usize {
-        self.render_rows(self.section, range, cx).len()
+        self.render_rows(self.section, range, window, cx).len()
     }
 
     /// Test hook: the current section's (row count, loading flag) — lets the
@@ -885,7 +1053,7 @@ impl RecordView {
     /// `uniform_list` closure is a dumb indexer over the precomputed
     /// `display` model: it renders only the visible window of rows, so frame
     /// work is O(visible) rather than O(loaded) (the wave-2 bug-3 fix).
-    fn render_listing(&self, cx: &Context<Self>) -> gpui::AnyElement {
+    fn render_listing(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let count = match self.section {
             RecordSection::Attestations => self.attestations.display.len(),
             RecordSection::Requests => self.requests.display.len(),
@@ -897,14 +1065,32 @@ impl RecordView {
             RecordSection::Spending => self.spending.scroll.clone(),
         };
         let section = self.section;
+        // The listing is this section's single tab stop, with a roving cursor
+        // over its display rows — see `Listing::list_focus`. Minted lazily so
+        // `Listing::default()` stays context-free.
+        let list_focus = {
+            let slot = match section {
+                RecordSection::Attestations => &mut self.attestations.list_focus,
+                RecordSection::Requests => &mut self.requests.list_focus,
+                RecordSection::Spending => &mut self.spending.list_focus,
+            };
+            slot.get_or_insert_with(|| cx.focus_handle().tab_stop(true))
+                .clone()
+        };
 
         uniform_list(
             ("record-list", section as usize),
             count,
-            cx.processor(move |this, range: Range<usize>, _window, cx| {
-                this.render_rows(section, range, cx)
+            cx.processor(move |this, range: Range<usize>, window, cx| {
+                this.render_rows(section, range, window, cx)
             }),
         )
+        .track_focus(&list_focus)
+        .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+            if this.handle_list_key(ev, window, cx) {
+                cx.stop_propagation();
+            }
+        }))
         .flex_1()
         .w_full()
         .px_6()
@@ -920,8 +1106,19 @@ impl RecordView {
         &self,
         section: RecordSection,
         range: Range<usize>,
+        window: &Window,
         cx: &Context<Self>,
     ) -> Vec<gpui::AnyElement> {
+        // The cursor's row only *shows* while the listing holds the keyboard.
+        let list_focus = match section {
+            RecordSection::Attestations => &self.attestations.list_focus,
+            RecordSection::Requests => &self.requests.list_focus,
+            RecordSection::Spending => &self.spending.list_focus,
+        };
+        let keyboard_row = list_focus
+            .as_ref()
+            .filter(|h| h.contains_focused(window, cx))
+            .and_then(|_| self.listing_shape(section).1);
         let display = match section {
             RecordSection::Attestations => &self.attestations.display,
             RecordSection::Requests => &self.requests.display,
@@ -929,19 +1126,36 @@ impl RecordView {
         };
         range
             .filter_map(|dix| display.get(dix).copied().map(|row| (dix, row)))
-            .map(|(dix, row)| match (section, row) {
-                (RecordSection::Attestations, DisplayRow::Data(i)) => {
-                    self.render_attestation_row(dix, i, cx)
+            .map(|(dix, row)| {
+                let el = match (section, row) {
+                    (RecordSection::Attestations, DisplayRow::Data(i)) => {
+                        self.render_attestation_row(dix, i, cx)
+                    }
+                    (RecordSection::Requests, DisplayRow::Data(i)) => {
+                        self.render_request_row(dix, i, cx)
+                    }
+                    (RecordSection::Spending, DisplayRow::Header(i)) => {
+                        self.render_spend_header(i, cx)
+                    }
+                    (RecordSection::Spending, DisplayRow::Data(i)) => self.render_spend_row(i, cx),
+                    (_, DisplayRow::LoadMore) => self.render_load_more_row(cx),
+                    // No other (section, row) combinations are produced by the
+                    // display builders.
+                    _ => div().h(ROW_H).into_any_element(),
+                };
+                if keyboard_row != Some(dix) {
+                    return el;
                 }
-                (RecordSection::Requests, DisplayRow::Data(i)) => {
-                    self.render_request_row(dix, i, cx)
-                }
-                (RecordSection::Spending, DisplayRow::Header(i)) => self.render_spend_header(i, cx),
-                (RecordSection::Spending, DisplayRow::Data(i)) => self.render_spend_row(i, cx),
-                (_, DisplayRow::LoadMore) => self.render_load_more_row(cx),
-                // No other (section, row) combinations are produced by the
-                // display builders.
-                _ => div().h(ROW_H).into_any_element(),
+                // The cursor's ring is drawn around the row rather than by
+                // `focus_visible`, because the focused *element* is the list;
+                // this is the row its cursor is on. No modality guard is
+                // needed — the cursor only shows while the list holds focus.
+                div()
+                    .h(ROW_H)
+                    .w_full()
+                    .shadow(crate::focus::ring_shadows(crate::focus::ring_colors()))
+                    .child(el)
+                    .into_any_element()
             })
             .collect()
     }
