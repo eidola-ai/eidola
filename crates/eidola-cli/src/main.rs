@@ -1,3 +1,5 @@
+mod service;
+
 use std::io::{IsTerminal, Write};
 
 use clap::{Parser, Subcommand};
@@ -84,6 +86,30 @@ enum Command {
         #[command(subcommand)]
         command: UpdateCommand,
     },
+    /// Run Eidola as a long-lived background service (Linux/systemd)
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+}
+
+/// The systemd user-service sugar. Handled *before* the core is built (see
+/// `main`): the whole point of `service stop` is to be usable while the
+/// running service holds the local database's exclusive lock.
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Write `~/.config/systemd/user/eidola.service`, reload systemd, and
+    /// enable the service for login. Starts nothing — `service start` does.
+    Install {
+        /// The `eidola-gui` binary the unit should launch. Defaults to the
+        /// one beside this executable, else the first on `PATH`.
+        #[arg(long)]
+        exec: Option<String>,
+    },
+    /// Start the service now
+    Start,
+    /// Stop the service (engines are torn down, not orphaned)
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -370,6 +396,22 @@ fn main() {
     // when the local database is held by another Eidola (building the core
     // takes its exclusive lock and can fail with `DatabaseInUse`).
     let cli = Cli::parse();
+
+    // `service` never touches the local database — and must not: the running
+    // service holds its exclusive lock, so building the core here would make
+    // `eidola service stop` fail exactly when it is needed.
+    if let Some(Command::Service { command }) = &cli.command {
+        let result = match command {
+            ServiceCommand::Install { exec } => service::install(exec.clone()),
+            ServiceCommand::Start => service::start(),
+            ServiceCommand::Stop => service::stop(),
+        };
+        if let Err(e) = result {
+            report(&e);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Build the core (and its tokio runtime) outside any async context so it
     // can be dropped cleanly when main returns.
@@ -1189,6 +1231,9 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             Ok(())
         }
+        // Handled in `main` before the core is built — `service stop` has to
+        // work while the running service holds the database lock.
+        Some(Command::Service { .. }) => Ok(()),
     }
 }
 

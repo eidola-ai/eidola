@@ -8209,3 +8209,78 @@ fn space_change_invalidates_the_trace_index(cx: &mut TestAppContext) {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// App lifecycle — the app outlives its windows (task 17, wave 2).
+//
+// The quit *policy* is the pure `lifecycle::quit_mode`, unit-tested in the
+// module. What is machine-verifiable here is the window-registry half: with
+// the mode production uses on macOS (and in windowless mode), every window
+// can close and a fresh one opens cleanly afterwards — and what a
+// reactivation does in each case. That the *process* survives is
+// hand-verified on the real `.app`; `TestPlatform::quit` is a no-op, so no
+// test can observe the difference.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn every_window_can_close_and_a_new_one_opens_cleanly(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+
+    let (first, _) = open_space(cx, &stores, Some("s".into()));
+    let (second, _) = open_space(cx, &stores, Some("s2".into()));
+    cx.update(|cx| assert_eq!(cx.windows().len(), 2));
+
+    for window in [first, second] {
+        cx.update_window(window, |_, window, _| window.remove_window())
+            .unwrap();
+    }
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(
+            cx.windows().is_empty(),
+            "both windows are gone; the app is still here"
+        );
+    });
+
+    // The whole point: a window opens again over the same live stores.
+    let (third, view) = open_space(cx, &stores, Some("s".into()));
+    draw_window(cx, third);
+    cx.update(|cx| assert_eq!(cx.windows().len(), 1));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    space.read_with(cx, |s, _| assert_eq!(s.id(), Some("s")));
+}
+
+#[gpui::test]
+fn reactivating_with_no_windows_opens_the_door(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let opened = Rc::new(Cell::new(0));
+    let counter = opened.clone();
+    cx.update(|cx| {
+        eidola_gui::lifecycle::reactivate(cx, move |_| counter.set(counter.get() + 1));
+    });
+    assert_eq!(opened.get(), 1, "no window: reactivation opens one");
+}
+
+#[gpui::test]
+fn reactivating_with_a_window_focuses_it_instead(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let stores = stub_stores_with_config(cx);
+    let (_window, _) = open_space(cx, &stores, Some("s".into()));
+
+    let opened = Rc::new(Cell::new(0));
+    let counter = opened.clone();
+    cx.update(|cx| {
+        eidola_gui::lifecycle::reactivate(cx, move |_| counter.set(counter.get() + 1));
+    });
+    assert_eq!(
+        opened.get(),
+        0,
+        "an existing window is focused, not duplicated"
+    );
+    cx.update(|cx| assert_eq!(cx.windows().len(), 1));
+}
