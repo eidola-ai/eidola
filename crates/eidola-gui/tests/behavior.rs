@@ -8595,3 +8595,132 @@ fn focus_visible_tracks_the_input_modality(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// The same post, one generation on: a new action id, the item id unchanged —
+/// exactly what an edit or a regeneration lands in the reloaded transcript.
+fn next_generation(mut post: PostNode, new_action_id: &str) -> PostNode {
+    post.action_id = new_action_id.into();
+    post.generation += 1;
+    post.generation_count += 1;
+    post
+}
+
+#[gpui::test]
+fn space_tree_focus_follows_an_edited_post_to_its_new_generation(cx: &mut TestAppContext) {
+    // Tree focus names a post by its **action** id, which an edit supersedes.
+    // Without forwarding, the reloaded transcript no longer carries the id
+    // focus sits on: `tree_target` can't find it in the path and returns
+    // `None`, and the deliberate-no-op arm still reports the press as handled
+    // — so every arrow reads as inert (and Enter finds no post, so it is dead
+    // too) until the reader escapes out of the conversation entirely.
+    // Threading already follows item identity; so does focus.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let a1 = fixture_user_post("a1", "the root post");
+    let mut a2 = fixture_assistant_post("a2", "the reply");
+    a2.parent_action_id = Some("a1".into());
+    seed_quotable_space(&view, window, cx, vec![a1.clone(), a2.clone()]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a1".to_string(), None)));
+    });
+
+    // The edit lands: a1's item is now action `a1b`, and a2 replies to it.
+    let mut a2_edited = a2.clone();
+    a2_edited.parent_action_id = Some("a1b".into());
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![next_generation(a1, "a1b"), a2_edited], cx)
+        });
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1b".to_string(), None)),
+            "focus followed the item to its current tip"
+        );
+    });
+
+    // …and the arrows still walk from there.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), None)),
+            "Down moves on from the forwarded position"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_tree_focus_follows_a_regenerated_post_and_clears_when_it_vanishes(
+    cx: &mut TestAppContext,
+) {
+    // The agent-side half of the same rule (a regeneration is a new generation
+    // of the inference's item), plus the one case where clearing is the honest
+    // answer: the item genuinely left the snapshot.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let a1 = fixture_user_post("a1", "the root post");
+    let mut a2 = fixture_assistant_post("a2", "the reply");
+    a2.parent_action_id = Some("a1".into());
+    seed_quotable_space(&view, window, cx, vec![a1.clone(), a2.clone()]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a2".to_string(), None)));
+    });
+
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![a1.clone(), next_generation(a2.clone(), "a2b")], cx)
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2b".to_string(), None)),
+            "focus followed the regenerated answer"
+        );
+    });
+    vcx.simulate_keystrokes("up");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), None)),
+            "Up walks from the forwarded position"
+        );
+    });
+
+    // The focused post's item leaves the snapshot entirely — the one case
+    // where releasing focus is the honest outcome.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![a1], cx));
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            None,
+            "a post that no longer exists releases focus"
+        );
+    });
+}

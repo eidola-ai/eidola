@@ -229,7 +229,7 @@ impl Render for UpdatesView {
                 // honest click target.
                 div()
                     .id("check-now-wrap")
-                    .probe("updates/check", gpui::Role::Button, check_label)
+                    .probe_delegating("updates/check", gpui::Role::Button, check_label)
                     .child(
                         Button::new("check-now")
                             .label(check_label)
@@ -411,7 +411,7 @@ fn render_update_available(
         // its bounds are an honest click target.
         div()
             .id("open-release-wrap")
-            .probe("updates/view-release", gpui::Role::Button, "View Release…")
+            .probe_delegating("updates/view-release", gpui::Role::Button, "View Release…")
             .child(
                 Button::new("open-release")
                     .primary()
@@ -555,7 +555,7 @@ fn render_claims_changed(
                 // button so its bounds are an honest click target.
                 div()
                     .id("treat-as-update-wrap")
-                    .probe(
+                    .probe_delegating(
                         "updates/accept-claims",
                         gpui::Role::Button,
                         "Treat as Update",

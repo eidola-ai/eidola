@@ -1183,6 +1183,7 @@ impl BackendsSettingsView {
     ) -> impl IntoElement + use<> {
         let id = backend_id.to_string();
         let id_click = id.clone();
+        let id_key = id.clone();
         div()
             .id(SharedString::from(format!("autostart-{id}")))
             .probe(
@@ -1191,6 +1192,17 @@ impl BackendsSettingsView {
                 "Start an engine automatically on request",
             )
             .aria_selected(auto_start)
+            // The wrapper owns the **keyboard** activation. Unlike `Button` /
+            // `Checkbox`, `gpui_component::Switch` tracks no focus handle at
+            // our pin, so there is nothing inside for Tab to reach — see
+            // `probe_delegating`'s doc for the other half of the rule. This does
+            // not double-fire on a pointer click: `Switch` handles the press
+            // in `on_mouse_down` and calls `stop_propagation`, so the wrapper
+            // never arms a click of its own (gpui bubbles mouse listeners
+            // innermost-first).
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_auto_start(id_key.clone(), !auto_start, cx);
+            }))
             .child(
                 Switch::new(SharedString::from(format!("autostart-switch-{id}")))
                     .small()
@@ -1292,6 +1304,11 @@ impl BackendsSettingsView {
                                     "Start an engine automatically on request",
                                 )
                                 .aria_selected(form.auto_start)
+                                // The wrapper owns the keyboard activation —
+                                // see `autostart_row` for why.
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.toggle_add_auto_start(cx)),
+                                )
                                 .child(
                                     Switch::new("add-autostart-switch")
                                         .small()
@@ -1550,7 +1567,7 @@ impl BackendsSettingsView {
                         .child(
                             div()
                                 .id("eidola-save-base-url-wrap")
-                                .probe(
+                                .probe_delegating(
                                     "settings/backends/eidola/url/save",
                                     gpui::Role::Button,
                                     "Save",
@@ -1568,7 +1585,7 @@ impl BackendsSettingsView {
                         .child(
                             div()
                                 .id("eidola-cancel-base-url-wrap")
-                                .probe(
+                                .probe_delegating(
                                     "settings/backends/eidola/url/cancel",
                                     gpui::Role::Button,
                                     "Cancel",

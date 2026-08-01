@@ -135,7 +135,7 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         role: Role,
         label: impl Into<SharedString>,
     ) -> Self {
-        self.probe_inner(name, role, label.into(), None)
+        self.probe_inner(name, role, label.into(), None, true)
     }
 
     /// Like [`Probe::probe`], plus the element's accessible **value**
@@ -156,7 +156,36 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         label: impl Into<SharedString>,
         value: impl Into<SharedString>,
     ) -> Self {
-        self.probe_inner(name, role, label.into(), Some(value.into()))
+        self.probe_inner(name, role, label.into(), Some(value.into()), true)
+    }
+
+    /// Like [`Probe::probe`], for an element that **delegates its focus**: it
+    /// carries the role, the label and the bounds, and something else carries
+    /// the keyboard. Applies **no focus attributes at all**. Two cases:
+    ///
+    /// - a **wrapper** around a `gpui-component` widget that owns its own focus
+    ///   handle (`Button`, `Checkbox`) — the shrink-wrapped `div` that exists
+    ///   only because those widgets carry no a11y annotations at our pin. The
+    ///   widget inside is already a tab stop, wears its own ring, and —
+    ///   decisively — owns the `on_click` that gpui's Enter/Space activation
+    ///   invokes. gpui's keyboard click runs *only the focused element's own
+    ///   click listeners* (`div.rs`, gated on that element having any), so a
+    ///   focusable wrapper is a tab stop that can never be activated: it would
+    ///   ring, swallow a Tab, and do nothing, with the working control one Tab
+    ///   further on.
+    /// - a **row of a roving-focus list** (the Library's listing), where the
+    ///   list is the single tab stop and moves a cursor over its rows. A tab
+    ///   stop per row cannot work in a virtualized list at all: only the
+    ///   materialized window would be in the tab order.
+    ///
+    /// See [`crate::focus`] for the rule in full.
+    fn probe_delegating(
+        self,
+        name: impl Into<SharedString>,
+        role: Role,
+        label: impl Into<SharedString>,
+    ) -> Self {
+        self.probe_inner(name, role, label.into(), None, false)
     }
 
     #[doc(hidden)]
@@ -166,6 +195,7 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         role: Role,
         label: SharedString,
         value: Option<SharedString>,
+        derive_focus: bool,
     ) -> Self {
         let mut this = self.role(role).aria_label(label.clone());
         if let Some(value) = value.clone() {
@@ -179,7 +209,10 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         // the page. `focusable()` alone (a post) means "can hold focus, is not
         // a Tab destination". The ring is gpui's own `:focus-visible`: shown
         // when this element is focused *and* the last input was a key.
-        if crate::focus::is_focusable(role) {
+        //
+        // `probe_delegating` opts out: the widget inside owns the focus, the
+        // ring and the activation.
+        if derive_focus && crate::focus::is_focusable(role) {
             this = this.focusable();
             if crate::focus::is_tab_stop(role) {
                 this = this.tab_index(0);

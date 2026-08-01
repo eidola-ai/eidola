@@ -9,7 +9,6 @@
 //! of the first message) with a right-aligned relative date in `text_sm`
 //! muted. An empty library is a single quiet line.
 
-use std::collections::HashMap;
 use std::ops::Range;
 
 use eidola_app_core::SpaceInfo;
@@ -60,16 +59,23 @@ pub struct LibraryView {
     focus_handle: FocusHandle,
     /// Scroll handle for the virtualized listing.
     scroll: UniformListScrollHandle,
-    /// One focus handle per **visible** row, minted lazily and keyed by row
-    /// index. Wave B / audit S7: the rename and archive verbs are hover-gated,
-    /// and gpui suppresses hover entirely under keyboard modality, so the row
-    /// has to know it holds focus in order to reveal them. A handle the *view*
-    /// owns rather than the one `probe` mints, because only the view can ask
-    /// "is this row focused" at render time. `tab_stop(true)` keeps the row in
-    /// the Tab order, which a tracked handle otherwise takes it out of (gpui
-    /// reads the flag off the handle, and `tab_index` on the element is
-    /// ignored once one is tracked).
-    row_focus: HashMap<usize, FocusHandle>,
+    /// **The listing is one tab stop with a roving cursor** — the shape the
+    /// space tree already ships, and the only shape a virtualized list can
+    /// have. `uniform_list` materializes only the visible window, so a tab stop
+    /// per row is a tab order that literally does not contain the rows you
+    /// haven't scrolled to: Tab walked off the end of the visible slice and out
+    /// of the library. So the list holds focus (this handle, the sole stop of
+    /// the `MAIN` region), ↑/↓/Home/End move [`Self::focused_row`] — scrolling
+    /// it into view — and Enter opens it. The cursor's row wears the ring and
+    /// reveals its verbs (audit S7: gpui suppresses hover entirely under
+    /// keyboard modality), and those verbs are ordinary tab stops painted
+    /// inside the list, so Tab from the list reaches Rename then Archive for
+    /// exactly that row.
+    list_focus: FocusHandle,
+    /// The roving cursor: which row the keyboard is on. Always meaningful — it
+    /// simply isn't *shown* while the list doesn't hold focus — so entering the
+    /// listing lands on the first row.
+    focused_row: usize,
     /// Test-only: how many times `open_space` has been invoked. Lets the
     /// pencil-propagation regression test prove that clicking the rename pencil
     /// does NOT also trigger the row's open (`open_space` itself defers a real
@@ -94,7 +100,8 @@ impl LibraryView {
             renaming: None,
             focus_handle,
             scroll: UniformListScrollHandle::new(),
-            row_focus: HashMap::new(),
+            list_focus: cx.focus_handle().tab_stop(true),
+            focused_row: 0,
             open_space_requests: 0,
             _subscriptions,
         }
@@ -133,6 +140,63 @@ impl LibraryView {
     /// The row index currently hovered, if any. Exposed for behavior tests.
     pub fn hovered_row(&self) -> Option<usize> {
         self.hovered
+    }
+
+    /// The listing's roving-focus key map: ↑/↓ move the cursor, Home/End take
+    /// its ends, Enter opens the row it sits on. Returns `true` when it
+    /// consumed the press.
+    ///
+    /// Gated on the **list itself** holding focus, not on containing it: once
+    /// Tab has moved on to the cursor row's Rename or Archive verb, that verb
+    /// owns the keyboard — gpui fires its activation on key *up*, and a
+    /// listener here would otherwise also open the space on the key *down* of
+    /// the very same press.
+    fn handle_list_key(
+        &mut self,
+        ev: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.list_focus.is_focused(window) || ev.keystroke.modifiers.modified() {
+            return false;
+        }
+        let count = self.spaces.read(cx).list().len();
+        if count == 0 {
+            return false;
+        }
+        let last = count - 1;
+        let target = match ev.keystroke.key.as_str() {
+            "up" => self.focused_row.saturating_sub(1),
+            "down" => (self.focused_row + 1).min(last),
+            "home" => 0,
+            "end" => last,
+            "enter" => {
+                let Some(space) = self.spaces.read(cx).list().get(self.focused_row) else {
+                    return false;
+                };
+                let id = space.id.clone();
+                self.open_space(id, cx);
+                return true;
+            }
+            _ => return false,
+        };
+        self.focus_row(target, cx);
+        true
+    }
+
+    /// Move the roving cursor to `idx` and scroll it into view. The scroll is
+    /// what makes one tab stop equivalent to a per-row one: an off-screen row
+    /// is materialized by the list before it can be read.
+    fn focus_row(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.focused_row = idx;
+        self.scroll.scroll_to_item(idx, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Test seam: where the roving cursor sits.
+    #[doc(hidden)]
+    pub fn focused_row_for_test(&self) -> usize {
+        self.focused_row
     }
 
     /// Archive a space. Called by the hover-revealed × button; public so
@@ -241,17 +305,16 @@ impl LibraryView {
             .get(range.clone())
             .map(|slice| range.clone().zip(slice.iter().cloned()).collect())
             .unwrap_or_default();
-        // Mint this window's row handles up front (the render borrow is
-        // shared), so a row can ask whether it holds focus.
-        for (idx, _) in &visible {
-            self.row_focus
-                .entry(*idx)
-                .or_insert_with(|| cx.focus_handle().tab_stop(true));
-        }
+        // The roving cursor only *shows* while the list holds the keyboard —
+        // resolved once here so a row never has to ask.
+        let keyboard_row = self
+            .list_focus
+            .contains_focused(window, cx)
+            .then_some(self.focused_row);
         visible
             .into_iter()
             .map(|(idx, space)| {
-                self.render_row(idx, &space, total, window, cx)
+                self.render_row(idx, &space, total, keyboard_row, cx)
                     .into_any_element()
             })
             .collect()
@@ -262,14 +325,15 @@ impl LibraryView {
         idx: usize,
         space: &SpaceInfo,
         total: usize,
-        window: &Window,
+        keyboard_row: Option<usize>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let row_focus = self.row_focus.get(&idx);
-        // Hover **or** keyboard focus — see `row_focus`.
-        let hovered =
-            self.hovered == Some(idx) || row_focus.is_some_and(|h| h.contains_focused(window, cx));
+        let is_keyboard_row = keyboard_row == Some(idx);
+        // Hover **or** the keyboard cursor: gpui suppresses hover entirely
+        // under keyboard modality, so without the second half a keyboard user
+        // could reach a row and find its verbs gone (audit S7).
+        let hovered = self.hovered == Some(idx) || is_keyboard_row;
         let space_id = space.id.clone();
         let archive_id = space.id.clone();
         let rename_id = space.id.clone();
@@ -344,7 +408,7 @@ impl LibraryView {
                 .child(
                     div()
                         .id(("rename-slot", idx))
-                        .probe(
+                        .probe_delegating(
                             format!("library/row/{idx}/rename"),
                             gpui::Role::Button,
                             format!("Rename {row_label}"),
@@ -383,7 +447,7 @@ impl LibraryView {
                 .child(
                     div()
                         .id(("archive-slot", idx))
-                        .probe(
+                        .probe_delegating(
                             format!("library/row/{idx}/archive"),
                             gpui::Role::Button,
                             format!("Archive {row_label}"),
@@ -412,7 +476,10 @@ impl LibraryView {
 
         let mut row = h_flex()
             .id(("space-row", idx))
-            .probe(
+            // The list holds the keyboard and moves a cursor over its rows, so
+            // a row is a *managed descendant*, never a tab stop — see
+            // `probe_delegating` and [`Self::list_focus`].
+            .probe_delegating(
                 format!("library/row/{idx}"),
                 gpui::Role::ListItem,
                 row_label,
@@ -421,7 +488,14 @@ impl LibraryView {
             // set metadata AT sees "6 spaces" in a library of six hundred.
             .aria_position_in_set(idx + 1)
             .aria_size_of_set(total)
-            .when_some(row_focus, |d, h| d.track_focus(h))
+            .aria_selected(is_keyboard_row)
+            // The cursor's ring is drawn here rather than by `focus_visible`,
+            // because the focused *element* is the list; this is the row its
+            // cursor is on. It needs no modality guard — the cursor is only
+            // ever shown while the list holds keyboard focus.
+            .when(is_keyboard_row, |d| {
+                d.shadow(crate::focus::ring_shadows(crate::focus::ring_colors()))
+            })
             .w_full()
             .h(ROW_H)
             .gap_3()
@@ -577,6 +651,11 @@ impl Render for LibraryView {
         // window of rows, so frame work is O(visible), not O(loaded). The
         // list self-scrolls; the centering wrapper caps it at the prose
         // measure and keeps it centered like the unvirtualized layout.
+        // **The list is the listing's single tab stop** (see `list_focus`): it
+        // tracks the handle, so it is where Tab lands and where the
+        // roving-cursor keys are dispatched. It sits inside the wrapper's
+        // `MAIN` tab group ahead of the cursor row's verbs — ordinary stops
+        // painted inside it — so Tab reads list → Rename → Archive → out.
         let list = uniform_list(
             "library-list",
             count,
@@ -584,6 +663,12 @@ impl Render for LibraryView {
                 this.render_rows(range, window, cx)
             }),
         )
+        .track_focus(&self.list_focus)
+        .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+            if this.handle_list_key(ev, window, cx) {
+                cx.stop_propagation();
+            }
+        }))
         .h_full()
         .w_full()
         .px_10()

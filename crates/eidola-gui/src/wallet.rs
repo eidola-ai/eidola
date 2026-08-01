@@ -154,7 +154,7 @@ impl Render for WalletView {
                 // button so its bounds are an honest click target.
                 div()
                     .id("recover-all-wrap")
-                    .probe(
+                    .probe_delegating(
                         "settings/wallet/recover",
                         gpui::Role::Button,
                         "Recover in-flight",
@@ -175,7 +175,7 @@ impl Render for WalletView {
             // button so its bounds are an honest click target.
             div()
                 .id("refresh-credentials-wrap")
-                .probe(
+                .probe_delegating(
                     "settings/wallet/refresh",
                     gpui::Role::Button,
                     "Refresh credentials",

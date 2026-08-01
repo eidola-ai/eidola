@@ -22,19 +22,42 @@
 //!   `TabList` / `Group` / `Menu`), static readouts (`Label`), alerts and
 //!   headings — is a container or a readout, never a focus target.
 //!
-//! **`Role::TextInput` is deliberately excluded**, and this is the one honest
-//! hole in the model. Our `TextInput` probes are *wrappers* around a
-//! `gpui_component::Input` or a `MarkdownEditor`, which own their own focus
-//! handles; making the wrapper a tab stop would land focus on a div that
-//! cannot type, and making it merely focusable would let a click on the
-//! wrapper's padding steal focus from the field inside it. Reaching a text
-//! field from the keyboard therefore needs the field's *own* handle marked as
-//! a tab stop, which is a per-site plumbing job (and, for
-//! `gpui_component::Input`, an upstream fix — its `.tab_index(…)` is applied to
-//! the element rather than to the tracked handle, where gpui reads it, so it
-//! is not a tab stop today). The composer is the one that matters and it is
-//! covered by design rather than by Tab: a space opens with it focused, and
-//! task 38 routes any printable character to it from anywhere in the window.
+//! **An element that delegates its focus is never a focus target.**
+//! Role-derivation classifies the *role*, but many of our probes annotate
+//! something that is not itself the control: a shrink-wrapped `div` around a
+//! `gpui-component` widget (which carries no a11y annotations at our pin), or a
+//! row of a roving-focus list whose container owns the keyboard. That
+//! distinction is not cosmetic: **gpui's Enter/Space activation invokes only
+//! the focused element's own click listeners** (`div.rs` registers the whole
+//! keyboard-click block only when that element has some), so a focusable
+//! wrapper is a tab stop that can never be activated — it rings, swallows a
+//! Tab, and does nothing, with the real control one Tab further on. (VoiceOver
+//! is unaffected: `Window::handle_a11y_action`'s `Action::Click` fallback
+//! synthesizes a mouse press at the node's centre, which hit-tests through to
+//! the widget. So the failure is exactly Tab+Enter, not AT activation.) Those
+//! elements use [`crate::probe::Probe::probe_delegating`], and for a wrapper
+//! the shape depends on what is inside:
+//!
+//! - **`Button` / `Checkbox`** track a focus handle with `tab_stop(true)`, draw
+//!   their own ring, and own the `on_click`. `probe_delegating` applies no focus
+//!   attributes at all and Tab lands on the widget, which activates.
+//! - **`Switch`** tracks no focus handle at all, so there is nothing inside to
+//!   reach. Those wrappers keep the ordinary `probe` (they *are* the tab stop
+//!   and wear the ring) and **hoist the activation** — an `on_click` on the
+//!   wrapper. It cannot double-fire on a pointer click, because `Switch`
+//!   handles the press in `on_mouse_down` and stops propagation, and gpui
+//!   bubbles mouse listeners innermost-first.
+//! - **`Input` / `MarkdownEditor`** is the model's one remaining hole, which is
+//!   why **`Role::TextInput` is excluded from [`is_focusable`] outright**: a
+//!   tab stop on the wrapper would land focus on a div that cannot type, mere
+//!   focusability would let a click on its padding steal focus from the field,
+//!   and no hoist exists — typing needs the field's own handle. Reaching one by
+//!   Tab needs per-site plumbing plus an upstream fix (`Input` applies
+//!   `.tab_index(…)` to the element rather than to the tracked handle, where
+//!   gpui reads it, so it is not a tab stop today). The composer is the one
+//!   that matters and it is covered by design rather than by Tab: a space opens
+//!   with it focused, and task 38 routes any printable character to it from
+//!   anywhere in the window.
 //!
 //! **The ring is `:focus-visible`, and gpui owns the condition.** `Window`
 //! tracks the last input modality (`KeyDown` → keyboard, `MouseDown` /
