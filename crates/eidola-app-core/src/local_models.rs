@@ -1544,6 +1544,43 @@ impl Inner {
             }),
         }
     }
+
+    /// Signal *every* live engine supervisor to kill its subprocess, and
+    /// return how many were signalled. Idempotent: the map is drained, so a
+    /// second call returns 0.
+    ///
+    /// This reads the **engine registry** and nothing else — no filesystem,
+    /// no database, no `Result`. That is the whole point of its existing
+    /// separately from a loop over [`Self::local_models_state`]: that
+    /// snapshot is reconstructed by *scanning* the managed models directory
+    /// and every `llamacpp` backend's directory (one `read_dir`, a `stat`
+    /// and a sidecar read per `.gguf`, plus a DB round trip to list the
+    /// backends), consulting this map only to *decorate* a file it already
+    /// found. A running engine whose `.gguf` was renamed or deleted
+    /// mid-session is therefore absent from that snapshot while its
+    /// subprocess is very much alive — and a slow or large directory would
+    /// spend a shutdown budget on I/O before killing anything. Neither is
+    /// acceptable on a quit path.
+    ///
+    /// Like [`Self::unload_local_model`], this *signals*; the supervisor
+    /// task owns the child and does the `start_kill`. Callers on a quit
+    /// path must leave the runtime a moment to run them.
+    pub(crate) fn shutdown_all_engines(&self) -> usize {
+        let entries: Vec<EngineEntry> = {
+            let mut engines = self.local.engines.lock().expect("engines lock");
+            engines.drain().map(|(_, entry)| entry).collect()
+        };
+        let count = entries.len();
+        for entry in entries {
+            // Supervisor may already be gone (crash path); the map removal
+            // is the user-visible state either way.
+            let _ = entry.shutdown.send(());
+        }
+        if count > 0 {
+            self.bus.emit(Change::LocalModels);
+        }
+        count
+    }
 }
 
 // ============================================================================
