@@ -230,6 +230,13 @@ impl ParticipantsView {
     }
 
     #[doc(hidden)]
+    pub fn adding_prompt(&self, cx: &gpui::App) -> Option<String> {
+        self.adding
+            .as_ref()
+            .map(|a| a.system_prompt.read(cx).value().to_string())
+    }
+
+    #[doc(hidden)]
     pub fn is_saving_template(&self) -> bool {
         self.template_form.is_some()
     }
@@ -425,10 +432,14 @@ impl ParticipantsView {
         self.template_form = None;
         self.picker = None;
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("Participant name"));
+        // A new agent starts from the shared default charter — the same
+        // starting point the Templates pane offers, so the two surfaces don't
+        // contradict each other on what "a new participant" begins as.
         let system_prompt = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(2, 8)
                 .placeholder("A short instruction for how this participant behaves.")
+                .default_value(DEFAULT_AGENT_SYSTEM_PROMPT)
         });
         self.adding = Some(AddState {
             label,

@@ -6114,6 +6114,13 @@ fn participants_view_add_and_remove(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.begin_add(window, cx));
     })
     .unwrap();
+    // The form arrives prefilled with the shared default charter — the same
+    // starting point the Templates pane offers a new agent.
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.adding_prompt(cx)).as_deref(),
+        Some(eidola_gui::participants_view::DEFAULT_AGENT_SYSTEM_PROMPT),
+        "a new participant starts from the shared default system prompt"
+    );
     let label = view
         .read_with(cx, |v, _| v.adding_label_state())
         .expect("add form open");
