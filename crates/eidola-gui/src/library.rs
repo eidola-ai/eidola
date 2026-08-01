@@ -9,13 +9,15 @@
 //! of the first message) with a right-aligned relative date in `text_sm`
 //! muted. An empty library is a single quiet line.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use eidola_app_core::SpaceInfo;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
     Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    UniformListScrollHandle, Window, actions, div, px, rems, uniform_list,
+    UniformListScrollHandle, Window, actions, div, prelude::FluentBuilder as _, px, rems,
+    uniform_list,
 };
 use gpui_component::{
     ActiveTheme, IconName, Sizable,
@@ -26,6 +28,7 @@ use gpui_component::{
 };
 
 use crate::actions::CloseWindow;
+use crate::focus::TabRegion as _;
 use crate::probe::Probe as _;
 use crate::stores::{SpacesStore, Stores};
 
@@ -57,6 +60,16 @@ pub struct LibraryView {
     focus_handle: FocusHandle,
     /// Scroll handle for the virtualized listing.
     scroll: UniformListScrollHandle,
+    /// One focus handle per **visible** row, minted lazily and keyed by row
+    /// index. Wave B / audit S7: the rename and archive verbs are hover-gated,
+    /// and gpui suppresses hover entirely under keyboard modality, so the row
+    /// has to know it holds focus in order to reveal them. A handle the *view*
+    /// owns rather than the one `probe` mints, because only the view can ask
+    /// "is this row focused" at render time. `tab_stop(true)` keeps the row in
+    /// the Tab order, which a tracked handle otherwise takes it out of (gpui
+    /// reads the flag off the handle, and `tab_index` on the element is
+    /// ignored once one is tracked).
+    row_focus: HashMap<usize, FocusHandle>,
     /// Test-only: how many times `open_space` has been invoked. Lets the
     /// pencil-propagation regression test prove that clicking the rename pencil
     /// does NOT also trigger the row's open (`open_space` itself defers a real
@@ -81,6 +94,7 @@ impl LibraryView {
             renaming: None,
             focus_handle,
             scroll: UniformListScrollHandle::new(),
+            row_focus: HashMap::new(),
             open_space_requests: 0,
             _subscriptions,
         }
@@ -213,7 +227,12 @@ impl LibraryView {
     /// Render the visible window of listing rows. Indexer for the virtualized
     /// `uniform_list` — clones only the visible slice from the store, so the
     /// per-frame cost is O(visible), not O(loaded).
-    fn render_rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+    fn render_rows(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
         let total = self.spaces.read(cx).list().len();
         let visible: Vec<(usize, SpaceInfo)> = self
             .spaces
@@ -222,9 +241,19 @@ impl LibraryView {
             .get(range.clone())
             .map(|slice| range.clone().zip(slice.iter().cloned()).collect())
             .unwrap_or_default();
+        // Mint this window's row handles up front (the render borrow is
+        // shared), so a row can ask whether it holds focus.
+        for (idx, _) in &visible {
+            self.row_focus
+                .entry(*idx)
+                .or_insert_with(|| cx.focus_handle().tab_stop(true));
+        }
         visible
             .into_iter()
-            .map(|(idx, space)| self.render_row(idx, &space, total, cx).into_any_element())
+            .map(|(idx, space)| {
+                self.render_row(idx, &space, total, window, cx)
+                    .into_any_element()
+            })
             .collect()
     }
 
@@ -233,10 +262,14 @@ impl LibraryView {
         idx: usize,
         space: &SpaceInfo,
         total: usize,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let hovered = self.hovered == Some(idx);
+        let row_focus = self.row_focus.get(&idx);
+        // Hover **or** keyboard focus — see `row_focus`.
+        let hovered =
+            self.hovered == Some(idx) || row_focus.is_some_and(|h| h.contains_focused(window, cx));
         let space_id = space.id.clone();
         let archive_id = space.id.clone();
         let rename_id = space.id.clone();
@@ -388,6 +421,7 @@ impl LibraryView {
             // set metadata AT sees "6 spaces" in a library of six hundred.
             .aria_position_in_set(idx + 1)
             .aria_size_of_set(total)
+            .when_some(row_focus, |d, h| d.track_focus(h))
             .w_full()
             .h(ROW_H)
             .gap_3()
@@ -546,7 +580,9 @@ impl Render for LibraryView {
         let list = uniform_list(
             "library-list",
             count,
-            cx.processor(|this, range: Range<usize>, _window, cx| this.render_rows(range, cx)),
+            cx.processor(|this, range: Range<usize>, window, cx| {
+                this.render_rows(range, window, cx)
+            }),
         )
         .h_full()
         .w_full()
@@ -573,6 +609,7 @@ impl Render for LibraryView {
                     // live), so the wrapper that already spans the viewport is
                     // where the `List` parent goes.
                     .probe("library/list", gpui::Role::List, "Spaces")
+                    .tab_region(crate::focus::region::MAIN)
                     .relative()
                     .h_full()
                     .w_full()
