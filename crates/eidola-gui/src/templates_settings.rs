@@ -960,15 +960,29 @@ impl TemplatesSettingsView {
             }
             None => format!("Responds {}", notify_label(&r.notify_policy)),
         };
+        // Its effective system prompt is real config a template can carry (a
+        // space→template projection preserves a per-membership override), so it
+        // is shown rather than silently dropped — read-only like the rest of the
+        // row, and part of the spoken content.
+        let prompt = r
+            .system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let spoken = match &prompt {
+            Some(p) => format!("{detail} · {p}"),
+            None => detail.clone(),
+        };
         h_flex()
             .id(SharedString::from(format!("template-referenced-{idx}")))
-            // A settled read-only row: the name labels it, the line under it is
-            // its content.
+            // A settled read-only row: the name labels it, the lines under it
+            // are its content.
             .probe_value(
                 format!("settings/templates/editor/referenced/{idx}"),
                 gpui::Role::Label,
                 format!("{} — shared participant", r.label),
-                detail.clone(),
+                spoken,
             )
             .w_full()
             .p_2p5()
@@ -988,7 +1002,15 @@ impl TemplatesSettingsView {
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(SharedString::from(detail)),
-                    ),
+                    )
+                    .when_some(prompt, |el, p| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground.opacity(0.8))
+                                .child(SharedString::from(p)),
+                        )
+                    }),
             )
             .child(
                 div()

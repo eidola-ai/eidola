@@ -102,6 +102,15 @@ impl TemplatesStore {
     /// snapshot and op-error on completion. The shared shape behind every CRUD
     /// method: the bus's `Change::Templates` would also refresh, but composing
     /// the re-list here keeps the store correct on a bus-less test run.
+    ///
+    /// **The re-list runs whether the op succeeded or failed**, because a
+    /// router-bearing create/update is two core calls and can therefore fail
+    /// *partially* — a template created whose router the setter then refused.
+    /// Leaving the snapshot untouched on failure would show the error beside a
+    /// listing that doesn't contain the template that was in fact created. The
+    /// error still wins the `op_error` slot; a re-list that itself fails leaves
+    /// the prior snapshot in place rather than replacing the write's error with
+    /// a read's.
     fn write_then_relist<F>(&mut self, cx: &mut Context<Self>, op: F)
     where
         F: FnOnce(
@@ -118,26 +127,17 @@ impl TemplatesStore {
         let relist_core = core.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let op_result = op(core).await;
-            // Re-list only on success; a failed op leaves the current snapshot
-            // in place and surfaces the error.
-            let list = match &op_result {
-                Ok(()) => Some(
-                    bridge(
-                        relist_core,
-                        |c| async move { c.list_space_templates().await },
-                    )
-                    .await,
-                ),
-                Err(_) => None,
-            };
+            let list = bridge(
+                relist_core,
+                |c| async move { c.list_space_templates().await },
+            )
+            .await;
             let _ = this.update(cx, |this, cx| {
-                match op_result {
-                    Ok(()) => {
-                        if let Some(Ok(templates)) = list {
-                            this.templates = Loadable::loaded(templates);
-                        }
-                    }
-                    Err(e) => this.op_error = Some(e),
+                if let Ok(templates) = list {
+                    this.templates = Loadable::loaded(templates);
+                }
+                if let Err(e) = op_result {
+                    this.op_error = Some(e);
                 }
                 this.task = None;
                 cx.notify();
@@ -173,6 +173,16 @@ impl TemplatesStore {
         self.write_then_relist(cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
+                    // Check the reference BEFORE the create. Setting the router
+                    // is a separate call that validates its backend, so a stale
+                    // pick — the backend disabled or removed while the editor was
+                    // open — would otherwise land a template *without* the router
+                    // it was created with. Validating first makes that a
+                    // zero-trace refusal; what's left is a TOCTOU of microseconds
+                    // inside one future.
+                    if router_model.is_some() {
+                        c.validate_router_model(router_model.clone()).await?;
+                    }
                     let created = c
                         .create_template(title, cascade_limit, participants)
                         .await?;
@@ -195,7 +205,10 @@ impl TemplatesStore {
     ///
     /// Both writes share one `bridge` closure for the reason spelled out on
     /// [`Self::create`] — a bus-driven `refresh` landing between them would
-    /// otherwise drop the router write.
+    /// otherwise drop the router write — and the router reference is validated
+    /// before the update for the same reason it is before a create: the two
+    /// calls cannot be one transaction, so a refused router must not follow an
+    /// applied edit.
     pub fn update(
         &mut self,
         id: String,
@@ -208,6 +221,9 @@ impl TemplatesStore {
         self.write_then_relist(cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
+                    if let Some(router_model) = router_model.clone().flatten() {
+                        c.validate_router_model(Some(router_model)).await?;
+                    }
                     c.update_template(id.clone(), title, cascade_limit, participants)
                         .await?;
                     if let Some(router_model) = router_model {

@@ -6367,6 +6367,115 @@ fn templates_pane_router_model_writes_through_and_off_round_trips(cx: &mut TestA
     drain_runtime(&core);
 }
 
+/// Setting a template's router is a **second** core call after the create, and
+/// it validates its backend — so a pick that went stale (its backend disabled
+/// or removed while the editor was open) must be refused **before** anything is
+/// written, not after a template has already landed without the router it was
+/// created with.
+#[gpui::test]
+fn a_stale_router_pick_refuses_before_creating_the_template(cx: &mut TestAppContext) {
+    let (stores, core, _dir, _space) = participants_scene(cx);
+    stores.templates.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "templates load", |cx| {
+        stores.templates.read_with(cx, |s, _| !s.list().is_empty())
+    });
+
+    // The pick goes stale: its backend is disabled after the editor opened.
+    core.runtime()
+        .block_on(core.set_backend_enabled("eidola".into(), false))
+        .expect("disable eidola");
+
+    stores.templates.update(cx, |s, cx| {
+        s.create(
+            "Doomed".into(),
+            4,
+            Vec::new(),
+            Some("gemma4-31b".into()),
+            cx,
+        );
+    });
+    wait_until(cx, "the refusal surfaces", |cx| {
+        stores
+            .templates
+            .read_with(cx, |s, _| s.op_error().is_some())
+    });
+
+    // Zero trace: the template itself was never created.
+    let titles: Vec<String> = core
+        .runtime()
+        .block_on(core.list_space_templates())
+        .expect("list templates")
+        .into_iter()
+        .map(|t| t.title)
+        .collect();
+    assert!(
+        !titles.iter().any(|t| t == "Doomed"),
+        "a refused router must leave no template behind: {titles:?}"
+    );
+
+    drain_runtime(&core);
+}
+
+/// A `SpaceTemplateInfo` embeds its referenced globals' **effective** config, so
+/// an "edit everywhere" of a shared participant — which emits only
+/// `Change::Participants` — must reach the templates snapshot too.
+#[gpui::test]
+fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    // A template projected from a space carries the shared "You" by reference.
+    core.runtime()
+        .block_on(core.template_from_space(space.clone(), "Projected".into()))
+        .expect("project template");
+    stores.templates.update(cx, |s, cx| s.refresh(cx));
+
+    let referenced_label = |cx: &mut TestAppContext| -> Option<String> {
+        stores.templates.read_with(cx, |s, _| {
+            s.list()
+                .iter()
+                .find(|t| t.title == "Projected")
+                .and_then(|t| t.referenced.first())
+                .map(|r| r.label.clone())
+        })
+    };
+    wait_until(cx, "projected template lists its shared global", |cx| {
+        stores.templates.read_with(cx, |s, _| {
+            s.list()
+                .iter()
+                .find(|t| t.title == "Projected")
+                .map(|t| !t.referenced.is_empty())
+                .unwrap_or(false)
+        })
+    });
+    assert_eq!(referenced_label(cx).as_deref(), Some("You"));
+
+    // Edit everywhere: the shared global's own config moves.
+    stores.participants.update(cx, |s, cx| {
+        s.update_everywhere(
+            space.clone(),
+            eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("Myself".into()),
+                ..Default::default()
+            },
+            cx,
+        );
+    });
+    wait_until(cx, "the edit lands", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space).iter().any(|p| p.label == "Myself")
+        })
+    });
+
+    // The bus bridge isn't installed in this scene, so drive the dispatch it
+    // would have: this is the routing under test.
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+    wait_until(cx, "the templates snapshot follows", |cx| {
+        referenced_label(cx).as_deref() == Some("Myself")
+    });
+
+    drain_runtime(&core);
+}
+
 /// A new agent participant arrives with the shared default system prompt, and
 /// that prompt survives the save.
 #[gpui::test]
