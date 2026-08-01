@@ -64,6 +64,7 @@ use gpui_component::{
 };
 
 use crate::actions::OpenRecord;
+use crate::focus::TabRegion as _;
 use crate::probe::Probe as _;
 use crate::stores::{BackendsStore, ConfigStore, LocalModelsStore, Stores};
 
@@ -1403,6 +1404,7 @@ impl Render for BackendsSettingsView {
                     gpui::Role::TabList,
                     "Backend kinds",
                 )
+                .tab_region(crate::focus::region::NAV)
                 .w_full()
                 .child(
                     TabBar::new("backends-tab-bar")

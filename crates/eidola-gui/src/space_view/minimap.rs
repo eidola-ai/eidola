@@ -17,6 +17,7 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
+use crate::focus::TabRegion as _;
 use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
 
@@ -476,6 +477,7 @@ impl SpaceView {
             // what makes its position at the end of the reading order right
             // rather than a burial (see AGENTS.md → Accessibility).
             .probe("space/minimap", gpui::Role::Navigation, "Conversation map")
+            .tab_region(crate::focus::region::AUX)
             .absolute()
             .top_0()
             .bottom_0()
