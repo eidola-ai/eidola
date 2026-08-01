@@ -315,6 +315,17 @@ pub(crate) struct LocalRuntime {
     failures: StdMutex<HashMap<EngineKey, String>>,
     /// Test override for the machine memory budget ([`memory_budget`]).
     budget_override: StdMutex<Option<u64>>,
+    /// One-way shutdown latch. Set by [`Inner::shutdown_all_engines`] and
+    /// checked by [`Self::reserve_engine`] — **both under the `engines`
+    /// lock**, which is what makes it race-free; the atomic is only here
+    /// because the lock guards a bare `HashMap` rather than a state struct.
+    ///
+    /// Without it, a load already past its `await`s (backend lookup, port
+    /// pick, `fs::metadata`) but not yet at its reservation would resume
+    /// *after* the drain observed an empty registry, reserve, and spawn a
+    /// subprocess that the imminent `exit()` orphans. Never cleared: the
+    /// process is quitting.
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl LocalRuntime {
@@ -374,6 +385,13 @@ impl LocalRuntime {
         shutdown: tokio::sync::oneshot::Sender<()>,
     ) -> Result<Option<Vec<EngineKey>>, String> {
         let mut engines = self.engines.lock().expect("engines lock");
+        // The shutdown authority is checked *here*, inside the reservation's
+        // critical section and under the same lock the drain takes — not by
+        // the caller before its `await`s, which is exactly the window that
+        // would let a mid-flight load spawn a subprocess after the drain.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err("Eidola is shutting down".into());
+        }
         if engines.contains_key(key) {
             return Ok(None);
         }
@@ -1562,12 +1580,31 @@ impl Inner {
     /// spend a shutdown budget on I/O before killing anything. Neither is
     /// acceptable on a quit path.
     ///
+    /// Draining alone would not be enough: a load already past its `await`s
+    /// but not yet at [`LocalRuntime::reserve_engine`] would resume after
+    /// the drain and spawn a subprocess into a process that is about to
+    /// `exit()`. So this also sets the one-way shutdown latch — **inside
+    /// the same lock the reservation takes**, so there is no instant in
+    /// which the registry is empty and loads are still permitted.
+    ///
     /// Like [`Self::unload_local_model`], this *signals*; the supervisor
     /// task owns the child and does the `start_kill`. Callers on a quit
     /// path must leave the runtime a moment to run them.
+    ///
+    /// **It deliberately does not emit `Change::LocalModels`.** Every other
+    /// engine transition does, because something is watching; here nothing
+    /// is — the process is exiting and no consumer can render the change.
+    /// Emitting was actively harmful: the GUI's app-lifetime bus bridge is a
+    /// foreground task that gpui keeps driving through its bounded shutdown
+    /// block, *after* `App::shutdown` has set `quitting`, so the dispatch
+    /// would reach `LocalModelsStore::refresh` → `cx.spawn` → gpui's
+    /// "Can't spawn on main thread after on_app_quit" panic. The one caller
+    /// is the quit hook (`AppCore::shutdown_engines`); there is no other,
+    /// and a new one would want this same silence.
     pub(crate) fn shutdown_all_engines(&self) -> usize {
         let entries: Vec<EngineEntry> = {
             let mut engines = self.local.engines.lock().expect("engines lock");
+            self.local.shutting_down.store(true, Ordering::SeqCst);
             engines.drain().map(|(_, entry)| entry).collect()
         };
         let count = entries.len();
@@ -1575,9 +1612,6 @@ impl Inner {
             // Supervisor may already be gone (crash path); the map removal
             // is the user-visible state either way.
             let _ = entry.shutdown.send(());
-        }
-        if count > 0 {
-            self.bus.emit(Change::LocalModels);
         }
         count
     }
@@ -2055,6 +2089,28 @@ mod tests {
                 .reserve_engine(&key_a, 4003, 6 * GIB, tx_a2)
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn the_shutdown_latch_refuses_a_reservation_that_arrives_after_the_drain() {
+        // A load that was already awaiting (backend lookup, port pick,
+        // `fs::metadata`) when the quit landed resumes *after* the drain saw
+        // an empty registry. Without the latch it would reserve and spawn a
+        // subprocess into a process about to `exit()`. The latch is checked
+        // inside the reservation's own critical section, under the same lock
+        // the drain takes, so there is no window between the two.
+        let runtime = LocalRuntime::default();
+        runtime.set_memory_budget_for_test(10 * GIB);
+        runtime.shutting_down.store(true, Ordering::SeqCst);
+
+        let key = ("local".to_string(), "late".to_string());
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let err = runtime.reserve_engine(&key, 4004, GIB, tx).unwrap_err();
+        assert!(err.contains("shutting down"), "got {err}");
+        assert!(
+            !runtime.engine_present(&key),
+            "a refused reservation leaves nothing to spawn against"
         );
     }
 

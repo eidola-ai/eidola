@@ -89,7 +89,16 @@ pub fn render_unit(exec: &str) -> String {
 /// - a double-quoted word is one argument;
 /// - inside it, `\` escapes, so a literal `\` or `"` must be doubled/escaped;
 /// - `%` introduces a *specifier* anywhere in the unit — including inside
-///   quotes — so a literal `%` must be written `%%`.
+///   quotes — so a literal `%` must be written `%%`;
+/// - `$` introduces **environment expansion** on a command line, likewise
+///   inside quotes, so a literal `$` must be written `$$`. Quoting removal
+///   and expansion are separate passes in systemd's parser — quotes are
+///   stripped when the word is extracted, expansion runs on the resulting
+///   word — which is exactly why `\$` would *not* do it and `$$` does.
+///
+/// The last two are not quote-level escapes at all, which is the trap: a path
+/// like `/opt/100%/x` or `/srv/$app/eidola-gui` looks safely quoted and is
+/// still rewritten out from under you.
 ///
 /// Quoting unconditionally rather than only when needed: one code path is one
 /// fewer thing to get subtly wrong, and systemd accepts a quoted executable
@@ -104,6 +113,7 @@ fn systemd_quote(path: &str) -> String {
                 out.push(ch);
             }
             '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
             _ => out.push(ch),
         }
     }
@@ -146,29 +156,65 @@ pub fn write_unit(config_home: &Path, exec: &str) -> std::io::Result<PathBuf> {
 /// An explicit `--exec` wins. Otherwise look for `eidola-gui` beside this
 /// binary — the layout every one of our artifacts uses (the Nix output, the
 /// cargo target dir, a distro package's `bin/`) — and fall back to a bare
-/// name resolved against `PATH`. A guess that turns out wrong fails loudly
-/// at `systemctl start`, which is the right place for it to fail; refusing to
-/// write a unit at all would be worse.
+/// name resolved against `PATH`.
+///
+/// Every branch goes through [`absolute_existing_exec`], because a unit's
+/// `ExecStart` **must** be absolute and a `--exec` typed at a shell is very
+/// often not (`--exec ./target/release/eidola-gui` is the dev loop).
 pub fn resolve_exec(explicit: Option<String>) -> Result<String, AppError> {
     if let Some(path) = explicit {
-        return Ok(path);
+        return absolute_existing_exec(Path::new(&path));
     }
     if let Ok(me) = std::env::current_exe()
         && let Some(dir) = me.parent()
     {
         let sibling = dir.join("eidola-gui");
         if sibling.is_file() {
-            return Ok(sibling.to_string_lossy().into_owned());
+            return absolute_existing_exec(&sibling);
         }
     }
     if let Some(found) = which_on_path("eidola-gui") {
-        return Ok(found.to_string_lossy().into_owned());
+        return absolute_existing_exec(&found);
     }
     Err(AppError::Config {
         message: "could not find the `eidola-gui` binary (looked beside this \
                   executable and on PATH) — pass `--exec <path>`"
             .into(),
     })
+}
+
+/// Make an executable path absolute (against the install-time CWD) and
+/// refuse one that isn't there.
+///
+/// **Absolutize lexically; do not `canonicalize`.** Canonicalization resolves
+/// symlinks, and the two places a `--exec` most often points are symlinks
+/// *on purpose*: a Nix profile entry, and `target/release/eidola-gui` under a
+/// symlinked checkout. Pinning the unit to today's link target means a
+/// rebuild swaps the link and `systemctl restart` keeps launching the old
+/// binary — silently, which is the worst way to be wrong. Writing the path
+/// the user named leaves the indirection they asked for intact.
+/// `std::path::absolute` is purely lexical: it joins the CWD and drops `.`
+/// components but leaves `..` alone, precisely because resolving `..` is
+/// unsound through a symlink. The kernel resolves both at exec time.
+///
+/// Existence is checked because the alternative is a unit that can only ever
+/// fail, discovered later at `systemctl start` with systemd's own wording
+/// rather than here with ours. Discovery already only yields paths it found,
+/// so this bites exactly the hand-typed `--exec`.
+fn absolute_existing_exec(path: &Path) -> Result<String, AppError> {
+    let absolute = std::path::absolute(path).map_err(|e| AppError::Config {
+        message: format!("could not resolve `{}`: {e}", path.display()),
+    })?;
+    if !absolute.is_file() {
+        return Err(AppError::Config {
+            message: format!(
+                "no executable at `{}` — systemd needs an absolute path to a \
+                 file that exists",
+                absolute.display()
+            ),
+        });
+    }
+    Ok(absolute.to_string_lossy().into_owned())
 }
 
 fn which_on_path(name: &str) -> Option<PathBuf> {
@@ -202,11 +248,35 @@ fn systemctl(args: &[&str]) -> Result<(), AppError> {
     }
 }
 
-/// Refuse before touching the filesystem when there is no systemd to install
-/// into — writing a unit nobody will ever read is worse than saying so.
+/// Refuse before touching the filesystem when there is no **reachable user
+/// manager** to install into — writing a unit nobody will ever read is worse
+/// than saying so, and a half-install (unit written, never reloaded or
+/// enabled) is worse than both.
+///
+/// The probe is `systemctl --user daemon-reload`, not `systemctl --version`.
+/// The version query is answered by the binary itself and succeeds anywhere
+/// the package is present — inside a container, under WSL, on a box where no
+/// per-user systemd instance is running — so it proved only that a *file*
+/// existed while the very next call failed to connect to the bus, after the
+/// unit had already been written. `daemon-reload` is the cheapest operation
+/// that must actually talk to the user manager, it is idempotent, and it is
+/// the same call the install has to make anyway.
 fn require_systemd() -> Result<(), AppError> {
-    match Command::new("systemctl").arg("--version").output() {
-        Ok(_) => Ok(()),
+    let probe = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .output();
+    match probe {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(AppError::Config {
+            message: format!(
+                "no systemd user manager is reachable ({}){}",
+                out.status,
+                match String::from_utf8_lossy(&out.stderr).trim() {
+                    "" => String::new(),
+                    detail => format!(": {detail}"),
+                }
+            ),
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::Config {
             message: "`systemctl` was not found — user services are a \
                       systemd (Linux) facility. On macOS the app already \
@@ -322,14 +392,95 @@ mod tests {
             systemd_quote(r"/opt/a\b/eidola-gui"),
             r#""/opt/a\\b/eidola-gui""#
         );
-        // The template itself must stay specifier-free, or `%%` in a path
-        // would be the only escaped one.
-        assert!(!UNIT_TEMPLATE.replace("@EXEC@", "").contains('%'));
+        // `$` is environment expansion, also inside quotes, and its escape is
+        // `$$` — not `\$`, which the quoting level cannot express, because
+        // systemd strips quotes and expands variables in separate passes.
+        assert_eq!(
+            systemd_quote("/srv/$app/eidola-gui"),
+            r#""/srv/$$app/eidola-gui""#
+        );
+        assert_eq!(
+            systemd_quote("/srv/${HOME}/eidola-gui"),
+            r#""/srv/$${HOME}/eidola-gui""#
+        );
+        // The template's own *directives* must stay specifier- and
+        // expansion-free, or a path's `%%`/`$$` would be the only escaped
+        // one. Comment lines are exempt — systemd expands neither in them,
+        // and one of ours legitimately names `$XDG_CONFIG_HOME`.
+        for line in UNIT_TEMPLATE.replace("@EXEC@", "").lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            assert!(!line.contains('%'), "unescaped specifier in: {line}");
+            assert!(!line.contains('$'), "unescaped expansion in: {line}");
+        }
     }
 
     #[test]
     fn an_explicit_exec_wins_over_discovery() {
-        let resolved = resolve_exec(Some("/somewhere/else/eidola-gui".into())).expect("resolve");
-        assert_eq!(resolved, "/somewhere/else/eidola-gui");
+        // A real file, so the existence gate passes; the point is that
+        // discovery is never consulted.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exe = tmp.path().join("eidola-gui");
+        std::fs::write(&exe, b"#!/bin/sh\n").expect("write");
+        let resolved = resolve_exec(Some(exe.to_string_lossy().into_owned())).expect("resolve");
+        assert_eq!(resolved, exe.to_string_lossy());
+    }
+
+    #[test]
+    fn a_relative_exec_is_resolved_against_the_cwd_not_written_verbatim() {
+        // `--exec ./target/release/eidola-gui` is the dev loop, and systemd
+        // requires an absolute path. Read-only on the CWD — `set_current_dir`
+        // is process-global and these tests run in parallel.
+        let cwd = std::env::current_dir().expect("cwd");
+        let err = resolve_exec(Some("./target/release/eidola-gui-absent".into()))
+            .expect_err("a relative path is resolved, then checked");
+        let message = err.to_string();
+        assert!(
+            message.contains(
+                &cwd.join("target/release/eidola-gui-absent")
+                    .to_string_lossy()
+                    .to_string()
+            ),
+            "the path must be absolutized against the CWD before use; got {message}"
+        );
+    }
+
+    #[test]
+    fn a_resolved_exec_is_absolute_in_the_unit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exe = tmp.path().join("eidola-gui");
+        std::fs::write(&exe, b"#!/bin/sh\n").expect("write");
+        let resolved = resolve_exec(Some(exe.to_string_lossy().into_owned())).expect("resolve");
+        assert!(Path::new(&resolved).is_absolute(), "got {resolved}");
+        assert!(
+            render_unit(&resolved).contains(&format!(r#"ExecStart="{resolved}" --windowless"#))
+        );
+    }
+
+    #[test]
+    fn a_symlinked_exec_keeps_the_link_not_its_target() {
+        // The indirection is the point: a Nix profile entry or a
+        // `target/release` symlink is swapped by a rebuild, and a unit
+        // pinned to today's target would keep launching the old binary.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("eidola-gui-v1");
+        std::fs::write(&real, b"#!/bin/sh\n").expect("write");
+        let link = tmp.path().join("eidola-gui");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let resolved = resolve_exec(Some(link.to_string_lossy().into_owned())).expect("resolve");
+        assert!(resolved.ends_with("/eidola-gui"), "got {resolved}");
+        assert!(
+            !resolved.ends_with("eidola-gui-v1"),
+            "the symlink must not be canonicalized away: {resolved}"
+        );
+    }
+
+    #[test]
+    fn a_missing_exec_is_refused_rather_than_written() {
+        let err = resolve_exec(Some("/definitely/not/here/eidola-gui".into()))
+            .expect_err("a unit that can never start must be refused here");
+        assert!(err.to_string().contains("no executable at"), "got {err}");
     }
 }
