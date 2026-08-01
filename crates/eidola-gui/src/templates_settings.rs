@@ -10,9 +10,21 @@
 //!
 //! Template participant editing works on a **working copy** (`Vec<ParticipantDraft>`)
 //! and saves the whole set through `AppCore::update_template` /
-//! `create_template` (which replace the template's owned agents atomically) —
-//! templates own their participant rows outright, so there is no
-//! override/referenced fork here (that is a per-space concept).
+//! `create_template` (which replace the template's owned **agent** rows
+//! atomically) — templates own those rows outright, so there is no
+//! override/referenced fork here (that is a per-space concept). A template's
+//! *referenced* globals (`SpaceTemplateInfo::referenced` — the shared "You" a
+//! space→template projection carries) are listed **read-only**: they belong to
+//! another surface, and no write path here touches them.
+//!
+//! The **router model** (task 22's may-decline router) is a template setting
+//! copied into every space the template instantiates. Its default — `None`,
+//! rendered "Off" — is a normal choice, not a degraded one; and because a
+//! remote (`eidola`) router bills an inference on *every* post in those spaces,
+//! the cost is stated inline under the row whenever a remote reference is
+//! selected. It saves through the dedicated
+//! `AppCore::set_template_router_model` (composed into `TemplatesStore::create`
+//! / `update`), not through the create/update signatures.
 
 use eidola_app_core::{NewTemplateParticipant, SpaceTemplateInfo};
 use gpui::{
@@ -27,11 +39,23 @@ use gpui_component::{
 };
 
 use crate::participants_view::{
-    NOTIFY_POLICIES, error_banner, field_label, ghost_button, ghost_button_labeled,
-    load_error_panel, mode_chip, model_field,
+    DEFAULT_AGENT_SYSTEM_PROMPT, NOTIFY_POLICIES, error_banner, field_label, ghost_button,
+    ghost_button_labeled, load_error_panel, mode_chip, model_display, model_field, model_groups,
+    notify_label,
 };
 use crate::probe::Probe as _;
 use crate::stores::{ConfigStore, Stores, TemplatesStore};
+
+/// The mandatory cost copy under a router row holding a **remote** reference.
+/// A remote router bills an inference per post in every space this template
+/// makes; an engine-served one is genuinely free (the zero-spend path). Always
+/// visible, never a tooltip.
+pub const ROUTER_REMOTE_COST_NOTE: &str = "Every post in spaces from this template is routed through this model, \
+     billed per call. Local models route free.";
+
+/// What the router picker does, said once under the row.
+const ROUTER_HELP: &str = "A small model that decides which participants a post is worth waking. When off, \
+     notifications simply follow each participant's notify setting.";
 
 /// One agent participant being edited inside a template draft.
 struct ParticipantDraft {
@@ -41,15 +65,31 @@ struct ParticipantDraft {
     notify_policy: String,
 }
 
+/// Which model picker is open — at most one at a time (they share
+/// `picker_scroll`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenPicker {
+    Participant(usize),
+    Router,
+}
+
 /// The in-progress template editor (create or edit).
 struct TemplateDraft {
     /// `None` while creating a brand-new template.
     id: Option<String>,
     title: Entity<InputState>,
     cascade_limit: i64,
+    /// The may-decline router reference; `None` = Off (the default).
+    router_model: Option<String>,
+    /// What the router was when the draft opened — so a save writes the setting
+    /// only when it actually moved (its setter is separate from
+    /// `update_template` and emits its own `Change::Templates`).
+    router_original: Option<String>,
     participants: Vec<ParticipantDraft>,
-    /// The participant index whose model picker is open, if any.
-    picker: Option<usize>,
+    /// The referenced globals this template carries, listed read-only.
+    referenced: Vec<eidola_app_core::TemplateReferencedParticipant>,
+    /// The open model picker, if any.
+    picker: Option<OpenPicker>,
 }
 
 pub struct TemplatesSettingsView {
@@ -127,6 +167,31 @@ impl TemplatesSettingsView {
         self.draft.as_ref().map(|d| d.participants.len())
     }
 
+    /// The draft's router reference — outer `None` = not editing, inner `None`
+    /// = Off.
+    #[doc(hidden)]
+    pub fn draft_router_model(&self) -> Option<Option<String>> {
+        self.draft.as_ref().map(|d| d.router_model.clone())
+    }
+
+    #[doc(hidden)]
+    pub fn draft_participant_prompt_state(&self, idx: usize) -> Option<Entity<InputState>> {
+        self.draft
+            .as_ref()?
+            .participants
+            .get(idx)
+            .map(|p| p.system_prompt.clone())
+    }
+
+    #[doc(hidden)]
+    pub fn draft_participant_prompt(&self, idx: usize, cx: &gpui::App) -> Option<String> {
+        self.draft
+            .as_ref()?
+            .participants
+            .get(idx)
+            .map(|p| p.system_prompt.read(cx).value().to_string())
+    }
+
     // --- Editing ---------------------------------------------------------
 
     fn new_participant_draft(
@@ -153,16 +218,31 @@ impl TemplatesSettingsView {
         }
     }
 
+    /// A brand-new agent draft: the resolved default model plus the shared
+    /// default system prompt, so the field arrives filled rather than blank.
+    fn new_agent_draft(&self, window: &mut Window, cx: &mut Context<Self>) -> ParticipantDraft {
+        let default_model = self.stores.config.read(cx).default_model();
+        self.new_participant_draft(
+            "Assistant",
+            Some(default_model),
+            Some(DEFAULT_AGENT_SYSTEM_PROMPT.to_string()),
+            "human",
+            window,
+            cx,
+        )
+    }
+
     pub fn begin_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let title = cx.new(|cx| InputState::new(window, cx).placeholder("Template name"));
-        let default_model = self.stores.config.read(cx).default_model();
-        let agent =
-            self.new_participant_draft("Assistant", Some(default_model), None, "human", window, cx);
+        let agent = self.new_agent_draft(window, cx);
         self.draft = Some(TemplateDraft {
             id: None,
             title,
             cascade_limit: 4,
+            router_model: None,
+            router_original: None,
             participants: vec![agent],
+            referenced: Vec::new(),
             picker: None,
         });
         cx.notify();
@@ -191,7 +271,10 @@ impl TemplatesSettingsView {
             id: Some(t.id.clone()),
             title,
             cascade_limit: t.cascade_limit,
+            router_model: t.router_model.clone(),
+            router_original: t.router_model.clone(),
             participants,
+            referenced: t.referenced.clone(),
             picker: None,
         });
         cx.notify();
@@ -203,9 +286,7 @@ impl TemplatesSettingsView {
     }
 
     pub fn add_participant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let default_model = self.stores.config.read(cx).default_model();
-        let agent =
-            self.new_participant_draft("Assistant", Some(default_model), None, "human", window, cx);
+        let agent = self.new_agent_draft(window, cx);
         if let Some(draft) = self.draft.as_mut() {
             draft.participants.push(agent);
         }
@@ -231,14 +312,14 @@ impl TemplatesSettingsView {
         cx.notify();
     }
 
-    pub fn toggle_participant_picker(&mut self, idx: usize, cx: &mut Context<Self>) {
+    fn toggle_picker(&mut self, target: OpenPicker, cx: &mut Context<Self>) {
         let mut opened = false;
         if let Some(draft) = self.draft.as_mut() {
-            draft.picker = if draft.picker == Some(idx) {
+            draft.picker = if draft.picker == Some(target) {
                 None
             } else {
                 opened = true;
-                Some(idx)
+                Some(target)
             };
         }
         if opened {
@@ -246,6 +327,14 @@ impl TemplatesSettingsView {
             self.picker_scroll = ScrollHandle::new();
         }
         cx.notify();
+    }
+
+    pub fn toggle_participant_picker(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.toggle_picker(OpenPicker::Participant(idx), cx);
+    }
+
+    pub fn toggle_router_picker(&mut self, cx: &mut Context<Self>) {
+        self.toggle_picker(OpenPicker::Router, cx);
     }
 
     pub fn set_participant_model(&mut self, idx: usize, model_id: &str, cx: &mut Context<Self>) {
@@ -256,6 +345,29 @@ impl TemplatesSettingsView {
             draft.picker = None;
         }
         cx.notify();
+    }
+
+    /// Choose the draft's router reference — `None` is **Off**, the default and
+    /// an ordinary choice.
+    pub fn set_router_model(&mut self, model_id: Option<&str>, cx: &mut Context<Self>) {
+        if let Some(draft) = self.draft.as_mut() {
+            draft.router_model = model_id.map(str::to_string);
+            draft.picker = None;
+        }
+        cx.notify();
+    }
+
+    /// True when a model reference routes to the **remote** eidola backend —
+    /// the condition (and only condition) for the per-call cost note. The
+    /// registry answers it; an unloaded registry falls back to the reference's
+    /// own backend id, which `parse_model_ref` canonicalizes (a bare name is
+    /// eidola).
+    fn is_remote_ref(&self, selection: &str, cx: &gpui::App) -> bool {
+        let backend_id = eidola_app_core::parse_model_ref(selection).backend_id;
+        match self.stores.backends.read(cx).get(&backend_id) {
+            Some(b) => b.kind == eidola_app_core::BackendKind::Eidola,
+            None => backend_id == eidola_app_core::EIDOLA_BACKEND_ID,
+        }
     }
 
     pub fn cascade_inc(&mut self, delta: i64, cx: &mut Context<Self>) {
@@ -293,13 +405,25 @@ impl TemplatesSettingsView {
             })
             .collect();
         let cascade_limit = draft.cascade_limit;
+        let router = draft.router_model.clone();
         match draft.id {
-            Some(id) => self.templates_store.update(cx, |s, cx| {
-                s.update(id, Some(title), Some(cascade_limit), Some(participants), cx)
+            Some(id) => {
+                // The router has its own setter, so write it only when it moved.
+                let router_change = (router != draft.router_original).then_some(router);
+                self.templates_store.update(cx, |s, cx| {
+                    s.update(
+                        id,
+                        Some(title),
+                        Some(cascade_limit),
+                        Some(participants),
+                        router_change,
+                        cx,
+                    )
+                })
+            }
+            None => self.templates_store.update(cx, |s, cx| {
+                s.create(title, cascade_limit, participants, router, cx)
             }),
-            None => self
-                .templates_store
-                .update(cx, |s, cx| s.create(title, cascade_limit, participants, cx)),
         }
         cx.notify();
     }
@@ -430,10 +554,18 @@ impl TemplatesSettingsView {
         let id_default = t.id.clone();
         let id_remove = t.id.clone();
         let subject = t.title.clone();
-        let names: Vec<String> = t.participants.iter().map(|p| p.label.clone()).collect();
+        let mut names: Vec<String> = t.referenced.iter().map(|r| r.label.clone()).collect();
+        names.extend(t.participants.iter().map(|p| p.label.clone()));
+        // A router that bills per post shouldn't be hidden a click deep, so the
+        // resting row names it (Off says nothing — it is the default).
+        let router = t.router_model.as_deref().map(|r| {
+            let (name, _) = model_display(&self.stores, r, cx);
+            format!("router {name} · ")
+        });
         let summary = format!(
-            "cascade {} · {}",
+            "cascade {} · {}{}",
             t.cascade_limit,
+            router.unwrap_or_default(),
             if names.is_empty() {
                 "no agents".to_string()
             } else {
@@ -590,10 +722,24 @@ impl TemplatesSettingsView {
                 ),
         );
 
+        // Router model — Off by default, with the per-call cost stated inline
+        // whenever a remote reference is chosen.
+        card = card
+            .child(field_label("Router model", cx))
+            .child(self.render_router_field(draft, cx));
+
         // Participants.
         card = card.child(field_label("Participants", cx));
+        for (idx, r) in draft.referenced.iter().enumerate() {
+            card = card.child(self.render_referenced(idx, r, cx));
+        }
         for (idx, p) in draft.participants.iter().enumerate() {
-            card = card.child(self.render_participant(idx, p, draft.picker == Some(idx), cx));
+            card = card.child(self.render_participant(
+                idx,
+                p,
+                draft.picker == Some(OpenPicker::Participant(idx)),
+                cx,
+            ));
         }
         card = card.child(
             div()
@@ -633,6 +779,226 @@ impl TemplatesSettingsView {
                 )),
         )
         .into_any_element()
+    }
+
+    /// The router-model row: a picker over the same qualified references the
+    /// chat model picker offers, with **Off** as its first option (and its
+    /// resting label) — the default, rendered as a normal choice rather than a
+    /// degraded one. A remote selection always carries the per-call cost note
+    /// beneath the row.
+    fn render_router_field(&self, draft: &TemplateDraft, cx: &Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let open = draft.picker == Some(OpenPicker::Router);
+        let selection = draft.router_model.as_deref();
+        let (name, backend) = match selection {
+            Some(sel) => {
+                let (n, b) = model_display(&self.stores, sel, cx);
+                (n, Some(b))
+            }
+            None => ("Off".into(), None),
+        };
+
+        let button = h_flex()
+            .id("template-router-button")
+            .probe(
+                "settings/templates/editor/router",
+                gpui::Role::Button,
+                "Router model",
+            )
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .justify_between()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_baseline()
+                    .child(div().text_sm().child(name))
+                    .when_some(backend, |el, b| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(SharedString::from(format!("· {b}"))),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("▾"),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_router_picker(cx)));
+
+        let mut col = v_flex().w_full().gap_1().child(button);
+
+        if open {
+            let mut menu = v_flex()
+                .id("template-router-menu")
+                .probe(
+                    "settings/templates/editor/router/menu",
+                    gpui::Role::ListBox,
+                    "Router models",
+                )
+                .w_full()
+                .max_h(gpui::px(220.))
+                .overflow_y_scroll()
+                .track_scroll(&self.picker_scroll)
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                // Off leads the list: it is the default, and it is a choice.
+                .child(
+                    div()
+                        .id("template-router-opt-off")
+                        .probe(
+                            "settings/templates/editor/router/option/off",
+                            gpui::Role::Button,
+                            "Off",
+                        )
+                        .px_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .text_sm()
+                        .hover(|s| s.bg(theme.secondary.opacity(0.6)))
+                        .when(selection.is_none(), |el| el.text_color(theme.link))
+                        .child("Off")
+                        .on_click(cx.listener(|this, _, _, cx| this.set_router_model(None, cx))),
+                );
+            for (gi, (header, models)) in model_groups(&self.stores, cx).into_iter().enumerate() {
+                menu = menu.child(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(header)),
+                );
+                for (mi, (id, display)) in models.into_iter().enumerate() {
+                    let selected = selection == Some(id.as_str());
+                    let pick_id = id.clone();
+                    menu = menu.child(
+                        div()
+                            .id(SharedString::from(format!("template-router-opt-{gi}-{mi}")))
+                            .probe(
+                                format!("settings/templates/editor/router/option/{gi}/{mi}"),
+                                gpui::Role::Button,
+                                display.clone(),
+                            )
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .text_sm()
+                            .hover(|s| s.bg(theme.secondary.opacity(0.6)))
+                            .when(selected, |el| el.text_color(theme.link))
+                            .child(SharedString::from(display))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_router_model(Some(&pick_id), cx)
+                            })),
+                    );
+                }
+            }
+            col = col.child(div().relative().w_full().child(menu).child(
+                crate::scrollbar::vertical_floating("router-picker-scrollbar", &self.picker_scroll),
+            ));
+        }
+
+        // The cost note is exactly remote-conditional, and always visible when
+        // it applies (a cost a person only discovers on hover is not disclosed).
+        if selection.is_some_and(|sel| self.is_remote_ref(sel, cx)) {
+            col = col.child(
+                div()
+                    .id("template-router-cost")
+                    .probe(
+                        "settings/templates/editor/router/cost",
+                        gpui::Role::Label,
+                        ROUTER_REMOTE_COST_NOTE,
+                    )
+                    .text_xs()
+                    .text_color(theme.warning)
+                    .child(ROUTER_REMOTE_COST_NOTE),
+            );
+        }
+
+        col.child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground.opacity(0.8))
+                .child(ROUTER_HELP),
+        )
+        .into_any_element()
+    }
+
+    /// A global this template references — listed so it isn't invisible, and
+    /// read-only because it is another surface's row (shared everywhere it is
+    /// referenced; no write path here touches it).
+    fn render_referenced(
+        &self,
+        idx: usize,
+        r: &eidola_app_core::TemplateReferencedParticipant,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let detail = match r.model_ref.as_deref() {
+            Some(m) => {
+                let (name, backend) = model_display(&self.stores, m, cx);
+                format!(
+                    "{name} · {backend} · responds {}",
+                    notify_label(&r.notify_policy)
+                )
+            }
+            None => format!("Responds {}", notify_label(&r.notify_policy)),
+        };
+        h_flex()
+            .id(SharedString::from(format!("template-referenced-{idx}")))
+            // A settled read-only row: the name labels it, the line under it is
+            // its content.
+            .probe_value(
+                format!("settings/templates/editor/referenced/{idx}"),
+                gpui::Role::Label,
+                format!("{} — shared participant", r.label),
+                detail.clone(),
+            )
+            .w_full()
+            .p_2p5()
+            .gap_2()
+            .items_start()
+            .justify_between()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border.opacity(0.4))
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .min_w_0()
+                    .child(div().text_sm().child(SharedString::from(r.label.clone())))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(detail)),
+                    ),
+            )
+            .child(
+                div()
+                    .px_1p5()
+                    .rounded_sm()
+                    .bg(theme.secondary)
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("shared"),
+            )
     }
 
     fn render_participant(

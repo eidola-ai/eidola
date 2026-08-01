@@ -1719,12 +1719,20 @@ fn template_from_space_projects_and_emits_templates() {
             .runtime()
             .block_on(core.template_from_space(sid, "From Space".into()))
             .unwrap();
-        // The space's one agent (from the default template) projects across;
-        // the human is excluded (its membership is implicit).
+        // The space's one agent (from the default template) projects across as
+        // an OWNED row; the human projects as a *reference*, so it is absent
+        // from `participants` (the owned set every write path replaces) and
+        // present in `referenced`.
         assert_eq!(tmpl.participants.len(), 1);
         assert_eq!(
             tmpl.participants[0].model_ref.as_deref(),
             Some(eidola_app_core::config::DEFAULT_MODEL)
+        );
+        assert_eq!(tmpl.referenced.len(), 1, "the shared human rides across");
+        assert_eq!(
+            tmpl.referenced[0].id,
+            eidola_app_core::HUMAN_PARTICIPANT_ID,
+            "and it is the shared \"You\""
         );
         assert!(
             drain(&mut rx).contains(&Change::Templates),

@@ -2605,6 +2605,7 @@ fn probe_templates() -> Vec<SpaceTemplateInfo> {
                 system_prompt: None,
                 notify_policy: "human".into(),
             }],
+            referenced: Vec::new(),
         },
         SpaceTemplateInfo {
             id: "tmpl-research".into(),
@@ -2612,6 +2613,15 @@ fn probe_templates() -> Vec<SpaceTemplateInfo> {
             cascade_limit: 6,
             router_model: None,
             participants: Vec::new(),
+            // A template saved from a space carries the shared "You" by
+            // reference — the read-only half of the editor's participant list.
+            referenced: vec![eidola_app_core::TemplateReferencedParticipant {
+                id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+                kind: "human".into(),
+                label: "You".into(),
+                model_ref: None,
+                notify_policy: "explicit".into(),
+            }],
         },
     ]
 }
@@ -2668,6 +2678,92 @@ fn templates_pane_probes_cover_rows_and_editor(cx: &mut TestAppContext) {
             "template editor probe {expected:?} missing: {names:?}"
         );
     }
+
+    probe::set_probes_enabled(false);
+}
+
+/// The router row's probes, and the cost note's exact condition: it is present
+/// for a **remote** (eidola) reference and absent for Off and for a local one.
+/// Both directions, because a cost warning that never disappears teaches
+/// nothing and one that never appears is the whole failure this copy exists to
+/// prevent.
+#[gpui::test]
+fn templates_pane_router_probes_and_remote_cost_note(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.templates = probe_templates();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("tmpl-research", window, cx));
+    })
+    .unwrap();
+
+    // Off (the default): the picker is there, the cost note is not.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router",
+        gpui::Role::Button,
+        "Router model",
+    );
+    // The referenced global this template carries is listed read-only — named,
+    // with its config as the content, and no verbs.
+    assert_probe_value(
+        &entries,
+        "settings/templates/editor/referenced/0",
+        gpui::Role::Label,
+        "You — shared participant",
+        "Responds when asked",
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "settings/templates/editor/router/cost"),
+        "Off must carry no cost note"
+    );
+
+    // Opening the picker offers Off as a first-class option.
+    view.update(cx, |v, cx| v.toggle_router_picker(cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router/menu",
+        gpui::Role::ListBox,
+        "Router models",
+    );
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router/option/off",
+        gpui::Role::Button,
+        "Off",
+    );
+
+    // A remote (eidola) reference: the note is visible, in full, always.
+    view.update(cx, |v, cx| v.set_router_model(Some("gemma4-31b"), cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router/cost",
+        gpui::Role::Label,
+        eidola_gui::templates_settings::ROUTER_REMOTE_COST_NOTE,
+    );
+
+    // A local reference routes free — no note.
+    view.update(cx, |v, cx| {
+        v.set_router_model(Some("gemma-4-e2b@local"), cx)
+    });
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "settings/templates/editor/router/cost"),
+        "a local router routes free — no per-call cost note"
+    );
 
     probe::set_probes_enabled(false);
 }
