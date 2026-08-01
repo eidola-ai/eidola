@@ -15,3 +15,8 @@ clap = { version = "4", features = ["derive"] }
 eidola-app-core = { path = "../eidola-app-core" }
 open = "5"
 tokio = { version = "1", features = ["sync", "macros", "time", "signal"] }
+
+[dev-dependencies]
+# `service::install` writes into an XDG config home; the unit tests point it
+# at a temp dir rather than the developer's real ~/.config.
+tempfile = "3"
