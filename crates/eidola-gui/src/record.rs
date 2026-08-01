@@ -38,6 +38,7 @@ use gpui_component::{
 
 use crate::actions::CloseWindow;
 use crate::bridge;
+use crate::focus::TabRegion as _;
 use crate::probe::Probe as _;
 use crate::stores::Stores;
 
@@ -711,6 +712,7 @@ impl Render for RecordView {
                 v_flex()
                     .id("record-body")
                     .probe("record/body", body_role, body_label)
+                    .tab_region(crate::focus::region::MAIN)
                     .relative()
                     .flex_1()
                     .w_full()
@@ -812,11 +814,10 @@ impl RecordView {
         // the section tabs) drag the window. The tabs/refresh keep their own
         // clicks — a plain click never arms a move.
         crate::titlebar::make_draggable(
-            strip.id("record-strip").probe(
-                "record/sections",
-                gpui::Role::TabList,
-                "Record sections",
-            ),
+            strip
+                .id("record-strip")
+                .probe("record/sections", gpui::Role::TabList, "Record sections")
+                .tab_region(crate::focus::region::NAV),
             "record-strip",
             window,
             cx,

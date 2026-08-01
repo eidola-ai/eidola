@@ -371,6 +371,7 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
         theme.dark_theme = Rc::new(circadian_night(character, settings.font_scale));
     }
     Theme::change(mode, window, cx);
+    snapshot_ring_colors(cx);
     if cx.has_global::<ThemeState>() {
         cx.global_mut::<ThemeState>().applied = Some((mode, character));
     }
@@ -381,6 +382,27 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
     for handle in cx.windows() {
         handle.update(cx, |_, window, _| window.refresh()).ok();
     }
+}
+
+/// Snapshot the focus ring's two colors out of the palette that was just
+/// installed, so `probe_inner` — which has no `App` to ask — can build the
+/// ring. Called from the two paths that ever change the theme. The ring is the
+/// palette's own accent (`ring`: a muted blue-grey by day, the brand's warm
+/// orange by night) at the day/night alpha; the spacer is the paper it sits on.
+fn snapshot_ring_colors(cx: &App) {
+    let theme = gpui_component::Theme::global(cx);
+    let alpha = if theme.is_dark() {
+        crate::focus::RING_ALPHA_NIGHT
+    } else {
+        crate::focus::RING_ALPHA_DAY
+    };
+    crate::focus::set_ring_colors(crate::focus::RingColors {
+        ring: gpui::Hsla {
+            a: alpha,
+            ..theme.ring
+        },
+        paper: theme.background,
+    });
 }
 
 /// The current base type-scale factor from the theme global (`1.0` when the
@@ -410,6 +432,7 @@ pub fn apply_fixed(mode: ThemeMode, character: LightCharacter, cx: &mut App) {
         theme.dark_theme = Rc::new(circadian_night(character, scale));
     }
     Theme::change(mode, None, cx);
+    snapshot_ring_colors(cx);
     for handle in cx.windows() {
         handle.update(cx, |_, window, _| window.refresh()).ok();
     }
