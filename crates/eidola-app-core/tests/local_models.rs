@@ -611,3 +611,78 @@ fn shutdown_reaches_an_engine_the_model_scan_cannot_see() {
         );
     });
 }
+
+/// The quit-time drain must stay **silent** on the invalidation bus.
+///
+/// Every other engine transition emits `Change::LocalModels` because
+/// something is watching. Here nothing is: the process is exiting. Worse,
+/// the GUI's app-lifetime bus bridge is a foreground task gpui keeps driving
+/// through its bounded shutdown block — *after* `App::shutdown` sets
+/// `quitting` — so a dispatch would reach `LocalModelsStore::refresh` →
+/// `cx.spawn` → gpui's "Can't spawn on main thread after on_app_quit" panic,
+/// turning a clean quit into a crash on exactly the machines that have an
+/// engine loaded.
+#[test]
+fn the_shutdown_drain_emits_nothing() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        core.test_register_engine("local", "loaded", 1, GIB, false, 100);
+        let mut rx = core.subscribe_changes();
+
+        assert_eq!(core.shutdown_engines(), 1, "an engine was signalled");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the drain must not emit — nobody can render it, and the GUI \
+             bridge would dispatch it into gpui's quitting state"
+        );
+    });
+}
+
+/// A load that arrives after the quit-time drain must not spawn.
+///
+/// `load_local_model` does real async work before it reserves — backend
+/// lookup, port pick, `fs::metadata` — so a quit landing mid-load would
+/// otherwise let the load resume *past* a drain that saw an empty registry,
+/// reserve, and spawn a subprocess into a process about to `exit()`. The
+/// shutdown latch is set inside the same lock the reservation takes, so the
+/// refusal happens at the write point rather than on captured state.
+#[test]
+fn a_load_after_the_shutdown_drain_is_refused_and_spawns_nothing() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let models_dir = _dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("wanted.gguf"), vec![0u8; 64]).unwrap();
+        // `/usr/bin/false` exits immediately, so a load that *did* get past
+        // the latch would fail with the engine's own message — which is what
+        // distinguishes "refused before spawning" from "spawned and died".
+        core.set_llama_server_path(Some("/usr/bin/false".into()))
+            .unwrap();
+
+        assert_eq!(core.shutdown_engines(), 0, "nothing is loaded yet");
+
+        let err = core
+            .runtime()
+            .block_on(core.load_local_model("wanted@local".into()))
+            .expect_err("a load after the drain must be refused");
+        assert!(err.to_string().contains("shutting down"), "got {err}");
+
+        // Nothing was reserved, so nothing is there to tear down or to
+        // leave behind as a warming entry.
+        assert_eq!(core.shutdown_engines(), 0);
+        let state = core
+            .runtime()
+            .block_on(core.local_models_state())
+            .expect("state");
+        let wanted = state
+            .models
+            .iter()
+            .find(|m| m.slug == "wanted")
+            .expect("the file is still on disk");
+        assert!(
+            matches!(wanted.status, LocalModelStatus::Available),
+            "no engine entry was created: {:?}",
+            wanted.status
+        );
+    });
+}
