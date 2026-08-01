@@ -570,3 +570,44 @@ fn local_chat_with_missing_model_is_typed_error() {
         assert_eq!(messages[0].role, "user");
     });
 }
+
+/// Quit-time teardown must reach every **live** engine, including one the
+/// model snapshot cannot see.
+///
+/// `local_models_state` is reconstructed by *scanning* the model directories
+/// and consulting the engine map only to decorate a `.gguf` it already found
+/// — so an engine whose backing file was renamed or deleted mid-session is
+/// absent from that snapshot while its subprocess is still running. A
+/// teardown written as a loop over the snapshot would silently leave it
+/// behind, which on macOS means orphaning it to launchd for good.
+#[test]
+fn shutdown_reaches_an_engine_the_model_scan_cannot_see() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let models_dir = _dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        // A loaded engine whose file was removed after it started. No
+        // `.gguf` is written at all — the same state a rename produces.
+        core.test_register_engine("local", "ghost", 1, GIB, false, 100);
+
+        let state = core
+            .runtime()
+            .block_on(core.local_models_state())
+            .expect("state");
+        assert!(
+            !state.models.iter().any(|m| m.slug == "ghost"),
+            "precondition: the scan-based snapshot cannot see this engine"
+        );
+
+        assert_eq!(
+            core.shutdown_engines(),
+            1,
+            "the registry-based teardown signals it anyway"
+        );
+        assert_eq!(
+            core.shutdown_engines(),
+            0,
+            "the registry is drained, so teardown is idempotent"
+        );
+    });
+}

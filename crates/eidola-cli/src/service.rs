@@ -75,7 +75,40 @@ WantedBy=default.target
 
 /// Render the unit for a concrete executable path.
 pub fn render_unit(exec: &str) -> String {
-    UNIT_TEMPLATE.replace("@EXEC@", exec)
+    UNIT_TEMPLATE.replace("@EXEC@", &systemd_quote(exec))
+}
+
+/// Quote a path for a systemd command line.
+///
+/// `ExecStart=` is **split on whitespace**, so a bare
+/// `/home/me/Eidola Builds/eidola-gui` would run `/home/me/Eidola` with
+/// `Builds/eidola-gui` as its first argument — and a path with a space in it
+/// is entirely ordinary on a desktop. Systemd's rules, all three of which
+/// apply here:
+///
+/// - a double-quoted word is one argument;
+/// - inside it, `\` escapes, so a literal `\` or `"` must be doubled/escaped;
+/// - `%` introduces a *specifier* anywhere in the unit — including inside
+///   quotes — so a literal `%` must be written `%%`.
+///
+/// Quoting unconditionally rather than only when needed: one code path is one
+/// fewer thing to get subtly wrong, and systemd accepts a quoted executable
+/// exactly as it accepts a bare one.
+fn systemd_quote(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('"');
+    for ch in path.chars() {
+        match ch {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '%' => out.push_str("%%"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Where the unit belongs, under a given XDG config home.
@@ -232,7 +265,7 @@ mod tests {
     fn the_rendered_unit_starts_the_gui_windowless() {
         let unit = render_unit("/opt/eidola/bin/eidola-gui");
         assert!(
-            unit.contains("ExecStart=/opt/eidola/bin/eidola-gui --windowless"),
+            unit.contains(r#"ExecStart="/opt/eidola/bin/eidola-gui" --windowless"#),
             "unit must launch the resolved binary in windowless mode:\n{unit}"
         );
         assert!(!unit.contains("@EXEC@"), "every placeholder is substituted");
@@ -260,6 +293,38 @@ mod tests {
         let written = std::fs::read_to_string(&path).expect("read back");
         assert!(written.contains("/new/eidola-gui"));
         assert!(!written.contains("/old/eidola-gui"));
+    }
+
+    #[test]
+    fn a_path_with_whitespace_stays_one_argument() {
+        // Unquoted, systemd would split this into the executable
+        // `/home/me/Eidola` with `Builds/eidola-gui` as its first argument.
+        let unit = render_unit("/home/me/Eidola Builds/eidola-gui");
+        assert!(
+            unit.contains(r#"ExecStart="/home/me/Eidola Builds/eidola-gui" --windowless"#),
+            "the whole path must be one quoted argument:\n{unit}"
+        );
+    }
+
+    #[test]
+    fn quoting_escapes_what_systemd_would_otherwise_read() {
+        // `%` is a specifier anywhere in the unit — even inside quotes — and
+        // `"`/`\` are the quoted word's own escapes.
+        assert_eq!(
+            systemd_quote("/opt/100%/eidola-gui"),
+            r#""/opt/100%%/eidola-gui""#
+        );
+        assert_eq!(
+            systemd_quote(r#"/opt/a"b/eidola-gui"#),
+            r#""/opt/a\"b/eidola-gui""#
+        );
+        assert_eq!(
+            systemd_quote(r"/opt/a\b/eidola-gui"),
+            r#""/opt/a\\b/eidola-gui""#
+        );
+        // The template itself must stay specifier-free, or `%%` in a path
+        // would be the only escaped one.
+        assert!(!UNIT_TEMPLATE.replace("@EXEC@", "").contains('%'));
     }
 
     #[test]

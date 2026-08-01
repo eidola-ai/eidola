@@ -151,56 +151,43 @@ pub fn reactivate(cx: &mut App, open_when_empty: impl FnOnce(&mut App)) {
 /// quit on macOS leaves every loaded `llama-server` running, holding
 /// gigabytes, adopted by launchd.
 ///
-/// Bounded by `gpui::SHUTDOWN_TIMEOUT` (200ms), so it is one round trip: the
-/// whole sweep runs inside a single bridged future on the core's runtime.
-/// Signalling an engine's supervisor is a channel send, and the supervisor is
-/// already parked on it, so the `start_kill` that follows lands in
-/// microseconds; the short sleep is insurance, not a wait.
+/// **It enumerates the live engine registry, not a model snapshot.**
+/// `AppCore::shutdown_engines` is synchronous, infallible and touches no
+/// filesystem — which is the whole reason it exists rather than a loop over
+/// `local_models_state`. That snapshot is *reconstructed by scanning* the
+/// managed models directory and every `llamacpp` backend's directory (a
+/// `read_dir`, a `stat` and a sidecar read per `.gguf`, plus a DB round trip
+/// to list the backends), consulting the engine map only to decorate a file
+/// it already found. So an engine whose backing `.gguf` was renamed or
+/// deleted mid-session is *absent* from it while its subprocess is very much
+/// alive, a `Result` means an unreadable directory could skip the sweep
+/// entirely, and a large or slow directory could spend the whole budget on
+/// I/O before killing anything. On a quit path none of that is acceptable.
 ///
-/// This is best-effort by construction and says so: a quit that outruns the
-/// budget still exits. A hard guarantee wants the OS to enforce it
-/// (`PR_SET_PDEATHSIG` on Linux; macOS has no equivalent and would need an
-/// explicit synchronous reap in app-core) — a follow-up, not wave 2.
+/// Signalling is not reaping — the supervisor task owns the child — so the
+/// hook yields briefly afterwards to let the runtime run them. `parked` (a
+/// timer on gpui's own executor, not tokio's) is what lets the tokio threads
+/// make that progress while `App::shutdown` blocks the main thread.
+///
+/// Bounded by `gpui::SHUTDOWN_TIMEOUT` (200ms), so this is best-effort by
+/// construction and says so: a quit that outruns the budget still exits. A
+/// hard guarantee wants the OS to enforce it (`PR_SET_PDEATHSIG` on Linux;
+/// macOS has no equivalent and would need an explicit synchronous reap in
+/// app-core) — a follow-up, not wave 2.
 pub fn install_engine_shutdown(stores: &Stores, cx: &mut App) {
     let core = stores.app_core();
-    cx.on_app_quit(move |_cx| {
-        let core = core.clone();
+    cx.on_app_quit(move |cx: &mut App| {
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_millis(50));
+        let signalled = core.as_ref().map(|c| c.shutdown_engines()).unwrap_or(0);
         async move {
-            let Some(core) = core else { return };
-            let _ = crate::bridge::bridge(core, |c| async move {
-                let state = c.local_models_state().await?;
-                for id in loaded_engine_ids(&state) {
-                    let _ = c.unload_local_model(id).await;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                Ok(())
-            })
-            .await;
+            if signalled > 0 {
+                timer.await;
+            }
         }
     })
     .detach();
-}
-
-/// Every currently-serving engine's selection id — the managed `local`
-/// store's plus every `llamacpp` backend's. `Loading` entries are included:
-/// a warming engine has a live subprocess too.
-pub fn loaded_engine_ids(state: &eidola_app_core::LocalModelsState) -> Vec<String> {
-    use eidola_app_core::LocalModelStatus as S;
-    let running = |s: &S| matches!(s, S::Loaded { .. } | S::Loading);
-    state
-        .models
-        .iter()
-        .filter(|m| running(&m.status))
-        .map(|m| m.id.clone())
-        .chain(
-            state
-                .external
-                .iter()
-                .flat_map(|b| b.models.iter())
-                .filter(|m| running(&m.status))
-                .map(|m| m.id.clone()),
-        )
-        .collect()
 }
 
 /// Quit cleanly on `SIGTERM` / `SIGINT` (windowless mode).
