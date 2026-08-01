@@ -194,7 +194,7 @@ impl Render for AccountView {
                                     // an honest click target.
                                     div()
                                         .id("confirm-reset-wrap")
-                                        .probe(
+                                        .probe_delegating(
                                             "settings/account/reset-confirm",
                                             gpui::Role::Button,
                                             "Reset account",
@@ -212,7 +212,7 @@ impl Render for AccountView {
                                 .child(
                                     div()
                                         .id("cancel-reset-wrap")
-                                        .probe(
+                                        .probe_delegating(
                                             "settings/account/reset-cancel",
                                             gpui::Role::Button,
                                             "Keep account",
@@ -260,7 +260,7 @@ impl Render for AccountView {
                         // the button so its bounds are an honest click target.
                         div()
                             .id("create-account-wrap")
-                            .probe(
+                            .probe_delegating(
                                 "settings/account/create",
                                 gpui::Role::Button,
                                 "Create account",

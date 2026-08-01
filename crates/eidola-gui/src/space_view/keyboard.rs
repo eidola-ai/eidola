@@ -48,7 +48,7 @@
 use gpui::{Context, SharedString, Window};
 
 use super::SpaceView;
-use super::model::{NodeSrc, TreeNode};
+use super::model::{NodeSrc, PostData, TreeNode};
 
 /// Which rung of the two-level model holds focus.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -568,6 +568,61 @@ impl SpaceView {
                 level: FocusLevel::Affordance(i),
             }) if id == node_id => Some(*i),
             _ => None,
+        }
+    }
+
+    /// Carry keyboard tree focus across a generation change of the post it
+    /// sits on — the [`SpaceView::rethread_drafts`] rule applied to the other
+    /// window-local reference into the transcript.
+    ///
+    /// [`TreeFocus::node_id`] is a tree node id, which for a post is its
+    /// **action** id. An edit or a regeneration appends a new generation of the
+    /// same *item*, so the reloaded transcript carries only the new tip and the
+    /// focused id names a post that is no longer there. Nothing then recovers:
+    /// [`tree_target`] can't find the id in the path and returns `None`, and
+    /// `move_tree_focus`'s deliberate-no-op arm reports the press as *handled*
+    /// — so every arrow reads as inert (and `post_verb_count` finds no post, so
+    /// Enter is dead too) until the reader escapes out of the conversation
+    /// entirely. Focus a post, edit it, and the keyboard model is simply gone.
+    ///
+    /// Reply threading already follows item identity (workspace `AGENTS.md`:
+    /// an action id is causality, an item id is the intended logical flow), so
+    /// the cure is the same one: resolve the vanished action id through the
+    /// *outgoing* snapshot to its item, then forward focus to that item's
+    /// current tip in the incoming one. The level (post vs. affordance) is
+    /// preserved — an edit committed from the affordance row leaves you on the
+    /// affordance row of the post you were editing. Focus is cleared **only**
+    /// when the item genuinely left the snapshot, which is the honest outcome
+    /// for a post that no longer exists.
+    pub(crate) fn retarget_tree_focus(&mut self, next: &[PostData]) {
+        let Some(focus) = self.tree_focus.as_ref() else {
+            return;
+        };
+        let stale = focus.node_id.clone();
+        // Node ids, not action ids: an optimistic row with no action id yet
+        // renders under a positional fallback, and focus can sit on it.
+        if (0..next.len()).any(|i| super::model::node_id(next, i) == stale) {
+            return;
+        }
+        let forwarded = self
+            .posts
+            .iter()
+            .find(|p| p.action_id.as_deref() == Some(stale.as_ref()))
+            .and_then(|p| p.item_id.clone())
+            .and_then(|item| {
+                next.iter()
+                    .find(|p| p.item_id.as_deref() == Some(item.as_ref()))
+                    .and_then(|p| p.action_id.clone())
+            });
+        match forwarded {
+            Some(tip) => {
+                let level = focus.level.clone();
+                self.tree_focus = Some(TreeFocus {
+                    node_id: tip,
+                    level,
+                });
+            }
+            None => self.tree_focus = None,
         }
     }
 

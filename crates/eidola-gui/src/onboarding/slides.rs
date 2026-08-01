@@ -272,7 +272,7 @@ impl RenderOnce for CreateAccount {
                 div()
                     .id("onboarding-agree")
                     .pt_10()
-                    .probe(
+                    .probe_delegating(
                         "onboarding/agree",
                         Role::CheckBox,
                         "I agree to the Terms of Service and Privacy Policy.",
@@ -297,7 +297,7 @@ impl RenderOnce for CreateAccount {
         let enabled = self.agreed && !self.creating;
         let cta = div()
             .id("onboarding-cta-create")
-            .probe("onboarding/cta/create", Role::Button, label)
+            .probe_delegating("onboarding/cta/create", Role::Button, label)
             .child(
                 Button::new("onboarding-btn-create")
                     .ghost()
@@ -614,7 +614,7 @@ fn cta_button(
     let label = label.into();
     div()
         .id(SharedString::from(format!("onboarding-cta-{key}")))
-        .probe(
+        .probe_delegating(
             SharedString::from(format!("onboarding/cta/{key}")),
             Role::Button,
             label.clone(),

@@ -1242,7 +1242,8 @@ impl SpaceView {
     /// Called on every space change (cheap `SharedString` projection) and at
     /// construction. Drafts are local UI state, but their reply antecedent is a
     /// reference *into* the transcript, so it is rethreaded here — see
-    /// [`Self::rethread_drafts`].
+    /// [`Self::rethread_drafts`]. Keyboard tree focus names a post the same
+    /// way and is forwarded by the same rule — see [`Self::retarget_tree_focus`].
     pub(crate) fn rebuild(&mut self, cx: &mut Context<Self>) {
         let messages: Vec<crate::space::ChatMessageView> = self.space.read(cx).messages().to_vec();
         let posts: Vec<PostData> = messages
@@ -1262,6 +1263,7 @@ impl SpaceView {
             })
             .collect();
         self.rethread_drafts(&posts);
+        self.retarget_tree_focus(&posts);
         self.posts = posts;
     }
 
