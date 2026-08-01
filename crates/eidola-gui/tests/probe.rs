@@ -3087,3 +3087,77 @@ fn space_probes_record_a_disclosure_per_turn(cx: &mut TestAppContext) {
 
     probe::set_probes_enabled(false);
 }
+
+#[gpui::test]
+fn keyboard_focus_reveals_a_posts_hover_gated_verbs(cx: &mut TestAppContext) {
+    // Wave B / audit S7. The Edit and Regenerate verbs are hover-gated, and
+    // gpui suppresses hover entirely while the input modality is keyboard — so
+    // without a focus-within reveal they are unreachable by exactly the user
+    // the keyboard model exists for. Asserted through the probe registry: the
+    // verb is *rendered*, not merely conceptually revealed.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the quick brown fox")], cx)
+        });
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries.iter().any(|(n, _)| n == "space/post/0/edit"),
+        "the verb is hidden at rest"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.focus_post("a1".into(), window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/edit",
+        gpui::Role::Button,
+        "Edit this post",
+    );
+}
+
+#[gpui::test]
+fn keyboard_focus_reveals_a_library_rows_verbs(cx: &mut TestAppContext) {
+    // The Library's half of audit S7 — the same rule as a post's action gutter:
+    // hover-gated verbs must also answer to keyboard focus, because gpui
+    // suppresses hover outright while the input modality is keyboard.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            space_info("s1", Some("Tides and the moon")),
+            space_info("s2", Some("Borrow checker")),
+        ];
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries.iter().any(|(n, _)| n == "library/row/0/rename"),
+        "the verbs are hidden at rest"
+    );
+
+    // Tab into the listing: the first stop is the first row.
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0/rename",
+        gpui::Role::Button,
+        "Rename Tides and the moon",
+    );
+}

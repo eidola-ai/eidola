@@ -8209,3 +8209,389 @@ fn space_change_invalidates_the_trace_index(cx: &mut TestAppContext) {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Wave B — focus and keyboard (task 12)
+// ---------------------------------------------------------------------------
+
+/// A fork at `a1`: two branches (`a2`, the spine, and `a3`), the second of
+/// which continues to `a4`.
+fn seed_branched_space(view: &Entity<SpaceView>, window: AnyWindowHandle, cx: &mut TestAppContext) {
+    let mut a2 = fixture_assistant_post("a2", "the first branch");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", "the second branch");
+    a3.parent_action_id = Some("a1".into());
+    let mut a4 = fixture_user_post("a4", "deeper in the second branch");
+    a4.parent_action_id = Some("a3".into());
+    seed_quotable_space(
+        view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post"), a2, a3, a4],
+    );
+}
+
+#[gpui::test]
+fn space_arrow_keys_walk_the_visible_rows(cx: &mut TestAppContext) {
+    // Down/Up move through the selected path — what the eye does — and
+    // Home/End reach its ends. Nothing is focused until an arrow enters the
+    // conversation, which is what makes the model reachable without a pointer.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), None, "nothing focused at rest");
+    });
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), None)),
+            "the first arrow enters the conversation at the top of the path"
+        );
+    });
+
+    // A lone root: Down stops rather than wrapping or falling into the draft.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a1".to_string(), None)));
+    });
+}
+
+#[gpui::test]
+fn space_branch_moves_enter_and_leave_a_fork(cx: &mut TestAppContext) {
+    // Right at the fork's anchor enters the next sibling branch; Left from the
+    // first branch returns to the anchor; and at a post with no siblings both
+    // are deliberate no-ops (Mike's decision — predictability over cleverness).
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_branched_space(&view, window, cx);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a1".to_string(), None)));
+    });
+
+    // The anchor stands alone on its own level — Left is a no-op there.
+    vcx.simulate_keystrokes("left");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), None)),
+            "Left on a spine post does nothing"
+        );
+    });
+
+    // Right enters the branch after the one the fork rests on.
+    vcx.simulate_keystrokes("right");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a3".to_string(), None)),
+            "Right at the fork enters the next sibling branch"
+        );
+    });
+
+    // Down follows the newly selected branch, not the old one.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a4".to_string(), None)));
+    });
+
+    // Back up into the strip, then Left across it and out to the anchor.
+    vcx.simulate_keystrokes("up left");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), None)),
+            "Left crosses to the previous branch"
+        );
+    });
+    vcx.simulate_keystrokes("left");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), None)),
+            "Left from the first branch returns to the fork's anchor"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_enter_descends_into_the_posts_affordances_and_escape_climbs_out(cx: &mut TestAppContext) {
+    // The two-level model, and the last two rungs of the Escape chain:
+    // affordance → post → nothing. Escape never closes the window.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    // A hover-gated verb is revealed by focus alone (audit S7): gpui suppresses
+    // hover entirely under keyboard modality, so this is the only way a
+    // keyboard user ever sees Edit / Regenerate.
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.post_affordances_revealed("a1"),
+            "focus reveals the hover-gated affordance row"
+        );
+    });
+
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), Some(0))),
+            "Enter enters the post's affordance row"
+        );
+    });
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), None)),
+            "Escape steps back to the post"
+        );
+    });
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            None,
+            "Escape releases the conversation"
+        );
+    });
+    assert_eq!(
+        cx.windows().len(),
+        1,
+        "and Escape never closes the window, at any rung"
+    );
+}
+
+#[gpui::test]
+fn space_escape_yields_to_the_context_menu_before_the_focus_levels(cx: &mut TestAppContext) {
+    // The full Escape priority chain: an open context menu speaks first (PR
+    // #259's root-owner rule), and the same press must not also unwind a focus
+    // level. The next press does.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down enter");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a1".to_string(), Some(0))));
+    });
+
+    let at = point_in_post(&view, &vcx, "a1");
+    right_click(&mut vcx, at);
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.context_menu_items_for_test().is_some(),
+            "the menu is open"
+        );
+    });
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.context_menu_items_for_test().is_none(),
+            "the first Escape closes the menu"
+        );
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), Some(0))),
+            "…and does not also unwind the focus level"
+        );
+    });
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), None)),
+            "the next Escape takes the affordance rung"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_typing_jumps_to_the_trailing_draft_without_moving_the_page(cx: &mut TestAppContext) {
+    // Task 38. A printable character with nothing composing starts the tail
+    // draft, applies the character at the end of whatever it already held, and
+    // leaves the space's scroll position exactly where the reader put it.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    // A document several windows tall, so the tail composer sits far below the
+    // fold: without the suppression the caret reveal would drag the page down
+    // to it, which is exactly what this shortcut promises not to do.
+    let long = "a long paragraph that wraps several times over. ".repeat(24);
+    let mut posts = vec![fixture_user_post("a1", &long)];
+    for i in 2..8u32 {
+        let id = format!("a{i}");
+        let mut p = if i % 2 == 0 {
+            fixture_assistant_post(&id, &long)
+        } else {
+            fixture_user_post(&id, &long)
+        };
+        p.parent_action_id = Some(format!("a{}", i - 1));
+        posts.push(p);
+    }
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    // Seed the tail draft with text, then leave it (so nothing is composing).
+    let draft = view
+        .read_with(&vcx, |v, _| v.tail_draft_state_for_test())
+        .expect("a docked tail draft");
+    draft.update(&mut vcx, |e, cx| e.set_value("already here", cx));
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    let before = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        assert!(v.has_active_draft_for_test(), "the draft is now composing");
+        let editor = v.composer_state_for_test().expect("the active composer");
+        let text = editor.read(cx).value().to_string();
+        assert_eq!(
+            text, "already herex",
+            "the character lands at the end of the existing text"
+        );
+        assert_eq!(
+            editor.read(cx).cursor_offset(),
+            text.len(),
+            "…with the caret after it"
+        );
+        assert_eq!(
+            v.page_scroll_offset_y_for_test(),
+            before,
+            "and the page did not move"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_typing_into_an_open_composer_is_not_intercepted(cx: &mut TestAppContext) {
+    // The jump only exists for the "nothing is composing" state; with a draft
+    // active the editor owns every keystroke.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.has_active_draft_for_test(),
+            "a blank space opens composing"
+        );
+    });
+    view.update(&mut vcx, |v, cx| {
+        let ed = v.composer_state_for_test().expect("the composer");
+        ed.update(cx, |e, cx| e.set_value("typed by hand", cx));
+    });
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, cx| {
+        // The editor's own input handler is the only writer here; our jump
+        // must not have appended a second copy of the character.
+        let text = v
+            .composer_state_for_test()
+            .expect("the composer")
+            .read(cx)
+            .value()
+            .to_string();
+        assert!(
+            !text.ends_with("xx"),
+            "the jump did not double the keystroke, got {text:?}"
+        );
+    });
+}
+
+#[gpui::test]
+fn focus_visible_tracks_the_input_modality(cx: &mut TestAppContext) {
+    // The ring's whole condition. gpui owns it (`Window::last_input_was_keyboard`,
+    // read by `focus_visible`), so what this pins is that we depend on the
+    // right signal: a keystroke arms it, a pointer press disarms it, and a
+    // mouse user therefore never sees a ring.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    vcx.update(|window, _| {
+        assert!(
+            window.last_input_was_keyboard(),
+            "a keystroke puts the window in keyboard modality — the ring shows"
+        );
+    });
+
+    let at = point_in_post(&view, &vcx, "a1");
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, _| {
+        assert!(
+            !window.last_input_was_keyboard(),
+            "a pointer press leaves pointer modality — the ring stays hidden"
+        );
+    });
+}
