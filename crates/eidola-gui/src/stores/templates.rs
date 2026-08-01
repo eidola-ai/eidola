@@ -148,8 +148,20 @@ impl TemplatesStore {
 
     /// Create a template. `router_model` is the may-decline router reference
     /// (`None` = off, the default); it rides through the dedicated
-    /// [`AppCore::set_template_router_model`] setter after the create, since
-    /// `create_template`'s signature deliberately doesn't carry it.
+    /// [`AppCore::set_template_router_model`] setter, which is why this is a
+    /// two-call write.
+    ///
+    /// **Both calls live in ONE [`bridge`] closure — one tokio future — and
+    /// that is load-bearing, not tidiness.** `refresh` and every CRUD op share
+    /// this store's single task slot, and `create_template` emits
+    /// `Change::Templates` core-side *before it returns*; the bus dispatch that
+    /// event drives calls `refresh`, which replaces the slot and drops the gpui
+    /// half of this op. Split across two `bridge` calls, the second one is
+    /// constructed only after the first await returns — so a refunded slot
+    /// mid-op meant the template was created with its router silently left
+    /// NULL. `bridge` spawns onto the core's tokio runtime and drops the
+    /// `JoinHandle`, so a dropped gpui receiver cancels nothing core-side
+    /// (see `bridge.rs`): as one future, both writes complete regardless.
     pub fn create(
         &mut self,
         title: String,
@@ -160,21 +172,19 @@ impl TemplatesStore {
     ) {
         self.write_then_relist(cx, move |core| {
             Box::pin(async move {
-                let created = bridge(core.clone(), move |c| async move {
-                    c.create_template(title, cascade_limit, participants).await
+                bridge(core, move |c| async move {
+                    let created = c
+                        .create_template(title, cascade_limit, participants)
+                        .await?;
+                    // Off is the default, so an unset router needs no second write.
+                    if router_model.is_some() {
+                        c.set_template_router_model(created.id, router_model)
+                            .await?;
+                    }
+                    Ok(())
                 })
                 .await
-                .map_err(|e| e.to_string())?;
-                // Off is the default, so an unset router needs no second write.
-                if router_model.is_some() {
-                    let id = created.id.clone();
-                    bridge(core, move |c| async move {
-                        c.set_template_router_model(id, router_model).await
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                }
-                Ok(())
+                .map_err(|e| e.to_string())
             })
         });
     }
@@ -182,6 +192,10 @@ impl TemplatesStore {
     /// Update a template. `router_model` follows the "untouched field" idiom of
     /// the other arguments: the outer `None` leaves the setting alone, `Some(r)`
     /// writes it (`Some(None)` = off).
+    ///
+    /// Both writes share one `bridge` closure for the reason spelled out on
+    /// [`Self::create`] — a bus-driven `refresh` landing between them would
+    /// otherwise drop the router write.
     pub fn update(
         &mut self,
         id: String,
@@ -193,21 +207,16 @@ impl TemplatesStore {
     ) {
         self.write_then_relist(cx, move |core| {
             Box::pin(async move {
-                let update_id = id.clone();
-                bridge(core.clone(), move |c| async move {
-                    c.update_template(update_id, title, cascade_limit, participants)
-                        .await
+                bridge(core, move |c| async move {
+                    c.update_template(id.clone(), title, cascade_limit, participants)
+                        .await?;
+                    if let Some(router_model) = router_model {
+                        c.set_template_router_model(id, router_model).await?;
+                    }
+                    Ok(())
                 })
                 .await
-                .map_err(|e| e.to_string())?;
-                if let Some(router_model) = router_model {
-                    bridge(core, move |c| async move {
-                        c.set_template_router_model(id, router_model).await
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                }
-                Ok(())
+                .map_err(|e| e.to_string())
             })
         });
     }

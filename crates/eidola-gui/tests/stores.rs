@@ -461,3 +461,64 @@ fn config_store_zoom_ladder_writes_through(cx: &mut TestAppContext) {
         .config
         .read_with(cx, |c, _| assert_eq!(c.font_scale(), FONT_SCALE_MIN));
 }
+
+/// A template write that carries a **router model** is two core calls
+/// (`create_template` / `update_template`, then the dedicated
+/// `set_template_router_model`), and the bus makes them race: app-core emits
+/// `Change::Templates` from inside the first call, and dispatching it calls
+/// `TemplatesStore::refresh` — which replaces the store's single task slot and
+/// drops the gpui half of the op that is still in flight.
+///
+/// Split across two `bridge` calls, the second was only *constructed* after the
+/// first await returned, so the cancellation swallowed it: the template was
+/// created and its router silently left NULL. As one `bridge` closure — one
+/// tokio future, whose `JoinHandle` `bridge` drops, so a dropped gpui receiver
+/// cancels nothing core-side — both writes complete regardless.
+///
+/// Unlike its neighbours this test *does* park (it is about a genuinely
+/// in-flight op, not a synchronous transition), and it asserts against the
+/// **database** rather than the store snapshot: the cancelled relist means the
+/// snapshot may predate the router write, which in production the setter's own
+/// `Change::Templates` reconciles.
+#[gpui::test]
+fn template_router_write_survives_a_refresh_landing_mid_op(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    stores.templates.update(cx, |s, cx| {
+        s.create(
+            "Routed".into(),
+            4,
+            Vec::new(),
+            Some("gemma4-31b".into()),
+            cx,
+        );
+    });
+    // Poll the op's future once: its tokio work is now running.
+    cx.run_until_parked();
+    // The bus event the first write already emitted, arriving mid-op.
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Templates), cx));
+
+    // Read the durable state, not the (superseded) snapshot.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let listed = core
+            .runtime()
+            .block_on(core.list_space_templates())
+            .expect("list templates");
+        if let Some(t) = listed.iter().find(|t| t.title == "Routed") {
+            if let Some(router) = t.router_model.as_deref() {
+                assert_eq!(router, "gemma4-31b", "the router write landed");
+                return;
+            }
+            // The template exists; give the second write its moment before
+            // calling it lost.
+            if std::time::Instant::now() > deadline {
+                panic!("template created but its router model was dropped mid-op");
+            }
+        } else if std::time::Instant::now() > deadline {
+            panic!("the create itself never landed");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
