@@ -253,10 +253,46 @@ pub fn resolve_exec(explicit: Option<String>) -> Result<String, AppError> {
 /// fail, discovered later at `systemctl start` with systemd's own wording
 /// rather than here with ours. Discovery already only yields paths it found,
 /// so this bites exactly the hand-typed `--exec`.
+///
+/// **A control character is refused, because systemd cannot express one in a
+/// command name.** A newline is a legal byte in a Unix filename, and the two
+/// candidate encodings both fail — verified with `systemd-analyze verify`
+/// (systemd 257):
+///
+/// - **Raw**, even inside quotes: the directive is *split*. The unit reports
+///   `Unbalanced quoting, ignoring: ""/tmp/nl"` and then `Missing '=',
+///   ignoring line.` for the remainder — the `ExecStart=` is destroyed, and
+///   with it any hope of the service starting.
+/// - **C-escaped** (`\n`, and equally `\x0a`, quoted or bare): systemd *does*
+///   decode it — the diagnostic names the reconstructed path, so the escape
+///   is honored — and then rejects the result: `Executable path contains
+///   special characters`, exit status 1, the same severity as naming a
+///   binary that does not exist.
+///
+/// So it is decodable but not usable, which is not "representable"; there is
+/// no third encoding, and writing a unit systemd complains about is not
+/// success. Refusing here keeps it at the same before-any-write seam as the
+/// missing and non-executable cases. The rule is *any* control character
+/// rather than just `\n`/`\r`: those two are what systemd was observed to
+/// reject and none of the others is ever intentional in a program path.
+/// **A space is explicitly fine** and stays fine — quoting covers it, and a
+/// quoted `"/tmp/Eidola Builds/eidola-gui"` verifies clean (exit 0).
 fn absolute_existing_exec(path: &Path) -> Result<String, AppError> {
     let absolute = std::path::absolute(path).map_err(|e| AppError::Config {
         message: format!("could not resolve `{}`: {e}", path.display()),
     })?;
+    // Representability first — before existence, and before anything prints
+    // the path, since the offending byte would corrupt our own message too.
+    let shown = absolute.to_string_lossy();
+    if shown.chars().any(char::is_control) {
+        return Err(AppError::Config {
+            message: format!(
+                "`{}` contains a control character, which systemd cannot express \
+                 in an `ExecStart=` path — rename it, or point `--exec` elsewhere",
+                shown.escape_debug()
+            ),
+        });
+    }
     if !absolute.is_file() {
         return Err(AppError::Config {
             message: format!(
@@ -758,6 +794,50 @@ mod tests {
         // Neither usable: an honest refusal, not a relative guess.
         assert!(resolve_config_home(Some(OsString::from("rel/cfg")), None).is_err());
         assert!(resolve_config_home(None, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_with_a_newline_or_cr_is_refused_rather_than_written() {
+        // Both are legal bytes in a Unix filename and neither is expressible
+        // in an `ExecStart=` command name: raw, the directive splits
+        // (`Unbalanced quoting` + `Missing '='`); C-escaped, systemd decodes
+        // it and then rejects the result with `Executable path contains
+        // special characters` at the same exit status as a missing binary.
+        // Both verified with `systemd-analyze verify` (systemd 257).
+        for bad in ["eidola\ngui", "eidola\rgui", "eidola\tgui"] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let exe = tmp.path().join(bad);
+            write_executable(&exe);
+            assert!(exe.is_file(), "precondition: the file really exists");
+
+            let err = resolve_exec(Some(exe.to_string_lossy().into_owned()))
+                .expect_err("a path systemd cannot express must not be written");
+            let message = err.to_string();
+            assert!(message.contains("control character"), "got {message}");
+            // The refusal must not carry the raw byte into our own output.
+            assert!(
+                !message.contains('\n') && !message.contains('\r'),
+                "the message must stay one line: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_space_in_the_path_is_still_perfectly_fine() {
+        // The control-character rule must not over-reach: a space is ordinary
+        // on a desktop, quoting covers it, and the quoted form verifies clean
+        // (exit 0) under `systemd-analyze verify`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("Eidola Builds");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let exe = dir.join("eidola-gui");
+        write_executable(&exe);
+
+        let resolved = resolve_exec(Some(exe.to_string_lossy().into_owned())).expect("accepted");
+        assert!(
+            render_unit(&resolved).contains(&format!(r#"ExecStart="{resolved}" --windowless"#))
+        );
     }
 
     #[test]
