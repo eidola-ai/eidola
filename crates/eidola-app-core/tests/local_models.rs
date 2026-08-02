@@ -570,3 +570,264 @@ fn local_chat_with_missing_model_is_typed_error() {
         assert_eq!(messages[0].role, "user");
     });
 }
+
+/// Quit-time teardown must reach every **live** engine, including one the
+/// model snapshot cannot see.
+///
+/// `local_models_state` is reconstructed by *scanning* the model directories
+/// and consulting the engine map only to decorate a `.gguf` it already found
+/// — so an engine whose backing file was renamed or deleted mid-session is
+/// absent from that snapshot while its subprocess is still running. A
+/// teardown written as a loop over the snapshot would silently leave it
+/// behind, which on macOS means orphaning it to launchd for good.
+#[test]
+fn shutdown_reaches_an_engine_the_model_scan_cannot_see() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let models_dir = _dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        // A loaded engine whose file was removed after it started. No
+        // `.gguf` is written at all — the same state a rename produces.
+        core.test_register_engine("local", "ghost", 1, GIB, false, 100);
+
+        let state = core
+            .runtime()
+            .block_on(core.local_models_state())
+            .expect("state");
+        assert!(
+            !state.models.iter().any(|m| m.slug == "ghost"),
+            "precondition: the scan-based snapshot cannot see this engine"
+        );
+
+        assert_eq!(
+            core.shutdown_engines(),
+            1,
+            "the registry-based teardown signals it anyway"
+        );
+        assert_eq!(
+            core.shutdown_engines(),
+            0,
+            "the registry is drained, so teardown is idempotent"
+        );
+    });
+}
+
+/// The quit-time drain must stay **silent** on the invalidation bus.
+///
+/// Every other engine transition emits `Change::LocalModels` because
+/// something is watching. Here nothing is: the process is exiting. Worse,
+/// the GUI's app-lifetime bus bridge is a foreground task gpui keeps driving
+/// through its bounded shutdown block — *after* `App::shutdown` sets
+/// `quitting` — so a dispatch would reach `LocalModelsStore::refresh` →
+/// `cx.spawn` → gpui's "Can't spawn on main thread after on_app_quit" panic,
+/// turning a clean quit into a crash on exactly the machines that have an
+/// engine loaded.
+#[test]
+fn the_shutdown_drain_emits_nothing() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        core.test_register_engine("local", "loaded", 1, GIB, false, 100);
+        let mut rx = core.subscribe_changes();
+
+        assert_eq!(core.shutdown_engines(), 1, "an engine was signalled");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the drain must not emit — nobody can render it, and the GUI \
+             bridge would dispatch it into gpui's quitting state"
+        );
+    });
+}
+
+/// A load that arrives after the quit-time drain must not spawn.
+///
+/// `load_local_model` does real async work before it reserves — backend
+/// lookup, port pick, `fs::metadata` — so a quit landing mid-load would
+/// otherwise let the load resume *past* a drain that saw an empty registry,
+/// reserve, and spawn a subprocess into a process about to `exit()`. The
+/// shutdown latch is set inside the same lock the reservation takes, so the
+/// refusal happens at the write point rather than on captured state.
+#[test]
+fn a_load_after_the_shutdown_drain_is_refused_and_spawns_nothing() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let models_dir = _dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("wanted.gguf"), vec![0u8; 64]).unwrap();
+        // `/usr/bin/false` exits immediately, so a load that *did* get past
+        // the latch would fail with the engine's own message — which is what
+        // distinguishes "refused before spawning" from "spawned and died".
+        core.set_llama_server_path(Some("/usr/bin/false".into()))
+            .unwrap();
+
+        assert_eq!(core.shutdown_engines(), 0, "nothing is loaded yet");
+
+        let err = core
+            .runtime()
+            .block_on(core.load_local_model("wanted@local".into()))
+            .expect_err("a load after the drain must be refused");
+        assert!(err.to_string().contains("shutting down"), "got {err}");
+
+        // Nothing was reserved, so nothing is there to tear down or to
+        // leave behind as a warming entry.
+        assert_eq!(core.shutdown_engines(), 0);
+        let state = core
+            .runtime()
+            .block_on(core.local_models_state())
+            .expect("state");
+        let wanted = state
+            .models
+            .iter()
+            .find(|m| m.slug == "wanted")
+            .expect("the file is still on disk");
+        assert!(
+            matches!(wanted.status, LocalModelStatus::Available),
+            "no engine entry was created: {:?}",
+            wanted.status
+        );
+    });
+}
+
+/// A fake `llama-server` that ignores its arguments and stays alive, so a
+/// load stays in its warming loop for the duration of a test.
+fn write_sleeping_engine(dir: &std::path::Path) -> String {
+    let path = dir.join("fake-llama-server");
+    std::fs::write(&path, b"#!/bin/sh\nexec sleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The supervisor's own shutdown arm must be silent during a quit, exactly
+/// like the drain that signalled it.
+///
+/// Silencing `shutdown_all_engines` alone left this second emitter wide open:
+/// the drain only *signals*, and the supervisor emits right after killing its
+/// child — into the same window that panics. The GUI's bus bridge is a
+/// foreground task gpui keeps driving through its bounded shutdown block
+/// *after* `App::shutdown` sets `quitting`, so that dispatch reaches
+/// `cx.spawn` → "Can't spawn on main thread after on_app_quit".
+#[test]
+fn the_supervisors_shutdown_arm_emits_nothing() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let core = std::sync::Arc::new(core);
+        let models_dir = _dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
+        core.set_llama_server_path(Some(write_sleeping_engine(_dir.path())))
+            .unwrap();
+
+        let handle = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.load_local_model("sleeper@local".into()).await }
+        });
+        // Wait until the engine is registered and warming.
+        wait_for_state(&core, |s| {
+            s.models
+                .iter()
+                .any(|m| m.slug == "sleeper" && matches!(m.status, LocalModelStatus::Loading))
+        });
+
+        // Subscribe *after* the load's own emissions, so anything we see is
+        // the shutdown path's.
+        let mut rx = core.subscribe_changes();
+        assert_eq!(
+            core.shutdown_engines(),
+            1,
+            "the warming engine is signalled"
+        );
+
+        // Let the supervisor run its shutdown arm to completion.
+        let outcome = core
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
+            })
+            .expect("the supervisor must finish promptly")
+            .expect("join");
+        assert!(outcome.is_err(), "a cancelled load reports failure");
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no path in the supervisor may emit once the shutdown latch is set"
+        );
+    });
+}
+
+/// A warming engine's in-flight `/health` probe must not swallow the
+/// shutdown signal.
+///
+/// The probe used to be awaited *outside* the supervisor's `select!`, so the
+/// oneshot was simply not polled for its duration — and warming is exactly
+/// when `/health` can hang rather than refuse (the socket is accepted while a
+/// multi-gigabyte model loads, and this client sets no request timeout). A
+/// quit landing in that window sent its signal into a receiver nobody was
+/// watching, the drain's grace expired, `exit()` followed, and the child
+/// outlived the process.
+///
+/// The hang is reproduced deterministically by pointing the injected HTTP
+/// client at a proxy that accepts connections and never answers.
+#[test]
+fn a_hanging_health_probe_does_not_swallow_the_shutdown_signal() {
+    run(|| {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A listener that accepts and never responds. Sockets are held so the
+        // connection stays open rather than being closed under the client.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        rt.spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{proxy_port}")).unwrap())
+            .build()
+            .expect("client");
+        let core = AppCore::with_test_http_client(
+            dir.path().to_path_buf(),
+            dir.path().join("data"),
+            client,
+        )
+        .expect("open core");
+        let core = std::sync::Arc::new(core);
+
+        let models_dir = dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
+        core.set_llama_server_path(Some(write_sleeping_engine(dir.path())))
+            .unwrap();
+
+        let handle = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.load_local_model("sleeper@local".into()).await }
+        });
+        wait_for_state(&core, |s| {
+            s.models
+                .iter()
+                .any(|m| m.slug == "sleeper" && matches!(m.status, LocalModelStatus::Loading))
+        });
+        // Give the loop time to enter a probe and hang in it.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        assert_eq!(core.shutdown_engines(), 1);
+        let outcome = core
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
+            })
+            .expect("the signal must be observed even mid-probe")
+            .expect("join");
+        assert!(outcome.is_err(), "a cancelled load reports failure");
+
+        drop(core);
+        rt.shutdown_background();
+    });
+}

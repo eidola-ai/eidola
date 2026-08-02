@@ -2597,7 +2597,9 @@ fn probe_templates() -> Vec<SpaceTemplateInfo> {
             id: eidola_app_core::DEFAULT_TEMPLATE_ID.into(),
             title: "Default".into(),
             cascade_limit: 4,
-            router_model: None,
+            // A remote router — the case whose backend the resting row has to
+            // name (it bills per post).
+            router_model: Some("gemma4-31b".into()),
             participants: vec![TemplateParticipantInfo {
                 id: "t-1".into(),
                 label: "Assistant".into(),
@@ -2605,6 +2607,7 @@ fn probe_templates() -> Vec<SpaceTemplateInfo> {
                 system_prompt: None,
                 notify_policy: "human".into(),
             }],
+            referenced: Vec::new(),
         },
         SpaceTemplateInfo {
             id: "tmpl-research".into(),
@@ -2612,6 +2615,16 @@ fn probe_templates() -> Vec<SpaceTemplateInfo> {
             cascade_limit: 6,
             router_model: None,
             participants: Vec::new(),
+            // A template saved from a space carries the shared "You" by
+            // reference — the read-only half of the editor's participant list.
+            referenced: vec![eidola_app_core::TemplateReferencedParticipant {
+                id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+                kind: "human".into(),
+                label: "You".into(),
+                model_ref: None,
+                system_prompt: Some("Keep me honest.".into()),
+                notify_policy: "explicit".into(),
+            }],
         },
     ]
 }
@@ -2668,6 +2681,370 @@ fn templates_pane_probes_cover_rows_and_editor(cx: &mut TestAppContext) {
             "template editor probe {expected:?} missing: {names:?}"
         );
     }
+
+    probe::set_probes_enabled(false);
+}
+
+/// The router row's probes, and the cost note's exact condition: it is present
+/// for a **remote** (eidola) reference and absent for Off and for a local one.
+/// Both directions, because a cost warning that never disappears teaches
+/// nothing and one that never appears is the whole failure this copy exists to
+/// prevent.
+#[gpui::test]
+fn templates_pane_router_probes_and_remote_cost_note(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.templates = probe_templates();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("tmpl-research", window, cx));
+    })
+    .unwrap();
+
+    // Off (the default): the picker is there, the cost note is not.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router",
+        gpui::Role::Button,
+        "Router model",
+    );
+    // The referenced global this template carries is listed read-only — named,
+    // with its config as the content (its effective system prompt included, so
+    // a real charter is neither hidden nor silently dropped), and no verbs.
+    assert_probe_value(
+        &entries,
+        "settings/templates/editor/referenced/0",
+        gpui::Role::Label,
+        "You — shared participant",
+        "Responds when asked · Keep me honest.",
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "settings/templates/editor/router/cost"),
+        "Off must carry no cost note"
+    );
+
+    // Opening the picker offers Off as a first-class option.
+    view.update(cx, |v, cx| v.toggle_router_picker(cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router/menu",
+        gpui::Role::ListBox,
+        "Router models",
+    );
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router/option/off",
+        gpui::Role::Button,
+        "Off",
+    );
+
+    // A remote (eidola) reference: the note is visible, in full, always.
+    view.update(cx, |v, cx| v.set_router_model(Some("gemma4-31b"), cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router/cost",
+        gpui::Role::Label,
+        eidola_gui::templates_settings::ROUTER_REMOTE_COST_NOTE,
+    );
+
+    // A local reference routes free — no note.
+    view.update(cx, |v, cx| {
+        v.set_router_model(Some("gemma-4-e2b@local"), cx)
+    });
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "settings/templates/editor/router/cost"),
+        "a local router routes free — no per-call cost note"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// A resting row summarizes its template, and the router is named there because
+/// it bills per post — which makes the **backend** the load-bearing half:
+/// `gemma4-31b@eidola` charges an inference on every post in every space the
+/// template makes, where an identically-named on-device model is free, and the
+/// model name alone cannot tell those apart. The summary is also the row's
+/// spoken content (settled — it moves only when the registry is refetched), so
+/// a screen reader hears the same distinction.
+#[gpui::test]
+fn a_template_row_names_its_routers_backend(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.templates = probe_templates();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        &format!(
+            "settings/templates/{}",
+            eidola_app_core::DEFAULT_TEMPLATE_ID
+        ),
+        gpui::Role::ListItem,
+        "Default — the default template",
+        "cascade 4 · router gemma4-31b · Eidola · Assistant",
+    );
+    // Off is the default and says nothing; the row is otherwise the same shape.
+    assert_probe_value(
+        &entries,
+        "settings/templates/tmpl-research",
+        gpui::Role::ListItem,
+        "Research",
+        "cascade 6 · You",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The editor's referenced-globals list is read-only display of config that
+/// lives on the **shared** participant, so an "edit everywhere" landing while
+/// the editor is open — from the Participants window, another window, or the
+/// CLI — must show through. The draft carries only what the editor edits;
+/// these rows resolve against the live registry every frame.
+#[gpui::test]
+fn templates_editor_referenced_rows_follow_the_live_registry(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.templates = probe_templates();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("tmpl-research", window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "settings/templates/editor/referenced/0",
+        gpui::Role::Label,
+        "You — shared participant",
+        "Responds when asked · Keep me honest.",
+    );
+
+    // The shared global is edited everywhere: `Change::Participants` refreshes
+    // this store (a `SpaceTemplateInfo` embeds its referenced globals'
+    // effective config), and the snapshot it hands back carries the new values.
+    let mut edited = probe_templates();
+    let referenced = &mut edited[1].referenced[0];
+    referenced.label = "Myself".into();
+    referenced.system_prompt = Some("Keep me sharp.".into());
+    referenced.notify_policy = "all".into();
+    stores
+        .templates
+        .update(cx, |s, cx| s.set_templates_for_test(edited, cx));
+
+    // The editor is still open, and it shows the edit — not the values it
+    // opened with.
+    let entries = fresh_entries(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.is_editing()),
+        "the editor must still be open — otherwise this proves nothing"
+    );
+    assert_probe_value(
+        &entries,
+        "settings/templates/editor/referenced/0",
+        gpui::Role::Label,
+        "Myself — shared participant",
+        "Responds to everything · Keep me sharp.",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// Two enabled backends serving a model of the same name — the managed local
+/// store and a user's own llama.cpp install, which is exactly what happens when
+/// someone downloads a model Eidola also curates.
+fn same_name_on_two_backends() -> eidola_app_core::LocalModelsState {
+    use eidola_app_core::{
+        ExternalEngineBackend, LocalModelInfo, LocalModelStatus, LocalModelsState,
+    };
+    let model = |id: &str, slug: &str| LocalModelInfo {
+        id: id.into(),
+        slug: slug.into(),
+        display_name: "Gemma 4 E2B".into(),
+        file_name: "gemma-4-e2b.gguf".into(),
+        size_bytes: Some(3_000_000_000),
+        source_url: None,
+        status: LocalModelStatus::Available,
+        last_error: None,
+    };
+    LocalModelsState {
+        engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+        external: vec![ExternalEngineBackend {
+            backend_id: "my-box".into(),
+            display_name: "My box".into(),
+            enabled: true,
+            models_dir: "/Users/me/models".into(),
+            engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+            auto_start: true,
+            models: vec![model("gemma-4-e2b@my-box", "gemma-4-e2b")],
+        }],
+        models: vec![model("gemma-4-e2b@local", "gemma-4-e2b")],
+    }
+}
+
+/// **A dropdown option has to name its own backend.** The visible row shows
+/// only the model name because the group header above it supplies the backend —
+/// but that header is a role-less `div`, so it never reaches the accessibility
+/// tree, and two backends serving the same model name give a screen reader two
+/// rows it cannot tell apart. On the router picker that ambiguity is also the
+/// billing difference. One helper serves both pickers, so this pins both.
+#[gpui::test]
+fn model_picker_options_name_their_backend(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.local_models = Some(same_name_on_two_backends());
+        s.templates = probe_templates();
+        s.participants = Some(probe_participants());
+    });
+
+    // The Templates pane's router picker.
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("tmpl-research", window, cx));
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.toggle_router_picker(cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router/option/0/0",
+        gpui::Role::Button,
+        "Gemma 4 E2B · Local",
+    );
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router/option/1/0",
+        gpui::Role::Button,
+        "Gemma 4 E2B · My box",
+    );
+
+    // The participant model field — the same shared widget, the same shape.
+    let (p_window, p_view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            ParticipantsView::new(
+                stores.clone(),
+                "demo".into(),
+                Some("Demo".into()),
+                window,
+                cx,
+            )
+        })
+    });
+    cx.update_window(p_window, |_, window, cx| {
+        p_view.update(cx, |v, cx| v.begin_add(window, cx));
+    })
+    .unwrap();
+    p_view.update(cx, |v, cx| v.open_add_picker_for_test(cx));
+    let entries = fresh_entries(cx, p_window);
+    assert_probe(
+        &entries,
+        "participants/add/model/option/0/0",
+        gpui::Role::Button,
+        "Gemma 4 E2B · Local",
+    );
+    assert_probe(
+        &entries,
+        "participants/add/model/option/1/0",
+        gpui::Role::Button,
+        "Gemma 4 E2B · My box",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// A picker's label names it ("Model", "Router model"); *which* model is chosen
+/// is its content, and rides `aria_value` — settled by construction, since it
+/// moves only on a click. Both pickers take the same shape from one helper: a
+/// screen reader otherwise hears the same word whether a space routes on-device,
+/// bills per post, or has no model selected at all.
+#[gpui::test]
+fn model_pickers_announce_their_selection(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.templates = probe_templates();
+        s.participants = Some(probe_participants());
+    });
+
+    // The Templates pane's router picker: Off (the default) is a real choice
+    // and says so; a chosen reference names itself and its backend.
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("tmpl-research", window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "settings/templates/editor/router",
+        gpui::Role::Button,
+        "Router model",
+        "Off",
+    );
+    view.update(cx, |v, cx| v.set_router_model(Some("gemma4-31b"), cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "settings/templates/editor/router",
+        gpui::Role::Button,
+        "Router model",
+        "gemma4-31b · Eidola",
+    );
+
+    // The participant model field — the shared widget the Templates pane's own
+    // agent rows use too — takes the identical shape.
+    let (p_window, p_view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            ParticipantsView::new(
+                stores.clone(),
+                "demo".into(),
+                Some("Demo".into()),
+                window,
+                cx,
+            )
+        })
+    });
+    cx.update_window(p_window, |_, window, cx| {
+        p_view.update(cx, |v, cx| v.begin_edit("agent-1", window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, p_window);
+    assert_probe_value(
+        &entries,
+        "participants/editor/model",
+        gpui::Role::Button,
+        "Model",
+        "gemma4-31b · Eidola",
+    );
 
     probe::set_probes_enabled(false);
 }

@@ -6128,6 +6128,13 @@ fn participants_view_add_and_remove(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.begin_add(window, cx));
     })
     .unwrap();
+    // The form arrives prefilled with the shared default charter — the same
+    // starting point the Templates pane offers a new agent.
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.adding_prompt(cx)).as_deref(),
+        Some(eidola_gui::participants_view::DEFAULT_AGENT_SYSTEM_PROMPT),
+        "a new participant starts from the shared default system prompt"
+    );
     let label = view
         .read_with(cx, |v, _| v.adding_label_state())
         .expect("add form open");
@@ -6297,6 +6304,304 @@ fn templates_pane_crud_and_set_default(cx: &mut TestAppContext) {
             .templates
             .read_with(cx, |s, _| !s.list().iter().any(|t| t.title == "Research"))
     });
+
+    drain_runtime(&core);
+}
+
+/// The router picker writes through `set_template_router_model`, and **Off**
+/// round-trips back to NULL — the default is a real choice, not a one-way door.
+#[gpui::test]
+fn templates_pane_router_model_writes_through_and_off_round_trips(cx: &mut TestAppContext) {
+    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    wait_until(cx, "templates load", |cx| {
+        stores.templates.read_with(cx, |s, _| !s.list().is_empty())
+    });
+    let default_id = eidola_app_core::DEFAULT_TEMPLATE_ID;
+
+    // The seeded template's router is unset — the draft reads Off.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit(default_id, window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.draft_router_model()),
+        Some(None),
+        "an unset router opens as Off"
+    );
+
+    // Pick a model and save: the setting lands on the template.
+    view.update(cx, |v, cx| v.set_router_model(Some("gemma4-31b"), cx));
+    view.update(cx, |v, cx| v.save(cx));
+    wait_until(cx, "router model persisted", |cx| {
+        stores.templates.read_with(cx, |s, _| {
+            s.list()
+                .iter()
+                .find(|t| t.id == default_id)
+                .and_then(|t| t.router_model.clone())
+                .is_some()
+        })
+    });
+    let stored = stores.templates.read_with(cx, |s, _| {
+        s.list()
+            .iter()
+            .find(|t| t.id == default_id)
+            .and_then(|t| t.router_model.clone())
+    });
+    assert_eq!(
+        stored.as_deref(),
+        Some("gemma4-31b"),
+        "the picked reference is what was written"
+    );
+
+    // Re-open: the draft is seeded from the stored value, and Off clears it.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit(default_id, window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.draft_router_model()),
+        Some(Some("gemma4-31b".to_string())),
+        "the editor reads back what it wrote"
+    );
+    view.update(cx, |v, cx| v.set_router_model(None, cx));
+    view.update(cx, |v, cx| v.save(cx));
+    wait_until(cx, "router model cleared", |cx| {
+        stores.templates.read_with(cx, |s, _| {
+            s.list()
+                .iter()
+                .find(|t| t.id == default_id)
+                .map(|t| t.router_model.is_none())
+                .unwrap_or(false)
+        })
+    });
+
+    drain_runtime(&core);
+}
+
+/// Setting a template's router is a **second** core call after the create, and
+/// it validates its backend — so a pick that went stale (its backend disabled
+/// or removed while the editor was open) must be refused **before** anything is
+/// written, not after a template has already landed without the router it was
+/// created with.
+#[gpui::test]
+fn a_stale_router_pick_refuses_before_creating_the_template(cx: &mut TestAppContext) {
+    let (stores, core, _dir, _space) = participants_scene(cx);
+    stores.templates.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "templates load", |cx| {
+        stores.templates.read_with(cx, |s, _| !s.list().is_empty())
+    });
+
+    // The pick goes stale: its backend is disabled after the editor opened.
+    core.runtime()
+        .block_on(core.set_backend_enabled("eidola".into(), false))
+        .expect("disable eidola");
+
+    stores.templates.update(cx, |s, cx| {
+        s.create(
+            "Doomed".into(),
+            4,
+            Vec::new(),
+            Some("gemma4-31b".into()),
+            cx,
+        );
+    });
+    wait_until(cx, "the refusal surfaces", |cx| {
+        stores
+            .templates
+            .read_with(cx, |s, _| s.op_error().is_some())
+    });
+
+    // Zero trace: the template itself was never created.
+    let titles: Vec<String> = core
+        .runtime()
+        .block_on(core.list_space_templates())
+        .expect("list templates")
+        .into_iter()
+        .map(|t| t.title)
+        .collect();
+    assert!(
+        !titles.iter().any(|t| t == "Doomed"),
+        "a refused router must leave no template behind: {titles:?}"
+    );
+
+    drain_runtime(&core);
+}
+
+/// A `SpaceTemplateInfo` embeds its referenced globals' **effective** config, so
+/// an "edit everywhere" of a shared participant — which emits only
+/// `Change::Participants` — must reach the templates snapshot too.
+#[gpui::test]
+fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    // A template projected from a space carries the shared "You" by reference.
+    core.runtime()
+        .block_on(core.template_from_space(space.clone(), "Projected".into()))
+        .expect("project template");
+    stores.templates.update(cx, |s, cx| s.refresh(cx));
+
+    let referenced_label = |cx: &mut TestAppContext| -> Option<String> {
+        stores.templates.read_with(cx, |s, _| {
+            s.list()
+                .iter()
+                .find(|t| t.title == "Projected")
+                .and_then(|t| t.referenced.first())
+                .map(|r| r.label.clone())
+        })
+    };
+    wait_until(cx, "projected template lists its shared global", |cx| {
+        stores.templates.read_with(cx, |s, _| {
+            s.list()
+                .iter()
+                .find(|t| t.title == "Projected")
+                .map(|t| !t.referenced.is_empty())
+                .unwrap_or(false)
+        })
+    });
+    assert_eq!(referenced_label(cx).as_deref(), Some("You"));
+
+    // Edit everywhere: the shared global's own config moves.
+    stores.participants.update(cx, |s, cx| {
+        s.update_everywhere(
+            space.clone(),
+            eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("Myself".into()),
+                ..Default::default()
+            },
+            cx,
+        );
+    });
+    wait_until(cx, "the edit lands", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space).iter().any(|p| p.label == "Myself")
+        })
+    });
+
+    // The bus bridge isn't installed in this scene, so drive the dispatch it
+    // would have: this is the routing under test.
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+    wait_until(cx, "the templates snapshot follows", |cx| {
+        referenced_label(cx).as_deref() == Some("Myself")
+    });
+
+    drain_runtime(&core);
+}
+
+/// A new agent participant arrives with the shared default system prompt, and
+/// that prompt survives the save.
+#[gpui::test]
+fn templates_pane_new_agent_carries_the_default_system_prompt(cx: &mut TestAppContext) {
+    use eidola_gui::participants_view::DEFAULT_AGENT_SYSTEM_PROMPT;
+
+    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    wait_until(cx, "templates load", |cx| {
+        stores.templates.read_with(cx, |s, _| !s.list().is_empty())
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_create(window, cx));
+        // A second agent takes the same starting point.
+        view.update(cx, |v, cx| v.add_participant(window, cx));
+    })
+    .unwrap();
+    for idx in [0, 1] {
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.draft_participant_prompt(idx, cx))
+                .as_deref(),
+            Some(DEFAULT_AGENT_SYSTEM_PROMPT),
+            "new agent {idx} is prefilled with the default system prompt"
+        );
+    }
+
+    let title = view.read_with(cx, |v, _| v.draft_title_state()).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        title.update(cx, |s, cx| s.set_value("Prompted", window, cx));
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.save(cx));
+    wait_until(cx, "template created", |cx| {
+        stores
+            .templates
+            .read_with(cx, |s, _| s.list().iter().any(|t| t.title == "Prompted"))
+    });
+    let prompts = stores.templates.read_with(cx, |s, _| {
+        s.list()
+            .iter()
+            .find(|t| t.title == "Prompted")
+            .map(|t| {
+                t.participants
+                    .iter()
+                    .map(|p| p.system_prompt.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    assert_eq!(
+        prompts,
+        vec![
+            Some(DEFAULT_AGENT_SYSTEM_PROMPT.to_string()),
+            Some(DEFAULT_AGENT_SYSTEM_PROMPT.to_string())
+        ],
+        "the default prompt round-trips through the template update path"
+    );
+
+    drain_runtime(&core);
+}
+
+/// An edited system prompt round-trips through the template update path.
+#[gpui::test]
+fn templates_pane_system_prompt_round_trips(cx: &mut TestAppContext) {
+    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    wait_until(cx, "templates load", |cx| {
+        stores.templates.read_with(cx, |s, _| !s.list().is_empty())
+    });
+    let default_id = eidola_app_core::DEFAULT_TEMPLATE_ID;
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit(default_id, window, cx));
+    })
+    .unwrap();
+    let prompt = view
+        .read_with(cx, |v, _| v.draft_participant_prompt_state(0))
+        .expect("the seeded template owns one agent");
+    cx.update_window(window, |_, window, cx| {
+        prompt.update(cx, |s, cx| {
+            s.set_value("Answer only in questions.", window, cx)
+        });
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.save(cx));
+    wait_until(cx, "system prompt persisted", |cx| {
+        stores.templates.read_with(cx, |s, _| {
+            s.list()
+                .iter()
+                .find(|t| t.id == default_id)
+                .and_then(|t| t.participants.first())
+                .and_then(|p| p.system_prompt.clone())
+                .as_deref()
+                == Some("Answer only in questions.")
+        })
+    });
+
+    // Re-opening the editor seeds the field from what was stored.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit(default_id, window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.draft_participant_prompt(0, cx))
+            .as_deref(),
+        Some("Answer only in questions.")
+    );
 
     drain_runtime(&core);
 }
@@ -9468,4 +9773,78 @@ fn space_an_overlay_that_hands_off_focus_does_not_get_it_back(cx: &mut TestAppCo
             "and the conversation's level is released, not restored over it"
         );
     });
+}
+
+// App lifecycle — the app outlives its windows (task 17, wave 2).
+//
+// The quit *policy* is the pure `lifecycle::quit_mode`, unit-tested in the
+// module. What is machine-verifiable here is the window-registry half: with
+// the mode production uses on macOS (and in windowless mode), every window
+// can close and a fresh one opens cleanly afterwards — and what a
+// reactivation does in each case. That the *process* survives is
+// hand-verified on the real `.app`; `TestPlatform::quit` is a no-op, so no
+// test can observe the difference.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn every_window_can_close_and_a_new_one_opens_cleanly(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+
+    let (first, _) = open_space(cx, &stores, Some("s".into()));
+    let (second, _) = open_space(cx, &stores, Some("s2".into()));
+    cx.update(|cx| assert_eq!(cx.windows().len(), 2));
+
+    for window in [first, second] {
+        cx.update_window(window, |_, window, _| window.remove_window())
+            .unwrap();
+    }
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(
+            cx.windows().is_empty(),
+            "both windows are gone; the app is still here"
+        );
+    });
+
+    // The whole point: a window opens again over the same live stores.
+    let (third, view) = open_space(cx, &stores, Some("s".into()));
+    draw_window(cx, third);
+    cx.update(|cx| assert_eq!(cx.windows().len(), 1));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    space.read_with(cx, |s, _| assert_eq!(s.id(), Some("s")));
+}
+
+#[gpui::test]
+fn reactivating_with_no_windows_opens_the_door(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let opened = Rc::new(Cell::new(0));
+    let counter = opened.clone();
+    cx.update(|cx| {
+        eidola_gui::lifecycle::reactivate(cx, move |_| counter.set(counter.get() + 1));
+    });
+    assert_eq!(opened.get(), 1, "no window: reactivation opens one");
+}
+
+#[gpui::test]
+fn reactivating_with_a_window_focuses_it_instead(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let stores = stub_stores_with_config(cx);
+    let (_window, _) = open_space(cx, &stores, Some("s".into()));
+
+    let opened = Rc::new(Cell::new(0));
+    let counter = opened.clone();
+    cx.update(|cx| {
+        eidola_gui::lifecycle::reactivate(cx, move |_| counter.set(counter.get() + 1));
+    });
+    assert_eq!(
+        opened.get(),
+        0,
+        "an existing window is focused, not duplicated"
+    );
+    cx.update(|cx| assert_eq!(cx.windows().len(), 1));
 }

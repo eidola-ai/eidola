@@ -267,6 +267,31 @@ pub struct SpaceTemplateInfo {
     /// `create_template` / `update_template`, whose signatures stay unchanged.
     pub router_model: Option<String>,
     pub participants: Vec<TemplateParticipantInfo>,
+    /// Global participants this template **references**
+    /// (`space_template_participant` rows), with their effective config
+    /// (`COALESCE(override, base)`). Additive beside `participants`, which stays
+    /// exactly the owned set every write path replaces: a reference is another
+    /// surface's row (the agent library / the shared "You"), so a template
+    /// editor may show it but never rewrites it here.
+    pub referenced: Vec<TemplateReferencedParticipant>,
+}
+
+/// One **global** participant a template references, with its effective config.
+/// Read-only from the template's side — `update_template` replaces owned rows
+/// only, and the shared config lives on the global itself.
+#[derive(Clone, Debug)]
+pub struct TemplateReferencedParticipant {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub model_ref: Option<String>,
+    /// The effective system prompt (`COALESCE(override, base)`) — carried, not
+    /// dropped: `template_from_space` preserves a per-membership prompt
+    /// override and instantiation honors it, so a template really can hold a
+    /// charter for a referenced global. Omitting it made the editor show an
+    /// empty field where a live instruction exists.
+    pub system_prompt: Option<String>,
+    pub notify_policy: String,
 }
 
 /// One agent participant a template OWNS (`scope='template'`).
@@ -3117,12 +3142,29 @@ impl Inner {
             .filter(|p| p.kind == "agent")
             .map(TemplateParticipantInfo::from_owned)
             .collect();
+        // Referenced globals (the shared "You" a space→template projection
+        // carries, and any shared agent) — invisible in `participants`, which is
+        // the owned set by construction.
+        let referenced = db::template_participants(conn, id)
+            .await?
+            .into_iter()
+            .filter(|p| p.source == "referenced")
+            .map(|p| TemplateReferencedParticipant {
+                id: p.participant_id,
+                kind: p.kind,
+                label: p.label,
+                model_ref: p.model_ref,
+                system_prompt: p.system_prompt,
+                notify_policy: p.notify_policy,
+            })
+            .collect();
         Ok(SpaceTemplateInfo {
             id: t.id,
             title: t.title,
             cascade_limit: t.cascade_limit,
             router_model: t.router_model,
             participants,
+            referenced,
         })
     }
 
@@ -6926,6 +6968,26 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Tear down **every** live inference engine, returning how many were
+    /// signalled. The shutdown path: a client quitting owes the user's
+    /// machine its memory back.
+    ///
+    /// Deliberately synchronous and infallible — it drains the in-process
+    /// engine registry and sends each supervisor its shutdown signal. It
+    /// touches no filesystem and no database, which is exactly why it is
+    /// not a loop over [`Self::local_models_state`]: that snapshot is
+    /// *reconstructed by scanning* the model directories, so an engine
+    /// whose backing `.gguf` moved mid-session is missing from it, and a
+    /// large or slow directory would burn a quit budget on I/O before
+    /// anything was killed.
+    ///
+    /// Signalling is not reaping: the supervisor task owns the child, so a
+    /// caller that is about to `exit()` must leave the runtime a moment to
+    /// run them.
+    pub fn shutdown_engines(&self) -> usize {
+        self.inner.shutdown_all_engines()
+    }
+
     /// Pin or unpin a loaded model's engine. Pinned engines are protected
     /// from automatic (LRU) unloading when another model needs the memory;
     /// manual unload still applies.
@@ -7648,6 +7710,37 @@ impl AppCore {
             .spawn(async move {
                 inner
                     .set_template_router_model(&template_id, router_model.as_deref())
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Check a may-decline router reference **without writing anything** —
+    /// exactly the validation [`Self::set_space_router_model`] /
+    /// [`Self::set_template_router_model`] run, returning the normalized value
+    /// (`None` for empty = off).
+    ///
+    /// It exists because setting a router is deliberately a *separate* call
+    /// from `create_template` / `update_template` (task 22 keeps their
+    /// signatures free of it), so a caller composing "create, then set the
+    /// router" has a window where the create commits and the setter is refused
+    /// — a backend disabled or removed while the editor was open. Running this
+    /// first turns that into a zero-trace failure, and sharing the real
+    /// validator (rather than the caller re-deriving the rule from its own
+    /// backend snapshot) is what keeps the two from drifting apart.
+    ///
+    /// Pure read: commits nothing, emits nothing.
+    pub async fn validate_router_model(
+        &self,
+        router_model: Option<String>,
+    ) -> Result<Option<String>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                inner
+                    .validate_router_model(&conn, router_model.as_deref())
                     .await
             })
             .await

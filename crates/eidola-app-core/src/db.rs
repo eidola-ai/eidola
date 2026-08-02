@@ -36,7 +36,10 @@ pub const HUMAN_PARTICIPANT_ID: &str = "00000000-0000-7000-8000-000000000001";
 pub const SYSTEM_PARTICIPANT_ID: &str = "00000000-0000-7000-8000-000000000002";
 
 /// Well-known id of the seeded "Default" template's single agent participant
-/// (seed-only; user-created template participants get fresh UUIDv7s).
+/// (seed-only; user-created template participants get fresh UUIDv7s). Written
+/// once, when the template row is created — the id is a stable handle for
+/// tests, **not** an idempotency key: re-seeding by id is exactly the bug
+/// [`ensure_default_participants`] documents.
 const DEFAULT_TEMPLATE_AGENT_ID: &str = "00000000-0000-7000-8000-000000000011";
 
 /// The generic system prompt the seeded default agent participant carries.
@@ -274,9 +277,35 @@ async fn initialize(conn: &Connection) -> Result<(), AppError> {
 }
 
 /// Seed the shared human "You" participant and the "Default" space template
-/// (with its single agent participant) if missing. Idempotent via well-known
-/// ids + `INSERT OR IGNORE`, so it runs on every open and never overwrites a
-/// user's edits. Mirrors the `ensure_default_backends` pattern.
+/// (with its single agent participant) if missing. Runs on every open.
+///
+/// **A seed makes a *fresh* database usable; it never re-asserts state over a
+/// user's later edits.** The distinction a seed must draw is "this row has
+/// never existed" vs. "the user removed it", and `INSERT OR IGNORE` on a
+/// well-known id only draws it for rows nothing can hard-delete. That holds for
+/// the globals and the template row itself — participants soft-remove, spaces
+/// leave by reference, and the built-in template refuses removal, so the row
+/// always survives and the re-seed is a genuine no-op.
+///
+/// It did **not** hold for the template's owned agent: `update_template`
+/// replaces a template's owned participants wholesale (hard delete + re-insert
+/// with fresh ids), so after *any* save to the Default template — a removal, an
+/// addition, even a plain rename — nothing sat at the well-known id and the
+/// next open injected the seeded agent back into the template, and from there
+/// into every new space (task 41). So that row is seeded **only in the same
+/// call that creates the template**: after the first open there is no path here
+/// that can touch a template's participants at all, which makes the
+/// re-injection unrepresentable rather than guarded.
+///
+/// (Nothing here ever needs to backfill an existing database: schema changes
+/// bump [`LATEST_VERSION`] and old databases are refused, not migrated.)
+///
+/// **Partial-seed safety.** `conn.execute` autocommits, so a process exit
+/// between two seed writes leaves the earlier one committed. Every seed here is
+/// independently keyed on its own well-known id and therefore self-heals on the
+/// next open — *except* the template + agent pair, whose second row is keyed on
+/// the first's creation. That group, and only that group, is written in one
+/// transaction ([`ensure_default_template_tx`]).
 async fn ensure_default_participants(conn: &Connection) -> Result<(), AppError> {
     let now = crate::now_ms();
 
@@ -308,25 +337,68 @@ async fn ensure_default_participants(conn: &Connection) -> Result<(), AppError> 
     .await
     .map_err(AppError::db)?;
 
-    // The seeded "Default" space template (must exist before its owned agent's
-    // owner FK resolves).
-    conn.execute(
-        "INSERT OR IGNORE INTO space_template \
-         (id, title, cascade_limit, created_at) \
-         VALUES (?1, 'Default', 4, ?2)",
-        (
-            Value::Text(crate::config::DEFAULT_TEMPLATE_ID.to_string()),
-            Value::Integer(now),
-        ),
-    )
-    .await
-    .map_err(AppError::db)?;
+    // The "Default" template and its agent — created together or not at all.
+    ensure_default_template_tx(conn, now).await
+}
+
+/// Create the "Default" template **and** its owned agent, atomically.
+///
+/// The two rows are one unit because the second is keyed on the first's
+/// *creation*, and `conn.execute` autocommits: without a transaction, a process
+/// exit (or a failing second write) between them would commit the template row
+/// alone and consume the creation signal — every later open would then see zero
+/// changes and skip the agent seed **permanently**, leaving new spaces with no
+/// assistant.
+///
+/// It is a transaction rather than a repair heuristic on purpose. The
+/// post-crash state ("template row, no owned agents, no user edits") is
+/// **indistinguishable** from a user who deliberately emptied the template, so
+/// any code that repaired it would resurrect exactly what
+/// [`ensure_default_participants`] exists to stop. Rolling back makes the state
+/// unrepresentable instead: there is nothing to detect, so nothing to
+/// misinterpret, and the seed simply stays retryable on the next open.
+async fn ensure_default_template_tx(conn: &Connection, now: i64) -> Result<(), AppError> {
+    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    match ensure_default_template_tx_body(conn, now).await {
+        Ok(()) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn ensure_default_template_tx_body(conn: &Connection, now: i64) -> Result<(), AppError> {
+    // The template row (must exist before its owned agent's owner FK resolves).
+    // The rows-changed count is the creation signal: 0 means the template was
+    // already here, and everything about it from that moment on is the user's.
+    let template_created = conn
+        .execute(
+            "INSERT OR IGNORE INTO space_template \
+             (id, title, cascade_limit, created_at) \
+             VALUES (?1, 'Default', 4, ?2)",
+            (
+                Value::Text(crate::config::DEFAULT_TEMPLATE_ID.to_string()),
+                Value::Integer(now),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?
+        > 0;
+    if !template_created {
+        return Ok(());
+    }
 
     // …owning a single template-scoped agent participant (label from the
     // model's friendly name, model = the compiled DEFAULT_MODEL, a generic
-    // prompt, notify 'human').
+    // prompt, notify 'human') — written once, with the template, and never
+    // again. See `ensure_default_participants`.
     conn.execute(
-        "INSERT OR IGNORE INTO participant \
+        "INSERT INTO participant \
          (id, scope, owner_template_id, kind, label, model_ref, system_prompt, \
           notify_policy, role, created_at) \
          VALUES (?1, 'template', ?2, 'agent', ?3, ?4, ?5, 'human', 'member', ?6)",
@@ -348,7 +420,10 @@ async fn ensure_default_participants(conn: &Connection) -> Result<(), AppError> 
 /// Insert the `eidola` and `local` singleton backend rows if they are
 /// missing. Runs on every open (idempotent), so both the fresh-install and
 /// migration paths — and any database from before backends existed — end up
-/// with them. Never overwrites: a user's enabled/display choices persist.
+/// with them. Never overwrites: a user's enabled/display choices persist. The
+/// seed-vs-user-edit hazard [`ensure_default_participants`] documents cannot
+/// arise here — a singleton backend is enable/disable only, never removable, so
+/// an absent row really is a fresh database.
 async fn ensure_default_backends(conn: &Connection) -> Result<(), AppError> {
     let now = crate::now_ms();
     conn.execute(
@@ -6059,8 +6134,8 @@ mod tests {
         let db = open_memory_fresh().await;
         let conn = db.connect().unwrap();
 
-        // Run the seed again — well-known ids + INSERT OR IGNORE make it a
-        // no-op (no duplicate rows, no error).
+        // Run the seed again — it must be a no-op (no duplicate rows, no
+        // error).
         ensure_default_participants(&conn).await.unwrap();
 
         // "You" is a GLOBAL participant.
@@ -6095,6 +6170,134 @@ mod tests {
             Some(crate::config::DEFAULT_MODEL)
         );
         assert_eq!(owned[0].notify_policy, "human");
+    }
+
+    /// The primitive behind task 41: a re-seed must not re-populate a template
+    /// whose agents the user has replaced. `update_template_tx` replaces the
+    /// owned set by hard-deleting it, so "the seeded id is absent" is the
+    /// *normal* state of an edited template — never a reason to write.
+    #[tokio::test]
+    async fn a_reseed_does_not_repopulate_an_edited_default_template() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+
+        // The user edits the Default template: its agents are replaced by one
+        // of their own (what `update_template_tx` does).
+        update_template_tx(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            None,
+            None,
+            Some(&[(
+                "Mine".to_string(),
+                Some("gemma-4-e2b@local".to_string()),
+                None,
+                "human".to_string(),
+            )]),
+            2_000,
+        )
+        .await
+        .unwrap();
+
+        // Next open.
+        ensure_default_participants(&conn).await.unwrap();
+
+        let owned = list_template_owned_participants(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+            .await
+            .unwrap();
+        let labels: Vec<&str> = owned.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["Mine"],
+            "the seed must not re-inject the default agent over the user's edit"
+        );
+    }
+
+    /// Creating the Default template and its agent is **atomic**. Without
+    /// that, a failure between the two writes would commit the template row
+    /// alone and *consume the creation signal* — every later open would report
+    /// zero changes and skip the agent seed permanently, leaving new spaces
+    /// with no assistant and no way back (the state is indistinguishable from a
+    /// user who emptied the template on purpose, which
+    /// `a_reseed_does_not_refill_an_emptied_default_template` requires us to
+    /// respect). The failure is forced deterministically by squatting on the
+    /// seeded agent's id, so the plain `INSERT` hits a PK conflict.
+    #[tokio::test]
+    async fn a_failed_first_seed_leaves_no_half_created_template() {
+        // Schema only — `open_memory_migrated` does not seed.
+        let db = open_memory_migrated().await;
+        let conn = fk_conn(&db).await;
+
+        insert_participant(
+            &conn,
+            DEFAULT_TEMPLATE_AGENT_ID,
+            "global",
+            None,
+            None,
+            "agent",
+            "Squatter",
+            None,
+            None,
+            "explicit",
+            "member",
+            None,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        ensure_default_participants(&conn)
+            .await
+            .expect_err("the agent insert must fail on the id conflict");
+
+        assert!(
+            get_space_template(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+                .await
+                .unwrap()
+                .is_none(),
+            "a half-created template must roll back, not persist without its agent"
+        );
+
+        // …and the seed stays retryable: with the conflict gone, the next open
+        // creates both rows.
+        conn.execute(
+            "DELETE FROM participant WHERE id = ?1",
+            (Value::Text(DEFAULT_TEMPLATE_AGENT_ID.to_string()),),
+        )
+        .await
+        .unwrap();
+        ensure_default_participants(&conn).await.unwrap();
+
+        assert!(
+            get_space_template(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let owned = list_template_owned_participants(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+            .await
+            .unwrap();
+        assert_eq!(owned.len(), 1, "the retry seeds the agent too");
+    }
+
+    /// …and the same for an outright emptied template: absence is a choice.
+    #[tokio::test]
+    async fn a_reseed_does_not_refill_an_emptied_default_template() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+
+        delete_template_owned_participants(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+            .await
+            .unwrap();
+        ensure_default_participants(&conn).await.unwrap();
+
+        assert!(
+            list_template_owned_participants(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a template the user emptied stays empty"
+        );
     }
 
     #[tokio::test]
