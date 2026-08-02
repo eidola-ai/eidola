@@ -16,6 +16,7 @@
 //! - [`composer`] — the floating/docking draft composer, the Post routing,
 //!   and the action gutter (Post / ⌥ Post quietly).
 //! - [`context_menu`] — the right-click menu over any of the space's editors.
+//! - [`keyboard`] — the two-level keyboard model over the tree (wave B).
 //! - [`minimap`] — the topology minimap.
 //! - [`traces`] — the per-post trace disclosure (what a turn actually did).
 //!
@@ -25,6 +26,7 @@
 
 pub mod composer;
 pub mod context_menu;
+pub mod keyboard;
 pub mod layout;
 pub mod minimap;
 pub mod model;
@@ -48,6 +50,7 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditorState, MarkdownStyle};
 
 use crate::actions::CloseWindow;
+use crate::focus::TabRegion as _;
 use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
 use crate::space::{ChatMessageView, Space, SpaceEvent};
@@ -484,6 +487,40 @@ pub struct SpaceView {
     pub(crate) hovered_post: Option<SharedString>,
     /// The post currently being edited in place, if any.
     pub(crate) editing: Option<EditingPost>,
+    /// Where the **keyboard** sits inside the conversation — which post, and
+    /// whether focus has entered that post's affordance row. `None` means the
+    /// conversation holds no keyboard focus (the resting state, and where
+    /// Escape at the post level returns to). See [`keyboard`].
+    pub(crate) tree_focus: Option<keyboard::TreeFocus>,
+    /// The focus handle the **focused post row** tracks. One handle moved from
+    /// row to row rather than one per post: gpui reports focus into the
+    /// AccessKit tree from whichever node tracks the focused handle, and the
+    /// row's `focus_visible` ring reads the same handle — so one handle gives
+    /// both, and nothing has to be minted or reaped as the transcript changes.
+    pub(crate) post_focus: FocusHandle,
+    /// One focus handle **per affordance slot**, tracked by the verbs of
+    /// whichever post currently holds the affordance level. A handle per slot
+    /// rather than one for "the focused verb", because Tab walks between the
+    /// verbs and only a handle *we* own can answer which one it landed on: a
+    /// single handle left [`keyboard::TreeFocus`]'s index frozen at the verb
+    /// Enter had entered, so the next `Right` cycled from a stale position. It
+    /// is a pool, grown to the largest verb row seen, and only the level's own
+    /// post tracks from it — two elements claiming one handle report focus
+    /// twice in a frame.
+    ///
+    /// Each handle carries `tab_index(0).tab_stop(true)`: gpui reads tab order
+    /// off the *tracked* handle once one exists, and these verbs must stay
+    /// ordinary Tab destinations.
+    pub(crate) affordance_slots: Vec<FocusHandle>,
+    /// **Who** an open transient overlay left holding the keyboard, recorded
+    /// each frame one is up — see [`keyboard::sync_tree_focus`], which uses the
+    /// falling edge to hand focus *back* to the conversation instead of reading
+    /// the borrow as a loss. The handle, not a flag: on the falling edge it is
+    /// the difference between "the overlay never gave the keyboard back" (still
+    /// focused, element gone — restore) and "something else claimed it in the
+    /// meantime" (a menu item that opened a draft and focused its editor —
+    /// leave it alone).
+    pub(crate) overlay_borrowed_focus: Option<FocusHandle>,
     /// Set when the active draft's editor emits a buffer [`Change`], consumed
     /// by the composer body's `caret_into_view` canvas on the next paint to
     /// scroll the new caret position into the composer's visible viewport
@@ -698,6 +735,10 @@ impl SpaceView {
             cascade_notice: None,
             hovered_post: None,
             editing: None,
+            tree_focus: None,
+            post_focus: cx.focus_handle(),
+            affordance_slots: Vec::new(),
+            overlay_borrowed_focus: None,
             composer_caret_scroll_pending: Cell::new(false),
             composer_aria_value: RefCell::new((SharedString::default(), SharedString::default())),
             page_scroll: ScrollHandle::new(),
@@ -771,6 +812,22 @@ impl SpaceView {
             .iter()
             .find(|d| &d.id == id)
             .map(|d| d.editor.clone())
+    }
+
+    /// The **trailing** draft's editor state — the tail composer at the end of
+    /// the current branch, whether or not it is the active one. The type-to-
+    /// compose jump (task 38) targets exactly this, so its test needs to seed
+    /// and read it while nothing is composing.
+    #[doc(hidden)]
+    pub fn tail_draft_state_for_test(&self) -> Option<Entity<MarkdownEditorState>> {
+        self.drafts.last().map(|d| d.editor.clone())
+    }
+
+    /// Leave the composing session (the Escape gesture), so a test can reach
+    /// the "nothing is composing" state the keyboard model needs.
+    #[doc(hidden)]
+    pub fn retire_draft_for_test(&mut self, cx: &mut Context<Self>) {
+        self.deactivate_active_draft(cx);
     }
 
     /// The current per-row render snapshot length (tests assert tree shape).
@@ -927,6 +984,12 @@ impl SpaceView {
     }
 
     /// Whether the minimap is currently shown (tests assert scroll reveals it).
+    #[doc(hidden)]
+    pub fn set_minimap_visible_for_test(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.minimap_visible = visible;
+        cx.notify();
+    }
+
     #[doc(hidden)]
     pub fn minimap_visible_for_test(&self) -> bool {
         self.minimap_visible
@@ -1204,7 +1267,8 @@ impl SpaceView {
     /// Called on every space change (cheap `SharedString` projection) and at
     /// construction. Drafts are local UI state, but their reply antecedent is a
     /// reference *into* the transcript, so it is rethreaded here — see
-    /// [`Self::rethread_drafts`].
+    /// [`Self::rethread_drafts`]. Keyboard tree focus names a post the same
+    /// way and is forwarded by the same rule — see [`Self::retarget_tree_focus`].
     pub(crate) fn rebuild(&mut self, cx: &mut Context<Self>) {
         let messages: Vec<crate::space::ChatMessageView> = self.space.read(cx).messages().to_vec();
         let posts: Vec<PostData> = messages
@@ -1224,6 +1288,7 @@ impl SpaceView {
             })
             .collect();
         self.rethread_drafts(&posts);
+        self.retarget_tree_focus(&posts);
         self.posts = posts;
     }
 
@@ -1735,6 +1800,11 @@ impl Render for SpaceView {
         let page_width = viewport.width;
         let window_h = viewport.height;
 
+        // Tree focus is *observed*, not merely bookkept: see
+        // `keyboard::sync_tree_focus`.
+        self.sync_tree_focus(window, cx);
+        self.ensure_affordance_slots(cx);
+
         // Window resize: branch offsets are absolute pixels but pages are a
         // window-width apart, so remap every offset by the stride ratio to keep
         // the selected branch (and exact position) invariant to width.
@@ -1933,9 +2003,34 @@ impl Render for SpaceView {
             // owner, consulted by one predicate, rather than a copy of the
             // close per handler that each has to remember to make first. A
             // no-op when no menu is open.
-            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
-                    this.close_context_menu(cx);
+                    // Rung 1 of the Escape chain (see `keyboard`): the menu
+                    // wins, and consumes the press.
+                    if this.close_context_menu(cx) {
+                        return;
+                    }
+                }
+                // The conversation's own keyboard model — arrows, Enter,
+                // Escape's last two rungs, and type-to-compose. It runs as a
+                // listener, so gpui's *binding* pass has already offered the
+                // press to every inner context (the composer's editor, an
+                // edit session); nothing here can shadow them.
+                //
+                // **A handled press must be consumed.** `gpui_macos`'s
+                // `handle_key_event` reports the key as handled to AppKit only
+                // when the callback comes back with `propagate == false`;
+                // otherwise it falls through to
+                // `[[self inputContext] handleEvent:]`, which hands the *same*
+                // native event to whatever input handler is installed. For
+                // type-to-compose that is the editor this press just focused,
+                // so the character it already applied would be typed a second
+                // time. `Window::dispatch_keystroke` (the test path) has the
+                // same shape — `if !result.propagate { return true }`, else
+                // `input_handler.dispatch_input(...)` — which is what makes
+                // "the press was consumed" assertable here at all.
+                if this.handle_conversation_key(ev, window, cx) {
+                    cx.stop_propagation();
                 }
             }))
             // The window's single modifiers listener (see `WindowInput`): the
@@ -1979,6 +2074,7 @@ impl Render for SpaceView {
                             // extent. What it *contains* is Wave C's job —
                             // today it is the branch dots, bands and asks.
                             .probe("space/conversation", gpui::Role::Main, "Conversation")
+                            .tab_region(crate::focus::region::MAIN)
                             .w_full()
                             .pt(px(doc_reserve))
                             .pb(px(floating_pad))

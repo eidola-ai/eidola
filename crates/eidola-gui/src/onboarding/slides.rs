@@ -277,11 +277,20 @@ impl RenderOnce for CreateAccount {
                         Role::CheckBox,
                         "I agree to the Terms of Service and Privacy Policy.",
                     )
+                    // A checkbox's state is `toggled`, not `selected` — the
+                    // macOS adapter reads `accessibilityValue` off `toggled()`
+                    // and consults `is_selected()` only for `Role::Tab`.
+                    .aria_toggled(self.agreed.into())
+                    .on_click({
+                        let toggle = self.on_toggle_agree;
+                        let next = !self.agreed;
+                        move |_, window, cx| toggle(&next, window, cx)
+                    })
                     .child(
                         Checkbox::new("onboarding-agree-box")
                             .label("I agree to the Terms of Service and Privacy Policy.")
                             .checked(self.agreed)
-                            .on_click(self.on_toggle_agree)
+                            .tab_stop(false)
                             .p_1(),
                     ),
             )
@@ -298,12 +307,23 @@ impl RenderOnce for CreateAccount {
         let cta = div()
             .id("onboarding-cta-create")
             .probe("onboarding/cta/create", Role::Button, label)
+            // One predicate decides both the tab stop and the activation, so a
+            // wrapper focused when the CTA disables itself cannot re-invoke on
+            // a second Enter (`Button` stops propagation on mouse-down while
+            // disabled, so the wrapper never arms a click either).
+            .map(|d| {
+                if enabled {
+                    d.on_click(self.on_create)
+                } else {
+                    d.tab_stop(false)
+                }
+            })
             .child(
                 Button::new("onboarding-btn-create")
                     .ghost()
                     .label(label)
                     .disabled(!enabled)
-                    .on_click(self.on_create),
+                    .tab_stop(false),
             );
 
         slide_frame(
@@ -619,11 +639,12 @@ fn cta_button(
             Role::Button,
             label.clone(),
         )
+        .on_click(on_click)
         .child(
             Button::new(SharedString::from(format!("onboarding-btn-{key}")))
                 .ghost()
                 .label(label)
-                .on_click(on_click),
+                .tab_stop(false),
         )
 }
 

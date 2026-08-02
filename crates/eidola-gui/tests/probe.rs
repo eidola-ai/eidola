@@ -3464,3 +3464,547 @@ fn space_probes_record_a_disclosure_per_turn(cx: &mut TestAppContext) {
 
     probe::set_probes_enabled(false);
 }
+
+#[gpui::test]
+fn keyboard_focus_reveals_a_posts_hover_gated_verbs(cx: &mut TestAppContext) {
+    // Wave B / audit S7. The Edit and Regenerate verbs are hover-gated, and
+    // gpui suppresses hover entirely while the input modality is keyboard — so
+    // without a focus-within reveal they are unreachable by exactly the user
+    // the keyboard model exists for. Asserted through the probe registry: the
+    // verb is *rendered*, not merely conceptually revealed.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the quick brown fox")], cx)
+        });
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries.iter().any(|(n, _)| n == "space/post/0/edit"),
+        "the verb is hidden at rest"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.focus_post("a1".into(), window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/edit",
+        gpui::Role::Button,
+        "Edit this post",
+    );
+}
+
+#[gpui::test]
+fn keyboard_focus_reveals_a_library_rows_verbs(cx: &mut TestAppContext) {
+    // The Library's half of audit S7 — the same rule as a post's action gutter:
+    // hover-gated verbs must also answer to keyboard focus, because gpui
+    // suppresses hover outright while the input modality is keyboard.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            space_info("s1", Some("Tides and the moon")),
+            space_info("s2", Some("Borrow checker")),
+        ];
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries.iter().any(|(n, _)| n == "library/row/0/rename"),
+        "the verbs are hidden at rest"
+    );
+
+    // Tab into the listing: the first stop is the first row.
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0/rename",
+        gpui::Role::Button,
+        "Rename Tides and the moon",
+    );
+}
+
+/// Press Enter as a real keyboard activation: gpui maps it on **key up** (the
+/// key-down only records the pending activation), and `TestAppContext`'s
+/// `dispatch_keystroke` sends the down alone.
+fn press_enter(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    let ks = gpui::Keystroke::parse("enter").unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: ks.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke: ks }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn tab_reaches_a_control_that_enter_actually_activates(cx: &mut TestAppContext) {
+    // The P1 the focus model had to answer: gpui's Enter/Space activation runs
+    // **only the focused element's own click listeners** (and registers the
+    // whole keyboard-click block only when it has some), so a probed *wrapper*
+    // around a `gpui_component::Button` is a tab stop that can never fire —
+    // it rings, eats a Tab, and does nothing, with the working control one Tab
+    // further on. `probe_delegating` takes the wrapper out of the tab order so
+    // Tab lands on the button that owns the handler.
+    //
+    // Driven end to end: Tab into the listing, Tab to the focused row's verbs,
+    // press Enter, and the space is archived.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            space_info("s1", Some("Tides and the moon")),
+            space_info("s2", Some("Borrow checker")),
+        ];
+    });
+    let spaces = stores.spaces.clone();
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    // Stop 1: the listing itself (one tab stop, roving cursor on row 0), which
+    // is what reveals that row's verbs.
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0/archive",
+        gpui::Role::Button,
+        "Archive Tides and the moon",
+    );
+
+    // Stops 2 and 3: the focused row's Rename then Archive. Exactly two — a
+    // probed wrapper before each would make it four, and the second press
+    // would land on the dead rename wrapper instead.
+    cx.update_window(window, |_, window, cx| {
+        window.focus_next(cx);
+        window.focus_next(cx);
+    })
+    .unwrap();
+    press_enter(cx, window);
+
+    let titles: Vec<String> = spaces.read_with(cx, |s, _| {
+        s.list().iter().filter_map(|s| s.title.clone()).collect()
+    });
+    assert_eq!(
+        titles,
+        vec!["Borrow checker".to_string()],
+        "Enter on the focused Archive verb archived the space"
+    );
+}
+
+#[gpui::test]
+fn library_arrows_rove_the_listing_and_enter_opens_a_space(cx: &mut TestAppContext) {
+    // `uniform_list` materializes only the visible window, so a tab stop per
+    // row is a tab order that cannot contain the rows you haven't scrolled to
+    // — Tab simply walked off the end of the visible slice and left the
+    // library. The listing is therefore one tab stop with a roving cursor (the
+    // shape the space tree already ships): ↑/↓/Home/End move the cursor, the
+    // focused row reveals its verbs, and Enter opens it.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            space_info("s1", Some("Tides and the moon")),
+            space_info("s2", Some("Borrow checker")),
+            space_info("s3", Some("Sourdough")),
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    let entries = fresh_entries(cx, window);
+    view.read_with(cx, |v, cx| assert_eq!(v.focused_row_for_test(cx), Some(0)));
+    assert!(
+        entries.iter().any(|(n, _)| n == "library/row/0/rename")
+            && !entries.iter().any(|(n, _)| n == "library/row/1/rename"),
+        "only the cursor's row reveals its verbs"
+    );
+
+    cx.simulate_keystrokes(window, "down");
+    let entries = fresh_entries(cx, window);
+    view.read_with(cx, |v, cx| assert_eq!(v.focused_row_for_test(cx), Some(1)));
+    assert_probe(
+        &entries,
+        "library/row/1/rename",
+        gpui::Role::Button,
+        "Rename Borrow checker",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "library/row/0/rename"),
+        "the cursor moved, so row 0's verbs went with it"
+    );
+
+    cx.simulate_keystrokes(window, "end");
+    view.read_with(cx, |v, cx| assert_eq!(v.focused_row_for_test(cx), Some(2)));
+    cx.simulate_keystrokes(window, "down");
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.focused_row_for_test(cx),
+            Some(2),
+            "the last row is the end"
+        )
+    });
+    cx.simulate_keystrokes(window, "home");
+    view.read_with(cx, |v, cx| assert_eq!(v.focused_row_for_test(cx), Some(0)));
+    cx.simulate_keystrokes(window, "up");
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.focused_row_for_test(cx),
+            Some(0),
+            "the first row is the top"
+        )
+    });
+
+    cx.simulate_keystrokes(window, "down enter");
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.open_space_requests_for_test(),
+            1,
+            "Enter opened the row the cursor was on"
+        );
+    });
+}
+
+/// Walk the window's whole Tab cycle and return how many distinct stops it
+/// contains. `focus_next` wraps, so a repeat ends the walk — and it is a no-op
+/// when there is nothing to reach, so an *unchanged* focus ends it too (the
+/// window's root handle is tracked but is not itself a stop, and would
+/// otherwise be miscounted as one).
+fn tab_stop_count(cx: &mut TestAppContext, window: AnyWindowHandle) -> usize {
+    draw(cx, window);
+    let focused = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.focused(cx).map(|h| format!("{h:?}"))
+        })
+        .unwrap()
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut prev = focused(cx);
+    for _ in 0..200 {
+        cx.update_window(window, |_, window, cx| window.focus_next(cx))
+            .unwrap();
+        let id = focused(cx);
+        if id == prev {
+            break;
+        }
+        let Some(id) = id else { break };
+        if seen.contains(&id) {
+            break;
+        }
+        seen.push(id.clone());
+        prev = Some(id);
+    }
+    seen.len()
+}
+
+#[gpui::test]
+fn a_listing_contributes_one_tab_stop_regardless_of_row_count(cx: &mut TestAppContext) {
+    // The classification cure for `Role::ListItem`. `listitem` is a
+    // *structural* role, and treating it as interactive handed a tab stop to
+    // every static row (a declined trace round, a footnote with nowhere to
+    // navigate) while the clickable rows it was meant for live in
+    // `uniform_list`s, where a per-row stop can only ever reach the
+    // materialized window. Both listings rove instead — so the window's tab
+    // order does not grow with the data.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Requests, cx);
+        v.set_requests_for_test(vec![stub_request("req-1")], false);
+    });
+    let one = tab_stop_count(cx, window);
+
+    view.update(cx, |v, _| {
+        v.set_requests_for_test(
+            (1..=5).map(|i| stub_request(&format!("req-{i}"))).collect(),
+            false,
+        );
+    });
+    let five = tab_stop_count(cx, window);
+
+    assert_eq!(
+        one, five,
+        "five rows must contribute exactly what one row does: the listing's own stop"
+    );
+}
+
+#[gpui::test]
+fn record_arrows_rove_the_listing_and_enter_opens_a_detail(cx: &mut TestAppContext) {
+    // The Record's listings are virtualized too, so they take the Library's
+    // shape: one tab stop, a roving cursor, Enter opens the row it sits on.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Requests, cx);
+        v.set_requests_for_test(
+            (1..=3).map(|i| stub_request(&format!("req-{i}"))).collect(),
+            false,
+        );
+    });
+    draw(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.focus_listing_for_test(window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), Some(0)));
+
+    cx.simulate_keystrokes(window, "down");
+    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), Some(1)));
+    cx.simulate_keystrokes(window, "end");
+    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), Some(2)));
+    cx.simulate_keystrokes(window, "home");
+    view.read_with(cx, |v, _| assert_eq!(v.focused_row_for_test(), Some(0)));
+
+    cx.simulate_keystrokes(window, "down enter");
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.detail_pending(),
+            Some("req-2"),
+            "Enter opened the detail of the row the cursor was on"
+        );
+    });
+}
+
+#[gpui::test]
+fn library_cursor_clamps_when_its_row_disappears(cx: &mut TestAppContext) {
+    // Rows come and go under a roving cursor — archive the one it sits on and
+    // a stored index points one past the end, where Enter is dead and no row
+    // draws the ring. The effective cursor is clamped on read instead, so it
+    // lands on the new last row and stays live.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            space_info("s1", Some("Tides and the moon")),
+            space_info("s2", Some("Borrow checker")),
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    cx.simulate_keystrokes(window, "end");
+    view.read_with(cx, |v, cx| assert_eq!(v.focused_row_for_test(cx), Some(1)));
+
+    view.update(cx, |v, cx| v.archive("s2".into(), cx));
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.focused_row_for_test(cx),
+            Some(0),
+            "the cursor lands on the new last row rather than past the end"
+        );
+    });
+
+    // …and it is still live: the row it now sits on opens.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0/rename",
+        gpui::Role::Button,
+        "Rename Tides and the moon",
+    );
+    cx.simulate_keystrokes(window, "enter");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.open_space_requests_for_test(), 1, "Enter still opens");
+    });
+}
+
+#[gpui::test]
+fn a_disabled_control_is_not_a_tab_stop(cx: &mut TestAppContext) {
+    use eidola_gui::updates::UpdatesView;
+    // The hazard the activation hoist introduces: with the handler on the
+    // probed wrapper, the widget's own disabled state no longer guards the
+    // keyboard. (A *pointer* press is still refused inside the widget, which
+    // stops propagation on mouse-down while disabled, so the wrapper never
+    // arms.) So the wrapper mirrors it: disabled means no tab stop.
+    let _guard = probes_on();
+
+    let idle = stub_stores(cx, |s| s.update_checking = false);
+    let (idle_window, _v) = open_view(cx, |window, cx| {
+        cx.new(|cx| UpdatesView::new(idle, window, cx))
+    });
+    let entries = fresh_entries(cx, idle_window);
+    assert_probe(&entries, "updates/check", gpui::Role::Button, "Check Now");
+    let idle_stops = tab_stop_count(cx, idle_window);
+
+    let busy = stub_stores(cx, |s| s.update_checking = true);
+    let (busy_window, _v) = open_view(cx, |window, cx| {
+        cx.new(|cx| UpdatesView::new(busy, window, cx))
+    });
+    let entries = fresh_entries(cx, busy_window);
+    assert_probe(&entries, "updates/check", gpui::Role::Button, "Checking…");
+    let busy_stops = tab_stop_count(cx, busy_window);
+
+    assert_eq!(
+        busy_stops,
+        idle_stops - 1,
+        "the check affordance is still announced, but leaves the tab order while \
+         it cannot be actioned"
+    );
+}
+
+#[gpui::test]
+fn library_cursor_yields_to_a_verb_it_tabs_into(cx: &mut TestAppContext) {
+    // Two questions, two predicates. Tab from the listing into the cursor row's
+    // Rename verb makes the *verb* the focused element — it paints its own ring
+    // — so the row must stop claiming the cursor, or one focus is indicated
+    // twice and AT is told a row is focused while a button inside it really is.
+    // The verbs must nevertheless stay revealed: they are what the Tab reached.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            space_info("s1", Some("Tides and the moon")),
+            space_info("s2", Some("Borrow checker")),
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert!(entries.iter().any(|(n, _)| n == "library/row/0/rename"));
+    let (cursor, revealed) = cx
+        .update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, cx| v.cursor_and_reveal_for_test(window, cx))
+        })
+        .unwrap();
+    assert_eq!(
+        (cursor, revealed),
+        (Some(0), Some(0)),
+        "the listing itself holds focus: it is both the cursor and the reveal"
+    );
+
+    // Tab on to the row's Rename verb.
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    let entries = fresh_entries(cx, window);
+    let (cursor, revealed) = cx
+        .update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, cx| v.cursor_and_reveal_for_test(window, cx))
+        })
+        .unwrap();
+    assert_eq!(cursor, None, "the verb owns the focus indication now");
+    assert_eq!(revealed, Some(0), "…and its row keeps showing the verbs");
+    assert!(
+        entries.iter().any(|(n, _)| n == "library/row/0/archive"),
+        "including the one Tab has not reached yet"
+    );
+}
+
+#[gpui::test]
+fn a_faded_minimap_contributes_no_tab_stops(cx: &mut TestAppContext) {
+    // The minimap's cells take their press handler only while the strip is up
+    // (a faded 36px strip must contain nothing), so at rest each is a
+    // `Role::Button` with no click listener of its own — and gpui's Enter/Space
+    // runs only the focused element's own listeners. Left as stops they were N
+    // dead ones at the end of every space window's tab order.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![
+                    probe_post("a1", "the root post"),
+                    probe_post("a2", "the reply"),
+                ],
+                cx,
+            )
+        });
+    });
+
+    let entries = fresh_entries(cx, window);
+    let cells = entries
+        .iter()
+        .filter(|(n, _)| n.starts_with("space/minimap/cell/"))
+        .count();
+    assert!(cells > 0, "the fixture really does render minimap cells");
+    let faded = tab_stop_count(cx, window);
+
+    view.update(cx, |v, cx| v.set_minimap_visible_for_test(true, cx));
+    let live = tab_stop_count(cx, window);
+
+    assert_eq!(
+        faded + cells,
+        live,
+        "every cell is a stop while the map is up and none while it is faded"
+    );
+}
+
+#[gpui::test]
+fn record_spend_group_header_is_a_readable_node(cx: &mut TestAppContext) {
+    // The roving cursor walks display rows, and a spending group header is one
+    // of them — navigable, not activatable. `aria_active_descendant` resolves
+    // through the a11y *node* tree, and gpui pushes a node only for an element
+    // carrying a role, so without one the pointer at a header is silently
+    // dropped. `Label` gives it a node and keeps it out of the tab order.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Spending, cx);
+        v.set_spending_for_test(vec![stub_spend("req-1")], false);
+    });
+
+    let entries = fresh_entries(cx, window);
+    let (_, header) = entries
+        .iter()
+        .find(|(n, _)| n == "record/spend/header/0")
+        .expect("the group header carries an a11y node");
+    assert_eq!(header.role, gpui::Role::Label);
+    assert!(
+        header.label.contains("credential"),
+        "and reads as what it captions: {:?}",
+        header.label
+    );
+}

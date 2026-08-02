@@ -4,9 +4,13 @@
 //!
 //! 1. **Accessibility** (always): sets the AccessKit role and label on the
 //!    element via gpui's a11y builders, so assistive technology sees a real
-//!    node. This requires the element to also carry an [`ElementId`] (call
-//!    `.id(…)` before `.probe(…)`) — gpui derives the AccessKit node id from
-//!    the `GlobalElementId`, and an id-less element never reaches the tree.
+//!    node — and, since wave B, the **focus attributes derived from that
+//!    role** (see [`crate::focus`]): an interactive role becomes a focusable
+//!    tab stop wearing the focus-visible ring, a container role stays a
+//!    container. This requires the element to also carry an [`ElementId`]
+//!    (call `.id(…)` before `.probe(…)`) — gpui derives the AccessKit node id
+//!    from the `GlobalElementId`, and an id-less element never reaches the
+//!    tree.
 //! 2. **The UI driver** (only when probes are enabled): records the element's
 //!    painted bounds — plus the role and label — into a process-global
 //!    registry keyed by window, so `examples/driver.rs` can list named,
@@ -131,7 +135,7 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         role: Role,
         label: impl Into<SharedString>,
     ) -> Self {
-        self.probe_inner(name, role, label.into(), None)
+        self.probe_inner(name, role, label.into(), None, true)
     }
 
     /// Like [`Probe::probe`], plus the element's accessible **value**
@@ -152,7 +156,28 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         label: impl Into<SharedString>,
         value: impl Into<SharedString>,
     ) -> Self {
-        self.probe_inner(name, role, label.into(), Some(value.into()))
+        self.probe_inner(name, role, label.into(), Some(value.into()), true)
+    }
+
+    /// Like [`Probe::probe`], for an element that **delegates its focus**: it
+    /// carries the role, the label and the bounds, and something else carries
+    /// the keyboard. Applies **no focus attributes at all**.
+    ///
+    /// The case it exists for is a **row of a roving-focus list** (the Library
+    /// and Record listings), where the list is the single tab stop and moves a
+    /// cursor over its rows — a tab stop per row cannot work in a virtualized
+    /// list at all, since only the materialized window would be in the tab
+    /// order. What makes it *safe* there, and unsafe as a general answer, is
+    /// that the list itself carries a role, so the AccessKit tree still has a
+    /// node to report focus on. See [`crate::focus`] for the wrapper rule,
+    /// which went the other way for exactly that reason.
+    fn probe_delegating(
+        self,
+        name: impl Into<SharedString>,
+        role: Role,
+        label: impl Into<SharedString>,
+    ) -> Self {
+        self.probe_inner(name, role, label.into(), None, false)
     }
 
     #[doc(hidden)]
@@ -162,10 +187,30 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         role: Role,
         label: SharedString,
         value: Option<SharedString>,
+        derive_focus: bool,
     ) -> Self {
         let mut this = self.role(role).aria_label(label.clone());
         if let Some(value) = value.clone() {
             this = this.aria_value(value);
+        }
+        // Wave B: focus is derived from the role, so one annotation still
+        // carries everything. `tab_index(0)` puts the element at index 0 of
+        // whatever tab *group* encloses it — the enclosing landmark supplies
+        // the region's place in the order (`focus::region`), and equal indices
+        // fall back to paint order, so within a region the tab walk follows
+        // the page. `focusable()` alone (a post) means "can hold focus, is not
+        // a Tab destination". The ring is gpui's own `:focus-visible`: shown
+        // when this element is focused *and* the last input was a key.
+        //
+        // `probe_delegating` opts out: the widget inside owns the focus, the
+        // ring and the activation.
+        if derive_focus && crate::focus::is_focusable(role) {
+            this = this.focusable();
+            if crate::focus::is_tab_stop(role) {
+                this = this.tab_index(0);
+                let shadows = crate::focus::ring_shadows(crate::focus::ring_colors());
+                this = this.focus_visible(move |s| s.shadow(shadows));
+            }
         }
         if !probes_enabled() {
             return this;

@@ -260,6 +260,9 @@ impl ParticipantsView {
         self.picker = None;
         let is_referenced = p.source == "referenced";
         let label = cx.new(|cx| InputState::new(window, cx).default_value(&p.label));
+        // A reveal focuses what it revealed — see `backends_settings`'s
+        // `begin_edit_base_url`.
+        label.update(cx, |s, cx| s.focus(window, cx));
         let system_prompt = cx.new(|cx| {
             let s = InputState::new(window, cx)
                 .auto_grow(2, 8)
@@ -432,6 +435,7 @@ impl ParticipantsView {
         self.template_form = None;
         self.picker = None;
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("Participant name"));
+        label.update(cx, |s, cx| s.focus(window, cx));
         // A new agent starts from the shared default charter — the same
         // starting point the Templates pane offers, so the two surfaces don't
         // contradict each other on what "a new participant" begins as.
@@ -502,6 +506,7 @@ impl ParticipantsView {
             .clone()
             .unwrap_or_else(|| "My template".to_string());
         let title = cx.new(|cx| InputState::new(window, cx).default_value(&default_title));
+        title.update(cx, |s, cx| s.focus(window, cx));
         self.template_form = Some(TemplateState { title });
         cx.notify();
     }

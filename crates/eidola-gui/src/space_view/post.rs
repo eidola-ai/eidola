@@ -158,6 +158,18 @@ impl SpaceView {
             .when_some(article, |d, (i, label, value)| {
                 d.probe_value(format!("space/post/{i}"), gpui::Role::Article, label, value)
             })
+            // Wave B: the *focused* post row tracks the view's single post
+            // focus handle. `Role::Article` already made the row focusable and
+            // gave it the `:focus-visible` ring; tracking the handle is what
+            // lets the arrow keys *move* focus here, and what tells gpui to
+            // report this node as focused in the AccessKit tree. One handle
+            // moved between rows — see `SpaceView::post_focus`.
+            // Only at the *post* level: once focus enters the affordance row
+            // the verb tracks its own handle, and two elements tracking one
+            // handle would claim focus twice in a frame (gpui asserts on it).
+            .when(self.post_row_holds_focus(&node.id), |d| {
+                d.track_focus(&self.post_focus)
+            })
             .relative()
             .w(page_width)
             .py(POST_PAD_Y)
@@ -212,6 +224,20 @@ impl SpaceView {
         let post = &self.posts[i];
 
         let mut col = v_flex().w(bw).gap_2();
+        // Wave B's focus ring, drawn here rather than by `probe`: the post
+        // *row* is full-bleed, so a ring on its own bounds is two window-wide
+        // rules with its sides off-screen. The reading column is what the
+        // reader perceives as the post, so that is what the ring frames — same
+        // hairline, same accent, a wider gap so it reads as a frame around
+        // prose rather than a rule under its first line. No `:focus-visible`
+        // guard is needed: tree focus is only ever set by the keyboard model.
+        if self.post_row_holds_focus(&node.id) {
+            let shadows = crate::focus::ring_shadows_at(
+                crate::focus::ring_colors(),
+                crate::focus::POST_RING_OFFSET,
+            );
+            col = col.rounded_sm().shadow(shadows);
+        }
         if let Some(reasoning) = post.reasoning.clone() {
             let (label, aria) = thinking_labels(false, post.reasoning_expanded);
             col = col.child(
@@ -305,15 +331,32 @@ impl SpaceView {
         }
 
         // The shared quiet-verb look (see `verb_button`) — the same family the
-        // reading column's thinking disclosure uses.
-        let verb = |id: SharedString, probe: String, label: &'static str, aria: SharedString| {
-            verb_button(id, probe, label, aria, cx)
+        // reading column's thinking disclosure uses. `slot` is the verb's index
+        // in this post's affordance row, and while the keyboard has entered
+        // *this* post every verb tracks that slot's own handle
+        // (`SpaceView::affordance_slots`, pre-grown in `render`). A handle per
+        // slot rather than one for "the focused verb" is what lets
+        // `sync_tree_focus` see which verb a Tab landed on and resync the
+        // level's index to it. Only the level's own post tracks from the pool —
+        // two elements claiming one handle report focus twice in a frame.
+        let holds_level = self.post_holds_affordance_level(&node.id);
+        let verb = |slot: usize,
+                    id: SharedString,
+                    probe: String,
+                    label: &'static str,
+                    aria: SharedString| {
+            let b = verb_button(id, probe, label, aria, cx);
+            match self.affordance_slots.get(slot).filter(|_| holds_level) {
+                Some(handle) => b.track_focus(handle),
+                None => b,
+            }
         };
 
         if self.editing.as_ref().map(|e| &e.node_id) == Some(&node.id) {
             return col
                 .child(
                     verb(
+                        0,
                         SharedString::from(format!("space-edit-save-{}", node.id)),
                         format!("space/post/{i}/save"),
                         "Save",
@@ -323,6 +366,7 @@ impl SpaceView {
                 )
                 .child(
                     verb(
+                        1,
                         SharedString::from(format!("space-edit-cancel-{}", node.id)),
                         format!("space/post/{i}/cancel"),
                         "Cancel",
@@ -332,7 +376,11 @@ impl SpaceView {
                 );
         }
 
-        if self.hovered_post.as_ref() != Some(&node.id) || self.editing.is_some() {
+        // Revealed by hover **or by keyboard focus** (wave B / audit S7): gpui
+        // suppresses hover entirely while the input modality is keyboard, so a
+        // hover-only gate would hide these verbs from exactly the user the
+        // keyboard model exists for.
+        if !self.post_affordances_revealed(&node.id) || self.editing.is_some() {
             return col;
         }
 
@@ -341,6 +389,7 @@ impl SpaceView {
                 let id = node.id.clone();
                 col.child(
                     verb(
+                        0,
                         SharedString::from(format!("space-edit-{}", node.id)),
                         format!("space/post/{i}/edit"),
                         "Edit",
@@ -355,6 +404,7 @@ impl SpaceView {
                 let id = action_id.clone();
                 col.child(
                     verb(
+                        0,
                         SharedString::from(format!("space-regenerate-{}", node.id)),
                         format!("space/post/{i}/regenerate"),
                         "Regenerate",
