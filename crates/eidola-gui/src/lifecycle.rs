@@ -43,7 +43,7 @@
 
 use gpui::{App, QuitMode};
 
-use crate::stores::Stores;
+use crate::stores::{BusBridge, Stores};
 
 /// Usage text for the GUI binary. Short by design — the GUI takes no real
 /// configuration; `--windowless` is the service launch mode.
@@ -126,10 +126,23 @@ pub fn quit_mode(opts: LaunchOptions) -> QuitMode {
 /// without a face. `cx.activate(true)` runs either way, because a reopen can
 /// arrive while another app is foreground.
 ///
+/// **"The most recent" is the platform's front-to-back stack, not slot order.**
+/// `App::windows()` enumerates gpui's `SlotMap`, which reuses a closed window's
+/// slot — so after a close-and-reopen its `.last()` is whatever landed in the
+/// highest slot index, not the window the user saw last. `App::window_stack()`
+/// is the real signal (macOS implements it as `MacWindow::ordered_windows()`,
+/// front-to-back), and reactivation is a macOS-only event, so this is exactly
+/// the platform that answers it. `windows().last()` stays as the deterministic
+/// fallback for the platforms that return `None` — including the test platform,
+/// which is why the behavior tests still exercise a real path.
+///
 /// `open_when_empty` is a parameter rather than a direct call so the decision
 /// is testable without `AppGlobal` installed.
 pub fn reactivate(cx: &mut App, open_when_empty: impl FnOnce(&mut App)) {
-    let target = cx.active_window().or_else(|| cx.windows().last().copied());
+    let target = cx
+        .active_window()
+        .or_else(|| cx.window_stack().and_then(|stack| stack.first().copied()))
+        .or_else(|| cx.windows().last().copied());
     match target {
         Some(handle) => {
             handle
@@ -178,14 +191,28 @@ pub fn reactivate(cx: &mut App, open_when_empty: impl FnOnce(&mut App)) {
 /// from being reaped. 50ms is imperceptible on a quit and well inside the
 /// budget; paying it on a no-engine quit is the cheaper mistake by far.
 ///
+/// **The bus bridge is stopped first, before anything else.** During the grace
+/// window below gpui keeps driving foreground tasks — including the
+/// app-lifetime bridge that dispatches every `Change` into the stores — while
+/// `App::shutdown` has already set `quitting`, so *any* dispatch lands in
+/// `cx.spawn` and panics ("Can't spawn on main thread after on_app_quit").
+/// Silencing the engine drain fixed one emitter and the engine supervisors a
+/// second, but a model **download** reporting progress mid-grace was a third,
+/// and every future emitter would be a fresh one. Closing the receiver is the
+/// cure for the class; see [`stores::BusBridge::quiesce`] for the layering
+/// (app-core keeps its own quiet-on-quit rules for the CLI's sake, and neither
+/// layer relies on the other).
+///
 /// Bounded by `gpui::SHUTDOWN_TIMEOUT` (200ms), so this is best-effort by
 /// construction and says so: a quit that outruns the budget still exits. A
 /// hard guarantee wants the OS to enforce it (`PR_SET_PDEATHSIG` on Linux;
 /// macOS has no equivalent and would need an explicit synchronous reap in
 /// app-core) — a follow-up, not wave 2.
-pub fn install_engine_shutdown(stores: &Stores, cx: &mut App) {
+pub fn install_engine_shutdown(stores: &Stores, bridge: BusBridge, cx: &mut App) {
     let core = stores.app_core();
     cx.on_app_quit(move |cx: &mut App| {
+        // Order is load-bearing: close the door before anything can knock.
+        bridge.quiesce();
         let timer = cx.background_executor().timer(ENGINE_TEARDOWN_GRACE);
         let had_core = core.is_some();
         if let Some(core) = core.as_ref() {
