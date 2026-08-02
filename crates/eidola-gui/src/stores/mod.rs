@@ -367,8 +367,18 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
         }
         // A per-space participant change carries no id, so re-read every cached
         // space's membership.
+        //
+        // It also reaches the **templates** registry, which is an amendment to
+        // the 1:1 variant↔store rule's letter in the service of its spirit: a
+        // `SpaceTemplateInfo` embeds its referenced globals' *effective* config
+        // (`SpaceTemplateInfo::referenced`), so an "edit everywhere" of a shared
+        // participant — which emits only `Change::Participants` — moves what a
+        // cached template snapshot says. The store reads participant config now,
+        // so it must hear about participant changes. (`Change::Config` already
+        // fans out to two stores for the same kind of reason.)
         Change::Participants => {
             stores.participants.update(cx, |s, cx| s.refresh_all(cx));
+            stores.templates.update(cx, |s, cx| s.refresh(cx));
         }
     }
 }
@@ -392,4 +402,103 @@ fn refresh_everything(stores: &Stores, cx: &mut App) {
     // A dropped change may have been a Record write — let open Record
     // windows mark themselves stale.
     stores.record.update(cx, |s, cx| s.notify_changed(cx));
+}
+
+/// Settle a write-through mutation's two outcomes — the write's, and the
+/// re-list's — into the domain cell and the op-error slot. Returns the error to
+/// record (`None` = the write succeeded); the caller owns where that lives
+/// (one slot in `TemplatesStore`, keyed per space in `ParticipantsStore`).
+///
+/// **The re-list always resolves the cell**, success or failure. That is the
+/// whole rule, and it is not tidiness: a mutation *cancels* the in-flight
+/// refresh when it takes over the read (see either store's
+/// `write_then_relist`), and that refresh may already have moved the cell to
+/// `Loading` — or to `Loaded { stale }` over prior data. Its own re-list is
+/// then the only thing left that can resolve it, so a re-list error that was
+/// merely dropped stranded the cell: a spinner with **no live task behind it**
+/// (the `Loadable` invariant inverted), rendering as a plausible-empty registry
+/// that nothing would ever correct until an unrelated `Change` happened along.
+/// `Loadable::resolve` lands it in `Failed { error, prior }` instead — which
+/// keeps prior data visible (STATE.md's "Failed is not empty") and gives the
+/// view its honest "couldn't refresh — retry" door.
+///
+/// **The write's error still wins the op-error slot.** The two errors answer
+/// different questions ("your edit was refused" vs "we couldn't re-read the
+/// list"), so they occupy different places rather than overwriting each other.
+pub(crate) fn settle_mutation<T>(
+    cell: &mut crate::loadable::Loadable<T>,
+    list: Result<T, eidola_app_core::error::AppError>,
+    op: Result<(), String>,
+) -> Option<String>
+where
+    T: Default,
+{
+    *cell = std::mem::take(cell).resolve(list);
+    op.err()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::settle_mutation;
+    use crate::loadable::Loadable;
+    use eidola_app_core::error::AppError;
+
+    fn err(message: &str) -> AppError {
+        AppError::Internal {
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_successful_relist_loads_the_cell_and_records_no_error() {
+        let mut cell: Loadable<Vec<u8>> = Loadable::NotLoaded.to_loading();
+        let recorded = settle_mutation(&mut cell, Ok(vec![1, 2]), Ok(()));
+        assert_eq!(recorded, None);
+        assert_eq!(cell.value(), Some(&vec![1, 2]));
+        assert!(!cell.is_stale(), "a settled re-list is fresh, not stale");
+    }
+
+    #[test]
+    fn a_failed_write_still_applies_its_relist() {
+        // The partial-failure case the unconditional re-list exists for: the
+        // listing must show what was in fact created, beside the error.
+        let mut cell: Loadable<Vec<u8>> = Loadable::loaded(vec![1]);
+        let recorded = settle_mutation(&mut cell, Ok(vec![1, 2]), Err("refused".into()));
+        assert_eq!(recorded.as_deref(), Some("refused"));
+        assert_eq!(cell.value(), Some(&vec![1, 2]));
+    }
+
+    #[test]
+    fn a_failed_relist_resolves_a_loading_cell_instead_of_stranding_it() {
+        // The strand: a cancelled refresh left the cell `Loading` with no task
+        // behind it, and this re-list is the only thing that can still resolve
+        // it. Dropping its error left a permanent spinner-shaped empty page.
+        let mut cell: Loadable<Vec<u8>> = Loadable::NotLoaded.to_loading();
+        assert!(
+            cell.is_loading(),
+            "precondition: the cancelled refresh's cell"
+        );
+        let recorded =
+            settle_mutation(&mut cell, Err(err("db read failed")), Err("refused".into()));
+        assert!(!cell.is_loading(), "the cell must never be left Loading");
+        assert!(cell.error().is_some(), "the read failure is visible");
+        assert_eq!(
+            recorded.as_deref(),
+            Some("refused"),
+            "the write's error still wins the op-error slot"
+        );
+    }
+
+    #[test]
+    fn a_failed_relist_keeps_prior_data_visible() {
+        let mut cell: Loadable<Vec<u8>> = Loadable::loaded(vec![7]).to_loading();
+        let recorded = settle_mutation(&mut cell, Err(err("db read failed")), Ok(()));
+        assert_eq!(recorded, None);
+        assert_eq!(
+            cell.value(),
+            Some(&vec![7]),
+            "Failed is not empty — the prior snapshot stays on screen"
+        );
+        assert!(cell.error().is_some());
+    }
 }
