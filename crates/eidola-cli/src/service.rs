@@ -75,35 +75,43 @@ WantedBy=default.target
 
 /// Render the unit for a concrete executable path.
 pub fn render_unit(exec: &str) -> String {
-    UNIT_TEMPLATE.replace("@EXEC@", &systemd_quote(exec))
+    UNIT_TEMPLATE.replace("@EXEC@", &systemd_quote_exec(exec))
 }
 
-/// Quote a path for a systemd command line.
+/// Quote the **executable word** of a systemd command line.
 ///
-/// `ExecStart=` is **split on whitespace**, so a bare
-/// `/home/me/Eidola Builds/eidola-gui` would run `/home/me/Eidola` with
-/// `Builds/eidola-gui` as its first argument — and a path with a space in it
-/// is entirely ordinary on a desktop. Systemd's rules, all three of which
-/// apply here:
+/// The name says `_exec` because the escaping rules are not the same for the
+/// program and for its arguments, and getting that backwards is precisely the
+/// bug this function had. Two things must be escaped here, and one must not:
 ///
-/// - a double-quoted word is one argument;
-/// - inside it, `\` escapes, so a literal `\` or `"` must be doubled/escaped;
-/// - `%` introduces a *specifier* anywhere in the unit — including inside
-///   quotes — so a literal `%` must be written `%%`;
-/// - `$` introduces **environment expansion** on a command line, likewise
-///   inside quotes, so a literal `$` must be written `$$`. Quoting removal
-///   and expansion are separate passes in systemd's parser — quotes are
-///   stripped when the word is extracted, expansion runs on the resulting
-///   word — which is exactly why `\$` would *not* do it and `$$` does.
+/// - **Whitespace** → quote the word. `ExecStart=` is split on whitespace, so
+///   a bare `/home/me/Eidola Builds/eidola-gui` would run `/home/me/Eidola`
+///   with `Builds/eidola-gui` as its first argument, and a space in a desktop
+///   path is entirely ordinary. Inside a double-quoted word `\` escapes, so a
+///   literal `\` or `"` must be escaped in turn.
+/// - **`%` → `%%`.** A specifier is expanded *everywhere in the unit*,
+///   including inside quotes and including the executable word. Verified:
+///   `ExecStart="/opt/100%dir/eidola-gui"` is rejected by
+///   `systemd-analyze verify` as
+///   `Command /opt/100/run/credentials/….serviceir/eidola-gui is not
+///   executable` — `%d` had been substituted mid-path.
+/// - **`$` must be left alone.** Environment expansion does *not* apply to
+///   the program: "Note that the first argument (i.e. the program to execute)
+///   may not be a variable" (systemd.service(5), Command Lines). Escaping it
+///   is therefore not merely unnecessary but *corrupting* — systemd takes the
+///   `$$` literally. Verified: `ExecStart="/srv/$app/eidola-gui"` passes
+///   `systemd-analyze verify` while `"/srv/$$app/eidola-gui"` is rejected as
+///   not existing.
 ///
-/// The last two are not quote-level escapes at all, which is the trap: a path
-/// like `/opt/100%/x` or `/srv/$app/eidola-gui` looks safely quoted and is
-/// still rewritten out from under you.
+/// (For a later *argument* the rule flips — `$FOO`/`${FOO}` are expanded there
+/// and `$$` is the documented literal-dollar escape — which is why this
+/// function is scoped to the executable and the unit's only other word is the
+/// fixed literal `--windowless`.)
 ///
 /// Quoting unconditionally rather than only when needed: one code path is one
 /// fewer thing to get subtly wrong, and systemd accepts a quoted executable
 /// exactly as it accepts a bare one.
-fn systemd_quote(path: &str) -> String {
+fn systemd_quote_exec(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 2);
     out.push('"');
     for ch in path.chars() {
@@ -113,7 +121,6 @@ fn systemd_quote(path: &str) -> String {
                 out.push(ch);
             }
             '%' => out.push_str("%%"),
-            '$' => out.push_str("$$"),
             _ => out.push(ch),
         }
     }
@@ -214,7 +221,43 @@ fn absolute_existing_exec(path: &Path) -> Result<String, AppError> {
             ),
         });
     }
+    if !is_executable(&absolute) {
+        return Err(AppError::Config {
+            message: format!(
+                "`{}` is not executable — systemd would refuse to start the \
+                 unit (`chmod +x` it, or point `--exec` elsewhere)",
+                absolute.display()
+            ),
+        });
+    }
     Ok(absolute.to_string_lossy().into_owned())
+}
+
+/// Whether the file at `path` can be executed.
+///
+/// Existing is not enough: systemd rejects a mode-644 file outright
+/// (`Command … is not executable: Permission denied`, verified with
+/// `systemd-analyze verify`), so a unit naming one can never start. Checking
+/// the bits here keeps the refusal at the same before-any-write seam as the
+/// missing-file case.
+///
+/// The mode test is any-of-`u+x`/`g+x`/`o+x` rather than "executable *by me*":
+/// the unit runs as this user, so `u+x` is what matters in practice, but a
+/// binary shipped mode 555 or 775 is perfectly startable and refusing it would
+/// be the wrong kind of strict. Off unix there are no mode bits and no systemd
+/// either — `service` is Linux-only and its callers are refused earlier by the
+/// `systemctl` preflight — so existence is the honest answer there.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn which_on_path(name: &str) -> Option<PathBuf> {
@@ -331,6 +374,18 @@ pub fn stop() -> Result<(), AppError> {
 mod tests {
     use super::*;
 
+    /// A fixture binary: present *and* executable, since `resolve_exec`
+    /// refuses a mode-644 file (systemd would too).
+    fn write_executable(path: &Path) {
+        std::fs::write(path, b"#!/bin/sh\n").expect("write fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fixture");
+        }
+    }
+
     #[test]
     fn the_rendered_unit_starts_the_gui_windowless() {
         let unit = render_unit("/opt/eidola/bin/eidola-gui");
@@ -381,38 +436,38 @@ mod tests {
         // `%` is a specifier anywhere in the unit — even inside quotes — and
         // `"`/`\` are the quoted word's own escapes.
         assert_eq!(
-            systemd_quote("/opt/100%/eidola-gui"),
+            systemd_quote_exec("/opt/100%/eidola-gui"),
             r#""/opt/100%%/eidola-gui""#
         );
         assert_eq!(
-            systemd_quote(r#"/opt/a"b/eidola-gui"#),
+            systemd_quote_exec(r#"/opt/a"b/eidola-gui"#),
             r#""/opt/a\"b/eidola-gui""#
         );
         assert_eq!(
-            systemd_quote(r"/opt/a\b/eidola-gui"),
+            systemd_quote_exec(r"/opt/a\b/eidola-gui"),
             r#""/opt/a\\b/eidola-gui""#
         );
-        // `$` is environment expansion, also inside quotes, and its escape is
-        // `$$` — not `\$`, which the quoting level cannot express, because
-        // systemd strips quotes and expands variables in separate passes.
+        // `$` is NOT escaped: environment expansion does not apply to the
+        // program word ("the first argument ... may not be a variable"), so
+        // `$$` would be taken literally and corrupt the path. Verified with
+        // `systemd-analyze verify` — the literal form passes, the escaped
+        // form is rejected as nonexistent.
         assert_eq!(
-            systemd_quote("/srv/$app/eidola-gui"),
-            r#""/srv/$$app/eidola-gui""#
+            systemd_quote_exec("/srv/$app/eidola-gui"),
+            r#""/srv/$app/eidola-gui""#
         );
         assert_eq!(
-            systemd_quote("/srv/${HOME}/eidola-gui"),
-            r#""/srv/$${HOME}/eidola-gui""#
+            systemd_quote_exec("/srv/${HOME}/eidola-gui"),
+            r#""/srv/${HOME}/eidola-gui""#
         );
-        // The template's own *directives* must stay specifier- and
-        // expansion-free, or a path's `%%`/`$$` would be the only escaped
-        // one. Comment lines are exempt — systemd expands neither in them,
-        // and one of ours legitimately names `$XDG_CONFIG_HOME`.
+        // The template's own *directives* must stay specifier-free, or a
+        // path's `%%` would be the only escaped one. Comment lines are exempt
+        // — systemd expands nothing in them.
         for line in UNIT_TEMPLATE.replace("@EXEC@", "").lines() {
             if line.starts_with('#') {
                 continue;
             }
             assert!(!line.contains('%'), "unescaped specifier in: {line}");
-            assert!(!line.contains('$'), "unescaped expansion in: {line}");
         }
     }
 
@@ -422,7 +477,7 @@ mod tests {
         // discovery is never consulted.
         let tmp = tempfile::tempdir().expect("tempdir");
         let exe = tmp.path().join("eidola-gui");
-        std::fs::write(&exe, b"#!/bin/sh\n").expect("write");
+        write_executable(&exe);
         let resolved = resolve_exec(Some(exe.to_string_lossy().into_owned())).expect("resolve");
         assert_eq!(resolved, exe.to_string_lossy());
     }
@@ -450,7 +505,7 @@ mod tests {
     fn a_resolved_exec_is_absolute_in_the_unit() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let exe = tmp.path().join("eidola-gui");
-        std::fs::write(&exe, b"#!/bin/sh\n").expect("write");
+        write_executable(&exe);
         let resolved = resolve_exec(Some(exe.to_string_lossy().into_owned())).expect("resolve");
         assert!(Path::new(&resolved).is_absolute(), "got {resolved}");
         assert!(
@@ -465,7 +520,7 @@ mod tests {
         // pinned to today's target would keep launching the old binary.
         let tmp = tempfile::tempdir().expect("tempdir");
         let real = tmp.path().join("eidola-gui-v1");
-        std::fs::write(&real, b"#!/bin/sh\n").expect("write");
+        write_executable(&real);
         let link = tmp.path().join("eidola-gui");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
@@ -475,6 +530,47 @@ mod tests {
             !resolved.ends_with("eidola-gui-v1"),
             "the symlink must not be canonicalized away: {resolved}"
         );
+    }
+
+    #[test]
+    fn a_dollar_bearing_path_reaches_the_unit_intact() {
+        // The program word is not subject to environment expansion, so it
+        // must be passed through verbatim. Escaping it to `$$` (which an
+        // earlier revision did) made systemd look for a path that contains
+        // two literal dollars — confirmed rejected by `systemd-analyze
+        // verify`, while this form is accepted.
+        let unit = render_unit("/srv/$app/eidola-gui");
+        assert!(
+            unit.contains(r#"ExecStart="/srv/$app/eidola-gui" --windowless"#),
+            "the path must survive verbatim:\n{unit}"
+        );
+        assert!(
+            !unit.contains("$$"),
+            "no dollar escaping in the program word"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_file_is_refused_rather_than_written() {
+        // Existing is not enough: systemd rejects a mode-644 file with
+        // `Command … is not executable: Permission denied`, so a unit naming
+        // one could never start.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exe = tmp.path().join("eidola-gui");
+        std::fs::write(&exe, b"#!/bin/sh\n").expect("write");
+        // Deliberately mode 644.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let err = resolve_exec(Some(exe.to_string_lossy().into_owned()))
+            .expect_err("a unit that could never start must be refused here");
+        assert!(err.to_string().contains("not executable"), "got {err}");
+
+        // And the same file, made executable, is accepted — so the gate is
+        // the mode bits and not the path.
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        resolve_exec(Some(exe.to_string_lossy().into_owned())).expect("now executable");
     }
 
     #[test]

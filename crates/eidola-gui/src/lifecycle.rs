@@ -165,9 +165,18 @@ pub fn reactivate(cx: &mut App, open_when_empty: impl FnOnce(&mut App)) {
 /// I/O before killing anything. On a quit path none of that is acceptable.
 ///
 /// Signalling is not reaping — the supervisor task owns the child — so the
-/// hook yields briefly afterwards to let the runtime run them. `parked` (a
-/// timer on gpui's own executor, not tokio's) is what lets the tokio threads
+/// hook yields briefly afterwards to let the runtime run them. The timer is on
+/// gpui's *own* executor, not tokio's, which is what lets the tokio threads
 /// make that progress while `App::shutdown` blocks the main thread.
+///
+/// **The grace is unconditional, not gated on how many engines were drained.**
+/// `unload_local_model` removes an engine's registry entry and returns as soon
+/// as it has *signalled* the supervisor — it does not await the child's exit.
+/// So an unload immediately followed by a quit finds an empty registry, and a
+/// count-gated grace would skip the yield precisely when a child is still
+/// dying, letting AppKit's `exit()` orphan the engine that was one instant
+/// from being reaped. 50ms is imperceptible on a quit and well inside the
+/// budget; paying it on a no-engine quit is the cheaper mistake by far.
 ///
 /// Bounded by `gpui::SHUTDOWN_TIMEOUT` (200ms), so this is best-effort by
 /// construction and says so: a quit that outruns the budget still exits. A
@@ -177,18 +186,23 @@ pub fn reactivate(cx: &mut App, open_when_empty: impl FnOnce(&mut App)) {
 pub fn install_engine_shutdown(stores: &Stores, cx: &mut App) {
     let core = stores.app_core();
     cx.on_app_quit(move |cx: &mut App| {
-        let timer = cx
-            .background_executor()
-            .timer(std::time::Duration::from_millis(50));
-        let signalled = core.as_ref().map(|c| c.shutdown_engines()).unwrap_or(0);
+        let timer = cx.background_executor().timer(ENGINE_TEARDOWN_GRACE);
+        let had_core = core.is_some();
+        if let Some(core) = core.as_ref() {
+            core.shutdown_engines();
+        }
         async move {
-            if signalled > 0 {
+            if had_core {
                 timer.await;
             }
         }
     })
     .detach();
 }
+
+/// How long the quit hook yields so the runtime can reap the children it just
+/// signalled. Comfortably inside `gpui::SHUTDOWN_TIMEOUT` (200ms).
+const ENGINE_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Quit cleanly on `SIGTERM` / `SIGINT` (windowless mode).
 ///
