@@ -688,6 +688,18 @@ pub(crate) fn picker_value(name: &SharedString, backend: Option<&SharedString>) 
     }
 }
 
+/// What one option in a model dropdown is *called*, as distinct from what it
+/// shows: the visible row is just the model name because the group header above
+/// it supplies the backend — but that header is a role-less `div`, so it never
+/// reaches the accessibility tree, and two enabled backends serving the same
+/// model name produce two rows a screen reader cannot tell apart. Folding the
+/// backend into the name is the `ghost_button_labeled` rule (a repeated verb
+/// names its subject), in the [`picker_value`] shape the picker buttons already
+/// speak — so choosing a model sounds like what the button then reads back.
+pub(crate) fn option_label(display: &SharedString, backend: &SharedString) -> SharedString {
+    picker_value(display, Some(backend))
+}
+
 /// A model-picker dropdown field shared by the Participants view and Templates
 /// pane: a button showing the current model, plus (when `open`) a grouped list
 /// of selectable models. `on_pick` receives the chosen model id.
@@ -779,6 +791,10 @@ pub(crate) fn model_field<V: 'static>(
             );
         }
         for (gi, (header, models)) in groups.into_iter().enumerate() {
+            // The group header is a node-less `div`, so it exists only for the
+            // eye — an option's accessible name has to carry the backend itself
+            // (see `option_label`).
+            let group = SharedString::from(header);
             menu = menu.child(
                 div()
                     .px_3()
@@ -786,19 +802,20 @@ pub(crate) fn model_field<V: 'static>(
                     .pb_1()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(SharedString::from(header)),
+                    .child(group.clone()),
             );
             for (mi, (id, display)) in models.into_iter().enumerate() {
                 let selected = current == Some(id.as_str());
                 let pick_id = id.clone();
                 let on_pick = on_pick.clone();
+                let display = SharedString::from(display);
                 menu = menu.child(
                     div()
                         .id(SharedString::from(format!("{probe_prefix}-opt-{gi}-{mi}")))
                         .probe(
                             format!("{probe_prefix}/option/{gi}/{mi}"),
                             gpui::Role::Button,
-                            display.clone(),
+                            option_label(&display, &group),
                         )
                         .px_3()
                         .py_1()
@@ -806,7 +823,7 @@ pub(crate) fn model_field<V: 'static>(
                         .text_sm()
                         .hover(|s| s.bg(theme.secondary.opacity(0.6)))
                         .when(selected, |el| el.text_color(theme.link))
-                        .child(SharedString::from(display))
+                        .child(display)
                         .on_click(cx.listener(move |this, _, _, cx| on_pick(&pick_id, this, cx))),
                 );
             }

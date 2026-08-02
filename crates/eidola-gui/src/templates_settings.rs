@@ -41,7 +41,7 @@ use gpui_component::{
 use crate::participants_view::{
     DEFAULT_AGENT_SYSTEM_PROMPT, NOTIFY_POLICIES, error_banner, field_label, ghost_button,
     ghost_button_labeled, load_error_panel, mode_chip, model_display, model_field, model_groups,
-    notify_label, picker_value,
+    notify_label, option_label, picker_value,
 };
 use crate::probe::Probe as _;
 use crate::stores::{ConfigStore, Stores, TemplatesStore};
@@ -915,6 +915,10 @@ impl TemplatesSettingsView {
                         .on_click(cx.listener(|this, _, _, cx| this.set_router_model(None, cx))),
                 );
             for (gi, (header, models)) in model_groups(&self.stores, cx).into_iter().enumerate() {
+                // The header is node-less chrome; the backend has to ride each
+                // option's own name (see `participants_view::option_label`) —
+                // and here it is also the billing difference.
+                let group = SharedString::from(header);
                 menu = menu.child(
                     div()
                         .px_3()
@@ -922,18 +926,19 @@ impl TemplatesSettingsView {
                         .pb_1()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(SharedString::from(header)),
+                        .child(group.clone()),
                 );
                 for (mi, (id, display)) in models.into_iter().enumerate() {
                     let selected = selection == Some(id.as_str());
                     let pick_id = id.clone();
+                    let display = SharedString::from(display);
                     menu = menu.child(
                         div()
                             .id(SharedString::from(format!("template-router-opt-{gi}-{mi}")))
                             .probe(
                                 format!("settings/templates/editor/router/option/{gi}/{mi}"),
                                 gpui::Role::Button,
-                                display.clone(),
+                                option_label(&display, &group),
                             )
                             .px_3()
                             .py_1()
@@ -941,7 +946,7 @@ impl TemplatesSettingsView {
                             .text_sm()
                             .hover(|s| s.bg(theme.secondary.opacity(0.6)))
                             .when(selected, |el| el.text_color(theme.link))
-                            .child(SharedString::from(display))
+                            .child(display)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.set_router_model(Some(&pick_id), cx)
                             })),
