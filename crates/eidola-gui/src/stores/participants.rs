@@ -2,12 +2,18 @@
 //! Participants view's data source).
 //!
 //! Per `crates/eidola-gui/STATE.md`: one gpui entity keyed **per space** (a
-//! `HashMap<SpaceId, Loadable<Vec<ParticipantInfo>>>` with one task slot per
-//! space, mirroring `ModelsStore`'s per-backend catalogs), subscribed to
-//! `Change::Participants` (routed in `stores::dispatch_change`, which refreshes
-//! every cached space — the change carries no id), and owning *all* mutations
-//! of the per-space participant domain. Each CRUD op composes `write; re-list`
-//! in the space's slot so the store reconciles even on a bus-less test run.
+//! `HashMap<SpaceId, Loadable<Vec<ParticipantInfo>>>` keyed by space, mirroring
+//! `ModelsStore`'s per-backend catalogs), subscribed to `Change::Participants`
+//! (routed in `stores::dispatch_change`, which refreshes every cached space —
+//! the change carries no id), and owning *all* mutations of the per-space
+//! participant domain. Each CRUD op composes `write; re-list` so the store
+//! reconciles even on a bus-less test run.
+//!
+//! **One slot per operation, per space**: refreshes and mutations have separate
+//! keyed slots, because a write emits `Change::Participants` itself and the
+//! `refresh_all` that drives would otherwise cancel the writing op's own
+//! completion — losing its `op_error` and its re-list. See
+//! [`ParticipantsStore::refresh`] for the ordering the split then restores.
 //!
 //! The edit-everywhere-vs-override-here fork lives here as two distinct
 //! methods: [`ParticipantsStore::update_everywhere`] writes the (possibly
@@ -16,7 +22,7 @@
 //! to call; app-core enforces the semantics (see `AppCore`'s
 //! `update_space_participant` / `set_space_participant_override`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use eidola_app_core::{
@@ -31,8 +37,14 @@ pub struct ParticipantsStore {
     app_core: Option<Arc<AppCore>>,
     /// One `Loadable` snapshot per opened space.
     spaces: HashMap<String, Loadable<Vec<ParticipantInfo>>>,
-    /// One supersede task slot per space (list refresh + CRUD compose).
-    tasks: HashMap<String, Task<()>>,
+    /// One supersede **list-refresh** slot per space.
+    refresh_tasks: HashMap<String, Task<()>>,
+    /// One supersede **mutation** slot per space (each composes `write;
+    /// re-list`), separate from the refresh slot above.
+    op_tasks: HashMap<String, Task<()>>,
+    /// Spaces whose refresh was signalled while their mutation held the read;
+    /// each runs once that mutation lands.
+    refresh_pending: HashSet<String>,
     /// The last write error, **keyed per space** — snapshots and task slots are
     /// space-keyed, so a store-wide error would cross-contaminate two open
     /// Participants windows (one space's failure banner appearing under another,
@@ -47,7 +59,9 @@ impl ParticipantsStore {
         Self {
             app_core,
             spaces: HashMap::new(),
-            tasks: HashMap::new(),
+            refresh_tasks: HashMap::new(),
+            op_tasks: HashMap::new(),
+            refresh_pending: HashSet::new(),
             op_errors: HashMap::new(),
         }
     }
@@ -61,7 +75,9 @@ impl ParticipantsStore {
         Self {
             app_core: None,
             spaces,
-            tasks: HashMap::new(),
+            refresh_tasks: HashMap::new(),
+            op_tasks: HashMap::new(),
+            refresh_pending: HashSet::new(),
             op_errors: HashMap::new(),
         }
     }
@@ -112,18 +128,29 @@ impl ParticipantsStore {
         }
     }
 
-    /// Refresh one space's participant list.
+    /// Refresh one space's participant list — in its own slot, deliberately not
+    /// the mutation's (see the module docs for what a shared slot cost).
+    ///
+    /// A refresh signalled while that space's mutation is in flight is
+    /// **deferred** to its completion rather than started beside it: the
+    /// mutation takes over the read for its duration (see
+    /// [`Self::write_then_relist`]), and a read that resolves after the
+    /// mutation's own re-list can only be fresher than one racing it.
     pub fn refresh(&mut self, space_id: String, cx: &mut Context<Self>) {
         let Some(core) = self.app_core.clone() else {
             return;
         };
+        if self.op_tasks.contains_key(&space_id) {
+            self.refresh_pending.insert(space_id);
+            return;
+        }
         let entry = self
             .spaces
             .entry(space_id.clone())
             .or_insert(Loadable::NotLoaded);
         *entry = std::mem::take(entry).to_loading();
         let key = space_id.clone();
-        self.tasks.insert(
+        self.refresh_tasks.insert(
             space_id.clone(),
             cx.spawn(async move |this, cx| {
                 let result = bridge(core, move |c| async move {
@@ -136,7 +163,7 @@ impl ParticipantsStore {
                         .entry(key.clone())
                         .or_insert(Loadable::NotLoaded);
                     *entry = std::mem::take(entry).resolve(result);
-                    this.tasks.remove(&key);
+                    this.refresh_tasks.remove(&key);
                     cx.notify();
                 });
             }),
@@ -154,6 +181,18 @@ impl ParticipantsStore {
     }
 
     /// The shared write-through shape: run `op`, then re-list `space_id`.
+    ///
+    /// **A mutation takes over that space's read** — it drops any in-flight
+    /// refresh, which may have been issued *before* this write and would
+    /// re-stale the snapshot by resolving after it. Cancelling another slot's
+    /// fetch is a debt (`crates/eidola-gui/STATE.md` → "Concurrency patterns"),
+    /// so the re-list runs on **every** exit, failure included — a failed write
+    /// changed nothing durably, so its re-list simply re-establishes what the
+    /// cancelled refresh was fetching. The write's error wins `op_errors` while
+    /// a re-list that itself fails resolves the *cell* (`Failed { prior }`,
+    /// keeping any prior snapshot visible) — see
+    /// [`crate::stores::settle_mutation`], which owns that pairing for both
+    /// write-through stores.
     fn write_then_relist<F>(&mut self, space_id: String, cx: &mut Context<Self>, op: F)
     where
         F: FnOnce(
@@ -167,36 +206,31 @@ impl ParticipantsStore {
             return;
         };
         self.op_errors.remove(&space_id);
+        // Take over this space's read for the duration of the write.
+        self.refresh_tasks.remove(&space_id);
+        self.refresh_pending.remove(&space_id);
         let relist_core = core.clone();
         let key = space_id.clone();
-        self.tasks.insert(
+        self.op_tasks.insert(
             space_id.clone(),
             cx.spawn(async move |this, cx| {
                 let op_result = op(core).await;
-                let list = match &op_result {
-                    Ok(()) => {
-                        let s = space_id.clone();
-                        Some(
-                            bridge(relist_core, move |c| async move {
-                                c.list_space_participants(s).await
-                            })
-                            .await,
-                        )
-                    }
-                    Err(_) => None,
-                };
+                let list = bridge(relist_core, move |c| async move {
+                    c.list_space_participants(space_id).await
+                })
+                .await;
                 let _ = this.update(cx, |this, cx| {
-                    match op_result {
-                        Ok(()) => {
-                            if let Some(Ok(list)) = list {
-                                this.spaces.insert(key.clone(), Loadable::loaded(list));
-                            }
-                        }
-                        Err(e) => {
-                            this.op_errors.insert(key.clone(), e);
-                        }
+                    let cell = this
+                        .spaces
+                        .entry(key.clone())
+                        .or_insert(Loadable::NotLoaded);
+                    if let Some(e) = crate::stores::settle_mutation(cell, list, op_result) {
+                        this.op_errors.insert(key.clone(), e);
                     }
-                    this.tasks.remove(&key);
+                    this.op_tasks.remove(&key);
+                    if this.refresh_pending.remove(&key) {
+                        this.refresh(key.clone(), cx);
+                    }
                     cx.notify();
                 });
             }),

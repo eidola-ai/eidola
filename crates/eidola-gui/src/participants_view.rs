@@ -46,6 +46,13 @@ pub(crate) const NOTIFY_POLICIES: [(&str, &str); 3] = [
     ("all", "to everything"),
 ];
 
+/// The system prompt a newly created agent participant starts from — a short,
+/// general-purpose charter rather than a persona, so the field arrives filled
+/// with something honest that a person can edit down or replace. Shared so
+/// every participant-creating surface offers the same starting point.
+pub const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are a participant in a shared conversation. Answer plainly, say when \
+     you are unsure, and keep replies as short as the question allows.";
+
 pub(crate) fn notify_label(policy: &str) -> &'static str {
     NOTIFY_POLICIES
         .iter()
@@ -220,6 +227,13 @@ impl ParticipantsView {
     #[doc(hidden)]
     pub fn adding_label_state(&self) -> Option<Entity<InputState>> {
         self.adding.as_ref().map(|a| a.label.clone())
+    }
+
+    #[doc(hidden)]
+    pub fn adding_prompt(&self, cx: &gpui::App) -> Option<String> {
+        self.adding
+            .as_ref()
+            .map(|a| a.system_prompt.read(cx).value().to_string())
     }
 
     #[doc(hidden)]
@@ -418,10 +432,14 @@ impl ParticipantsView {
         self.template_form = None;
         self.picker = None;
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("Participant name"));
+        // A new agent starts from the shared default charter — the same
+        // starting point the Templates pane offers, so the two surfaces don't
+        // contradict each other on what "a new participant" begins as.
         let system_prompt = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(2, 8)
                 .placeholder("A short instruction for how this participant behaves.")
+                .default_value(DEFAULT_AGENT_SYSTEM_PROMPT)
         });
         self.adding = Some(AddState {
             label,
@@ -653,6 +671,35 @@ pub(crate) fn model_groups(
     groups
 }
 
+/// What a model-picker button says it holds, as one spoken line — the same
+/// `name · backend` the row renders, or the bare name when there is no backend
+/// to qualify (an unset field, the router's "Off").
+///
+/// This is the picker's **content**, distinct from the label that names it: a
+/// picker labelled only "Model" tells a screen reader nothing about which model
+/// is selected. It is settled by construction — it moves only when the user
+/// picks — which is what makes it safe to ride `aria_value` (see
+/// [`crate::probe::Probe::probe_value`]). Shared so the participant field and
+/// the Templates pane's router picker cannot drift apart.
+pub(crate) fn picker_value(name: &SharedString, backend: Option<&SharedString>) -> SharedString {
+    match backend {
+        Some(b) => SharedString::from(format!("{name} · {b}")),
+        None => name.clone(),
+    }
+}
+
+/// What one option in a model dropdown is *called*, as distinct from what it
+/// shows: the visible row is just the model name because the group header above
+/// it supplies the backend — but that header is a role-less `div`, so it never
+/// reaches the accessibility tree, and two enabled backends serving the same
+/// model name produce two rows a screen reader cannot tell apart. Folding the
+/// backend into the name is the `ghost_button_labeled` rule (a repeated verb
+/// names its subject), in the [`picker_value`] shape the picker buttons already
+/// speak — so choosing a model sounds like what the button then reads back.
+pub(crate) fn option_label(display: &SharedString, backend: &SharedString) -> SharedString {
+    picker_value(display, Some(backend))
+}
+
 /// A model-picker dropdown field shared by the Participants view and Templates
 /// pane: a button showing the current model, plus (when `open`) a grouped list
 /// of selectable models. `on_pick` receives the chosen model id.
@@ -677,9 +724,10 @@ pub(crate) fn model_field<V: 'static>(
         }
         _ => ("Choose a model…".into(), None),
     };
+    let value = picker_value(&name, backend.as_ref());
     let button = h_flex()
         .id(SharedString::from(format!("{probe_prefix}-button")))
-        .probe(probe_prefix.clone(), gpui::Role::Button, "Model")
+        .probe_value(probe_prefix.clone(), gpui::Role::Button, "Model", value)
         .w_full()
         .px_2()
         .py_1()
@@ -743,6 +791,10 @@ pub(crate) fn model_field<V: 'static>(
             );
         }
         for (gi, (header, models)) in groups.into_iter().enumerate() {
+            // The group header is a node-less `div`, so it exists only for the
+            // eye — an option's accessible name has to carry the backend itself
+            // (see `option_label`).
+            let group = SharedString::from(header);
             menu = menu.child(
                 div()
                     .px_3()
@@ -750,19 +802,20 @@ pub(crate) fn model_field<V: 'static>(
                     .pb_1()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(SharedString::from(header)),
+                    .child(group.clone()),
             );
             for (mi, (id, display)) in models.into_iter().enumerate() {
                 let selected = current == Some(id.as_str());
                 let pick_id = id.clone();
                 let on_pick = on_pick.clone();
+                let display = SharedString::from(display);
                 menu = menu.child(
                     div()
                         .id(SharedString::from(format!("{probe_prefix}-opt-{gi}-{mi}")))
                         .probe(
                             format!("{probe_prefix}/option/{gi}/{mi}"),
                             gpui::Role::Button,
-                            display.clone(),
+                            option_label(&display, &group),
                         )
                         .px_3()
                         .py_1()
@@ -770,7 +823,7 @@ pub(crate) fn model_field<V: 'static>(
                         .text_sm()
                         .hover(|s| s.bg(theme.secondary.opacity(0.6)))
                         .when(selected, |el| el.text_color(theme.link))
-                        .child(SharedString::from(display))
+                        .child(display)
                         .on_click(cx.listener(move |this, _, _, cx| on_pick(&pick_id, this, cx))),
                 );
             }
@@ -882,6 +935,12 @@ impl Render for ParticipantsView {
                 cx,
                 cx.listener(|this, _, _, cx| this.retry_load(cx)),
             ));
+            // A refused write and a failed re-list can hold at once (see
+            // `stores::settle_mutation`); this branch owns the body, so it
+            // carries the write's error too rather than swallowing it.
+            if let Some(err) = op_error {
+                body = body.child(self.render_op_error(&err, cx));
+            }
             return root.child(self.wrap_body(body, window));
         }
 
@@ -948,13 +1007,7 @@ impl Render for ParticipantsView {
         }
 
         if let Some(err) = op_error {
-            body = body.child(
-                div()
-                    .id("participants-error")
-                    .probe("participants/error", gpui::Role::Alert, err.clone())
-                    .mt_2()
-                    .child(error_banner(&err, cx)),
-            );
+            body = body.child(self.render_op_error(&err, cx));
         }
 
         // A refresh that failed *over* existing data: keep the (stale) list but
@@ -981,6 +1034,16 @@ impl Render for ParticipantsView {
 }
 
 impl ParticipantsView {
+    /// The write-error banner. One helper because it renders in two places —
+    /// under the roster, and under the failed-load panel that owns the body.
+    fn render_op_error(&self, err: &str, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .id("participants-error")
+            .probe("participants/error", gpui::Role::Alert, err.to_string())
+            .mt_2()
+            .child(error_banner(err, cx))
+    }
+
     /// A resting participant row: identity + who-responds line + Edit/Remove.
     fn render_row(&self, p: &ParticipantInfo, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
