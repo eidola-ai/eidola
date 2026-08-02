@@ -48,9 +48,9 @@ use eidola_app_core::{
     MeasurementInfo, NewBackend,
 };
 use gpui::{
-    AppContext, ClipboardItem, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
-    prelude::FluentBuilder, px,
+    App, AppContext, ClipboardItem, Context, Entity, Focusable as _, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     ActiveTheme, Sizable, StyledExt,
@@ -310,6 +310,16 @@ impl BackendsSettingsView {
 
     /// Whether the Eidola tab's base-URL row is in its edit state (test
     /// accessor).
+    /// Test seam: whether the base-URL editor's input holds the window's
+    /// focus — what a keyboard-activated reveal must leave behind.
+    #[doc(hidden)]
+    pub fn base_url_input_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.base_url_state
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }
+
     pub fn editing_base_url(&self) -> bool {
         self.editing_base_url
     }
@@ -325,6 +335,14 @@ impl BackendsSettingsView {
             .unwrap_or_default();
         self.base_url_state.update(cx, |s, cx| {
             s.set_value(&current, window, cx);
+            // **A reveal focuses what it revealed.** The affordance that opened
+            // this row unmounts as the row becomes the form, so a keyboard
+            // reader who pressed Enter on it is left with focus on nothing at
+            // all — the window keeps a handle whose element is gone, the
+            // dispatch tree has no node for it, and Tab restarts from the top
+            // of the window. Its siblings here (`begin_add_measurement`,
+            // `begin_edit_ca`) already did this; this row did not.
+            s.focus(window, cx);
         });
         self.editing_base_url = true;
         cx.notify();
@@ -536,6 +554,8 @@ impl BackendsSettingsView {
         let engine_state = cx.new(|cx| {
             InputState::new(window, cx).placeholder("optional — discovered if left blank")
         });
+        // The reveal focuses its first field — see `begin_edit_base_url`.
+        id_state.update(cx, |s, cx| s.focus(window, cx));
         self.add_form = Some(AddForm {
             kind,
             id_state,
