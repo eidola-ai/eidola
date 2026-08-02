@@ -512,11 +512,15 @@ pub struct SpaceView {
     /// off the *tracked* handle once one exists, and these verbs must stay
     /// ordinary Tab destinations.
     pub(crate) affordance_slots: Vec<FocusHandle>,
-    /// Whether a transient overlay held the keyboard on the last rendered
-    /// frame — see [`keyboard::sync_tree_focus`], which uses the falling edge
-    /// to hand focus *back* to the conversation instead of reading the borrow
-    /// as a loss.
-    pub(crate) overlay_held_focus: bool,
+    /// **Who** an open transient overlay left holding the keyboard, recorded
+    /// each frame one is up — see [`keyboard::sync_tree_focus`], which uses the
+    /// falling edge to hand focus *back* to the conversation instead of reading
+    /// the borrow as a loss. The handle, not a flag: on the falling edge it is
+    /// the difference between "the overlay never gave the keyboard back" (still
+    /// focused, element gone — restore) and "something else claimed it in the
+    /// meantime" (a menu item that opened a draft and focused its editor —
+    /// leave it alone).
+    pub(crate) overlay_borrowed_focus: Option<FocusHandle>,
     /// Set when the active draft's editor emits a buffer [`Change`], consumed
     /// by the composer body's `caret_into_view` canvas on the next paint to
     /// scroll the new caret position into the composer's visible viewport
@@ -734,7 +738,7 @@ impl SpaceView {
             tree_focus: None,
             post_focus: cx.focus_handle(),
             affordance_slots: Vec::new(),
-            overlay_held_focus: false,
+            overlay_borrowed_focus: None,
             composer_caret_scroll_pending: Cell::new(false),
             composer_aria_value: RefCell::new((SharedString::default(), SharedString::default())),
             page_scroll: ScrollHandle::new(),
