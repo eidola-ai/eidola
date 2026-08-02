@@ -462,6 +462,54 @@ fn config_store_zoom_ladder_writes_through(cx: &mut TestAppContext) {
         .read_with(cx, |c, _| assert_eq!(c.font_scale(), FONT_SCALE_MIN));
 }
 
+/// The quit path closes the bus bridge, and nothing dispatches after it.
+///
+/// This is the *class* cure for a bug that had already been patched twice at
+/// the emitter: silencing app-core's quit-time engine drain fixed one, its
+/// engine supervisors a second, and an in-flight model **download** reporting
+/// progress during the quit's grace window would have been a third. Any
+/// `Change` dispatched after `App::shutdown` sets `quitting` reaches a store's
+/// `refresh` → `cx.spawn` → gpui's "Can't spawn on main thread after
+/// on_app_quit" panic — so the fix belongs at the single door every `Change`
+/// in the process comes through, not at each emitter in turn.
+///
+/// Drives the **live** tokio→gpui plumbing (the rest of this file uses the
+/// `dispatch_change_for_test` seam), because closing the loop is exactly what
+/// is being asserted.
+#[gpui::test]
+fn a_quiesced_bus_bridge_dispatches_nothing(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores have a core");
+    let bridge = cx.update(|cx| stores::install_bus_bridge(&stores, cx));
+
+    // A real write on the core emits `Change::SpaceIndex`; the bridge should
+    // carry it into the SpacesStore without anyone asking.
+    core.runtime()
+        .block_on(core.create_space(Some("first".into())))
+        .expect("create space");
+    wait_until(cx, "the live bridge dispatches a change", |cx| {
+        stores.spaces.read_with(cx, |s, _| s.list().len() == 1)
+    });
+
+    bridge.quiesce();
+    assert!(bridge.is_quiesced());
+
+    core.runtime()
+        .block_on(core.create_space(Some("second".into())))
+        .expect("create space");
+    // Give the bridge every chance to dispatch it — the assertion is that it
+    // does not.
+    for _ in 0..8 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(
+        stores.spaces.read_with(cx, |s, _| s.list().len()),
+        1,
+        "a quiesced bridge must dispatch nothing, however the change arrives"
+    );
+}
+
 /// A template write that carries a **router model** is two core calls
 /// (`create_template` / `update_template`, then the dedicated
 /// `set_template_router_model`), and the bus makes them race: app-core emits

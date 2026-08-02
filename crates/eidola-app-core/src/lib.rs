@@ -6968,6 +6968,26 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Tear down **every** live inference engine, returning how many were
+    /// signalled. The shutdown path: a client quitting owes the user's
+    /// machine its memory back.
+    ///
+    /// Deliberately synchronous and infallible — it drains the in-process
+    /// engine registry and sends each supervisor its shutdown signal. It
+    /// touches no filesystem and no database, which is exactly why it is
+    /// not a loop over [`Self::local_models_state`]: that snapshot is
+    /// *reconstructed by scanning* the model directories, so an engine
+    /// whose backing `.gguf` moved mid-session is missing from it, and a
+    /// large or slow directory would burn a quit budget on I/O before
+    /// anything was killed.
+    ///
+    /// Signalling is not reaping: the supervisor task owns the child, so a
+    /// caller that is about to `exit()` must leave the runtime a moment to
+    /// run them.
+    pub fn shutdown_engines(&self) -> usize {
+        self.inner.shutdown_all_engines()
+    }
+
     /// Pin or unpin a loaded model's engine. Pinned engines are protected
     /// from automatic (LRU) unloading when another model needs the memory;
     /// manual unload still applies.
