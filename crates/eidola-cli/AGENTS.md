@@ -1,0 +1,32 @@
+# eidola-cli — Agent Development Guide
+
+Depends on `eidola-app-core` as a regular Rust crate: constructs `AppCore::new(config_dir, data_dir)` and invokes methods directly (see `crates/eidola-app-core/AGENTS.md`).
+
+## Structure and error surface
+
+`main` parses argv **first** — so `--help` / `--version` / argument errors work even when another Eidola process holds the local database's exclusive lock — then builds the core, routing a construction failure through the same `report(&err)` renderer as a command failure. That renderer prints actionable hints for the typed errors: `NoAccount` → `eidola account create`; `InsufficientBalance` → `eidola account prices` / `checkout`; `DatabaseInUse` → quit the other Eidola.
+
+## Commands
+
+- `eidola chat` without `--model` resolves the default template's agent model (async `AppCore::default_model()`); `--model` accepts qualified `<model>@<backend>` references. The model-picker chat path uses `TurnSelector::Model`, so a plain pick reuses the space's matching agent.
+- `eidola backend {list,add openai,add llamacpp,enable,disable,remove,models}` manages the backend registry (`disable eidola` = no-account on-device mode). `add llamacpp` takes `--engine-path` and `--no-auto-start`; `list` shows engine + auto-start state for llamacpp rows.
+- `eidola model {list,download,delete,load,unload,pin,unpin}` manages local llama.cpp models. A chat against any engine-served model loads the engine on demand inside the request path (the CLI narrates the wait); `eidola model load` serves until Ctrl-C.
+- `eidola update check` runs the update-notification check and prints the same five states the GUI's Updates window renders (exit code 2 = unverifiable security state, 3 = claims-changed); the previous full-pipeline command moved to `eidola update verify`.
+- `eidola account create --accept-terms` records terms acceptance; `eidola account accept-terms` handles re-acceptance after a 428.
+- `eidola service {install,start,stop}` — see below.
+
+## `service.rs` — the Linux systemd user service (task 17 wave 2)
+
+`install` writes `$XDG_CONFIG_HOME/systemd/user/eidola.service` — a `const` template with the resolved `eidola-gui` path substituted, launching it `--windowless` — then `systemctl --user daemon-reload` + `enable`; `start`/`stop` are the matching calls. **These three verbs are handled in `main` before the core is built**, because the running service holds the database lock and `service stop` must work exactly then.
+
+The doctrine below was verified empirically against systemd 257 (`systemd-path`, `systemd-analyze --user unit-paths`, `systemd-analyze verify`); don't relax it without re-verifying:
+
+- **A relative `XDG_CONFIG_HOME` is ignored, not honored** (`resolve_config_home`): the XDG spec calls a relative value invalid, and systemd obeys — with `XDG_CONFIG_HOME=rel/cfg`, systemd still resolves `$HOME/.config` and searches `$HOME/.config/systemd/user`. Honoring it would file the unit where the manager never looks and report success for a service that doesn't exist. Whoever resolves this path must agree with **systemd**, not the spec's letter alone. Empty and unset fall through the same way, and **the `HOME` fallback obeys the same rule** (systemd ignores a relative or empty `HOME`, answering from the passwd database). Where we diverge: systemd has a third source we don't read, so rather than guess we refuse — honest and actionable, unlike resolving against the CWD.
+- The resolved exec path is made **absolute, existing, and executable *by the installing user*** (`absolute_existing_exec`): lexical `std::path::absolute`, deliberately *not* `canonicalize` — the two things a `--exec` most often names are symlinks on purpose (a Nix profile entry, `target/release/eidola-gui`), and pinning to today's link target would silently keep launching an old binary after rebuilds. Executability is `faccessat(…, X_OK, AT_EACCESS)` via `rustix`, not a mode-bit mask — a root-owned mode-`010` binary has an execute bit this user still can't use; only the kernel's effective-uid check (supplementary groups included) answers the question, and systemd rejects such a file too.
+- **A control character in the path is refused outright**: systemd cannot express one in a command name — raw (even quoted) *splits the directive*, and the C-escaped form is decoded then rejected as `Executable path contains special characters`. There is no third encoding, so the refusal joins the missing/non-executable cases at the before-any-write seam; the message escapes the path rather than echoing the offending byte. A **space** is unaffected: quoting covers it.
+- **PATH discovery shares the exact usability predicate** (`is_usable_exec`) and walks *past* an unusable candidate to a later good one (`which`'s first-runnable-match semantics) — a stale `chmod`-less copy earlier on `PATH` can't mask a working install, and discovery can never hand `resolve_exec` a path its own gate refuses.
+- **Quoting** (`systemd_quote_exec`): `"…"` with `\`-escaped `"`/`\`, and `%` → `%%`. `ExecStart=` splits on whitespace, so unquoted spaces would truncate the program word. **`%` is escaped but `$` deliberately is not**: a specifier expands everywhere (quotes included), while environment expansion does *not* apply to the program word — escaping `$` to `$$` would be corrupting (systemd takes the doubled form literally). The function is named `_exec` because the rule flips for a later *argument*; the unit's only other word is the fixed literal `--windowless`.
+- **The install preflight probes `systemctl --user daemon-reload`, not `--version`**: the version query is answered by the binary and succeeds where no per-user manager runs (containers, WSL), which previously produced half-installs. `daemon-reload` is the cheapest call that must reach the user manager, is idempotent, and is needed anyway — so refusal happens before any write (the zero-trace pattern).
+- The unit is a Rust `const` rather than a `data/` asset on purpose: the Nix build's crane source filter keeps Rust plus a short extension allowlist (`.sql`, `.ttf`), so a `.service` file would silently vanish from the packaged source.
+
+Unit-tested against a temp XDG dir in `service.rs` (rendering, quoting, `$`/`%` handling, resolution, refusal cases, discovery walk-past, idempotent rewrite, relative-XDG ignore).
