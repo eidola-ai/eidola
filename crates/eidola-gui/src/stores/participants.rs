@@ -188,9 +188,11 @@ impl ParticipantsStore {
     /// fetch is a debt (`crates/eidola-gui/STATE.md` → "Concurrency patterns"),
     /// so the re-list runs on **every** exit, failure included — a failed write
     /// changed nothing durably, so its re-list simply re-establishes what the
-    /// cancelled refresh was fetching. The write's error still wins `op_errors`;
-    /// a re-list that itself fails leaves the prior snapshot in place rather
-    /// than replacing the write's error with a read's.
+    /// cancelled refresh was fetching. The write's error wins `op_errors` while
+    /// a re-list that itself fails resolves the *cell* (`Failed { prior }`,
+    /// keeping any prior snapshot visible) — see
+    /// [`crate::stores::settle_mutation`], which owns that pairing for both
+    /// write-through stores.
     fn write_then_relist<F>(&mut self, space_id: String, cx: &mut Context<Self>, op: F)
     where
         F: FnOnce(
@@ -218,10 +220,11 @@ impl ParticipantsStore {
                 })
                 .await;
                 let _ = this.update(cx, |this, cx| {
-                    if let Ok(list) = list {
-                        this.spaces.insert(key.clone(), Loadable::loaded(list));
-                    }
-                    if let Err(e) = op_result {
+                    let cell = this
+                        .spaces
+                        .entry(key.clone())
+                        .or_insert(Loadable::NotLoaded);
+                    if let Some(e) = crate::stores::settle_mutation(cell, list, op_result) {
                         this.op_errors.insert(key.clone(), e);
                     }
                     this.op_tasks.remove(&key);

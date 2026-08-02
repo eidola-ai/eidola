@@ -587,11 +587,19 @@ fn a_refresh_landing_mid_write_keeps_the_templates_ops_error(cx: &mut TestAppCon
             .read_with(cx, |s, _| s.op_error().is_some())
     });
     // The same continuation carries the re-list, so the registry is a listing
-    // and not whatever a cancelled op left behind.
+    // and not whatever a cancelled op left behind — and the cell it took over
+    // from the cancelled refresh is *resolved*, never left mid-flight (the
+    // strand `stores::settle_mutation` exists to prevent; its own failure
+    // quadrants are unit-tested there, since a DB read cannot be made to fail
+    // through this seam).
     stores.templates.read_with(cx, |s, _| {
         assert!(
             s.list().iter().any(|t| t.title == "Default"),
             "the mutation re-listed on its failure exit"
+        );
+        assert!(
+            !s.templates().is_loading(),
+            "the mutation must resolve the cell it took the read from"
         );
     });
 }
@@ -642,6 +650,10 @@ fn a_refresh_landing_mid_write_keeps_the_participants_ops_error(cx: &mut TestApp
         assert!(
             !s.list(&space).is_empty(),
             "the mutation re-listed on its failure exit"
+        );
+        assert!(
+            !s.participants(&space).is_loading(),
+            "the mutation must resolve the cell it took the read from"
         );
     });
 }

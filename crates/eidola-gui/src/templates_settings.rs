@@ -483,6 +483,14 @@ impl Render for TemplatesSettingsView {
                 cx,
                 cx.listener(|this, _, _, cx| this.retry_load(cx)),
             ));
+            // A refused write and a failed re-list are two different truths and
+            // can hold at once (the write's error wins `op_error`, the read's
+            // resolves the cell — see `stores::settle_mutation`). This branch
+            // owns the whole body, so it must carry the write's error too or the
+            // refusal would be silent exactly when the listing went blank.
+            if let Some(err) = op_error {
+                col = col.child(self.render_op_error(&err, cx));
+            }
             return col;
         }
 
@@ -507,12 +515,7 @@ impl Render for TemplatesSettingsView {
         }
 
         if let Some(err) = op_error {
-            col = col.child(
-                div()
-                    .id("templates-error")
-                    .probe("settings/templates/error", gpui::Role::Alert, err.clone())
-                    .child(error_banner(&err, cx)),
-            );
+            col = col.child(self.render_op_error(&err, cx));
         }
 
         // A refresh failure over existing data: keep the list, offer a quiet retry.
@@ -536,6 +539,19 @@ impl Render for TemplatesSettingsView {
 }
 
 impl TemplatesSettingsView {
+    /// The write-error banner. One helper because it renders in two places —
+    /// under the listing, and under the failed-load panel that owns the body.
+    fn render_op_error(&self, err: &str, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .id("templates-error")
+            .probe(
+                "settings/templates/error",
+                gpui::Role::Alert,
+                err.to_string(),
+            )
+            .child(error_banner(err, cx))
+    }
+
     fn render_row(
         &self,
         t: &SpaceTemplateInfo,

@@ -155,9 +155,12 @@ impl TemplatesStore {
     /// *partially* — a template created whose router the setter then refused.
     /// Leaving the snapshot untouched on failure would show the error beside a
     /// listing that doesn't contain the template that was in fact created. The
-    /// error still wins the `op_error` slot; a re-list that itself fails leaves
-    /// the prior snapshot in place rather than replacing the write's error with
-    /// a read's.
+    /// error still wins the `op_error` slot, while a re-list that itself fails
+    /// resolves the *cell* — `Failed { prior }`, keeping any prior snapshot
+    /// visible — so the two errors answer their own questions instead of
+    /// overwriting each other, and neither is dropped. See
+    /// [`crate::stores::settle_mutation`] for why dropping the read's error
+    /// stranded the cell.
     ///
     /// **A mutation takes over the read** — it drops any in-flight refresh,
     /// which may have been issued *before* this write and would re-stale the
@@ -190,12 +193,8 @@ impl TemplatesStore {
             )
             .await;
             let _ = this.update(cx, |this, cx| {
-                if let Ok(templates) = list {
-                    this.templates = Loadable::loaded(templates);
-                }
-                if let Err(e) = op_result {
-                    this.op_error = Some(e);
-                }
+                this.op_error =
+                    crate::stores::settle_mutation(&mut this.templates, list, op_result);
                 this.op_task = None;
                 if std::mem::take(&mut this.refresh_pending) {
                     this.refresh(cx);
