@@ -2872,6 +2872,112 @@ fn templates_editor_referenced_rows_follow_the_live_registry(cx: &mut TestAppCon
     probe::set_probes_enabled(false);
 }
 
+/// Two enabled backends serving a model of the same name — the managed local
+/// store and a user's own llama.cpp install, which is exactly what happens when
+/// someone downloads a model Eidola also curates.
+fn same_name_on_two_backends() -> eidola_app_core::LocalModelsState {
+    use eidola_app_core::{
+        ExternalEngineBackend, LocalModelInfo, LocalModelStatus, LocalModelsState,
+    };
+    let model = |id: &str, slug: &str| LocalModelInfo {
+        id: id.into(),
+        slug: slug.into(),
+        display_name: "Gemma 4 E2B".into(),
+        file_name: "gemma-4-e2b.gguf".into(),
+        size_bytes: Some(3_000_000_000),
+        source_url: None,
+        status: LocalModelStatus::Available,
+        last_error: None,
+    };
+    LocalModelsState {
+        engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+        external: vec![ExternalEngineBackend {
+            backend_id: "my-box".into(),
+            display_name: "My box".into(),
+            enabled: true,
+            models_dir: "/Users/me/models".into(),
+            engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+            auto_start: true,
+            models: vec![model("gemma-4-e2b@my-box", "gemma-4-e2b")],
+        }],
+        models: vec![model("gemma-4-e2b@local", "gemma-4-e2b")],
+    }
+}
+
+/// **A dropdown option has to name its own backend.** The visible row shows
+/// only the model name because the group header above it supplies the backend —
+/// but that header is a role-less `div`, so it never reaches the accessibility
+/// tree, and two backends serving the same model name give a screen reader two
+/// rows it cannot tell apart. On the router picker that ambiguity is also the
+/// billing difference. One helper serves both pickers, so this pins both.
+#[gpui::test]
+fn model_picker_options_name_their_backend(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.local_models = Some(same_name_on_two_backends());
+        s.templates = probe_templates();
+        s.participants = Some(probe_participants());
+    });
+
+    // The Templates pane's router picker.
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("tmpl-research", window, cx));
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.toggle_router_picker(cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router/option/0/0",
+        gpui::Role::Button,
+        "Gemma 4 E2B · Local",
+    );
+    assert_probe(
+        &entries,
+        "settings/templates/editor/router/option/1/0",
+        gpui::Role::Button,
+        "Gemma 4 E2B · My box",
+    );
+
+    // The participant model field — the same shared widget, the same shape.
+    let (p_window, p_view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            ParticipantsView::new(
+                stores.clone(),
+                "demo".into(),
+                Some("Demo".into()),
+                window,
+                cx,
+            )
+        })
+    });
+    cx.update_window(p_window, |_, window, cx| {
+        p_view.update(cx, |v, cx| v.begin_add(window, cx));
+    })
+    .unwrap();
+    p_view.update(cx, |v, cx| v.open_add_picker_for_test(cx));
+    let entries = fresh_entries(cx, p_window);
+    assert_probe(
+        &entries,
+        "participants/add/model/option/0/0",
+        gpui::Role::Button,
+        "Gemma 4 E2B · Local",
+    );
+    assert_probe(
+        &entries,
+        "participants/add/model/option/1/0",
+        gpui::Role::Button,
+        "Gemma 4 E2B · My box",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 /// A picker's label names it ("Model", "Router model"); *which* model is chosen
 /// is its content, and rides `aria_value` — settled by construction, since it
 /// moves only on a click. Both pickers take the same shape from one helper: a
