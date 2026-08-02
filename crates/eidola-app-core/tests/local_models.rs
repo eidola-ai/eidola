@@ -686,3 +686,148 @@ fn a_load_after_the_shutdown_drain_is_refused_and_spawns_nothing() {
         );
     });
 }
+
+/// A fake `llama-server` that ignores its arguments and stays alive, so a
+/// load stays in its warming loop for the duration of a test.
+fn write_sleeping_engine(dir: &std::path::Path) -> String {
+    let path = dir.join("fake-llama-server");
+    std::fs::write(&path, b"#!/bin/sh\nexec sleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The supervisor's own shutdown arm must be silent during a quit, exactly
+/// like the drain that signalled it.
+///
+/// Silencing `shutdown_all_engines` alone left this second emitter wide open:
+/// the drain only *signals*, and the supervisor emits right after killing its
+/// child — into the same window that panics. The GUI's bus bridge is a
+/// foreground task gpui keeps driving through its bounded shutdown block
+/// *after* `App::shutdown` sets `quitting`, so that dispatch reaches
+/// `cx.spawn` → "Can't spawn on main thread after on_app_quit".
+#[test]
+fn the_supervisors_shutdown_arm_emits_nothing() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let core = std::sync::Arc::new(core);
+        let models_dir = _dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
+        core.set_llama_server_path(Some(write_sleeping_engine(_dir.path())))
+            .unwrap();
+
+        let handle = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.load_local_model("sleeper@local".into()).await }
+        });
+        // Wait until the engine is registered and warming.
+        wait_for_state(&core, |s| {
+            s.models
+                .iter()
+                .any(|m| m.slug == "sleeper" && matches!(m.status, LocalModelStatus::Loading))
+        });
+
+        // Subscribe *after* the load's own emissions, so anything we see is
+        // the shutdown path's.
+        let mut rx = core.subscribe_changes();
+        assert_eq!(
+            core.shutdown_engines(),
+            1,
+            "the warming engine is signalled"
+        );
+
+        // Let the supervisor run its shutdown arm to completion.
+        let outcome = core
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
+            })
+            .expect("the supervisor must finish promptly")
+            .expect("join");
+        assert!(outcome.is_err(), "a cancelled load reports failure");
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no path in the supervisor may emit once the shutdown latch is set"
+        );
+    });
+}
+
+/// A warming engine's in-flight `/health` probe must not swallow the
+/// shutdown signal.
+///
+/// The probe used to be awaited *outside* the supervisor's `select!`, so the
+/// oneshot was simply not polled for its duration — and warming is exactly
+/// when `/health` can hang rather than refuse (the socket is accepted while a
+/// multi-gigabyte model loads, and this client sets no request timeout). A
+/// quit landing in that window sent its signal into a receiver nobody was
+/// watching, the drain's grace expired, `exit()` followed, and the child
+/// outlived the process.
+///
+/// The hang is reproduced deterministically by pointing the injected HTTP
+/// client at a proxy that accepts connections and never answers.
+#[test]
+fn a_hanging_health_probe_does_not_swallow_the_shutdown_signal() {
+    run(|| {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A listener that accepts and never responds. Sockets are held so the
+        // connection stays open rather than being closed under the client.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        rt.spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{proxy_port}")).unwrap())
+            .build()
+            .expect("client");
+        let core = AppCore::with_test_http_client(
+            dir.path().to_path_buf(),
+            dir.path().join("data"),
+            client,
+        )
+        .expect("open core");
+        let core = std::sync::Arc::new(core);
+
+        let models_dir = dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("sleeper.gguf"), b"gguf").unwrap();
+        core.set_llama_server_path(Some(write_sleeping_engine(dir.path())))
+            .unwrap();
+
+        let handle = core.runtime().spawn({
+            let core = core.clone();
+            async move { core.load_local_model("sleeper@local".into()).await }
+        });
+        wait_for_state(&core, |s| {
+            s.models
+                .iter()
+                .any(|m| m.slug == "sleeper" && matches!(m.status, LocalModelStatus::Loading))
+        });
+        // Give the loop time to enter a probe and hang in it.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        assert_eq!(core.shutdown_engines(), 1);
+        let outcome = core
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
+            })
+            .expect("the signal must be observed even mid-probe")
+            .expect("join");
+        assert!(outcome.is_err(), "a cancelled load reports failure");
+
+        drop(core);
+        rt.shutdown_background();
+    });
+}

@@ -1756,12 +1756,35 @@ async fn supervise_engine(
             .insert(key.clone(), message.to_string());
     };
 
+    // **Every** emission in this supervisor goes through here, and it is
+    // silent once the quit-time shutdown latch is set.
+    //
+    // Silencing only [`Inner::shutdown_all_engines`] left this second emitter
+    // wide open: the drain merely *signals*, and the supervisor's own
+    // shutdown arms emit right after killing the child — into the same window
+    // that panics. The GUI's bus bridge is an app-lifetime foreground task
+    // gpui keeps driving through its bounded shutdown block *after*
+    // `App::shutdown` sets `quitting`, so any dispatch there reaches
+    // `LocalModelsStore::refresh` → `cx.spawn` → "Can't spawn on main thread
+    // after on_app_quit".
+    //
+    // Gating on the latch rather than on the shutdown *arm* is deliberate:
+    // during a quit no path should emit, including a child that happens to
+    // exit on its own at that moment. An ordinary unload is not a quit — the
+    // latch is unset — so it still emits, which is what the Local settings
+    // pane redraws from.
+    let emit = || {
+        if !local.shutting_down.load(Ordering::SeqCst) {
+            bus.emit(Change::LocalModels);
+        }
+    };
+
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             let message = format!("failed to start llama-server: {e}");
             fail(&message);
-            bus.emit(Change::LocalModels);
+            emit();
             let _ = ready_tx.send(Err(message));
             return;
         }
@@ -1817,9 +1840,23 @@ async fn supervise_engine(
         if std::time::Instant::now() >= deadline {
             break LoadEnd::TimedOut;
         }
-        if let Ok(resp) = http.get(&health_url).send().await
-            && resp.status().is_success()
-        {
+        // The probe must race the shutdown signal, not precede it.
+        //
+        // Awaiting the request outside the `select!` meant the oneshot was
+        // simply not polled for its duration — and a *warming* engine is
+        // exactly the case where `/health` can hang rather than refuse: the
+        // socket is accepted while a multi-gigabyte model loads, and this
+        // client has no request timeout. A quit landing in that window sent
+        // its signal into a receiver nobody was watching, the drain's brief
+        // grace expired, `exit()` followed, and the child outlived the
+        // process — the orphan the whole teardown exists to prevent.
+        let ready = tokio::select! {
+            _ = &mut shutdown_rx => break LoadEnd::Shutdown,
+            resp = http.get(&health_url).send() => {
+                matches!(resp, Ok(r) if r.status().is_success())
+            }
+        };
+        if ready {
             break LoadEnd::Ready;
         }
     };
@@ -1830,7 +1867,7 @@ async fn supervise_engine(
             let _ = child.start_kill();
             let _ = child.wait().await;
             // Map entry was already removed by `unload`.
-            bus.emit(Change::LocalModels);
+            emit();
             let _ = ready_tx.send(Err("load cancelled".into()));
             return;
         }
@@ -1840,7 +1877,7 @@ async fn supervise_engine(
                 tail_text(),
             );
             fail(&message);
-            bus.emit(Change::LocalModels);
+            emit();
             let _ = ready_tx.send(Err(message));
             return;
         }
@@ -1853,7 +1890,7 @@ async fn supervise_engine(
                 tail_text(),
             );
             fail(&message);
-            bus.emit(Change::LocalModels);
+            emit();
             let _ = ready_tx.send(Err(message));
             return;
         }
@@ -1878,7 +1915,7 @@ async fn supervise_engine(
         let _ = ready_tx.send(Err("unloaded during startup".into()));
         return;
     }
-    bus.emit(Change::LocalModels);
+    emit();
     let _ = ready_tx.send(Ok(()));
 
     // Phase 2: serve until shutdown or unexpected exit. The `child.wait()`
@@ -1891,7 +1928,7 @@ async fn supervise_engine(
         None => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            bus.emit(Change::LocalModels);
+            emit();
         }
         Some(exit) => {
             let code = exit.ok().and_then(|s| s.code());
@@ -1900,7 +1937,7 @@ async fn supervise_engine(
                 tail_text(),
             );
             fail(&message);
-            bus.emit(Change::LocalModels);
+            emit();
         }
     }
 }
