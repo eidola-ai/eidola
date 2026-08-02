@@ -27,7 +27,8 @@ use eidola_app_core::{
 use gpui::{
     AsyncApp, ClipboardItem, Context, Div, FocusHandle, InteractiveElement, IntoElement,
     ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div,
+    prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, StyledExt, h_flex,
@@ -824,6 +825,10 @@ impl Render for RecordView {
             (gpui::Role::List, self.section.label())
         };
 
+        // Only a real listing gets the roving handle: a detail / loading /
+        // empty body is a `Region`, not a list, and has nothing to rove.
+        let listing_focus = matches!(body_role, gpui::Role::List).then(|| self.list_focus(cx));
+
         let (body, scrollbar): (gpui::AnyElement, gpui::AnyElement) = if self.detail.is_some() {
             (
                 scroll_wrap(self.render_detail(cx), &self.detail_scroll).into_any_element(),
@@ -881,6 +886,14 @@ impl Render for RecordView {
                     .id("record-body")
                     .probe("record/body", body_role, body_label)
                     .tab_region(crate::focus::region::MAIN)
+                    .when(listing_focus.is_some(), |d| {
+                        d.on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                            if this.handle_list_key(ev, window, cx) {
+                                cx.stop_propagation();
+                            }
+                        }))
+                    })
+                    .when_some(listing_focus, |d, h| d.track_focus(&h))
                     .relative()
                     .flex_1()
                     .w_full()
@@ -1053,6 +1066,28 @@ impl RecordView {
     /// `uniform_list` closure is a dumb indexer over the precomputed
     /// `display` model: it renders only the visible window of rows, so frame
     /// work is O(visible) rather than O(loaded) (the wave-2 bug-3 fix).
+    /// The current section's roving-focus handle, minted on demand so
+    /// `Listing::default()` stays context-free. It is tracked by the **body
+    /// wrapper**, the element that carries the `List` role: `uniform_list`
+    /// cannot take a role (`InteractiveElement` but not
+    /// `StatefulInteractiveElement`), and a handle tracked on a node-less
+    /// element leaves `TreeUpdate.focus` falling back to the window root.
+    /// `tab_index(MAIN)` rides the handle because gpui reads tab order off the
+    /// handle once one is tracked.
+    fn list_focus(&mut self, cx: &mut Context<Self>) -> FocusHandle {
+        let slot = match self.section {
+            RecordSection::Attestations => &mut self.attestations.list_focus,
+            RecordSection::Requests => &mut self.requests.list_focus,
+            RecordSection::Spending => &mut self.spending.list_focus,
+        };
+        slot.get_or_insert_with(|| {
+            cx.focus_handle()
+                .tab_index(crate::focus::region::MAIN)
+                .tab_stop(true)
+        })
+        .clone()
+    }
+
     fn render_listing(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let count = match self.section {
             RecordSection::Attestations => self.attestations.display.len(),
@@ -1065,18 +1100,6 @@ impl RecordView {
             RecordSection::Spending => self.spending.scroll.clone(),
         };
         let section = self.section;
-        // The listing is this section's single tab stop, with a roving cursor
-        // over its display rows — see `Listing::list_focus`. Minted lazily so
-        // `Listing::default()` stays context-free.
-        let list_focus = {
-            let slot = match section {
-                RecordSection::Attestations => &mut self.attestations.list_focus,
-                RecordSection::Requests => &mut self.requests.list_focus,
-                RecordSection::Spending => &mut self.spending.list_focus,
-            };
-            slot.get_or_insert_with(|| cx.focus_handle().tab_stop(true))
-                .clone()
-        };
 
         uniform_list(
             ("record-list", section as usize),
@@ -1085,12 +1108,6 @@ impl RecordView {
                 this.render_rows(section, range, window, cx)
             }),
         )
-        .track_focus(&list_focus)
-        .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
-            if this.handle_list_key(ev, window, cx) {
-                cx.stop_propagation();
-            }
-        }))
         .flex_1()
         .w_full()
         .px_6()
@@ -1151,6 +1168,13 @@ impl RecordView {
                 // this is the row its cursor is on. No modality guard is
                 // needed — the cursor only shows while the list holds focus.
                 div()
+                    .id(("record-cursor-row", dix))
+                    // The active-descendant half of the roving pattern: the
+                    // focused node is the body's `List`, and this is the row AT
+                    // should report as focused inside it (`uniform_list`
+                    // contributes no node, so the list *is* this row's a11y
+                    // parent).
+                    .aria_active_descendant()
                     .h(ROW_H)
                     .w_full()
                     .shadow(crate::focus::ring_shadows(crate::focus::ring_colors()))

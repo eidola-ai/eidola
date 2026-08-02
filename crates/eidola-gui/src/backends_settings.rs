@@ -1567,37 +1567,37 @@ impl BackendsSettingsView {
                         .child(
                             div()
                                 .id("eidola-save-base-url-wrap")
-                                .probe_delegating(
+                                .probe(
                                     "settings/backends/eidola/url/save",
                                     gpui::Role::Button,
                                     "Save",
                                 )
+                                .on_click(cx.listener(|this, _, _, cx| this.save_base_url(cx)))
                                 .child(
                                     Button::new("eidola-save-base-url")
                                         .primary()
                                         .small()
                                         .label("Save")
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.save_base_url(cx)),
-                                        ),
+                                        .tab_stop(false),
                                 ),
                         )
                         .child(
                             div()
                                 .id("eidola-cancel-base-url-wrap")
-                                .probe_delegating(
+                                .probe(
                                     "settings/backends/eidola/url/cancel",
                                     gpui::Role::Button,
                                     "Cancel",
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.cancel_edit_base_url(cx)),
                                 )
                                 .child(
                                     Button::new("eidola-cancel-base-url")
                                         .ghost()
                                         .small()
                                         .label("Cancel")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cancel_edit_base_url(cx)
-                                        })),
+                                        .tab_stop(false),
                                 ),
                         ),
                 );

@@ -11,8 +11,8 @@
 
 use eidola_app_core::CredentialLifecycleInfo;
 use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
-    Subscription, Window, div,
+    Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Sizable, StyledExt, WindowExt,
@@ -154,19 +154,21 @@ impl Render for WalletView {
                 // button so its bounds are an honest click target.
                 div()
                     .id("recover-all-wrap")
-                    .probe_delegating(
+                    .probe(
                         "settings/wallet/recover",
                         gpui::Role::Button,
                         "Recover in-flight",
                     )
+                    .when(busy, |d| d.tab_stop(false))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.recover_all(window, cx);
+                    }))
                     .child(
                         Button::new("recover-all")
                             .small()
                             .label("Recover in-flight")
                             .disabled(busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.recover_all(window, cx);
-                            })),
+                            .tab_stop(false),
                     ),
             );
         }
@@ -175,19 +177,20 @@ impl Render for WalletView {
             // button so its bounds are an honest click target.
             div()
                 .id("refresh-credentials-wrap")
-                .probe_delegating(
+                .probe(
                     "settings/wallet/refresh",
                     gpui::Role::Button,
                     "Refresh credentials",
                 )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.wallet.update(cx, |s, cx| s.refresh(cx));
+                }))
                 .child(
                     Button::new("refresh-credentials")
                         .ghost()
                         .small()
                         .label("Refresh")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.wallet.update(cx, |s, cx| s.refresh(cx));
-                        })),
+                        .tab_stop(false),
                 ),
         );
         header = header.child(actions);

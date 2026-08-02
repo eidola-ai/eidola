@@ -318,7 +318,15 @@ impl SpaceView {
     /// instead. Hidden entirely while streaming (the entity refuses mutations
     /// mid-stream, so dead verbs would lie).
     fn render_post_actions(&self, node: &TreeNode, cx: &Context<Self>) -> gpui::Div {
-        let col = action_gutter().gap_0p5();
+        let mut col = action_gutter().gap_0p5();
+        // The affordance level's containment seam: while the keyboard has
+        // entered *this* post's verbs, the gutter tracks the row handle, so
+        // `sync_tree_focus` can ask whether any of them (each on a gpui
+        // implicit handle we never see) still holds focus. Only the focused
+        // post's gutter tracks it — one handle, one claimant per frame.
+        if self.focused_affordance(&node.id).is_some() {
+            col = col.track_focus(&self.affordance_row_focus);
+        }
         let NodeSrc::Msg(i) = node.src else {
             return col;
         };

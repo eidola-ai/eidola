@@ -503,6 +503,22 @@ pub struct SpaceView {
     /// verb the row must *stop* tracking, since two elements claiming one
     /// handle would report focus twice in a frame (gpui asserts on it).
     pub(crate) affordance_focus: FocusHandle,
+    /// The focus handle the focused post's **affordance row container** tracks
+    /// — the observation seam for [`keyboard::sync_tree_focus`]'s second level.
+    /// The row's individual verbs are ordinary tab stops riding gpui's
+    /// *implicit* handles, which this crate never receives, so "is a verb of
+    /// this post still focused" is only answerable from a container:
+    /// `FocusHandle::contains_focused` resolves through the **dispatch tree**
+    /// (`FocusId::contains` → `dispatch_tree.focus_contains`), where an
+    /// implicit descendant is an ordinary node. Tracked only by the focused
+    /// post's gutter, since two elements claiming one handle report focus
+    /// twice in a frame.
+    pub(crate) affordance_row_focus: FocusHandle,
+    /// Whether a transient overlay held the keyboard on the last rendered
+    /// frame — see [`keyboard::sync_tree_focus`], which uses the falling edge
+    /// to hand focus *back* to the conversation instead of reading the borrow
+    /// as a loss.
+    pub(crate) overlay_held_focus: bool,
     /// Set when the active draft's editor emits a buffer [`Change`], consumed
     /// by the composer body's `caret_into_view` canvas on the next paint to
     /// scroll the new caret position into the composer's visible viewport
@@ -720,6 +736,8 @@ impl SpaceView {
             tree_focus: None,
             post_focus: cx.focus_handle(),
             affordance_focus: cx.focus_handle(),
+            affordance_row_focus: cx.focus_handle(),
+            overlay_held_focus: false,
             composer_caret_scroll_pending: Cell::new(false),
             composer_aria_value: RefCell::new((SharedString::default(), SharedString::default())),
             page_scroll: ScrollHandle::new(),
@@ -1777,7 +1795,7 @@ impl Render for SpaceView {
 
         // Tree focus is *observed*, not merely bookkept: see
         // `keyboard::sync_tree_focus`.
-        self.sync_tree_focus(window);
+        self.sync_tree_focus(window, cx);
 
         // Window resize: branch offsets are absolute pixels but pages are a
         // window-width apart, so remap every offset by the stride ratio to keep
@@ -1990,7 +2008,22 @@ impl Render for SpaceView {
                 // listener, so gpui's *binding* pass has already offered the
                 // press to every inner context (the composer's editor, an
                 // edit session); nothing here can shadow them.
-                this.handle_conversation_key(ev, window, cx);
+                //
+                // **A handled press must be consumed.** `gpui_macos`'s
+                // `handle_key_event` reports the key as handled to AppKit only
+                // when the callback comes back with `propagate == false`;
+                // otherwise it falls through to
+                // `[[self inputContext] handleEvent:]`, which hands the *same*
+                // native event to whatever input handler is installed. For
+                // type-to-compose that is the editor this press just focused,
+                // so the character it already applied would be typed a second
+                // time. `Window::dispatch_keystroke` (the test path) has the
+                // same shape — `if !result.propagate { return true }`, else
+                // `input_handler.dispatch_input(...)` — which is what makes
+                // "the press was consumed" assertable here at all.
+                if this.handle_conversation_key(ev, window, cx) {
+                    cx.stop_propagation();
+                }
             }))
             // The window's single modifiers listener (see `WindowInput`): the
             // root is an ancestor of the focused composer, so it sees every
