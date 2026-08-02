@@ -569,12 +569,17 @@ impl TemplatesSettingsView {
         let mut names: Vec<String> = t.referenced.iter().map(|r| r.label.clone()).collect();
         names.extend(t.participants.iter().map(|p| p.label.clone()));
         // A router that bills per post shouldn't be hidden a click deep, so the
-        // resting row names it (Off says nothing — it is the default).
+        // resting row names it — **model and backend**, in the same
+        // `<model> · <backend>` shape the picker uses (one helper, so the two
+        // can't drift). The backend is the whole point of naming it at rest:
+        // `gemma4-31b@eidola` bills an inference on every post where a
+        // same-named on-device model is free, and the model name alone cannot
+        // tell those apart. Off says nothing — it is the default.
         let router = t.router_model.as_deref().map(|r| {
-            let (name, _) = model_display(&self.stores, r, cx);
-            format!("router {name} · ")
+            let (name, backend) = model_display(&self.stores, r, cx);
+            format!("router {} · ", picker_value(&name, Some(&backend)))
         });
-        let summary = format!(
+        let summary = SharedString::from(format!(
             "cascade {} · {}{}",
             t.cascade_limit,
             router.unwrap_or_default(),
@@ -583,10 +588,25 @@ impl TemplatesSettingsView {
             } else {
                 names.join(", ")
             }
-        );
+        ));
+        // A settled row: the title names it (and says when it is the one ⌘N
+        // uses), the summary line is its content — which is where the router
+        // and its backend live, so a screen reader hears the billing
+        // difference the sighted reader can see.
+        let spoken_name = if is_default {
+            SharedString::from(format!("{subject} — the default template"))
+        } else {
+            SharedString::from(subject.clone())
+        };
 
         h_flex()
             .id(SharedString::from(format!("template-row-{id}")))
+            .probe_value(
+                format!("settings/templates/{id}"),
+                gpui::Role::ListItem,
+                spoken_name,
+                summary.clone(),
+            )
             .w_full()
             .py_2()
             .gap_3()
@@ -623,7 +643,7 @@ impl TemplatesSettingsView {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(SharedString::from(summary)),
+                            .child(summary),
                     ),
             )
             .child(

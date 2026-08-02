@@ -2597,7 +2597,9 @@ fn probe_templates() -> Vec<SpaceTemplateInfo> {
             id: eidola_app_core::DEFAULT_TEMPLATE_ID.into(),
             title: "Default".into(),
             cascade_limit: 4,
-            router_model: None,
+            // A remote router — the case whose backend the resting row has to
+            // name (it bills per post).
+            router_model: Some("gemma4-31b".into()),
             participants: vec![TemplateParticipantInfo {
                 id: "t-1".into(),
                 label: "Assistant".into(),
@@ -2765,6 +2767,48 @@ fn templates_pane_router_probes_and_remote_cost_note(cx: &mut TestAppContext) {
             .iter()
             .any(|(n, _)| n == "settings/templates/editor/router/cost"),
         "a local router routes free — no per-call cost note"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// A resting row summarizes its template, and the router is named there because
+/// it bills per post — which makes the **backend** the load-bearing half:
+/// `gemma4-31b@eidola` charges an inference on every post in every space the
+/// template makes, where an identically-named on-device model is free, and the
+/// model name alone cannot tell those apart. The summary is also the row's
+/// spoken content (settled — it moves only when the registry is refetched), so
+/// a screen reader hears the same distinction.
+#[gpui::test]
+fn a_template_row_names_its_routers_backend(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.templates = probe_templates();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        &format!(
+            "settings/templates/{}",
+            eidola_app_core::DEFAULT_TEMPLATE_ID
+        ),
+        gpui::Role::ListItem,
+        "Default — the default template",
+        "cascade 4 · router gemma4-31b · Eidola · Assistant",
+    );
+    // Off is the default and says nothing; the row is otherwise the same shape.
+    assert_probe_value(
+        &entries,
+        "settings/templates/tmpl-research",
+        gpui::Role::ListItem,
+        "Research",
+        "cascade 6 · You",
     );
 
     probe::set_probes_enabled(false);
