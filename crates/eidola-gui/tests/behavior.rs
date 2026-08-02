@@ -8778,3 +8778,206 @@ fn space_tree_focus_releases_when_the_conversation_loses_focus(cx: &mut TestAppC
         );
     });
 }
+
+#[gpui::test]
+fn space_typing_consumes_the_press_so_the_platform_cannot_retype_it(cx: &mut TestAppContext) {
+    // The handler's `true` used to be discarded, so the press stayed
+    // propagating. `gpui_macos::handle_key_event` reports a key as handled to
+    // AppKit only when the callback comes back with `propagate == false`;
+    // otherwise it falls through to `[[self inputContext] handleEvent:]`,
+    // which hands the same native event to the installed input handler — the
+    // editor this press just focused. `Window::dispatch_keystroke` has the
+    // same shape (`if !result.propagate { return true }`, else
+    // `input_handler.dispatch_input(...)`), and its return value is what makes
+    // "consumed" assertable from a test at all.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    let consumed = vcx
+        .update(|window, cx| window.dispatch_keystroke(gpui::Keystroke::parse("x").unwrap(), cx));
+    vcx.run_until_parked();
+    assert!(
+        consumed,
+        "type-to-compose must consume the press; an unconsumed one is re-delivered \
+         to the platform input context and typed a second time"
+    );
+
+    // The arrow keys are handled too, and must be consumed for the same reason.
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+    let consumed = vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("down").unwrap(), cx)
+    });
+    assert!(consumed, "a handled arrow is consumed too");
+}
+
+#[gpui::test]
+fn space_typing_reseeds_the_composers_accessible_value(cx: &mut TestAppContext) {
+    // `activate_draft` seeds the accessible value from the draft *as it stood*
+    // — before the character that started the session. The §4 freeze rule
+    // means nothing refreshes a focused composer's value, so a pre-keystroke
+    // seed sticks until focus leaves.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let draft = view
+        .read_with(&vcx, |v, _| v.tail_draft_state_for_test())
+        .expect("a docked tail draft");
+    draft.update(&mut vcx, |e, cx| e.set_value("already here", cx));
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.composer_aria_value_for_test().as_ref(),
+            "already herex",
+            "the accessible value includes the character that started the session"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_end_reaches_the_last_post_past_the_trailing_draft(cx: &mut TestAppContext) {
+    // A space's selected path ends in the tail draft, so `End` resolved to the
+    // composer and was then thrown away by a post-hoc filter — a no-op on the
+    // one key whose whole job is "take me to the bottom". The filter belongs on
+    // the path, not on the answer.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut a2 = fixture_assistant_post("a2", "the reply");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and on");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post"), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.tail_draft_state_for_test().is_some()),
+        "the fixture really does end in a draft"
+    );
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a1".to_string(), None)));
+    });
+
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a3".to_string(), None)),
+            "End reaches the last *post*, not the draft below it"
+        );
+    });
+
+    vcx.simulate_keystrokes("home");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a1".to_string(), None)));
+    });
+}
+
+#[gpui::test]
+fn space_tree_focus_releases_from_the_affordance_level_too(cx: &mut TestAppContext) {
+    // The affordance level's verbs ride gpui's *implicit* focus handles, so
+    // "is one of them still focused" is only answerable from a container:
+    // `FocusHandle::contains_focused` resolves through the dispatch tree, where
+    // an implicit descendant is an ordinary node.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down enter");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a1".to_string(), Some(0))));
+    });
+
+    vcx.update(|window, cx| window.focus_next(cx));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            None,
+            "Tab out of the affordance row releases the level"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_composer_resize_handle_adjusts_with_the_arrows(cx: &mut TestAppContext) {
+    // A `Role::Slider` that only answers the mouse is a tab stop where the
+    // arrows do nothing — the dead-stop shape the focus model exists to
+    // prevent. The handle adjusts, in both directions, and clamps.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let start = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
+    view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(true, cx));
+    let taller = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
+    assert!(taller > start, "Up grows the bar: {start} -> {taller}");
+
+    view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(false, cx));
+    let back = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
+    assert!(
+        (back - start).abs() < 1e-4,
+        "Down undoes it: {back} vs {start}"
+    );
+
+    // Clamped, not unbounded.
+    for _ in 0..100 {
+        view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(true, cx));
+    }
+    let maxed = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
+    assert!(
+        maxed <= 0.85 + 1e-4,
+        "clamped at the drag's own ceiling: {maxed}"
+    );
+    for _ in 0..100 {
+        view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(false, cx));
+    }
+    let floored = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
+    assert!(floored >= 0.1 - 1e-4, "and at its floor: {floored}");
+}

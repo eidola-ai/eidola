@@ -45,7 +45,7 @@
 //! walk up to the nearest fork — and Right on one likewise. See
 //! [`tree_target`] for the exact rule.
 
-use gpui::{Context, SharedString, Window};
+use gpui::{App, Context, SharedString, Window};
 
 use super::SpaceView;
 use super::model::{NodeSrc, PostData, TreeNode};
@@ -94,12 +94,35 @@ pub(crate) struct Level {
 /// **post** nodes as focus targets: a draft is the composer (reached by typing
 /// or by Tab, never by an arrow) and a streaming leaf has no settled text to
 /// read, so neither is a place focus can rest.
+///
+/// **The filter happens here, not after the move.** It used to be applied to
+/// [`tree_target`]'s *answer*, which quietly broke `End`: a space's selected
+/// path almost always ends in the tail draft, so `End` resolved to the composer
+/// and was then thrown away — a no-op on the one key whose whole job is "take
+/// me to the bottom". Filtering the input makes `path.last()` the last *post*,
+/// and Left/Right stop counting a draft as a branch sibling for free.
+///
+/// A level that holds no post at all is dropped rather than left empty, because
+/// [`tree_target`] indexes `levels` by position in the flattened path — an
+/// empty level would desync the two and hand a branch move the wrong strip.
 pub(crate) fn levels_from(levels: &[(Vec<&TreeNode>, usize)]) -> Vec<Level> {
     levels
         .iter()
-        .map(|(sibs, active)| Level {
-            siblings: sibs.iter().map(|n| n.id.clone()).collect(),
-            active: (*active).min(sibs.len().saturating_sub(1)),
+        .filter_map(|(sibs, active)| {
+            let kept: Vec<usize> = (0..sibs.len()).filter(|i| is_post_node(sibs[*i])).collect();
+            if kept.is_empty() {
+                return None;
+            }
+            // Keep pointing at the same node when it survived the filter;
+            // otherwise fall to the nearest kept sibling before it.
+            let active = kept
+                .iter()
+                .position(|i| i == active)
+                .unwrap_or_else(|| kept.partition_point(|i| i < active).saturating_sub(1));
+            Some(Level {
+                siblings: kept.into_iter().map(|i| sibs[i].id.clone()).collect(),
+                active,
+            })
         })
         .collect()
 }
@@ -316,15 +339,12 @@ impl SpaceView {
         let (page_width, window_h) = (viewport.width, viewport.height);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(page_width, &turns);
+        // `levels_from` already keeps only post nodes, so this *is* the
+        // navigable path — no post-hoc filter, which is what used to eat `End`.
         let levels = levels_from(&self.selected_levels(&tree, page_width));
         let posts: Vec<SharedString> = levels
             .iter()
             .filter_map(|l| l.siblings.get(l.active))
-            .filter(|id| {
-                super::model::node_ref(&tree, id)
-                    .map(is_post_node)
-                    .unwrap_or(false)
-            })
             .cloned()
             .collect();
         if posts.is_empty() {
@@ -336,11 +356,7 @@ impl SpaceView {
                 TreeMove::Up | TreeMove::End => posts.last().cloned(),
                 _ => posts.first().cloned(),
             },
-            Some(focus) => tree_target(&levels, &focus.node_id, mv).filter(|id| {
-                super::model::node_ref(&tree, id)
-                    .map(is_post_node)
-                    .unwrap_or(false)
-            }),
+            Some(focus) => tree_target(&levels, &focus.node_id, mv),
         };
         let Some(target) = target else {
             // A deliberate no-op still counts as handled: the conversation
@@ -503,6 +519,13 @@ impl SpaceView {
             let handle = editor.read(cx).focus_handle.clone();
             editor.update(cx, |e, cx| e.append_at_end(ch, cx));
             handle.focus(window, cx);
+            // `activate_draft` seeds the accessible value from the draft *as it
+            // stood* — which here is before the character that started the
+            // session. Re-seed after the append, or the composer reports its
+            // pre-keystroke text until focus leaves it (the §4 freeze rule
+            // means nothing else refreshes a focused composer's value, which is
+            // exactly what makes a stale seed stick).
+            self.seed_composer_aria_value(&draft_id, cx);
         }
         cx.notify();
         true
@@ -585,25 +608,70 @@ impl SpaceView {
     /// state costs one comparison per frame and needs no clear-call at any of
     /// the exits — which is the point: there is no exit to forget.
     ///
-    /// **Only the post level is observed.** At the affordance level Tab walks
-    /// between the post's sibling verbs (the map promises it), and those verbs
-    /// hold gpui's *implicit* focus handles, which this crate never sees — so
-    /// "the affordance row still holds focus" is not an observable fact at
-    /// this pin, and clearing on `!affordance_focus.is_focused` would drop the
-    /// level on the very Tab the map advertises. That level draws no manual
-    /// ring (each verb wears gpui's own `:focus-visible`), so the bug this
-    /// fixes cannot occur there; a stale level ends at the next Escape.
-    pub(crate) fn sync_tree_focus(&mut self, window: &Window) {
-        if matches!(
-            self.tree_focus,
-            Some(TreeFocus {
-                level: FocusLevel::Post,
-                ..
-            })
-        ) && !self.post_focus.is_focused(window)
-        {
-            self.tree_focus = None;
+    /// **Each level is observed through the handle that can actually answer
+    /// for it.** The post level asks `post_focus.is_focused` — one element, one
+    /// handle, exact. The affordance level cannot ask
+    /// `affordance_focus.is_focused`, because Tab walks between the post's
+    /// sibling verbs (the keyboard map promises it) and only the *named* verb
+    /// tracks that handle; the others ride gpui's implicit handles, which this
+    /// crate never receives, so an exact test would drop the level on the very
+    /// Tab it advertises. It asks the row **container** instead
+    /// ([`SpaceView::affordance_row_focus`]): `contains_focused` resolves
+    /// through the dispatch tree, where an implicit descendant is an ordinary
+    /// node — so a Tab *within* the row stays inside the container and a Tab
+    /// *out* of it clears, which is exactly the distinction the level means.
+    ///
+    /// The named verb's own handle is checked **as well**, and that is not
+    /// belt-and-braces: containment is answered from
+    /// `window.rendered_frame.dispatch_tree`, i.e. the **last painted** frame,
+    /// but the gutter only starts tracking the row handle on the frame that
+    /// renders *after* the level is entered. Without the exact half, the entry
+    /// frame would read "nothing inside is focused", clear the level, and the
+    /// gutter would never track it again — a one-frame lag that latches.
+    ///
+    /// **A transient overlay borrows the keyboard; it does not end the level.**
+    /// A context menu, a band menu or the highlight picker takes the window's
+    /// focus while it is open — and, at this pin, does *not* hand it back when
+    /// it closes. Reading that as "the conversation lost focus" would silently
+    /// consume a rung of the decided Escape chain (the menu answers the first
+    /// press, the focus levels the ones after). So the observation parks while
+    /// an overlay is open — the same set
+    /// [`SpaceView::handle_conversation_key`] yields to, so the key handler and
+    /// the observation cannot disagree about who owns the keyboard — and, on
+    /// the falling edge, **restores** focus to the level's own handle rather
+    /// than clearing it. That is the honest reading of a borrow, and it is one
+    /// place rather than a restore-call on each of the overlay-close paths
+    /// (there are eight).
+    pub(crate) fn sync_tree_focus(&mut self, window: &mut Window, cx: &mut App) {
+        let overlay = self.context_menu.is_some()
+            || self.band_menu.is_some()
+            || self.highlight_picker.is_some();
+        let borrowed = std::mem::replace(&mut self.overlay_held_focus, overlay);
+        if overlay {
+            return;
         }
+        let Some(focus) = self.tree_focus.as_ref() else {
+            return;
+        };
+        let live = match focus.level {
+            FocusLevel::Post => self.post_focus.is_focused(window),
+            FocusLevel::Affordance(_) => {
+                self.affordance_focus.is_focused(window)
+                    || self.affordance_row_focus.contains_focused(window, cx)
+            }
+        };
+        if live {
+            return;
+        }
+        if borrowed {
+            let handle = match focus.level {
+                FocusLevel::Post => self.post_focus.clone(),
+                FocusLevel::Affordance(_) => self.affordance_focus.clone(),
+            };
+            window.focus(&handle, cx);
+            return;
+        }
+        self.tree_focus = None;
     }
 
     /// Carry keyboard tree focus across a generation change of the post it

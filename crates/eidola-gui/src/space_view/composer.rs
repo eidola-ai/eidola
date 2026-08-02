@@ -271,7 +271,7 @@ impl SpaceView {
     /// Write the draft's current buffer into the accessible-value snapshot.
     /// A no-op when the id names no live draft (the caller's own guard clauses
     /// already cover that; this just refuses to invent a value).
-    fn seed_composer_aria_value(&self, id: &gpui::SharedString, cx: &Context<Self>) {
+    pub(crate) fn seed_composer_aria_value(&self, id: &gpui::SharedString, cx: &Context<Self>) {
         let Some(draft) = self.drafts.iter().find(|d| d.id == *id) else {
             return;
         };
@@ -688,6 +688,33 @@ impl SpaceView {
             self.composer_fraction = fraction;
             cx.notify();
         }
+    }
+
+    /// Nudge the composer's height by one keyboard step — the resize handle's
+    /// keyboard equivalent of a drag. `up` grows the bar (the same direction
+    /// dragging its top edge upward does).
+    ///
+    /// A `Role::Slider` that only answers the mouse is a tab stop where the
+    /// arrows do nothing, which is the dead-stop shape `crate::focus` exists to
+    /// prevent — so the handle either adjusts from the keyboard or should not
+    /// be focusable at all. It adjusts.
+    #[doc(hidden)]
+    pub fn nudge_composer_fraction(&mut self, up: bool, cx: &mut Context<Self>) {
+        let delta = if up {
+            COMPOSER_FRACTION_STEP
+        } else {
+            -COMPOSER_FRACTION_STEP
+        };
+        let next =
+            (self.composer_fraction + delta).clamp(COMPOSER_FRACTION_MIN, COMPOSER_FRACTION_MAX);
+        if (next - self.composer_fraction).abs() <= f32::EPSILON {
+            return;
+        }
+        // Same switch the drag makes: an explicit size is Exact, so the bar can
+        // exceed its content rather than shrink back to it.
+        self.composer_fraction = next;
+        self.composer_sizing = ComposerSizing::Exact;
+        cx.notify();
     }
 
     /// End the resize drag (mouse-up, or a move with no button held). The
@@ -1170,6 +1197,27 @@ impl SpaceView {
                         gpui::Role::Slider,
                         "Resize composer",
                     )
+                    // The slider's own values, so AT can read where the handle
+                    // sits rather than only that it exists.
+                    .aria_orientation(gpui::Orientation::Vertical)
+                    .aria_min_numeric_value(COMPOSER_FRACTION_MIN as f64)
+                    .aria_max_numeric_value(COMPOSER_FRACTION_MAX as f64)
+                    .aria_numeric_value(self.composer_fraction as f64)
+                    .aria_numeric_value_step(COMPOSER_FRACTION_STEP as f64)
+                    // ↑/↓ resize. The listener is inner to the view root's, so
+                    // it takes the press before the conversation's tree
+                    // navigation ever sees it, and consumes it either way.
+                    .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                        if ev.keystroke.modifiers.modified() {
+                            return;
+                        }
+                        match ev.keystroke.key.as_str() {
+                            "up" => this.nudge_composer_fraction(true, cx),
+                            "down" => this.nudge_composer_fraction(false, cx),
+                            _ => return,
+                        }
+                        cx.stop_propagation();
+                    }))
                     .absolute()
                     .top_0()
                     .left_0()
@@ -1509,6 +1557,10 @@ pub(crate) struct ComposerResizeDrag {
 /// current ratio so nothing jumps); the bounds clamp only where the user
 /// drags to.
 pub(crate) const COMPOSER_FRACTION_MIN: f32 = 0.1;
+/// One keyboard step of the composer resize handle — 5% of the window, about a
+/// line and a half of prose, so a few presses cover the useful range without
+/// making the arrows feel inert.
+pub(crate) const COMPOSER_FRACTION_STEP: f32 = 0.05;
 pub(crate) const COMPOSER_FRACTION_MAX: f32 = 0.85;
 
 /// The resize handle's hit band: the separator plus a few px into the body's

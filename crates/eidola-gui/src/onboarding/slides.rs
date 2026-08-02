@@ -272,16 +272,22 @@ impl RenderOnce for CreateAccount {
                 div()
                     .id("onboarding-agree")
                     .pt_10()
-                    .probe_delegating(
+                    .probe(
                         "onboarding/agree",
                         Role::CheckBox,
                         "I agree to the Terms of Service and Privacy Policy.",
                     )
+                    .aria_selected(self.agreed)
+                    .on_click({
+                        let toggle = self.on_toggle_agree;
+                        let next = !self.agreed;
+                        move |_, window, cx| toggle(&next, window, cx)
+                    })
                     .child(
                         Checkbox::new("onboarding-agree-box")
                             .label("I agree to the Terms of Service and Privacy Policy.")
                             .checked(self.agreed)
-                            .on_click(self.on_toggle_agree)
+                            .tab_stop(false)
                             .p_1(),
                     ),
             )
@@ -297,13 +303,18 @@ impl RenderOnce for CreateAccount {
         let enabled = self.agreed && !self.creating;
         let cta = div()
             .id("onboarding-cta-create")
-            .probe_delegating("onboarding/cta/create", Role::Button, label)
+            .probe("onboarding/cta/create", Role::Button, label)
+            // Disabled: no tab stop, so Enter cannot reach what the pointer is
+            // refused (`Button` stops propagation on mouse-down while disabled,
+            // so the wrapper never arms a click either).
+            .when(!enabled, |d| d.tab_stop(false))
+            .on_click(self.on_create)
             .child(
                 Button::new("onboarding-btn-create")
                     .ghost()
                     .label(label)
                     .disabled(!enabled)
-                    .on_click(self.on_create),
+                    .tab_stop(false),
             );
 
         slide_frame(
@@ -614,16 +625,17 @@ fn cta_button(
     let label = label.into();
     div()
         .id(SharedString::from(format!("onboarding-cta-{key}")))
-        .probe_delegating(
+        .probe(
             SharedString::from(format!("onboarding/cta/{key}")),
             Role::Button,
             label.clone(),
         )
+        .on_click(on_click)
         .child(
             Button::new(SharedString::from(format!("onboarding-btn-{key}")))
                 .ghost()
                 .label(label)
-                .on_click(on_click),
+                .tab_stop(false),
         )
 }
 

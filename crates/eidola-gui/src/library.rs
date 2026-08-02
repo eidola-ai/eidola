@@ -103,7 +103,10 @@ impl LibraryView {
             renaming: None,
             focus_handle,
             scroll: UniformListScrollHandle::new(),
-            list_focus: cx.focus_handle().tab_stop(true),
+            list_focus: cx
+                .focus_handle()
+                .tab_index(crate::focus::region::MAIN)
+                .tab_stop(true),
             focused_row: 0,
             open_space_requests: 0,
             _subscriptions,
@@ -425,11 +428,19 @@ impl LibraryView {
                 .child(
                     div()
                         .id(("rename-slot", idx))
-                        .probe_delegating(
+                        .probe(
                             format!("library/row/{idx}/rename"),
                             gpui::Role::Button,
                             format!("Rename {row_label}"),
                         )
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            cx.stop_propagation();
+                            let id = rename_id.clone();
+                            let title = rename_title.clone();
+                            cx.defer_in(window, move |this, window, cx| {
+                                this.begin_rename(id, title, window, cx);
+                            });
+                        }))
                         .debug_selector(move || format!("rename-pencil-{idx}"))
                         .on_mouse_down(
                             gpui::MouseButton::Left,
@@ -448,27 +459,21 @@ impl LibraryView {
                                 // ("Aa") is the quiet text-edit affordance that
                                 // reads as "rename this title".
                                 .icon(IconName::CaseSensitive)
-                                .on_click(cx.listener(move |_, _, window, cx| {
-                                    // Don't let the click also open the row.
-                                    cx.stop_propagation();
-                                    // Defer the reshape so the in-flight click
-                                    // sequence finishes against the old layout.
-                                    let id = rename_id.clone();
-                                    let title = rename_title.clone();
-                                    cx.defer_in(window, move |this, window, cx| {
-                                        this.begin_rename(id, title, window, cx);
-                                    });
-                                })),
+                                .tab_stop(false),
                         ),
                 )
                 .child(
                     div()
                         .id(("archive-slot", idx))
-                        .probe_delegating(
+                        .probe(
                             format!("library/row/{idx}/archive"),
                             gpui::Role::Button,
                             format!("Archive {row_label}"),
                         )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.archive(archive_id.clone(), cx);
+                        }))
                         .debug_selector(move || format!("archive-x-{idx}"))
                         .on_mouse_down(
                             gpui::MouseButton::Left,
@@ -483,10 +488,7 @@ impl LibraryView {
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Close)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.archive(archive_id.clone(), cx);
-                                })),
+                                .tab_stop(false),
                         ),
                 );
         }
@@ -506,6 +508,13 @@ impl LibraryView {
             .aria_position_in_set(idx + 1)
             .aria_size_of_set(total)
             .aria_selected(is_keyboard_row)
+            // The active-descendant half of the roving pattern: the focused
+            // node is the `List` above, and this row is what AT should report
+            // as focused inside it. gpui honours it only when the focused node
+            // really is an ancestor of this one, which is exactly the shape
+            // here (`uniform_list` contributes no node, so the row's a11y
+            // parent *is* the list).
+            .when(is_keyboard_row, |d| d.aria_active_descendant())
             // The cursor's ring is drawn here rather than by `focus_visible`,
             // because the focused *element* is the list; this is the row its
             // cursor is on. It needs no modality guard — the cursor is only
@@ -668,11 +677,6 @@ impl Render for LibraryView {
         // window of rows, so frame work is O(visible), not O(loaded). The
         // list self-scrolls; the centering wrapper caps it at the prose
         // measure and keeps it centered like the unvirtualized layout.
-        // **The list is the listing's single tab stop** (see `list_focus`): it
-        // tracks the handle, so it is where Tab lands and where the
-        // roving-cursor keys are dispatched. It sits inside the wrapper's
-        // `MAIN` tab group ahead of the cursor row's verbs — ordinary stops
-        // painted inside it — so Tab reads list → Rename → Archive → out.
         let list = uniform_list(
             "library-list",
             count,
@@ -680,12 +684,6 @@ impl Render for LibraryView {
                 this.render_rows(range, window, cx)
             }),
         )
-        .track_focus(&self.list_focus)
-        .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
-            if this.handle_list_key(ev, window, cx) {
-                cx.stop_propagation();
-            }
-        }))
         .h_full()
         .w_full()
         .px_10()
@@ -712,6 +710,24 @@ impl Render for LibraryView {
                     // where the `List` parent goes.
                     .probe("library/list", gpui::Role::List, "Spaces")
                     .tab_region(crate::focus::region::MAIN)
+                    // **The listing's single tab stop lives on the element that
+                    // carries the role.** `uniform_list` cannot take one
+                    // (`InteractiveElement` but not `StatefulInteractiveElement`,
+                    // where gpui's aria builders live), so a handle tracked
+                    // there focuses a node the AccessKit tree does not contain
+                    // — `A11y::set_focus` is a no-op for a node-less element and
+                    // `TreeUpdate.focus` falls back to the window root. Tracked
+                    // here, focus lands on the `List` node and the cursor row
+                    // reports itself as its active descendant. The handle
+                    // carries `tab_index(MAIN)` because gpui reads tab order off
+                    // the *handle* once one is tracked, and the element's own
+                    // `tab_region` index only opens the group.
+                    .track_focus(&self.list_focus)
+                    .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                        if this.handle_list_key(ev, window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
                     .relative()
                     .h_full()
                     .w_full()

@@ -3319,22 +3319,33 @@ fn library_arrows_rove_the_listing_and_enter_opens_a_space(cx: &mut TestAppConte
 }
 
 /// Walk the window's whole Tab cycle and return how many distinct stops it
-/// contains. `focus_next` wraps, so a repeat ends the walk.
+/// contains. `focus_next` wraps, so a repeat ends the walk — and it is a no-op
+/// when there is nothing to reach, so an *unchanged* focus ends it too (the
+/// window's root handle is tracked but is not itself a stop, and would
+/// otherwise be miscounted as one).
 fn tab_stop_count(cx: &mut TestAppContext, window: AnyWindowHandle) -> usize {
     draw(cx, window);
+    let focused = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.focused(cx).map(|h| format!("{h:?}"))
+        })
+        .unwrap()
+    };
     let mut seen: Vec<String> = Vec::new();
+    let mut prev = focused(cx);
     for _ in 0..200 {
-        let id = cx
-            .update_window(window, |_, window, cx| {
-                window.focus_next(cx);
-                window.focused(cx).map(|h| format!("{h:?}"))
-            })
+        cx.update_window(window, |_, window, cx| window.focus_next(cx))
             .unwrap();
+        let id = focused(cx);
+        if id == prev {
+            break;
+        }
         let Some(id) = id else { break };
         if seen.contains(&id) {
             break;
         }
-        seen.push(id);
+        seen.push(id.clone());
+        prev = Some(id);
     }
     seen.len()
 }
@@ -3459,4 +3470,38 @@ fn library_cursor_clamps_when_its_row_disappears(cx: &mut TestAppContext) {
     view.read_with(cx, |v, _| {
         assert_eq!(v.open_space_requests_for_test(), 1, "Enter still opens");
     });
+}
+
+#[gpui::test]
+fn a_disabled_control_is_not_a_tab_stop(cx: &mut TestAppContext) {
+    use eidola_gui::updates::UpdatesView;
+    // The hazard the activation hoist introduces: with the handler on the
+    // probed wrapper, the widget's own disabled state no longer guards the
+    // keyboard. (A *pointer* press is still refused inside the widget, which
+    // stops propagation on mouse-down while disabled, so the wrapper never
+    // arms.) So the wrapper mirrors it: disabled means no tab stop.
+    let _guard = probes_on();
+
+    let idle = stub_stores(cx, |s| s.update_checking = false);
+    let (idle_window, _v) = open_view(cx, |window, cx| {
+        cx.new(|cx| UpdatesView::new(idle, window, cx))
+    });
+    let entries = fresh_entries(cx, idle_window);
+    assert_probe(&entries, "updates/check", gpui::Role::Button, "Check Now");
+    let idle_stops = tab_stop_count(cx, idle_window);
+
+    let busy = stub_stores(cx, |s| s.update_checking = true);
+    let (busy_window, _v) = open_view(cx, |window, cx| {
+        cx.new(|cx| UpdatesView::new(busy, window, cx))
+    });
+    let entries = fresh_entries(cx, busy_window);
+    assert_probe(&entries, "updates/check", gpui::Role::Button, "Checking…");
+    let busy_stops = tab_stop_count(cx, busy_window);
+
+    assert_eq!(
+        busy_stops,
+        idle_stops - 1,
+        "the check affordance is still announced, but leaves the tab order while \
+         it cannot be actioned"
+    );
 }

@@ -161,24 +161,16 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
 
     /// Like [`Probe::probe`], for an element that **delegates its focus**: it
     /// carries the role, the label and the bounds, and something else carries
-    /// the keyboard. Applies **no focus attributes at all**. Two cases:
+    /// the keyboard. Applies **no focus attributes at all**.
     ///
-    /// - a **wrapper** around a `gpui-component` widget that owns its own focus
-    ///   handle (`Button`, `Checkbox`) — the shrink-wrapped `div` that exists
-    ///   only because those widgets carry no a11y annotations at our pin. The
-    ///   widget inside is already a tab stop, wears its own ring, and —
-    ///   decisively — owns the `on_click` that gpui's Enter/Space activation
-    ///   invokes. gpui's keyboard click runs *only the focused element's own
-    ///   click listeners* (`div.rs`, gated on that element having any), so a
-    ///   focusable wrapper is a tab stop that can never be activated: it would
-    ///   ring, swallow a Tab, and do nothing, with the working control one Tab
-    ///   further on.
-    /// - a **row of a roving-focus list** (the Library's listing), where the
-    ///   list is the single tab stop and moves a cursor over its rows. A tab
-    ///   stop per row cannot work in a virtualized list at all: only the
-    ///   materialized window would be in the tab order.
-    ///
-    /// See [`crate::focus`] for the rule in full.
+    /// The case it exists for is a **row of a roving-focus list** (the Library
+    /// and Record listings), where the list is the single tab stop and moves a
+    /// cursor over its rows — a tab stop per row cannot work in a virtualized
+    /// list at all, since only the materialized window would be in the tab
+    /// order. What makes it *safe* there, and unsafe as a general answer, is
+    /// that the list itself carries a role, so the AccessKit tree still has a
+    /// node to report focus on. See [`crate::focus`] for the wrapper rule,
+    /// which went the other way for exactly that reason.
     fn probe_delegating(
         self,
         name: impl Into<SharedString>,

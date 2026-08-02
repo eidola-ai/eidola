@@ -194,37 +194,39 @@ impl Render for AccountView {
                                     // an honest click target.
                                     div()
                                         .id("confirm-reset-wrap")
-                                        .probe_delegating(
+                                        .probe(
                                             "settings/account/reset-confirm",
                                             gpui::Role::Button,
                                             "Reset account",
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.confirm_reset(cx)),
                                         )
                                         .child(
                                             Button::new("confirm-reset")
                                                 .danger()
                                                 .small()
                                                 .label("Reset account")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.confirm_reset(cx)
-                                                })),
+                                                .tab_stop(false),
                                         ),
                                 )
                                 .child(
                                     div()
                                         .id("cancel-reset-wrap")
-                                        .probe_delegating(
+                                        .probe(
                                             "settings/account/reset-cancel",
                                             gpui::Role::Button,
                                             "Keep account",
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.cancel_reset(cx)),
                                         )
                                         .child(
                                             Button::new("cancel-reset")
                                                 .ghost()
                                                 .small()
                                                 .label("Keep account")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.cancel_reset(cx)
-                                                })),
+                                                .tab_stop(false),
                                         ),
                                 ),
                         ),
@@ -260,19 +262,20 @@ impl Render for AccountView {
                         // the button so its bounds are an honest click target.
                         div()
                             .id("create-account-wrap")
-                            .probe_delegating(
+                            .probe(
                                 "settings/account/create",
                                 gpui::Role::Button,
                                 "Create account",
                             )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.account.update(cx, |s, cx| s.create_account(cx));
+                            }))
                             .child(
                                 Button::new("create-account")
                                     .primary()
                                     .small()
                                     .label("Create account")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.account.update(cx, |s, cx| s.create_account(cx));
-                                    })),
+                                    .tab_stop(false),
                             ),
                     ),
                 );

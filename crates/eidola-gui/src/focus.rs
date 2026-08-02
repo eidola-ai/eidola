@@ -24,31 +24,47 @@
 //!   a focus target. See [`is_tab_stop`] for why `ListItem` counts as structure
 //!   even though plenty of our list rows are clickable.
 //!
-//! **An element that delegates its focus is never a focus target.**
-//! Role-derivation classifies the *role*, but many of our probes annotate
-//! something that is not itself the control: a shrink-wrapped `div` around a
-//! `gpui-component` widget (which carries no a11y annotations at our pin), or a
-//! row of a roving-focus list whose container owns the keyboard. That
-//! distinction is not cosmetic: **gpui's Enter/Space activation invokes only
-//! the focused element's own click listeners** (`div.rs` registers the whole
-//! keyboard-click block only when that element has some), so a focusable
-//! wrapper is a tab stop that can never be activated — it rings, swallows a
-//! Tab, and does nothing, with the real control one Tab further on. (VoiceOver
-//! is unaffected: `Window::handle_a11y_action`'s `Action::Click` fallback
-//! synthesizes a mouse press at the node's centre, which hit-tests through to
-//! the widget. So the failure is exactly Tab+Enter, not AT activation.) Those
-//! elements use [`crate::probe::Probe::probe_delegating`], and for a wrapper
-//! the shape depends on what is inside:
+//! **A probed wrapper around a `gpui-component` widget is the control** — it
+//! carries the role, the label, the focus handle, the ring *and* the
+//! activation, and the widget inside is taken out of the tab order
+//! (`.tab_stop(false)`). Two gpui facts force that shape, and they pull in
+//! opposite directions:
 //!
-//! - **`Button` / `Checkbox`** track a focus handle with `tab_stop(true)`, draw
-//!   their own ring, and own the `on_click`. `probe_delegating` applies no focus
-//!   attributes at all and Tab lands on the widget, which activates.
+//! 1. **Enter/Space runs only the focused element's own click listeners**
+//!    (`div.rs` registers the whole keyboard-click block only when that element
+//!    has some). A focusable wrapper with no handler is a tab stop that can
+//!    never be activated.
+//! 2. **A focused element with no a11y node reports no focus at all.**
+//!    `A11y::set_focus` is a no-op unless the node was pushed (which needs a
+//!    role), and `finalize` then falls back to `ROOT_NODE_ID` — so focusing the
+//!    inner widget, which carries no role at our pin, tells assistive
+//!    technology that focus is on the *window*.
+//!
+//! Letting the widget keep the tab stop satisfies (1) and violates (2);
+//! wrapping without hoisting does the reverse. Hoisting satisfies both, and its
+//! feared cost turned out not to exist: `Button::clickable()` gates only a
+//! `stop_propagation` guard, never any styling, so a `Button` with no
+//! `on_click` still hovers, presses and disables exactly as before. The mouse
+//! path stays single-fire because the widget no longer stops propagation, so
+//! the click bubbles to the wrapper's one handler. (VoiceOver was never
+//! affected either way: `Window::handle_a11y_action`'s `Action::Click` fallback
+//! synthesizes a mouse press at the node's centre, which hit-tests through.)
+//!
+//! **The hazard hoisting introduces is `disabled`**, and it is the one thing a
+//! call site must remember: the widget's disabled state no longer guards the
+//! keyboard, so a wrapper around a dynamically-disabled control adds
+//! `.tab_stop(false)` while it is disabled. (The *pointer* is still refused
+//! inside the widget, which stops propagation on mouse-down when disabled, so
+//! the wrapper never arms a click.) Pinned by
+//! `a_disabled_control_is_not_a_tab_stop`.
+//!
+//! Two exceptions:
+//!
 //! - **`Switch`** tracks no focus handle at all, so there is nothing inside to
-//!   reach. Those wrappers keep the ordinary `probe` (they *are* the tab stop
-//!   and wear the ring) and **hoist the activation** — an `on_click` on the
-//!   wrapper. It cannot double-fire on a pointer click, because `Switch`
-//!   handles the press in `on_mouse_down` and stops propagation, and gpui
-//!   bubbles mouse listeners innermost-first.
+//!   take out of the tab order; the hoist is the whole fix. It cannot
+//!   double-fire on a pointer click, because `Switch` handles the press in
+//!   `on_mouse_down` and stops propagation, and gpui bubbles mouse listeners
+//!   innermost-first.
 //! - **`Input` / `MarkdownEditor`** is the model's one remaining hole, which is
 //!   why **`Role::TextInput` is excluded from [`is_focusable`] outright**: a
 //!   tab stop on the wrapper would land focus on a div that cannot type, mere
@@ -60,6 +76,10 @@
 //!   that matters and it is covered by design rather than by Tab: a space opens
 //!   with it focused, and task 38 routes any printable character to it from
 //!   anywhere in the window.
+//!
+//! Fact (2) also governs [`crate::probe::Probe::probe_delegating`], which
+//! survives for one case: a **row of a roving-focus list**, where the list
+//! carries the role *and* the handle, so there is a node to report focus on.
 //!
 //! **The ring is `:focus-visible`, and gpui owns the condition.** `Window`
 //! tracks the last input modality (`KeyDown` → keyboard, `MouseDown` /

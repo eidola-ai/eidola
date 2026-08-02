@@ -17,6 +17,7 @@ use eidola_app_core::updates::{ClaimsComparison, UpdateCheckResult, VerifiedRele
 use gpui::{
     Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
     ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
+    prelude::FluentBuilder as _,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Sizable, StyledExt,
@@ -229,13 +230,19 @@ impl Render for UpdatesView {
                 // honest click target.
                 div()
                     .id("check-now-wrap")
-                    .probe_delegating("updates/check", gpui::Role::Button, check_label)
+                    .probe("updates/check", gpui::Role::Button, check_label)
+                    // Disabled: no tab stop, so Enter cannot reach an action
+                    // the pointer is refused. (A pointer press is already
+                    // refused inside `Button`, which stops propagation on
+                    // mouse-down while disabled, so the wrapper never arms.)
+                    .when(checking, |d| d.tab_stop(false))
+                    .on_click(cx.listener(|this, _, _, cx| this.check_now(cx)))
                     .child(
                         Button::new("check-now")
                             .label(check_label)
                             .small()
                             .disabled(checking)
-                            .on_click(cx.listener(|this, _, _, cx| this.check_now(cx))),
+                            .tab_stop(false),
                     ),
             )
             .child(div().flex_1())
@@ -411,12 +418,13 @@ fn render_update_available(
         // its bounds are an honest click target.
         div()
             .id("open-release-wrap")
-            .probe_delegating("updates/view-release", gpui::Role::Button, "View Release…")
+            .probe("updates/view-release", gpui::Role::Button, "View Release…")
+            .on_click(cx.listener(|this, _, _, cx| this.open_release_page(cx)))
             .child(
                 Button::new("open-release")
                     .primary()
                     .label("View Release…")
-                    .on_click(cx.listener(|this, _, _, cx| this.open_release_page(cx))),
+                    .tab_stop(false),
             ),
     )
 }
@@ -555,17 +563,18 @@ fn render_claims_changed(
                 // button so its bounds are an honest click target.
                 div()
                     .id("treat-as-update-wrap")
-                    .probe_delegating(
+                    .probe(
                         "updates/accept-claims",
                         gpui::Role::Button,
                         "Treat as Update",
                     )
+                    .on_click(cx.listener(|this, _, _, cx| this.accept_claims(cx)))
                     .child(
                         Button::new("treat-as-update")
                             .outline()
                             .label("Treat as Update")
                             .small()
-                            .on_click(cx.listener(|this, _, _, cx| this.accept_claims(cx))),
+                            .tab_stop(false),
                     ),
             ),
         )
