@@ -159,10 +159,19 @@ impl Render for WalletView {
                         gpui::Role::Button,
                         "Recover in-flight",
                     )
-                    .when(busy, |d| d.tab_stop(false))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.recover_all(window, cx);
-                    }))
+                    // One predicate decides both the tab stop and the
+                    // activation — see `updates.rs`'s check affordance for why
+                    // `tab_stop(false)` alone leaves a focused wrapper able to
+                    // re-invoke an in-flight recovery on a second Enter.
+                    .map(|d| {
+                        if busy {
+                            d.tab_stop(false)
+                        } else {
+                            d.on_click(cx.listener(|this, _, window, cx| {
+                                this.recover_all(window, cx);
+                            }))
+                        }
+                    })
                     .child(
                         Button::new("recover-all")
                             .small()

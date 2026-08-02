@@ -13,7 +13,8 @@
 use gpui::{
     Animation, AnimationExt, AnyElement, Context, Hsla, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, WeakEntity, Window, div, point, px,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, point,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
@@ -571,6 +572,25 @@ impl SpaceView {
                             self.node_label(sib, cx),
                         )
                         .aria_selected(is_active)
+                        // **A faded-out strip contributes no tab stops.** The
+                        // cell's press handler is attached only while the map is
+                        // up (below), so an invisible column is a `Role::Button`
+                        // with no listener of its own — which the role-derived
+                        // focus model would still make a stop, and gpui's
+                        // Enter/Space runs only the focused element's *own*
+                        // click listeners, so Tab would walk N dead stops at the
+                        // end of every space window's order. Tab-stopness
+                        // therefore shares the predicate that decides
+                        // activation, exactly as a disabled control's does
+                        // (`crate::focus`). It is still annotated at rest, so
+                        // the map stays readable to assistive technology — and
+                        // VoiceOver activation is unaffected either way, since
+                        // `Action::Click` synthesizes a press rather than
+                        // invoking listeners. Giving the cells a *real*
+                        // keyboard activation is the recorded follow-up
+                        // (task 12); the arrow keys over the post tree are the
+                        // conversation's navigation surface today.
+                        .when(!interactive, |d| d.tab_stop(false))
                         .flex_1()
                         .h_full()
                         .child(cell);

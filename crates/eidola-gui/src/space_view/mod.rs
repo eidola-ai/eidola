@@ -984,6 +984,12 @@ impl SpaceView {
 
     /// Whether the minimap is currently shown (tests assert scroll reveals it).
     #[doc(hidden)]
+    pub fn set_minimap_visible_for_test(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.minimap_visible = visible;
+        cx.notify();
+    }
+
+    #[doc(hidden)]
     pub fn minimap_visible_for_test(&self) -> bool {
         self.minimap_visible
     }

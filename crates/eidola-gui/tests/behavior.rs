@@ -1580,7 +1580,7 @@ fn record_section_switching(cx: &mut TestAppContext) {
 #[gpui::test]
 fn record_detail_open_and_close(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
-    let (_window, view) = open_view(cx, |window, cx| {
+    let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| RecordView::new(stores.clone(), window, cx))
     });
 
@@ -1615,7 +1615,10 @@ fn record_detail_open_and_close(cx: &mut TestAppContext) {
     });
 
     // Back returns to the listing; switching sections also closes detail.
-    view.update(cx, |v, cx| v.close_detail(cx));
+    cx.update_window(window, |_, win, cx| {
+        view.update(cx, |v, cx| v.close_detail(win, cx));
+    })
+    .unwrap();
     view.read_with(cx, |v, _| assert!(v.detail().is_none()));
 }
 
@@ -8980,4 +8983,135 @@ fn space_composer_resize_handle_adjusts_with_the_arrows(cx: &mut TestAppContext)
     }
     let floored = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
     assert!(floored >= 0.1 - 1e-4, "and at its floor: {floored}");
+}
+
+#[gpui::test]
+fn record_closing_a_detail_returns_focus_to_the_listing(cx: &mut TestAppContext) {
+    // Opening a detail replaces the listing, so the element tracking the
+    // section's `list_focus` unmounts while the window's focus still names that
+    // handle — a dead handle: the dispatch tree has no node for it, so the
+    // roving keys reach nothing and `focus_next` restarts the walk from the top
+    // of the window. Backing out hands focus back to the listing.
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Requests, cx);
+        v.set_requests_for_test(vec![stub_request("req-1", 1_000)], false);
+    });
+    draw_frame(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.focus_listing_for_test(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, _| v.listing_is_focused_for_test(window))
+        })
+        .unwrap()
+    );
+
+    // Open a detail — the listing (and its handle's element) unmounts — and
+    // then Tab, which is what a keyboard reader does to reach Back. Focus is
+    // now on a detail affordance that the very next press unmounts.
+    view.update(cx, |v, cx| v.open_request("req-1".into(), cx));
+    draw_frame(cx, window);
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    assert!(
+        !cx.update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, _| v.listing_is_focused_for_test(window))
+        })
+        .unwrap(),
+        "the listing does not hold focus while its detail is open"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.close_detail(window, cx));
+    })
+    .unwrap();
+    draw_frame(cx, window);
+    assert!(
+        cx.update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, _| v.listing_is_focused_for_test(window))
+        })
+        .unwrap(),
+        "backing out puts the keyboard back on the listing it returns to"
+    );
+}
+
+#[gpui::test]
+fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAppContext) {
+    // The key handler yielded to the context and band menus but not the
+    // highlight picker, so with a picker open every arrow, Escape and printable
+    // character fell through to the conversation behind it — and a printable
+    // character *starts a draft*, which is a keystroke landing somewhere the
+    // reader cannot see. One predicate now answers "is an overlay open" for
+    // both the handler and the focus observation.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let a1 = fixture_post_with_block("a1", "b1", "the quick brown fox jumps");
+    let mut a2 = fixture_assistant_post("a2", "first responder");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", "second responder");
+    a3.parent_action_id = Some("a1".into());
+    seed_quotable_space(&view, window, cx, vec![a1, a2, a3]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    // Leave nothing composing, so a stray printable would be visible as a jump.
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    let incoming = |action: &str, lo: i64, hi: i64| eidola_app_core::IncomingReference {
+        action_id: action.into(),
+        space_id: "s".into(),
+        ordinal: 1,
+        content_block_id: Some("b1".into()),
+        range_start: Some(lo),
+        range_end: Some(hi),
+        annotation: None,
+        created_at: 0,
+    };
+    vcx.update(|_, cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![incoming("a2", 4, 15), incoming("a3", 10, 19)],
+            );
+        });
+    });
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test("a1", &[0, 1], window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.highlight_picker_for_test().is_some(),
+            "the picker is open"
+        );
+    });
+
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "a printable character behind an open picker must not start a draft"
+        );
+        assert!(
+            v.highlight_picker_for_test().is_some(),
+            "…and the picker is still the thing that owns the keyboard"
+        );
+        assert_eq!(
+            v.tree_focus_for_test(),
+            None,
+            "nor does an overlay move tree focus"
+        );
+    });
 }
