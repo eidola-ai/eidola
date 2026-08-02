@@ -423,6 +423,30 @@ impl LocalRuntime {
         Ok(Some(victims))
     }
 
+    /// Run `f` — the engine spawn — only if no quit-time shutdown has begun,
+    /// **atomically with respect to the drain**.
+    ///
+    /// The latch on [`Self::reserve_engine`] closes the window between a load's
+    /// last `await` and its reservation; this closes the one *after* it. A
+    /// reservation accepted a moment before the latch flipped hands its
+    /// supervisor to `tokio::spawn`, and that task's first poll can land after
+    /// the drain has already walked an empty-of-it registry — at which point an
+    /// unconditional `command.spawn()` starts a subprocess into a process about
+    /// to `exit()`. Same class, same cure: the authority is read at the write
+    /// point, under the same lock the drain takes, so no interleaving can put a
+    /// spawn after the latch.
+    ///
+    /// Holding the `engines` lock across the spawn is safe and deliberate:
+    /// `Command::spawn` is synchronous (no `await` under the guard) and touches
+    /// nothing in this map.
+    fn spawn_unless_shutting_down<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        let _engines = self.engines.lock().expect("engines lock");
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(f())
+    }
+
     /// The total memory the engine pool may occupy: a fixed fraction of
     /// physical RAM (leaving headroom for the app and the OS), or the test
     /// override. The estimate errs permissive — a genuinely-too-big load
@@ -1779,7 +1803,15 @@ async fn supervise_engine(
         }
     };
 
-    let mut child = match command.spawn() {
+    // A quit may have landed between our reservation and this task's first
+    // poll; starting a subprocess now would orphan it to the imminent
+    // `exit()`. Checked under the drain's own lock — see
+    // `LocalRuntime::spawn_unless_shutting_down`.
+    let Some(spawned) = local.spawn_unless_shutting_down(|| command.spawn()) else {
+        let _ = ready_tx.send(Err("Eidola is shutting down".into()));
+        return;
+    };
+    let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
             let message = format!("failed to start llama-server: {e}");
@@ -2148,6 +2180,29 @@ mod tests {
         assert!(
             !runtime.engine_present(&key),
             "a refused reservation leaves nothing to spawn against"
+        );
+    }
+
+    #[test]
+    fn the_shutdown_latch_also_refuses_a_spawn_that_was_already_reserved() {
+        // The latch on `reserve_engine` closes the window before a
+        // reservation; this closes the one after it. A supervisor whose
+        // reservation was accepted a moment before the quit lands can have
+        // its first poll scheduled *after* the drain walked the registry —
+        // and an unconditional `command.spawn()` there starts a subprocess
+        // into a process about to `exit()`.
+        let runtime = LocalRuntime::default();
+        assert_eq!(
+            runtime.spawn_unless_shutting_down(|| "spawned"),
+            Some("spawned"),
+            "an ordinary load spawns"
+        );
+
+        runtime.shutting_down.store(true, Ordering::SeqCst);
+        assert_eq!(
+            runtime.spawn_unless_shutting_down(|| "spawned"),
+            None,
+            "once the drain has run, nothing may start a child"
         );
     }
 

@@ -32,6 +32,7 @@ pub mod update;
 pub mod wallet;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eidola_app_core::AppCore;
 use eidola_app_core::changes::Change;
@@ -240,9 +241,15 @@ pub struct StoresStub {
 /// dropped change.
 ///
 /// No-op when there is no backend (stub mode).
-pub fn install_bus_bridge(stores: &Stores, cx: &mut App) {
+///
+/// Returns a [`BusBridge`] handle so the quit path can **stop the dispatch
+/// loop** before anything else — see [`BusBridge::quiesce`].
+pub fn install_bus_bridge(stores: &Stores, cx: &mut App) -> BusBridge {
+    let bridge = BusBridge {
+        quiesced: Arc::new(AtomicBool::new(false)),
+    };
     let Some(app_core) = stores.app_core.clone() else {
-        return;
+        return bridge;
     };
 
     // The tokio side: a broadcast receiver feeding a gpui-side mpsc. The
@@ -274,8 +281,17 @@ pub fn install_bus_bridge(stores: &Stores, cx: &mut App) {
     // the no-detach rule (see `crates/eidola-gui/STATE.md` principle 3 and the
     // stores module docs). Every other task in the app is owned by an entity
     // field with replace-cancels semantics.
+    let quiesced = bridge.quiesced.clone();
     let task: gpui::Task<()> = cx.spawn(async move |cx: &mut AsyncApp| {
         while let Some(event) = rx.recv().await {
+            // The quit gate. Checked on this side — the *receiver* — because
+            // this is the single place every `Change` in the process enters
+            // gpui, and therefore the only place where "no dispatch after
+            // quit begins" can be stated once instead of re-proved for each
+            // emitter (see [`BusBridge::quiesce`]).
+            if quiesced.load(Ordering::SeqCst) {
+                break;
+            }
             // `AsyncApp::update` here yields `()` (the dispatch returns unit);
             // ignore via a statement-position call so the loop keeps draining.
             cx.update(|cx| match event {
@@ -285,6 +301,44 @@ pub fn install_bus_bridge(stores: &Stores, cx: &mut App) {
         }
     });
     task.detach();
+    bridge
+}
+
+/// Handle to the app-lifetime bus bridge, held so the quit path can stop it.
+///
+/// **Why the seam is here and not on each emitter.** A `Change` dispatched
+/// after `App::shutdown` has set `quitting` reaches a store's `refresh` →
+/// `cx.spawn` → gpui's "Can't spawn on main thread after on_app_quit" panic.
+/// Silencing the engine drain fixed one emitter; silencing the engine
+/// supervisors fixed a second; an in-flight model *download* reporting
+/// progress during the quit's grace window would have been a third, and every
+/// future emitter a fresh one. The bridge is the one door all of them come
+/// through, so closing it is the cure for the class rather than for its
+/// current members.
+///
+/// **Layering.** This handle is the GUI's protection and covers *every*
+/// emitter, present and future. app-core keeps its own latch-gating of the
+/// quit-time drain and supervisor arms for a different reason and a different
+/// consumer: the CLI embeds `AppCore` with no gpui at all, and the bus is a
+/// documented contract there (`tests/bus.rs` enumerates every exit point's
+/// emissions) — a teardown nobody is expected to observe should not announce
+/// itself on it. Neither layer relies on the other.
+#[derive(Clone)]
+pub struct BusBridge {
+    quiesced: Arc<AtomicBool>,
+}
+
+impl BusBridge {
+    /// Stop dispatching invalidations into gpui. One-way, and safe to call
+    /// when no bridge was installed (stub mode).
+    pub fn quiesce(&self) {
+        self.quiesced.store(true, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn is_quiesced(&self) -> bool {
+        self.quiesced.load(Ordering::SeqCst)
+    }
 }
 
 enum BridgeEvent {

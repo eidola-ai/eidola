@@ -2684,6 +2684,7 @@ dependencies = [
  "clap",
  "eidola-app-core",
  "open",
+ "rustix 1.1.4",
  "tempfile",
  "tokio",
 ]

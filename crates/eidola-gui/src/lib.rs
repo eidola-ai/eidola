@@ -137,7 +137,7 @@ pub fn run_with(opts: LaunchOptions) {
         // stores (the only place tokio receivers touch gpui). Install it
         // before the startup refreshes so nothing committed during them is
         // missed.
-        stores::install_bus_bridge(&stores, cx);
+        let bus_bridge = stores::install_bus_bridge(&stores, cx);
 
         // Point the Circadian theme at the persisted settings (day/night
         // axis + time-of-day tint), re-applying on config changes and on
@@ -183,7 +183,7 @@ pub fn run_with(opts: LaunchOptions) {
         // Quit is a full shutdown — engines, everything (decided). On macOS
         // this hook is the only thing that delivers it; see
         // `lifecycle::install_engine_shutdown`.
-        lifecycle::install_engine_shutdown(&stores, cx);
+        lifecycle::install_engine_shutdown(&stores, bus_bridge, cx);
 
         // Order matters: `cx.set_menus` snapshots the keymap when it builds
         // NSMenuItems and attaches each item's `keyEquivalent` from

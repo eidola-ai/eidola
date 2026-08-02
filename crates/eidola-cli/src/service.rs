@@ -176,7 +176,7 @@ pub fn resolve_exec(explicit: Option<String>) -> Result<String, AppError> {
         && let Some(dir) = me.parent()
     {
         let sibling = dir.join("eidola-gui");
-        if sibling.is_file() {
+        if is_usable_exec(&sibling) {
             return absolute_existing_exec(&sibling);
         }
     }
@@ -233,26 +233,29 @@ fn absolute_existing_exec(path: &Path) -> Result<String, AppError> {
     Ok(absolute.to_string_lossy().into_owned())
 }
 
-/// Whether the file at `path` can be executed.
+/// Whether the file at `path` can be executed **by the user installing it**.
 ///
 /// Existing is not enough: systemd rejects a mode-644 file outright
 /// (`Command … is not executable: Permission denied`, verified with
 /// `systemd-analyze verify`), so a unit naming one can never start. Checking
-/// the bits here keeps the refusal at the same before-any-write seam as the
+/// here keeps the refusal at the same before-any-write seam as the
 /// missing-file case.
 ///
-/// The mode test is any-of-`u+x`/`g+x`/`o+x` rather than "executable *by me*":
-/// the unit runs as this user, so `u+x` is what matters in practice, but a
-/// binary shipped mode 555 or 775 is perfectly startable and refusing it would
-/// be the wrong kind of strict. Off unix there are no mode bits and no systemd
-/// either — `service` is Linux-only and its callers are refused earlier by the
-/// `systemctl` preflight — so existence is the honest answer there.
+/// **The question is "can *I* run this", not "is any execute bit set".** A
+/// mode-`010` root-owned binary has an execute bit and this user still cannot
+/// run it; the unit runs as this user, so a bitmask test would accept a path
+/// that can only ever fail at `systemctl start`. `faccessat(…, X_OK,
+/// AT_EACCESS)` asks the kernel the real question against our **effective**
+/// uid/gid — including the supplementary groups a mode-`010` file actually
+/// turns on, which no hand-rolled owner/group comparison gets right.
+///
+/// Off unix there are no mode bits and no systemd either — `service` is
+/// Linux-only and its callers are refused earlier by the `systemctl`
+/// preflight — so existence is the honest answer there.
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    use rustix::fs::{Access, AtFlags, CWD, accessat};
+    accessat(CWD, path, Access::EXEC_OK, AtFlags::EACCESS).is_ok()
 }
 
 #[cfg(not(unix))]
@@ -260,11 +263,35 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
+/// The one predicate for "this path is a usable engine binary".
+///
+/// Discovery and install validation **must** agree: a discovery filter that
+/// merely checked `is_file` would hand `resolve_exec` a path its own gate then
+/// refuses, turning "you have `eidola-gui` on PATH" into a hard error. Sharing
+/// the predicate makes that disagreement unrepresentable.
+fn is_usable_exec(path: &Path) -> bool {
+    path.is_file() && is_executable(path)
+}
+
 fn which_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
+    first_usable(std::env::split_paths(&path), name)
+}
+
+/// The first directory in `dirs` holding a usable `name`.
+///
+/// **It continues past unusable candidates rather than stopping at the first
+/// hit.** A stale non-executable `eidola-gui` earlier on `PATH` — a
+/// half-extracted download, a `chmod`-less copy, a leftover wrapper — would
+/// otherwise mask a perfectly good install further along, and `which`'s own
+/// semantics are "first *runnable* match" for exactly this reason. The
+/// predicate is the same one `resolve_exec` validates with, so discovery can
+/// never hand it something it then refuses.
+///
+/// Takes the directories as an iterator so it is testable without mutating the
+/// process-global `PATH` (these tests run in parallel).
+fn first_usable(dirs: impl Iterator<Item = PathBuf>, name: &str) -> Option<PathBuf> {
+    dirs.map(|dir| dir.join(name)).find(|c| is_usable_exec(c))
 }
 
 /// Run `systemctl --user <args>`, passing its output through.
@@ -571,6 +598,67 @@ mod tests {
         // the mode bits and not the path.
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         resolve_exec(Some(exe.to_string_lossy().into_owned())).expect("now executable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_walks_past_an_unusable_candidate_to_a_working_one() {
+        // A stale non-executable `eidola-gui` earlier on PATH — a
+        // half-extracted download, a `chmod`-less copy — must not mask a good
+        // install further along. `which`'s own semantics are "first
+        // *runnable* match", and the predicate here is the same one
+        // `resolve_exec` validates with, so discovery can never hand it
+        // something it then refuses.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        // Present but mode 644 — exactly what systemd would refuse.
+        std::fs::write(first.join("eidola-gui"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            first.join("eidola-gui"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        write_executable(&second.join("eidola-gui"));
+
+        let found = first_usable([first.clone(), second.clone()].into_iter(), "eidola-gui")
+            .expect("the second directory holds a runnable one");
+        assert_eq!(found, second.join("eidola-gui"));
+
+        // And with nothing runnable anywhere, discovery reports nothing
+        // rather than the unusable candidate.
+        assert!(first_usable([first].into_iter(), "eidola-gui").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executability_is_asked_of_this_user_not_of_the_mode_bits() {
+        // A mode-`010` file has an execute bit set and this user still cannot
+        // run it, so a `mode & 0o111` mask would accept a path that can only
+        // ever fail at `systemctl start`. (Skipped when running as root,
+        // which bypasses the permission check by design.)
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exe = tmp.path().join("eidola-gui");
+        std::fs::write(&exe, b"#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o010)).expect("chmod");
+
+        assert_ne!(
+            std::fs::metadata(&exe).unwrap().permissions().mode() & 0o111,
+            0,
+            "precondition: a bitmask test would call this executable"
+        );
+        assert!(
+            !is_executable(&exe),
+            "but this user cannot run it, which is the question that matters"
+        );
     }
 
     #[test]
