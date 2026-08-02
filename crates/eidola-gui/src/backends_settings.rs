@@ -1191,7 +1191,13 @@ impl BackendsSettingsView {
                 gpui::Role::CheckBox,
                 "Start an engine automatically on request",
             )
-            .aria_selected(auto_start)
+            // A checkbox's state is `toggled`, not `selected`:
+            // `accesskit_macos` reads `accessibilityValue` from `toggled()`
+            // first and only falls through to `is_selected()` for `Role::Tab`,
+            // so a `CheckBox` carrying only `aria_selected` reports **no
+            // value at all** — VoiceOver announces the control and not whether
+            // it is on.
+            .aria_toggled(auto_start.into())
             // The wrapper owns the **keyboard** activation. Unlike `Button` /
             // `Checkbox`, `gpui_component::Switch` tracks no focus handle at
             // our pin, so there is nothing inside for Tab to reach — see
@@ -1303,7 +1309,9 @@ impl BackendsSettingsView {
                                     gpui::Role::CheckBox,
                                     "Start an engine automatically on request",
                                 )
-                                .aria_selected(form.auto_start)
+                                // See `autostart_row`: a checkbox's state is
+                                // `toggled`, which is what the adapter reads.
+                                .aria_toggled(form.auto_start.into())
                                 // The wrapper owns the keyboard activation —
                                 // see `autostart_row` for why.
                                 .on_click(

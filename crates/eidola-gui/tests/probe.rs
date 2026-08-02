@@ -3505,3 +3505,129 @@ fn a_disabled_control_is_not_a_tab_stop(cx: &mut TestAppContext) {
          it cannot be actioned"
     );
 }
+
+#[gpui::test]
+fn library_cursor_yields_to_a_verb_it_tabs_into(cx: &mut TestAppContext) {
+    // Two questions, two predicates. Tab from the listing into the cursor row's
+    // Rename verb makes the *verb* the focused element — it paints its own ring
+    // — so the row must stop claiming the cursor, or one focus is indicated
+    // twice and AT is told a row is focused while a button inside it really is.
+    // The verbs must nevertheless stay revealed: they are what the Tab reached.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            space_info("s1", Some("Tides and the moon")),
+            space_info("s2", Some("Borrow checker")),
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert!(entries.iter().any(|(n, _)| n == "library/row/0/rename"));
+    let (cursor, revealed) = cx
+        .update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, cx| v.cursor_and_reveal_for_test(window, cx))
+        })
+        .unwrap();
+    assert_eq!(
+        (cursor, revealed),
+        (Some(0), Some(0)),
+        "the listing itself holds focus: it is both the cursor and the reveal"
+    );
+
+    // Tab on to the row's Rename verb.
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    let entries = fresh_entries(cx, window);
+    let (cursor, revealed) = cx
+        .update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, cx| v.cursor_and_reveal_for_test(window, cx))
+        })
+        .unwrap();
+    assert_eq!(cursor, None, "the verb owns the focus indication now");
+    assert_eq!(revealed, Some(0), "…and its row keeps showing the verbs");
+    assert!(
+        entries.iter().any(|(n, _)| n == "library/row/0/archive"),
+        "including the one Tab has not reached yet"
+    );
+}
+
+#[gpui::test]
+fn a_faded_minimap_contributes_no_tab_stops(cx: &mut TestAppContext) {
+    // The minimap's cells take their press handler only while the strip is up
+    // (a faded 36px strip must contain nothing), so at rest each is a
+    // `Role::Button` with no click listener of its own — and gpui's Enter/Space
+    // runs only the focused element's own listeners. Left as stops they were N
+    // dead ones at the end of every space window's tab order.
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![
+                    probe_post("a1", "the root post"),
+                    probe_post("a2", "the reply"),
+                ],
+                cx,
+            )
+        });
+    });
+
+    let entries = fresh_entries(cx, window);
+    let cells = entries
+        .iter()
+        .filter(|(n, _)| n.starts_with("space/minimap/cell/"))
+        .count();
+    assert!(cells > 0, "the fixture really does render minimap cells");
+    let faded = tab_stop_count(cx, window);
+
+    view.update(cx, |v, cx| v.set_minimap_visible_for_test(true, cx));
+    let live = tab_stop_count(cx, window);
+
+    assert_eq!(
+        faded + cells,
+        live,
+        "every cell is a stop while the map is up and none while it is faded"
+    );
+}
+
+#[gpui::test]
+fn record_spend_group_header_is_a_readable_node(cx: &mut TestAppContext) {
+    // The roving cursor walks display rows, and a spending group header is one
+    // of them — navigable, not activatable. `aria_active_descendant` resolves
+    // through the a11y *node* tree, and gpui pushes a node only for an element
+    // carrying a role, so without one the pointer at a header is silently
+    // dropped. `Label` gives it a node and keeps it out of the tab order.
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Spending, cx);
+        v.set_spending_for_test(vec![stub_spend("req-1")], false);
+    });
+
+    let entries = fresh_entries(cx, window);
+    let (_, header) = entries
+        .iter()
+        .find(|(n, _)| n == "record/spend/header/0")
+        .expect("the group header carries an a11y node");
+    assert_eq!(header.role, gpui::Role::Label);
+    assert!(
+        header.label.contains("credential"),
+        "and reads as what it captions: {:?}",
+        header.label
+    );
+}

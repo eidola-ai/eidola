@@ -264,7 +264,7 @@ impl SpaceView {
         }
         // Transient overlays speak before the tree does; the context menu's
         // Escape ownership is the view root's and is untouched by this.
-        if self.context_menu.is_some() || self.band_menu.is_some() {
+        if self.transient_overlay_open() {
             return false;
         }
 
@@ -294,6 +294,20 @@ impl SpaceView {
                 }
             }
         }
+    }
+
+    /// Whether a transient overlay currently owns the keyboard — **the one
+    /// definition**, read by both the key handler and the focus observation.
+    ///
+    /// The two had drifted: the handler yielded for the context and band menus
+    /// but not the highlight picker, so with a picker open every arrow, Escape
+    /// and printable character fell through to the conversation behind it — and
+    /// a printable character *starts a draft*, which is a keystroke landing
+    /// somewhere the reader cannot see. Sharing the predicate is what keeps the
+    /// two from disagreeing about who owns the keyboard, which is the property
+    /// [`Self::sync_tree_focus`]'s park-and-restore already depended on.
+    pub(crate) fn transient_overlay_open(&self) -> bool {
+        self.context_menu.is_some() || self.band_menu.is_some() || self.highlight_picker.is_some()
     }
 
     /// Move tree focus. With no focus yet, an arrow *enters* the conversation
@@ -643,9 +657,7 @@ impl SpaceView {
     /// place rather than a restore-call on each of the overlay-close paths
     /// (there are eight).
     pub(crate) fn sync_tree_focus(&mut self, window: &mut Window, cx: &mut App) {
-        let overlay = self.context_menu.is_some()
-            || self.band_menu.is_some()
-            || self.highlight_picker.is_some();
+        let overlay = self.transient_overlay_open();
         let borrowed = std::mem::replace(&mut self.overlay_held_focus, overlay);
         if overlay {
             return;

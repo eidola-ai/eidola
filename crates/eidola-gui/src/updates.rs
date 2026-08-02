@@ -231,12 +231,22 @@ impl Render for UpdatesView {
                 div()
                     .id("check-now-wrap")
                     .probe("updates/check", gpui::Role::Button, check_label)
-                    // Disabled: no tab stop, so Enter cannot reach an action
-                    // the pointer is refused. (A pointer press is already
-                    // refused inside `Button`, which stops propagation on
-                    // mouse-down while disabled, so the wrapper never arms.)
-                    .when(checking, |d| d.tab_stop(false))
-                    .on_click(cx.listener(|this, _, _, cx| this.check_now(cx)))
+                    // **One predicate decides both** whether the wrapper is a
+                    // tab stop and whether it carries the activation.
+                    // `tab_stop(false)` alone only removes it from the *Tab
+                    // order*; a wrapper already focused when the control
+                    // disables itself keeps its `on_click`, so a second Enter
+                    // re-invokes the action that is still running. (The pointer
+                    // is refused inside `Button`, which stops propagation on
+                    // mouse-down while disabled, so the wrapper never arms a
+                    // click either way.)
+                    .map(|d| {
+                        if checking {
+                            d.tab_stop(false)
+                        } else {
+                            d.on_click(cx.listener(|this, _, _, cx| this.check_now(cx)))
+                        }
+                    })
                     .child(
                         Button::new("check-now")
                             .label(check_label)

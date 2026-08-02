@@ -33,6 +33,32 @@ use crate::stores::{SpacesStore, Stores};
 
 actions!(library, [CancelRename]);
 
+/// Where the roving cursor stands this frame, resolved once per rendered
+/// window of rows — see [`LibraryView::cursor_and_reveal`] for the two
+/// predicates, and why the ring takes a third.
+#[derive(Clone, Copy)]
+struct RowFocus {
+    /// The row that *is* the cursor: ring identity and a11y focus.
+    cursor: Option<usize>,
+    /// The row that *draws* the ring — the cursor under keyboard modality.
+    ring: Option<usize>,
+    /// The row whose hover-gated verbs are revealed.
+    revealed: Option<usize>,
+}
+
+impl RowFocus {
+    fn resolve(view: &LibraryView, window: &Window, cx: &App) -> Self {
+        let (cursor, revealed) = view.cursor_and_reveal(window, cx);
+        Self {
+            cursor,
+            // A *programmatic* focus must not paint a keyboard cursor for a
+            // pointer user.
+            ring: cursor.filter(|_| window.last_input_was_keyboard()),
+            revealed,
+        }
+    }
+}
+
 /// Vertical reserve at the top of the window — under the macOS traffic
 /// lights, or hosting the Linux CSD window controls + drag strip (same
 /// pattern as `space_view::TITLE_BAR_RESERVE`; the window uses the shared
@@ -212,6 +238,41 @@ impl LibraryView {
         cx.notify();
     }
 
+    /// **Two questions, two predicates** — `(cursor, revealed)`, and the row
+    /// render reads exactly this pair, so the rule has one statement.
+    ///
+    /// The *cursor* — the ring and the row's focus identity — belongs to the row
+    /// only while the list **itself** holds focus: Tab moving on to that row's
+    /// Rename verb makes the verb the focused element, and it paints its own
+    /// ring, so keeping the row's would be two focus indications for one focus
+    /// (and would report a row as focused while the real focus is a button
+    /// inside it). The *reveal* stays on `contains_focused`, because the verbs
+    /// must not vanish out from under the Tab that just reached them.
+    fn cursor_and_reveal(&self, window: &Window, cx: &App) -> (Option<usize>, Option<usize>) {
+        let cursor = self.cursor(cx);
+        (
+            self.list_focus
+                .is_focused(window)
+                .then_some(cursor)
+                .flatten(),
+            self.list_focus
+                .contains_focused(window, cx)
+                .then_some(cursor)
+                .flatten(),
+        )
+    }
+
+    /// Test seam over [`Self::cursor_and_reveal`] — the same computation the
+    /// rows render from, so pinning it pins the render.
+    #[doc(hidden)]
+    pub fn cursor_and_reveal_for_test(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> (Option<usize>, Option<usize>) {
+        self.cursor_and_reveal(window, cx)
+    }
+
     /// Test seam: where the roving cursor effectively sits.
     #[doc(hidden)]
     pub fn focused_row_for_test(&self, cx: &App) -> Option<usize> {
@@ -324,17 +385,11 @@ impl LibraryView {
             .get(range.clone())
             .map(|slice| range.clone().zip(slice.iter().cloned()).collect())
             .unwrap_or_default();
-        // The roving cursor only *shows* while the list holds the keyboard —
-        // resolved once here so a row never has to ask.
-        let keyboard_row = self
-            .list_focus
-            .contains_focused(window, cx)
-            .then(|| self.cursor(cx))
-            .flatten();
+        let focus = RowFocus::resolve(self, window, cx);
         visible
             .into_iter()
             .map(|(idx, space)| {
-                self.render_row(idx, &space, total, keyboard_row, cx)
+                self.render_row(idx, &space, total, focus, cx)
                     .into_any_element()
             })
             .collect()
@@ -345,15 +400,16 @@ impl LibraryView {
         idx: usize,
         space: &SpaceInfo,
         total: usize,
-        keyboard_row: Option<usize>,
+        focus: RowFocus,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let is_keyboard_row = keyboard_row == Some(idx);
+        let is_keyboard_row = focus.cursor == Some(idx);
         // Hover **or** the keyboard cursor: gpui suppresses hover entirely
         // under keyboard modality, so without the second half a keyboard user
-        // could reach a row and find its verbs gone (audit S7).
-        let hovered = self.hovered == Some(idx) || is_keyboard_row;
+        // could reach a row and find its verbs gone (audit S7). This half uses
+        // the *reveal* predicate, which survives Tab moving into the verbs.
+        let hovered = self.hovered == Some(idx) || focus.revealed == Some(idx);
         let space_id = space.id.clone();
         let archive_id = space.id.clone();
         let rename_id = space.id.clone();
@@ -517,9 +573,10 @@ impl LibraryView {
             .when(is_keyboard_row, |d| d.aria_active_descendant())
             // The cursor's ring is drawn here rather than by `focus_visible`,
             // because the focused *element* is the list; this is the row its
-            // cursor is on. It needs no modality guard — the cursor is only
-            // ever shown while the list holds keyboard focus.
-            .when(is_keyboard_row, |d| {
+            // cursor is on. The modality guard is what keeps a *programmatic*
+            // focus (the Record's back-out precedent) from painting a keyboard
+            // cursor for a pointer user.
+            .when(focus.ring == Some(idx), |d| {
                 d.shadow(crate::focus::ring_shadows(crate::focus::ring_colors()))
             })
             .w_full()
