@@ -10,6 +10,7 @@ pub mod chrome;
 pub mod focus;
 pub mod general;
 pub mod library;
+pub mod lifecycle;
 pub mod loadable;
 pub mod onboarding;
 pub mod overlay;
@@ -44,6 +45,7 @@ use crate::actions::{
     Quote, QuoteInReply, ShowAll, ToggleInspector, Zoom, ZoomIn, ZoomOut,
 };
 use crate::library::LibraryView;
+use crate::lifecycle::LaunchOptions;
 use crate::onboarding::OnboardingView;
 use crate::record::RecordView;
 use crate::settings::SettingsView;
@@ -88,21 +90,41 @@ struct AppGlobal {
 
 impl gpui::Global for AppGlobal {}
 
+/// Run the GUI application with default (windowed) launch options.
+pub fn run() {
+    run_with(LaunchOptions::default());
+}
+
 /// Run the GUI application. The binary's `fn main()` is a thin shim around
 /// this; tests do not call this — they use `tests/visual.rs` instead.
-pub fn run() {
-    let application = gpui_platform::application().with_assets(Assets);
+///
+/// **The process outlives its windows** (task 17 wave 2) — see
+/// [`crate::lifecycle`] for the seams and the per-platform rules. Quit
+/// (`⌘Q` / the menu) stays a full shutdown: engines, everything.
+pub fn run_with(opts: LaunchOptions) {
+    let application = gpui_platform::application()
+        .with_assets(Assets)
+        // Named explicitly rather than inherited from `QuitMode::Default`'s
+        // `cfg!`: on Linux this is a launch-mode decision (a `--windowless`
+        // service must survive a visiting window closing), which no upstream
+        // default can make for us.
+        .with_quit_mode(lifecycle::quit_mode(opts));
 
-    // Standard macOS: clicking the dock icon when the app has no open
-    // windows should create one. Without this, closing the last window
-    // leaves the app running but unreachable. `on_reopen` is on the
-    // `Application` builder (registered before launch), not on `App`, and
-    // returns `&Self` rather than `Self` so we can't chain it before
-    // `run()` (which consumes by value).
+    // macOS reactivation (Dock icon, Spotlight relaunch of the running app,
+    // a second `open -a Eidola`): focus a window, or open the Library when
+    // there is none. Without this, closing the last window leaves the app
+    // running but unreachable. `on_reopen` is on the `Application` builder
+    // (registered before launch), not on `App`, and returns `&Self` rather
+    // than `Self` so we can't chain it before `run()` (which consumes by
+    // value). On Linux gpui stores the callback and nothing ever fires it —
+    // there is no platform mechanism; that door is the wave-4 socket.
     application.on_reopen(|cx: &mut App| {
-        if cx.windows().is_empty() {
-            open_main_window(cx);
-        }
+        lifecycle::reactivate(cx, |cx| {
+            // A reopen can in principle arrive before launch finishes.
+            if cx.has_global::<AppGlobal>() {
+                open_library_window(cx);
+            }
+        });
     });
 
     application.run(move |cx: &mut App| {
@@ -116,7 +138,7 @@ pub fn run() {
         // stores (the only place tokio receivers touch gpui). Install it
         // before the startup refreshes so nothing committed during them is
         // missed.
-        stores::install_bus_bridge(&stores, cx);
+        let bus_bridge = stores::install_bus_bridge(&stores, cx);
 
         // Point the Circadian theme at the persisted settings (day/night
         // axis + time-of-day tint), re-applying on config changes and on
@@ -159,6 +181,11 @@ pub fn run() {
         // the next time one opens — no banners in chat windows.
         stores.update.read(cx).start_polling();
 
+        // Quit is a full shutdown — engines, everything (decided). On macOS
+        // this hook is the only thing that delivers it; see
+        // `lifecycle::install_engine_shutdown`.
+        lifecycle::install_engine_shutdown(&stores, bus_bridge, cx);
+
         // Order matters: `cx.set_menus` snapshots the keymap when it builds
         // NSMenuItems and attaches each item's `keyEquivalent` from
         // `keymap.bindings_for_action(action)`. If we set menus before
@@ -180,23 +207,24 @@ pub fn run() {
         cx.observe(&stores.templates, |_, cx| install_menus(cx))
             .detach();
 
+        // Windowless: the process *is* the app — no window at launch, no
+        // foreground activation, and (per `lifecycle::quit_mode`) nothing
+        // that closes later can stop it. Everything above still runs: the
+        // stores, the bus bridge, update polling and any engine loaded
+        // through them belong to the process, which is the whole point.
+        // The only way out is an explicit quit, which a service manager
+        // delivers as a signal.
+        if opts.windowless {
+            #[cfg(unix)]
+            lifecycle::install_signal_quit(&stores, cx).detach();
+            return;
+        }
+
         // Bring the app to the foreground at launch. Mirrors Zed; ensures
         // macOS treats us as the active app from frame 0 so the menu bar
         // / key-equivalent dispatch is fully wired before the user
         // interacts with anything.
         cx.activate(true);
-
-        // Linux lifecycle: quit when the last window closes. There is no
-        // dock or menu-bar presence to keep a windowless app reachable
-        // (macOS keeps running and reopens via `on_reopen`); a lingering
-        // headless process is just a leak on Linux.
-        #[cfg(not(target_os = "macos"))]
-        cx.on_window_closed(|cx, _window_id| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
 
         // First-run onboarding: with no account configured, open the "Get
         // Started" window *instead of* a blank space — onboarding is the
