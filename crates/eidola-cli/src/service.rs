@@ -135,14 +135,45 @@ pub fn unit_path(config_home: &Path) -> PathBuf {
 
 /// `$XDG_CONFIG_HOME`, else `$HOME/.config`.
 pub fn config_home() -> Result<PathBuf, AppError> {
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir));
+    resolve_config_home(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// The XDG config home, resolved the way **systemd** resolves it.
+///
+/// An `XDG_CONFIG_HOME` that is empty *or relative* is ignored. The XDG Base
+/// Directory spec requires this — "All paths set in these environment
+/// variables must be absolute. If an implementation encounters a relative
+/// path in any of these variables it should consider the path invalid and
+/// ignore it" — and systemd obeys it: with `XDG_CONFIG_HOME=rel/cfg`,
+/// `systemd-path user-configuration` still answers `$HOME/.config`, and
+/// `systemd-analyze --user unit-paths` still searches
+/// `$HOME/.config/systemd/user` (verified against systemd 257).
+///
+/// Honoring a relative value would therefore write the unit somewhere the
+/// manager will never look, and `install` would report success for a service
+/// that does not exist. Whoever resolves this path must agree with systemd,
+/// not with the spec's letter alone — here they happen to coincide.
+///
+/// Pure over its inputs so the four cases are testable without mutating the
+/// process environment, which is global and these tests run in parallel.
+fn resolve_config_home(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, AppError> {
+    if let Some(dir) = xdg
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty() && p.is_absolute())
+    {
+        return Ok(dir);
     }
-    let home = std::env::var_os("HOME").filter(|v| !v.is_empty());
-    home.map(|h| PathBuf::from(h).join(".config"))
+    home.filter(|v| !v.is_empty())
+        .map(|h| PathBuf::from(h).join(".config"))
         .ok_or_else(|| AppError::Config {
-            message: "neither XDG_CONFIG_HOME nor HOME is set, so there is no \
-                      user unit directory to install into"
+            message: "neither XDG_CONFIG_HOME nor HOME is set to an absolute \
+                      path, so there is no user unit directory to install into"
                 .into(),
         })
 }
@@ -659,6 +690,43 @@ mod tests {
             !is_executable(&exe),
             "but this user cannot run it, which is the question that matters"
         );
+    }
+
+    #[test]
+    fn a_relative_xdg_config_home_is_ignored_like_systemd_ignores_it() {
+        use std::ffi::OsString;
+        let home = || Some(OsString::from("/home/me"));
+        let expected = PathBuf::from("/home/me/.config");
+
+        // Absolute: honored.
+        assert_eq!(
+            resolve_config_home(Some(OsString::from("/xdg")), home()).unwrap(),
+            PathBuf::from("/xdg")
+        );
+        // Relative: invalid per the XDG spec, and *ignored* by systemd —
+        // `systemd-path user-configuration` answers `$HOME/.config` and the
+        // unit search path stays `$HOME/.config/systemd/user`, so honoring it
+        // would file the unit where the manager never looks and let `install`
+        // claim success for a service that does not exist.
+        for relative in ["rel/cfg", "./cfg", "cfg"] {
+            assert_eq!(
+                resolve_config_home(Some(OsString::from(relative)), home()).unwrap(),
+                expected,
+                "a relative XDG_CONFIG_HOME ({relative}) must fall through to $HOME/.config"
+            );
+            assert_eq!(
+                unit_path(&resolve_config_home(Some(OsString::from(relative)), home()).unwrap()),
+                PathBuf::from("/home/me/.config/systemd/user/eidola.service"),
+            );
+        }
+        // Empty and unset: likewise.
+        assert_eq!(
+            resolve_config_home(Some(OsString::new()), home()).unwrap(),
+            expected
+        );
+        assert_eq!(resolve_config_home(None, home()).unwrap(), expected);
+        // Neither usable: an honest refusal, not a relative guess.
+        assert!(resolve_config_home(Some(OsString::from("rel/cfg")), None).is_err());
     }
 
     #[test]
