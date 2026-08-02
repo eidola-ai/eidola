@@ -9349,3 +9349,123 @@ fn space_revealing_a_post_upward_clears_the_title_band(cx: &mut TestAppContext) 
         "the revealed post's top ({top}) must clear the title band ({reserve})"
     );
 }
+
+#[gpui::test]
+fn space_navigating_beside_an_escaped_fork_draft_keeps_the_branch(cx: &mut TestAppContext) {
+    // Escape a Reply draft beside an existing reply and the fork's selected
+    // branch *is* that draft. The level's active index used to be remapped to
+    // the nearest persisted sibling, which made that sibling a member of the
+    // navigable path — so the next arrow resolved a target on the *other*
+    // branch and `select_path_to` moved the reader's selection for them.
+    // Navigation observes the tree; it does not steer it.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut a2 = fixture_assistant_post("a2", "the existing reply");
+    a2.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post"), a2],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    // Reply at a1: a second branch, which is a draft. Then escape it — it stays
+    // as an inactive inline draft, and it stays the selected branch.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a1".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    // Type into it: an *empty* fork draft is pruned on escape, and the case
+    // this pins is the one that survives — a reply you started and set aside.
+    view.update(&mut vcx, |v, cx| {
+        let ed = v.composer_state_for_test().expect("the fork draft");
+        ed.update(cx, |e, cx| e.set_value("a reply in progress", cx));
+    });
+    view.update(&mut vcx, |v, cx| v.deactivate_for_test(cx));
+    vcx.run_until_parked();
+
+    // Enter the conversation and walk down from the fork's anchor.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a1".to_string(), None)));
+    });
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), None)),
+            "the selected branch below a1 is the draft, so there is no post to \
+             move to — and certainly not one on a branch the reader did not choose"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_an_overlay_that_hands_off_focus_does_not_get_it_back(cx: &mut TestAppContext) {
+    // A transient overlay borrows the keyboard and, at this pin, does not hand
+    // it back — so the falling edge restores the conversation's focus level.
+    // But a menu *item* can hand it somewhere on purpose: Reply creates a draft
+    // and focuses its editor. Restoring then yanks focus out of the very thing
+    // the reader asked the menu for. The borrow is returned only to a lender
+    // who still has nothing.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a1".to_string(), None)));
+    });
+
+    // Open the band's Reply-or-Ask menu over that post, and let a frame record
+    // the borrow.
+    view.update(&mut vcx, |v, cx| v.set_band_menu_for_test(Some("a1"), cx));
+    vcx.run_until_parked();
+
+    // Pick Reply: a draft opens and its editor takes the keyboard, and the menu
+    // closes on the same gesture.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a1".into()), window, cx);
+            v.set_band_menu_for_test(None, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let editor_focused = vcx.update(|window, cx| {
+        let v = view.read(cx);
+        let editor = v.composer_state_for_test().expect("the reply draft opened");
+        let handle = editor.read(cx).focus_handle(cx);
+        handle.is_focused(window)
+    });
+    assert!(
+        editor_focused,
+        "the draft the reader asked for keeps the keyboard"
+    );
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            None,
+            "and the conversation's level is released, not restored over it"
+        );
+    });
+}

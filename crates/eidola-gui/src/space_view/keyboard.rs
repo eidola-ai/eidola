@@ -102,29 +102,34 @@ pub(crate) struct Level {
 /// me to the bottom". Filtering the input makes `path.last()` the last *post*,
 /// and Left/Right stop counting a draft as a branch sibling for free.
 ///
-/// A level that holds no post at all is dropped rather than left empty, because
-/// [`tree_target`] indexes `levels` by position in the flattened path — an
-/// empty level would desync the two and hand a branch move the wrong strip.
+/// **Where the selected child is itself synthetic, the navigable path simply
+/// ends** — it is never re-pointed at a sibling. Escape a Reply draft beside an
+/// existing reply and the fork's selected branch *is* that draft; remapping the
+/// level's active index to the nearest persisted sibling made it a member of
+/// the path, so the next arrow resolved a target on that other branch and
+/// `select_path_to` **moved the reader's branch selection** for them. Navigation
+/// observes the tree; it does not steer it. A synthetic child is always a leaf
+/// (a draft and a streaming turn both attach as one), so no level below it can
+/// exist — which is what keeps `path` and `levels` index-aligned, the property
+/// [`tree_target`] relies on to hand a branch move the right strip.
 pub(crate) fn levels_from(levels: &[(Vec<&TreeNode>, usize)]) -> Vec<Level> {
-    levels
-        .iter()
-        .filter_map(|(sibs, active)| {
-            let kept: Vec<usize> = (0..sibs.len()).filter(|i| is_post_node(sibs[*i])).collect();
-            if kept.is_empty() {
-                return None;
-            }
-            // Keep pointing at the same node when it survived the filter;
-            // otherwise fall to the nearest kept sibling before it.
-            let active = kept
-                .iter()
-                .position(|i| i == active)
-                .unwrap_or_else(|| kept.partition_point(|i| i < active).saturating_sub(1));
-            Some(Level {
-                siblings: kept.into_iter().map(|i| sibs[i].id.clone()).collect(),
-                active,
-            })
-        })
-        .collect()
+    let mut out = Vec::with_capacity(levels.len());
+    for (sibs, active) in levels {
+        // The selected child decides whether this level is navigable at all.
+        let Some(selected) = sibs.get(*active).filter(|n| is_post_node(n)) else {
+            break;
+        };
+        let kept: Vec<usize> = (0..sibs.len()).filter(|i| is_post_node(sibs[*i])).collect();
+        // `selected` is a post, so it survived the filter by construction.
+        let Some(active) = kept.iter().position(|i| sibs[*i].id == selected.id) else {
+            break;
+        };
+        out.push(Level {
+            siblings: kept.into_iter().map(|i| sibs[i].id.clone()).collect(),
+            active,
+        });
+    }
+    out
 }
 
 /// Whether a node is a focusable post (see [`levels_from`]).
@@ -745,12 +750,24 @@ impl SpaceView {
     /// than clearing it. That is the honest reading of a borrow, and it is one
     /// place rather than a restore-call on each of the overlay-close paths
     /// (there are eight).
+    ///
+    /// A borrow is only returned to a lender who still has nothing. The falling
+    /// edge compares the recorded holder against the window's current focus: if
+    /// the overlay's handle is *still* focused, nobody took the keyboard and the
+    /// conversation should have it back; if something else holds it — a
+    /// Reply-or-Ask menu item that created a draft and focused its editor —
+    /// restoring would yank focus out of the very thing the reader asked the
+    /// menu for.
     pub(crate) fn sync_tree_focus(&mut self, window: &mut Window, cx: &mut App) {
         let overlay = self.transient_overlay_open();
-        let borrowed = std::mem::replace(&mut self.overlay_held_focus, overlay);
         if overlay {
+            // Remember *who* the overlay left holding the keyboard, so the
+            // falling edge can tell a borrow it never returned from a claim
+            // somebody else made.
+            self.overlay_borrowed_focus = window.focused(cx);
             return;
         }
+        let borrowed = self.overlay_borrowed_focus.take();
         let Some(focus) = self.tree_focus.clone() else {
             return;
         };
@@ -772,7 +789,12 @@ impl SpaceView {
         if live {
             return;
         }
-        if borrowed {
+        // Restore **only** if the overlay's own handle is still the window's
+        // focus — i.e. it closed without handing the keyboard anywhere. A menu
+        // item that opened a draft and focused its editor has already claimed
+        // it, and yanking focus back to the post the reader right-clicked is
+        // exactly what they did not ask for.
+        if borrowed.is_some_and(|h| h.is_focused(window)) {
             let handle = match focus.level {
                 FocusLevel::Post => self.post_focus.clone(),
                 FocusLevel::Affordance(i) => self.affordance_slot_or_post(i),
