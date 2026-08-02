@@ -466,20 +466,21 @@ fn config_store_zoom_ladder_writes_through(cx: &mut TestAppContext) {
 /// (`create_template` / `update_template`, then the dedicated
 /// `set_template_router_model`), and the bus makes them race: app-core emits
 /// `Change::Templates` from inside the first call, and dispatching it calls
-/// `TemplatesStore::refresh` — which replaces the store's single task slot and
-/// drops the gpui half of the op that is still in flight.
+/// `TemplatesStore::refresh`.
 ///
-/// Split across two `bridge` calls, the second was only *constructed* after the
-/// first await returned, so the cancellation swallowed it: the template was
-/// created and its router silently left NULL. As one `bridge` closure — one
-/// tokio future, whose `JoinHandle` `bridge` drops, so a dropped gpui receiver
-/// cancels nothing core-side — both writes complete regardless.
+/// Split across two `bridge` calls, the second is only *constructed* after the
+/// first await returns, so anything that replaces the op's slot in between
+/// swallows it: the template is created and its router silently left NULL. As
+/// one `bridge` closure — one tokio future, whose `JoinHandle` `bridge` drops,
+/// so a dropped gpui receiver cancels nothing core-side — both writes complete
+/// regardless. The refresh is no longer a superseder (mutations own their own
+/// slot — see the store's docs), but another **mutation** still is, so the
+/// one-future composition this drives stays the guard.
 ///
 /// Unlike its neighbours this test *does* park (it is about a genuinely
 /// in-flight op, not a synchronous transition), and it asserts against the
-/// **database** rather than the store snapshot: the cancelled relist means the
-/// snapshot may predate the router write, which in production the setter's own
-/// `Change::Templates` reconciles.
+/// **database** rather than the store snapshot, which is what a superseded op
+/// would have left behind.
 #[gpui::test]
 fn template_router_write_survives_a_refresh_landing_mid_op(cx: &mut TestAppContext) {
     let (stores, _dir) = backed_stores(cx);
@@ -521,4 +522,126 @@ fn template_router_write_survives_a_refresh_landing_mid_op(cx: &mut TestAppConte
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// Poll `run_until_parked` until `pred` holds — a write-then-relist round-trips
+/// through the tokio runtime, which `run_until_parked` alone can return before.
+fn wait_until(
+    cx: &mut TestAppContext,
+    what: &str,
+    mut pred: impl FnMut(&mut TestAppContext) -> bool,
+) {
+    for _ in 0..400 {
+        cx.run_until_parked();
+        if pred(cx) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("timed out waiting until {what}");
+}
+
+/// **A bus-driven refresh must not cancel a mutation's completion.** Both
+/// write-through stores compose `write; re-list` and report a failure in
+/// `op_error` — and both are refreshed by signals they do not raise
+/// (`Change::Templates`, which a write of its own emits *before it returns*;
+/// `Change::Participants`, which any shared-participant edit anywhere emits).
+/// While the refresh shared the mutation's task slot, one landing mid-write
+/// replaced it and dropped the gpui half of the op: the core write still ran
+/// (`bridge` drops the tokio `JoinHandle`, cancelling nothing), but the
+/// continuation that surfaces the error and applies the re-list never did — so
+/// a *refused* write was indistinguishable from a successful one.
+///
+/// Driven at the narrowest point there is: the refresh is dispatched before the
+/// op's future has been polled even once.
+#[gpui::test]
+fn a_refresh_landing_mid_write_keeps_the_templates_ops_error(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    stores.templates.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the registry loads", |cx| {
+        stores.templates.read_with(cx, |s, _| !s.list().is_empty())
+    });
+
+    // Make the write fail before it writes anything: the router reference's
+    // backend is gone by the time the create runs.
+    core.runtime()
+        .block_on(core.set_backend_enabled("eidola".into(), false))
+        .expect("disable eidola");
+    stores.templates.update(cx, |s, cx| {
+        s.create(
+            "Doomed".into(),
+            4,
+            Vec::new(),
+            Some("gemma4-31b".into()),
+            cx,
+        );
+    });
+    // An unrelated shared-participant edit, landing mid-write.
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+
+    wait_until(cx, "the refusal surfaces", |cx| {
+        stores
+            .templates
+            .read_with(cx, |s, _| s.op_error().is_some())
+    });
+    // The same continuation carries the re-list, so the registry is a listing
+    // and not whatever a cancelled op left behind.
+    stores.templates.read_with(cx, |s, _| {
+        assert!(
+            s.list().iter().any(|t| t.title == "Default"),
+            "the mutation re-listed on its failure exit"
+        );
+    });
+}
+
+/// The per-space half of the rule above — and the sharper case, because
+/// `ParticipantsStore`'s own writes emit the very `Change::Participants` that
+/// drove `refresh_all` into their slot.
+#[gpui::test]
+fn a_refresh_landing_mid_write_keeps_the_participants_ops_error(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(None))
+        .expect("create space")
+        .id;
+
+    stores
+        .participants
+        .update(cx, |s, cx| s.ensure(space.clone(), cx));
+    wait_until(cx, "the roster loads", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| !s.list(&space).is_empty())
+    });
+
+    // A label carrying a line break is refused before any write (it would
+    // inject a second authored paragraph into the wire header).
+    stores.participants.update(cx, |s, cx| {
+        s.update_everywhere(
+            space.clone(),
+            eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("You\nand me".into()),
+                ..Default::default()
+            },
+            cx,
+        );
+    });
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+
+    wait_until(cx, "the refusal surfaces", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_error(&space).is_some())
+    });
+    stores.participants.read_with(cx, |s, _| {
+        assert!(
+            !s.list(&space).is_empty(),
+            "the mutation re-listed on its failure exit"
+        );
+    });
 }
