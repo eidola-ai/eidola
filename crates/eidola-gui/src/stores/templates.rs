@@ -2,12 +2,12 @@
 //! Templates pane's data source).
 //!
 //! Per `crates/eidola-gui/STATE.md`: one gpui entity owning the
-//! `Loadable<Vec<SpaceTemplateInfo>>` snapshot, one supersede task slot (shared
-//! by the list refresh and the write-through CRUD ops, which compose
-//! `write; re-list` so the store reconciles even without the bus), its
-//! subscription to `Change::Templates` (routed in `stores::dispatch_change`),
-//! and *all* mutations of the template domain. Views call these methods; they
-//! never touch `AppCore` directly.
+//! `Loadable<Vec<SpaceTemplateInfo>>` snapshot, **one task slot per operation**
+//! (a refresh slot and a mutation slot — see [`TemplatesStore::refresh`] for
+//! why they are not one), its subscription to `Change::Templates` and
+//! `Change::Participants` (routed in `stores::dispatch_change`), and *all*
+//! mutations of the template domain. Views call these methods; they never touch
+//! `AppCore` directly.
 
 use std::sync::Arc;
 
@@ -20,9 +20,16 @@ use crate::loadable::Loadable;
 pub struct TemplatesStore {
     app_core: Option<Arc<AppCore>>,
     templates: Loadable<Vec<SpaceTemplateInfo>>,
-    /// Supersede slot for the list refresh and every write-through CRUD op
-    /// (each composes `write; re-list`, replace-cancels).
-    task: Option<Task<()>>,
+    /// Supersede slot for the **list refresh** (launch, the pane's Retry, and
+    /// every bus-driven `Change::Templates` / `Change::Participants`).
+    refresh_task: Option<Task<()>>,
+    /// Supersede slot for the **write-through CRUD ops** (each composes
+    /// `write; re-list`). Separate from the refresh slot so an unrelated
+    /// bus-driven refresh can never cancel a mutation's completion — see
+    /// [`TemplatesStore::refresh`].
+    op_task: Option<Task<()>>,
+    /// A refresh signalled while a mutation held the read; run once it lands.
+    refresh_pending: bool,
     /// The last write error, surfaced by the pane's op-error banner.
     op_error: Option<String>,
 }
@@ -32,7 +39,9 @@ impl TemplatesStore {
         Self {
             app_core,
             templates: Loadable::NotLoaded,
-            task: None,
+            refresh_task: None,
+            op_task: None,
+            refresh_pending: false,
             op_error: None,
         }
     }
@@ -46,13 +55,29 @@ impl TemplatesStore {
             } else {
                 Loadable::loaded(templates)
             },
-            task: None,
+            refresh_task: None,
+            op_task: None,
+            refresh_pending: false,
             op_error: None,
         }
     }
 
     pub fn templates(&self) -> &Loadable<Vec<SpaceTemplateInfo>> {
         &self.templates
+    }
+
+    /// Test-only: replace the registry snapshot, standing in for the refresh a
+    /// `Change::Templates` / `Change::Participants` dispatch would drive on a
+    /// backed store. Lets a stub-backed test move the registry *under* an open
+    /// editor.
+    #[doc(hidden)]
+    pub fn set_templates_for_test(
+        &mut self,
+        templates: Vec<SpaceTemplateInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        self.templates = Loadable::loaded(templates);
+        cx.notify();
     }
 
     /// Test-only: force the registry into `Failed` (no prior) to exercise the
@@ -81,17 +106,39 @@ impl TemplatesStore {
         }
     }
 
-    /// Refresh the registry. Fire-and-notify supersede slot.
+    /// Refresh the registry. Fire-and-notify supersede slot — its **own**
+    /// slot, deliberately not the mutation's.
+    ///
+    /// Refreshes arrive from the bus, on signals this store does not raise:
+    /// `Change::Templates` (which a write of its own emits *before it returns*)
+    /// and `Change::Participants` (a shared participant edited anywhere). With
+    /// one shared slot each of those cancelled the gpui half of an in-flight
+    /// mutation — the core write still completed (`bridge` drops the tokio
+    /// `JoinHandle`, it cancels nothing), but the continuation that surfaces
+    /// `op_error` and applies the mutation's own re-list never ran, so a failed
+    /// create could report success by saying nothing at all.
+    ///
+    /// The split alone would trade that for a staleness race — a read issued
+    /// before the write, resolving after it, re-staling the snapshot — so the
+    /// two slots are ordered rather than merely parallel: a mutation takes over
+    /// the read (see [`Self::write_then_relist`]), and a refresh signalled while
+    /// one is in flight is **deferred** to its completion rather than started
+    /// beside it. Deferring is what keeps the signal: the deferred read runs
+    /// after the mutation's snapshot lands, so it can only be fresher.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(core) = self.app_core.clone() else {
             return;
         };
+        if self.op_task.is_some() {
+            self.refresh_pending = true;
+            return;
+        }
         self.templates = std::mem::take(&mut self.templates).to_loading();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let result = bridge(core, |c| async move { c.list_space_templates().await }).await;
             let _ = this.update(cx, |this, cx| {
                 this.templates = std::mem::take(&mut this.templates).resolve(result);
-                this.task = None;
+                this.refresh_task = None;
                 cx.notify();
             });
         }));
@@ -102,6 +149,25 @@ impl TemplatesStore {
     /// snapshot and op-error on completion. The shared shape behind every CRUD
     /// method: the bus's `Change::Templates` would also refresh, but composing
     /// the re-list here keeps the store correct on a bus-less test run.
+    ///
+    /// **The re-list runs whether the op succeeded or failed**, because a
+    /// router-bearing create/update is two core calls and can therefore fail
+    /// *partially* — a template created whose router the setter then refused.
+    /// Leaving the snapshot untouched on failure would show the error beside a
+    /// listing that doesn't contain the template that was in fact created. The
+    /// error still wins the `op_error` slot, while a re-list that itself fails
+    /// resolves the *cell* — `Failed { prior }`, keeping any prior snapshot
+    /// visible — so the two errors answer their own questions instead of
+    /// overwriting each other, and neither is dropped. See
+    /// [`crate::stores::settle_mutation`] for why dropping the read's error
+    /// stranded the cell.
+    ///
+    /// **A mutation takes over the read** — it drops any in-flight refresh,
+    /// which may have been issued *before* this write and would re-stale the
+    /// snapshot by resolving after it. Cancelling another slot's fetch is a debt
+    /// (`crates/eidola-gui/STATE.md` → "Concurrency patterns"); the
+    /// unconditional re-list above discharges it on every exit, failure
+    /// included, and a refresh signalled meanwhile runs once this op lands.
     fn write_then_relist<F>(&mut self, cx: &mut Context<Self>, op: F)
     where
         F: FnOnce(
@@ -115,69 +181,114 @@ impl TemplatesStore {
             return;
         };
         self.op_error = None;
+        // Take over the read for the duration of the write (see the doc above).
+        self.refresh_task = None;
+        self.refresh_pending = false;
         let relist_core = core.clone();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.op_task = Some(cx.spawn(async move |this, cx| {
             let op_result = op(core).await;
-            // Re-list only on success; a failed op leaves the current snapshot
-            // in place and surfaces the error.
-            let list = match &op_result {
-                Ok(()) => Some(
-                    bridge(
-                        relist_core,
-                        |c| async move { c.list_space_templates().await },
-                    )
-                    .await,
-                ),
-                Err(_) => None,
-            };
+            let list = bridge(
+                relist_core,
+                |c| async move { c.list_space_templates().await },
+            )
+            .await;
             let _ = this.update(cx, |this, cx| {
-                match op_result {
-                    Ok(()) => {
-                        if let Some(Ok(templates)) = list {
-                            this.templates = Loadable::loaded(templates);
-                        }
-                    }
-                    Err(e) => this.op_error = Some(e),
+                this.op_error =
+                    crate::stores::settle_mutation(&mut this.templates, list, op_result);
+                this.op_task = None;
+                if std::mem::take(&mut this.refresh_pending) {
+                    this.refresh(cx);
                 }
-                this.task = None;
                 cx.notify();
             });
         }));
         cx.notify();
     }
 
+    /// Create a template. `router_model` is the may-decline router reference
+    /// (`None` = off, the default); it rides through the dedicated
+    /// [`AppCore::set_template_router_model`] setter, which is why this is a
+    /// two-call write.
+    ///
+    /// **Both calls live in ONE [`bridge`] closure — one tokio future — and
+    /// that is load-bearing, not tidiness.** `refresh` and every CRUD op share
+    /// this store's single task slot, and `create_template` emits
+    /// `Change::Templates` core-side *before it returns*; the bus dispatch that
+    /// event drives calls `refresh`, which replaces the slot and drops the gpui
+    /// half of this op. Split across two `bridge` calls, the second one is
+    /// constructed only after the first await returns — so a refunded slot
+    /// mid-op meant the template was created with its router silently left
+    /// NULL. `bridge` spawns onto the core's tokio runtime and drops the
+    /// `JoinHandle`, so a dropped gpui receiver cancels nothing core-side
+    /// (see `bridge.rs`): as one future, both writes complete regardless.
     pub fn create(
         &mut self,
         title: String,
         cascade_limit: i64,
         participants: Vec<NewTemplateParticipant>,
+        router_model: Option<String>,
         cx: &mut Context<Self>,
     ) {
         self.write_then_relist(cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
-                    c.create_template(title, cascade_limit, participants).await
+                    // Check the reference BEFORE the create. Setting the router
+                    // is a separate call that validates its backend, so a stale
+                    // pick — the backend disabled or removed while the editor was
+                    // open — would otherwise land a template *without* the router
+                    // it was created with. Validating first makes that a
+                    // zero-trace refusal; what's left is a TOCTOU of microseconds
+                    // inside one future.
+                    if router_model.is_some() {
+                        c.validate_router_model(router_model.clone()).await?;
+                    }
+                    let created = c
+                        .create_template(title, cascade_limit, participants)
+                        .await?;
+                    // Off is the default, so an unset router needs no second write.
+                    if router_model.is_some() {
+                        c.set_template_router_model(created.id, router_model)
+                            .await?;
+                    }
+                    Ok(())
                 })
                 .await
-                .map(|_| ())
                 .map_err(|e| e.to_string())
             })
         });
     }
 
+    /// Update a template. `router_model` follows the "untouched field" idiom of
+    /// the other arguments: the outer `None` leaves the setting alone, `Some(r)`
+    /// writes it (`Some(None)` = off).
+    ///
+    /// Both writes share one `bridge` closure for the reason spelled out on
+    /// [`Self::create`] — a bus-driven `refresh` landing between them would
+    /// otherwise drop the router write — and the router reference is validated
+    /// before the update for the same reason it is before a create: the two
+    /// calls cannot be one transaction, so a refused router must not follow an
+    /// applied edit.
     pub fn update(
         &mut self,
         id: String,
         title: Option<String>,
         cascade_limit: Option<i64>,
         participants: Option<Vec<NewTemplateParticipant>>,
+        router_model: Option<Option<String>>,
         cx: &mut Context<Self>,
     ) {
         self.write_then_relist(cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
-                    c.update_template(id, title, cascade_limit, participants)
-                        .await
+                    if let Some(router_model) = router_model.clone().flatten() {
+                        c.validate_router_model(Some(router_model)).await?;
+                    }
+                    c.update_template(id.clone(), title, cascade_limit, participants)
+                        .await?;
+                    if let Some(router_model) = router_model {
+                        c.set_template_router_model(id, router_model).await?;
+                    }
+                    Ok(())
                 })
                 .await
                 .map_err(|e| e.to_string())
