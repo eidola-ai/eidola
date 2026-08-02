@@ -46,7 +46,9 @@ gpui-markdown-editor = { path = "../gpui-markdown-editor" }
 # tree via gpui; the workspace avoids a chrono dependency.
 libc = "0.2"
 serde_json = "1"
-tokio = { version = "1", features = ["sync"] }
+# `signal` backs the windowless mode's SIGTERM/SIGINT → `cx.quit()` bridge
+# (`lifecycle::install_signal_quit`); `time` its bounded engine teardown.
+tokio = { version = "1", features = ["sync", "signal", "time"] }
 
 [dev-dependencies]
 # Pulls in `VisualTestAppContext` and `Window::render_to_image`. Cargo unifies

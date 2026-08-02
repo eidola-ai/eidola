@@ -315,6 +315,17 @@ pub(crate) struct LocalRuntime {
     failures: StdMutex<HashMap<EngineKey, String>>,
     /// Test override for the machine memory budget ([`memory_budget`]).
     budget_override: StdMutex<Option<u64>>,
+    /// One-way shutdown latch. Set by [`Inner::shutdown_all_engines`] and
+    /// checked by [`Self::reserve_engine`] — **both under the `engines`
+    /// lock**, which is what makes it race-free; the atomic is only here
+    /// because the lock guards a bare `HashMap` rather than a state struct.
+    ///
+    /// Without it, a load already past its `await`s (backend lookup, port
+    /// pick, `fs::metadata`) but not yet at its reservation would resume
+    /// *after* the drain observed an empty registry, reserve, and spawn a
+    /// subprocess that the imminent `exit()` orphans. Never cleared: the
+    /// process is quitting.
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl LocalRuntime {
@@ -374,6 +385,13 @@ impl LocalRuntime {
         shutdown: tokio::sync::oneshot::Sender<()>,
     ) -> Result<Option<Vec<EngineKey>>, String> {
         let mut engines = self.engines.lock().expect("engines lock");
+        // The shutdown authority is checked *here*, inside the reservation's
+        // critical section and under the same lock the drain takes — not by
+        // the caller before its `await`s, which is exactly the window that
+        // would let a mid-flight load spawn a subprocess after the drain.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err("Eidola is shutting down".into());
+        }
         if engines.contains_key(key) {
             return Ok(None);
         }
@@ -403,6 +421,30 @@ impl LocalRuntime {
             },
         );
         Ok(Some(victims))
+    }
+
+    /// Run `f` — the engine spawn — only if no quit-time shutdown has begun,
+    /// **atomically with respect to the drain**.
+    ///
+    /// The latch on [`Self::reserve_engine`] closes the window between a load's
+    /// last `await` and its reservation; this closes the one *after* it. A
+    /// reservation accepted a moment before the latch flipped hands its
+    /// supervisor to `tokio::spawn`, and that task's first poll can land after
+    /// the drain has already walked an empty-of-it registry — at which point an
+    /// unconditional `command.spawn()` starts a subprocess into a process about
+    /// to `exit()`. Same class, same cure: the authority is read at the write
+    /// point, under the same lock the drain takes, so no interleaving can put a
+    /// spawn after the latch.
+    ///
+    /// Holding the `engines` lock across the spawn is safe and deliberate:
+    /// `Command::spawn` is synchronous (no `await` under the guard) and touches
+    /// nothing in this map.
+    fn spawn_unless_shutting_down<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        let _engines = self.engines.lock().expect("engines lock");
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(f())
     }
 
     /// The total memory the engine pool may occupy: a fixed fraction of
@@ -1544,6 +1586,59 @@ impl Inner {
             }),
         }
     }
+
+    /// Signal *every* live engine supervisor to kill its subprocess, and
+    /// return how many were signalled. Idempotent: the map is drained, so a
+    /// second call returns 0.
+    ///
+    /// This reads the **engine registry** and nothing else — no filesystem,
+    /// no database, no `Result`. That is the whole point of its existing
+    /// separately from a loop over [`Self::local_models_state`]: that
+    /// snapshot is reconstructed by *scanning* the managed models directory
+    /// and every `llamacpp` backend's directory (one `read_dir`, a `stat`
+    /// and a sidecar read per `.gguf`, plus a DB round trip to list the
+    /// backends), consulting this map only to *decorate* a file it already
+    /// found. A running engine whose `.gguf` was renamed or deleted
+    /// mid-session is therefore absent from that snapshot while its
+    /// subprocess is very much alive — and a slow or large directory would
+    /// spend a shutdown budget on I/O before killing anything. Neither is
+    /// acceptable on a quit path.
+    ///
+    /// Draining alone would not be enough: a load already past its `await`s
+    /// but not yet at [`LocalRuntime::reserve_engine`] would resume after
+    /// the drain and spawn a subprocess into a process that is about to
+    /// `exit()`. So this also sets the one-way shutdown latch — **inside
+    /// the same lock the reservation takes**, so there is no instant in
+    /// which the registry is empty and loads are still permitted.
+    ///
+    /// Like [`Self::unload_local_model`], this *signals*; the supervisor
+    /// task owns the child and does the `start_kill`. Callers on a quit
+    /// path must leave the runtime a moment to run them.
+    ///
+    /// **It deliberately does not emit `Change::LocalModels`.** Every other
+    /// engine transition does, because something is watching; here nothing
+    /// is — the process is exiting and no consumer can render the change.
+    /// Emitting was actively harmful: the GUI's app-lifetime bus bridge is a
+    /// foreground task that gpui keeps driving through its bounded shutdown
+    /// block, *after* `App::shutdown` has set `quitting`, so the dispatch
+    /// would reach `LocalModelsStore::refresh` → `cx.spawn` → gpui's
+    /// "Can't spawn on main thread after on_app_quit" panic. The one caller
+    /// is the quit hook (`AppCore::shutdown_engines`); there is no other,
+    /// and a new one would want this same silence.
+    pub(crate) fn shutdown_all_engines(&self) -> usize {
+        let entries: Vec<EngineEntry> = {
+            let mut engines = self.local.engines.lock().expect("engines lock");
+            self.local.shutting_down.store(true, Ordering::SeqCst);
+            engines.drain().map(|(_, entry)| entry).collect()
+        };
+        let count = entries.len();
+        for entry in entries {
+            // Supervisor may already be gone (crash path); the map removal
+            // is the user-visible state either way.
+            let _ = entry.shutdown.send(());
+        }
+        count
+    }
 }
 
 // ============================================================================
@@ -1685,12 +1780,43 @@ async fn supervise_engine(
             .insert(key.clone(), message.to_string());
     };
 
-    let mut child = match command.spawn() {
+    // **Every** emission in this supervisor goes through here, and it is
+    // silent once the quit-time shutdown latch is set.
+    //
+    // Silencing only [`Inner::shutdown_all_engines`] left this second emitter
+    // wide open: the drain merely *signals*, and the supervisor's own
+    // shutdown arms emit right after killing the child — into the same window
+    // that panics. The GUI's bus bridge is an app-lifetime foreground task
+    // gpui keeps driving through its bounded shutdown block *after*
+    // `App::shutdown` sets `quitting`, so any dispatch there reaches
+    // `LocalModelsStore::refresh` → `cx.spawn` → "Can't spawn on main thread
+    // after on_app_quit".
+    //
+    // Gating on the latch rather than on the shutdown *arm* is deliberate:
+    // during a quit no path should emit, including a child that happens to
+    // exit on its own at that moment. An ordinary unload is not a quit — the
+    // latch is unset — so it still emits, which is what the Local settings
+    // pane redraws from.
+    let emit = || {
+        if !local.shutting_down.load(Ordering::SeqCst) {
+            bus.emit(Change::LocalModels);
+        }
+    };
+
+    // A quit may have landed between our reservation and this task's first
+    // poll; starting a subprocess now would orphan it to the imminent
+    // `exit()`. Checked under the drain's own lock — see
+    // `LocalRuntime::spawn_unless_shutting_down`.
+    let Some(spawned) = local.spawn_unless_shutting_down(|| command.spawn()) else {
+        let _ = ready_tx.send(Err("Eidola is shutting down".into()));
+        return;
+    };
+    let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
             let message = format!("failed to start llama-server: {e}");
             fail(&message);
-            bus.emit(Change::LocalModels);
+            emit();
             let _ = ready_tx.send(Err(message));
             return;
         }
@@ -1746,9 +1872,23 @@ async fn supervise_engine(
         if std::time::Instant::now() >= deadline {
             break LoadEnd::TimedOut;
         }
-        if let Ok(resp) = http.get(&health_url).send().await
-            && resp.status().is_success()
-        {
+        // The probe must race the shutdown signal, not precede it.
+        //
+        // Awaiting the request outside the `select!` meant the oneshot was
+        // simply not polled for its duration — and a *warming* engine is
+        // exactly the case where `/health` can hang rather than refuse: the
+        // socket is accepted while a multi-gigabyte model loads, and this
+        // client has no request timeout. A quit landing in that window sent
+        // its signal into a receiver nobody was watching, the drain's brief
+        // grace expired, `exit()` followed, and the child outlived the
+        // process — the orphan the whole teardown exists to prevent.
+        let ready = tokio::select! {
+            _ = &mut shutdown_rx => break LoadEnd::Shutdown,
+            resp = http.get(&health_url).send() => {
+                matches!(resp, Ok(r) if r.status().is_success())
+            }
+        };
+        if ready {
             break LoadEnd::Ready;
         }
     };
@@ -1759,7 +1899,7 @@ async fn supervise_engine(
             let _ = child.start_kill();
             let _ = child.wait().await;
             // Map entry was already removed by `unload`.
-            bus.emit(Change::LocalModels);
+            emit();
             let _ = ready_tx.send(Err("load cancelled".into()));
             return;
         }
@@ -1769,7 +1909,7 @@ async fn supervise_engine(
                 tail_text(),
             );
             fail(&message);
-            bus.emit(Change::LocalModels);
+            emit();
             let _ = ready_tx.send(Err(message));
             return;
         }
@@ -1782,7 +1922,7 @@ async fn supervise_engine(
                 tail_text(),
             );
             fail(&message);
-            bus.emit(Change::LocalModels);
+            emit();
             let _ = ready_tx.send(Err(message));
             return;
         }
@@ -1807,7 +1947,7 @@ async fn supervise_engine(
         let _ = ready_tx.send(Err("unloaded during startup".into()));
         return;
     }
-    bus.emit(Change::LocalModels);
+    emit();
     let _ = ready_tx.send(Ok(()));
 
     // Phase 2: serve until shutdown or unexpected exit. The `child.wait()`
@@ -1820,7 +1960,7 @@ async fn supervise_engine(
         None => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            bus.emit(Change::LocalModels);
+            emit();
         }
         Some(exit) => {
             let code = exit.ok().and_then(|s| s.code());
@@ -1829,7 +1969,7 @@ async fn supervise_engine(
                 tail_text(),
             );
             fail(&message);
-            bus.emit(Change::LocalModels);
+            emit();
         }
     }
 }
@@ -2018,6 +2158,51 @@ mod tests {
                 .reserve_engine(&key_a, 4003, 6 * GIB, tx_a2)
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn the_shutdown_latch_refuses_a_reservation_that_arrives_after_the_drain() {
+        // A load that was already awaiting (backend lookup, port pick,
+        // `fs::metadata`) when the quit landed resumes *after* the drain saw
+        // an empty registry. Without the latch it would reserve and spawn a
+        // subprocess into a process about to `exit()`. The latch is checked
+        // inside the reservation's own critical section, under the same lock
+        // the drain takes, so there is no window between the two.
+        let runtime = LocalRuntime::default();
+        runtime.set_memory_budget_for_test(10 * GIB);
+        runtime.shutting_down.store(true, Ordering::SeqCst);
+
+        let key = ("local".to_string(), "late".to_string());
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let err = runtime.reserve_engine(&key, 4004, GIB, tx).unwrap_err();
+        assert!(err.contains("shutting down"), "got {err}");
+        assert!(
+            !runtime.engine_present(&key),
+            "a refused reservation leaves nothing to spawn against"
+        );
+    }
+
+    #[test]
+    fn the_shutdown_latch_also_refuses_a_spawn_that_was_already_reserved() {
+        // The latch on `reserve_engine` closes the window before a
+        // reservation; this closes the one after it. A supervisor whose
+        // reservation was accepted a moment before the quit lands can have
+        // its first poll scheduled *after* the drain walked the registry —
+        // and an unconditional `command.spawn()` there starts a subprocess
+        // into a process about to `exit()`.
+        let runtime = LocalRuntime::default();
+        assert_eq!(
+            runtime.spawn_unless_shutting_down(|| "spawned"),
+            Some("spawned"),
+            "an ordinary load spawns"
+        );
+
+        runtime.shutting_down.store(true, Ordering::SeqCst);
+        assert_eq!(
+            runtime.spawn_unless_shutting_down(|| "spawned"),
+            None,
+            "once the drain has run, nothing may start a child"
         );
     }
 
