@@ -157,6 +157,17 @@ pub fn config_home() -> Result<PathBuf, AppError> {
 /// that does not exist. Whoever resolves this path must agree with systemd,
 /// not with the spec's letter alone — here they happen to coincide.
 ///
+/// **The same absoluteness rule applies to the `HOME` fallback**, and for the
+/// same reason: systemd ignores a relative or empty `HOME` too — with
+/// `HOME=relative` it still answers `$HOME`-from-passwd (`/root/.config` in
+/// the container this was checked in) and still searches
+/// `/root/.config/systemd/user`. Where we *do* diverge is the last step:
+/// systemd has a third source (the passwd database) and we do not read it, so
+/// rather than guess we refuse. A refusal is honest and actionable; resolving
+/// `relative/.config` against the CWD would be neither, and the error message
+/// here has always promised "set to an absolute path" — this makes the code
+/// keep that promise.
+///
 /// Pure over its inputs so the four cases are testable without mutating the
 /// process environment, which is global and these tests run in parallel.
 fn resolve_config_home(
@@ -169,11 +180,14 @@ fn resolve_config_home(
     {
         return Ok(dir);
     }
-    home.filter(|v| !v.is_empty())
-        .map(|h| PathBuf::from(h).join(".config"))
+    home.map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .map(|h| h.join(".config"))
         .ok_or_else(|| AppError::Config {
             message: "neither XDG_CONFIG_HOME nor HOME is set to an absolute \
-                      path, so there is no user unit directory to install into"
+                      path, so there is no user unit directory to install into \
+                      (set one, or pass an explicit path with `--exec` after \
+                      creating the unit yourself)"
                 .into(),
         })
 }
@@ -725,8 +739,25 @@ mod tests {
             expected
         );
         assert_eq!(resolve_config_home(None, home()).unwrap(), expected);
+
+        // The HOME fallback obeys the same rule — there is no third source
+        // here (systemd has one, the passwd database, and falls back to it;
+        // we don't read it, so we refuse rather than resolve `relative/
+        // .config` against the CWD, where the manager would never look).
+        for bad_home in ["relative", "./home", ""] {
+            let err = resolve_config_home(None, Some(OsString::from(bad_home)))
+                .expect_err("a relative HOME is no better than a relative XDG_CONFIG_HOME");
+            assert!(err.to_string().contains("absolute"), "got {err}");
+            // And an absolute XDG_CONFIG_HOME still wins over a useless HOME.
+            assert_eq!(
+                resolve_config_home(Some(OsString::from("/xdg")), Some(OsString::from(bad_home)))
+                    .unwrap(),
+                PathBuf::from("/xdg")
+            );
+        }
         // Neither usable: an honest refusal, not a relative guess.
         assert!(resolve_config_home(Some(OsString::from("rel/cfg")), None).is_err());
+        assert!(resolve_config_home(None, None).is_err());
     }
 
     #[test]
