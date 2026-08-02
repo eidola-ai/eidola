@@ -13,8 +13,8 @@ use std::ops::Range;
 
 use eidola_app_core::SpaceInfo;
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    App, AppContext, Context, Entity, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
     UniformListScrollHandle, Window, actions, div, prelude::FluentBuilder as _, px, rems,
     uniform_list,
 };
@@ -262,6 +262,13 @@ impl LibraryView {
         )
     }
 
+    /// Test seam: whether the listing holds the window's focus — what ending an
+    /// inline rename must hand back.
+    #[doc(hidden)]
+    pub fn list_is_focused_for_test(&self, window: &Window) -> bool {
+        self.list_focus.is_focused(window)
+    }
+
     /// Test seam over [`Self::cursor_and_reveal`] — the same computation the
     /// rows render from, so pinning it pins the render.
     #[doc(hidden)]
@@ -333,7 +340,7 @@ impl LibraryView {
             window,
             |this, _, ev: &InputEvent, window, cx| match ev {
                 InputEvent::PressEnter { .. } => this.commit_rename(window, cx),
-                InputEvent::Blur => this.cancel_rename(cx),
+                InputEvent::Blur => this.cancel_rename(window, cx),
                 _ => {}
             },
         )];
@@ -343,7 +350,7 @@ impl LibraryView {
 
     /// Commit the in-progress rename — write the new title to the store and
     /// close the input.
-    pub fn commit_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((space_id, input_state, _)) = self.renaming.take() {
             let title = input_state.read(cx).value().to_string();
             let title = title.trim().to_string();
@@ -351,14 +358,42 @@ impl LibraryView {
                 self.spaces
                     .update(cx, |s, cx| s.rename(space_id, title, cx));
             }
+            self.return_focus_to_list(&input_state, window, cx);
         }
         cx.notify();
     }
 
     /// Cancel an in-progress rename without persisting anything.
-    pub fn cancel_rename(&mut self, cx: &mut Context<Self>) {
-        self.renaming = None;
+    pub fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, input, _)) = self.renaming.take() {
+            self.return_focus_to_list(&input, window, cx);
+        }
         cx.notify();
+    }
+
+    /// Hand focus back to the listing after an inline rename ends — but only
+    /// if the rename's input still **held** it.
+    ///
+    /// `begin_rename` focuses the row's input, and ending the session removes
+    /// that input, so without this the window keeps a handle whose element is
+    /// gone: the dispatch tree has no node for it, the roving keys reach
+    /// nothing, and `focus_next` restarts the walk from the top of the window.
+    /// The same cure as `RecordView::close_detail`, for the same reason.
+    ///
+    /// The guard is what makes it safe to call from every exit. `Blur` ends a
+    /// session precisely *because* focus went somewhere else — refocusing there
+    /// would drag it back out of whatever the user just clicked. Enter and
+    /// Escape end it while the input still has focus, which is the case that
+    /// needs rescuing.
+    fn return_focus_to_list(
+        &mut self,
+        input: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if input.read(cx).focus_handle(cx).is_focused(window) {
+            window.focus(&self.list_focus, cx);
+        }
     }
 
     /// The id of the space currently being renamed, if any. Used by
@@ -584,7 +619,9 @@ impl LibraryView {
             .gap_3()
             .items_center()
             .cursor_pointer()
-            .on_action(cx.listener(|this, _: &CancelRename, _, cx| this.cancel_rename(cx)))
+            .on_action(
+                cx.listener(|this, _: &CancelRename, window, cx| this.cancel_rename(window, cx)),
+            )
             .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
                 this.set_row_hover(idx, *hovering, cx);
             }));

@@ -155,6 +155,9 @@ impl TemplatesSettingsView {
 
     pub fn begin_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let title = cx.new(|cx| InputState::new(window, cx).placeholder("Template name"));
+        // A reveal focuses what it revealed — see `backends_settings`'s
+        // `begin_edit_base_url` for why an unfocused reveal strands the reader.
+        title.update(cx, |s, cx| s.focus(window, cx));
         let default_model = self.stores.config.read(cx).default_model();
         let agent =
             self.new_participant_draft("Assistant", Some(default_model), None, "human", window, cx);
@@ -173,6 +176,7 @@ impl TemplatesSettingsView {
             return;
         };
         let title = cx.new(|cx| InputState::new(window, cx).default_value(&t.title));
+        title.update(cx, |s, cx| s.focus(window, cx));
         let participants = t
             .participants
             .iter()
