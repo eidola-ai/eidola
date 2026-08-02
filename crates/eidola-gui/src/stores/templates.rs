@@ -2,12 +2,12 @@
 //! Templates pane's data source).
 //!
 //! Per `crates/eidola-gui/STATE.md`: one gpui entity owning the
-//! `Loadable<Vec<SpaceTemplateInfo>>` snapshot, one supersede task slot (shared
-//! by the list refresh and the write-through CRUD ops, which compose
-//! `write; re-list` so the store reconciles even without the bus), its
-//! subscription to `Change::Templates` (routed in `stores::dispatch_change`),
-//! and *all* mutations of the template domain. Views call these methods; they
-//! never touch `AppCore` directly.
+//! `Loadable<Vec<SpaceTemplateInfo>>` snapshot, **one task slot per operation**
+//! (a refresh slot and a mutation slot — see [`TemplatesStore::refresh`] for
+//! why they are not one), its subscription to `Change::Templates` and
+//! `Change::Participants` (routed in `stores::dispatch_change`), and *all*
+//! mutations of the template domain. Views call these methods; they never touch
+//! `AppCore` directly.
 
 use std::sync::Arc;
 
@@ -20,9 +20,16 @@ use crate::loadable::Loadable;
 pub struct TemplatesStore {
     app_core: Option<Arc<AppCore>>,
     templates: Loadable<Vec<SpaceTemplateInfo>>,
-    /// Supersede slot for the list refresh and every write-through CRUD op
-    /// (each composes `write; re-list`, replace-cancels).
-    task: Option<Task<()>>,
+    /// Supersede slot for the **list refresh** (launch, the pane's Retry, and
+    /// every bus-driven `Change::Templates` / `Change::Participants`).
+    refresh_task: Option<Task<()>>,
+    /// Supersede slot for the **write-through CRUD ops** (each composes
+    /// `write; re-list`). Separate from the refresh slot so an unrelated
+    /// bus-driven refresh can never cancel a mutation's completion — see
+    /// [`TemplatesStore::refresh`].
+    op_task: Option<Task<()>>,
+    /// A refresh signalled while a mutation held the read; run once it lands.
+    refresh_pending: bool,
     /// The last write error, surfaced by the pane's op-error banner.
     op_error: Option<String>,
 }
@@ -32,7 +39,9 @@ impl TemplatesStore {
         Self {
             app_core,
             templates: Loadable::NotLoaded,
-            task: None,
+            refresh_task: None,
+            op_task: None,
+            refresh_pending: false,
             op_error: None,
         }
     }
@@ -46,7 +55,9 @@ impl TemplatesStore {
             } else {
                 Loadable::loaded(templates)
             },
-            task: None,
+            refresh_task: None,
+            op_task: None,
+            refresh_pending: false,
             op_error: None,
         }
     }
@@ -95,17 +106,39 @@ impl TemplatesStore {
         }
     }
 
-    /// Refresh the registry. Fire-and-notify supersede slot.
+    /// Refresh the registry. Fire-and-notify supersede slot — its **own**
+    /// slot, deliberately not the mutation's.
+    ///
+    /// Refreshes arrive from the bus, on signals this store does not raise:
+    /// `Change::Templates` (which a write of its own emits *before it returns*)
+    /// and `Change::Participants` (a shared participant edited anywhere). With
+    /// one shared slot each of those cancelled the gpui half of an in-flight
+    /// mutation — the core write still completed (`bridge` drops the tokio
+    /// `JoinHandle`, it cancels nothing), but the continuation that surfaces
+    /// `op_error` and applies the mutation's own re-list never ran, so a failed
+    /// create could report success by saying nothing at all.
+    ///
+    /// The split alone would trade that for a staleness race — a read issued
+    /// before the write, resolving after it, re-staling the snapshot — so the
+    /// two slots are ordered rather than merely parallel: a mutation takes over
+    /// the read (see [`Self::write_then_relist`]), and a refresh signalled while
+    /// one is in flight is **deferred** to its completion rather than started
+    /// beside it. Deferring is what keeps the signal: the deferred read runs
+    /// after the mutation's snapshot lands, so it can only be fresher.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(core) = self.app_core.clone() else {
             return;
         };
+        if self.op_task.is_some() {
+            self.refresh_pending = true;
+            return;
+        }
         self.templates = std::mem::take(&mut self.templates).to_loading();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let result = bridge(core, |c| async move { c.list_space_templates().await }).await;
             let _ = this.update(cx, |this, cx| {
                 this.templates = std::mem::take(&mut this.templates).resolve(result);
-                this.task = None;
+                this.refresh_task = None;
                 cx.notify();
             });
         }));
@@ -125,6 +158,13 @@ impl TemplatesStore {
     /// error still wins the `op_error` slot; a re-list that itself fails leaves
     /// the prior snapshot in place rather than replacing the write's error with
     /// a read's.
+    ///
+    /// **A mutation takes over the read** — it drops any in-flight refresh,
+    /// which may have been issued *before* this write and would re-stale the
+    /// snapshot by resolving after it. Cancelling another slot's fetch is a debt
+    /// (`crates/eidola-gui/STATE.md` → "Concurrency patterns"); the
+    /// unconditional re-list above discharges it on every exit, failure
+    /// included, and a refresh signalled meanwhile runs once this op lands.
     fn write_then_relist<F>(&mut self, cx: &mut Context<Self>, op: F)
     where
         F: FnOnce(
@@ -138,8 +178,11 @@ impl TemplatesStore {
             return;
         };
         self.op_error = None;
+        // Take over the read for the duration of the write (see the doc above).
+        self.refresh_task = None;
+        self.refresh_pending = false;
         let relist_core = core.clone();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.op_task = Some(cx.spawn(async move |this, cx| {
             let op_result = op(core).await;
             let list = bridge(
                 relist_core,
@@ -153,7 +196,10 @@ impl TemplatesStore {
                 if let Err(e) = op_result {
                     this.op_error = Some(e);
                 }
-                this.task = None;
+                this.op_task = None;
+                if std::mem::take(&mut this.refresh_pending) {
+                    this.refresh(cx);
+                }
                 cx.notify();
             });
         }));
