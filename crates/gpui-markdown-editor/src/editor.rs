@@ -689,6 +689,24 @@ impl MarkdownEditorState {
         &self.highlights
     }
 
+    /// Place the caret at the end of the buffer and insert `text` there (host
+    /// API). The seam for "the user started typing at something that isn't
+    /// this editor, and the host decided the keystrokes belong here" — the
+    /// space view's type-to-compose jump. Routed through the normal update
+    /// pipeline ([`EditorEvent::InsertText`]), so it records one undo step and
+    /// emits [`MarkdownEditorEvent::Change`] like any typed insertion; the
+    /// preceding `SetSelection` collapses any selection rather than replacing
+    /// it, because the host's intent is *append*, not *replace*. A no-op on a
+    /// disabled (read-only) editor, whose buffer the host owns.
+    pub fn append_at_end(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
+        let end = self.state.markdown.len();
+        self.dispatch(EditorEvent::SetSelection(Selection::Cursor(end)), cx);
+        self.dispatch(EditorEvent::InsertText(text.into()), cx);
+    }
+
     /// Insert the canonical `{{ embed N }}` marker as its **own top-level
     /// paragraph** at the caret (host API — the quote-creation seam). The
     /// marker only renders as an embed block when it stands as a

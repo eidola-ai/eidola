@@ -13,9 +13,10 @@ use std::ops::Range;
 
 use eidola_app_core::SpaceInfo;
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    UniformListScrollHandle, Window, actions, div, px, rems, uniform_list,
+    App, AppContext, Context, Entity, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    UniformListScrollHandle, Window, actions, div, prelude::FluentBuilder as _, px, rems,
+    uniform_list,
 };
 use gpui_component::{
     ActiveTheme, IconName, Sizable,
@@ -26,10 +27,37 @@ use gpui_component::{
 };
 
 use crate::actions::CloseWindow;
+use crate::focus::TabRegion as _;
 use crate::probe::Probe as _;
 use crate::stores::{SpacesStore, Stores};
 
 actions!(library, [CancelRename]);
+
+/// Where the roving cursor stands this frame, resolved once per rendered
+/// window of rows — see [`LibraryView::cursor_and_reveal`] for the two
+/// predicates, and why the ring takes a third.
+#[derive(Clone, Copy)]
+struct RowFocus {
+    /// The row that *is* the cursor: ring identity and a11y focus.
+    cursor: Option<usize>,
+    /// The row that *draws* the ring — the cursor under keyboard modality.
+    ring: Option<usize>,
+    /// The row whose hover-gated verbs are revealed.
+    revealed: Option<usize>,
+}
+
+impl RowFocus {
+    fn resolve(view: &LibraryView, window: &Window, cx: &App) -> Self {
+        let (cursor, revealed) = view.cursor_and_reveal(window, cx);
+        Self {
+            cursor,
+            // A *programmatic* focus must not paint a keyboard cursor for a
+            // pointer user.
+            ring: cursor.filter(|_| window.last_input_was_keyboard()),
+            revealed,
+        }
+    }
+}
 
 /// Vertical reserve at the top of the window — under the macOS traffic
 /// lights, or hosting the Linux CSD window controls + drag strip (same
@@ -57,6 +85,26 @@ pub struct LibraryView {
     focus_handle: FocusHandle,
     /// Scroll handle for the virtualized listing.
     scroll: UniformListScrollHandle,
+    /// **The listing is one tab stop with a roving cursor** — the shape the
+    /// space tree already ships, and the only shape a virtualized list can
+    /// have. `uniform_list` materializes only the visible window, so a tab stop
+    /// per row is a tab order that literally does not contain the rows you
+    /// haven't scrolled to: Tab walked off the end of the visible slice and out
+    /// of the library. So the list holds focus (this handle, the sole stop of
+    /// the `MAIN` region), ↑/↓/Home/End move [`Self::focused_row`] — scrolling
+    /// it into view — and Enter opens it. The cursor's row wears the ring and
+    /// reveals its verbs (audit S7: gpui suppresses hover entirely under
+    /// keyboard modality), and those verbs are ordinary tab stops painted
+    /// inside the list, so Tab from the list reaches Rename then Archive for
+    /// exactly that row.
+    list_focus: FocusHandle,
+    /// The roving cursor: which row the keyboard is on. Read through
+    /// [`Self::cursor`], never directly — rows come and go under it (an
+    /// archive, a bus-driven re-list, a rename that reorders), so the stored
+    /// value is clamped at every use rather than chased at every mutation
+    /// site. Always meaningful once clamped; it simply isn't *shown* while the
+    /// list doesn't hold focus, so entering the listing lands on the first row.
+    focused_row: usize,
     /// Test-only: how many times `open_space` has been invoked. Lets the
     /// pencil-propagation regression test prove that clicking the rename pencil
     /// does NOT also trigger the row's open (`open_space` itself defers a real
@@ -81,6 +129,11 @@ impl LibraryView {
             renaming: None,
             focus_handle,
             scroll: UniformListScrollHandle::new(),
+            list_focus: cx
+                .focus_handle()
+                .tab_index(crate::focus::region::MAIN)
+                .tab_stop(true),
+            focused_row: 0,
             open_space_requests: 0,
             _subscriptions,
         }
@@ -119,6 +172,118 @@ impl LibraryView {
     /// The row index currently hovered, if any. Exposed for behavior tests.
     pub fn hovered_row(&self) -> Option<usize> {
         self.hovered
+    }
+
+    /// The **effective** cursor: clamped into the current listing, and `None`
+    /// when the library is empty. Deriving it on read is what keeps a
+    /// shrinking listing honest — archive the last row while the cursor is on
+    /// it and the cursor lands on the new last row, rather than pointing one
+    /// past the end where Enter is dead and no row draws the ring.
+    fn cursor(&self, cx: &App) -> Option<usize> {
+        self.spaces
+            .read(cx)
+            .list()
+            .len()
+            .checked_sub(1)
+            .map(|last| self.focused_row.min(last))
+    }
+
+    /// The listing's roving-focus key map: ↑/↓ move the cursor, Home/End take
+    /// its ends, Enter opens the row it sits on. Returns `true` when it
+    /// consumed the press.
+    ///
+    /// Gated on the **list itself** holding focus, not on containing it: once
+    /// Tab has moved on to the cursor row's Rename or Archive verb, that verb
+    /// owns the keyboard — gpui fires its activation on key *up*, and a
+    /// listener here would otherwise also open the space on the key *down* of
+    /// the very same press.
+    fn handle_list_key(
+        &mut self,
+        ev: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.list_focus.is_focused(window) || ev.keystroke.modifiers.modified() {
+            return false;
+        }
+        let count = self.spaces.read(cx).list().len();
+        let (Some(last), Some(cursor)) = (count.checked_sub(1), self.cursor(cx)) else {
+            return false;
+        };
+        let target = match ev.keystroke.key.as_str() {
+            "up" => cursor.saturating_sub(1),
+            "down" => (cursor + 1).min(last),
+            "home" => 0,
+            "end" => last,
+            "enter" => {
+                let Some(space) = self.spaces.read(cx).list().get(cursor) else {
+                    return false;
+                };
+                let id = space.id.clone();
+                self.open_space(id, cx);
+                return true;
+            }
+            _ => return false,
+        };
+        self.focus_row(target, cx);
+        true
+    }
+
+    /// Move the roving cursor to `idx` and scroll it into view. The scroll is
+    /// what makes one tab stop equivalent to a per-row one: an off-screen row
+    /// is materialized by the list before it can be read.
+    fn focus_row(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.focused_row = idx;
+        self.scroll.scroll_to_item(idx, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// **Two questions, two predicates** — `(cursor, revealed)`, and the row
+    /// render reads exactly this pair, so the rule has one statement.
+    ///
+    /// The *cursor* — the ring and the row's focus identity — belongs to the row
+    /// only while the list **itself** holds focus: Tab moving on to that row's
+    /// Rename verb makes the verb the focused element, and it paints its own
+    /// ring, so keeping the row's would be two focus indications for one focus
+    /// (and would report a row as focused while the real focus is a button
+    /// inside it). The *reveal* stays on `contains_focused`, because the verbs
+    /// must not vanish out from under the Tab that just reached them.
+    fn cursor_and_reveal(&self, window: &Window, cx: &App) -> (Option<usize>, Option<usize>) {
+        let cursor = self.cursor(cx);
+        (
+            self.list_focus
+                .is_focused(window)
+                .then_some(cursor)
+                .flatten(),
+            self.list_focus
+                .contains_focused(window, cx)
+                .then_some(cursor)
+                .flatten(),
+        )
+    }
+
+    /// Test seam: whether the listing holds the window's focus — what ending an
+    /// inline rename must hand back.
+    #[doc(hidden)]
+    pub fn list_is_focused_for_test(&self, window: &Window) -> bool {
+        self.list_focus.is_focused(window)
+    }
+
+    /// Test seam over [`Self::cursor_and_reveal`] — the same computation the
+    /// rows render from, so pinning it pins the render.
+    #[doc(hidden)]
+    pub fn cursor_and_reveal_for_test(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> (Option<usize>, Option<usize>) {
+        self.cursor_and_reveal(window, cx)
+    }
+
+    /// Test seam: where the roving cursor effectively sits.
+    #[doc(hidden)]
+    pub fn focused_row_for_test(&self, cx: &App) -> Option<usize> {
+        self.cursor(cx)
     }
 
     /// Archive a space. Called by the hover-revealed × button; public so
@@ -175,7 +340,7 @@ impl LibraryView {
             window,
             |this, _, ev: &InputEvent, window, cx| match ev {
                 InputEvent::PressEnter { .. } => this.commit_rename(window, cx),
-                InputEvent::Blur => this.cancel_rename(cx),
+                InputEvent::Blur => this.cancel_rename(window, cx),
                 _ => {}
             },
         )];
@@ -185,7 +350,7 @@ impl LibraryView {
 
     /// Commit the in-progress rename — write the new title to the store and
     /// close the input.
-    pub fn commit_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((space_id, input_state, _)) = self.renaming.take() {
             let title = input_state.read(cx).value().to_string();
             let title = title.trim().to_string();
@@ -193,14 +358,42 @@ impl LibraryView {
                 self.spaces
                     .update(cx, |s, cx| s.rename(space_id, title, cx));
             }
+            self.return_focus_to_list(&input_state, window, cx);
         }
         cx.notify();
     }
 
     /// Cancel an in-progress rename without persisting anything.
-    pub fn cancel_rename(&mut self, cx: &mut Context<Self>) {
-        self.renaming = None;
+    pub fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, input, _)) = self.renaming.take() {
+            self.return_focus_to_list(&input, window, cx);
+        }
         cx.notify();
+    }
+
+    /// Hand focus back to the listing after an inline rename ends — but only
+    /// if the rename's input still **held** it.
+    ///
+    /// `begin_rename` focuses the row's input, and ending the session removes
+    /// that input, so without this the window keeps a handle whose element is
+    /// gone: the dispatch tree has no node for it, the roving keys reach
+    /// nothing, and `focus_next` restarts the walk from the top of the window.
+    /// The same cure as `RecordView::close_detail`, for the same reason.
+    ///
+    /// The guard is what makes it safe to call from every exit. `Blur` ends a
+    /// session precisely *because* focus went somewhere else — refocusing there
+    /// would drag it back out of whatever the user just clicked. Enter and
+    /// Escape end it while the input still has focus, which is the case that
+    /// needs rescuing.
+    fn return_focus_to_list(
+        &mut self,
+        input: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if input.read(cx).focus_handle(cx).is_focused(window) {
+            window.focus(&self.list_focus, cx);
+        }
     }
 
     /// The id of the space currently being renamed, if any. Used by
@@ -213,7 +406,12 @@ impl LibraryView {
     /// Render the visible window of listing rows. Indexer for the virtualized
     /// `uniform_list` — clones only the visible slice from the store, so the
     /// per-frame cost is O(visible), not O(loaded).
-    fn render_rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+    fn render_rows(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
         let total = self.spaces.read(cx).list().len();
         let visible: Vec<(usize, SpaceInfo)> = self
             .spaces
@@ -222,9 +420,13 @@ impl LibraryView {
             .get(range.clone())
             .map(|slice| range.clone().zip(slice.iter().cloned()).collect())
             .unwrap_or_default();
+        let focus = RowFocus::resolve(self, window, cx);
         visible
             .into_iter()
-            .map(|(idx, space)| self.render_row(idx, &space, total, cx).into_any_element())
+            .map(|(idx, space)| {
+                self.render_row(idx, &space, total, focus, cx)
+                    .into_any_element()
+            })
             .collect()
     }
 
@@ -233,10 +435,16 @@ impl LibraryView {
         idx: usize,
         space: &SpaceInfo,
         total: usize,
+        focus: RowFocus,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let hovered = self.hovered == Some(idx);
+        let is_keyboard_row = focus.cursor == Some(idx);
+        // Hover **or** the keyboard cursor: gpui suppresses hover entirely
+        // under keyboard modality, so without the second half a keyboard user
+        // could reach a row and find its verbs gone (audit S7). This half uses
+        // the *reveal* predicate, which survives Tab moving into the verbs.
+        let hovered = self.hovered == Some(idx) || focus.revealed == Some(idx);
         let space_id = space.id.clone();
         let archive_id = space.id.clone();
         let rename_id = space.id.clone();
@@ -316,6 +524,14 @@ impl LibraryView {
                             gpui::Role::Button,
                             format!("Rename {row_label}"),
                         )
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            cx.stop_propagation();
+                            let id = rename_id.clone();
+                            let title = rename_title.clone();
+                            cx.defer_in(window, move |this, window, cx| {
+                                this.begin_rename(id, title, window, cx);
+                            });
+                        }))
                         .debug_selector(move || format!("rename-pencil-{idx}"))
                         .on_mouse_down(
                             gpui::MouseButton::Left,
@@ -334,17 +550,7 @@ impl LibraryView {
                                 // ("Aa") is the quiet text-edit affordance that
                                 // reads as "rename this title".
                                 .icon(IconName::CaseSensitive)
-                                .on_click(cx.listener(move |_, _, window, cx| {
-                                    // Don't let the click also open the row.
-                                    cx.stop_propagation();
-                                    // Defer the reshape so the in-flight click
-                                    // sequence finishes against the old layout.
-                                    let id = rename_id.clone();
-                                    let title = rename_title.clone();
-                                    cx.defer_in(window, move |this, window, cx| {
-                                        this.begin_rename(id, title, window, cx);
-                                    });
-                                })),
+                                .tab_stop(false),
                         ),
                 )
                 .child(
@@ -355,6 +561,10 @@ impl LibraryView {
                             gpui::Role::Button,
                             format!("Archive {row_label}"),
                         )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.archive(archive_id.clone(), cx);
+                        }))
                         .debug_selector(move || format!("archive-x-{idx}"))
                         .on_mouse_down(
                             gpui::MouseButton::Left,
@@ -369,17 +579,17 @@ impl LibraryView {
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Close)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.archive(archive_id.clone(), cx);
-                                })),
+                                .tab_stop(false),
                         ),
                 );
         }
 
         let mut row = h_flex()
             .id(("space-row", idx))
-            .probe(
+            // The list holds the keyboard and moves a cursor over its rows, so
+            // a row is a *managed descendant*, never a tab stop — see
+            // `probe_delegating` and [`Self::list_focus`].
+            .probe_delegating(
                 format!("library/row/{idx}"),
                 gpui::Role::ListItem,
                 row_label,
@@ -388,12 +598,30 @@ impl LibraryView {
             // set metadata AT sees "6 spaces" in a library of six hundred.
             .aria_position_in_set(idx + 1)
             .aria_size_of_set(total)
+            .aria_selected(is_keyboard_row)
+            // The active-descendant half of the roving pattern: the focused
+            // node is the `List` above, and this row is what AT should report
+            // as focused inside it. gpui honours it only when the focused node
+            // really is an ancestor of this one, which is exactly the shape
+            // here (`uniform_list` contributes no node, so the row's a11y
+            // parent *is* the list).
+            .when(is_keyboard_row, |d| d.aria_active_descendant())
+            // The cursor's ring is drawn here rather than by `focus_visible`,
+            // because the focused *element* is the list; this is the row its
+            // cursor is on. The modality guard is what keeps a *programmatic*
+            // focus (the Record's back-out precedent) from painting a keyboard
+            // cursor for a pointer user.
+            .when(focus.ring == Some(idx), |d| {
+                d.shadow(crate::focus::ring_shadows(crate::focus::ring_colors()))
+            })
             .w_full()
             .h(ROW_H)
             .gap_3()
             .items_center()
             .cursor_pointer()
-            .on_action(cx.listener(|this, _: &CancelRename, _, cx| this.cancel_rename(cx)))
+            .on_action(
+                cx.listener(|this, _: &CancelRename, window, cx| this.cancel_rename(window, cx)),
+            )
             .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
                 this.set_row_hover(idx, *hovering, cx);
             }));
@@ -546,7 +774,9 @@ impl Render for LibraryView {
         let list = uniform_list(
             "library-list",
             count,
-            cx.processor(|this, range: Range<usize>, _window, cx| this.render_rows(range, cx)),
+            cx.processor(|this, range: Range<usize>, window, cx| {
+                this.render_rows(range, window, cx)
+            }),
         )
         .h_full()
         .w_full()
@@ -573,6 +803,25 @@ impl Render for LibraryView {
                     // live), so the wrapper that already spans the viewport is
                     // where the `List` parent goes.
                     .probe("library/list", gpui::Role::List, "Spaces")
+                    .tab_region(crate::focus::region::MAIN)
+                    // **The listing's single tab stop lives on the element that
+                    // carries the role.** `uniform_list` cannot take one
+                    // (`InteractiveElement` but not `StatefulInteractiveElement`,
+                    // where gpui's aria builders live), so a handle tracked
+                    // there focuses a node the AccessKit tree does not contain
+                    // — `A11y::set_focus` is a no-op for a node-less element and
+                    // `TreeUpdate.focus` falls back to the window root. Tracked
+                    // here, focus lands on the `List` node and the cursor row
+                    // reports itself as its active descendant. The handle
+                    // carries `tab_index(MAIN)` because gpui reads tab order off
+                    // the *handle* once one is tracked, and the element's own
+                    // `tab_region` index only opens the group.
+                    .track_focus(&self.list_focus)
+                    .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                        if this.handle_list_key(ev, window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
                     .relative()
                     .h_full()
                     .w_full()

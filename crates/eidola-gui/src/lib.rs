@@ -7,6 +7,7 @@ pub mod actions;
 pub mod backends_settings;
 pub mod bridge;
 pub mod chrome;
+pub mod focus;
 pub mod general;
 pub mod library;
 pub mod lifecycle;

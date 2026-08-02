@@ -48,9 +48,9 @@ use eidola_app_core::{
     MeasurementInfo, NewBackend,
 };
 use gpui::{
-    AppContext, ClipboardItem, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
-    prelude::FluentBuilder, px,
+    App, AppContext, ClipboardItem, Context, Entity, Focusable as _, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     ActiveTheme, Sizable, StyledExt,
@@ -64,6 +64,7 @@ use gpui_component::{
 };
 
 use crate::actions::OpenRecord;
+use crate::focus::TabRegion as _;
 use crate::probe::Probe as _;
 use crate::stores::{BackendsStore, ConfigStore, LocalModelsStore, Stores};
 
@@ -309,6 +310,16 @@ impl BackendsSettingsView {
 
     /// Whether the Eidola tab's base-URL row is in its edit state (test
     /// accessor).
+    /// Test seam: whether the base-URL editor's input holds the window's
+    /// focus — what a keyboard-activated reveal must leave behind.
+    #[doc(hidden)]
+    pub fn base_url_input_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.base_url_state
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }
+
     pub fn editing_base_url(&self) -> bool {
         self.editing_base_url
     }
@@ -324,6 +335,14 @@ impl BackendsSettingsView {
             .unwrap_or_default();
         self.base_url_state.update(cx, |s, cx| {
             s.set_value(&current, window, cx);
+            // **A reveal focuses what it revealed.** The affordance that opened
+            // this row unmounts as the row becomes the form, so a keyboard
+            // reader who pressed Enter on it is left with focus on nothing at
+            // all — the window keeps a handle whose element is gone, the
+            // dispatch tree has no node for it, and Tab restarts from the top
+            // of the window. Its siblings here (`begin_add_measurement`,
+            // `begin_edit_ca`) already did this; this row did not.
+            s.focus(window, cx);
         });
         self.editing_base_url = true;
         cx.notify();
@@ -535,6 +554,8 @@ impl BackendsSettingsView {
         let engine_state = cx.new(|cx| {
             InputState::new(window, cx).placeholder("optional — discovered if left blank")
         });
+        // The reveal focuses its first field — see `begin_edit_base_url`.
+        id_state.update(cx, |s, cx| s.focus(window, cx));
         self.add_form = Some(AddForm {
             kind,
             id_state,
@@ -1182,6 +1203,7 @@ impl BackendsSettingsView {
     ) -> impl IntoElement + use<> {
         let id = backend_id.to_string();
         let id_click = id.clone();
+        let id_key = id.clone();
         div()
             .id(SharedString::from(format!("autostart-{id}")))
             .probe(
@@ -1189,7 +1211,24 @@ impl BackendsSettingsView {
                 gpui::Role::CheckBox,
                 "Start an engine automatically on request",
             )
-            .aria_selected(auto_start)
+            // A checkbox's state is `toggled`, not `selected`:
+            // `accesskit_macos` reads `accessibilityValue` from `toggled()`
+            // first and only falls through to `is_selected()` for `Role::Tab`,
+            // so a `CheckBox` carrying only `aria_selected` reports **no
+            // value at all** — VoiceOver announces the control and not whether
+            // it is on.
+            .aria_toggled(auto_start.into())
+            // The wrapper owns the **keyboard** activation. Unlike `Button` /
+            // `Checkbox`, `gpui_component::Switch` tracks no focus handle at
+            // our pin, so there is nothing inside for Tab to reach — see
+            // `probe_delegating`'s doc for the other half of the rule. This does
+            // not double-fire on a pointer click: `Switch` handles the press
+            // in `on_mouse_down` and calls `stop_propagation`, so the wrapper
+            // never arms a click of its own (gpui bubbles mouse listeners
+            // innermost-first).
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_auto_start(id_key.clone(), !auto_start, cx);
+            }))
             .child(
                 Switch::new(SharedString::from(format!("autostart-switch-{id}")))
                     .small()
@@ -1290,7 +1329,14 @@ impl BackendsSettingsView {
                                     gpui::Role::CheckBox,
                                     "Start an engine automatically on request",
                                 )
-                                .aria_selected(form.auto_start)
+                                // See `autostart_row`: a checkbox's state is
+                                // `toggled`, which is what the adapter reads.
+                                .aria_toggled(form.auto_start.into())
+                                // The wrapper owns the keyboard activation —
+                                // see `autostart_row` for why.
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.toggle_add_auto_start(cx)),
+                                )
                                 .child(
                                     Switch::new("add-autostart-switch")
                                         .small()
@@ -1403,6 +1449,7 @@ impl Render for BackendsSettingsView {
                     gpui::Role::TabList,
                     "Backend kinds",
                 )
+                .tab_region(crate::focus::region::NAV)
                 .w_full()
                 .child(
                     TabBar::new("backends-tab-bar")
@@ -1553,14 +1600,13 @@ impl BackendsSettingsView {
                                     gpui::Role::Button,
                                     "Save",
                                 )
+                                .on_click(cx.listener(|this, _, _, cx| this.save_base_url(cx)))
                                 .child(
                                     Button::new("eidola-save-base-url")
                                         .primary()
                                         .small()
                                         .label("Save")
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.save_base_url(cx)),
-                                        ),
+                                        .tab_stop(false),
                                 ),
                         )
                         .child(
@@ -1571,14 +1617,15 @@ impl BackendsSettingsView {
                                     gpui::Role::Button,
                                     "Cancel",
                                 )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.cancel_edit_base_url(cx)),
+                                )
                                 .child(
                                     Button::new("eidola-cancel-base-url")
                                         .ghost()
                                         .small()
                                         .label("Cancel")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cancel_edit_base_url(cx)
-                                        })),
+                                        .tab_stop(false),
                                 ),
                         ),
                 );

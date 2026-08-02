@@ -11,8 +11,8 @@
 
 use eidola_app_core::CredentialLifecycleInfo;
 use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
-    Subscription, Window, div,
+    Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Sizable, StyledExt, WindowExt,
@@ -159,14 +159,25 @@ impl Render for WalletView {
                         gpui::Role::Button,
                         "Recover in-flight",
                     )
+                    // One predicate decides both the tab stop and the
+                    // activation — see `updates.rs`'s check affordance for why
+                    // `tab_stop(false)` alone leaves a focused wrapper able to
+                    // re-invoke an in-flight recovery on a second Enter.
+                    .map(|d| {
+                        if busy {
+                            d.tab_stop(false)
+                        } else {
+                            d.on_click(cx.listener(|this, _, window, cx| {
+                                this.recover_all(window, cx);
+                            }))
+                        }
+                    })
                     .child(
                         Button::new("recover-all")
                             .small()
                             .label("Recover in-flight")
                             .disabled(busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.recover_all(window, cx);
-                            })),
+                            .tab_stop(false),
                     ),
             );
         }
@@ -180,14 +191,15 @@ impl Render for WalletView {
                     gpui::Role::Button,
                     "Refresh credentials",
                 )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.wallet.update(cx, |s, cx| s.refresh(cx));
+                }))
                 .child(
                     Button::new("refresh-credentials")
                         .ghost()
                         .small()
                         .label("Refresh")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.wallet.update(cx, |s, cx| s.refresh(cx));
-                        })),
+                        .tab_stop(false),
                 ),
         );
         header = header.child(actions);

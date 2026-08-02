@@ -27,7 +27,8 @@ use eidola_app_core::{
 use gpui::{
     AsyncApp, ClipboardItem, Context, Div, FocusHandle, InteractiveElement, IntoElement,
     ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div,
+    prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, StyledExt, h_flex,
@@ -38,6 +39,7 @@ use gpui_component::{
 
 use crate::actions::CloseWindow;
 use crate::bridge;
+use crate::focus::TabRegion as _;
 use crate::probe::Probe as _;
 use crate::stores::Stores;
 
@@ -197,6 +199,21 @@ struct Listing<T> {
     /// list closure stays O(visible).
     display: Vec<DisplayRow>,
     scroll: UniformListScrollHandle,
+    /// **The listing is one tab stop with a roving cursor** — the Library's
+    /// shape, and the only one a virtualized list can have (`uniform_list`
+    /// materializes only the visible window, so a tab stop per row is a tab
+    /// order that cannot contain the rows you haven't scrolled to). The list
+    /// tracks this handle; ↑/↓/Home/End move [`Listing::cursor`] and Enter
+    /// opens the row it sits on. Per section, so switching sections restores
+    /// where you were.
+    list_focus: Option<FocusHandle>,
+    /// The roving cursor, as a **display** index (the flat model interleaves
+    /// spending group headers and the load-more row, and the cursor walks what
+    /// is rendered). Read through [`Listing::cursor`], never directly: rows
+    /// come and go under it — a refresh, an archive, a shrinking page — so the
+    /// stored value is clamped at every use rather than chased at every
+    /// mutation site.
+    focused_row: usize,
     /// Supersede slot for this section's page fetch. Replacing the `Listing`
     /// (refresh) drops the slot and cancels the in-flight task, so a
     /// superseded fetch can never land late and append stale or duplicate
@@ -214,12 +231,27 @@ impl<T> Default for Listing<T> {
             loading: false,
             display: Vec::new(),
             scroll: UniformListScrollHandle::new(),
+            list_focus: None,
+            focused_row: 0,
             task: None,
         }
     }
 }
 
 impl<T> Listing<T> {
+    /// The **effective** cursor: clamped into the current display model, and
+    /// `None` when there is nothing to point at. Deriving it on read is what
+    /// keeps a shrinking listing honest without a clamp at every mutation
+    /// site — archive the last row while the cursor is on it and the cursor
+    /// simply lands on the new last row rather than pointing past the end
+    /// (where Enter would be dead and no row would draw the ring).
+    fn cursor(&self) -> Option<usize> {
+        self.display
+            .len()
+            .checked_sub(1)
+            .map(|last| self.focused_row.min(last))
+    }
+
     /// Whether a trailing load-more row should be appended: when there are
     /// more pages, or a page fetch is currently in flight over existing rows
     /// (the in-flight row is honest — it maps to a real fetch task).
@@ -398,6 +430,155 @@ impl RecordView {
         self.fetch_page(self.section, cx);
     }
 
+    /// The current section's listing state, by the one accessor the roving
+    /// cursor needs (the three `Listing<T>`s have different row types, so the
+    /// cursor's `(len, cursor, display row)` view is what gets unified).
+    fn listing_shape(&self, section: RecordSection) -> (usize, Option<usize>, Option<DisplayRow>) {
+        macro_rules! shape {
+            ($l:expr) => {{
+                let cursor = $l.cursor();
+                (
+                    $l.display.len(),
+                    cursor,
+                    cursor.and_then(|i| $l.display.get(i).copied()),
+                )
+            }};
+        }
+        match section {
+            RecordSection::Attestations => shape!(self.attestations),
+            RecordSection::Requests => shape!(self.requests),
+            RecordSection::Spending => shape!(self.spending),
+        }
+    }
+
+    /// Move the current section's roving cursor and scroll it into view — the
+    /// scroll is what materializes an off-screen row, which is what makes one
+    /// tab stop equivalent to a per-row one.
+    fn focus_row(&mut self, idx: usize, cx: &mut Context<Self>) {
+        macro_rules! go {
+            ($l:expr) => {{
+                $l.focused_row = idx;
+                $l.scroll.scroll_to_item(idx, gpui::ScrollStrategy::Top);
+            }};
+        }
+        match self.section {
+            RecordSection::Attestations => go!(self.attestations),
+            RecordSection::Requests => go!(self.requests),
+            RecordSection::Spending => go!(self.spending),
+        }
+        cx.notify();
+    }
+
+    /// The listing's roving-focus key map: ↑/↓ move the cursor, Home/End take
+    /// its ends, Enter opens the row it sits on. Returns `true` when it
+    /// consumed the press.
+    ///
+    /// Gated on the list itself holding focus, not on containing it: the
+    /// load-more row inside it is an ordinary tab stop whose own activation
+    /// fires on key **up**, and a listener here would otherwise fetch a second
+    /// page on the key **down** of the same press.
+    fn handle_list_key(
+        &mut self,
+        ev: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let focused = match self.section {
+            RecordSection::Attestations => &self.attestations.list_focus,
+            RecordSection::Requests => &self.requests.list_focus,
+            RecordSection::Spending => &self.spending.list_focus,
+        };
+        if !focused.as_ref().is_some_and(|h| h.is_focused(window)) {
+            return false;
+        }
+        if ev.keystroke.modifiers.modified() {
+            return false;
+        }
+        let (len, cursor, row) = self.listing_shape(self.section);
+        let (Some(last), Some(cursor)) = (len.checked_sub(1), cursor) else {
+            return false;
+        };
+        let target = match ev.keystroke.key.as_str() {
+            "up" => cursor.saturating_sub(1),
+            "down" => (cursor + 1).min(last),
+            "home" => 0,
+            "end" => last,
+            "enter" => {
+                self.activate_row(row, cx);
+                return true;
+            }
+            _ => return false,
+        };
+        self.focus_row(target, cx);
+        true
+    }
+
+    /// Activate the cursor's row: a data row opens its detail, the load-more
+    /// row fetches the next page, a spending group header does nothing (it is
+    /// a caption, and saying so by no-op is more honest than skipping over it
+    /// while navigating).
+    fn activate_row(&mut self, row: Option<DisplayRow>, cx: &mut Context<Self>) {
+        let Some(DisplayRow::Data(i)) = row else {
+            if matches!(row, Some(DisplayRow::LoadMore)) {
+                self.load_more(cx);
+            }
+            return;
+        };
+        match self.section {
+            RecordSection::Attestations => {
+                if let Some(a) = self.attestations.rows.get(i) {
+                    let hash = a.hash.clone();
+                    self.open_attestation(hash, cx);
+                }
+            }
+            RecordSection::Requests => {
+                if let Some(r) = self.requests.rows.get(i) {
+                    let id = r.id.clone();
+                    self.open_request(id, cx);
+                }
+            }
+            RecordSection::Spending => {
+                if let Some(e) = self.spending.rows.get(i) {
+                    let id = e.request_id.clone();
+                    self.open_request(id, cx);
+                }
+            }
+        }
+    }
+
+    /// Test seam: where the current section's roving cursor sits.
+    #[doc(hidden)]
+    pub fn focused_row_for_test(&self) -> Option<usize> {
+        self.listing_shape(self.section).1
+    }
+
+    /// Test seam: whether the current section's listing holds the window's
+    /// focus — what backing out of a detail restores.
+    #[doc(hidden)]
+    pub fn listing_is_focused_for_test(&self, window: &Window) -> bool {
+        let handle = match self.section {
+            RecordSection::Attestations => &self.attestations.list_focus,
+            RecordSection::Requests => &self.requests.list_focus,
+            RecordSection::Spending => &self.spending.list_focus,
+        };
+        handle.as_ref().is_some_and(|h| h.is_focused(window))
+    }
+
+    /// Test seam: put the window's focus on the current section's listing —
+    /// what a Tab into the `MAIN` region does. The handle is minted lazily in
+    /// `render_listing`, so this is a no-op until a listing has painted.
+    #[doc(hidden)]
+    pub fn focus_listing_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = match self.section {
+            RecordSection::Attestations => self.attestations.list_focus.clone(),
+            RecordSection::Requests => self.requests.list_focus.clone(),
+            RecordSection::Spending => self.spending.list_focus.clone(),
+        };
+        if let Some(handle) = handle {
+            window.focus(&handle, cx);
+        }
+    }
+
     fn fetch_page(&mut self, section: RecordSection, cx: &mut Context<Self>) {
         let Some(app_core) = self.stores.app_core() else {
             // Stub stores (tests): rows are installed via the test setters.
@@ -536,10 +717,23 @@ impl RecordView {
     /// Back from a detail to the section listing. Dropping the detail task
     /// cancels an in-flight fetch, so a slow detail can't reopen after the
     /// user backed out.
-    pub fn close_detail(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// **Focus comes back with you.** Opening a detail replaces the listing, so
+    /// the element tracking the section's `list_focus` unmounts while the
+    /// window's `focus` still names that handle — a *dead* handle: the dispatch
+    /// tree has no node for it, so the roving keys reach nothing, and
+    /// `focus_next` finds no tab node and restarts the walk from the top of the
+    /// window. (The Back affordance is itself a tab stop, so arriving by
+    /// keyboard leaves focus on *it*, which unmounts on the very same press.)
+    /// Handing focus back to the listing is both the honest place to be and
+    /// what retires the dead handle. It is only *visible* under keyboard
+    /// modality — see [`Self::cursor_row`].
+    pub fn close_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.detail = None;
         self.detail_pending = None;
         self.detail_task = None;
+        let handle = self.list_focus(cx);
+        window.focus(&handle, cx);
         cx.notify();
     }
 
@@ -584,9 +778,10 @@ impl RecordView {
     pub fn render_visible_window_for_test(
         &self,
         range: std::ops::Range<usize>,
+        window: &Window,
         cx: &Context<Self>,
     ) -> usize {
-        self.render_rows(self.section, range, cx).len()
+        self.render_rows(self.section, range, window, cx).len()
     }
 
     /// Test hook: the current section's (row count, loading flag) — lets the
@@ -655,6 +850,10 @@ impl Render for RecordView {
             (gpui::Role::List, self.section.label())
         };
 
+        // Only a real listing gets the roving handle: a detail / loading /
+        // empty body is a `Region`, not a list, and has nothing to rove.
+        let listing_focus = matches!(body_role, gpui::Role::List).then(|| self.list_focus(cx));
+
         let (body, scrollbar): (gpui::AnyElement, gpui::AnyElement) = if self.detail.is_some() {
             (
                 scroll_wrap(self.render_detail(cx), &self.detail_scroll).into_any_element(),
@@ -711,6 +910,15 @@ impl Render for RecordView {
                 v_flex()
                     .id("record-body")
                     .probe("record/body", body_role, body_label)
+                    .tab_region(crate::focus::region::MAIN)
+                    .when(listing_focus.is_some(), |d| {
+                        d.on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                            if this.handle_list_key(ev, window, cx) {
+                                cx.stop_propagation();
+                            }
+                        }))
+                    })
+                    .when_some(listing_focus, |d, h| d.track_focus(&h))
                     .relative()
                     .flex_1()
                     .w_full()
@@ -812,11 +1020,10 @@ impl RecordView {
         // the section tabs) drag the window. The tabs/refresh keep their own
         // clicks — a plain click never arms a move.
         crate::titlebar::make_draggable(
-            strip.id("record-strip").probe(
-                "record/sections",
-                gpui::Role::TabList,
-                "Record sections",
-            ),
+            strip
+                .id("record-strip")
+                .probe("record/sections", gpui::Role::TabList, "Record sections")
+                .tab_region(crate::focus::region::NAV),
             "record-strip",
             window,
             cx,
@@ -884,7 +1091,29 @@ impl RecordView {
     /// `uniform_list` closure is a dumb indexer over the precomputed
     /// `display` model: it renders only the visible window of rows, so frame
     /// work is O(visible) rather than O(loaded) (the wave-2 bug-3 fix).
-    fn render_listing(&self, cx: &Context<Self>) -> gpui::AnyElement {
+    /// The current section's roving-focus handle, minted on demand so
+    /// `Listing::default()` stays context-free. It is tracked by the **body
+    /// wrapper**, the element that carries the `List` role: `uniform_list`
+    /// cannot take a role (`InteractiveElement` but not
+    /// `StatefulInteractiveElement`), and a handle tracked on a node-less
+    /// element leaves `TreeUpdate.focus` falling back to the window root.
+    /// `tab_index(MAIN)` rides the handle because gpui reads tab order off the
+    /// handle once one is tracked.
+    fn list_focus(&mut self, cx: &mut Context<Self>) -> FocusHandle {
+        let slot = match self.section {
+            RecordSection::Attestations => &mut self.attestations.list_focus,
+            RecordSection::Requests => &mut self.requests.list_focus,
+            RecordSection::Spending => &mut self.spending.list_focus,
+        };
+        slot.get_or_insert_with(|| {
+            cx.focus_handle()
+                .tab_index(crate::focus::region::MAIN)
+                .tab_stop(true)
+        })
+        .clone()
+    }
+
+    fn render_listing(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let count = match self.section {
             RecordSection::Attestations => self.attestations.display.len(),
             RecordSection::Requests => self.requests.display.len(),
@@ -900,8 +1129,8 @@ impl RecordView {
         uniform_list(
             ("record-list", section as usize),
             count,
-            cx.processor(move |this, range: Range<usize>, _window, cx| {
-                this.render_rows(section, range, cx)
+            cx.processor(move |this, range: Range<usize>, window, cx| {
+                this.render_rows(section, range, window, cx)
             }),
         )
         .flex_1()
@@ -912,6 +1141,39 @@ impl RecordView {
         .into_any_element()
     }
 
+    /// Mark the row the roving cursor sits on — **applied to the row's own
+    /// role-bearing element**, never to a wrapper around it.
+    ///
+    /// `aria_active_descendant` resolves through the a11y node tree, and gpui
+    /// pushes a node only for an element that carries a **role**
+    /// (`Element::prepaint`), so a role-less wrapper is invisible there:
+    /// `A11y::set_active_descendant`'s `has_node` guard silently drops the
+    /// pointer and `TreeUpdate.focus` falls back to the focused list. (The
+    /// wrapper did *not* corrupt the ancestry — a node-less element is simply
+    /// absent from the a11y stack, so the row's `List` parent was always
+    /// correct — but it did give the row a different `GlobalElementId`, and so
+    /// a different AccessKit node id, on the frames it was the cursor.)
+    ///
+    /// The **ring** additionally waits for keyboard modality, because focus can
+    /// now reach the listing programmatically (backing out of a detail), and a
+    /// pointer user who never asked for a keyboard cursor should not be shown
+    /// one. The a11y state is not gated: assistive technology wants to know
+    /// where focus is regardless of how it got there.
+    fn cursor_row<E>(el: E, cursor: bool, window: &Window) -> E
+    where
+        E: StatefulInteractiveElement + Styled + Sized,
+    {
+        if !cursor {
+            return el;
+        }
+        let el = el.aria_active_descendant().aria_selected(true);
+        if window.last_input_was_keyboard() {
+            el.shadow(crate::focus::ring_shadows(crate::focus::ring_colors()))
+        } else {
+            el
+        }
+    }
+
     /// Render the visible window of display rows for `section`. Each returned
     /// element is exactly [`ROW_H`] tall so `uniform_list`'s single-measure
     /// layout holds.
@@ -919,8 +1181,22 @@ impl RecordView {
         &self,
         section: RecordSection,
         range: Range<usize>,
+        window: &Window,
         cx: &Context<Self>,
     ) -> Vec<gpui::AnyElement> {
+        // The cursor is shown while the **listing itself** holds focus —
+        // `is_focused`, not `contains_focused`: Tab moving on to the load-more
+        // button inside the list would otherwise leave the row's ring painted
+        // beside the button's own, two focus indications for one focus.
+        let list_focus = match section {
+            RecordSection::Attestations => &self.attestations.list_focus,
+            RecordSection::Requests => &self.requests.list_focus,
+            RecordSection::Spending => &self.spending.list_focus,
+        };
+        let keyboard_row = list_focus
+            .as_ref()
+            .filter(|h| h.is_focused(window))
+            .and_then(|_| self.listing_shape(section).1);
         let display = match section {
             RecordSection::Attestations => &self.attestations.display,
             RecordSection::Requests => &self.requests.display,
@@ -928,19 +1204,26 @@ impl RecordView {
         };
         range
             .filter_map(|dix| display.get(dix).copied().map(|row| (dix, row)))
-            .map(|(dix, row)| match (section, row) {
-                (RecordSection::Attestations, DisplayRow::Data(i)) => {
-                    self.render_attestation_row(dix, i, cx)
+            .map(|(dix, row)| {
+                let cursor = keyboard_row == Some(dix);
+                match (section, row) {
+                    (RecordSection::Attestations, DisplayRow::Data(i)) => {
+                        self.render_attestation_row(dix, i, cursor, window, cx)
+                    }
+                    (RecordSection::Requests, DisplayRow::Data(i)) => {
+                        self.render_request_row(dix, i, cursor, window, cx)
+                    }
+                    (RecordSection::Spending, DisplayRow::Header(i)) => {
+                        self.render_spend_header(i, cursor, window, cx)
+                    }
+                    (RecordSection::Spending, DisplayRow::Data(i)) => {
+                        self.render_spend_row(i, cursor, window, cx)
+                    }
+                    (_, DisplayRow::LoadMore) => self.render_load_more_row(cursor, window, cx),
+                    // No other (section, row) combinations are produced by the
+                    // display builders.
+                    _ => div().h(ROW_H).into_any_element(),
                 }
-                (RecordSection::Requests, DisplayRow::Data(i)) => {
-                    self.render_request_row(dix, i, cx)
-                }
-                (RecordSection::Spending, DisplayRow::Header(i)) => self.render_spend_header(i, cx),
-                (RecordSection::Spending, DisplayRow::Data(i)) => self.render_spend_row(i, cx),
-                (_, DisplayRow::LoadMore) => self.render_load_more_row(cx),
-                // No other (section, row) combinations are produced by the
-                // display builders.
-                _ => div().h(ROW_H).into_any_element(),
             })
             .collect()
     }
@@ -1016,7 +1299,12 @@ impl RecordView {
     /// The trailing load-more row: a quiet "Load more…" affordance, or — when
     /// a page fetch is in flight — an honest "Loading more…" in-flight row
     /// (it maps to a real task).
-    fn render_load_more_row(&self, cx: &Context<Self>) -> gpui::AnyElement {
+    fn render_load_more_row(
+        &self,
+        cursor: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme();
         let loading = match self.section {
             RecordSection::Attestations => self.attestations.loading,
@@ -1035,25 +1323,36 @@ impl RecordView {
                 .child("Loading more…")
                 .into_any_element();
         }
-        div()
-            .id("load-more")
-            .probe("record/load-more", gpui::Role::Button, "Load more")
-            .w_full()
-            .h(ROW_H)
-            .flex()
-            .items_center()
-            .text_sm()
-            .cursor_pointer()
-            .text_color(theme.muted_foreground)
-            .hover(|s| s.text_color(theme.foreground))
-            .child("Load more…")
-            .on_click(cx.listener(|this, _, _, cx| this.load_more(cx)))
-            .into_any_element()
+        Self::cursor_row(
+            div()
+                .id("load-more")
+                .probe("record/load-more", gpui::Role::Button, "Load more"),
+            cursor,
+            window,
+        )
+        .w_full()
+        .h(ROW_H)
+        .flex()
+        .items_center()
+        .text_sm()
+        .cursor_pointer()
+        .text_color(theme.muted_foreground)
+        .hover(|s| s.text_color(theme.foreground))
+        .child("Load more…")
+        .on_click(cx.listener(|this, _, _, cx| this.load_more(cx)))
+        .into_any_element()
     }
 
     // --- Attestations -----------------------------------------------------
 
-    fn render_attestation_row(&self, dix: usize, i: usize, cx: &Context<Self>) -> gpui::AnyElement {
+    fn render_attestation_row(
+        &self,
+        dix: usize,
+        i: usize,
+        cursor: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme();
         let a = &self.attestations.rows[i];
         let hash = a.hash.clone();
@@ -1067,40 +1366,44 @@ impl RecordView {
             format_bytes(a.doc_bytes),
         );
         let (pos, size) = self.row_set_metadata(RecordSection::Attestations, i);
-        self.row_shell(("attestation", dix), dix, cx)
-            .aria_position_in_set(pos)
-            .aria_size_of_set(size)
-            .probe(
-                format!("record/attestation/{dix}"),
-                gpui::Role::ListItem,
-                format!("Attestation {}", spoken_hash(&a.hash)),
-            )
-            // The whole hash is still reachable — as the node's value, which
-            // AT reads on request rather than as part of the row's name.
-            .aria_value(a.hash.clone())
-            .on_click(cx.listener(move |this, _, _, cx| this.open_attestation(hash.clone(), cx)))
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .items_baseline()
-                    .gap_4()
-                    .child(mono(13.).child(SharedString::from(truncate_middle(&a.hash, 44))))
-                    .child(
-                        div()
-                            .text_xs()
-                            .whitespace_nowrap()
-                            .text_color(theme.muted_foreground)
-                            .child(SharedString::from(fmt_utc(a.created_at, false))),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(SharedString::from(sub)),
-            )
-            .into_any_element()
+        Self::cursor_row(
+            self.row_shell(("attestation", dix), dix, cx)
+                .aria_position_in_set(pos)
+                .aria_size_of_set(size)
+                .probe(
+                    format!("record/attestation/{dix}"),
+                    gpui::Role::ListItem,
+                    format!("Attestation {}", spoken_hash(&a.hash)),
+                ),
+            cursor,
+            window,
+        )
+        // The whole hash is still reachable — as the node's value, which
+        // AT reads on request rather than as part of the row's name.
+        .aria_value(a.hash.clone())
+        .on_click(cx.listener(move |this, _, _, cx| this.open_attestation(hash.clone(), cx)))
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_baseline()
+                .gap_4()
+                .child(mono(13.).child(SharedString::from(truncate_middle(&a.hash, 44))))
+                .child(
+                    div()
+                        .text_xs()
+                        .whitespace_nowrap()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(fmt_utc(a.created_at, false))),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(SharedString::from(sub)),
+        )
+        .into_any_element()
     }
 
     fn render_attestation_detail(&self, d: &AttestationDetail, cx: &Context<Self>) -> Div {
@@ -1140,7 +1443,14 @@ impl RecordView {
 
     // --- Requests -----------------------------------------------------------
 
-    fn render_request_row(&self, dix: usize, i: usize, cx: &Context<Self>) -> gpui::AnyElement {
+    fn render_request_row(
+        &self,
+        dix: usize,
+        i: usize,
+        cursor: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme();
         let r = &self.requests.rows[i];
         let id = r.id.clone();
@@ -1176,37 +1486,41 @@ impl RecordView {
         sub_parts.push(fmt_utc(r.request_at, false));
 
         let (pos, size) = self.row_set_metadata(RecordSection::Requests, i);
-        self.row_shell(("request", dix), dix, cx)
-            .aria_position_in_set(pos)
-            .aria_size_of_set(size)
-            .probe(
-                format!("record/request/{dix}"),
-                gpui::Role::ListItem,
-                format!("{} {} — {}", r.method, r.path, status_text),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| this.open_request(id.clone(), cx)))
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .items_baseline()
-                    .gap_4()
-                    .child(mono(13.).child(SharedString::from(format!("{} {}", r.method, r.path))))
-                    .child(
-                        div()
-                            .text_xs()
-                            .whitespace_nowrap()
-                            .text_color(status_color)
-                            .child(SharedString::from(status_text)),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(SharedString::from(sub_parts.join(" · "))),
-            )
-            .into_any_element()
+        Self::cursor_row(
+            self.row_shell(("request", dix), dix, cx)
+                .aria_position_in_set(pos)
+                .aria_size_of_set(size)
+                .probe(
+                    format!("record/request/{dix}"),
+                    gpui::Role::ListItem,
+                    format!("{} {} — {}", r.method, r.path, status_text),
+                ),
+            cursor,
+            window,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.open_request(id.clone(), cx)))
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_baseline()
+                .gap_4()
+                .child(mono(13.).child(SharedString::from(format!("{} {}", r.method, r.path))))
+                .child(
+                    div()
+                        .text_xs()
+                        .whitespace_nowrap()
+                        .text_color(status_color)
+                        .child(SharedString::from(status_text)),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(SharedString::from(sub_parts.join(" · "))),
+        )
+        .into_any_element()
     }
 
     fn render_request_detail(&self, d: &RequestDetail, cx: &Context<Self>) -> Div {
@@ -1353,24 +1667,42 @@ impl RecordView {
     /// total. Fixed [`ROW_H`] height like every other listing row — the group
     /// rhythm is the even row spacing, not extra top padding (a minor
     /// intentional change from the unvirtualized layout; see AGENTS.md).
-    fn render_spend_header(&self, i: usize, cx: &Context<Self>) -> gpui::AnyElement {
+    fn render_spend_header(
+        &self,
+        i: usize,
+        cursor: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme();
         let e = &self.spending.rows[i];
         let mut head_line = format!("credential {}", truncate_middle(&e.credential_nonce, 24));
         head_line = format!("{head_line} · {}", e.credential_state);
-        let mut header = h_flex()
-            .w_full()
-            .h(ROW_H)
-            .justify_between()
-            .items_end()
-            .pb_1()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                mono(12.)
-                    .text_color(theme.muted_foreground)
-                    .child(SharedString::from(head_line)),
-            );
+        // The caption carries a `Label` node so the roving cursor has something
+        // to point `aria_active_descendant` at when it rests here (the cursor
+        // walks display rows, and a header is navigable — just not activatable).
+        // `Label` is a readout, so it stays out of the tab order.
+        let mut header = Self::cursor_row(
+            h_flex().id(("spend-header", i)).probe(
+                format!("record/spend/header/{i}"),
+                gpui::Role::Label,
+                SharedString::from(head_line.clone()),
+            ),
+            cursor,
+            window,
+        )
+        .w_full()
+        .h(ROW_H)
+        .justify_between()
+        .items_end()
+        .pb_1()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            mono(12.)
+                .text_color(theme.muted_foreground)
+                .child(SharedString::from(head_line)),
+        );
         if let Some(amount) = e.spend_amount {
             header = header.child(
                 div()
@@ -1392,7 +1724,13 @@ impl RecordView {
     }
 
     /// A spending data row (clicks through to the request detail).
-    fn render_spend_row(&self, i: usize, cx: &Context<Self>) -> gpui::AnyElement {
+    fn render_spend_row(
+        &self,
+        i: usize,
+        cursor: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme();
         let (pos, size) = self.row_set_metadata(RecordSection::Spending, i);
         let e = &self.spending.rows[i];
@@ -1411,57 +1749,61 @@ impl RecordView {
         }
         sub_parts.push(fmt_utc(e.request_at, false));
 
-        v_flex()
-            .id(("spend", i))
-            .aria_position_in_set(pos)
-            .aria_size_of_set(size)
-            .probe(
-                format!("record/spend/{i}"),
-                gpui::Role::ListItem,
-                format!(
-                    "{} {} — {}",
-                    e.method,
-                    e.path,
-                    match e.credits_consumed {
-                        Some(c) => format!("{} credits", crate::plans::format_credits(c)),
-                        None => "—".to_string(),
-                    }
-                ),
-            )
-            .w_full()
-            .h(ROW_H)
-            .justify_center()
-            .gap_0p5()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.muted.opacity(0.35)))
-            .on_click(cx.listener(move |this, _, _, cx| this.open_request(id.clone(), cx)))
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .items_baseline()
-                    .gap_4()
-                    .child(mono(13.).child(SharedString::from(format!("{} {}", e.method, e.path))))
-                    .child(
-                        div()
-                            .text_xs()
-                            .whitespace_nowrap()
-                            .text_color(theme.muted_foreground)
-                            .child(SharedString::from(match e.credits_consumed {
-                                Some(c) => {
-                                    format!("{} credits", crate::plans::format_credits(c))
-                                }
-                                None => "—".to_string(),
-                            })),
+        Self::cursor_row(
+            v_flex()
+                .id(("spend", i))
+                .aria_position_in_set(pos)
+                .aria_size_of_set(size)
+                .probe(
+                    format!("record/spend/{i}"),
+                    gpui::Role::ListItem,
+                    format!(
+                        "{} {} — {}",
+                        e.method,
+                        e.path,
+                        match e.credits_consumed {
+                            Some(c) => format!("{} credits", crate::plans::format_credits(c)),
+                            None => "—".to_string(),
+                        }
                     ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(SharedString::from(sub_parts.join(" · "))),
-            )
-            .into_any_element()
+                ),
+            cursor,
+            window,
+        )
+        .w_full()
+        .h(ROW_H)
+        .justify_center()
+        .gap_0p5()
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.muted.opacity(0.35)))
+        .on_click(cx.listener(move |this, _, _, cx| this.open_request(id.clone(), cx)))
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_baseline()
+                .gap_4()
+                .child(mono(13.).child(SharedString::from(format!("{} {}", e.method, e.path))))
+                .child(
+                    div()
+                        .text_xs()
+                        .whitespace_nowrap()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(match e.credits_consumed {
+                            Some(c) => {
+                                format!("{} credits", crate::plans::format_credits(c))
+                            }
+                            None => "—".to_string(),
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(SharedString::from(sub_parts.join(" · "))),
+        )
+        .into_any_element()
     }
 
     // --- Detail dispatch + cached payloads --------------------------------
@@ -1510,7 +1852,7 @@ impl RecordView {
                 .text_color(theme.muted_foreground)
                 .hover(|s| s.text_color(theme.foreground))
                 .child(SharedString::from(format!("‹ {label}")))
-                .on_click(cx.listener(|this, _, _, cx| this.close_detail(cx))),
+                .on_click(cx.listener(|this, _, window, cx| this.close_detail(window, cx))),
         )
     }
 }

@@ -26,6 +26,7 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use crate::account::AccountView;
 use crate::actions::CloseWindow;
 use crate::backends_settings::BackendsSettingsView;
+use crate::focus::TabRegion as _;
 use crate::general::GeneralView;
 use crate::probe::Probe as _;
 use crate::stores::{BackendsStore, Stores};
@@ -283,6 +284,7 @@ impl Render for SettingsView {
                 // container makes them a set rather than five loose tabs
                 // hanging off the window root.
                 .probe("settings/nav", gpui::Role::TabList, "Settings sections")
+                .tab_region(crate::focus::region::NAV)
                 .aria_orientation(gpui::Orientation::Vertical)
                 .w(NAV_WIDTH)
                 .h_full()
@@ -313,6 +315,7 @@ impl Render for SettingsView {
                         gpui::Role::Main,
                         format!("{} settings", effective.label()),
                     )
+                    .tab_region(crate::focus::region::MAIN)
                     .relative()
                     .flex_1()
                     .h_full()

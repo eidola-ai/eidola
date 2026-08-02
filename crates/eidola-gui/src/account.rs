@@ -199,14 +199,15 @@ impl Render for AccountView {
                                             gpui::Role::Button,
                                             "Reset account",
                                         )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.confirm_reset(cx)),
+                                        )
                                         .child(
                                             Button::new("confirm-reset")
                                                 .danger()
                                                 .small()
                                                 .label("Reset account")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.confirm_reset(cx)
-                                                })),
+                                                .tab_stop(false),
                                         ),
                                 )
                                 .child(
@@ -217,14 +218,15 @@ impl Render for AccountView {
                                             gpui::Role::Button,
                                             "Keep account",
                                         )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.cancel_reset(cx)),
+                                        )
                                         .child(
                                             Button::new("cancel-reset")
                                                 .ghost()
                                                 .small()
                                                 .label("Keep account")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.cancel_reset(cx)
-                                                })),
+                                                .tab_stop(false),
                                         ),
                                 ),
                         ),
@@ -265,14 +267,15 @@ impl Render for AccountView {
                                 gpui::Role::Button,
                                 "Create account",
                             )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.account.update(cx, |s, cx| s.create_account(cx));
+                            }))
                             .child(
                                 Button::new("create-account")
                                     .primary()
                                     .small()
                                     .label("Create account")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.account.update(cx, |s, cx| s.create_account(cx));
-                                    })),
+                                    .tab_stop(false),
                             ),
                     ),
                 );
