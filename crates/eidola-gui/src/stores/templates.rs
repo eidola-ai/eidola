@@ -55,6 +55,20 @@ impl TemplatesStore {
         &self.templates
     }
 
+    /// Test-only: replace the registry snapshot, standing in for the refresh a
+    /// `Change::Templates` / `Change::Participants` dispatch would drive on a
+    /// backed store. Lets a stub-backed test move the registry *under* an open
+    /// editor.
+    #[doc(hidden)]
+    pub fn set_templates_for_test(
+        &mut self,
+        templates: Vec<SpaceTemplateInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        self.templates = Loadable::loaded(templates);
+        cx.notify();
+    }
+
     /// Test-only: force the registry into `Failed` (no prior) to exercise the
     /// failed-initial-load rendering.
     #[doc(hidden)]

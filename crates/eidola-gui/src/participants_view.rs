@@ -671,6 +671,23 @@ pub(crate) fn model_groups(
     groups
 }
 
+/// What a model-picker button says it holds, as one spoken line — the same
+/// `name · backend` the row renders, or the bare name when there is no backend
+/// to qualify (an unset field, the router's "Off").
+///
+/// This is the picker's **content**, distinct from the label that names it: a
+/// picker labelled only "Model" tells a screen reader nothing about which model
+/// is selected. It is settled by construction — it moves only when the user
+/// picks — which is what makes it safe to ride `aria_value` (see
+/// [`crate::probe::Probe::probe_value`]). Shared so the participant field and
+/// the Templates pane's router picker cannot drift apart.
+pub(crate) fn picker_value(name: &SharedString, backend: Option<&SharedString>) -> SharedString {
+    match backend {
+        Some(b) => SharedString::from(format!("{name} · {b}")),
+        None => name.clone(),
+    }
+}
+
 /// A model-picker dropdown field shared by the Participants view and Templates
 /// pane: a button showing the current model, plus (when `open`) a grouped list
 /// of selectable models. `on_pick` receives the chosen model id.
@@ -695,9 +712,10 @@ pub(crate) fn model_field<V: 'static>(
         }
         _ => ("Choose a model…".into(), None),
     };
+    let value = picker_value(&name, backend.as_ref());
     let button = h_flex()
         .id(SharedString::from(format!("{probe_prefix}-button")))
-        .probe(probe_prefix.clone(), gpui::Role::Button, "Model")
+        .probe_value(probe_prefix.clone(), gpui::Role::Button, "Model", value)
         .w_full()
         .px_2()
         .py_1()
