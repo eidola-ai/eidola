@@ -318,15 +318,7 @@ impl SpaceView {
     /// instead. Hidden entirely while streaming (the entity refuses mutations
     /// mid-stream, so dead verbs would lie).
     fn render_post_actions(&self, node: &TreeNode, cx: &Context<Self>) -> gpui::Div {
-        let mut col = action_gutter().gap_0p5();
-        // The affordance level's containment seam: while the keyboard has
-        // entered *this* post's verbs, the gutter tracks the row handle, so
-        // `sync_tree_focus` can ask whether any of them (each on a gpui
-        // implicit handle we never see) still holds focus. Only the focused
-        // post's gutter tracks it — one handle, one claimant per frame.
-        if self.focused_affordance(&node.id).is_some() {
-            col = col.track_focus(&self.affordance_row_focus);
-        }
+        let col = action_gutter().gap_0p5();
         let NodeSrc::Msg(i) = node.src else {
             return col;
         };
@@ -340,21 +332,23 @@ impl SpaceView {
 
         // The shared quiet-verb look (see `verb_button`) — the same family the
         // reading column's thinking disclosure uses. `slot` is the verb's index
-        // in this post's affordance row: the keyboard's affordance level names
-        // one by index, and the named one tracks the view's affordance focus
-        // handle so the ring paints and gpui's Enter-activates-a-focused-click
-        // fires the same listener a mouse would.
-        let focused_slot = self.focused_affordance(&node.id);
+        // in this post's affordance row, and while the keyboard has entered
+        // *this* post every verb tracks that slot's own handle
+        // (`SpaceView::affordance_slots`, pre-grown in `render`). A handle per
+        // slot rather than one for "the focused verb" is what lets
+        // `sync_tree_focus` see which verb a Tab landed on and resync the
+        // level's index to it. Only the level's own post tracks from the pool —
+        // two elements claiming one handle report focus twice in a frame.
+        let holds_level = self.post_holds_affordance_level(&node.id);
         let verb = |slot: usize,
                     id: SharedString,
                     probe: String,
                     label: &'static str,
                     aria: SharedString| {
             let b = verb_button(id, probe, label, aria, cx);
-            if focused_slot == Some(slot) {
-                b.track_focus(&self.affordance_focus)
-            } else {
-                b
+            match self.affordance_slots.get(slot).filter(|_| holds_level) {
+                Some(handle) => b.track_focus(handle),
+                None => b,
             }
         };
 

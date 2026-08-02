@@ -498,22 +498,20 @@ pub struct SpaceView {
     /// row's `focus_visible` ring reads the same handle — so one handle gives
     /// both, and nothing has to be minted or reaped as the transcript changes.
     pub(crate) post_focus: FocusHandle,
-    /// The focus handle the focused **affordance-row verb** tracks. A second
-    /// handle rather than reusing [`Self::post_focus`]: while focus is on a
-    /// verb the row must *stop* tracking, since two elements claiming one
-    /// handle would report focus twice in a frame (gpui asserts on it).
-    pub(crate) affordance_focus: FocusHandle,
-    /// The focus handle the focused post's **affordance row container** tracks
-    /// — the observation seam for [`keyboard::sync_tree_focus`]'s second level.
-    /// The row's individual verbs are ordinary tab stops riding gpui's
-    /// *implicit* handles, which this crate never receives, so "is a verb of
-    /// this post still focused" is only answerable from a container:
-    /// `FocusHandle::contains_focused` resolves through the **dispatch tree**
-    /// (`FocusId::contains` → `dispatch_tree.focus_contains`), where an
-    /// implicit descendant is an ordinary node. Tracked only by the focused
-    /// post's gutter, since two elements claiming one handle report focus
+    /// One focus handle **per affordance slot**, tracked by the verbs of
+    /// whichever post currently holds the affordance level. A handle per slot
+    /// rather than one for "the focused verb", because Tab walks between the
+    /// verbs and only a handle *we* own can answer which one it landed on: a
+    /// single handle left [`keyboard::TreeFocus`]'s index frozen at the verb
+    /// Enter had entered, so the next `Right` cycled from a stale position. It
+    /// is a pool, grown to the largest verb row seen, and only the level's own
+    /// post tracks from it — two elements claiming one handle report focus
     /// twice in a frame.
-    pub(crate) affordance_row_focus: FocusHandle,
+    ///
+    /// Each handle carries `tab_index(0).tab_stop(true)`: gpui reads tab order
+    /// off the *tracked* handle once one exists, and these verbs must stay
+    /// ordinary Tab destinations.
+    pub(crate) affordance_slots: Vec<FocusHandle>,
     /// Whether a transient overlay held the keyboard on the last rendered
     /// frame — see [`keyboard::sync_tree_focus`], which uses the falling edge
     /// to hand focus *back* to the conversation instead of reading the borrow
@@ -735,8 +733,7 @@ impl SpaceView {
             editing: None,
             tree_focus: None,
             post_focus: cx.focus_handle(),
-            affordance_focus: cx.focus_handle(),
-            affordance_row_focus: cx.focus_handle(),
+            affordance_slots: Vec::new(),
             overlay_held_focus: false,
             composer_caret_scroll_pending: Cell::new(false),
             composer_aria_value: RefCell::new((SharedString::default(), SharedString::default())),
@@ -1802,6 +1799,7 @@ impl Render for SpaceView {
         // Tree focus is *observed*, not merely bookkept: see
         // `keyboard::sync_tree_focus`.
         self.sync_tree_focus(window, cx);
+        self.ensure_affordance_slots(cx);
 
         // Window resize: branch offsets are absolute pixels but pages are a
         // window-width apart, so remap every offset by the stride ratio to keep

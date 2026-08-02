@@ -45,7 +45,7 @@
 //! walk up to the nearest fork — and Right on one likewise. See
 //! [`tree_target`] for the exact rule.
 
-use gpui::{App, Context, SharedString, Window};
+use gpui::{App, Context, FocusHandle, SharedString, Window};
 
 use super::SpaceView;
 use super::model::{NodeSrc, PostData, TreeNode};
@@ -193,48 +193,72 @@ pub(crate) fn tree_target(levels: &[Level], focused: &str, mv: TreeMove) -> Opti
 ///
 /// Offsets are gpui page-scroll offsets: `0` is the document top and scrolling
 /// down is *negative*. `min_y` is the most-negative valid offset.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RevealViewport {
+    /// The window's content height.
+    pub height: f32,
+    /// How much of the top an overlay covers — the title band.
+    pub top_inset: f32,
+    /// How much of the bottom one covers — a floating composer.
+    pub bottom_inset: f32,
+}
+
 pub(crate) fn scroll_into_view(
     top: f32,
     bottom: f32,
-    viewport_h: f32,
+    view: RevealViewport,
     current: f32,
     min_y: f32,
     margin: f32,
 ) -> f32 {
-    let view_top = -current;
-    let view_bottom = view_top + viewport_h;
+    let RevealViewport {
+        height: viewport_h,
+        top_inset,
+        bottom_inset,
+    } = view;
+    // The *usable* band, not the raw viewport: the title band paints over the
+    // top of the window and a floating composer over the bottom, so a row
+    // "revealed" flush to either edge lands underneath one of them.
+    let view_top = -current + top_inset;
+    let view_bottom = -current + viewport_h - bottom_inset;
+    let usable_h = (view_bottom - view_top).max(0.0);
     let target = if top < view_top + margin {
-        -(top - margin)
-    } else if bottom > view_bottom - margin && bottom - top <= viewport_h - 2.0 * margin {
-        -(bottom + margin - viewport_h)
+        -(top - margin - top_inset)
+    } else if bottom > view_bottom - margin && bottom - top <= usable_h - 2.0 * margin {
+        -(bottom + margin - viewport_h + bottom_inset)
     } else if bottom > view_bottom - margin {
-        // Taller than the viewport: align its top rather than its bottom.
-        -(top - margin)
+        // Taller than the usable band: align its top rather than its bottom.
+        -(top - margin - top_inset)
     } else {
         return current;
     };
     target.clamp(min_y.min(0.0), 0.0)
 }
 
-/// Whether a keystroke is "the user started typing" for task 38 — a printable,
-/// non-whitespace character with no command modifier.
+/// Whether a keystroke is "the user started typing" for task 38 — printable
+/// text with no command modifier.
 ///
 /// Whitespace is excluded on purpose. Space is gpui's *activation* key on a
 /// focused affordance (it fires the click), and neither a leading space nor a
-/// leading newline is a draft anybody meant to start.
+/// leading newline is a draft anybody meant to start. The test is on the
+/// **leading** character, so a commit that opens with real text and contains a
+/// space is still text.
+///
+/// **A multi-character `key_char` is text too.** It used to be refused, on the
+/// reasoning that a composition belongs to an editor's input handler — true
+/// when an editor is focused, and exactly wrong when the *conversation* is:
+/// there is no input handler then, so the commit had nowhere to land and was
+/// dropped silently. macOS builds `key_char` from `UCKeyTranslate` into a
+/// four-unit buffer, so any layout whose key translates to more than one
+/// character (dead-key and ligature layouts) produced one of these. The whole
+/// string is appended.
 pub(crate) fn typed_character(keystroke: &gpui::Keystroke) -> Option<String> {
     let m = keystroke.modifiers;
     if m.platform || m.control || m.alt || m.function {
         return None;
     }
     let ch = keystroke.key_char.as_deref()?;
-    let mut chars = ch.chars();
-    let first = chars.next()?;
-    if chars.next().is_some() {
-        // A multi-character key_char is an IME/dead-key composition — the
-        // editor's own input handler is the only honest place for those.
-        return None;
-    }
+    let first = ch.chars().next()?;
     if first.is_control() || first.is_whitespace() {
         return None;
     }
@@ -294,6 +318,34 @@ impl SpaceView {
                 }
             }
         }
+    }
+
+    /// The focus handle for affordance slot `i`, minting pool entries up to
+    /// it. See [`SpaceView::affordance_slots`].
+    pub(crate) fn affordance_slot(&mut self, i: usize, cx: &mut Context<Self>) -> FocusHandle {
+        while self.affordance_slots.len() <= i {
+            self.affordance_slots
+                .push(cx.focus_handle().tab_index(0).tab_stop(true));
+        }
+        self.affordance_slots[i].clone()
+    }
+
+    /// The slot handle for `i` **without** minting — the restore path has no
+    /// `&mut Context`. Falls back to the post handle if the pool never grew
+    /// that far, which can only happen before the level was ever entered.
+    fn affordance_slot_or_post(&self, i: usize) -> FocusHandle {
+        self.affordance_slots
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| self.post_focus.clone())
+    }
+
+    /// Which affordance slot the window's focus is actually on, if any — the
+    /// observation the level's index is resynced from.
+    pub(crate) fn focused_affordance_slot(&self, window: &Window) -> Option<usize> {
+        self.affordance_slots
+            .iter()
+            .position(|h| h.is_focused(window))
     }
 
     /// Whether a transient overlay currently owns the keyboard — **the one
@@ -429,7 +481,24 @@ impl SpaceView {
         let y = scroll_into_view(
             top,
             top + height,
-            window_h.as_f32(),
+            RevealViewport {
+                height: window_h.as_f32(),
+                // The title band paints over the document's top for its whole
+                // height; the document reserves that much space, which keeps
+                // the *first* post clear, but any post can pass under it once
+                // scrolled.
+                top_inset: self.doc_reserve(),
+                // A floating composer occludes the bottom. It cannot coexist
+                // with tree focus today (`handle_conversation_key` yields the
+                // keyboard to an active draft outright), so this arm is
+                // defensive — but the reveal has no business assuming the
+                // composer's docking state.
+                bottom_inset: if self.active_draft.is_some() {
+                    self.composer_float_bar_h(window_h)
+                } else {
+                    0.0
+                },
+            },
             off.y.as_f32(),
             self.scroll_min_y.get(),
             REVEAL_MARGIN,
@@ -459,7 +528,8 @@ impl SpaceView {
             node_id,
             level: FocusLevel::Affordance(0),
         });
-        window.focus(&self.affordance_focus, cx);
+        let handle = self.affordance_slot(0, cx);
+        window.focus(&handle, cx);
         cx.notify();
         true
     }
@@ -608,6 +678,31 @@ impl SpaceView {
         }
     }
 
+    /// Whether the keyboard has entered *this* post's affordance row — the
+    /// bookkeeping half, which decides which post's verbs track from the slot
+    /// pool. Which *slot* holds focus is then observed, not assumed.
+    pub(crate) fn post_holds_affordance_level(&self, node_id: &str) -> bool {
+        self.focused_affordance(node_id).is_some()
+    }
+
+    /// Grow the affordance slot pool to cover the verb row the keyboard is
+    /// currently in, so the render (which only has `&self`) can hand every verb
+    /// its own handle. Called from `SpaceView::render` beside
+    /// [`Self::sync_tree_focus`].
+    pub(crate) fn ensure_affordance_slots(&mut self, cx: &mut Context<Self>) {
+        let Some(TreeFocus {
+            node_id,
+            level: FocusLevel::Affordance(_),
+        }) = self.tree_focus.clone()
+        else {
+            return;
+        };
+        let count = self.post_verb_count(&node_id, cx);
+        if count > 0 {
+            self.affordance_slot(count - 1, cx);
+        }
+    }
+
     /// Release tree focus once the conversation no longer holds the window's
     /// focus. Called at the head of [`SpaceView::render`], which is the one
     /// place with both `&mut self` and a `&Window` to ask.
@@ -624,24 +719,18 @@ impl SpaceView {
     ///
     /// **Each level is observed through the handle that can actually answer
     /// for it.** The post level asks `post_focus.is_focused` — one element, one
-    /// handle, exact. The affordance level cannot ask
-    /// `affordance_focus.is_focused`, because Tab walks between the post's
-    /// sibling verbs (the keyboard map promises it) and only the *named* verb
-    /// tracks that handle; the others ride gpui's implicit handles, which this
-    /// crate never receives, so an exact test would drop the level on the very
-    /// Tab it advertises. It asks the row **container** instead
-    /// ([`SpaceView::affordance_row_focus`]): `contains_focused` resolves
-    /// through the dispatch tree, where an implicit descendant is an ordinary
-    /// node — so a Tab *within* the row stays inside the container and a Tab
-    /// *out* of it clears, which is exactly the distinction the level means.
+    /// handle, exact. The affordance level asks the **slot pool**
+    /// ([`SpaceView::affordance_slots`]): every verb of the post holding the
+    /// level tracks its own handle, so "which verb is focused" is a lookup
+    /// rather than a guess. A Tab *within* the row therefore **resyncs** the
+    /// level's index — bookkeeping alone would have kept it on the verb `Enter`
+    /// entered, so the next `Right` cycled from a stale position — while a Tab
+    /// *out* of the row clears the level.
     ///
-    /// The named verb's own handle is checked **as well**, and that is not
-    /// belt-and-braces: containment is answered from
-    /// `window.rendered_frame.dispatch_tree`, i.e. the **last painted** frame,
-    /// but the gutter only starts tracking the row handle on the frame that
-    /// renders *after* the level is entered. Without the exact half, the entry
-    /// frame would read "nothing inside is focused", clear the level, and the
-    /// gutter would never track it again — a one-frame lag that latches.
+    /// Because the slot handles are ours, that arm is exact and has no frame
+    /// lag: `is_focused` compares ids against `window.focus`, which
+    /// `Window::focus` sets synchronously, unlike `contains_focused`, which
+    /// answers from the last *painted* dispatch tree.
     ///
     /// **A transient overlay borrows the keyboard; it does not end the level.**
     /// A context menu, a band menu or the highlight picker takes the window's
@@ -662,15 +751,23 @@ impl SpaceView {
         if overlay {
             return;
         }
-        let Some(focus) = self.tree_focus.as_ref() else {
+        let Some(focus) = self.tree_focus.clone() else {
             return;
         };
         let live = match focus.level {
             FocusLevel::Post => self.post_focus.is_focused(window),
-            FocusLevel::Affordance(_) => {
-                self.affordance_focus.is_focused(window)
-                    || self.affordance_row_focus.contains_focused(window, cx)
-            }
+            FocusLevel::Affordance(i) => match self.focused_affordance_slot(window) {
+                Some(slot) => {
+                    if slot != i {
+                        self.tree_focus = Some(TreeFocus {
+                            node_id: focus.node_id.clone(),
+                            level: FocusLevel::Affordance(slot),
+                        });
+                    }
+                    true
+                }
+                None => false,
+            },
         };
         if live {
             return;
@@ -678,7 +775,7 @@ impl SpaceView {
         if borrowed {
             let handle = match focus.level {
                 FocusLevel::Post => self.post_focus.clone(),
-                FocusLevel::Affordance(_) => self.affordance_focus.clone(),
+                FocusLevel::Affordance(i) => self.affordance_slot_or_post(i),
             };
             window.focus(&handle, cx);
             return;
@@ -739,6 +836,46 @@ impl SpaceView {
             }
             None => self.tree_focus = None,
         }
+    }
+
+    /// Test seam: put the level, and the window's focus, on affordance slot `i`
+    /// of the post tree focus is on.
+    ///
+    /// It exists because the only **two-verb** row today is an inline edit
+    /// session's Save/Cancel, and an edit session makes
+    /// [`Self::handle_conversation_key`] yield the keyboard outright — so the
+    /// state where a Tab between verbs can desync the index is real in the code
+    /// but not reachable through the shipped key map. The seam constructs it so
+    /// the resync is pinned before a second verb ever becomes reachable.
+    #[doc(hidden)]
+    pub fn focus_affordance_for_test(
+        &mut self,
+        node_id: &str,
+        i: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tree_focus = Some(TreeFocus {
+            node_id: SharedString::from(node_id.to_string()),
+            level: FocusLevel::Affordance(i),
+        });
+        let handle = self.affordance_slot(i, cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Test seam: the focused post's top edge in **window** space — what the
+    /// reveal is really steering, and the only way to see that it cleared the
+    /// title band rather than landing under it.
+    #[doc(hidden)]
+    pub fn focused_post_window_top_for_test(&self, window: &Window, cx: &App) -> Option<f32> {
+        let focus = self.tree_focus.as_ref()?;
+        let viewport = crate::chrome::content_size(window);
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(viewport.width, &turns);
+        let top =
+            self.selected_path_doc_top(&tree, &focus.node_id, viewport.width, viewport.height)?;
+        Some(top + self.page_scroll.offset().y.as_f32())
     }
 
     /// Test seam: where tree focus sits, as `(node id, level index)` — `None`
@@ -847,30 +984,145 @@ mod tests {
     #[test]
     fn scroll_into_view_never_moves_a_visible_row() {
         // Row 100..200 inside a 0..600 viewport.
-        assert_eq!(scroll_into_view(100., 200., 600., 0., -1000., 8.), 0.);
+        assert_eq!(
+            scroll_into_view(
+                100.,
+                200.,
+                RevealViewport {
+                    height: 600.,
+                    top_inset: 0.,
+                    bottom_inset: 0.
+                },
+                0.,
+                -1000.,
+                8.
+            ),
+            0.
+        );
     }
 
     #[test]
     fn scroll_into_view_reveals_below_and_above_with_minimal_motion() {
         // Below the fold: bottom lands at the fold less the margin.
-        let off = scroll_into_view(900., 1000., 600., 0., -2000., 8.);
+        let off = scroll_into_view(
+            900.,
+            1000.,
+            RevealViewport {
+                height: 600.,
+                top_inset: 0.,
+                bottom_inset: 0.,
+            },
+            0.,
+            -2000.,
+            8.,
+        );
         assert!((off - -(1000. + 8. - 600.)).abs() < 1e-3, "{off}");
         // Above: top lands at the top plus the margin.
-        let off = scroll_into_view(100., 200., 600., -500., -2000., 8.);
+        let off = scroll_into_view(
+            100.,
+            200.,
+            RevealViewport {
+                height: 600.,
+                top_inset: 0.,
+                bottom_inset: 0.,
+            },
+            -500.,
+            -2000.,
+            8.,
+        );
         assert!((off - -92.).abs() < 1e-3, "{off}");
     }
 
     #[test]
     fn scroll_into_view_aligns_the_top_of_an_oversized_row() {
         // A post taller than the window: land at its beginning, not its end.
-        let off = scroll_into_view(1000., 2000., 600., 0., -3000., 8.);
+        let off = scroll_into_view(
+            1000.,
+            2000.,
+            RevealViewport {
+                height: 600.,
+                top_inset: 0.,
+                bottom_inset: 0.,
+            },
+            0.,
+            -3000.,
+            8.,
+        );
         assert!((off - -992.).abs() < 1e-3, "{off}");
     }
 
     #[test]
     fn scroll_into_view_clamps_to_the_document() {
-        let off = scroll_into_view(900., 1000., 600., 0., -100., 8.);
+        let off = scroll_into_view(
+            900.,
+            1000.,
+            RevealViewport {
+                height: 600.,
+                top_inset: 0.,
+                bottom_inset: 0.,
+            },
+            0.,
+            -100.,
+            8.,
+        );
         assert_eq!(off, -100.);
+
+        // And the insets shrink the usable band from both ends: a row that fits
+        // the raw viewport but not the band still gets revealed, top-aligned
+        // below the title band.
+    }
+
+    #[test]
+    fn scroll_into_view_keeps_a_row_clear_of_the_overlays() {
+        // A 600px window with a 40px title band and a 120px floating composer:
+        // the usable band is y 40..480.
+        //
+        // Above the band's top (a row at 100..200 with the page at -80, i.e.
+        // window y 20..120 — under the title band): land its top at 40 + 8.
+        let off = scroll_into_view(
+            100.,
+            200.,
+            RevealViewport {
+                height: 600.,
+                top_inset: 40.,
+                bottom_inset: 120.,
+            },
+            -80.,
+            -2000.,
+            8.,
+        );
+        assert!((off - -(100. - 8. - 40.)).abs() < 1e-3, "{off}");
+        // Below the band's bottom (a row at 500..560, window y 500..560 —
+        // behind the composer): land its bottom at 480 - 8.
+        let off = scroll_into_view(
+            500.,
+            560.,
+            RevealViewport {
+                height: 600.,
+                top_inset: 40.,
+                bottom_inset: 120.,
+            },
+            0.,
+            -2000.,
+            8.,
+        );
+        assert!((off - -(560. + 8. - 600. + 120.)).abs() < 1e-3, "{off}");
+        // A row already inside the usable band does not move.
+        assert_eq!(
+            scroll_into_view(
+                100.,
+                200.,
+                RevealViewport {
+                    height: 600.,
+                    top_inset: 40.,
+                    bottom_inset: 120.
+                },
+                0.,
+                -2000.,
+                8.
+            ),
+            0.
+        );
     }
 
     fn stroke(key: &str, key_char: Option<&str>, modifiers: gpui::Modifiers) -> gpui::Keystroke {

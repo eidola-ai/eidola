@@ -431,7 +431,10 @@ fn library_begin_rename_tracks_space(cx: &mut TestAppContext) {
     });
 
     // Cancel clears the state.
-    view.update(cx, |v, cx| v.cancel_rename(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_rename(window, cx));
+    })
+    .unwrap();
     view.read_with(cx, |v, _| {
         assert_eq!(v.renaming_space_id(), None);
     });
@@ -9114,4 +9117,235 @@ fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAp
             "nor does an overlay move tree focus"
         );
     });
+}
+
+#[gpui::test]
+fn space_affordance_index_follows_the_verb_tab_moved_to(cx: &mut TestAppContext) {
+    // The level's index is bookkeeping; which verb has focus is the truth. Tab
+    // walks Save → Cancel, and without a resync the index stayed on the verb
+    // Enter entered, so the next Right cycled from a stale position. Every verb
+    // of the post holding the level tracks its own slot handle, so "which one"
+    // is a lookup.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    // An inline edit session is the only two-verb row (Save, Cancel), and it
+    // makes the conversation's key handler yield outright — so the level is
+    // established through the seam rather than through `Enter`, which cannot
+    // reach it. Everything after that is the real Tab path.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.focus_affordance_for_test("a1", 0, window, cx));
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a1".to_string(), Some(0))));
+    });
+
+    // Tab on to the second verb: the level follows the focus.
+    vcx.update(|window, cx| window.focus_next(cx));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), Some(1))),
+            "the index resyncs to the verb Tab actually moved to"
+        );
+    });
+
+    // …which is what `Left`/`Right` cycle from. (The cycle itself cannot be
+    // exercised here: the same edit session that supplies the second verb makes
+    // the key handler yield, so the arrows never reach the tree.)
+    vcx.update(|window, cx| window.focus_next(cx));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            None,
+            "and a Tab out of the row still releases the level"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_typing_accepts_a_multi_character_commit(cx: &mut TestAppContext) {
+    // macOS builds `key_char` with `UCKeyTranslate` into a four-unit buffer, so
+    // a dead-key or ligature layout can hand one keystroke several characters.
+    // Refusing those dropped the text on the floor: with the conversation
+    // focused there is no input handler to fall through to.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the root post")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    // `Keystroke::parse`'s `key->key_char` form is gpui's own way of spelling a
+    // keystroke whose committed text differs from its key.
+    let consumed = vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("a->ábc").unwrap(), cx)
+    });
+    vcx.run_until_parked();
+    assert!(consumed, "a multi-character commit is handled, not dropped");
+    view.read_with(&vcx, |v, cx| {
+        let editor = v.composer_state_for_test().expect("the composer opened");
+        assert_eq!(
+            editor.read(cx).value().to_string(),
+            "ábc",
+            "the whole commit lands, not its first character"
+        );
+    });
+}
+
+#[gpui::test]
+fn backends_revealing_the_base_url_editor_focuses_it(cx: &mut TestAppContext) {
+    // A keyboard-activated reveal must focus what it revealed: the affordance
+    // that opened the editor unmounts as the row becomes a form, so without it
+    // the window keeps a handle whose element is gone — the dispatch tree has
+    // no node for it, and Tab restarts from the top of the window. Its
+    // siblings here already did this; this row did not.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+
+    assert!(
+        !cx.update_window(window, |_, window, cx| {
+            pane.read_with(cx, |p, cx| p.base_url_input_is_focused(window, cx))
+        })
+        .unwrap()
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.begin_edit_base_url(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, cx| {
+            pane.read_with(cx, |p, cx| p.base_url_input_is_focused(window, cx))
+        })
+        .unwrap(),
+        "the revealed input has the keyboard"
+    );
+}
+
+#[gpui::test]
+fn library_ending_a_rename_hands_focus_back_to_the_listing(cx: &mut TestAppContext) {
+    // `begin_rename` focuses the row's input; committing or cancelling removes
+    // it. Without handing focus back the window keeps a dead handle — the same
+    // class as the Record's detail close, and the same cure. The guard matters
+    // too: a `Blur` ends a session *because* focus went elsewhere, so it must
+    // not be dragged back.
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            stub_space("s1", Some("Tides"), None, 1_000),
+            stub_space("s2", Some("Borrow checker"), None, 900),
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+    draw_frame(cx, window);
+
+    for commit in [false, true] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.begin_rename("s1".into(), Some("Tides".into()), window, cx)
+            });
+        })
+        .unwrap();
+        assert!(
+            !cx.update_window(window, |_, window, cx| {
+                view.read_with(cx, |v, _| v.list_is_focused_for_test(window))
+            })
+            .unwrap(),
+            "the rename input holds the keyboard while the session is open"
+        );
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                if commit {
+                    v.commit_rename(window, cx)
+                } else {
+                    v.cancel_rename(window, cx)
+                }
+            });
+        })
+        .unwrap();
+        assert!(
+            cx.update_window(window, |_, window, cx| {
+                view.read_with(cx, |v, _| v.list_is_focused_for_test(window))
+            })
+            .unwrap(),
+            "ending the session (commit={commit}) returns focus to the listing"
+        );
+    }
+}
+
+#[gpui::test]
+fn space_revealing_a_post_upward_clears_the_title_band(cx: &mut TestAppContext) {
+    // The reveal used to treat the raw content height as visible, so a post
+    // brought in from above landed flush with the window's top — underneath the
+    // title band, which paints over it. The band's height is the document's own
+    // top reserve, and the usable band starts below it.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let long = "a long paragraph that wraps several times over. ".repeat(24);
+    let mut posts = vec![fixture_user_post("a1", &long)];
+    for i in 2..8u32 {
+        let id = format!("a{i}");
+        let mut p = if i % 2 == 0 {
+            fixture_assistant_post(&id, &long)
+        } else {
+            fixture_user_post(&id, &long)
+        };
+        p.parent_action_id = Some(format!("a{}", i - 1));
+        posts.push(p);
+    }
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    // Walk to the end, then back up: the upward moves are the ones that pull a
+    // post down from above the fold.
+    vcx.simulate_keystrokes("end up up");
+    vcx.run_until_parked();
+
+    let (top, reserve) = vcx.update(|window, cx| {
+        let v = view.read(cx);
+        (
+            v.focused_post_window_top_for_test(window, cx),
+            v.doc_reserve_for_test(),
+        )
+    });
+    let top = top.expect("a post is focused");
+    assert!(
+        top >= reserve,
+        "the revealed post's top ({top}) must clear the title band ({reserve})"
+    );
 }
