@@ -918,6 +918,12 @@ impl Render for ParticipantsView {
                 cx,
                 cx.listener(|this, _, _, cx| this.retry_load(cx)),
             ));
+            // A refused write and a failed re-list can hold at once (see
+            // `stores::settle_mutation`); this branch owns the body, so it
+            // carries the write's error too rather than swallowing it.
+            if let Some(err) = op_error {
+                body = body.child(self.render_op_error(&err, cx));
+            }
             return root.child(self.wrap_body(body, window));
         }
 
@@ -984,13 +990,7 @@ impl Render for ParticipantsView {
         }
 
         if let Some(err) = op_error {
-            body = body.child(
-                div()
-                    .id("participants-error")
-                    .probe("participants/error", gpui::Role::Alert, err.clone())
-                    .mt_2()
-                    .child(error_banner(&err, cx)),
-            );
+            body = body.child(self.render_op_error(&err, cx));
         }
 
         // A refresh that failed *over* existing data: keep the (stale) list but
@@ -1017,6 +1017,16 @@ impl Render for ParticipantsView {
 }
 
 impl ParticipantsView {
+    /// The write-error banner. One helper because it renders in two places —
+    /// under the roster, and under the failed-load panel that owns the body.
+    fn render_op_error(&self, err: &str, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .id("participants-error")
+            .probe("participants/error", gpui::Role::Alert, err.to_string())
+            .mt_2()
+            .child(error_banner(err, cx))
+    }
+
     /// A resting participant row: identity + who-responds line + Edit/Remove.
     fn render_row(&self, p: &ParticipantInfo, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
