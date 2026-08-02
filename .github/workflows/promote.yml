@@ -13,7 +13,7 @@ name: Promote next to main
 # After the push, the PR head is reachable from `main`, so GitHub marks the PR
 # merged automatically.
 #
-# Integrity model (full setup in docs/contributing/promotion-security.md):
+# Integrity model:
 #   * Credentials are a dedicated GitHub App, not a PAT. Its App ID + private
 #     key live as secrets on the `promote` Environment, whose deployment-branch
 #     policy is restricted to `main` and which (recommended) requires a human
