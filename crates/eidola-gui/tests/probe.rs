@@ -2770,6 +2770,135 @@ fn templates_pane_router_probes_and_remote_cost_note(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// The editor's referenced-globals list is read-only display of config that
+/// lives on the **shared** participant, so an "edit everywhere" landing while
+/// the editor is open — from the Participants window, another window, or the
+/// CLI — must show through. The draft carries only what the editor edits;
+/// these rows resolve against the live registry every frame.
+#[gpui::test]
+fn templates_editor_referenced_rows_follow_the_live_registry(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.templates = probe_templates();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("tmpl-research", window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "settings/templates/editor/referenced/0",
+        gpui::Role::Label,
+        "You — shared participant",
+        "Responds when asked · Keep me honest.",
+    );
+
+    // The shared global is edited everywhere: `Change::Participants` refreshes
+    // this store (a `SpaceTemplateInfo` embeds its referenced globals'
+    // effective config), and the snapshot it hands back carries the new values.
+    let mut edited = probe_templates();
+    let referenced = &mut edited[1].referenced[0];
+    referenced.label = "Myself".into();
+    referenced.system_prompt = Some("Keep me sharp.".into());
+    referenced.notify_policy = "all".into();
+    stores
+        .templates
+        .update(cx, |s, cx| s.set_templates_for_test(edited, cx));
+
+    // The editor is still open, and it shows the edit — not the values it
+    // opened with.
+    let entries = fresh_entries(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.is_editing()),
+        "the editor must still be open — otherwise this proves nothing"
+    );
+    assert_probe_value(
+        &entries,
+        "settings/templates/editor/referenced/0",
+        gpui::Role::Label,
+        "Myself — shared participant",
+        "Responds to everything · Keep me sharp.",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// A picker's label names it ("Model", "Router model"); *which* model is chosen
+/// is its content, and rides `aria_value` — settled by construction, since it
+/// moves only on a click. Both pickers take the same shape from one helper: a
+/// screen reader otherwise hears the same word whether a space routes on-device,
+/// bills per post, or has no model selected at all.
+#[gpui::test]
+fn model_pickers_announce_their_selection(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.templates = probe_templates();
+        s.participants = Some(probe_participants());
+    });
+
+    // The Templates pane's router picker: Off (the default) is a real choice
+    // and says so; a chosen reference names itself and its backend.
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("tmpl-research", window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "settings/templates/editor/router",
+        gpui::Role::Button,
+        "Router model",
+        "Off",
+    );
+    view.update(cx, |v, cx| v.set_router_model(Some("gemma4-31b"), cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "settings/templates/editor/router",
+        gpui::Role::Button,
+        "Router model",
+        "gemma4-31b · Eidola",
+    );
+
+    // The participant model field — the shared widget the Templates pane's own
+    // agent rows use too — takes the identical shape.
+    let (p_window, p_view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            ParticipantsView::new(
+                stores.clone(),
+                "demo".into(),
+                Some("Demo".into()),
+                window,
+                cx,
+            )
+        })
+    });
+    cx.update_window(p_window, |_, window, cx| {
+        p_view.update(cx, |v, cx| v.begin_edit("agent-1", window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, p_window);
+    assert_probe_value(
+        &entries,
+        "participants/editor/model",
+        gpui::Role::Button,
+        "Model",
+        "gemma4-31b · Eidola",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn participants_view_failed_load_shows_retry_not_controls(cx: &mut TestAppContext) {
     let _guard = probes_on();

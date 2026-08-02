@@ -41,7 +41,7 @@ use gpui_component::{
 use crate::participants_view::{
     DEFAULT_AGENT_SYSTEM_PROMPT, NOTIFY_POLICIES, error_banner, field_label, ghost_button,
     ghost_button_labeled, load_error_panel, mode_chip, model_display, model_field, model_groups,
-    notify_label,
+    notify_label, picker_value,
 };
 use crate::probe::Probe as _;
 use crate::stores::{ConfigStore, Stores, TemplatesStore};
@@ -86,8 +86,6 @@ struct TemplateDraft {
     /// `update_template` and emits its own `Change::Templates`).
     router_original: Option<String>,
     participants: Vec<ParticipantDraft>,
-    /// The referenced globals this template carries, listed read-only.
-    referenced: Vec<eidola_app_core::TemplateReferencedParticipant>,
     /// The open model picker, if any.
     picker: Option<OpenPicker>,
 }
@@ -242,7 +240,6 @@ impl TemplatesSettingsView {
             router_model: None,
             router_original: None,
             participants: vec![agent],
-            referenced: Vec::new(),
             picker: None,
         });
         cx.notify();
@@ -274,7 +271,6 @@ impl TemplatesSettingsView {
             router_model: t.router_model.clone(),
             router_original: t.router_model.clone(),
             participants,
-            referenced: t.referenced.clone(),
             picker: None,
         });
         cx.notify();
@@ -728,9 +724,10 @@ impl TemplatesSettingsView {
             .child(field_label("Router model", cx))
             .child(self.render_router_field(draft, cx));
 
-        // Participants.
+        // Participants. The referenced globals render from the **live store
+        // snapshot** (see `editor_referenced`), the owned agents from the draft.
         card = card.child(field_label("Participants", cx));
-        for (idx, r) in draft.referenced.iter().enumerate() {
+        for (idx, r) in self.editor_referenced(draft, cx).iter().enumerate() {
             card = card.child(self.render_referenced(idx, r, cx));
         }
         for (idx, p) in draft.participants.iter().enumerate() {
@@ -797,13 +794,19 @@ impl TemplatesSettingsView {
             }
             None => ("Off".into(), None),
         };
+        // The picker's *content* is which router is chosen — settled (it moves
+        // only on a click) and otherwise unreachable to a screen reader, which
+        // would hear "Router model" whether the space bills per post or not.
+        // Same shape as the participant model field, deliberately.
+        let value = picker_value(&name, backend.as_ref());
 
         let button = h_flex()
             .id("template-router-button")
-            .probe(
+            .probe_value(
                 "settings/templates/editor/router",
                 gpui::Role::Button,
                 "Router model",
+                value,
             )
             .w_full()
             .px_2()
@@ -938,6 +941,33 @@ impl TemplatesSettingsView {
                 .child(ROUTER_HELP),
         )
         .into_any_element()
+    }
+
+    /// The referenced globals the open editor lists, resolved against the
+    /// **live registry** rather than carried in the draft.
+    ///
+    /// A draft holds only what the editor edits, and these rows are read-only
+    /// display of config that lives elsewhere and is shared everywhere it is
+    /// referenced — so an "edit everywhere" from the Participants window (which
+    /// emits `Change::Participants`, routed to this store) must be visible under
+    /// an editor that is already open. A clone taken at `begin_edit` would keep
+    /// showing the old label and prompt for as long as the editor stayed open.
+    /// A create draft has no template id and therefore no referenced rows.
+    fn editor_referenced(
+        &self,
+        draft: &TemplateDraft,
+        cx: &gpui::App,
+    ) -> Vec<eidola_app_core::TemplateReferencedParticipant> {
+        let Some(id) = draft.id.as_deref() else {
+            return Vec::new();
+        };
+        self.templates_store
+            .read(cx)
+            .list()
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.referenced.clone())
+            .unwrap_or_default()
     }
 
     /// A global this template references — listed so it isn't invisible, and
