@@ -10121,3 +10121,163 @@ fn space_inspector_escape_closes_its_router_picker(cx: &mut TestAppContext) {
         "the view root closes the picker, the same rung the context menu owns"
     );
 }
+
+/// **A view must observe the stores it renders** (STATE.md). The inspector's
+/// rows come from `SpaceSettingsStore`, whose every announcement is
+/// asynchronous — the panel's opening `ensure` load completing, each write's
+/// re-read, a bus-driven refresh — and none of them repaints this window by any
+/// other route. Without the subscription the panel sat on "Loading…" until some
+/// unrelated event happened to redraw it.
+///
+/// Driven against a real core so the load genuinely lands, with the window
+/// quiesced first so the only thing that can notify the view afterwards is the
+/// settings load itself.
+#[gpui::test]
+fn space_inspector_repaints_when_its_settings_land(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_space(cx, &stores, Some(space.clone()));
+    // Let the transcript load and every launch-time refresh settle, so nothing
+    // else is in flight to repaint this window.
+    wait_until(cx, "the window quiesces", |cx| {
+        view.read_with(cx, |v, cx| {
+            !matches!(
+                v.space().read(cx).transcript(),
+                eidola_gui::loadable::Loadable::NotLoaded | eidola_gui::loadable::Loadable::Loading
+            )
+        })
+    });
+
+    let repaints = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = repaints.clone();
+    let _sub = cx.update(|cx| cx.observe(&view, move |_, _| counter.set(counter.get() + 1)));
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, cx))
+    })
+    .unwrap();
+    // The toggle's own notify is not what this test is about.
+    repaints.set(0);
+    assert!(
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).is_loading()),
+        "precondition: opening the panel started the settings load"
+    );
+
+    wait_until(cx, "the settings load lands", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).has_value())
+    });
+    assert!(
+        repaints.get() > 0,
+        "the settings landing must schedule a repaint — otherwise the panel \
+         keeps rendering the spinner it drew before the load completed"
+    );
+
+    drain_runtime(&core);
+}
+
+/// The empty-title rejection must leave the *field* honest too. Clearing the
+/// title and committing is read as a mistake rather than an intent (a space's
+/// title is generated), so nothing is written — but the field is then showing a
+/// blank where the space still has a name. The repair is
+/// `sync_inspector_title`, and it only fires when the seed disagrees with the
+/// stored title, so the rejection has to invalidate the seed; leaving it equal
+/// made the sync read "already synchronized" and the field stayed blank.
+#[gpui::test]
+fn space_inspector_rejecting_a_blank_title_restores_the_stored_one(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let state = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("the title field exists once the inspector renders");
+    assert_eq!(state.read_with(cx, |s, _| s.value().to_string()), "Tides");
+
+    // Clear the field and commit — the seam both `PressEnter` and `Blur` route
+    // through, with the field left unfocused as it is after a blur.
+    cx.update_window(window, |_, window, cx| {
+        state.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        view.update(cx, |v, cx| v.inspector_commit_title(cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    stores.spaces.read_with(cx, |s, _| {
+        assert_eq!(
+            s.list()
+                .iter()
+                .find(|r| r.id == "s1")
+                .and_then(|r| r.title.clone()),
+            Some("Tides".into()),
+            "a blanked field writes nothing — the space keeps its name"
+        );
+    });
+    assert_eq!(
+        state.read_with(cx, |s, _| s.value().to_string()),
+        "Tides",
+        "and the field is repaired from the stored title rather than left blank"
+    );
+}
+
+/// Two quick presses of the cascade stepper are two increments. Each press
+/// derives `next` from the store's cached value, and a write's round trip is
+/// slower than a second click — so the store has to advance its own snapshot as
+/// the write leaves (see `SpaceSettingsStore::write_then_reread`). Without that
+/// both presses stepped from the same cached 4, the second write superseded the
+/// first, and 4 + 1 + 1 persisted as 5.
+#[gpui::test]
+fn space_inspector_two_quick_cascade_steps_both_count(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_space(cx, &stores, Some(space.clone()));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, cx))
+    })
+    .unwrap();
+    wait_until(cx, "the settings load", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).has_value())
+    });
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.inspector_cascade_for_test(cx)),
+        Some(eidola_app_core::DEFAULT_CASCADE_LIMIT),
+        "precondition: the panel shows the space's stored limit"
+    );
+
+    // Two presses with nothing settling in between — the first write has not
+    // round-tripped when the second derives its value.
+    view.update(cx, |v, cx| v.inspector_step_cascade_for_test(1, cx));
+    view.update(cx, |v, cx| v.inspector_step_cascade_for_test(1, cx));
+
+    let target = eidola_app_core::DEFAULT_CASCADE_LIMIT + 2;
+    // Wait on the **durable row**, not the store's cell — the optimistic value
+    // is there the moment the press is handled, and what this test is about is
+    // that both increments survive the round trip.
+    let durable = |core: &std::sync::Arc<AppCore>, space: &str| {
+        core.runtime()
+            .block_on(core.space_settings(space.to_string()))
+            .expect("read the space's settings back")
+            .cascade_limit
+    };
+    wait_until(cx, "both steps persist", |_| {
+        durable(&core, &space) == target
+    });
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.inspector_cascade_for_test(cx)),
+        Some(target),
+        "and the panel agrees with the row it wrote"
+    );
+
+    drain_runtime(&core);
+}
