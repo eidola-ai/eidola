@@ -702,6 +702,13 @@ impl SpaceView {
             // The space's participants feed the separator Ask menus, the
             // streaming bylines, and the cascade notice's ask affordances.
             cx.observe(&stores.participants, |_, _, cx| cx.notify()),
+            // This space's own settings are the inspector's rows. Every one of
+            // this store's announcements is asynchronous — the panel's opening
+            // `ensure` load completing or failing, each write's re-read, a bus
+            // `Change::Space` refresh — and none of them is accompanied by
+            // anything else that would repaint this window, so without this the
+            // panel could sit on "Loading…" until an unrelated event redrew it.
+            cx.observe(&stores.space_settings, |_, _, cx| cx.notify()),
             // Local models feed the request panel (a load/unload while it's
             // open must re-render — offline, the models store is quiet, so
             // this is the *only* signal that would refresh it) *and* the

@@ -188,6 +188,12 @@ impl SpaceView {
         self.inspector_toggle_router_picker(cx);
     }
 
+    /// Press the cascade stepper without a click (tests).
+    #[doc(hidden)]
+    pub fn inspector_step_cascade_for_test(&mut self, delta: i64, cx: &mut Context<Self>) {
+        self.inspector_step_cascade(delta, cx);
+    }
+
     /// Open/close the inspector without a menu action (driver scenes, tests).
     #[doc(hidden)]
     pub fn set_inspector_open_for_test(&mut self, open: bool, cx: &mut Context<Self>) {
@@ -301,7 +307,8 @@ impl SpaceView {
 
     /// Commit the title field. Empty means "no title" here — a space's title is
     /// generated, so blanking the field is a mistake rather than an intent, and
-    /// the field re-seeds from the stored value on the next frame.
+    /// the field re-seeds from the stored value on the next frame it is not
+    /// being typed in.
     pub fn inspector_commit_title(&mut self, cx: &mut Context<Self>) {
         let Some(space_id) = self.space.read(cx).id().map(str::to_string) else {
             return;
@@ -311,6 +318,15 @@ impl SpaceView {
         };
         let title = state.read(cx).value().trim().to_string();
         if title.is_empty() || Some(title.as_str()) == self.space_title(cx).as_deref() {
+            // Nothing to write — but the field is not necessarily showing the
+            // stored title either (it was blanked, or padded with whitespace).
+            // **Every rejection invalidates the seed**, because the seed is the
+            // only thing `sync_inspector_title` consults: leave it equal to the
+            // stored title and the sync reads "already synchronized" and never
+            // repairs the field, so a cleared title stays blank on screen while
+            // the space is still called what it was called.
+            self.inspector_title_seed = None;
+            cx.notify();
             return;
         }
         self.inspector_title_seed = Some(title.clone().into());

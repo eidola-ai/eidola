@@ -15,6 +15,15 @@
 //! and every exit re-reads (`crate::stores::settle_mutation` resolves the cell
 //! either way).
 //!
+//! **A write advances the cell it will re-read.** Every setter applies its own
+//! value to the cached snapshot before the write leaves, so a control that
+//! derives its next value from this cell (the inspector's ±1 cascade stepper)
+//! steps from what is being written rather than from the snapshot the write
+//! replaces — otherwise two quick presses both step from the same number and
+//! the second supersedes the first. The optimism never outlives the round trip:
+//! the unconditional re-read reconciles it on every exit, so a refused write
+//! lands back on the truth with its refusal in `op_error`.
+//!
 //! The space **title** is deliberately *not* here: it belongs to the Library
 //! index (`SpacesStore`, which already owns rename), and the inspector's title
 //! row writes through that store so the Library, the window title, and the
@@ -176,8 +185,23 @@ impl SpaceSettingsStore {
     /// was in flight (STATE.md's cancellation debt). See
     /// [`crate::stores::participants::ParticipantsStore`] for the full
     /// rationale; this is the same machine over a one-row domain.
-    fn write_then_reread<F>(&mut self, space_id: String, cx: &mut Context<Self>, op: F)
-    where
+    ///
+    /// `advance` applies the write's value to the cached snapshot **before** the
+    /// write leaves: a caller deriving its next value from this cell (the
+    /// inspector's ±1 cascade stepper) must see what is being written, not the
+    /// snapshot it replaces. Without it two quick presses both step from the
+    /// same cached number and the second write supersedes the first, so two
+    /// increments persist as one. The optimism is bounded by the re-read below,
+    /// which lands on **every** exit — a refused write is reconciled back to the
+    /// truth (with its refusal in `op_error`), never left showing a value the
+    /// database does not hold.
+    fn write_then_reread<F>(
+        &mut self,
+        space_id: String,
+        cx: &mut Context<Self>,
+        advance: impl FnOnce(&mut SpaceSettings),
+        op: F,
+    ) where
         F: FnOnce(
                 Arc<AppCore>,
             ) -> std::pin::Pin<
@@ -188,6 +212,13 @@ impl SpaceSettingsStore {
         let Some(core) = self.app_core.clone() else {
             return;
         };
+        if let Some(value) = self
+            .spaces
+            .get_mut(&space_id)
+            .and_then(|cell| cell.value_mut())
+        {
+            advance(value);
+        }
         self.op_errors.remove(&space_id);
         self.refresh_tasks.remove(&space_id);
         self.refresh_pending.remove(&space_id);
@@ -223,15 +254,20 @@ impl SpaceSettingsStore {
     /// Set the space's cascade limit (app-core enforces the floor).
     pub fn set_cascade_limit(&mut self, space_id: String, limit: i64, cx: &mut Context<Self>) {
         let s = space_id.clone();
-        self.write_then_reread(space_id, cx, move |core| {
-            Box::pin(async move {
-                bridge(core, move |c| async move {
-                    c.set_space_cascade_limit(s, limit).await
+        self.write_then_reread(
+            space_id,
+            cx,
+            move |settings| settings.cascade_limit = limit,
+            move |core| {
+                Box::pin(async move {
+                    bridge(core, move |c| async move {
+                        c.set_space_cascade_limit(s, limit).await
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
                 })
-                .await
-                .map_err(|e| e.to_string())
-            })
-        });
+            },
+        );
     }
 
     /// Set (or clear, with `None` — **Off**) the space's may-decline router
@@ -244,14 +280,20 @@ impl SpaceSettingsStore {
         cx: &mut Context<Self>,
     ) {
         let s = space_id.clone();
-        self.write_then_reread(space_id, cx, move |core| {
-            Box::pin(async move {
-                bridge(core, move |c| async move {
-                    c.set_space_router_model(s, router_model).await
+        let picked = router_model.clone();
+        self.write_then_reread(
+            space_id,
+            cx,
+            move |settings| settings.router_model = picked,
+            move |core| {
+                Box::pin(async move {
+                    bridge(core, move |c| async move {
+                        c.set_space_router_model(s, router_model).await
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
                 })
-                .await
-                .map_err(|e| e.to_string())
-            })
-        });
+            },
+        );
     }
 }
