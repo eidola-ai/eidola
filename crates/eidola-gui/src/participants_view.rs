@@ -1213,8 +1213,8 @@ impl ParticipantsView {
         card = card.child(
             div()
                 .id("editor-label-wrap")
-                .probe("participants/editor/label", gpui::Role::TextInput, "Name")
-                .child(Input::new(&edit.label).role(None)),
+                .probe_bounds("participants/editor/label", gpui::Role::TextInput, "Name")
+                .child(Input::new(&edit.label).aria_label("Name")),
         );
 
         if is_agent {
@@ -1231,12 +1231,12 @@ impl ParticipantsView {
             card = card.child(
                 div()
                     .id("editor-prompt-wrap")
-                    .probe(
+                    .probe_bounds(
                         "participants/editor/system-prompt",
                         gpui::Role::TextInput,
                         "System prompt",
                     )
-                    .child(Input::new(&edit.system_prompt).role(None)),
+                    .child(Input::new(&edit.system_prompt).aria_label("System prompt")),
             );
 
             // Notify policy.
@@ -1286,8 +1286,8 @@ impl ParticipantsView {
             .child(
                 div()
                     .id("add-label-wrap")
-                    .probe("participants/add/name", gpui::Role::TextInput, "Name")
-                    .child(Input::new(&add.label).role(None)),
+                    .probe_bounds("participants/add/name", gpui::Role::TextInput, "Name")
+                    .child(Input::new(&add.label).aria_label("Name")),
             )
             .child(field_label("Model", cx))
             .child(self.render_model_field(add.model_ref.as_deref(), PickerTarget::Add, cx))
@@ -1295,12 +1295,12 @@ impl ParticipantsView {
             .child(
                 div()
                     .id("add-prompt-wrap")
-                    .probe(
+                    .probe_bounds(
                         "participants/add/system-prompt",
                         gpui::Role::TextInput,
                         "System prompt",
                     )
-                    .child(Input::new(&add.system_prompt).role(None)),
+                    .child(Input::new(&add.system_prompt).aria_label("System prompt")),
             )
             .child(field_label("Responds", cx))
             .child(self.notify_row(&add.notify_policy, "add", false, cx))
@@ -1348,12 +1348,12 @@ impl ParticipantsView {
             .child(
                 div()
                     .id("template-title-wrap")
-                    .probe(
+                    .probe_bounds(
                         "participants/template/title",
                         gpui::Role::TextInput,
                         "Template name",
                     )
-                    .child(Input::new(title).role(None)),
+                    .child(Input::new(title).aria_label("Template name")),
             )
             .child(
                 h_flex()

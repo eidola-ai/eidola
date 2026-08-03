@@ -712,12 +712,12 @@ impl TemplatesSettingsView {
             .child(
                 div()
                     .id("template-title-wrap")
-                    .probe(
+                    .probe_bounds(
                         "settings/templates/editor/title",
                         gpui::Role::TextInput,
                         "Template name",
                     )
-                    .child(Input::new(&draft.title).role(None)),
+                    .child(Input::new(&draft.title).aria_label("Template name")),
             );
 
         // Cascade limit — a small +/- stepper.
@@ -1122,12 +1122,12 @@ impl TemplatesSettingsView {
                         div()
                             .id(SharedString::from(format!("tp-label-wrap-{idx}")))
                             .flex_1()
-                            .probe(
+                            .probe_bounds(
                                 format!("settings/templates/participant/{idx}/name"),
                                 gpui::Role::TextInput,
                                 "Name",
                             )
-                            .child(Input::new(&p.label).role(None)),
+                            .child(Input::new(&p.label).aria_label("Name")),
                     )
                     .child(ghost_button_labeled(
                         SharedString::from(format!("tp-remove-{idx}")),
@@ -1152,12 +1152,12 @@ impl TemplatesSettingsView {
             .child(
                 div()
                     .id(SharedString::from(format!("tp-prompt-wrap-{idx}")))
-                    .probe(
+                    .probe_bounds(
                         format!("settings/templates/participant/{idx}/system-prompt"),
                         gpui::Role::TextInput,
                         "System prompt",
                     )
-                    .child(Input::new(&p.system_prompt).role(None)),
+                    .child(Input::new(&p.system_prompt).aria_label("System prompt")),
             )
             .child({
                 let mut row = h_flex().gap_2().items_center().child(

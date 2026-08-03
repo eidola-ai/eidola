@@ -180,6 +180,38 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         self.probe_inner(name, role, label.into(), None, false)
     }
 
+    /// Record the driver selector + painted bounds under `name` — exactly
+    /// like [`Probe::probe`]'s registry half — while applying **no AccessKit
+    /// attributes at all**: no role, no label, no focus. The element emits no
+    /// a11y node; `role` and `label` here only describe the control in the
+    /// driver's `elements` listing.
+    ///
+    /// **Scope is deliberately narrow: only for a wrapper whose inner widget
+    /// is itself the accessible node** (today: the `Input` wrappers — the
+    /// widget owns the tracked focus handle, emits the `TextInput` node, and
+    /// carries the label via `Input::aria_label`). This is the bounds-only
+    /// slice of task 43's un-hoist design pulled forward. [`Probe::probe`]
+    /// remains the default annotation; reaching for this anywhere the wrapper
+    /// is the control would silently remove the control from the a11y tree.
+    ///
+    /// Residual drift this shape accepts: the role/label recorded here and
+    /// the widget's own annotation are two statements kept equal by the call
+    /// site (the source-scan test in `tests/probe.rs` enforces the widget
+    /// half; the registry half is what probe tests assert).
+    fn probe_bounds(
+        self,
+        name: impl Into<SharedString>,
+        role: Role,
+        label: impl Into<SharedString>,
+    ) -> Self {
+        let label = label.into();
+        if !probes_enabled() {
+            return self;
+        }
+        let name = name.into();
+        self.child(record_canvas(name, role, label, None))
+    }
+
     #[doc(hidden)]
     fn probe_inner(
         self,
@@ -215,35 +247,44 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         if !probes_enabled() {
             return this;
         }
-        let name = name.into();
-        this.child(
-            canvas(
-                move |bounds, window, _| {
-                    record(
-                        window.window_handle().window_id().as_u64(),
-                        name.to_string(),
-                        ProbeEntry {
-                            role,
-                            label,
-                            value,
-                            bounds,
-                        },
-                    );
-                },
-                |_, _, _, _| {},
-            )
-            // Inset-0 is load-bearing: with auto insets an absolute child
-            // falls back to its *static position* — after any siblings — so
-            // a probe added after the element's content records bounds
-            // offset by that content (a click-by-name then misses). Pinning
-            // to the parent's origin makes recording independent of whether
-            // `.probe()` is called before or after `.child(…)`.
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full(),
-        )
+        this.child(record_canvas(name.into(), role, label, value))
     }
 }
 
 impl<T: StatefulInteractiveElement + ParentElement + Sized> Probe for T {}
+
+/// The registry-recording half shared by every probe variant: a hitbox-free
+/// `canvas` whose prepaint sees the parent's final bounds and records them
+/// under `name`.
+fn record_canvas(
+    name: SharedString,
+    role: Role,
+    label: SharedString,
+    value: Option<SharedString>,
+) -> impl gpui::IntoElement {
+    canvas(
+        move |bounds, window, _| {
+            record(
+                window.window_handle().window_id().as_u64(),
+                name.to_string(),
+                ProbeEntry {
+                    role,
+                    label,
+                    value,
+                    bounds,
+                },
+            );
+        },
+        |_, _, _, _| {},
+    )
+    // Inset-0 is load-bearing: with auto insets an absolute child falls back
+    // to its *static position* — after any siblings — so a probe added after
+    // the element's content records bounds offset by that content (a
+    // click-by-name then misses). Pinning to the parent's origin makes
+    // recording independent of whether `.probe()` is called before or after
+    // `.child(…)`.
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
