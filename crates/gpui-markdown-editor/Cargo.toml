@@ -19,17 +19,17 @@ path = "src/bin/demo.rs"
 # workspace.
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/eidola-ai/gpui-component", rev = "cda36771ab171b2f6b6b63b2b0930a06cf1ef25a" }
-gpui-component-assets = { git = "https://github.com/eidola-ai/gpui-component", rev = "cda36771ab171b2f6b6b63b2b0930a06cf1ef25a" }
+gpui-component = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola" }
+gpui-component-assets = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola" }
 
-# Local fork that exposes `Options::ENABLE_EMPTY_NESTED_LISTS`. We need
-# pulldown to parse `  - \n` (and similar empty-nested-item shapes) as
-# a list item rather than lazy-continuation text so the editor's chain
-# query stays correct mid-typing. Switch back to crates.io once the
-# upstream PR lands. `std` is required (the v0.13 fork's default
-# disables it via `default-features = false`); we don't need `html` or
-# `getopts`.
-pulldown-cmark = { git = "https://github.com/eidola-ai/pulldown-cmark", rev = "3153947232d9e89e0af24c3a0977915be5fbb6b3", default-features = false, features = ["std"] }
+# Our fork's `eidola` branch (upstream main + our feature commits, rebased):
+# exposes `Options::ENABLE_EMPTY_NESTED_LISTS` — we need pulldown to parse
+# `  - \n` (and similar empty-nested-item shapes) as a list item rather than
+# lazy-continuation text so the editor's chain query stays correct mid-typing
+# — plus block display math. Switch back to crates.io once the upstream PRs
+# land. `std` is required (the fork's default disables it via
+# `default-features = false`); we don't need `html` or `getopts`.
+pulldown-cmark = { git = "https://github.com/eidola-ai/pulldown-cmark", branch = "eidola", default-features = false, features = ["std"] }
 # RaTeX — parse + lay out LaTeX math expressions into a DisplayList of
 # absolute-coordinate drawing commands. We walk the DisplayList and
 # emit native gpui paint ops (paint_quad / paint_path / shaped text)

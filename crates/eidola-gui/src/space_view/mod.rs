@@ -2376,7 +2376,11 @@ impl SpaceView {
                                 this.last_h_delta = delta.x;
                             }
                         }
-                        TouchPhase::Ended => {}
+                        // Nothing to unwind here — the per-gesture state this
+                        // arm would reset is re-elected on the next `Started`,
+                        // and `resolve_scroll_axis` already clears the axis
+                        // lock for any non-`Moved` phase.
+                        TouchPhase::Ended | TouchPhase::Cancelled => {}
                     }
                     let locked = this.scroll_axis;
                     match this.resolve_scroll_axis(ev.touch_phase, delta) {
