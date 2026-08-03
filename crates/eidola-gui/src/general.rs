@@ -1,7 +1,11 @@
-//! General settings pane — how the app looks.
+//! General settings pane — how the app looks, and when it starts.
 //!
-//! The whole pane is the circadian **Appearance** axes (day/night, time of
-//! day, and the fixed light character while the sun is off). Everything
+//! Mostly the circadian **Appearance** axes (day/night, time of day, and the
+//! fixed light character while the sun is off), plus the one **Startup**
+//! row: "Open at login" (task 17 wave 3), opt-in and never default. That row
+//! is the only state in this pane that does not come from a store — the
+//! system owns it (see [`crate::login_item`]), so it is read at construction
+//! and re-read after every write. Everything
 //! about the Eidola *connection* — base URL, trusted measurements, hardware
 //! CAs, attestation URL, domain separator — lives in Settings → Backends →
 //! Eidola, the eidola backend's own configuration surface; this pane no
@@ -15,13 +19,23 @@ use gpui::{
     Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder,
 };
-use gpui_component::{ActiveTheme, StyledExt, h_flex, label::Label, v_flex};
+use gpui_component::{
+    ActiveTheme, Sizable, StyledExt, h_flex, label::Label, switch::Switch, v_flex,
+};
 
+use crate::login_item::{self, LoginItemState};
 use crate::probe::Probe as _;
 use crate::stores::ConfigStore;
 
 pub struct GeneralView {
     config: Entity<ConfigStore>,
+    /// The system's answer about our login item. Not store-backed — macOS
+    /// owns this state and a second copy would be a second answer (see
+    /// `crate::login_item`). Read once here and again after every write.
+    login_item: LoginItemState,
+    /// The system's own words when it refuses a register/unregister, until
+    /// the next attempt.
+    login_item_error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -31,8 +45,29 @@ impl GeneralView {
 
         Self {
             config,
+            login_item: login_item::state(),
+            login_item_error: None,
             _subscriptions,
         }
+    }
+
+    /// The login item as the system last reported it (test accessor).
+    pub fn login_item(&self) -> LoginItemState {
+        self.login_item
+    }
+
+    pub fn login_item_error(&self) -> Option<&str> {
+        self.login_item_error.as_deref()
+    }
+
+    /// Turn "Open at login" on or off. **The write's result is never
+    /// assumed** — a refusal (unsigned bundle, a user-level denial) leaves
+    /// the system exactly as it was, so the row re-reads the system rather
+    /// than flipping to what was asked for.
+    pub fn set_open_at_login(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.login_item_error = login_item::set(enabled).err();
+        self.login_item = login_item::state();
+        cx.notify();
     }
 
     /// Circadian day/night axis. Writes through the store; the theme
@@ -295,6 +330,34 @@ impl Render for GeneralView {
             ));
         }
 
+        // --- Startup: the opt-in login item -----------------------------
+        col = col.child(section_header("Startup", cx));
+        col = col.child(field_row(
+            "Open at login",
+            cx,
+            v_flex()
+                .gap_1()
+                .child(self.login_item_toggle(cx))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground.opacity(0.8))
+                        .child(self.login_item.description()),
+                )
+                .when_some(self.login_item_error.clone(), |el, err| {
+                    el.child(
+                        div()
+                            .id("login-item-error")
+                            .probe(
+                                "settings/general/login-item/error",
+                                gpui::Role::Alert,
+                                err.clone(),
+                            )
+                            .child(error_banner(&err, cx)),
+                    )
+                }),
+        ));
+
         if let Some(err) = error {
             col = col.child(
                 div()
@@ -305,6 +368,58 @@ impl Render for GeneralView {
         }
 
         col
+    }
+}
+
+impl GeneralView {
+    /// The "Open at login" switch. Same hoisted shape as the backends pane's
+    /// auto-start toggle: the probed wrapper is the accessible control (role,
+    /// label, toggled state, keyboard activation) because `Switch` tracks no
+    /// focus handle at our gpui-component rev, and `Switch` handles the
+    /// pointer press itself with `stop_propagation`, so the two never
+    /// double-fire.
+    fn login_item_toggle(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let state = self.login_item;
+        let next = !state.is_on();
+        let settable = state.is_settable();
+        div()
+            .id("login-item")
+            .probe(
+                "settings/general/login-item",
+                gpui::Role::CheckBox,
+                "Open Eidola at login",
+            )
+            // `aria_toggled`, not `aria_selected`: `accesskit_macos` reads a
+            // checkbox's value from `toggled()` and consults `is_selected`
+            // only for `Role::Tab`.
+            .aria_toggled(state.is_on().into())
+            // One predicate for activation *and* tab-stopness — a wrapper
+            // that keeps its click while dropping only the Tab entry is a
+            // control that lies to the pointer.
+            .map(|el| {
+                if settable {
+                    el.on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_open_at_login(next, cx);
+                    }))
+                } else {
+                    el.tab_stop(false).opacity(0.5)
+                }
+            })
+            .child(
+                // Switch sets no AccessKit role/label at our gpui-component
+                // rev, so the probed wrapper is the only node; if Switch
+                // gains self-annotation upstream, this site must join the
+                // `.role(None)` opt-out.
+                Switch::new("login-item-switch")
+                    .small()
+                    .checked(state.is_on())
+                    .label("Start Eidola when you log in")
+                    .when(settable, |s| {
+                        s.on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                            this.set_open_at_login(*checked, cx);
+                        }))
+                    }),
+            )
     }
 }
 

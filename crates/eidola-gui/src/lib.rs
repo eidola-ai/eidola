@@ -12,6 +12,7 @@ pub mod general;
 pub mod library;
 pub mod lifecycle;
 pub mod loadable;
+pub mod login_item;
 pub mod onboarding;
 pub mod overlay;
 pub mod participants_view;
@@ -23,6 +24,7 @@ pub mod settings;
 pub mod solar;
 pub mod space;
 pub mod space_view;
+pub mod status_item;
 pub mod stores;
 pub mod templates_settings;
 pub mod theme;
@@ -118,14 +120,7 @@ pub fn run_with(opts: LaunchOptions) {
     // than `Self` so we can't chain it before `run()` (which consumes by
     // value). On Linux gpui stores the callback and nothing ever fires it —
     // there is no platform mechanism; that door is the wave-4 socket.
-    application.on_reopen(|cx: &mut App| {
-        lifecycle::reactivate(cx, |cx| {
-            // A reopen can in principle arrive before launch finishes.
-            if cx.has_global::<AppGlobal>() {
-                open_library_window(cx);
-            }
-        });
-    });
+    application.on_reopen(|cx: &mut App| reactivate_app(cx));
 
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
@@ -207,6 +202,13 @@ pub fn run_with(opts: LaunchOptions) {
         cx.observe(&stores.templates, |_, cx| install_menus(cx))
             .detach();
 
+        // The menu-bar face, and with it the Regular ⇄ Accessory flip (task
+        // 17 wave 3). After the action handlers, because the status menu
+        // dispatches them; before any window opens, because the flip's
+        // "Regular" half rides `base_window_options`. A windowless macOS
+        // launch gets one too — that is exactly the toolbar-app shape.
+        status_item::install(&stores, opts, cx);
+
         // Windowless: the process *is* the app — no window at launch, no
         // foreground activation, and (per `lifecycle::quit_mode`) nothing
         // that closes later can stop it. Everything above still runs: the
@@ -271,6 +273,21 @@ pub fn run_with(opts: LaunchOptions) {
                 task.detach();
             }
             None => open_main_window(cx),
+        }
+    });
+}
+
+/// The app's door back in when it has been running without a face: focus a
+/// window, or open the Library when there is none.
+///
+/// Shared by `Application::on_reopen` (Dock click, Spotlight, a second
+/// `open -a Eidola`) and the status menu's "Open Eidola" — one behaviour, so
+/// the two can never drift.
+pub(crate) fn reactivate_app(cx: &mut App) {
+    lifecycle::reactivate(cx, |cx| {
+        // A reopen can in principle arrive before launch finishes.
+        if cx.has_global::<AppGlobal>() {
+            open_library_window(cx);
         }
     });
 }
@@ -739,7 +756,21 @@ fn centered_window_bounds(cx: &mut App, w: f32, h: f32) -> Option<WindowBounds> 
 /// `chrome::ChromeRoot` is actually see-through) and the Wayland `app_id`
 /// (matching the shipped `.desktop` file so the shell can associate windows
 /// with the app's identity and icon).
-fn base_window_options(bounds: Option<WindowBounds>, min_w: f32, min_h: f32) -> WindowOptions {
+///
+/// **It is also the one choke point every window open passes through**, and
+/// therefore where the macOS activation policy flips back to `Regular`
+/// (`status_item::window_will_open`) — an `Accessory` app has no menu bar, so
+/// a window opened without the flip would appear under someone else's. Taking
+/// `cx` for a side effect is deliberate: putting the call here rather than in
+/// each `open_*_window` makes "open a window without becoming Regular"
+/// unrepresentable.
+fn base_window_options(
+    cx: &mut App,
+    bounds: Option<WindowBounds>,
+    min_w: f32,
+    min_h: f32,
+) -> WindowOptions {
+    status_item::window_will_open(cx);
     WindowOptions {
         window_bounds: bounds,
         titlebar: Some(transparent_titlebar()),
@@ -766,7 +797,7 @@ const APP_ID: &str = "tech.m6i.Eidola";
 /// license note, and a "View on GitHub" link.
 fn open_about_window(cx: &mut App) {
     let bounds = centered_window_bounds(cx, 360., 420.);
-    let opts = base_window_options(bounds, 300., 340.);
+    let opts = base_window_options(cx, bounds, 300., 340.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -823,7 +854,7 @@ fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
     // Square chat window — a sheet of paper, not a wide chat pane.
     let side = writing_surface_side(cx);
     let bounds = centered_window_bounds(cx, side, side);
-    let opts = base_window_options(bounds, 480., 360.);
+    let opts = base_window_options(cx, bounds, 480., 360.);
 
     let _ = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -846,7 +877,7 @@ fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
 fn open_library_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 520., 620.);
-    let opts = base_window_options(bounds, 380., 320.);
+    let opts = base_window_options(cx, bounds, 380., 320.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -867,7 +898,7 @@ fn open_library_window(cx: &mut App) {
 fn open_updates_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 480., 360.);
-    let opts = base_window_options(bounds, 420., 300.);
+    let opts = base_window_options(cx, bounds, 420., 300.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -889,7 +920,7 @@ fn open_updates_window(cx: &mut App) {
 fn open_record_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 860., 640.);
-    let opts = base_window_options(bounds, 560., 400.);
+    let opts = base_window_options(cx, bounds, 560., 400.);
 
     // The view is minted inside the window builder; capture it on the way out
     // so a deep link can reach it later (see `AppGlobal::record_view`).
@@ -944,7 +975,7 @@ fn open_onboarding_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let side = writing_surface_side(cx);
     let bounds = centered_window_bounds(cx, side, side);
-    let opts = base_window_options(bounds, 480., 360.);
+    let opts = base_window_options(cx, bounds, 480., 360.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -971,7 +1002,7 @@ pub fn open_participants_window(
     space_title: Option<String>,
 ) {
     let bounds = centered_window_bounds(cx, 520., 620.);
-    let opts = base_window_options(bounds, 400., 340.);
+    let opts = base_window_options(cx, bounds, 400., 340.);
 
     let _ = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -997,7 +1028,7 @@ pub fn open_participants_window(
 fn open_settings_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 620., 520.);
-    let opts = base_window_options(bounds, 420., 320.);
+    let opts = base_window_options(cx, bounds, 420., 320.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
