@@ -126,37 +126,17 @@ pub fn install(stores: &Stores, opts: LaunchOptions, cx: &mut App) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-
     let rows: RowMirror = Rc::new(RefCell::new(menu_rows(
         stores.local_models.read(cx).state().value(),
     )));
-    let target = Target::new(cx.to_async(), rows.clone(), mtm);
-
-    let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Eidola"));
-    // Deterministic enablement: the info rows are labels and must stay grey,
-    // the commands must stay live even with no window key (AppKit's
-    // auto-enabling walks the responder chain and would disable both).
-    menu.setAutoenablesItems(false);
-    menu.setDelegate(Some(ProtocolObject::from_ref(&*target)));
-    rebuild(&menu, &rows.borrow(), &target, mtm);
-
-    let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
-    // Without an autosave name macOS forgets where the user dragged the item.
-    item.setAutosaveName(Some(&NSString::from_str("EidolaStatusItem")));
-    if let Some(button) = item.button(mtm) {
-        match NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str(GLYPH_SYMBOL),
-            Some(&NSString::from_str("Eidola")),
-        ) {
-            Some(image) => {
-                // Template images take the menu bar's own tint, light or dark.
-                image.setTemplate(true);
-                button.setImage(Some(&image));
-            }
-            None => button.setTitle(&NSString::from_str(GLYPH_FALLBACK)),
-        }
-    }
-    item.setMenu(Some(&menu));
+    let Some((item, target)) = build(rows.clone(), cx, mtm) else {
+        // No door was built, so none is claimed: without the global,
+        // `policy_for` sees `status_item_present = false` and the app stays
+        // `Regular` for the session — the wave-2 shape, which is a perfectly
+        // good app. This early return is the whole reason the flip's promise
+        // holds by construction rather than by AppKit trivia.
+        return;
+    };
 
     cx.set_global(StatusItemGlobal {
         _item: item,
@@ -182,6 +162,77 @@ pub fn install(stores: &Stores, opts: LaunchOptions, cx: &mut App) {
     // (the onboarding branch opens its window a spawned read later, which is
     // long enough for an Accessory→Regular round trip to be seen).
     apply(policy_for(usize::from(!opts.windowless), true), cx);
+}
+
+/// Build the status item and its menu, or hand back `None` if what came out
+/// would not be a door the user can find.
+///
+/// **A status item nobody can see is worse than no status item**, because the
+/// Accessory flip is gated on this returning `Some`. Two checks, both real:
+///
+/// - **`button` is `None`** when the item was made with the deprecated custom
+///   `view` property. We never call `setView:`, so this is not reachable on
+///   today's path (measured: `button=true` on a live launch) — it is here so
+///   that a later change which *does* reach it degrades to Regular instead of
+///   silently making the app invisible.
+/// - **`isVisible` is false** when the user has previously hidden the item.
+///   Visibility is persisted under the autosave name, which is exactly what
+///   makes this live rather than dead: today `behavior` stays at its default
+///   (measured: `0`, i.e. no `RemovalAllowed`, so nothing can set it false),
+///   but the day removal is allowed, a removed item comes back hidden on the
+///   next launch and must not be counted as a door.
+///
+/// **The residual, accepted and undetectable:** a menu bar with no room does
+/// not draw the item, and AppKit reports nothing — `isVisible` stays true
+/// (measured, at creation and three seconds later). It is not permanent (the
+/// item reappears as other items go away) and it does not strand the app:
+/// Spotlight / `open -a Eidola` / Finder reach the running process and
+/// `lifecycle::reactivate` opens a window, which flips it back to Regular
+/// (measured: an Accessory, window-less instance went to `Foreground` on
+/// `open -a`, same pid). So the failure mode is "hard to see", not
+/// "unquittable".
+fn build(
+    rows: RowMirror,
+    cx: &mut App,
+    mtm: MainThreadMarker,
+) -> Option<(Retained<NSStatusItem>, Retained<Target>)> {
+    let target = Target::new(cx.to_async(), rows.clone(), mtm);
+
+    let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Eidola"));
+    // Deterministic enablement: the info rows are labels and must stay grey,
+    // the commands must stay live even with no window key (AppKit's
+    // auto-enabling walks the responder chain and would disable both).
+    menu.setAutoenablesItems(false);
+    menu.setDelegate(Some(ProtocolObject::from_ref(&*target)));
+    rebuild(&menu, &rows.borrow(), &target, mtm);
+
+    let bar = NSStatusBar::systemStatusBar();
+    let item = bar.statusItemWithLength(NSVariableStatusItemLength);
+    // Without an autosave name macOS forgets where the user dragged the item.
+    item.setAutosaveName(Some(&NSString::from_str("EidolaStatusItem")));
+
+    let Some(button) = item.button(mtm) else {
+        bar.removeStatusItem(&item);
+        return None;
+    };
+    match NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(GLYPH_SYMBOL),
+        Some(&NSString::from_str("Eidola")),
+    ) {
+        Some(image) => {
+            // Template images take the menu bar's own tint, light or dark.
+            image.setTemplate(true);
+            button.setImage(Some(&image));
+        }
+        None => button.setTitle(&NSString::from_str(GLYPH_FALLBACK)),
+    }
+    item.setMenu(Some(&menu));
+
+    if !item.isVisible() {
+        bar.removeStatusItem(&item);
+        return None;
+    }
+    Some((item, target))
 }
 
 pub fn window_will_open(cx: &mut App) {
