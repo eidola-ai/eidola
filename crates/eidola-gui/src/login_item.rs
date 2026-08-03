@@ -55,7 +55,7 @@ impl LoginItemState {
             }
             #[cfg(target_os = "macos")]
             Self::Unsupported => {
-                "Unavailable — macOS manages login items only for an installed, signed app."
+                "Unavailable — this needs macOS 13 or later, and an installed, signed app."
             }
             #[cfg(not(target_os = "macos"))]
             Self::Unsupported => {
@@ -80,10 +80,37 @@ pub fn state_from_status(raw: isize) -> LoginItemState {
     }
 }
 
+/// Whether `SMAppService` exists in this process at all.
+///
+/// **This guard is load-bearing, not belt-and-braces.** `SMAppService` is
+/// macOS 13+, and our binaries declare a floor of **macOS 11** (`otool -l` on
+/// the packaged app: `LC_BUILD_VERSION … minos 11.0`) with no
+/// `LSMinimumSystemVersion` in `Support/Info.plist` and no documented product
+/// floor anywhere in the repo. `ServiceManagement.framework` itself exists on
+/// 11/12, so the process links and launches — only the *class* is absent, and
+/// objc2's class lookup **panics** on a miss (`objc2`'s `CachedClass::fetch`:
+/// `panic!("class {name} could not be found")`). Without this check, opening
+/// Settings → General on Monterey would take the whole app down from inside a
+/// `Render`.
+///
+/// Asking the runtime for the class is the direct question, so no version
+/// table (`objc2::available!`) is needed. **Removal trigger:** delete this and
+/// call `SMAppService` unconditionally once the shipped floor is ≥ macOS 13 —
+/// i.e. once `LSMinimumSystemVersion` says so *and* the release build's
+/// `minos` agrees.
+#[cfg(target_os = "macos")]
+fn service_management_is_available() -> bool {
+    objc2::runtime::AnyClass::get(c"SMAppService").is_some()
+}
+
 #[cfg(target_os = "macos")]
 pub fn state() -> LoginItemState {
+    if !service_management_is_available() {
+        return LoginItemState::Unsupported;
+    }
     // SAFETY: `mainAppService` takes no arguments and is safe to call from
-    // any thread; the returned object is retained by objc2.
+    // any thread; the returned object is retained by objc2. The class is
+    // present — checked immediately above.
     let service = unsafe { objc2_service_management::SMAppService::mainAppService() };
     state_from_status(unsafe { service.status() }.0)
 }
@@ -99,9 +126,18 @@ pub fn state() -> LoginItemState {
 /// would be worse than quoting macOS.
 #[cfg(target_os = "macos")]
 pub fn set(enabled: bool) -> Result<(), String> {
+    if !service_management_is_available() {
+        // Both entry points are guarded, not just `state`: the switch is
+        // inert while `Unsupported`, but a caller is a caller.
+        return Err(
+            "Opening at login needs macOS 13 or later — this Mac's system software is older."
+                .to_string(),
+        );
+    }
     // SAFETY: as above; both calls are the documented register/unregister
     // pair and return their failure through the `NSError` out-parameter,
-    // which objc2 surfaces as a `Result`.
+    // which objc2 surfaces as a `Result`. The class is present — checked
+    // immediately above.
     let service = unsafe { objc2_service_management::SMAppService::mainAppService() };
     let result = unsafe {
         if enabled {
@@ -131,6 +167,23 @@ mod tests {
         // NotFound (3) and anything a future macOS adds.
         assert_eq!(state_from_status(3), LoginItemState::Unsupported);
         assert_eq!(state_from_status(97), LoginItemState::Unsupported);
+    }
+
+    /// The pre-Ventura guard has to *discriminate*, or it is a check that
+    /// always says yes and protects nothing. Both halves are asserted: the
+    /// real class resolves here (so the guard does not disable the feature on
+    /// a supported Mac), and a name the runtime has never heard of does not
+    /// (so a missing `SMAppService` really would be caught, rather than the
+    /// lookup succeeding for everything).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_availability_guard_answers_no_for_a_class_that_is_not_there() {
+        use objc2::runtime::AnyClass;
+        assert!(
+            service_management_is_available(),
+            "the test machine is macOS 13+, so the class must resolve"
+        );
+        assert!(AnyClass::get(c"SMAppServiceThatDoesNotExist").is_none());
     }
 
     #[test]
