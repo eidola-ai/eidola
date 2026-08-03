@@ -673,6 +673,17 @@ impl Render for OnboardingView {
                                     }
                                 }
                             }
+                            TouchPhase::Cancelled => {
+                                // The system took the gesture; it never
+                                // committed, so unwind rather than snap —
+                                // the same release the "stay put" decision
+                                // above performs, minus the proximity choice.
+                                this.owning = false;
+                                this.pinned_y = None;
+                                this.snap = None;
+                                this.last_dy = px(0.);
+                                cx.notify();
+                            }
                         },
                     ))
                     .children(slides),

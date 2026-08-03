@@ -204,6 +204,7 @@ impl Render for AccountView {
                                         )
                                         .child(
                                             Button::new("confirm-reset")
+                                                .role(None)
                                                 .danger()
                                                 .small()
                                                 .label("Reset account")
@@ -223,6 +224,7 @@ impl Render for AccountView {
                                         )
                                         .child(
                                             Button::new("cancel-reset")
+                                                .role(None)
                                                 .ghost()
                                                 .small()
                                                 .label("Keep account")
@@ -272,6 +274,7 @@ impl Render for AccountView {
                             }))
                             .child(
                                 Button::new("create-account")
+                                    .role(None)
                                     .primary()
                                     .small()
                                     .label("Create account")

@@ -357,13 +357,15 @@ impl SpaceView {
     ) {
         match phase {
             gpui::TouchPhase::Started => self.minimap_gesturing = true,
-            gpui::TouchPhase::Ended => self.minimap_gesturing = false,
+            // `Cancelled` unwinds like `Ended`: the gesture is over either way,
+            // so the minimap must stop gesturing and re-arm its hide timer.
+            gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled => self.minimap_gesturing = false,
             gpui::TouchPhase::Moved => {}
         }
         if moved {
             self.minimap_visible = true;
         }
-        if moved || matches!(phase, gpui::TouchPhase::Ended) {
+        if moved || matches!(phase, gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled) {
             self.arm_minimap_hide(cx);
             cx.notify();
         }

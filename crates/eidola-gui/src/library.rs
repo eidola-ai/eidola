@@ -464,19 +464,20 @@ impl LibraryView {
             if let Some((_, input_state, _)) = &self.renaming {
                 // Ghost-styled inline input: no border/background chrome,
                 // flex_1 so it fills the title column, same font as the row.
-                // The probed wrapper carries the a11y role/label (probe the
-                // wrapping div, not the gpui-component Input); it takes over
-                // the input's flex_1 slot so bounds stay honest.
+                // The Input's own node is the AT surface (it holds the
+                // tracked focus handle; `aria_label` names it), so the
+                // wrapper is a bounds-only probe for the driver; it takes
+                // over the input's flex_1 slot so bounds stay honest.
                 div()
                     .id("rename-input-wrap")
-                    .probe(
+                    .probe_bounds(
                         "library/rename-input",
                         gpui::Role::TextInput,
                         "Rename space",
                     )
                     .flex_1()
                     .flex()
-                    .child(Input::new(input_state).flex_1())
+                    .child(Input::new(input_state).aria_label("Rename space").flex_1())
                     .into_any_element()
             } else {
                 div().flex_1().into_any_element()
@@ -543,6 +544,7 @@ impl LibraryView {
                         )
                         .child(
                             Button::new(("rename-space", idx))
+                                .role(None)
                                 .ghost()
                                 .xsmall()
                                 // The bundled Lucide icon set has no
@@ -576,6 +578,7 @@ impl LibraryView {
                         )
                         .child(
                             Button::new(("archive-space", idx))
+                                .role(None)
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Close)

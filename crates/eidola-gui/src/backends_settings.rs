@@ -1068,14 +1068,14 @@ impl BackendsSettingsView {
                 .child(
                     div()
                         .id("models-url-wrap")
-                        .probe(
+                        .probe_bounds(
                             "settings/backends/local/url",
                             gpui::Role::TextInput,
                             "Model URL",
                         )
                         .flex_1()
                         .min_w_0()
-                        .child(Input::new(&self.url_state)),
+                        .child(Input::new(&self.url_state).aria_label("Model URL")),
                 )
                 .child(
                     quiet_verb("models-url-download", "Download", cx)
@@ -1230,6 +1230,10 @@ impl BackendsSettingsView {
                 this.set_auto_start(id_key.clone(), !auto_start, cx);
             }))
             .child(
+                // Switch sets no AccessKit role/label at our gpui-component
+                // rev, so the probed wrapper is the only node; if Switch gains
+                // self-annotation upstream, this site must join the
+                // `.role(None)` opt-out.
                 Switch::new(SharedString::from(format!("autostart-switch-{id}")))
                     .small()
                     .checked(auto_start)
@@ -1338,6 +1342,11 @@ impl BackendsSettingsView {
                                     cx.listener(|this, _, _, cx| this.toggle_add_auto_start(cx)),
                                 )
                                 .child(
+                                    // Switch sets no AccessKit role/label at
+                                    // our gpui-component rev (wrapper is the
+                                    // only node); if Switch gains
+                                    // self-annotation upstream, join the
+                                    // `.role(None)` opt-out.
                                     Switch::new("add-autostart-switch")
                                         .small()
                                         .checked(form.auto_start)
@@ -1575,18 +1584,22 @@ impl BackendsSettingsView {
         if self.editing_base_url {
             base_value = base_value
                 .child(
-                    // Probed wrapper for the a11y role/label — probe the
-                    // wrapping div, not the gpui-component Input.
+                    // Bounds-only probe for the driver — the labeled Input
+                    // node itself is the AT surface (two-regime rule).
                     div()
                         .id("eidola-base-url-input-wrap")
-                        .probe(
+                        .probe_bounds(
                             "settings/backends/eidola/url/base-url",
                             gpui::Role::TextInput,
                             "Base URL",
                         )
                         .w_full()
                         .flex()
-                        .child(Input::new(&self.base_url_state).flex_1()),
+                        .child(
+                            Input::new(&self.base_url_state)
+                                .aria_label("Base URL")
+                                .flex_1(),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -1603,6 +1616,7 @@ impl BackendsSettingsView {
                                 .on_click(cx.listener(|this, _, _, cx| this.save_base_url(cx)))
                                 .child(
                                     Button::new("eidola-save-base-url")
+                                        .role(None)
                                         .primary()
                                         .small()
                                         .label("Save")
@@ -1622,6 +1636,7 @@ impl BackendsSettingsView {
                                 )
                                 .child(
                                     Button::new("eidola-cancel-base-url")
+                                        .role(None)
                                         .ghost()
                                         .small()
                                         .label("Cancel")
@@ -1846,14 +1861,18 @@ impl BackendsSettingsView {
                 .child(
                     div()
                         .id("eidola-add-measurement-wrap")
-                        .probe(
+                        .probe_bounds(
                             "settings/backends/eidola/measurements/add",
                             gpui::Role::TextInput,
                             "Add a trusted measurement",
                         )
                         .w_full()
                         .flex()
-                        .child(Input::new(&self.add_measurement_state).flex_1()),
+                        .child(
+                            Input::new(&self.add_measurement_state)
+                                .aria_label("Add a trusted measurement")
+                                .flex_1(),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -2058,14 +2077,18 @@ impl BackendsSettingsView {
                 .child(
                     div()
                         .id(SharedString::from(format!("eidola-ca-{slug}-input-wrap")))
-                        .probe(
+                        .probe_bounds(
                             format!("settings/backends/eidola/ca/{slug}/input"),
                             gpui::Role::TextInput,
                             format!("Paste {label} PEM"),
                         )
                         .w_full()
                         .flex()
-                        .child(Input::new(state).flex_1()),
+                        .child(
+                            Input::new(state)
+                                .aria_label(format!("Paste {label} PEM"))
+                                .flex_1(),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -2394,10 +2417,10 @@ fn labeled_input(
             .child(
                 div()
                     .id(SharedString::from(probe_name.to_string()))
-                    .probe(probe_name.to_string(), gpui::Role::TextInput, label)
+                    .probe_bounds(probe_name.to_string(), gpui::Role::TextInput, label)
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(state)),
+                    .child(Input::new(state).aria_label(label)),
             ),
     );
     if !hint.is_empty() {
