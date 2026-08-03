@@ -4008,3 +4008,103 @@ fn record_spend_group_header_is_a_readable_node(cx: &mut TestAppContext) {
         header.label
     );
 }
+
+/// Two regimes for `gpui-component` widgets that self-annotate for AccessKit
+/// at our fork rev, each enforced **immediately after the constructor** (the
+/// placement is what makes this source scan reliable):
+///
+/// - **Hoisted controls** (`Button`, `Checkbox`): the probed wrapper is the
+///   accessible control (role, label, focus, activation), so the widget is
+///   made presentational via `.role(None)` — without it AT sees two nodes for
+///   one control.
+/// - **Focus-bearing editors** (`Input`): the widget owns the tracked focus
+///   handle, so *it* must be the node or AT reports focus on the window root
+///   — it carries `.aria_label(..)` and the wrapper is a bounds-only probe
+///   (`probe_bounds`, no node).
+///
+/// The emitted AccessKit `TreeUpdate` is crate-private, so neither invariant
+/// can be asserted against the tree itself; this scan is the gate. `Switch`
+/// is deliberately absent: it sets no role at our rev (comments at its two
+/// call sites carry the tripwire).
+#[test]
+fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut stack = vec![src_root];
+    let mut seen = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for needle in ["Button::new(", "Input::new(", "Checkbox::new("] {
+                let mut from = 0;
+                while let Some(pos) = text[from..].find(needle) {
+                    let start = from + pos;
+                    // Skip matches that are part of a longer path segment
+                    // (e.g. `WindowInput::new`): require a non-identifier
+                    // character before the widget name.
+                    let named_ok = text[..start]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                    // Walk to the constructor's matching close paren, then
+                    // require the opt-out as the next builder call.
+                    let open = start + needle.len() - 1;
+                    let mut depth = 0usize;
+                    let mut end = None;
+                    for (i, c) in text[open..].char_indices() {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = Some(open + i + 1);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if named_ok {
+                        seen += 1;
+                        let rest = &text[end.expect("unbalanced parens")..];
+                        let rest: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+                        let required = if needle == "Input::new(" {
+                            ".aria_label("
+                        } else {
+                            ".role(None)"
+                        };
+                        if !rest.starts_with(required) {
+                            let line = text[..start].matches('\n').count() + 1;
+                            offenders.push(format!(
+                                "{}:{line} (wants `{required}..` first)",
+                                path.display()
+                            ));
+                        }
+                    }
+                    from = start + needle.len();
+                }
+            }
+        }
+    }
+    assert!(
+        seen >= 30,
+        "the scan found only {seen} widget constructors — the needle set or \
+         src layout changed; fix the scan rather than losing the gate"
+    );
+    assert!(
+        offenders.is_empty(),
+        "self-annotating widgets missing their regime's annotation \
+         immediately after the constructor (Button/Checkbox: `.role(None)`, \
+         the wrapper is the control; Input: `.aria_label(..)`, the widget is \
+         the node — see AGENTS.md → Accessibility & QA probes):\n{}",
+        offenders.join("\n")
+    );
+}

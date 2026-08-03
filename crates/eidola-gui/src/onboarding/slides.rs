@@ -288,6 +288,7 @@ impl RenderOnce for CreateAccount {
                     })
                     .child(
                         Checkbox::new("onboarding-agree-box")
+                            .role(None)
                             .label("I agree to the Terms of Service and Privacy Policy.")
                             .checked(self.agreed)
                             .tab_stop(false)
@@ -320,6 +321,7 @@ impl RenderOnce for CreateAccount {
             })
             .child(
                 Button::new("onboarding-btn-create")
+                    .role(None)
                     .ghost()
                     .label(label)
                     .disabled(!enabled)
@@ -642,6 +644,7 @@ fn cta_button(
         .on_click(on_click)
         .child(
             Button::new(SharedString::from(format!("onboarding-btn-{key}")))
+                .role(None)
                 .ghost()
                 .label(label)
                 .tab_stop(false),
@@ -778,9 +781,9 @@ fn labeled_input(
     v_flex().gap_1().child(div().text_sm().child(label)).child(
         div()
             .id(SharedString::from(format!("onboarding-input-{label}")))
-            .probe(probe_name, Role::TextInput, label)
+            .probe_bounds(probe_name, Role::TextInput, label)
             .w_full()
-            .child(Input::new(state)),
+            .child(Input::new(state).aria_label(label)),
     )
 }
 
