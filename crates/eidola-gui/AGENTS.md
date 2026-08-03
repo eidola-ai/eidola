@@ -579,7 +579,11 @@ Zed ships with AccessKit force-disabled after early teething (zed #57954) — ab
 
 ## gpui / gpui-component pinning
 
-`gpui-component` and `gpui-component-assets` track **the `eidola` branch of our fork** (`eidola-ai/gpui-component`, `branch = "eidola"` in both this crate and `gpui-markdown-editor` — same spec so cargo unifies). The branch is upstream longbridge main plus a short rebased patch stack; each carried commit names its removal trigger:
+`gpui-component` and `gpui-component-assets` track **the `eidola` branch of our fork** (`eidola-ai/gpui-component`, `branch = "eidola"` in both this crate and `gpui-markdown-editor` — same spec so cargo unifies). The branch is upstream longbridge main plus a short rebased patch stack; each carried commit names its removal trigger.
+
+**Fork-branch rewrite practice (all `eidola-ai` fork deps — gpui-component, pulldown-cmark, turso):** these branches are *rebased* onto upstream when they advance, which orphans the previously locked SHA. **Before any force-push of a tracked fork branch, tag the currently-locked rev on the fork** (`pin-<shortsha>`, e.g. `pin-cda36771`, `pin-397a8a65`) — cargo's precise-rev fetch resolves tag-reachable objects, so historical lockfiles (releases, rollbacks, bisects) stay buildable. Branch tracking over `rev` pins is deliberate (the carry-and-rebase model); the tags are what make it safe.
+
+The carried commits:
 
 - **`layout_selections` viewport bound** (the Record detail-body perf fix — skip lines outside the selection/content mask). *Removal trigger: upstream landing.*
 - **Two `TestWindow` guards**: `HasWindowHandle::window_handle` is `unimplemented!()` (a panic, not an `Err`) on gpui's `TestWindow`, and upstream calls it unguarded from `Root::new → install_window_hit_test_forwarder` (`macos_accessibility.rs`) and from `Input::render → sync_native_content_type` (`input/native.rs`, plus the latent `native_menu/macos.rs` site) — either kills every test that opens a `Root` window / renders an `Input`. The guards wrap the call in `catch_unwind` so a test window opts out. *Removal trigger: gpui's `TestWindow::window_handle` returning `Err(HandleError::Unavailable)`.* (`native_menu/windows.rs` still has a bare site — Windows-only, deliberately left.)
