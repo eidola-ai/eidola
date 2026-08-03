@@ -4009,17 +4009,23 @@ fn record_spend_group_header_is_a_readable_node(cx: &mut TestAppContext) {
     );
 }
 
-/// Every `gpui-component` widget that self-annotates for AccessKit at our
-/// fork rev (`Button`, `Input`, `Checkbox`) must be made presentational via
-/// `.role(None)` **immediately after its constructor**, because our probed
-/// wrapper is the accessible control — without the opt-out,
-/// AT sees two nodes for one control (a duplicate button, or a dead labeled
-/// text field beside the real unlabeled one). The emitted AccessKit
-/// `TreeUpdate` is crate-private, so this invariant cannot be asserted
-/// against the tree itself; this source scan is the gate, and placing the
-/// call first in the chain is what makes the scan reliable. `Switch` is
-/// deliberately absent: it sets no role at our rev (comments at its two call
-/// sites carry the tripwire).
+/// Two regimes for `gpui-component` widgets that self-annotate for AccessKit
+/// at our fork rev, each enforced **immediately after the constructor** (the
+/// placement is what makes this source scan reliable):
+///
+/// - **Hoisted controls** (`Button`, `Checkbox`): the probed wrapper is the
+///   accessible control (role, label, focus, activation), so the widget is
+///   made presentational via `.role(None)` — without it AT sees two nodes for
+///   one control.
+/// - **Focus-bearing editors** (`Input`): the widget owns the tracked focus
+///   handle, so *it* must be the node or AT reports focus on the window root
+///   — it carries `.aria_label(..)` and the wrapper is a bounds-only probe
+///   (`probe_bounds`, no node).
+///
+/// The emitted AccessKit `TreeUpdate` is crate-private, so neither invariant
+/// can be asserted against the tree itself; this scan is the gate. `Switch`
+/// is deliberately absent: it sets no role at our rev (comments at its two
+/// call sites carry the tripwire).
 #[test]
 fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -4070,9 +4076,17 @@ fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
                         seen += 1;
                         let rest = &text[end.expect("unbalanced parens")..];
                         let rest: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
-                        if !rest.starts_with(".role(None)") {
+                        let required = if needle == "Input::new(" {
+                            ".aria_label("
+                        } else {
+                            ".role(None)"
+                        };
+                        if !rest.starts_with(required) {
                             let line = text[..start].matches('\n').count() + 1;
-                            offenders.push(format!("{}:{line}", path.display()));
+                            offenders.push(format!(
+                                "{}:{line} (wants `{required}..` first)",
+                                path.display()
+                            ));
                         }
                     }
                     from = start + needle.len();
@@ -4087,9 +4101,10 @@ fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
     );
     assert!(
         offenders.is_empty(),
-        "self-annotating widgets missing `.role(None)` immediately after \
-         the constructor (wrapper-is-the-control doctrine, see AGENTS.md → \
-         Accessibility & QA probes):\n{}",
+        "self-annotating widgets missing their regime's annotation \
+         immediately after the constructor (Button/Checkbox: `.role(None)`, \
+         the wrapper is the control; Input: `.aria_label(..)`, the widget is \
+         the node — see AGENTS.md → Accessibility & QA probes):\n{}",
         offenders.join("\n")
     );
 }

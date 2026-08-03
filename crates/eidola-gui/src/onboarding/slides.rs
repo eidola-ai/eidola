@@ -781,9 +781,9 @@ fn labeled_input(
     v_flex().gap_1().child(div().text_sm().child(label)).child(
         div()
             .id(SharedString::from(format!("onboarding-input-{label}")))
-            .probe(probe_name, Role::TextInput, label)
+            .probe_bounds(probe_name, Role::TextInput, label)
             .w_full()
-            .child(Input::new(state).role(None)),
+            .child(Input::new(state).aria_label(label)),
     )
 }
 

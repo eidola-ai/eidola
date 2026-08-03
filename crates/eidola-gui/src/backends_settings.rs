@@ -1068,14 +1068,14 @@ impl BackendsSettingsView {
                 .child(
                     div()
                         .id("models-url-wrap")
-                        .probe(
+                        .probe_bounds(
                             "settings/backends/local/url",
                             gpui::Role::TextInput,
                             "Model URL",
                         )
                         .flex_1()
                         .min_w_0()
-                        .child(Input::new(&self.url_state).role(None)),
+                        .child(Input::new(&self.url_state).aria_label("Model URL")),
                 )
                 .child(
                     quiet_verb("models-url-download", "Download", cx)
@@ -1584,18 +1584,22 @@ impl BackendsSettingsView {
         if self.editing_base_url {
             base_value = base_value
                 .child(
-                    // Probed wrapper for the a11y role/label — probe the
-                    // wrapping div, not the gpui-component Input.
+                    // Bounds-only probe for the driver — the labeled Input
+                    // node itself is the AT surface (two-regime rule).
                     div()
                         .id("eidola-base-url-input-wrap")
-                        .probe(
+                        .probe_bounds(
                             "settings/backends/eidola/url/base-url",
                             gpui::Role::TextInput,
                             "Base URL",
                         )
                         .w_full()
                         .flex()
-                        .child(Input::new(&self.base_url_state).role(None).flex_1()),
+                        .child(
+                            Input::new(&self.base_url_state)
+                                .aria_label("Base URL")
+                                .flex_1(),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -1857,14 +1861,18 @@ impl BackendsSettingsView {
                 .child(
                     div()
                         .id("eidola-add-measurement-wrap")
-                        .probe(
+                        .probe_bounds(
                             "settings/backends/eidola/measurements/add",
                             gpui::Role::TextInput,
                             "Add a trusted measurement",
                         )
                         .w_full()
                         .flex()
-                        .child(Input::new(&self.add_measurement_state).role(None).flex_1()),
+                        .child(
+                            Input::new(&self.add_measurement_state)
+                                .aria_label("Add a trusted measurement")
+                                .flex_1(),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -2069,14 +2077,18 @@ impl BackendsSettingsView {
                 .child(
                     div()
                         .id(SharedString::from(format!("eidola-ca-{slug}-input-wrap")))
-                        .probe(
+                        .probe_bounds(
                             format!("settings/backends/eidola/ca/{slug}/input"),
                             gpui::Role::TextInput,
                             format!("Paste {label} PEM"),
                         )
                         .w_full()
                         .flex()
-                        .child(Input::new(state).role(None).flex_1()),
+                        .child(
+                            Input::new(state)
+                                .aria_label(format!("Paste {label} PEM"))
+                                .flex_1(),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -2405,10 +2417,10 @@ fn labeled_input(
             .child(
                 div()
                     .id(SharedString::from(probe_name.to_string()))
-                    .probe(probe_name.to_string(), gpui::Role::TextInput, label)
+                    .probe_bounds(probe_name.to_string(), gpui::Role::TextInput, label)
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(state).role(None)),
+                    .child(Input::new(state).aria_label(label)),
             ),
     );
     if !hint.is_empty() {
