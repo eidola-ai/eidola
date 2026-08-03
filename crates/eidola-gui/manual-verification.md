@@ -33,7 +33,7 @@ Build: `just build gui` (or `cargo build -p eidola-gui && ./scripts/package-gui-
 ### Open at login
 
 13. Settings → General now ends with a **Startup** section: "Open at login" with a switch and one muted line.
-14. Running from `crates/eidola-gui/build/Eidola.app` (ad-hoc signed, not in /Applications), expect the honest unavailable state: switch dimmed and inert, line reads "Unavailable — macOS manages login items only for an installed, signed app." **This is the expected dev-build state**, not a bug. If it *is* settable in your build, so much the better — go on.
+14. Running from `crates/eidola-gui/build/Eidola.app` (ad-hoc signed, not in /Applications), expect the honest unavailable state: switch dimmed and inert, line reads "Unavailable — this needs macOS 13 or later, and an installed, signed app." **This is the expected dev-build state**, not a bug. If it *is* settable in your build, so much the better — go on.
 15. Copy the bundle to /Applications and launch it from there. Turn the switch on: System Settings → General → Login Items should list Eidola under "Open at Login". Turn it off: the entry disappears.
 16. Turn it on, then remove/deny Eidola in System Settings → Login Items, then reopen Eidola's Settings → General. Expected: the switch still reads on and the line says macOS is waiting for you (`RequiresApproval`) — not a silent "off".
 17. A refusal (unsigned bundle, denied) shows macOS's own wording in a red banner under the row and leaves the switch where the system actually is — it never flips optimistically.
