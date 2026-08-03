@@ -225,9 +225,9 @@ impl Render for UpdatesView {
             .gap_3()
             .child(
                 // The probed wrapper carries the a11y role/label (the
-                // gpui-component Button has no a11y annotations at our
-                // pin); it shrink-wraps the button so its bounds are an
-                // honest click target.
+                // Button opts out of its own via `a11y_labelled_by_ancestor`
+                // so AT sees one control, not two); it shrink-wraps the
+                // button so its bounds are an honest click target.
                 div()
                     .id("check-now-wrap")
                     .probe("updates/check", gpui::Role::Button, check_label)
@@ -249,6 +249,7 @@ impl Render for UpdatesView {
                     })
                     .child(
                         Button::new("check-now")
+                            .a11y_labelled_by_ancestor()
                             .label(check_label)
                             .small()
                             .disabled(checking)
@@ -432,6 +433,7 @@ fn render_update_available(
             .on_click(cx.listener(|this, _, _, cx| this.open_release_page(cx)))
             .child(
                 Button::new("open-release")
+                    .a11y_labelled_by_ancestor()
                     .primary()
                     .label("View Release…")
                     .tab_stop(false),
@@ -581,6 +583,7 @@ fn render_claims_changed(
                     .on_click(cx.listener(|this, _, _, cx| this.accept_claims(cx)))
                     .child(
                         Button::new("treat-as-update")
+                            .a11y_labelled_by_ancestor()
                             .outline()
                             .label("Treat as Update")
                             .small()
