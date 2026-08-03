@@ -50,6 +50,31 @@ serde_json = "1"
 # (`lifecycle::install_signal_quit`); `time` its bounded engine teardown.
 tokio = { version = "1", features = ["sync", "signal", "time"] }
 
+# The status item, the Regular ⇄ Accessory activation flip, and the login
+# item (task 17 wave 3) are AppKit/ServiceManagement, not gpui — a status menu
+# is not a window, so this needs no gpui fork. `objc2` is the modern, typed
+# binding layer; gpui's own platform crate still uses the older `cocoa`/`objc`
+# pair, and the two coexist (both are just the Objective-C runtime). Versions
+# mirror what gpui's dependency tree already resolves, so cargo unifies.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSButton",
+    "NSCell",
+    "NSControl",
+    "NSImage",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+] }
+objc2-foundation = { version = "0.3", features = ["NSError", "NSString"] }
+objc2-service-management = { version = "0.3", features = ["SMAppService"] }
+
 [dev-dependencies]
 # Pulls in `VisualTestAppContext` and `Window::render_to_image`. Cargo unifies
 # this with the regular `gpui` dep, so feature flags merge for dev/test builds

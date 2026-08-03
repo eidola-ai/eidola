@@ -9828,6 +9828,82 @@ fn reactivating_with_no_windows_opens_the_door(cx: &mut TestAppContext) {
     assert_eq!(opened.get(), 1, "no window: reactivation opens one");
 }
 
+// Status item + the Regular ⇄ Accessory flip (task 17, wave 3).
+//
+// The policy itself is the pure `status_item::policy_for`, unit-tested in the
+// module. What only a real gpui app can answer is *when the window count is
+// what*, which is the assumption the flip's two verbs are built on — and the
+// AppKit half (NSStatusItem, setActivationPolicy:, SMAppService) is a live
+// system surface no test platform reaches.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn the_close_observer_sees_the_post_close_window_count(cx: &mut TestAppContext) {
+    use eidola_gui::status_item::{ActivationPolicy, policy_for};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // gpui removes the window from its registry *before* firing
+    // `on_window_closed`, so the count read there is already the post-close
+    // one — which is why `window_did_close` can decide the policy from it
+    // directly. If that ever inverted, the app would go menu-bar-only one
+    // window early, hiding a window the user still had open.
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+
+    let seen: Rc<RefCell<Vec<usize>>> = Default::default();
+    let sink = seen.clone();
+    let _subscription = cx
+        .update(|cx| cx.on_window_closed(move |cx, _| sink.borrow_mut().push(cx.windows().len())));
+
+    let (first, _) = open_space(cx, &stores, Some("s".into()));
+    let (second, _) = open_space(cx, &stores, Some("s2".into()));
+    for window in [first, second] {
+        cx.update_window(window, |_, window, _| window.remove_window())
+            .unwrap();
+    }
+    cx.run_until_parked();
+
+    assert_eq!(
+        *seen.borrow(),
+        vec![1, 0],
+        "counts exclude the closing window"
+    );
+    let policies: Vec<ActivationPolicy> =
+        seen.borrow().iter().map(|n| policy_for(*n, true)).collect();
+    assert_eq!(
+        policies,
+        vec![ActivationPolicy::Regular, ActivationPolicy::Accessory],
+        "only the last window leaving drops the Dock icon"
+    );
+}
+
+#[gpui::test]
+fn the_login_item_row_starts_from_the_system_and_invents_nothing(cx: &mut TestAppContext) {
+    use eidola_gui::general::GeneralView;
+
+    // "Open at login" has no store behind it — the system owns that state,
+    // so the pane reads it at construction and holds no opinion of its own.
+    // An error is only ever the system's words on a refused *write*, and
+    // this test performs none deliberately: registering a login item is a
+    // real change to the machine running the suite.
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx))
+    });
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.login_item(), eidola_gui::login_item::state());
+        assert!(
+            v.login_item_error().is_none(),
+            "nothing was written, so there is nothing to report"
+        );
+        // Whatever the system said, the row has honest copy for it — and an
+        // unmanageable login item never reads as a plain "off".
+        assert!(!v.login_item().description().is_empty());
+    });
+}
+
 #[gpui::test]
 fn reactivating_with_a_window_focuses_it_instead(cx: &mut TestAppContext) {
     use std::cell::Cell;
