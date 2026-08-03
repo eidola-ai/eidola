@@ -4008,3 +4008,88 @@ fn record_spend_group_header_is_a_readable_node(cx: &mut TestAppContext) {
         header.label
     );
 }
+
+/// Every `gpui-component` widget that self-annotates for AccessKit at our
+/// fork rev (`Button`, `Input`, `Checkbox`) must opt out via
+/// `.a11y_labelled_by_ancestor()` **immediately after its constructor**,
+/// because our probed wrapper is the accessible control — without the opt-out,
+/// AT sees two nodes for one control (a duplicate button, or a dead labeled
+/// text field beside the real unlabeled one). The emitted AccessKit
+/// `TreeUpdate` is crate-private, so this invariant cannot be asserted
+/// against the tree itself; this source scan is the gate, and placing the
+/// call first in the chain is what makes the scan reliable. `Switch` is
+/// deliberately absent: it sets no role at our rev (comments at its two call
+/// sites carry the tripwire).
+#[test]
+fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut stack = vec![src_root];
+    let mut seen = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for needle in ["Button::new(", "Input::new(", "Checkbox::new("] {
+                let mut from = 0;
+                while let Some(pos) = text[from..].find(needle) {
+                    let start = from + pos;
+                    // Skip matches that are part of a longer path segment
+                    // (e.g. `WindowInput::new`): require a non-identifier
+                    // character before the widget name.
+                    let named_ok = text[..start]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                    // Walk to the constructor's matching close paren, then
+                    // require the opt-out as the next builder call.
+                    let open = start + needle.len() - 1;
+                    let mut depth = 0usize;
+                    let mut end = None;
+                    for (i, c) in text[open..].char_indices() {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = Some(open + i + 1);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if named_ok {
+                        seen += 1;
+                        let rest = &text[end.expect("unbalanced parens")..];
+                        let rest: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+                        if !rest.starts_with(".a11y_labelled_by_ancestor()") {
+                            let line = text[..start].matches('\n').count() + 1;
+                            offenders.push(format!("{}:{line}", path.display()));
+                        }
+                    }
+                    from = start + needle.len();
+                }
+            }
+        }
+    }
+    assert!(
+        seen >= 30,
+        "the scan found only {seen} widget constructors — the needle set or \
+         src layout changed; fix the scan rather than losing the gate"
+    );
+    assert!(
+        offenders.is_empty(),
+        "self-annotating widgets missing `.a11y_labelled_by_ancestor()` \
+         immediately after the constructor (wrapper-is-the-control doctrine, \
+         see AGENTS.md → Accessibility & QA probes):\n{}",
+        offenders.join("\n")
+    );
+}
