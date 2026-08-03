@@ -30,8 +30,14 @@
 # Environment overrides (all optional):
 #   EIDOLA_DEV_CERT_DIR   shim cert directory      (default: .dev-certs)
 #   EIDOLA_DEV_BASE_URL   shim URL                 (default: https://localhost:8443)
-#   DEV_MEASUREMENT       measurement the shim advertises — same variable the
-#                         shim itself reads       (default: 48 zero bytes)
+#   DEV_MEASUREMENT       measurement the shim advertises — the same variable
+#                         the shim itself reads, forwarded to the container by
+#                         compose.yaml, so one value governs both sides
+#                                                  (default: 48 zero bytes)
+#
+# Only `enable` reads DEV_MEASUREMENT. `disable` drops the whole measurement
+# override list unconditionally, so reverting can never depend on reproducing
+# the environment that configured it.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -55,6 +61,11 @@ cli() {
     cargo run -q -p eidola-cli -- "$@"
 }
 
+# The host OS, as a function so tests can stub it.
+platform() {
+    uname -s
+}
+
 # ── Mock TLS root: report, never mutate ──────────────────────────────────────
 #
 # `tls-ca.pem` is the shim's *TLS* anchor (RSA PKCS#1 v1.5) — deliberately a
@@ -63,14 +74,22 @@ cli() {
 # is a privileged, system-wide change, so this script only tells you the
 # command; the mutation itself is the commented block in each function.
 
-# Best-effort, read-only: is the mock TLS root already trusted?
+# Best-effort, read-only: is *this* mock TLS root already trusted?
 # Prints `trusted`, `untrusted`, or `unknown`.
+#
+# Both branches answer for the current `tls-ca.pem`, not for "some eidola dev
+# cert once existed" — deleting `.dev-certs/` mints a new root, and a check
+# that ignored which cert is installed would suppress the trust command and
+# leave TLS failing before attestation ever runs. On macOS that falls out of
+# `verify-cert`, which evaluates this cert against the store. On Linux the
+# installed file is a verbatim copy of the source, so comparing bytes is the
+# equivalent question (and needs no openssl).
 ca_trust_state() {
     if [ ! -f "$TLS_CA" ]; then
         echo "unknown"
         return
     fi
-    case "$(uname -s)" in
+    case "$(platform)" in
         Darwin)
             # `verify-cert` evaluates trust; it writes nothing.
             if security verify-cert -c "$TLS_CA" -p ssl >/dev/null 2>&1; then
@@ -80,7 +99,11 @@ ca_trust_state() {
             fi
             ;;
         Linux)
-            if [ -f "$LINUX_CA_PATH" ]; then echo "trusted"; else echo "untrusted"; fi
+            if [ -f "$LINUX_CA_PATH" ] && cmp -s "$TLS_CA" "$LINUX_CA_PATH"; then
+                echo "trusted"
+            else
+                echo "untrusted"
+            fi
             ;;
         *) echo "unknown" ;;
     esac
@@ -95,7 +118,7 @@ trust_ca_note() {
     fi
     echo "==> Mock TLS root is NOT trusted by this machine ($state)."
     echo "    Run this once by hand (it needs sudo and changes the system trust store):"
-    case "$(uname -s)" in
+    case "$(platform)" in
         Darwin)
             echo ""
             echo "    sudo security add-trusted-cert -d -r trustRoot \\"
@@ -118,7 +141,7 @@ trust_ca_note() {
     # printing above) once you have run it by hand and are happy with the
     # exact invocation.
     #
-    # case "$(uname -s)" in
+    # case "$(platform)" in
     #     Darwin)
     #         sudo security add-trusted-cert -d -r trustRoot \
     #             -k /Library/Keychains/System.keychain "$TLS_CA"
@@ -136,7 +159,7 @@ untrust_ca_note() {
     echo "==> The mock TLS root is still trusted by this machine."
     echo "    Leaving it in place is harmless (it only signs the local shim's"
     echo "    certificate), but to remove it:"
-    case "$(uname -s)" in
+    case "$(platform)" in
         Darwin)
             echo ""
             echo "    sudo security remove-trusted-cert -d $TLS_CA"
@@ -152,7 +175,7 @@ untrust_ca_note() {
     # KEYCHAIN MUTATION — see the note in `trust_ca_note`. Same reasoning,
     # same status: unvalidated, so left commented out.
     #
-    # case "$(uname -s)" in
+    # case "$(platform)" in
     #     Darwin)
     #         sudo security remove-trusted-cert -d "$TLS_CA"
     #         ;;
@@ -208,13 +231,18 @@ EOF
 
 cmd_disable() {
     echo "==> Reverting the local client to the built-in trust-root pins"
-    # Idempotent: clearing an absent override and untrusting an absent
-    # measurement are both no-ops the CLI reports honestly.
+    # Every flag clears a column to NULL unconditionally, so the revert is
+    # complete whatever `enable` wrote and whatever is in the environment now
+    # — including a DEV_MEASUREMENT that was set then and isn't set here.
+    # (Untrusting by key instead would leave the column non-NULL, and a
+    # non-NULL list that omits the pinned measurement rejects the real
+    # enclave: a "reset" that silently breaks production.) Idempotent:
+    # clearing an absent override is a no-op the CLI reports honestly.
     cli configure \
         --clear-base-url \
         --clear-hardware-root-ca \
         --clear-hardware-intermediate-ca \
-        --untrust-measurement "$MEASUREMENT"
+        --clear-trusted-measurements
     echo ""
     untrust_ca_note
     cmd_status
@@ -225,17 +253,21 @@ cmd_status() {
     cli | sed 's/^/    /'
 }
 
-case "${1:-}" in
-    enable) cmd_enable ;;
-    disable) cmd_disable ;;
-    status) cmd_status ;;
-    -h | --help)
-        sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
-        exit 0
-        ;;
-    *)
-        echo "ERROR: expected one of: enable, disable, status" >&2
-        echo "Usage: $0 {enable|disable|status}" >&2
-        exit 1
-        ;;
-esac
+# Guarded so the functions above can be sourced and exercised directly
+# (`platform` and `LINUX_CA_PATH` are the stubbing seams).
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    case "${1:-}" in
+        enable) cmd_enable ;;
+        disable) cmd_disable ;;
+        status) cmd_status ;;
+        -h | --help)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "ERROR: expected one of: enable, disable, status" >&2
+            echo "Usage: $0 {enable|disable|status}" >&2
+            exit 1
+            ;;
+    esac
+fi

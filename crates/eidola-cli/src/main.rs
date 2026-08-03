@@ -34,6 +34,13 @@ enum Command {
         /// Remove a trusted enclave release by SNP measurement
         #[arg(long)]
         untrust_measurement: Option<String>,
+        /// Drop every trusted-measurement override (revert to the pin)
+        #[arg(
+            long,
+            conflicts_with = "trust_measurement",
+            conflicts_with = "untrust_measurement"
+        )]
+        clear_trusted_measurements: bool,
         /// Remove the base-URL override (revert to the trust-root pin)
         #[arg(long, conflicts_with = "base_url")]
         clear_base_url: bool,
@@ -511,6 +518,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             hardware_intermediate_ca,
             trust_measurement,
             untrust_measurement,
+            clear_trusted_measurements,
             clear_base_url,
             clear_hardware_root_ca,
             clear_hardware_intermediate_ca,
@@ -521,6 +529,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 && hardware_intermediate_ca.is_none()
                 && trust_measurement.is_none()
                 && untrust_measurement.is_none()
+                && !clear_trusted_measurements
                 && !clear_base_url
                 && !clear_hardware_root_ca
                 && !clear_hardware_intermediate_ca
@@ -580,6 +589,10 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 } else {
                     println!("measurement already trusted (snp={})", m.snp_measurement);
                 }
+            }
+            if clear_trusted_measurements {
+                core.clear_trusted_measurements().await?;
+                println!("trusted_measurements override removed (using the trust-root pin)");
             }
             if let Some(spec) = untrust_measurement {
                 let key = config::parse_untrust_key(&spec)?;

@@ -6558,6 +6558,31 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Drop the eidola backend row's whole trusted-measurement override list
+    /// (column back to NULL), reverting to the measurement pinned in this
+    /// binary. The unconditional counterpart to [`Self::untrust_measurement`],
+    /// and the member the trust bundle was missing: `base_url` and both
+    /// hardware CAs already have a clear-to-pin verb, so a caller reverting
+    /// the bundle had to know every key it had ever trusted. Emits
+    /// [`Change::Backends`].
+    pub async fn clear_trusted_measurements(&self) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .update_backend(
+                        backends::EIDOLA_BACKEND_ID,
+                        backends::BackendUpdate {
+                            trusted_measurements: Some(None),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
     pub fn set_account_credentials(&self, id: String, secret: String) -> Result<(), AppError> {
         let cfg = self.inner.load_config();
         if cfg.account_id.is_some() || cfg.account_secret.is_some() {
