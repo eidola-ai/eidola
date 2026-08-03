@@ -2301,6 +2301,26 @@ pub async fn space_cascade_limit(
     }
 }
 
+/// Set a space's `cascade_limit`. Returns whether a row was updated (`false` =
+/// no such space).
+pub async fn set_space_cascade_limit(
+    conn: &Connection,
+    space_id: &str,
+    cascade_limit: i64,
+) -> Result<bool, AppError> {
+    let n = conn
+        .execute(
+            "UPDATE space SET cascade_limit = ?2 WHERE id = ?1",
+            (
+                Value::Text(space_id.to_string()),
+                Value::Integer(cascade_limit),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(n > 0)
+}
+
 /// A space's `router_model` (the may-decline router setting, copied from the
 /// template it was instantiated from). `Ok(None)` covers both "no such space"
 /// and "the feature is off here" — the caller validates space existence
