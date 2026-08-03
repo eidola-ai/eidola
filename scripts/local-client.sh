@@ -27,7 +27,8 @@
 # left for a human to run. It is printed when it's needed, and the
 # ready-to-uncomment lines are in `trust_ca_note` / `untrust_ca_note` below.
 #
-# Environment overrides (all optional):
+# Settings (all optional), read from the environment first and then from
+# `.env`, exactly like the rest of the dev stack (see `dotenv_get`):
 #   EIDOLA_DEV_CERT_DIR   shim cert directory      (default: .dev-certs)
 #   EIDOLA_DEV_BASE_URL   shim URL                 (default: https://localhost:8443)
 #   DEV_MEASUREMENT       measurement the shim advertises — the same variable
@@ -37,18 +38,51 @@
 #
 # Only `enable` reads DEV_MEASUREMENT. `disable` drops the whole measurement
 # override list unconditionally, so reverting can never depend on reproducing
-# the environment that configured it.
+# the environment that configured it — or on `.env` being well-formed.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CERT_DIR="${EIDOLA_DEV_CERT_DIR:-.dev-certs}"
-BASE_URL="${EIDOLA_DEV_BASE_URL:-https://localhost:8443}"
+# Read one key out of `.env`, without executing it. Compose reads `.env` from
+# the project directory automatically, and the justfile's `set dotenv-load`
+# gives every recipe the same view — so a value that lives there reaches both
+# `just dev` (the shim) and `just client-local` (the client). Running this
+# script directly has to see it too, or the shim advertises one measurement
+# while the client trusts another. Environment wins over `.env`, matching
+# what both compose and just do.
+#
+# Deliberately not `source .env`: that executes arbitrary shell, and this
+# file holds real secrets (TINFOIL_API_KEY, STRIPE_API_KEY) that would then
+# be exported into every process this script spawns.
+dotenv_get() {
+    local key="$1" line
+    [ -f .env ] || return 0
+    line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" .env | tail -n 1 || true)"
+    [ -n "$line" ] || return 0
+    line="${line#*=}"
+    line="${line%$'\r'}"                       # tolerate CRLF
+    line="${line#"${line%%[![:space:]]*}"}"    # trim leading space
+    line="${line%"${line##*[![:space:]]}"}"    # trim trailing space
+    if [[ "$line" =~ ^\"(.*)\"$ ]] || [[ "$line" =~ ^\'(.*)\'$ ]]; then
+        line="${BASH_REMATCH[1]}"
+    fi
+    printf '%s' "$line"
+}
+
+# Environment, then `.env`, then the built-in default.
+setting() {
+    local name="$1" default="$2" value="${!1:-}"
+    [ -n "$value" ] || value="$(dotenv_get "$name")"
+    printf '%s' "${value:-$default}"
+}
+
+CERT_DIR="$(setting EIDOLA_DEV_CERT_DIR .dev-certs)"
+BASE_URL="$(setting EIDOLA_DEV_BASE_URL https://localhost:8443)"
 
 # 48 zero bytes as hex — what tinfoil-shim-mock advertises unless DEV_MEASUREMENT
 # is set on the shim. All three fields (SNP, TDX rtmr1, TDX rtmr2) carry it.
 ZERO_MEASUREMENT="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-MEASUREMENT="${DEV_MEASUREMENT:-$ZERO_MEASUREMENT}"
+MEASUREMENT="$(setting DEV_MEASUREMENT "$ZERO_MEASUREMENT")"
 MEASUREMENT_TRIPLE="$MEASUREMENT:$MEASUREMENT:$MEASUREMENT"
 
 TLS_CA="$CERT_DIR/tls-ca.pem"
@@ -207,6 +241,15 @@ warn_if_shim_down() {
 
 cmd_enable() {
     require_certs
+    # Belt-and-braces over the CLI's own parse-before-write validation: the
+    # measurement can now arrive from `.env`, and naming the source beats a
+    # bare parse error. A shape this rejects would also panic the shim.
+    if ! printf '%s' "$MEASUREMENT" | grep -qE '^[0-9a-fA-F]{96}$'; then
+        echo "ERROR: DEV_MEASUREMENT must be 96 hex characters (48 bytes), got:" >&2
+        echo "       $MEASUREMENT" >&2
+        echo "       (checked the environment, then .env)" >&2
+        exit 1
+    fi
     echo "==> Pointing the local client at $BASE_URL"
     trust_ca_note
     cli configure \

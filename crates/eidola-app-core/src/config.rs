@@ -363,6 +363,15 @@ fn validate_hex_field(value: &str, field: &str) -> Result<String, AppError> {
     Ok(value.to_ascii_lowercase())
 }
 
+/// Check that a certificate value parses, without writing anything — the
+/// pure half of the hardware-CA setters, exposed so a caller applying a
+/// batch of trust-bundle changes can validate every input *before* it
+/// applies the first one. The setters re-validate on write; this is the
+/// same rule read early, not a second one.
+pub fn validate_cert_pem(value: &str, field_name: &str) -> Result<(), AppError> {
+    parse_cert_config(Some(value), field_name).map(|_| ())
+}
+
 /// Parse a PEM or raw base64 DER certificate from a config value.
 pub(crate) fn parse_cert_config(
     value: Option<&str>,
