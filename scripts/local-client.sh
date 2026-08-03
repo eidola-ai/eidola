@@ -28,20 +28,45 @@
 # ready-to-uncomment lines are in `trust_ca_note` / `untrust_ca_note` below.
 #
 # Settings (all optional), read from the environment first and then from
-# `.env`, exactly like the rest of the dev stack (see `dotenv_get`):
-#   EIDOLA_DEV_CERT_DIR   shim cert directory      (default: .dev-certs)
-#   EIDOLA_DEV_BASE_URL   shim URL                 (default: https://localhost:8443)
-#   DEV_MEASUREMENT       measurement the shim advertises — the same variable
-#                         the shim itself reads, forwarded to the container by
-#                         compose.yaml, so one value governs both sides
+# `.env` (see `dotenv_get`). They fall into two deliberately different
+# classes:
+#
+#   DEV_MEASUREMENT       the measurement the shim advertises — literally the
+#                         same scalar on both sides, so one value has to
+#                         govern both. `compose.yaml` forwards it to the shim
+#                         container and this script trusts it on the client;
+#                         set it once, in the environment or `.env`, and
+#                         `just dev` + `just client-local` agree.
 #                                                  (default: 48 zero bytes)
+#
+#   EIDOLA_DEV_CERT_DIR   where the shim's cert set already is (host path)
+#                                                  (default: .dev-certs)
+#   EIDOLA_DEV_BASE_URL   where the shim already listens
+#                                                  (default: https://localhost:8443)
+#
+#                         These two are *client-side only* and deliberately
+#                         not consumed by compose: they exist to point the
+#                         client at a stack that is not the default compose
+#                         one — a shim someone else runs, one on another
+#                         port, or (the common case) a client in one worktree
+#                         talking to the stack in another checkout. They have
+#                         no compose counterpart to follow: the shim's
+#                         `CERT_DIR` is a *container* path whose host side is
+#                         the bind-mount source, and the client-visible URL
+#                         is the published port mapping. Moving the stack
+#                         itself means editing that volume/ports pair in
+#                         `compose.yaml` — at which point you point the
+#                         client at the result with these.
 #
 # Only `enable` reads DEV_MEASUREMENT. `disable` drops the whole measurement
 # override list unconditionally, so reverting can never depend on reproducing
 # the environment that configured it — or on `.env` being well-formed.
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+# `BASH_SOURCE`, not `$0`: everything below resolves paths relative to the
+# repo root, and `$0` is the *interpreter* when this file is sourced (which
+# the tests do, to exercise the functions directly).
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 # Read one key out of `.env`, without executing it. Compose reads `.env` from
 # the project directory automatically, and the justfile's `set dotenv-load`
@@ -54,6 +79,14 @@ cd "$(dirname "$0")/.."
 # Deliberately not `source .env`: that executes arbitrary shell, and this
 # file holds real secrets (TINFOIL_API_KEY, STRIPE_API_KEY) that would then
 # be exported into every process this script spawns.
+#
+# The supported subset of compose's `.env` grammar, verified against
+# `docker compose config`: `export` prefix, single or double quotes, an
+# inline `#` comment after whitespace (or after a closing quote), and a bare
+# `#` inside an unquoted value staying literal. The one thing compose does
+# that this deliberately does not is interpolate `${VAR}` — reimplementing
+# that is reimplementing compose — so a value containing `${` warns and is
+# passed through literally, where the caller's validation rejects it loudly.
 dotenv_get() {
     local key="$1" line
     [ -f .env ] || return 0
@@ -62,9 +95,16 @@ dotenv_get() {
     line="${line#*=}"
     line="${line%$'\r'}"                       # tolerate CRLF
     line="${line#"${line%%[![:space:]]*}"}"    # trim leading space
-    line="${line%"${line##*[![:space:]]}"}"    # trim trailing space
-    if [[ "$line" =~ ^\"(.*)\"$ ]] || [[ "$line" =~ ^\'(.*)\'$ ]]; then
+    if [[ "$line" =~ ^\"([^\"]*)\" ]] || [[ "$line" =~ ^\'([^\']*)\' ]]; then
+        # Quoted: the quoted span is the value; anything after it is comment.
         line="${BASH_REMATCH[1]}"
+    else
+        line="${line%%[[:space:]]#*}"          # ` # comment` — `a#b` is literal
+        line="${line%"${line##*[![:space:]]}"}" # trim trailing space
+    fi
+    if [[ "$line" == *'${'* ]]; then
+        echo "WARNING: $key in .env contains \${...}, which this script does not" >&2
+        echo "         interpolate (compose does). Export the variable instead." >&2
     fi
     printf '%s' "$line"
 }
@@ -248,6 +288,9 @@ cmd_enable() {
         echo "ERROR: DEV_MEASUREMENT must be 96 hex characters (48 bytes), got:" >&2
         echo "       $MEASUREMENT" >&2
         echo "       (checked the environment, then .env)" >&2
+        echo "       If that value came from .env, note this script does not" >&2
+        echo "       interpolate \${...} the way compose does — export the" >&2
+        echo "       variable instead." >&2
         exit 1
     fi
     echo "==> Pointing the local client at $BASE_URL"
