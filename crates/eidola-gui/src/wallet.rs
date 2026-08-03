@@ -174,7 +174,7 @@ impl Render for WalletView {
                     })
                     .child(
                         Button::new("recover-all")
-                            .a11y_labelled_by_ancestor()
+                            .role(None)
                             .small()
                             .label("Recover in-flight")
                             .disabled(busy)
@@ -197,7 +197,7 @@ impl Render for WalletView {
                 }))
                 .child(
                     Button::new("refresh-credentials")
-                        .a11y_labelled_by_ancestor()
+                        .role(None)
                         .ghost()
                         .small()
                         .label("Refresh")

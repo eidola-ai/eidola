@@ -717,7 +717,7 @@ impl TemplatesSettingsView {
                         gpui::Role::TextInput,
                         "Template name",
                     )
-                    .child(Input::new(&draft.title).a11y_labelled_by_ancestor()),
+                    .child(Input::new(&draft.title).role(None)),
             );
 
         // Cascade limit — a small +/- stepper.
@@ -1127,7 +1127,7 @@ impl TemplatesSettingsView {
                                 gpui::Role::TextInput,
                                 "Name",
                             )
-                            .child(Input::new(&p.label).a11y_labelled_by_ancestor()),
+                            .child(Input::new(&p.label).role(None)),
                     )
                     .child(ghost_button_labeled(
                         SharedString::from(format!("tp-remove-{idx}")),
@@ -1157,7 +1157,7 @@ impl TemplatesSettingsView {
                         gpui::Role::TextInput,
                         "System prompt",
                     )
-                    .child(Input::new(&p.system_prompt).a11y_labelled_by_ancestor()),
+                    .child(Input::new(&p.system_prompt).role(None)),
             )
             .child({
                 let mut row = h_flex().gap_2().items_center().child(
