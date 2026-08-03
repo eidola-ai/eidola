@@ -1214,7 +1214,7 @@ impl ParticipantsView {
             div()
                 .id("editor-label-wrap")
                 .probe("participants/editor/label", gpui::Role::TextInput, "Name")
-                .child(Input::new(&edit.label).a11y_labelled_by_ancestor()),
+                .child(Input::new(&edit.label).role(None)),
         );
 
         if is_agent {
@@ -1236,7 +1236,7 @@ impl ParticipantsView {
                         gpui::Role::TextInput,
                         "System prompt",
                     )
-                    .child(Input::new(&edit.system_prompt).a11y_labelled_by_ancestor()),
+                    .child(Input::new(&edit.system_prompt).role(None)),
             );
 
             // Notify policy.
@@ -1287,7 +1287,7 @@ impl ParticipantsView {
                 div()
                     .id("add-label-wrap")
                     .probe("participants/add/name", gpui::Role::TextInput, "Name")
-                    .child(Input::new(&add.label).a11y_labelled_by_ancestor()),
+                    .child(Input::new(&add.label).role(None)),
             )
             .child(field_label("Model", cx))
             .child(self.render_model_field(add.model_ref.as_deref(), PickerTarget::Add, cx))
@@ -1300,7 +1300,7 @@ impl ParticipantsView {
                         gpui::Role::TextInput,
                         "System prompt",
                     )
-                    .child(Input::new(&add.system_prompt).a11y_labelled_by_ancestor()),
+                    .child(Input::new(&add.system_prompt).role(None)),
             )
             .child(field_label("Responds", cx))
             .child(self.notify_row(&add.notify_policy, "add", false, cx))
@@ -1353,7 +1353,7 @@ impl ParticipantsView {
                         gpui::Role::TextInput,
                         "Template name",
                     )
-                    .child(Input::new(title).a11y_labelled_by_ancestor()),
+                    .child(Input::new(title).role(None)),
             )
             .child(
                 h_flex()

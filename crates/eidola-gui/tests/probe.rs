@@ -4010,9 +4010,9 @@ fn record_spend_group_header_is_a_readable_node(cx: &mut TestAppContext) {
 }
 
 /// Every `gpui-component` widget that self-annotates for AccessKit at our
-/// fork rev (`Button`, `Input`, `Checkbox`) must opt out via
-/// `.a11y_labelled_by_ancestor()` **immediately after its constructor**,
-/// because our probed wrapper is the accessible control — without the opt-out,
+/// fork rev (`Button`, `Input`, `Checkbox`) must be made presentational via
+/// `.role(None)` **immediately after its constructor**, because our probed
+/// wrapper is the accessible control — without the opt-out,
 /// AT sees two nodes for one control (a duplicate button, or a dead labeled
 /// text field beside the real unlabeled one). The emitted AccessKit
 /// `TreeUpdate` is crate-private, so this invariant cannot be asserted
@@ -4070,7 +4070,7 @@ fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
                         seen += 1;
                         let rest = &text[end.expect("unbalanced parens")..];
                         let rest: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
-                        if !rest.starts_with(".a11y_labelled_by_ancestor()") {
+                        if !rest.starts_with(".role(None)") {
                             let line = text[..start].matches('\n').count() + 1;
                             offenders.push(format!("{}:{line}", path.display()));
                         }
@@ -4087,9 +4087,9 @@ fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
     );
     assert!(
         offenders.is_empty(),
-        "self-annotating widgets missing `.a11y_labelled_by_ancestor()` \
-         immediately after the constructor (wrapper-is-the-control doctrine, \
-         see AGENTS.md → Accessibility & QA probes):\n{}",
+        "self-annotating widgets missing `.role(None)` immediately after \
+         the constructor (wrapper-is-the-control doctrine, see AGENTS.md → \
+         Accessibility & QA probes):\n{}",
         offenders.join("\n")
     );
 }

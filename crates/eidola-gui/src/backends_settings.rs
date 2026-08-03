@@ -1075,7 +1075,7 @@ impl BackendsSettingsView {
                         )
                         .flex_1()
                         .min_w_0()
-                        .child(Input::new(&self.url_state).a11y_labelled_by_ancestor()),
+                        .child(Input::new(&self.url_state).role(None)),
                 )
                 .child(
                     quiet_verb("models-url-download", "Download", cx)
@@ -1233,7 +1233,7 @@ impl BackendsSettingsView {
                 // Switch sets no AccessKit role/label at our gpui-component
                 // rev, so the probed wrapper is the only node; if Switch gains
                 // self-annotation upstream, this site must join the
-                // `.a11y_labelled_by_ancestor()` opt-out.
+                // `.role(None)` opt-out.
                 Switch::new(SharedString::from(format!("autostart-switch-{id}")))
                     .small()
                     .checked(auto_start)
@@ -1346,7 +1346,7 @@ impl BackendsSettingsView {
                                     // our gpui-component rev (wrapper is the
                                     // only node); if Switch gains
                                     // self-annotation upstream, join the
-                                    // `.a11y_labelled_by_ancestor()` opt-out.
+                                    // `.role(None)` opt-out.
                                     Switch::new("add-autostart-switch")
                                         .small()
                                         .checked(form.auto_start)
@@ -1595,11 +1595,7 @@ impl BackendsSettingsView {
                         )
                         .w_full()
                         .flex()
-                        .child(
-                            Input::new(&self.base_url_state)
-                                .a11y_labelled_by_ancestor()
-                                .flex_1(),
-                        ),
+                        .child(Input::new(&self.base_url_state).role(None).flex_1()),
                 )
                 .child(
                     h_flex()
@@ -1616,7 +1612,7 @@ impl BackendsSettingsView {
                                 .on_click(cx.listener(|this, _, _, cx| this.save_base_url(cx)))
                                 .child(
                                     Button::new("eidola-save-base-url")
-                                        .a11y_labelled_by_ancestor()
+                                        .role(None)
                                         .primary()
                                         .small()
                                         .label("Save")
@@ -1636,7 +1632,7 @@ impl BackendsSettingsView {
                                 )
                                 .child(
                                     Button::new("eidola-cancel-base-url")
-                                        .a11y_labelled_by_ancestor()
+                                        .role(None)
                                         .ghost()
                                         .small()
                                         .label("Cancel")
@@ -1868,11 +1864,7 @@ impl BackendsSettingsView {
                         )
                         .w_full()
                         .flex()
-                        .child(
-                            Input::new(&self.add_measurement_state)
-                                .a11y_labelled_by_ancestor()
-                                .flex_1(),
-                        ),
+                        .child(Input::new(&self.add_measurement_state).role(None).flex_1()),
                 )
                 .child(
                     h_flex()
@@ -2084,7 +2076,7 @@ impl BackendsSettingsView {
                         )
                         .w_full()
                         .flex()
-                        .child(Input::new(state).a11y_labelled_by_ancestor().flex_1()),
+                        .child(Input::new(state).role(None).flex_1()),
                 )
                 .child(
                     h_flex()
@@ -2416,7 +2408,7 @@ fn labeled_input(
                     .probe(probe_name.to_string(), gpui::Role::TextInput, label)
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(state).a11y_labelled_by_ancestor()),
+                    .child(Input::new(state).role(None)),
             ),
     );
     if !hint.is_empty() {

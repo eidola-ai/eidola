@@ -3839,7 +3839,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/eidola-ai/gpui-component?branch=eidola#397a8a65c7cb5bccfec3dc2fe749bcd9f9342548"
+source = "git+https://github.com/eidola-ai/gpui-component?branch=eidola#9f5c9fae210ec9464be94811b9dd49faa65131f4"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3887,7 +3887,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/eidola-ai/gpui-component?branch=eidola#397a8a65c7cb5bccfec3dc2fe749bcd9f9342548"
+source = "git+https://github.com/eidola-ai/gpui-component?branch=eidola#9f5c9fae210ec9464be94811b9dd49faa65131f4"
 dependencies = [
  "anyhow",
  "gpui",
@@ -3901,7 +3901,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/eidola-ai/gpui-component?branch=eidola#397a8a65c7cb5bccfec3dc2fe749bcd9f9342548"
+source = "git+https://github.com/eidola-ai/gpui-component?branch=eidola#9f5c9fae210ec9464be94811b9dd49faa65131f4"
 dependencies = [
  "proc-macro2",
  "quote",

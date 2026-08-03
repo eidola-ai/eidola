@@ -476,7 +476,7 @@ impl LibraryView {
                     )
                     .flex_1()
                     .flex()
-                    .child(Input::new(input_state).a11y_labelled_by_ancestor().flex_1())
+                    .child(Input::new(input_state).role(None).flex_1())
                     .into_any_element()
             } else {
                 div().flex_1().into_any_element()
@@ -543,7 +543,7 @@ impl LibraryView {
                         )
                         .child(
                             Button::new(("rename-space", idx))
-                                .a11y_labelled_by_ancestor()
+                                .role(None)
                                 .ghost()
                                 .xsmall()
                                 // The bundled Lucide icon set has no
@@ -577,7 +577,7 @@ impl LibraryView {
                         )
                         .child(
                             Button::new(("archive-space", idx))
-                                .a11y_labelled_by_ancestor()
+                                .role(None)
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Close)
