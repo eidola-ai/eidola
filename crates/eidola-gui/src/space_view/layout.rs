@@ -312,6 +312,32 @@ impl SpaceView {
         Some(node.id.clone())
     }
 
+    /// The slot height a **trailing draft** claims at the end of the selected
+    /// path, or `0.0` when the path ends in a post or a streaming leaf.
+    ///
+    /// That slot is speculative — an empty composer reserves a whole window of
+    /// runway — which is why tail-following stops short of it (see
+    /// [`super::SpaceView::follow_streaming_tail`]).
+    pub(crate) fn trailing_draft_slot_h(
+        &self,
+        roots: &[TreeNode],
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+    ) -> f32 {
+        let mut node = match self.active_root(roots, page_width) {
+            Some(n) => n,
+            None => return 0.0,
+        };
+        while !node.children.is_empty() {
+            let active = self.active_child_index(&node.id, page_width, node.children.len());
+            node = &node.children[active];
+        }
+        match node.src {
+            NodeSrc::Draft => self.node_height(node, page_width, window_h),
+            _ => 0.0,
+        }
+    }
+
     /// The selected root (the active page of the implicit top-level scroller).
     fn active_root<'a>(
         &self,

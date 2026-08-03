@@ -5459,6 +5459,9 @@ impl Inner {
         let mut byte_stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut full_content = String::new();
+        // Strip-on-receipt for the *live* stream: what the caller watches
+        // arrive is what will be persisted (see `LeadingHeaderFilter`).
+        let mut header_filter = LeadingHeaderFilter::default();
         let mut full_reasoning = String::new();
         let mut tool_call_acc: std::collections::BTreeMap<u64, StreamingToolCall> =
             std::collections::BTreeMap::new();
@@ -5535,7 +5538,10 @@ impl Inner {
                         && !text.is_empty()
                     {
                         full_content.push_str(text);
-                        let _ = sender.send(ChatStreamEvent::ContentDelta(text.to_string()));
+                        let visible = header_filter.feed(text);
+                        if !visible.is_empty() {
+                            let _ = sender.send(ChatStreamEvent::ContentDelta(visible));
+                        }
                     }
 
                     // OpenAI o1-style ("reasoning_content") and vLLM-style
@@ -5581,11 +5587,19 @@ impl Inner {
         }
         let response_at = now_ms();
 
-        // Strip-on-receipt (see `strip_leading_header`). Applied to the
-        // accumulated text at persist time: the deltas already streamed to the
-        // caller verbatim — the emission contract is untouched — and what
-        // lands in the durable trail (and in `ChatResult`) is the stripped
-        // text every later read sees.
+        // Release whatever the live filter still held (a stream that ended
+        // mid-first-line), so the caller's accumulated text ends up equal to
+        // the persisted text below.
+        let tail = header_filter.finish();
+        if !tail.is_empty() {
+            let _ = sender.send(ChatStreamEvent::ContentDelta(tail));
+        }
+
+        // Strip-on-receipt (see `strip_leading_header`). The live deltas were
+        // filtered by the same rule on the way out (`LeadingHeaderFilter`), so
+        // this is the same strip applied to the accumulated text at persist
+        // time — what lands in the durable trail (and in `ChatResult`) is what
+        // the reader watched arrive.
         let full_content = strip_leading_header(&full_content).to_string();
 
         // SSE carries no inline refund — always consult the recovery endpoint
@@ -9237,23 +9251,127 @@ fn strip_leading_header(text: &str) -> &str {
         Some((first, rest)) => (first.trim_end_matches('\r'), rest),
         None => (text, ""),
     };
-    let Some(after_hash) = first.strip_prefix('#') else {
-        return text;
-    };
-    let Some(handle_end) = after_hash.find(HEADER_SEPARATOR) else {
-        return text;
-    };
-    let handle = &after_hash[..handle_end];
-    if handle.is_empty()
-        || handle.len() > 16
-        || !handle
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
-    {
+    if !is_header_line(first) {
         return text;
     }
     // Drop the header line and the blank line that separates it from the body.
     rest.trim_start_matches(['\n', '\r'])
+}
+
+/// Whether one complete line is header-shaped: `#` + 1..=16 base32 characters +
+/// the pinned [`HEADER_SEPARATOR`]. The shared predicate behind
+/// [`strip_leading_header`] and its streaming twin [`LeadingHeaderFilter`], so
+/// the two can never disagree about what a header is.
+fn is_header_line(line: &str) -> bool {
+    let Some(after_hash) = line.strip_prefix('#') else {
+        return false;
+    };
+    let Some(handle_end) = after_hash.find(HEADER_SEPARATOR) else {
+        return false;
+    };
+    let handle = &after_hash[..handle_end];
+    !handle.is_empty()
+        && handle.len() <= 16
+        && handle
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+}
+
+/// The streaming twin of [`strip_leading_header`]: the same strip applied to a
+/// *delta sequence*, so a caller watching a reply arrive sees exactly the text
+/// that will be persisted — never a header line that appears while streaming
+/// and vanishes on reload.
+///
+/// It holds back only what it must: bytes are released as soon as the first
+/// line can no longer be a header (usually the very first delta), and a header
+/// that *is* present costs the first line plus the blank line under it. A
+/// stream that ends mid-decision resolves through [`Self::finish`] on the same
+/// rule the persisted text uses.
+#[derive(Debug, Default)]
+struct LeadingHeaderFilter {
+    state: HeaderFilterState,
+    /// The first line so far, while it is still undecided.
+    held: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum HeaderFilterState {
+    /// The first line is still undecided; `held` carries it so far.
+    #[default]
+    Scanning,
+    /// A header line was consumed; the blank line under it is being dropped.
+    SkippingBlankLines,
+    /// Decided — everything passes through untouched.
+    Passing,
+}
+
+impl LeadingHeaderFilter {
+    /// Feed one delta; returns what the caller should see (often the delta
+    /// itself, and never more than what was fed).
+    fn feed(&mut self, delta: &str) -> String {
+        match self.state {
+            HeaderFilterState::Passing => delta.to_string(),
+            HeaderFilterState::SkippingBlankLines => {
+                let rest = delta.trim_start_matches(['\n', '\r']);
+                if rest.is_empty() {
+                    return String::new();
+                }
+                self.state = HeaderFilterState::Passing;
+                rest.to_string()
+            }
+            HeaderFilterState::Scanning => {
+                self.held.push_str(delta);
+                let Some(newline) = self.held.find('\n') else {
+                    // No line end yet: keep holding while the line could still
+                    // become a header, otherwise release everything at once.
+                    if header_prefix_viable(&self.held) {
+                        return String::new();
+                    }
+                    self.state = HeaderFilterState::Passing;
+                    return std::mem::take(&mut self.held);
+                };
+                let all = std::mem::take(&mut self.held);
+                let (first, rest) = all.split_at(newline);
+                if !is_header_line(first.trim_end_matches('\r')) {
+                    self.state = HeaderFilterState::Passing;
+                    return all;
+                }
+                self.state = HeaderFilterState::SkippingBlankLines;
+                self.feed(&rest[1..])
+            }
+        }
+    }
+
+    /// End of stream: release whatever is still held, applying the same rule
+    /// [`strip_leading_header`] applies to an unterminated single line.
+    fn finish(&mut self) -> String {
+        if self.state == HeaderFilterState::Scanning && is_header_line(&self.held) {
+            self.held.clear();
+        }
+        self.state = HeaderFilterState::Passing;
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// Whether an incomplete first line could still become a header line — `#`,
+/// then base32 handle characters, then (possibly a prefix of) the separator.
+fn header_prefix_viable(line: &str) -> bool {
+    let Some(after_hash) = line.strip_prefix('#') else {
+        return line.is_empty();
+    };
+    if after_hash.contains(HEADER_SEPARATOR) {
+        return true; // the separator landed; only the line end is missing
+    }
+    // A delta can end part-way through the separator.
+    let handle = ["·", " "]
+        .iter()
+        .find_map(|p| after_hash.strip_suffix(*p))
+        .map(|s| s.trim_end_matches(' '))
+        .unwrap_or(after_hash);
+    handle.len() <= 16
+        && handle
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
 }
 
 /// Convert space action rows into a sequence of role/content messages for UI
@@ -12192,6 +12310,77 @@ mod tests {
         );
         assert_eq!(strip_leading_header("plain answer"), "plain answer");
         assert_eq!(strip_leading_header(""), "");
+    }
+
+    /// Feed `deltas` through the streaming filter and return what a caller
+    /// watching the stream would have seen, in order.
+    fn filter_stream(deltas: &[&str]) -> String {
+        let mut f = LeadingHeaderFilter::default();
+        let mut seen = String::new();
+        for d in deltas {
+            seen.push_str(&f.feed(d));
+        }
+        seen.push_str(&f.finish());
+        seen
+    }
+
+    /// The streaming filter shows exactly what `strip_leading_header` leaves —
+    /// however the deltas are chopped up, including mid-header.
+    #[test]
+    fn streaming_header_filter_matches_the_persisted_strip() {
+        let whole = "#a2c3d4e · Gemma\n\nThe tides are driven by";
+        assert_eq!(filter_stream(&[whole]), strip_leading_header(whole));
+        // Split at every byte boundary of the header (and inside the body).
+        for i in 1..whole.len() {
+            if !whole.is_char_boundary(i) {
+                continue;
+            }
+            assert_eq!(
+                filter_stream(&[&whole[..i], &whole[i..]]),
+                strip_leading_header(whole),
+                "split at {i}"
+            );
+        }
+        // The pathological per-character stream.
+        let chars: Vec<String> = whole.chars().map(|c| c.to_string()).collect();
+        let refs: Vec<&str> = chars.iter().map(|s| s.as_str()).collect();
+        assert_eq!(filter_stream(&refs), strip_leading_header(whole));
+    }
+
+    /// Everything `strip_leading_header` leaves alone streams through
+    /// untouched, and a stream that ends mid-decision resolves the same way.
+    #[test]
+    fn streaming_header_filter_leaves_ordinary_text_alone() {
+        for text in [
+            "# Tides\n\nbody",
+            "#Not-Base32! · X\n\nbody",
+            "Sure.\n\n#a2c3d4e · Gemma\n\nbody",
+            "plain answer",
+            "#a2c3d4e · Gemma", // a bare header and nothing else
+            "",
+        ] {
+            assert_eq!(
+                filter_stream(&[text]),
+                strip_leading_header(text),
+                "{text:?}"
+            );
+            let chars: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+            let refs: Vec<&str> = chars.iter().map(|s| s.as_str()).collect();
+            assert_eq!(
+                filter_stream(&refs),
+                strip_leading_header(text),
+                "{text:?} one character at a time"
+            );
+        }
+    }
+
+    /// The filter holds back only while the first line is undecided: ordinary
+    /// prose is released on the very first delta.
+    #[test]
+    fn streaming_header_filter_releases_prose_immediately() {
+        let mut f = LeadingHeaderFilter::default();
+        assert_eq!(f.feed("The tides "), "The tides ");
+        assert_eq!(f.feed("are driven"), "are driven");
     }
 
     /// Round-trip: what `with_header` renders is exactly what

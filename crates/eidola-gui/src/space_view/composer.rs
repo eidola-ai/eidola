@@ -45,7 +45,10 @@ use super::model::{self, TreeNode};
 const SHADOW_OFFSET_Y: Pixels = px(-3.);
 const SHADOW_BLUR: Pixels = px(18.);
 use super::nav::ScrollOwner;
-use super::{Draft, GUTTER_GAP, POST_PAD_Y, PostOnly, Send, SpaceView, prose_style};
+use super::{
+    Draft, GUTTER_GAP, POST_PAD_Y, PendingSelect, PendingSettle, PostOnly, Send, SpaceView,
+    prose_style,
+};
 
 impl SpaceView {
     // -- Draft lifecycle ---------------------------------------------------
@@ -181,7 +184,10 @@ impl SpaceView {
         let id = self.create_draft_node(parent, window, cx);
         let focus = self.drafts.last().unwrap().editor.read(cx).focus_handle(cx);
         self.activate_draft(id.clone(), cx);
-        self.pending_select = Some(id);
+        self.pending_select = Some(PendingSelect {
+            node: id,
+            settle: PendingSettle::DockDraft,
+        });
         window.focus(&focus, cx);
     }
 
@@ -463,8 +469,16 @@ impl SpaceView {
     /// Route an explicit ask — a separator's `Ask ▸ <participant>`, the
     /// cascade notice's "Ask to continue", or a retry — to the shared
     /// [`Space::ask`]. Closes any open band menu + the cascade notice, applies
-    /// the tail-draft rule, selects the target's branch so the streaming node
-    /// renders where the reply will land, and scrolls it into view.
+    /// the tail-draft rule, selects **the branch the new turn's streaming leaf
+    /// lands on**, and parks the page at its end.
+    ///
+    /// Selecting the *target's* path is not enough: an ask on a post that has
+    /// already been replied to mints a **new sibling** branch, and the target's
+    /// strip stays on the branch it was resting on — the reply then streams
+    /// somewhere the reader can't see (task 46, bug 3). The new leaf does not
+    /// exist in this frame's tree, so the selection is deferred through
+    /// [`SpaceView::pending_select`], which runs after the next frame's
+    /// `sync_scrolls` has minted the strip's handle.
     ///
     /// **The tail-draft rule** (asking at the end of a branch): an **empty**
     /// draft replying to the target is discarded — the UI tracks the new tail
@@ -501,21 +515,23 @@ impl SpaceView {
             self.delete_draft(&id);
         }
 
-        let accepted = self.space.update(cx, |s, cx| {
+        let started = self.space.update(cx, |s, cx| {
             s.ask(participant_id, target_action_id.clone(), cx)
         });
-        if accepted {
-            // Select the target's branch *before* the next render so the
-            // streaming node attaches under the asked post, not whatever
-            // branch was selected (the PR #218 retry lesson).
-            let page_width = crate::chrome::content_size(window).width;
-            let roots = model::build_tree(&self.posts);
-            if model::node_ref(&roots, &target_action_id).is_some() {
-                self.select_path_to(&roots, &target_action_id, page_width);
-            }
-            self.scroll_to_tail(window, cx);
+        if let Some(seq) = started {
+            self.select_turn_branch(seq);
         }
         cx.notify();
+    }
+
+    /// Bring the branch turn `seq`'s streaming leaf lands on onto the selected
+    /// path, and park the page at its end — on the next render, where the leaf
+    /// exists in the tree (see [`SpaceView::ask_participant`]).
+    pub(crate) fn select_turn_branch(&mut self, seq: u64) {
+        self.pending_select = Some(PendingSelect {
+            node: model::streaming_node_id(seq),
+            settle: PendingSettle::BranchEnd,
+        });
     }
 
     // -- Scrolling ---------------------------------------------------------
@@ -526,9 +542,19 @@ impl SpaceView {
         let viewport = crate::chrome::content_size(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(viewport.width, &turns);
-        let total = self.selected_total_height(&tree, viewport.width, viewport.height);
+        self.scroll_to_branch_end(&tree, viewport.width, viewport.height);
+    }
+
+    /// The same, against a tree the caller already has (`render`'s).
+    pub(crate) fn scroll_to_branch_end(
+        &self,
+        roots: &[TreeNode],
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+    ) {
+        let total = self.selected_total_height(roots, page_width, window_h);
         let doc = self.doc_reserve() + total;
-        let y = (viewport.height.as_f32() - doc).min(0.0);
+        let y = (window_h.as_f32() - doc).min(0.0);
         let off = self.page_scroll.offset();
         self.page_scroll.set_offset(point(off.x, px(y)));
     }
@@ -541,14 +567,26 @@ impl SpaceView {
         page_width: gpui::Pixels,
         window_h: gpui::Pixels,
     ) {
-        let doc_top = self.placeholder_doc_top(roots, page_width, window_h);
-        let target = window_h.as_f32() * 0.4;
-        let y = (target - doc_top).min(0.0);
+        let y = self.dock_active_draft_y(roots, page_width, window_h);
         let off = self.page_scroll.offset();
         self.page_scroll.set_offset(point(off.x, px(y)));
     }
 
+    /// The page scroll `y` [`Self::dock_active_draft`] rests at.
+    fn dock_active_draft_y(
+        &self,
+        roots: &[TreeNode],
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+    ) -> f32 {
+        let doc_top = self.placeholder_doc_top(roots, page_width, window_h);
+        let target = window_h.as_f32() * 0.4;
+        (target - doc_top).min(0.0)
+    }
+
     /// "See in context": dock the active draft back at its place in the branch.
+    /// Glided rather than jumped — the reader asked to be taken somewhere, and
+    /// the travel is what says where from (see [`super::nav::PageGlide`]).
     pub(crate) fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let viewport = crate::chrome::content_size(window);
         let turns = self.stream_overlays(cx);
@@ -557,7 +595,8 @@ impl SpaceView {
             && model::node_ref(&tree, &active).is_some()
         {
             self.select_path_to(&tree, &active, viewport.width);
-            self.dock_active_draft(&tree, viewport.width, viewport.height);
+            let y = self.dock_active_draft_y(&tree, viewport.width, viewport.height);
+            self.glide_page_to(y, window, cx);
         }
         cx.notify();
     }
