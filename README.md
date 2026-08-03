@@ -74,6 +74,8 @@ Both modes expose the same endpoints externally: postgres on `localhost:5432`, t
 
 To run the CLI against a local development stack:
 
+`just client-local` performs steps 2 and 3 below — it reads the shim's cert set, writes the overrides, and prints (never runs) the one `sudo` command that has to trust the mock TLS root. `just client-reset` clears every override back to the built-in trust-root pins. The steps below are what those recipes automate, and the reference for doing it by hand. Both the GUI and the CLI read one profile, so either recipe configures both — quit any running Eidola first, since the local database is single-writer.
+
 1. **Start the stack:** `just dev` (starts Postgres, Server, and the Hardware Shim).
 2. **Trust the Mock TLS Root:** On its first boot the shim generates two independent root CAs in `./.dev-certs/`:
    - `tls-ca.pem` + `tls-ca.key` — the **TLS** trust anchor (RSA PKCS#1 v1.5). This is what you trust in your OS keychain.
@@ -96,6 +98,8 @@ To run the CLI against a local development stack:
    `--trust-measurement` takes a `<snp>:<rtmr1>:<rtmr2>` triple — three 96-char hex strings separated by colons — since each Tinfoil release ships paired AMD SEV-SNP and Intel TDX measurements. The mock shim advertises all-zeros for every field, so the dev triple is just three zero blocks. Both `--hardware-root-ca` and `--hardware-intermediate-ca` are required when pointing the CLI at the local mock shim — without ASK, the verifier falls back to AMD's production Genoa ASK, which obviously isn't signed by your local mock ARK and the chain fails to verify. (If you ever rotate `.dev-certs/`, re-run this `configure` command to refresh the embedded certs.)
 
    The connection + trust bundle these flags set — base URL, hardware CAs, and trusted measurements — is stored on the `eidola` backend row in the local database (`~/Library/Application Support/eidola/eidola.db` on macOS); each is a per-column override of the embedded trust-root pin. Other CLI settings (default model, attestation URL, account credentials) live in `~/Library/Application Support/eidola/config.toml`.
+
+   To go back to the released service, clear each override — `configure --clear-base-url --clear-hardware-root-ca --clear-hardware-intermediate-ca --untrust-measurement <snp>` (or just `just client-reset`). A cleared column *is* the pin, so nothing else is needed. Note that accounts and wallet credentials are per-server: the account in `config.toml` was issued by whichever server you were pointed at, so expect to create one on the local stack (`eidola account create --accept-terms`) and to hit the mismatch in reverse on the way back.
 
 Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) for convenience.
 
