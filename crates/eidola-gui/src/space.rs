@@ -1326,22 +1326,26 @@ impl Space {
     /// (`AppCore::respond_stream_as`). Runs as an independent keyed turn, so
     /// asking is legal while other turns still stream; a duplicate ask (same
     /// participant, same target, already in flight) and an ask during the
-    /// exclusive mutation are no-ops. Returns whether the ask was accepted.
+    /// exclusive mutation are no-ops. Returns the **seq of the turn that
+    /// started** — the render key of the streaming leaf the answer will grow
+    /// in, so the view can select *that branch* (a new sibling of whatever the
+    /// target already replied with) rather than merely the target's path.
+    /// `None` when nothing started: a refusal, or a space with no id yet.
     pub fn ask(
         &mut self,
         participant_id: String,
         target_action_id: String,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Option<u64> {
         if self.post_runner.is_some() {
-            return false;
+            return None;
         }
         let duplicate = self.streams.iter().any(|s| {
             s.participant_id.as_deref() == Some(participant_id.as_str())
                 && s.target_action_id.as_deref() == Some(target_action_id.as_str())
         });
         if duplicate {
-            return false;
+            return None;
         }
         // Re-asking the *failed turn itself* (same participant **and** same
         // target) is the Retry; clear the recorded failure so `can_retry` reads
@@ -1367,12 +1371,12 @@ impl Space {
             });
             cx.emit(SpaceEvent::MessagesChanged);
             cx.notify();
-            return true;
+            return Some(seq);
         }
-        self.start_turn(participant_id, target_action_id, cx);
+        let seq = self.start_turn(participant_id, target_action_id, cx);
         cx.emit(SpaceEvent::MessagesChanged);
         cx.notify();
-        true
+        seq
     }
 
     fn mint_turn_seq(&mut self) -> u64 {
@@ -1392,13 +1396,9 @@ impl Space {
         participant_id: String,
         target_action_id: String,
         cx: &mut Context<Self>,
-    ) {
-        let Some(app_core) = self.app_core.clone() else {
-            return;
-        };
-        let Some(space_id) = self.id.clone() else {
-            return;
-        };
+    ) -> Option<u64> {
+        let app_core = self.app_core.clone()?;
+        let space_id = self.id.clone()?;
         let seq = self.mint_turn_seq();
         self.streams.push(StreamingTurn {
             seq,
@@ -1425,6 +1425,7 @@ impl Space {
         );
         self.turn_runners.insert(seq, runner);
         cx.notify();
+        Some(seq)
     }
 
     /// The keyed turn runner: pump this turn's deltas, then finalize —
@@ -1552,19 +1553,16 @@ impl Space {
 
     /// Re-ask the failed turn's participant about the same post — **without**
     /// re-posting anything (the post is already durable; the ask bypasses the
-    /// cascade guard). Returns the **target action id** the retry ran against
-    /// (so the view can select its branch before the streaming node renders —
-    /// PR #218 review), or `None` if nothing is retryable.
-    pub fn retry(&mut self, cx: &mut Context<Self>) -> Option<String> {
+    /// cascade guard). Returns the retried turn's **seq** (so the view can
+    /// select the branch its streaming leaf lands on before it renders — PR
+    /// #218 review), or `None` if nothing is retryable.
+    pub fn retry(&mut self, cx: &mut Context<Self>) -> Option<u64> {
         let failed = self.failed_turn.clone()?;
-        if !self.ask(
+        self.ask(
             failed.participant_id.clone(),
             failed.target_action_id.clone(),
             cx,
-        ) {
-            return None;
-        }
-        Some(failed.target_action_id)
+        )
     }
 
     // -- Test seams --------------------------------------------------------

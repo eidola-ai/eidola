@@ -60,7 +60,7 @@ use crate::window_input::WindowInput;
 
 use layout::Layout;
 use model::{NodeSrc, PostData, TreeNode};
-use nav::{ScrollAxis, ScrollOwner, SnapAnim};
+use nav::{PageGlide, ScrollAxis, ScrollOwner, SnapAnim};
 
 // Re-export the composer actions (⌘↩ Post / ⌘⇧↩ Post quietly, routed via
 // the editor's `PressEnter` event).
@@ -285,6 +285,28 @@ pub(crate) struct CascadeNotice {
     pub(crate) target_action_id: String,
 }
 
+/// A branch selection deferred to the next render, where the effective tree
+/// carrying the node (and the scroll handles the selection writes) both exist.
+/// Two sources: a freshly-created fork draft, and a freshly-started turn whose
+/// streaming leaf is a *new sibling* under its target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingSelect {
+    /// The node to bring onto the selected path.
+    pub(crate) node: SharedString,
+    /// Where the page rests once the branch is selected.
+    pub(crate) settle: PendingSettle,
+}
+
+/// The resting position a [`PendingSelect`] scrolls to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingSettle {
+    /// Dock the active draft at its home (a new composer: you are writing).
+    DockDraft,
+    /// Park at the end of the selected branch (a new turn: the answer will
+    /// grow there).
+    BranchEnd,
+}
+
 /// The open source-highlight picker: a quoted passage that **several** posts
 /// reference, so a click can't disambiguate on its own. Anchored to the post
 /// whose text was clicked, listing each referencing post (byline + snippet) as
@@ -411,9 +433,12 @@ pub struct SpaceView {
     pub(crate) active_draft: Option<SharedString>,
     /// Monotonic counter for minting unique draft ids.
     pub(crate) next_draft_seq: usize,
-    /// A freshly-created draft to bring onto the selected path on the next
-    /// render (computed there against the real effective tree).
-    pub(crate) pending_select: Option<SharedString>,
+    /// A node to bring onto the selected path on the next render — where the
+    /// real effective tree (and its scroll handles) exist. A freshly-created
+    /// draft and a freshly-started turn both name a node the current frame's
+    /// tree does not carry yet; [`PendingSelect::settle`] says where the page
+    /// should come to rest once the branch is selected.
+    pub(crate) pending_select: Option<PendingSelect>,
     /// Internal scroll of the floating composer overlay.
     pub(crate) composer_scroll: ScrollHandle,
     pub(crate) composer_prev_off_y: f32,
@@ -549,6 +574,13 @@ pub struct SpaceView {
     /// never moves the docked composer / posts / minimap (the flicker fix,
     /// generalized).
     pub(crate) scroll_min_y: Cell<f32>,
+    /// The previous frame's **end of written content** — the page scroll `y` at
+    /// which the selected branch's last post/streaming leaf sat against the
+    /// window bottom, with any trailing draft's speculative runway excluded.
+    /// [`Self::follow_streaming_tail`] both tests against it ("is the reader
+    /// still at the end?") and scrolls to this frame's value, so the two can
+    /// never disagree about where "the end" is.
+    pub(crate) follow_anchor: Cell<f32>,
     /// The reader just posted: extend tail-following to the growth that
     /// follows a submit, until the exchange settles. Armed by
     /// [`Self::settle_on_new_post`], cleared in `render` the moment the space
@@ -590,6 +622,10 @@ pub struct SpaceView {
     /// A settled branch + resting x, pinned until the next gesture so trailing
     /// momentum can't drift the page off-branch.
     pub(crate) snap_pin: Option<(SharedString, f32)>,
+    /// The page (vertical) glide carrying the reader to a place they asked to
+    /// be taken to — a reference, a footnote's source, "See in context". See
+    /// [`PageGlide`]; cancelled by any scroll the reader or the tail drives.
+    pub(crate) page_glide: Option<PageGlide>,
     /// The previous frame's page width, to remap branch offsets on resize.
     pub(crate) last_page_width: Option<Pixels>,
 
@@ -743,6 +779,7 @@ impl SpaceView {
             composer_aria_value: RefCell::new((SharedString::default(), SharedString::default())),
             page_scroll: ScrollHandle::new(),
             scroll_min_y: Cell::new(0.0),
+            follow_anchor: Cell::new(0.0),
             tail_pin: false,
             docked_caret_slot_offset: Cell::new(0.0),
             scrolls: HashMap::new(),
@@ -752,6 +789,7 @@ impl SpaceView {
             last_h_delta: px(0.),
             snap: None,
             snap_pin: None,
+            page_glide: None,
             last_page_width: None,
             layout: Layout::new(),
             warm_remaining: Cell::new(0),
@@ -1003,6 +1041,28 @@ impl SpaceView {
         self.scroll_min_y.get()
     }
 
+    /// The destination of the navigation glide in flight, if any (`None` when
+    /// the page is at rest). Drives the animated-navigation regressions.
+    #[doc(hidden)]
+    pub fn page_glide_target_for_test(&self) -> Option<f32> {
+        self.page_glide.as_ref().map(|g| g.to_y)
+    }
+
+    /// Advance the navigation glide to progress `t` — the frame loop's body
+    /// without its clock (no test dispatcher pumps `on_next_frame`).
+    #[doc(hidden)]
+    pub fn drive_page_glide_for_test(&mut self, t: f32) {
+        self.apply_page_glide(t);
+    }
+
+    /// The page scroll `y` a following reader comes to rest at — the end of the
+    /// **written** content (see `follow_streaming_tail`). Equals
+    /// `scroll_min_y_for_test` except while a draft trails the selected path.
+    #[doc(hidden)]
+    pub fn content_end_for_test(&self) -> f32 {
+        self.follow_anchor.get()
+    }
+
     /// The recorded top (window-space y) of the minimap container — the origin a
     /// mousedown's window-y is measured from to get a minimap-local y. Must be
     /// the container's real top (≈ 0 for a window-filling space view), not the
@@ -1138,6 +1198,21 @@ impl SpaceView {
         let roots = model::build_tree(&self.posts);
         self.selected_leaf_id(&roots, page_width)
             .map(|s| s.to_string())
+    }
+
+    /// The selected path through the **effective** tree (streaming leaves and
+    /// drafts included), root → leaf. Drives the ask/retry branch-selection
+    /// regressions: a new turn's streaming leaf must be *on* this path, which
+    /// the post-only tree above cannot say.
+    #[doc(hidden)]
+    pub fn selected_effective_path_for_test(&self, window: &Window, cx: &gpui::App) -> Vec<String> {
+        let page_width = crate::chrome::content_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        self.selected_levels(&tree, page_width)
+            .into_iter()
+            .map(|(sibs, active)| sibs[active].id.to_string())
+            .collect()
     }
 
     /// A post's `(reasoning, expanded)` from the render snapshot.
@@ -1856,14 +1931,17 @@ impl Render for SpaceView {
             self.warm_remaining.set(2);
         }
 
-        // A freshly-created draft selects its branch on the first frame it
-        // exists in the tree (computed here against the real effective tree),
-        // then docks the page so the composer lands at its "home" position.
-        if let Some(sel) = self.pending_select.take()
-            && model::node_ref(&tree, &sel).is_some()
+        // A freshly-created draft / freshly-started turn selects its branch on
+        // the first frame it exists in the tree (computed here against the real
+        // effective tree), then settles the page where that node lives.
+        if let Some(pending) = self.pending_select.take()
+            && model::node_ref(&tree, &pending.node).is_some()
         {
-            self.select_path_to(&tree, &sel, page_width);
-            self.dock_active_draft(&tree, page_width, window_h);
+            self.select_path_to(&tree, &pending.node, page_width);
+            match pending.settle {
+                PendingSettle::DockDraft => self.dock_active_draft(&tree, page_width, window_h),
+                PendingSettle::BranchEnd => self.scroll_to_branch_end(&tree, page_width, window_h),
+            }
         }
 
         // Sync one read-only editor per in-flight turn to its live partial
@@ -1909,9 +1987,20 @@ impl Render for SpaceView {
         let doc_reserve = self.doc_reserve();
         let total_doc =
             doc_reserve + self.selected_total_height(&tree, page_width, window_h) + floating_pad;
-        let prev_min_y = self
-            .scroll_min_y
-            .replace((window_h.as_f32() - total_doc).min(0.0));
+        self.scroll_min_y
+            .set((window_h.as_f32() - total_doc).min(0.0));
+        // Where "the end" is for a *following* reader: the end of what has been
+        // written. A trailing draft's slot is a whole window of speculative
+        // runway, and following into it carries the reply the reader was
+        // watching off the top of the window (task 46, bug 2). While a turn
+        // streams there is no trailing draft, so this is the document end and
+        // nothing changes; it differs exactly across the settling window where
+        // the fresh composer appears.
+        let content_end = (window_h.as_f32()
+            - (total_doc - self.trailing_draft_slot_h(&tree, page_width, window_h)))
+        .min(0.0)
+        .max(self.scroll_min_y.get());
+        let prev_content_end = self.follow_anchor.replace(content_end);
 
         // **Follow the producing tail.** While a turn streams *on the branch
         // the reader is on*, the document grows with every delta; a reader
@@ -1924,14 +2013,12 @@ impl Render for SpaceView {
         // yet the document keeps growing (the persisted post replaces the
         // optimistic one under a new node id and re-measures from its estimate),
         // which would drift the reader off the end before following could ever
-        // engage. The pin ends the moment the exchange settles — checked *before*
-        // following, so the tail draft `sync_tail_drafts` then docks under the
-        // finished exchange isn't itself chased.
+        // engage. The pin ends the moment the exchange settles.
         let producing = self.selected_path_is_streaming(&tree, page_width);
         if self.tail_pin && !producing && !self.space.read(cx).is_busy() {
             self.tail_pin = false;
         }
-        self.follow_streaming_tail(producing || self.tail_pin, prev_min_y);
+        self.follow_streaming_tail(producing || self.tail_pin, prev_content_end, content_end);
 
         // While a readonly post is being drag-selected, autoscroll the page when
         // the pointer sits against a viewport edge — so a selection can pull
@@ -2138,13 +2225,22 @@ impl SpaceView {
     ///
     /// The "am I at the end?" question is answered by *observation*, not by a
     /// flag: the page is following iff its current offset still sits at the
-    /// **previous** frame's end-of-document (`prev_min_y`, the value
-    /// `scroll_min_y` held before this frame's document was measured). That
-    /// makes every scroll source — the wheel, a minimap drag, selection
-    /// autoscroll, a programmatic dock — participate for free, with no state to
-    /// keep in sync: scrolling up leaves the band and following stops;
-    /// scrolling back down re-enters it and following resumes. There is no
-    /// "sticky" mode to get wedged.
+    /// **previous** frame's end (`prev_end`, the target this function computed
+    /// for the frame before). That makes every scroll source — the wheel, a
+    /// minimap drag, selection autoscroll, a programmatic dock — participate for
+    /// free, with no state to keep in sync: scrolling up leaves the band and
+    /// following stops; scrolling back down re-enters it and following resumes.
+    /// There is no "sticky" mode to get wedged.
+    ///
+    /// **"The end" is the end of what was written, not the end of the
+    /// document** (`end`, the caller's `content_end`): a trailing draft's slot
+    /// is a window of speculative runway, and a reader following a reply must
+    /// come to rest on the reply — not be carried past it the moment the stream
+    /// closes and `sync_tail_drafts` docks a fresh composer under it (task 46,
+    /// bug 2). The two coincide whenever no draft trails the selected path,
+    /// which is every frame a turn is actually streaming. The *observation*
+    /// reads the same value, so following survives the frame the draft appears
+    /// on rather than disengaging on its own correction.
     ///
     /// Deliberately gated on `producing` — **the selected path carries a live
     /// stream** ([`Self::selected_path_is_streaming`]), not merely "some turn in
@@ -2169,18 +2265,17 @@ impl SpaceView {
     ///
     /// Runs in `render` immediately after `scroll_min_y` is set for the frame,
     /// so every consumer of `clamped_scroll_y` sees the followed position.
-    fn follow_streaming_tail(&self, producing: bool, prev_min_y: f32) {
+    fn follow_streaming_tail(&self, producing: bool, prev_end: f32, end: f32) {
         if !producing {
             return;
         }
         let off = self.page_scroll.offset();
-        let at_tail = off.y.as_f32() <= prev_min_y + TAIL_FOLLOW_EPSILON;
+        let at_tail = off.y.as_f32() <= prev_end + TAIL_FOLLOW_EPSILON;
         if !at_tail {
             return; // the reader scrolled away — never yank them back
         }
-        let target = self.scroll_min_y.get();
-        if (target - off.y.as_f32()).abs() > 0.5 {
-            self.page_scroll.set_offset(gpui::point(off.x, px(target)));
+        if (end - off.y.as_f32()).abs() > 0.5 {
+            self.page_scroll.set_offset(gpui::point(off.x, px(end)));
         }
     }
 
@@ -2655,18 +2750,15 @@ impl SpaceView {
     /// still streaming are untouched.
     pub fn retry_failed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.error = None;
-        let target = self.space.update(cx, |s, cx| s.retry(cx));
-        // Select the failed post's branch *before* the next render so the
-        // synthetic streaming node appears under the post the reply will
-        // actually land on — not whatever branch the user navigated to after
-        // the failure (PR #218 review). `self.posts` still reflects the
-        // transcript (retry only adds the streaming overlay).
-        if let Some(target) = target {
-            let page_width = crate::chrome::content_size(window).width;
-            let roots = model::build_tree(&self.posts);
-            self.select_path_to(&roots, &target, page_width);
+        let seq = self.space.update(cx, |s, cx| s.retry(cx));
+        // Select the branch the retried turn's streaming node lands on — not
+        // whatever branch the user navigated to after the failure (PR #218
+        // review), and not merely the target's path (the retry is a new
+        // sibling; see `ask_participant`).
+        match seq {
+            Some(seq) => self.select_turn_branch(seq),
+            None => self.scroll_to_tail(window, cx),
         }
-        self.scroll_to_tail(window, cx);
         cx.notify();
     }
 

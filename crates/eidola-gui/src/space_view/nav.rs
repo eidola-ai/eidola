@@ -58,6 +58,35 @@ pub struct SnapAnim {
     pub duration: Duration,
 }
 
+/// An in-flight glide of the **page** (vertical) scroll toward a destination
+/// the reader asked to be taken to — a footnote's source, a highlight's
+/// referencer, "See in context". The horizontal twin is [`SnapAnim`]; both ride
+/// the same easing and the same frame loop shape.
+///
+/// Navigation is animated because a jump gives the reader no way to tell
+/// *where* they were taken from: the glide carries the intervening page past
+/// them, which is the whole difference between "this is elsewhere in the same
+/// conversation" and "the page changed". Gesture-driven scrolls (the wheel, a
+/// minimap drag) are never animated — they are already the reader's own motion.
+#[derive(Clone, Debug)]
+pub struct PageGlide {
+    /// Page scroll `y` (≤ 0) at the start and end of the glide.
+    pub from_y: f32,
+    pub to_y: f32,
+    pub start: Instant,
+    pub duration: Duration,
+}
+
+/// The current eased `y` of a page glide at progress fraction `t` (clamped).
+pub fn glide_y_at(a: &PageGlide, t: f32) -> f32 {
+    a.from_y + (a.to_y - a.from_y) * ease_out_cubic(t.clamp(0.0, 1.0))
+}
+
+/// Elapsed progress `t` (0..=1) of a page glide as of now.
+pub fn glide_progress(a: &PageGlide) -> f32 {
+    (a.start.elapsed().as_secs_f32() / a.duration.as_secs_f32().max(f32::EPSILON)).clamp(0.0, 1.0)
+}
+
 /// Cubic ease-out: fast departure, gentle arrival — reads as a thrown page
 /// floating to rest on its snap point.
 pub fn ease_out_cubic(t: f32) -> f32 {
@@ -166,6 +195,7 @@ pub fn proximity_snap_target(
 
 use super::model::TreeNode;
 use super::{BAND_HEIGHT, SpaceView};
+
 use gpui::{Context, IsZero, Pixels, Point, ScrollHandle, TouchPhase, Window, point, px};
 
 impl SpaceView {
@@ -197,6 +227,72 @@ impl SpaceView {
     pub(crate) fn cancel_snap(&mut self) {
         self.snap = None;
         self.snap_pin = None;
+    }
+
+    /// Glide the page to `y` (a page scroll offset, ≤ 0) instead of jumping —
+    /// the navigation motion (see [`PageGlide`]). A short hop, an equal
+    /// destination, or a destination the page is already at lands immediately.
+    pub(crate) fn glide_page_to(&mut self, y: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let off = self.page_scroll.offset();
+        let from_y = off.y.as_f32();
+        let dist = (y - from_y).abs();
+        // A reader who asked for less motion gets the destination, not the
+        // journey. `App::reduce_motion` is gpui's own flag (it also drives every
+        // `Animation` element); nothing feeds it from the platform at this pin —
+        // see the note in `crates/eidola-gui/AGENTS.md`.
+        if dist < 1.0 || cx.reduce_motion() {
+            self.page_glide = None;
+            self.page_scroll.set_offset(point(off.x, px(y)));
+            cx.notify();
+            return;
+        }
+        let window_h = crate::chrome::content_size(window).height.as_f32().max(1.0);
+        self.page_glide = Some(PageGlide {
+            from_y,
+            to_y: y,
+            start: std::time::Instant::now(),
+            duration: snap_duration(dist, window_h),
+        });
+        self.drive_page_glide(window, cx);
+    }
+
+    /// One frame of the page glide: ease the offset toward the target and,
+    /// until it arrives, schedule the next frame.
+    pub(crate) fn drive_page_glide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = self.page_glide.as_ref().map(glide_progress) else {
+            return;
+        };
+        if !self.apply_page_glide(t) {
+            let entity = cx.entity();
+            window.on_next_frame(move |window, cx| {
+                entity.update(cx, |this, cx| this.drive_page_glide(window, cx));
+            });
+        }
+        cx.notify();
+    }
+
+    /// Place the page at the glide's eased position for progress `t`, retiring
+    /// the glide once it arrives. Returns whether it arrived. Split from the
+    /// frame loop so the landing is testable without a real clock (no test
+    /// dispatcher pumps `on_next_frame`).
+    pub(crate) fn apply_page_glide(&mut self, t: f32) -> bool {
+        let Some(a) = self.page_glide.clone() else {
+            return true;
+        };
+        let off = self.page_scroll.offset();
+        self.page_scroll
+            .set_offset(point(off.x, px(glide_y_at(&a, t))));
+        if t >= 1.0 {
+            self.page_glide = None;
+            return true;
+        }
+        false
+    }
+
+    /// Drop any in-flight page glide — the reader's own scrolling, a gesture,
+    /// or tail-following now owns the offset.
+    pub(crate) fn cancel_page_glide(&mut self) {
+        self.page_glide = None;
     }
 
     /// Begin (or immediately resolve) a snap glide for `node_id` from its
@@ -266,7 +362,8 @@ impl SpaceView {
         let to_x = -(index as f32) * stride;
         self.cancel_snap();
         let dist = (to_x - from_x).abs();
-        if dist < 0.5 {
+        // Navigation, so it honors reduce-motion (see `glide_page_to`).
+        if dist < 0.5 || cx.reduce_motion() {
             if let Some(h) = self.scrolls.get(&node_id) {
                 h.set_offset(point(px(to_x), off_y));
             }
@@ -381,6 +478,21 @@ mod tests {
             ease_out_cubic(0.5) > 0.5,
             "ease-out is ahead at the midpoint"
         );
+    }
+
+    #[test]
+    fn page_glide_eases_between_its_endpoints() {
+        let g = PageGlide {
+            from_y: -1000.0,
+            to_y: 0.0,
+            start: Instant::now(),
+            duration: Duration::from_millis(300),
+        };
+        assert!((glide_y_at(&g, 0.0) - g.from_y).abs() < 1e-3);
+        assert!((glide_y_at(&g, 1.0) - g.to_y).abs() < 1e-3);
+        // Clamped outside 0..=1, and ahead of linear at the midpoint.
+        assert!((glide_y_at(&g, 2.0) - g.to_y).abs() < 1e-3);
+        assert!(glide_y_at(&g, 0.5) > -500.0);
     }
 
     #[test]
