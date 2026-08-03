@@ -495,7 +495,8 @@ impl SpaceView {
     fn note_scroll_activity(&mut self, phase: TouchPhase, moved: bool, cx: &mut Context<Self>) {
         match phase {
             TouchPhase::Started => self.minimap_gesturing = true,
-            TouchPhase::Ended => self.minimap_gesturing = false,
+            // `Cancelled` unwinds like `Ended` — the gesture is over either way.
+            TouchPhase::Ended | TouchPhase::Cancelled => self.minimap_gesturing = false,
             TouchPhase::Moved => {}
         }
         // macOS-style: reveal only once the scroll actually moves, not on mere
@@ -507,7 +508,7 @@ impl SpaceView {
         // Arm the linger timer on real movement, or on lift (so the 1s countdown
         // starts precisely when the gesture ends). A contact-without-scroll
         // arms nothing, leaving no stray polling task behind.
-        if moved || matches!(phase, TouchPhase::Ended) {
+        if moved || matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
             self.arm_minimap_hide(cx);
             cx.notify();
         }
@@ -1215,7 +1216,7 @@ impl SpaceView {
                             this.last_h_delta = delta.x;
                         }
                     }
-                    TouchPhase::Ended => {}
+                    TouchPhase::Ended | TouchPhase::Cancelled => {}
                 }
                 // Capture the gesture's locked axis before `resolve_scroll_axis`
                 // clears it on `Ended`, so we only snap a horizontal gesture.
