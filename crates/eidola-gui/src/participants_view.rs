@@ -844,6 +844,224 @@ pub(crate) fn model_field<V: 'static>(
     col.into_any_element()
 }
 
+/// True when a model reference routes to the **remote** eidola backend — the
+/// condition (and only condition) for a router row's per-call cost note. The
+/// registry answers it; an unloaded registry falls back to the reference's own
+/// backend id, which `parse_model_ref` canonicalizes (a bare name is eidola).
+pub(crate) fn is_remote_ref(stores: &Stores, selection: &str, cx: &gpui::App) -> bool {
+    let backend_id = eidola_app_core::parse_model_ref(selection).backend_id;
+    match stores.backends.read(cx).get(&backend_id) {
+        Some(b) => b.kind == eidola_app_core::BackendKind::Eidola,
+        None => backend_id == eidola_app_core::EIDOLA_BACKEND_ID,
+    }
+}
+
+/// Where a [`router_field`] renders: the element ids and probe names it mints,
+/// the copy it carries, and the scroll handle its dropdown tracks. The two
+/// router surfaces (a template's, a space's) differ only in these.
+pub(crate) struct RouterField<'a> {
+    /// Prefix for element ids (`{id_prefix}-button`, `-menu`, `-opt-*`, `-cost`).
+    pub id_prefix: &'static str,
+    /// Prefix for probe names (`{probe_prefix}`, `/menu`, `/option/off`,
+    /// `/option/{g}/{m}`, `/cost`).
+    pub probe_prefix: &'static str,
+    /// The selected reference; `None` is **Off** — the default and an ordinary
+    /// choice, never a degraded one.
+    pub selection: Option<&'a str>,
+    pub open: bool,
+    /// The mandatory per-call cost copy for a **remote** selection. Its wording
+    /// is the surface's (a template's spaces vs this space), the rule is not:
+    /// it is always visible whenever a remote reference is chosen.
+    pub cost_note: &'static str,
+    /// One quiet line saying what the router does, under the row.
+    pub help: &'static str,
+    pub picker_scroll: &'a ScrollHandle,
+    /// Element id for the dropdown's overlay scroll indicator.
+    pub scrollbar_id: &'static str,
+}
+
+/// The **router-model** picker — the same qualified references the chat model
+/// picker offers, with **Off** leading the list (its resting label too), and the
+/// per-call cost stated inline under the row whenever a remote reference is
+/// selected.
+///
+/// Shared by the Space Templates pane and the space inspector, because the thing
+/// it must not get wrong is the same in both: a remote router bills an inference
+/// on every post, and that is disclosed in the row rather than on hover. Only
+/// the ids, the probe names, and the wording of the cost line differ (see
+/// [`RouterField`]).
+pub(crate) fn router_field<V: 'static>(
+    stores: &Stores,
+    spec: RouterField<'_>,
+    cx: &Context<V>,
+    on_toggle: impl Fn(&mut V, &gpui::ClickEvent, &mut Window, &mut Context<V>) + 'static,
+    on_pick: impl Fn(Option<&str>, &mut V, &mut Context<V>) + Clone + 'static,
+) -> gpui::AnyElement {
+    let theme = cx.theme();
+    let RouterField {
+        id_prefix,
+        probe_prefix,
+        selection,
+        open,
+        cost_note,
+        help,
+        picker_scroll,
+        scrollbar_id,
+    } = spec;
+    let (name, backend) = match selection {
+        Some(sel) => {
+            let (n, b) = model_display(stores, sel, cx);
+            (n, Some(b))
+        }
+        None => ("Off".into(), None),
+    };
+    // The picker's *content* is which router is chosen — settled (it moves only
+    // on a click) and otherwise unreachable to a screen reader, which would hear
+    // "Router model" whether the space bills per post or not. Same shape as the
+    // participant model field, deliberately.
+    let value = picker_value(&name, backend.as_ref());
+
+    let button = h_flex()
+        .id(SharedString::from(format!("{id_prefix}-button")))
+        .probe_value(probe_prefix, gpui::Role::Button, "Router model", value)
+        .w_full()
+        .px_2()
+        .py_1()
+        .gap_2()
+        .items_center()
+        .justify_between()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+        .child(
+            h_flex()
+                .gap_1p5()
+                .items_baseline()
+                .child(div().text_sm().child(name))
+                .when_some(backend, |el, b| {
+                    el.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(format!("· {b}"))),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("▾"),
+        )
+        .on_click(cx.listener(on_toggle));
+
+    let mut col = v_flex().w_full().gap_1().child(button);
+
+    if open {
+        let off_pick = on_pick.clone();
+        let mut menu = v_flex()
+            .id(SharedString::from(format!("{id_prefix}-menu")))
+            .probe(
+                format!("{probe_prefix}/menu"),
+                gpui::Role::ListBox,
+                "Router models",
+            )
+            .w_full()
+            .max_h(px(220.))
+            .overflow_y_scroll()
+            .track_scroll(picker_scroll)
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            // Off leads the list: it is the default, and it is a choice.
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id_prefix}-opt-off")))
+                    .probe(
+                        format!("{probe_prefix}/option/off"),
+                        gpui::Role::Button,
+                        "Off",
+                    )
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .text_sm()
+                    .hover(|s| s.bg(theme.secondary.opacity(0.6)))
+                    .when(selection.is_none(), |el| el.text_color(theme.link))
+                    .child("Off")
+                    .on_click(cx.listener(move |this, _, _, cx| off_pick(None, this, cx))),
+            );
+        for (gi, (header, models)) in model_groups(stores, cx).into_iter().enumerate() {
+            // The header is node-less chrome; the backend has to ride each
+            // option's own name (see `option_label`) — and here it is also the
+            // billing difference.
+            let group = SharedString::from(header);
+            menu = menu.child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(group.clone()),
+            );
+            for (mi, (id, display)) in models.into_iter().enumerate() {
+                let selected = selection == Some(id.as_str());
+                let pick_id = id.clone();
+                let on_pick = on_pick.clone();
+                let display = SharedString::from(display);
+                menu = menu.child(
+                    div()
+                        .id(SharedString::from(format!("{id_prefix}-opt-{gi}-{mi}")))
+                        .probe(
+                            format!("{probe_prefix}/option/{gi}/{mi}"),
+                            gpui::Role::Button,
+                            option_label(&display, &group),
+                        )
+                        .px_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .text_sm()
+                        .hover(|s| s.bg(theme.secondary.opacity(0.6)))
+                        .when(selected, |el| el.text_color(theme.link))
+                        .child(display)
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| on_pick(Some(&pick_id), this, cx)),
+                        ),
+                );
+            }
+        }
+        col = col.child(div().relative().w_full().child(menu).child(
+            crate::scrollbar::vertical_floating(scrollbar_id, picker_scroll),
+        ));
+    }
+
+    // The cost note is exactly remote-conditional, and always visible when it
+    // applies (a cost a person only discovers on hover is not disclosed).
+    if selection.is_some_and(|sel| is_remote_ref(stores, sel, cx)) {
+        col = col.child(
+            div()
+                .id(SharedString::from(format!("{id_prefix}-cost")))
+                .probe(format!("{probe_prefix}/cost"), gpui::Role::Label, cost_note)
+                .text_xs()
+                .text_color(theme.warning)
+                .child(cost_note),
+        );
+    }
+
+    col.child(
+        div()
+            .text_xs()
+            .text_color(theme.muted_foreground.opacity(0.8))
+            .child(help),
+    )
+    .into_any_element()
+}
+
 impl Render for ParticipantsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let drag_band =

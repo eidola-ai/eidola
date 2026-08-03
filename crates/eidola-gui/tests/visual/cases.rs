@@ -58,6 +58,49 @@ fn register_space(s: &mut Snapshots) {
         })
     });
 
+    // The space inspector (task 26.2): the per-space settings panel splitting
+    // the window — chrome type beside the paper, with a remote router selected
+    // so the mandatory per-call cost copy is in frame.
+    s.add(
+        "space_inspector",
+        size(px(1040.), px(760.)),
+        |window, cx| {
+            let stores = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(true));
+                s.spaces = vec![SpaceInfo {
+                    id: "demo".into(),
+                    title: Some("Tides and the moon".into()),
+                    snippet: None,
+                    created_at: 0,
+                    last_activity_at: 0,
+                    message_count: 4,
+                    archived_at: None,
+                }];
+                s.space_settings = Some((
+                    "demo".into(),
+                    eidola_app_core::SpaceSettings {
+                        cascade_limit: 4,
+                        router_model: Some("gemma4-31b@eidola".into()),
+                    },
+                ));
+            });
+            cx.new(|cx| {
+                let mut view = SpaceView::new(
+                    stores,
+                    Some("demo".into()),
+                    WindowInput::new(cx),
+                    window,
+                    cx,
+                );
+                view.space().update(cx, |sp, cx| {
+                    sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
+                });
+                view.set_inspector_open_for_test(true, cx);
+                view
+            })
+        },
+    );
+
     // Quoted references: a source post whose quoted passages carry the warm
     // highlight wash (one plain, one overlapping pair), the replies whose
     // bodies render the quote as an embed block, and the footnote rails

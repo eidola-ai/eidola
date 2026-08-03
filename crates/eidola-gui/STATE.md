@@ -47,7 +47,8 @@ One gpui entity per domain, created at startup, held by `AppGlobal`, observed by
 | `LocalModelsStore` | engine-domain snapshot (managed models on disk / downloading, running engines, engine binary, each llamacpp backend's scanned directory) | Refreshed at launch + on `LocalModels`; ops are thin initiating calls — the downloads/engine supervisors are core-owned tasks that survive any window |
 | `AccountStore` | balances, prices, account lifecycle, checkout | The checkout *poll* is view-owned (see scoping); its result lands here via invalidation |
 | `WalletStore` | credential lifecycle list, recovery | |
-| `SpacesStore` | the Library index **and** the space-entity registry (below) | |
+| `SpacesStore` | the Library index **and** the space-entity registry (below) | Also owns rename — the space inspector's title row writes through it |
+| `SpaceSettingsStore` | per-space settings (cascade limit, router model) | Keyed per space; refreshed on `Change::Space` for **cached** spaces only (every post emits it); write-through with the ordered refresh/mutation slot split |
 | `UpdateStore` | `UpdateCheckSnapshot`, polling, accept-claims | Mostly exists already; the pattern to which everything else converges |
 
 Store method shape (the only sanctioned async idiom):
@@ -162,7 +163,8 @@ Any list that can exceed roughly one screen renders through gpui's virtualized p
 | Update check state | global | `UpdateStore` |
 | Record listings, cursors, detail | per-window | reader entity |
 | Checkout balance poll | per-window task | initiating view (dies with window; outcome lands in `AccountStore` via the bus) |
-| Composer draft, scroll, hover, disclosure, picker-open, ⌥ | per-window | view / `WindowInput` |
+| Per-space settings (cascade limit, router model) | global, keyed per space | `SpaceSettingsStore` |
+| Composer draft, scroll, hover, disclosure, picker-open, inspector open, ⌥ | per-window | view / `WindowInput` |
 
 ### Testing doctrine
 

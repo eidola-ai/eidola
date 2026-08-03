@@ -705,3 +705,133 @@ fn a_refresh_landing_mid_write_keeps_the_participants_ops_error(cx: &mut TestApp
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// SpaceSettingsStore — the space inspector's per-space domain cell.
+// ---------------------------------------------------------------------------
+
+/// The write-through round trip: each setter writes core-side and the store's
+/// own re-read (not the bus) is what lands the new value, so the panel is
+/// correct even on a bus-less run.
+#[gpui::test]
+fn space_settings_write_through_and_reread(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(None))
+        .expect("create space")
+        .id;
+
+    stores
+        .space_settings
+        .update(cx, |s, cx| s.ensure(space.clone(), cx));
+    wait_until(cx, "the settings load", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).has_value())
+    });
+    stores.space_settings.read_with(cx, |s, _| {
+        assert_eq!(
+            s.settings(&space).value().map(|v| v.cascade_limit),
+            Some(eidola_app_core::DEFAULT_CASCADE_LIMIT)
+        );
+    });
+
+    stores
+        .space_settings
+        .update(cx, |s, cx| s.set_cascade_limit(space.clone(), 7, cx));
+    wait_until(cx, "the new limit lands", |cx| {
+        stores.space_settings.read_with(cx, |s, _| {
+            s.settings(&space).value().map(|v| v.cascade_limit) == Some(7)
+        })
+    });
+
+    // Off round-trips as an ordinary choice, and a reference whose backend is
+    // gone is refused into the op-error slot rather than silently dropped.
+    stores.space_settings.update(cx, |s, cx| {
+        s.set_router_model(space.clone(), Some("nothing@nope".into()), cx)
+    });
+    wait_until(cx, "the refusal surfaces", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.op_error(&space).is_some())
+    });
+    stores.space_settings.read_with(cx, |s, _| {
+        assert_eq!(
+            s.settings(&space).value().map(|v| v.router_model.clone()),
+            Some(None),
+            "a refused write leaves the setting where it was"
+        );
+        assert!(
+            !s.settings(&space).is_loading(),
+            "the mutation must resolve the cell it took the read from"
+        );
+    });
+}
+
+/// The refresh-vs-mutation rule for this store: its own write emits
+/// `Change::Space`, which routes back here as a refresh — sharing one slot
+/// would cancel the write's continuation and lose both its `op_error` and its
+/// re-read.
+#[gpui::test]
+fn a_refresh_landing_mid_write_keeps_the_space_settings_op_error(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(None))
+        .expect("create space")
+        .id;
+
+    stores
+        .space_settings
+        .update(cx, |s, cx| s.ensure(space.clone(), cx));
+    wait_until(cx, "the settings load", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).has_value())
+    });
+
+    // Refused before it writes anything (the floor is 1), with the space's own
+    // bus signal landing mid-write.
+    stores
+        .space_settings
+        .update(cx, |s, cx| s.set_cascade_limit(space.clone(), 0, cx));
+    cx.update(|cx| {
+        stores::dispatch_change_for_test(&stores, Some(Change::Space(space.clone())), cx)
+    });
+
+    wait_until(cx, "the refusal surfaces", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.op_error(&space).is_some())
+    });
+    stores.space_settings.read_with(cx, |s, _| {
+        assert!(
+            s.settings(&space).has_value(),
+            "the mutation re-read on its failure exit"
+        );
+        assert!(
+            !s.settings(&space).is_loading(),
+            "the mutation must resolve the cell it took the read from"
+        );
+    });
+}
+
+/// `Change::Space` fires on every post; only a space something is actually
+/// looking at should pay for a re-read.
+#[gpui::test]
+fn a_space_change_re_reads_only_cached_settings(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+
+    cx.update(|cx| {
+        stores::dispatch_change_for_test(&stores, Some(Change::Space("unseen".into())), cx)
+    });
+    stores.space_settings.read_with(cx, |s, _| {
+        assert!(
+            !s.settings("unseen").is_loading(),
+            "a space with no inspector open is never fetched"
+        );
+    });
+}
