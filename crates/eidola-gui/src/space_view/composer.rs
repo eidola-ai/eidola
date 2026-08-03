@@ -527,9 +527,45 @@ impl SpaceView {
     /// Bring the branch turn `seq`'s streaming leaf lands on onto the selected
     /// path, and park the page at its end — on the next render, where the leaf
     /// exists in the tree (see [`SpaceView::ask_participant`]).
+    ///
+    /// The leaf is an **ephemeral** render key, and nothing sequences a render
+    /// between the ask and the turn's completion (gpui draws from the
+    /// platform's frame callback; a turn completes in an ordinary foreground
+    /// task). A turn that lands first is followed onto its post by
+    /// [`Self::retarget_pending_turn_select`].
     pub(crate) fn select_turn_branch(&mut self, seq: u64) {
         self.pending_select = Some(PendingSelect {
             node: model::streaming_node_id(seq),
+            settle: PendingSettle::BranchEnd,
+        });
+    }
+
+    /// Follow a selection deferred onto turn `seq`'s streaming leaf across the
+    /// turn's completion: the leaf is gone by then, and the branch the reader
+    /// was to be taken to is the one carrying the post the turn wrote
+    /// (`SpaceEvent::TurnEnded`, delivered before the frame that would consume
+    /// the request). Without this, a turn that finished before its first
+    /// render left the new branch unselected — the very failure the deferral
+    /// exists to prevent (task 46, bug 3), on the timing edge.
+    ///
+    /// A turn that wrote **no** post (a decline) has no branch to offer, so
+    /// the request is dropped rather than left naming a node that can never
+    /// appear. Requests for *other* nodes (a fork draft, a later turn) are
+    /// untouched — the leaf id is unique per turn.
+    pub(crate) fn retarget_pending_turn_select(
+        &mut self,
+        seq: u64,
+        response_action_id: Option<&str>,
+    ) {
+        let waiting = self
+            .pending_select
+            .as_ref()
+            .is_some_and(|p| p.node == model::streaming_node_id(seq));
+        if !waiting {
+            return;
+        }
+        self.pending_select = response_action_id.map(|id| PendingSelect {
+            node: SharedString::from(id.to_string()),
             settle: PendingSettle::BranchEnd,
         });
     }

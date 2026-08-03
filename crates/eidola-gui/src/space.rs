@@ -312,6 +312,21 @@ pub enum SpaceEvent {
     /// when a plain post persists — either way the space now has a durable id,
     /// which is what the registry's blank-space adoption keys off.
     StreamEnded,
+    /// A **keyed turn** finished successfully, naming itself by the `seq`
+    /// [`Space::ask`] handed back and by the post it wrote (`None` for a
+    /// decline — the turn produced no post). Emitted beside `StreamEnded`,
+    /// which says only *that* an exchange settled.
+    ///
+    /// It exists because a turn's streaming leaf is an ephemeral render key:
+    /// the moment the turn lands, the leaf is gone and the persisted response
+    /// takes its place. Anything that deferred work onto the leaf — the view's
+    /// branch selection ([`crate::space_view::SpaceView::select_turn_branch`])
+    /// — must be able to follow the turn across that swap, which needs both
+    /// halves of the identity in one event.
+    TurnEnded {
+        seq: u64,
+        response_action_id: Option<String>,
+    },
     /// A mutation or turn failed with a typed error. The view routes
     /// onboarding-degraded states (`InsufficientBalance`) off this; a failed
     /// *turn* additionally records [`Space::failed_turn`] so the notice's
@@ -892,6 +907,15 @@ impl Space {
                 cx.emit(SpaceEvent::Failed(e));
             }
         }
+        // The turn names itself on the way out: its streaming leaf no longer
+        // exists, and anything the view deferred onto that leaf has to follow
+        // the turn onto the post it wrote (`SpaceEvent::TurnEnded`). Emitted on
+        // both arms — a failed *reload* still ended the turn, and a listener
+        // that can't find the post simply drops the request.
+        cx.emit(SpaceEvent::TurnEnded {
+            seq,
+            response_action_id: result.response_action_id.clone(),
+        });
         cx.notify();
     }
 
@@ -1692,8 +1716,9 @@ impl Space {
     }
 
     /// Test-only: complete one streaming turn **successfully** — drop its stream
-    /// entry and emit `MessagesChanged` + `StreamEnded`, exactly as a real turn
-    /// runner's success arm does (minus the DB reload a stub can't perform).
+    /// entry and emit `MessagesChanged` + `StreamEnded`, as a real turn
+    /// runner's success arm does (minus the DB reload a stub can't perform,
+    /// and minus `TurnEnded`: there is no reloaded post to name).
     /// Drives the sibling-success-keeps-the-failed-turn-notice regression: a
     /// sibling of a fan-out finishing must not hide a still-recorded failed
     /// turn's recovery notice.

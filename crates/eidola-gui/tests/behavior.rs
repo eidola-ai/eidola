@@ -3482,6 +3482,65 @@ fn space_ask_selects_the_new_branch_the_reply_will_stream_in(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn space_ask_selects_the_reply_when_the_turn_lands_before_the_next_render(cx: &mut TestAppContext) {
+    // The ordering edge of the test above. Nothing sequences a render between
+    // the ask and its turn's completion: gpui draws from the platform's frame
+    // callback (`flush_effects` draws only in test builds), while a turn's
+    // completion is an ordinary foreground-task update — so a turn that lands
+    // fast (a decline, an immediate refusal, a cached answer) removes its
+    // streaming entry and puts the persisted response in its place *before*
+    // any frame runs. A selection deferred by streaming-leaf id then names a
+    // node that no longer exists and is dropped: bug 3 again, one frame later.
+    // Modelled by doing both in one update — gpui flushes effects, and only
+    // then draws, when the outermost update unwinds.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = fixture_assistant_post("a2", "the first answer");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", "the second answer");
+    a3.parent_action_id = Some("a1".into());
+    let before_tree = vec![fixture_user_post("a1", "a question"), a2.clone()];
+    let after_tree = vec![fixture_user_post("a1", "a question"), a2, a3];
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(before_tree, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-b".into(), "a1".into(), window, cx)
+        });
+        let seq = space.read(cx).streams()[0].seq;
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(seq, after_tree, false, cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&"a3".to_string()),
+        "the reply the ask started must be selected even when its turn \
+         finished before the selection could be consumed ({path:?})"
+    );
+    assert!(
+        !path.contains(&"a2".to_string()),
+        "and the branch it forked away from is left behind ({path:?})"
+    );
+}
+
+#[gpui::test]
 fn space_tail_ask_keeps_nonempty_draft_as_its_own_branch(cx: &mut TestAppContext) {
     // The tail-draft rule, non-empty half: a draft with content is kept
     // exactly as it is — it becomes its own sibling branch beside the incoming

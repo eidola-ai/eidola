@@ -1608,6 +1608,15 @@ impl SpaceView {
                 // loadable now (the Ask menus need them).
                 self.ensure_participants(cx);
             }
+            SpaceEvent::TurnEnded {
+                seq,
+                response_action_id,
+            } => {
+                // A selection deferred onto this turn's streaming leaf has to
+                // follow the turn onto the post it wrote — the leaf is already
+                // gone (see `retarget_pending_turn_select`).
+                self.retarget_pending_turn_select(*seq, response_action_id.as_deref());
+            }
             SpaceEvent::Failed(e) => {
                 self.error = Some(error_copy(e));
                 self.rebuild(cx);
@@ -1934,6 +1943,12 @@ impl Render for SpaceView {
         // A freshly-created draft / freshly-started turn selects its branch on
         // the first frame it exists in the tree (computed here against the real
         // effective tree), then settles the page where that node lives.
+        //
+        // **The request lives exactly one frame** — the `take` is unconditional,
+        // so a node that never appeared (a turn that failed, a draft retired
+        // before it rendered) can't leave a request dangling for some later
+        // frame to act on. A turn that *ended* is followed onto its post
+        // instead, before this frame runs (`retarget_pending_turn_select`).
         if let Some(pending) = self.pending_select.take()
             && model::node_ref(&tree, &pending.node).is_some()
         {
