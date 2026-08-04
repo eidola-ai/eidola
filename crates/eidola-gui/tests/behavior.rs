@@ -9828,53 +9828,87 @@ fn reactivating_with_no_windows_opens_the_door(cx: &mut TestAppContext) {
     assert_eq!(opened.get(), 1, "no window: reactivation opens one");
 }
 
-// Status item + the Regular ⇄ Accessory flip (task 17, wave 3).
+// Status item + retire-to-the-background (task 17, waves 3 and 3b).
 //
-// The policy itself is the pure `status_item::policy_for`, unit-tested in the
-// module. What only a real gpui app can answer is *when the window count is
-// what*, which is the assumption the flip's two verbs are built on — and the
-// AppKit half (NSStatusItem, setActivationPolicy:, SMAppService) is a live
-// system surface no test platform reaches.
+// The quit decision itself is the pure `status_item::quit_intent`, unit-tested
+// in the module. What only a real gpui app can answer is what retiring does to
+// the window registry — and the AppKit half (NSStatusItem,
+// setActivationPolicy:, SMAppService) is a live system surface no test
+// platform reaches.
 // ---------------------------------------------------------------------------
 
 #[gpui::test]
-fn the_close_observer_sees_the_post_close_window_count(cx: &mut TestAppContext) {
-    use eidola_gui::status_item::{ActivationPolicy, policy_for};
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    // gpui removes the window from its registry *before* firing
-    // `on_window_closed`, so the count read there is already the post-close
-    // one — which is why `window_did_close` can decide the policy from it
-    // directly. If that ever inverted, the app would go menu-bar-only one
-    // window early, hiding a window the user still had open.
+fn retiring_closes_every_window_and_leaves_the_app_standing(cx: &mut TestAppContext) {
+    // The window half of ⌘Q's retire-to-the-background. gpui drops a window
+    // as its own `update_window` unwinds, so the registry is genuinely empty
+    // when `close_all_windows` returns — and under `QuitMode::Explicit` (what
+    // macOS uses) emptying it quits nothing, which is the whole trick: the
+    // process, the stores and the loaded engines outlive the windows because
+    // nothing on the quit path ever ran.
     cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
     let stores = stub_stores_with_config(cx);
 
-    let seen: Rc<RefCell<Vec<usize>>> = Default::default();
-    let sink = seen.clone();
-    let _subscription = cx
-        .update(|cx| cx.on_window_closed(move |cx, _| sink.borrow_mut().push(cx.windows().len())));
+    open_space(cx, &stores, Some("s".into()));
+    open_space(cx, &stores, Some("s2".into()));
+    assert_eq!(cx.update(|cx| cx.windows().len()), 2);
 
-    let (first, _) = open_space(cx, &stores, Some("s".into()));
-    let (second, _) = open_space(cx, &stores, Some("s2".into()));
-    for window in [first, second] {
-        cx.update_window(window, |_, window, _| window.remove_window())
-            .unwrap();
-    }
+    cx.update(eidola_gui::lifecycle::close_all_windows);
     cx.run_until_parked();
-
     assert_eq!(
-        *seen.borrow(),
-        vec![1, 0],
-        "counts exclude the closing window"
+        cx.update(|cx| cx.windows().len()),
+        0,
+        "every window closes, synchronously"
     );
-    let policies: Vec<ActivationPolicy> =
-        seen.borrow().iter().map(|n| policy_for(*n, true)).collect();
+
+    // …and the app is still an app: the way back in opens a window again.
+    open_space(cx, &stores, Some("s3".into()));
     assert_eq!(
-        policies,
-        vec![ActivationPolicy::Regular, ActivationPolicy::Accessory],
-        "only the last window leaving drops the Dock icon"
+        cx.update(|cx| cx.windows().len()),
+        1,
+        "a retired app still opens windows"
+    );
+}
+
+#[gpui::test]
+fn retiring_from_a_windows_own_update_still_closes_that_window(cx: &mut TestAppContext) {
+    // ⌘Q arrives with a window key, and `App::dispatch_action` routes an
+    // action *through* the active window — so the Quit handler runs inside
+    // that window's `update_window`, which has taken it out of the registry.
+    // A sweep from there skips the one window the user is looking at, which
+    // on the real app meant going `Accessory` with a window still on screen
+    // and no menu bar (measured, before the defer). Both halves are pinned
+    // here: the gpui fact, and the cure.
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+    let (first, _) = open_space(cx, &stores, Some("s".into()));
+    open_space(cx, &stores, Some("s2".into()));
+
+    cx.update_window(first, |_, _, cx| {
+        assert_eq!(
+            cx.windows().len(),
+            2,
+            "the updating window is still listed — the trap is that it is not *reachable*"
+        );
+        eidola_gui::lifecycle::close_all_windows(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        1,
+        "its own `update` refuses (the slot is taken), so an undeferred sweep leaves it standing"
+    );
+
+    let (third, _) = open_space(cx, &stores, Some("s3".into()));
+    cx.update_window(third, |_, _, cx| {
+        cx.defer(eidola_gui::lifecycle::close_all_windows);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        0,
+        "deferred until the update unwinds, the sweep reaches every window"
     );
 }
 

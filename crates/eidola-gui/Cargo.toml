@@ -63,6 +63,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSButton",
     "NSCell",
     "NSControl",
+    "NSEvent",
     "NSImage",
     "NSMenu",
     "NSMenuItem",

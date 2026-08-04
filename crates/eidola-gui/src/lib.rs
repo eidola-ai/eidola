@@ -44,7 +44,8 @@ use crate::about::AboutView;
 use crate::actions::{
     About, ActualSize, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize,
     NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenParticipants, OpenRecord, OpenSettings, Quit,
-    Quote, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn, ZoomOut,
+    QuitApp, Quote, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn,
+    ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::lifecycle::LaunchOptions;
@@ -101,8 +102,10 @@ pub fn run() {
 /// this; tests do not call this — they use `tests/visual.rs` instead.
 ///
 /// **The process outlives its windows** (task 17 wave 2) — see
-/// [`crate::lifecycle`] for the seams and the per-platform rules. Quit
-/// (`⌘Q` / the menu) stays a full shutdown: engines, everything.
+/// [`crate::lifecycle`] for the seams and the per-platform rules. On macOS
+/// ⌘Q retires it to the background behind the status item rather than ending
+/// it (wave 3b, [`crate::status_item`]); the full shutdown is the status
+/// menu's own Quit.
 pub fn run_with(opts: LaunchOptions) {
     let application = gpui_platform::application()
         .with_assets(Assets)
@@ -176,8 +179,10 @@ pub fn run_with(opts: LaunchOptions) {
         // the next time one opens — no banners in chat windows.
         stores.update.read(cx).start_polling();
 
-        // Quit is a full shutdown — engines, everything (decided). On macOS
-        // this hook is the only thing that delivers it; see
+        // The *full* shutdown drains the engines — and on macOS this hook
+        // is the only thing that delivers it. ⌘Q no longer reaches it (it
+        // retires the app instead, keeping the engines up, which is the
+        // point); the status menu's Quit and a windowless SIGTERM do. See
         // `lifecycle::install_engine_shutdown`.
         lifecycle::install_engine_shutdown(&stores, bus_bridge, cx);
 
@@ -202,11 +207,11 @@ pub fn run_with(opts: LaunchOptions) {
         cx.observe(&stores.templates, |_, cx| install_menus(cx))
             .detach();
 
-        // The menu-bar face, and with it the Regular ⇄ Accessory flip (task
-        // 17 wave 3). After the action handlers, because the status menu
-        // dispatches them; before any window opens, because the flip's
-        // "Regular" half rides `base_window_options`. A windowless macOS
-        // launch gets one too — that is exactly the toolbar-app shape.
+        // The menu-bar face — and, because it exists, the thing ⌘Q retires
+        // *into* (task 17 waves 3/3b). After the action handlers, because
+        // the status menu dispatches them; before any window opens, because
+        // `base_window_options` asks it to assert `Regular`. A windowless
+        // macOS launch gets one too — that is exactly the toolbar-app shape.
         status_item::install(&stores, opts, cx);
 
         // Windowless: the process *is* the app — no window at launch, no
@@ -504,7 +509,16 @@ pub fn install_keybindings(cx: &mut App) {
 }
 
 fn install_action_handlers(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx: &mut App| {
+    // ⌘Q is now two-tier (task 17 wave 3b). Where a background layer exists —
+    // macOS with a status item standing — it retires into it: windows close,
+    // the Dock indicator goes, the process and its loaded engines stay. Where
+    // one does not (no status item; every non-macOS build, whose background
+    // layer is the systemd user service, not a tray), it is the full shutdown
+    // it has always been. Ending the process deliberately is `QuitApp`, which
+    // the status menu's "Quit Eidola" raises.
+    cx.on_action(|_: &Quit, cx: &mut App| status_item::quit_or_retire(cx));
+
+    cx.on_action(|_: &QuitApp, cx: &mut App| {
         cx.quit();
     });
 
@@ -769,12 +783,13 @@ fn centered_window_bounds(cx: &mut App, w: f32, h: f32) -> Option<WindowBounds> 
 /// with the app's identity and icon).
 ///
 /// **It is also the one choke point every window open passes through**, and
-/// therefore where the macOS activation policy flips back to `Regular`
-/// (`status_item::window_will_open`) — an `Accessory` app has no menu bar, so
-/// a window opened without the flip would appear under someone else's. Taking
-/// `cx` for a side effect is deliberate: putting the call here rather than in
-/// each `open_*_window` makes "open a window without becoming Regular"
-/// unrepresentable.
+/// therefore the single door out of the retired-to-the-background state
+/// (`status_item::window_will_open`, which asserts `Regular`) — an
+/// `Accessory` app has no menu bar, so a window opened without it would
+/// appear under someone else's. Taking `cx` for a side effect is deliberate:
+/// putting the call here rather than in each `open_*_window` makes "open a
+/// window while `Accessory`" unrepresentable, and it covers every reopen path
+/// at once (the status menu, Spotlight, `open -a`, `on_reopen`).
 fn base_window_options(
     cx: &mut App,
     bounds: Option<WindowBounds>,

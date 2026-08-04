@@ -32,12 +32,12 @@ use objc2::rc::Retained;
 use objc2::runtime::{ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
-    NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSEventModifierFlags, NSImage, NSMenu,
+    NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
 
-use super::{ActivationPolicy, StatusCommand, StatusRow, menu_rows, policy_for};
+use super::{ActivationPolicy, QuitIntent, StatusCommand, StatusRow, menu_rows, quit_intent};
 use crate::lifecycle::LaunchOptions;
 use crate::stores::Stores;
 
@@ -131,18 +131,19 @@ pub fn install(stores: &Stores, opts: LaunchOptions, cx: &mut App) {
     )));
     let Some((item, target)) = build(rows.clone(), cx, mtm) else {
         // No door was built, so none is claimed: without the global,
-        // `policy_for` sees `status_item_present = false` and the app stays
-        // `Regular` for the session — the wave-2 shape, which is a perfectly
-        // good app. This early return is the whole reason the flip's promise
-        // holds by construction rather than by AppKit trivia.
+        // `quit_or_retire` sees `status_item_present = false` and ⌘Q stays
+        // the full shutdown it has always been — the wave-2 shape, which is
+        // a perfectly good app. This early return is the whole reason the
+        // safety gate holds by construction rather than by AppKit trivia.
         return;
     };
 
     cx.set_global(StatusItemGlobal {
         _item: item,
         _target: target,
-        // Not the real policy yet — `apply` below is what asserts it, and it
-        // compares against this to decide whether to speak to AppKit at all.
+        // A bundled app launches Regular, and wave 3b keeps it there for as
+        // long as the app is "open" — however many windows it has. Only ⌘Q
+        // moves this.
         applied: ActivationPolicy::Regular,
     });
 
@@ -153,28 +154,27 @@ pub fn install(stores: &Stores, opts: LaunchOptions, cx: &mut App) {
     })
     .detach();
 
-    // The other half of the flip: gpui removes the window from its registry
-    // *before* firing this, so the count is already the post-close one.
-    cx.on_window_closed(|cx, _| window_did_close(cx)).detach();
-
-    // A windowed launch is about to open its first window — declaring that
-    // here rather than settling at zero avoids a visible Dock-icon flicker
-    // (the onboarding branch opens its window a spawned read later, which is
-    // long enough for an Accessory→Regular round trip to be seen).
-    apply(policy_for(usize::from(!opts.windowless), true), cx);
+    // A `--windowless` macOS launch *is* the background state: it opens no
+    // window, so there is nothing for a Dock icon to point at. Starting
+    // retired also makes its ⌘Q (from the status menu) a full shutdown,
+    // which is what a service-shaped process should answer.
+    if opts.windowless {
+        apply(ActivationPolicy::Accessory, cx);
+    }
 }
 
 /// Build the status item and its menu, or hand back `None` if what came out
 /// would not be a door the user can find.
 ///
-/// **A status item nobody can see is worse than no status item**, because the
-/// Accessory flip is gated on this returning `Some`. Two checks, both real:
+/// **A status item nobody can see is worse than no status item**, because
+/// ⌘Q's retire-to-the-background is gated on this returning `Some`. Two
+/// checks, both real:
 ///
 /// - **`button` is `None`** when the item was made with the deprecated custom
 ///   `view` property. We never call `setView:`, so this is not reachable on
 ///   today's path (measured: `button=true` on a live launch) — it is here so
-///   that a later change which *does* reach it degrades to Regular instead of
-///   silently making the app invisible.
+///   that a later change which *does* reach it degrades to a plain full quit
+///   instead of silently making the app invisible.
 /// - **`isVisible` is false** when the user has previously hidden the item.
 ///   Visibility is persisted under the autosave name, which is exactly what
 ///   makes this live rather than dead: today `behavior` stays at its default
@@ -185,9 +185,9 @@ pub fn install(stores: &Stores, opts: LaunchOptions, cx: &mut App) {
 /// **The residual, accepted and undetectable:** a menu bar with no room does
 /// not draw the item, and AppKit reports nothing — `isVisible` stays true
 /// (measured, at creation and three seconds later). It is not permanent (the
-/// item reappears as other items go away) and it does not strand the app:
-/// Spotlight / `open -a Eidola` / Finder reach the running process and
-/// `lifecycle::reactivate` opens a window, which flips it back to Regular
+/// item reappears as other items go away) and it does not strand a retired
+/// app: Spotlight / `open -a Eidola` / Finder reach the running process and
+/// `lifecycle::reactivate` opens a window, which puts it back to Regular
 /// (measured: an Accessory, window-less instance went to `Foreground` on
 /// `open -a`, same pid). So the failure mode is "hard to see", not
 /// "unquittable".
@@ -236,18 +236,38 @@ fn build(
 }
 
 pub fn window_will_open(cx: &mut App) {
-    if !cx.has_global::<StatusItemGlobal>() {
-        return;
-    }
-    // The window being opened is not in `cx.windows()` yet; count it.
-    apply(policy_for(cx.windows().len() + 1, true), cx);
+    apply(ActivationPolicy::Regular, cx);
 }
 
-pub fn window_did_close(cx: &mut App) {
-    if !cx.has_global::<StatusItemGlobal>() {
-        return;
+/// ⌘Q. Either park the app behind its status item, or end it.
+///
+/// **Retiring must not run the quit path at all** — no `cx.quit()`, so
+/// `on_app_quit` never fires and `lifecycle::install_engine_shutdown` never
+/// drains the engines. Keeping them loaded is the entire point of the
+/// background state; the bus bridge and the stores keep running with them, so
+/// the status menu's engine lines stay live while the app has no face.
+pub fn quit_or_retire(cx: &mut App) {
+    let present = cx.has_global::<StatusItemGlobal>();
+    let retired = cx
+        .try_global::<StatusItemGlobal>()
+        .is_some_and(|g| g.applied == ActivationPolicy::Accessory);
+    match quit_intent(present, retired) {
+        QuitIntent::FullShutdown => cx.quit(),
+        // **Deferred, and that is load-bearing.** ⌘Q arrives with a window
+        // key, and `App::dispatch_action` routes an action through the active
+        // window — so this handler runs *inside* that window's
+        // `update_window`, which holds its registry slot. The window is still
+        // listed but no longer updatable, so closing "every window" from here
+        // silently skips the one the user is looking at: measured against the
+        // live bundle, the app went `Accessory` with its window still on
+        // screen and no menu bar. `defer` runs the pair once the window update
+        // has unwound, and keeps the order that matters — windows first, then
+        // the policy over a bare process.
+        QuitIntent::Retire => cx.defer(|cx| {
+            crate::lifecycle::close_all_windows(cx);
+            apply(ActivationPolicy::Accessory, cx);
+        }),
     }
-    apply(policy_for(cx.windows().len(), true), cx);
 }
 
 /// Hand a policy to AppKit, if it isn't already the one in force.
@@ -279,14 +299,18 @@ fn apply(policy: ActivationPolicy, cx: &mut App) {
 }
 
 /// Route a status-menu command onto the path that already exists for it —
-/// the menu is a second door, never a second implementation. Quit in
-/// particular dispatches the very action ⌘Q does, so wave 2's engine
-/// teardown runs.
+/// the menu is a second door, never a second implementation.
+///
+/// **Quit is the one command that does not share the app's ⌘Q**, and that is
+/// the wave-3b decision rather than an oversight: `actions::Quit` now retires
+/// to the background, so the status menu dispatches `actions::QuitApp`, the
+/// full shutdown. Both are ordinary actions, so wave 2's `on_app_quit` engine
+/// teardown still runs from exactly one place.
 fn dispatch(command: StatusCommand, cx: &mut App) {
     match command {
         StatusCommand::Open => crate::reactivate_app(cx),
         StatusCommand::NewSpace => cx.dispatch_action(&crate::actions::NewSpace),
-        StatusCommand::Quit => cx.dispatch_action(&crate::actions::Quit),
+        StatusCommand::Quit => cx.dispatch_action(&crate::actions::QuitApp),
     }
 }
 
@@ -297,7 +321,12 @@ fn rebuild(menu: &NSMenu, rows: &[StatusRow], target: &Target, mtm: MainThreadMa
         let item = match row {
             StatusRow::Separator => NSMenuItem::separatorItem(mtm),
             StatusRow::Info(text) => {
-                let item = new_item(&NSString::from_str(text), None, mtm);
+                let item = new_item(
+                    &NSString::from_str(text),
+                    None,
+                    &NSString::from_str(""),
+                    mtm,
+                );
                 item.setEnabled(false);
                 item
             }
@@ -305,8 +334,14 @@ fn rebuild(menu: &NSMenu, rows: &[StatusRow], target: &Target, mtm: MainThreadMa
                 let item = new_item(
                     &NSString::from_str(command.title()),
                     Some(sel!(eidolaStatusMenuCommand:)),
+                    &NSString::from_str(command.key_equivalent()),
                     mtm,
                 );
+                // ⌘ is AppKit's default mask, but the default is not the
+                // contract — Quit's ⌘Q is load-bearing (it is what "⌘Q while
+                // the toolbar app has focus" resolves against), so it is
+                // stated.
+                item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
                 item.setTag(command.tag());
                 // SAFETY: the target outlives the menu (both are owned by
                 // `StatusItemGlobal`, which lives for the process).
@@ -319,7 +354,12 @@ fn rebuild(menu: &NSMenu, rows: &[StatusRow], target: &Target, mtm: MainThreadMa
     }
 }
 
-fn new_item(title: &NSString, action: Option<Sel>, mtm: MainThreadMarker) -> Retained<NSMenuItem> {
+fn new_item(
+    title: &NSString,
+    action: Option<Sel>,
+    key_equivalent: &NSString,
+    mtm: MainThreadMarker,
+) -> Retained<NSMenuItem> {
     // SAFETY: a plain designated initializer; the selector (when given) is
     // implemented by `Target`, which is the only object we ever target.
     unsafe {
@@ -327,7 +367,7 @@ fn new_item(title: &NSString, action: Option<Sel>, mtm: MainThreadMarker) -> Ret
             NSMenuItem::alloc(mtm),
             title,
             action,
-            &NSString::from_str(""),
+            key_equivalent,
         )
     }
 }
