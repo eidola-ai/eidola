@@ -583,6 +583,9 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 hardware_intermediate_ca.as_deref(),
                 "hardware_intermediate_ca",
             )?;
+            if let Some(url) = attestation_url.as_deref() {
+                config::validate_attestation_url(url)?;
+            }
             let trust_entry = match trust_measurement.as_deref() {
                 Some(spec) => Some(config::parse_trust_measurement(spec)?),
                 None => None,

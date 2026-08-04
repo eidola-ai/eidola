@@ -6483,8 +6483,9 @@ impl AppCore {
     /// empty string as the endpoint. That is a client broken at every
     /// handshake by a setter that returned success.
     pub fn set_attestation_url(&self, url: String) -> Result<(), AppError> {
+        config::validate_attestation_url(&url)?;
         let mut cfg = self.inner.load_config();
-        cfg.attestation_url = Some(url).filter(|u| !u.trim().is_empty());
+        cfg.attestation_url = Some(url.trim().to_string()).filter(|u| !u.is_empty());
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
         Ok(())
