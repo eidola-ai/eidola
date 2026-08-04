@@ -244,7 +244,7 @@ impl SpaceView {
             cx.notify();
             return;
         }
-        let window_h = crate::chrome::content_size(window).height.as_f32().max(1.0);
+        let window_h = self.page_size(window).height.as_f32().max(1.0);
         self.page_glide.set(Some(PageGlide {
             from_y,
             to_y: y,

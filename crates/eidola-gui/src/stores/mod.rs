@@ -26,6 +26,7 @@ pub mod local_models;
 pub mod models;
 pub mod participants;
 pub mod record;
+pub mod space_settings;
 pub mod spaces;
 pub mod templates;
 pub mod update;
@@ -45,6 +46,7 @@ pub use local_models::LocalModelsStore;
 pub use models::{BackendCatalog, ModelsStore};
 pub use participants::ParticipantsStore;
 pub use record::RecordStore;
+pub use space_settings::SpaceSettingsStore;
 pub use spaces::SpacesStore;
 pub use templates::TemplatesStore;
 pub use update::UpdateStore;
@@ -76,6 +78,9 @@ pub struct Stores {
     /// The space-template registry (the Space Templates settings pane);
     /// refreshed on `Change::Templates`.
     pub templates: Entity<TemplatesStore>,
+    /// Per-space settings (cascade limit, router model) — the space
+    /// inspector's data source; refreshed on `Change::Space`.
+    pub space_settings: Entity<SpaceSettingsStore>,
     /// Bus-relay only — owns no rows. Record listings live in window-scoped
     /// reader entities (`RecordView`), which observe this store to learn
     /// that the local trail grew (see `stores/record.rs`).
@@ -138,6 +143,7 @@ impl Stores {
         let update = cx.new(|_| UpdateStore::stub(fixture.update_check, fixture.update_checking));
         let participants = cx.new(|_| ParticipantsStore::stub(fixture.participants));
         let templates = cx.new(|_| TemplatesStore::stub(fixture.templates));
+        let space_settings = cx.new(|_| SpaceSettingsStore::stub(fixture.space_settings));
         let record = cx.new(|_| RecordStore::new());
         Self {
             app_core: None,
@@ -151,6 +157,7 @@ impl Stores {
             update,
             participants,
             templates,
+            space_settings,
             record,
         }
     }
@@ -174,6 +181,7 @@ impl Stores {
         let update = cx.new(|_| UpdateStore::new(app_core.clone()));
         let participants = cx.new(|_| ParticipantsStore::new(app_core.clone()));
         let templates = cx.new(|_| TemplatesStore::new(app_core.clone()));
+        let space_settings = cx.new(|_| SpaceSettingsStore::new(app_core.clone()));
         let record = cx.new(|_| RecordStore::new());
         Self {
             app_core,
@@ -187,6 +195,7 @@ impl Stores {
             update,
             participants,
             templates,
+            space_settings,
             record,
         }
     }
@@ -229,6 +238,8 @@ pub struct StoresStub {
     pub participants: Option<(String, Vec<eidola_app_core::ParticipantInfo>)>,
     /// Fixture space templates (the Space Templates settings pane's scene).
     pub templates: Vec<eidola_app_core::SpaceTemplateInfo>,
+    /// One space's fixture settings (the space inspector's scene).
+    pub space_settings: Option<(String, eidola_app_core::SpaceSettings)>,
 }
 
 /// Install the single app-lifetime bus bridge: a task on `AppCore`'s tokio
@@ -379,10 +390,19 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
         // process) is routed to the live registered `Space` entity, which
         // refreshes its own transcript. The listing-level signal is
         // `SpaceIndex` (above).
+        // A per-space message change (e.g. a CLI write to the same space, in
+        // process) is routed to the live registered `Space` entity, which
+        // refreshes its own transcript. The same signal carries a space's own
+        // settings (cascade limit / router model), so an open inspector — and
+        // only an open one, since the store re-reads just what it has cached —
+        // re-reads them too.
         Change::Space(id) => {
             stores
                 .spaces
                 .update(cx, |s, cx| s.notify_space_changed(&id, cx));
+            stores
+                .space_settings
+                .update(cx, |s, cx| s.refresh_if_cached(&id, cx));
         }
         // Record listings are window-scoped reader entities; no global store
         // owns their rows. The RecordStore is the bus seam those readers
@@ -453,6 +473,7 @@ fn refresh_everything(stores: &Stores, cx: &mut App) {
     stores.update.update(cx, |s, cx| s.refresh(cx));
     stores.templates.update(cx, |s, cx| s.refresh(cx));
     stores.participants.update(cx, |s, cx| s.refresh_all(cx));
+    stores.space_settings.update(cx, |s, cx| s.refresh_all(cx));
     // A dropped change may have been a Record write — let open Record
     // windows mark themselves stale.
     stores.record.update(cx, |s, cx| s.notify_changed(cx));

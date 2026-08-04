@@ -79,11 +79,18 @@ actions!(
         Minimize,
         /// Zoom the focused window (macOS Window menu standard).
         Zoom,
-        /// Toggle the gpui element inspector on the focused window. Bound to
-        /// ⌘⌥I. Requires the `inspector` feature on `gpui` (enabled in
-        /// `Cargo.toml`); the rich element/style editor UI comes from
-        /// `gpui-component`'s inspector renderer, also feature-gated.
+        /// Show or hide the focused space window's **inspector** — the
+        /// per-space settings panel that splits the window (task 26). Space
+        /// menu; ⌥⌘I (the Xcode/Finder convention). Registered per-`SpaceView`
+        /// like `CloseWindow`, so macOS greys it when no space window is open;
+        /// the space itself carries no visual toggle by design.
         ToggleInspector,
+        /// Toggle **gpui's element inspector** — the development overlay, not
+        /// the product's. Bound to ⌥⇧⌘I (it gave up ⌥⌘I to the space
+        /// inspector above). Requires the `inspector` feature on `gpui`
+        /// (enabled in `Cargo.toml`); the rich element/style editor UI comes
+        /// from `gpui-component`'s inspector renderer, also feature-gated.
+        ToggleElementInspector,
         /// **Post** the composer's draft — the common gesture. The space's
         /// participants decide who responds (notify policies drive one
         /// streaming turn per responder). The composer's ⌘↩ reaches this via
@@ -111,6 +118,15 @@ pub(crate) fn primary_chord(key: &str) -> String {
         format!("⌘{key}")
     } else {
         format!("Ctrl+{key}")
+    }
+}
+
+/// The primary+alt chord label: ⌥⌘I on macOS, Ctrl+Alt+I elsewhere.
+pub(crate) fn primary_alt_chord(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⌥⌘{key}")
+    } else {
+        format!("Ctrl+Alt+{key}")
     }
 }
 

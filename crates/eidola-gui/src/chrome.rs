@@ -610,8 +610,8 @@ impl ChromeRoot {
     fn render_menu_panel(&self, _window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         use crate::actions::{
             About, ActualSize, CheckForUpdates, NewSpace, NewSpaceFromTemplate, OpenLibrary,
-            OpenParticipants, OpenRecord, OpenSettings, Quit, Quote, QuoteInReply, ZoomIn, ZoomOut,
-            primary_chord, primary_shift_chord,
+            OpenParticipants, OpenRecord, OpenSettings, Quit, Quote, QuoteInReply, ToggleInspector,
+            ZoomIn, ZoomOut, primary_alt_chord, primary_chord, primary_shift_chord,
         };
         let theme = cx.theme();
 
@@ -680,6 +680,16 @@ impl ChromeRoot {
                 "Participants…",
                 None,
                 |w, cx| w.dispatch_action(Box::new(OpenParticipants), cx),
+                cx,
+            ))
+            // The space inspector's other door (the space itself carries no
+            // visual toggle) — a no-op without a focused space window, like
+            // Participants… above.
+            .child(menu_item(
+                "inspector",
+                "Show/Hide Inspector",
+                Some(primary_alt_chord("I")),
+                |w, cx| w.dispatch_action(Box::new(ToggleInspector), cx),
                 cx,
             ))
             // The selection-scoped verbs (the macOS "Edit" menu's quote pair).
