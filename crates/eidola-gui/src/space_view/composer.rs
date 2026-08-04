@@ -619,8 +619,7 @@ impl SpaceView {
         let total = self.selected_total_height(roots, page_width, window_h);
         let doc = self.doc_reserve() + total;
         let y = (window_h.as_f32() - doc).min(0.0);
-        let off = self.page_scroll.offset();
-        self.page_scroll.set_offset(point(off.x, px(y)));
+        self.set_page_scroll_y(y);
     }
 
     /// Dock the active draft at its "home": its slot top around 40% of the
@@ -632,8 +631,7 @@ impl SpaceView {
         window_h: gpui::Pixels,
     ) {
         let y = self.dock_active_draft_y(roots, page_width, window_h);
-        let off = self.page_scroll.offset();
-        self.page_scroll.set_offset(point(off.x, px(y)));
+        self.set_page_scroll_y(y);
     }
 
     /// The page scroll `y` [`Self::dock_active_draft`] rests at.
@@ -2023,8 +2021,7 @@ fn caret_into_view(
                     // `next` (gpui-clamped) or a cross-frame content read (lags).
                     this.docked_caret_slot_offset.set(caret_doc_bot - caret_bot);
                     if (next - cur).abs() > 0.5 {
-                        let off = this.page_scroll.offset();
-                        this.page_scroll.set_offset(point(off.x, px(next)));
+                        this.set_page_scroll_y(next);
                         true
                     } else {
                         false

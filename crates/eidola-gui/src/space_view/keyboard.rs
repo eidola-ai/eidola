@@ -508,7 +508,7 @@ impl SpaceView {
             self.scroll_min_y.get(),
             REVEAL_MARGIN,
         );
-        self.page_scroll.set_offset(gpui::point(off.x, gpui::px(y)));
+        self.set_page_scroll_y(y);
     }
 
     /// Enter: descend one level. From the tree level, focus the focused post's

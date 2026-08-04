@@ -4898,6 +4898,61 @@ fn space_streaming_tail_follows_when_parked_at_the_end(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+fn space_streaming_tail_yields_to_a_navigation_glide(cx: &mut TestAppContext) {
+    // A reader parked at the tail who asks to be taken somewhere is on their
+    // way — the glide owns the page until it lands. Following and the glide are
+    // the only two motions that span frames, and both write the offset every
+    // frame (each delta moves "the end"), so without the stand-down the
+    // follower takes the page straight back — through the very seam that lets
+    // an instant scroll retire a glide, on the first frame after the
+    // navigation.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let seq = seed_streaming_tall_space(&view, window, cx);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+    let end = view.read_with(&vcx, |v, _| v.scroll_min_y_for_test());
+
+    // Taken to the top of the conversation, mid-stream.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.navigate_to_action("a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.page_glide_target_for_test())
+            .is_some(),
+        "the navigation armed a glide"
+    );
+    view.update(&mut vcx, |v, _| v.drive_page_glide_for_test(0.4));
+    let mid = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    // The reply keeps coming while the reader travels.
+    space.update(&mut vcx, |s, cx| {
+        s.push_content_delta_for_test(seq, &"streamed answer line\n".repeat(60), cx)
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let grown = v.scroll_min_y_for_test();
+        assert!(
+            grown < end - 1.0,
+            "the streamed reply grew the document ({end} -> {grown})"
+        );
+        assert!(
+            (v.page_scroll_offset_y_for_test() - mid).abs() < 2.0,
+            "the traveling reader is not dragged back to the tail (offset {}, \
+             on the glide at {mid}, new end {grown})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
 fn space_streaming_tail_does_not_yank_a_reader_who_scrolled_away(cx: &mut TestAppContext) {
     // The other half of the contract: a reader who has scrolled back up to
     // re-read something must be left exactly where they are, however much the
@@ -7884,6 +7939,72 @@ fn space_navigation_glides_to_its_destination_instead_of_jumping(cx: &mut TestAp
             v.page_scroll_offset_y_for_test()
         );
     });
+}
+
+#[gpui::test]
+fn space_keyboard_navigation_takes_the_page_from_a_glide_in_flight(cx: &mut TestAppContext) {
+    // A glide owns `page_scroll` until something else takes it. The wheel and
+    // the minimap say so (`note_scroll_activity` / `minimap_press`); the
+    // *programmatic instant* scrolls did not, so a keyboard move (or a caret
+    // reveal, or a post settling) wrote an offset the glide's next frame
+    // overwrote from its own trajectory — the reader's own navigation undone,
+    // repeatedly, until the glide landed.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2], cx)
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+    let from = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    // Taken to the top of the conversation — a glide, in flight.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.navigate_to_action("a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    let target = view
+        .read_with(&vcx, |v, _| v.page_glide_target_for_test())
+        .expect("navigating arms a glide");
+
+    // Mid-flight the reader navigates themselves: arrow into the conversation,
+    // which reveals the focused post instantly.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    let after = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    assert!(
+        (after - from).abs() > 1.0,
+        "the keyboard reveal moved the page ({from} -> {after})"
+    );
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "an instant scroll takes the page from the glide, rather than \
+             leaving it to be overwritten (destination {target})"
+        );
+    });
+
+    // And the frame that would have continued the glide moves nothing.
+    view.update(&mut vcx, |v, _| v.drive_page_glide_for_test(0.5));
+    let settled = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    assert!(
+        (settled - after).abs() < 1.0,
+        "the reader stays where their own navigation put them (offset \
+         {settled}, expected {after}; the abandoned glide ran from {from} to \
+         {target})"
+    );
 }
 
 #[gpui::test]
