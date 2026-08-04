@@ -88,11 +88,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # that this deliberately does not is interpolate `${VAR}` — reimplementing
 # that is reimplementing compose — so a value containing `${` warns and is
 # passed through literally, where the caller's validation rejects it loudly.
+#
+# **Exit status reports presence, stdout reports the value** — `KEY=` in
+# `.env` is *set to empty* for compose (it renders `""`, where an absent key
+# renders `null` and never reaches the container), so a caller cannot infer
+# "not present" from an empty string.
 dotenv_get() {
     local key="$1" line
-    [ -f .env ] || return 0
+    [ -f .env ] || return 1
     line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" .env | tail -n 1 || true)"
-    [ -n "$line" ] || return 0
+    [ -n "$line" ] || return 1
     line="${line#*=}"
     line="${line%$'\r'}"                       # tolerate CRLF
     line="${line#"${line%%[![:space:]]*}"}"    # trim leading space
@@ -111,10 +116,37 @@ dotenv_get() {
 }
 
 # Environment, then `.env`, then the built-in default.
+#
+# **Set-but-empty is set.** `DEV_MEASUREMENT= just dev` makes compose pass the
+# empty value to the shim rather than fall back to `.env` (verified against
+# `docker compose config`: the export renders `""`), so treating empty as
+# "unset" here would hand the client a `.env` measurement the shim never
+# advertises — the exact divergence reading `.env` exists to prevent. An empty
+# value therefore survives to the caller, where `enable` refuses it by name
+# instead of silently substituting something else.
 setting() {
-    local name="$1" default="$2" value="${!1:-}"
-    [ -n "$value" ] || value="$(dotenv_get "$name")"
-    printf '%s' "${value:-$default}"
+    local name="$1" default="$2" value
+    if [ -n "${!1+x}" ]; then # exported, even if empty
+        value="${!1}"
+    elif value="$(dotenv_get "$name")"; then # present in .env, even if empty
+        :
+    else
+        value="$default"
+    fi
+    printf '%s' "$value"
+}
+
+# Refuse a setting that resolved to empty. Only `enable` calls this: a broken
+# environment must never stop `disable` from putting the client back on the
+# pin.
+require_nonempty_setting() {
+    [ -n "$2" ] && return 0
+    echo "ERROR: $1 resolved to an empty value." >&2
+    echo "       An exported-but-empty variable (or a bare \`$1=\` in .env)" >&2
+    echo "       wins over the fallbacks — the same precedence compose uses," >&2
+    echo "       which is why it is not silently replaced here. Unset it to" >&2
+    echo "       fall back to .env or the built-in default." >&2
+    exit 1
 }
 
 CERT_DIR="$(setting EIDOLA_DEV_CERT_DIR .dev-certs)"
@@ -159,6 +191,51 @@ platform() {
 # `verify-cert`, which evaluates this cert against the store. On Linux the
 # installed file is a verbatim copy of the source, so comparing bytes is the
 # equivalent question (and needs no openssl).
+# The subject CN the shim gives its TLS root — the only handle on an
+# *installed* copy once the file that produced it is gone.
+TLS_CA_CN="Local Dev TLS Root"
+
+# Is a dev TLS root of ours installed in the machine's trust store at all,
+# whatever `.dev-certs/` currently holds? Prints `current`, `stale`, `none`,
+# or `unknown`.
+#
+# `ca_trust_state` answers a different question — "is *this* cert trusted",
+# which is what `enable` needs. Removal guidance must not key on that: rotate
+# `.dev-certs/` (or point `EIDOLA_DEV_CERT_DIR` elsewhere) and the current
+# cert reads untrusted while the *previous* root stays installed and trusted
+# machine-wide, so the advice to remove it would be suppressed exactly when
+# it matters most.
+installed_dev_root() {
+    case "$(platform)" in
+        Darwin)
+            # Read-only lookup by subject CN; finds the installed copy even
+            # when the file it came from is gone.
+            if security find-certificate -a -c "$TLS_CA_CN" \
+                /Library/Keychains/System.keychain >/dev/null 2>&1; then
+                if [ "$(ca_trust_state)" = "trusted" ]; then
+                    echo "current"
+                else
+                    echo "stale"
+                fi
+            else
+                echo "none"
+            fi
+            ;;
+        Linux)
+            if [ -f "$LINUX_CA_PATH" ]; then
+                if [ -f "$TLS_CA" ] && cmp -s "$TLS_CA" "$LINUX_CA_PATH"; then
+                    echo "current"
+                else
+                    echo "stale"
+                fi
+            else
+                echo "none"
+            fi
+            ;;
+        *) echo "unknown" ;;
+    esac
+}
+
 ca_trust_state() {
     if [ ! -f "$TLS_CA" ]; then
         echo "unknown"
@@ -201,12 +278,14 @@ trust_ca_note() {
         Darwin)
             echo ""
             echo "    sudo security add-trusted-cert -d -r trustRoot \\"
-            echo "        -k /Library/Keychains/System.keychain $TLS_CA"
+            # `%q` so a cert dir with spaces stays copy-pasteable.
+            printf '        -k /Library/Keychains/System.keychain %s\n' "$(printf '%q' "$TLS_CA")"
             echo ""
             ;;
         Linux)
             echo ""
-            echo "    sudo cp $TLS_CA $LINUX_CA_PATH && sudo update-ca-certificates"
+            printf '    sudo cp %s %s && sudo update-ca-certificates\n' \
+                "$(printf '%q' "$TLS_CA")" "$(printf '%q' "$LINUX_CA_PATH")"
             echo ""
             ;;
         *)
@@ -232,24 +311,43 @@ trust_ca_note() {
 }
 
 untrust_ca_note() {
-    if [ "$(ca_trust_state)" != "trusted" ]; then
-        return
+    local installed
+    installed="$(installed_dev_root)"
+    case "$installed" in
+        current | stale) ;;
+        *) return ;;
+    esac
+
+    echo "==> A mock TLS root of ours is still installed on this machine."
+    if [ "$installed" = "stale" ]; then
+        echo "    It is NOT the cert in $CERT_DIR — the certs rotated (or that"
+        echo "    directory changed) and an older root is what stayed trusted."
     fi
-    echo "==> The mock TLS root is still trusted by this machine."
-    echo "    Worth removing when you are done with local dev: its private key"
-    echo "    sits in $CERT_DIR, and whoever can read that key can mint a"
-    echo "    certificate for ANY host this machine will then accept. The shim"
-    echo "    keeps the key owner-only, but the trust itself is machine-wide"
-    echo "    and outlives the stack. To remove it:"
+    echo "    Worth removing when you are done with local dev: whoever can read"
+    echo "    the matching private key can mint a certificate for ANY host this"
+    echo "    machine will then accept. The shim keeps its keys owner-only, but"
+    echo "    the trust itself is machine-wide and outlives the stack."
+    echo "    To remove it:"
     case "$(platform)" in
         Darwin)
             echo ""
-            echo "    sudo security remove-trusted-cert -d $TLS_CA"
+            if [ "$installed" = "current" ]; then
+                printf '    sudo security remove-trusted-cert -d %s\n' "$(printf '%q' "$TLS_CA")"
+            else
+                # The file that produced the installed root is gone, and
+                # `remove-trusted-cert` takes a cert file — so name it in the
+                # keychain instead. (Printed, never run, like every sudo line
+                # here.)
+                printf '    sudo security delete-certificate -c %s -t /Library/Keychains/System.keychain\n' \
+                    "$(printf '%q' "$TLS_CA_CN")"
+                echo "    (or Keychain Access → System → search \"$TLS_CA_CN\")"
+            fi
             echo ""
             ;;
         Linux)
             echo ""
-            echo "    sudo rm $LINUX_CA_PATH && sudo update-ca-certificates --fresh"
+            printf '    sudo rm %s && sudo update-ca-certificates --fresh\n' \
+                "$(printf '%q' "$LINUX_CA_PATH")"
             echo ""
             ;;
     esac
@@ -404,6 +502,9 @@ warn_if_shim_down() {
 }
 
 cmd_enable() {
+    require_nonempty_setting EIDOLA_DEV_CERT_DIR "$CERT_DIR"
+    require_nonempty_setting EIDOLA_DEV_BASE_URL "$BASE_URL"
+    require_nonempty_setting DEV_MEASUREMENT "$MEASUREMENT"
     require_certs
     # Belt-and-braces over the CLI's own parse-before-write validation: the
     # measurement can now arrive from `.env`, and naming the source beats a
