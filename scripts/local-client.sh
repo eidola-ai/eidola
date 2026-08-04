@@ -191,7 +191,11 @@ trust_ca_note() {
         return
     fi
     echo "==> Mock TLS root is NOT trusted by this machine ($state)."
-    echo "    Run this once by hand (it needs sudo and changes the system trust store):"
+    echo "    Run this once by hand (it needs sudo and changes the system trust"
+    echo "    store). Note what you are agreeing to: this root's private key is a"
+    echo "    file in $CERT_DIR, and trusting it machine-wide means anyone who"
+    echo "    can read that file can mint a certificate this machine accepts for"
+    echo "    any host. \`just client-reset\` prints the command to undo it."
     case "$(platform)" in
         Darwin)
             echo ""
@@ -231,8 +235,11 @@ untrust_ca_note() {
         return
     fi
     echo "==> The mock TLS root is still trusted by this machine."
-    echo "    Leaving it in place is harmless (it only signs the local shim's"
-    echo "    certificate), but to remove it:"
+    echo "    Worth removing when you are done with local dev: its private key"
+    echo "    sits in $CERT_DIR, and whoever can read that key can mint a"
+    echo "    certificate for ANY host this machine will then accept. The shim"
+    echo "    keeps the key owner-only, but the trust itself is machine-wide"
+    echo "    and outlives the stack. To remove it:"
     case "$(platform)" in
         Darwin)
             echo ""
