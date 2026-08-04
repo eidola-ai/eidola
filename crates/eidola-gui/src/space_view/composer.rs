@@ -553,10 +553,11 @@ impl SpaceView {
     ///
     /// - **A pending selection** (an ask/retry whose turn landed before any
     ///   frame consumed the request — see [`Self::select_turn_branch`]): the
-    ///   reader has not been taken anywhere yet, so the settle stands
-    ///   (`BranchEnd`). Without this the new branch stayed unselected — the
-    ///   very failure the deferral exists to prevent (task 46, bug 3), one
-    ///   frame later.
+    ///   reader has not been taken anywhere yet, so it settles at the end of
+    ///   the branch (`BranchEnd`, which is the end of what was *written* there
+    ///   — see [`Self::scroll_to_branch_end`]). Without this the new branch
+    ///   stayed unselected — the very failure the deferral exists to prevent
+    ///   (task 46, bug 3), one frame later.
     /// - **A reader parked on the leaf** (`selected_turn`, what the last frame
     ///   observed): branch selection is *positional* — a strip's scroll offset
     ///   resolved to a child index — and a turn's persisted response is
@@ -567,33 +568,41 @@ impl SpaceView {
     ///   fixes the index; the page must not move (`Stay`) — the reader is
     ///   already where they want to be.
     ///
+    /// **The parked case yields to a pending request for anything else**, which
+    /// is the newest-intent rule: a pending selection is an ask (or a fork
+    /// draft) the reader made *after* the turn now landing, and following the
+    /// older turn would quietly undo it. The pending case has no such conflict
+    /// — the request being re-aimed is the reader's latest intent.
+    ///
     /// A turn that wrote **no** post (a decline) has no branch to offer: a
     /// pending request is dropped rather than left naming a node that can never
     /// appear, and a parked reader is left alone (there is nothing to follow —
-    /// the leaf simply collapses). Requests for *other* nodes (a fork draft, a
-    /// later turn) are untouched — the leaf id is unique per turn.
+    /// the leaf simply collapses).
     pub(crate) fn follow_completed_turn(&mut self, seq: u64, response_action_id: Option<&str>) {
-        let pending = self
-            .pending_select
-            .as_ref()
-            .is_some_and(|p| p.node == model::streaming_node_id(seq));
+        let leaf = model::streaming_node_id(seq);
+        let aimed_at_leaf = self.pending_select.as_ref().is_some_and(|p| p.node == leaf);
+        // Something newer is already asked for: the reader's latest intent wins.
+        if !aimed_at_leaf && self.pending_select.is_some() {
+            return;
+        }
         let parked = self.selected_turn.get() == Some(seq);
-        if !pending && !parked {
+        if !aimed_at_leaf && !parked {
             return;
         }
         match response_action_id {
             Some(id) => {
                 self.pending_select = Some(PendingSelect {
                     node: SharedString::from(id.to_string()),
-                    settle: if pending {
+                    settle: if aimed_at_leaf {
                         PendingSettle::BranchEnd
                     } else {
                         PendingSettle::Stay
                     },
                 })
             }
-            // Only the doomed request is dropped; an unrelated one stands.
-            None if pending => self.pending_select = None,
+            // Only the doomed request is dropped; an unrelated one already
+            // returned above.
+            None if aimed_at_leaf => self.pending_select = None,
             None => {}
         }
     }
@@ -610,16 +619,20 @@ impl SpaceView {
     }
 
     /// The same, against a tree the caller already has (`render`'s).
+    ///
+    /// **"The end" is the end of what was written** (`layout::page_end_ys`),
+    /// not the end of the document: by the time a settle runs,
+    /// `sync_tail_drafts` may already have docked a fresh composer under the
+    /// branch, and its runway is a whole window of speculative space to scroll
+    /// past the last word into (task 46, bug 2 — the same rule tail-following
+    /// obeys, from the same definition).
     pub(crate) fn scroll_to_branch_end(
         &self,
         roots: &[TreeNode],
         page_width: gpui::Pixels,
         window_h: gpui::Pixels,
     ) {
-        let total = self.selected_total_height(roots, page_width, window_h);
-        let doc = self.doc_reserve() + total;
-        let y = (window_h.as_f32() - doc).min(0.0);
-        self.set_page_scroll_y(y);
+        self.set_page_scroll_y(self.page_end_ys(roots, page_width, window_h).content);
     }
 
     /// Dock the active draft at its "home": its slot top around 40% of the

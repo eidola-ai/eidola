@@ -176,6 +176,18 @@ pub(crate) fn body_width(page_width: Pixels) -> f32 {
         .as_f32()
 }
 
+/// The selected branch's two ends as page-scroll `y`s (both ≤ 0). See
+/// [`SpaceView::page_end_ys`] — `content` is where a reader comes to rest,
+/// `document` is only the scroll floor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PageEnds {
+    /// The end of the document — the scroll range's floor.
+    pub(crate) document: f32,
+    /// The end of what has been **written**: the document less a trailing
+    /// draft's speculative runway. Never past `document`.
+    pub(crate) content: f32,
+}
+
 impl SpaceView {
     /// Which child page a node's scroller is resting on, from its scroll offset.
     /// Pages are `page_width + BAND_HEIGHT` apart, so the nearest is
@@ -312,12 +324,43 @@ impl SpaceView {
         Some(node.id.clone())
     }
 
+    /// **The selected branch's two ends**, as page-scroll `y`s — the single
+    /// definition every "scroll to the end" reads, so no caller can invent a
+    /// second one.
+    ///
+    /// The distinction is task 46, bug 2: a trailing draft's slot is a whole
+    /// window of *speculative* runway ([`Self::trailing_draft_slot_h`]), and
+    /// coming to rest past the last written word carries the reply the reader
+    /// was reading off the top of the window. So tail-following stops at
+    /// `content` ([`super::SpaceView::follow_streaming_tail`]) — and so does
+    /// every programmatic settle at a branch's end
+    /// ([`super::SpaceView::scroll_to_branch_end`]), which lands on frames
+    /// where `sync_tail_drafts` has already docked that composer. The two
+    /// coincide whenever no draft trails the path, which is every frame a turn
+    /// is actually streaming.
+    pub(crate) fn page_end_ys(
+        &self,
+        roots: &[TreeNode],
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+    ) -> PageEnds {
+        let total_doc = self.doc_reserve()
+            + self.selected_total_height(roots, page_width, window_h)
+            + self.floating_pad(roots, page_width, window_h);
+        let document = (window_h.as_f32() - total_doc).min(0.0);
+        let content = (window_h.as_f32()
+            - (total_doc - self.trailing_draft_slot_h(roots, page_width, window_h)))
+        .min(0.0)
+        .max(document);
+        PageEnds { document, content }
+    }
+
     /// The slot height a **trailing draft** claims at the end of the selected
     /// path, or `0.0` when the path ends in a post or a streaming leaf.
     ///
     /// That slot is speculative — an empty composer reserves a whole window of
-    /// runway — which is why tail-following stops short of it (see
-    /// [`super::SpaceView::follow_streaming_tail`]).
+    /// runway — which is why "the end" has two values (see
+    /// [`Self::page_end_ys`]).
     pub(crate) fn trailing_draft_slot_h(
         &self,
         roots: &[TreeNode],
