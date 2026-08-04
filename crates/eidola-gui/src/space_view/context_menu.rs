@@ -352,7 +352,7 @@ impl SpaceView {
         // Row height + the card's own padding, so the clamp knows the size
         // before layout does.
         let height = px(items.len() as f32 * 24.0 + 8.0);
-        let size = crate::chrome::content_size(window);
+        let size = self.page_size(window);
         let left = menu
             .position
             .x

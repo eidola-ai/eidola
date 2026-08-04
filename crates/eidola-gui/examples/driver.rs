@@ -478,6 +478,48 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_inspector",
+                description: "Space view: the inspector open beside the conversation (a real split — title, cascade stepper, router picker at its Off default)",
+                default_size: size(px(1040.), px(760.)),
+                build: |window, cx| {
+                    let stores = inspector_stores(cx, None);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
+                    view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_inspector_remote_router",
+                description: "Space view: the inspector with a remote (eidola) router selected — the mandatory per-call cost copy under the row",
+                default_size: size(px(1040.), px(760.)),
+                build: |window, cx| {
+                    let stores = inspector_stores(cx, Some("gemma4-31b@eidola"));
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
+                    view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_traces",
                 description: "Space view: trace disclosures — an answered turn's tool rounds under its reply, and three declines stacked in the gap under the post they answered (two agents, one of them asked twice)",
                 default_size: size(px(860.), px(760.)),
@@ -657,6 +699,37 @@ mod driver {
         let mut fixture = StoresStub::default();
         setup(&mut fixture);
         Stores::stub_with(fixture, cx)
+    }
+
+    /// `ready_stores` plus this space's own settings row and a Library title,
+    /// so the inspector renders real values rather than placeholders.
+    fn inspector_stores(cx: &mut App, router: Option<&str>) -> Stores {
+        let router = router.map(str::to_string);
+        stub_stores(cx, |s| {
+            s.config_state = Some(config_state(true));
+            s.eidola_trust = Some(eidola_trust());
+            s.models = models();
+            s.backends = backends();
+            s.local_models = Some(local_models_state());
+            s.participants = Some(participants_fixture());
+            s.templates = templates_fixture();
+            s.spaces = vec![SpaceInfo {
+                id: "demo".into(),
+                title: Some("Tides and the moon".into()),
+                snippet: None,
+                created_at: 0,
+                last_activity_at: 0,
+                message_count: 4,
+                archived_at: None,
+            }];
+            s.space_settings = Some((
+                "demo".into(),
+                eidola_app_core::SpaceSettings {
+                    cascade_limit: 4,
+                    router_model: router,
+                },
+            ));
+        })
     }
 
     /// A funded, ready account with a populated model list (so the ⌥ model

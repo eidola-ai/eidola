@@ -42,7 +42,7 @@ use crate::about::AboutView;
 use crate::actions::{
     About, ActualSize, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize,
     NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenParticipants, OpenRecord, OpenSettings, Quit,
-    Quote, QuoteInReply, ShowAll, ToggleInspector, Zoom, ZoomIn, ZoomOut,
+    Quote, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn, ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::lifecycle::LaunchOptions;
@@ -309,6 +309,12 @@ fn install_menus(cx: &mut App) {
                 new_space_from_template_submenu(cx),
                 MenuItem::Separator,
                 MenuItem::action("Participants…", OpenParticipants),
+                // The inspector's only doors are this item and its ⌥⌘I
+                // equivalent — the space carries no visual toggle (Mike,
+                // 2026-08-01). The label states both directions because
+                // `cx.set_menus` builds a static bar: gpui rebuilds it only
+                // when we ask it to, and the answer would differ per window.
+                MenuItem::action("Show/Hide Inspector", ToggleInspector),
                 MenuItem::Separator,
                 MenuItem::action("Close Window", CloseWindow),
             ],
@@ -427,7 +433,10 @@ pub fn install_keybindings(cx: &mut App) {
         KeyBinding::new("secondary-shift-l", OpenRecord, None),
         KeyBinding::new("secondary-w", CloseWindow, None),
         KeyBinding::new("secondary-q", Quit, None),
+        // ⌥⌘I shows/hides the space window's inspector (Xcode/Finder); gpui's
+        // element inspector — a development overlay — took ⌥⇧⌘I.
         KeyBinding::new("secondary-alt-i", ToggleInspector, None),
+        KeyBinding::new("secondary-alt-shift-i", ToggleElementInspector, None),
         // View → type size. ⌘0 / Ctrl+0 resets; ⌘=/⌘+ zooms in (both the bare
         // `=` and the shifted `+` that shares the key, so either keypress
         // works); ⌘-/Ctrl+- zooms out. Global (no context) so they fire even
@@ -615,7 +624,9 @@ fn install_action_handlers(cx: &mut App) {
         });
     });
 
-    // Toggle gpui's element inspector on the active window. Same `cx.defer`
+    // Toggle gpui's *element* inspector (development) on the active window.
+    // The product's space inspector is `ToggleInspector`, registered per-view.
+    // Same `cx.defer`
     // pattern as `Minimize`/`Zoom` — `Window::toggle_inspector` requires
     // `&mut Window`, and dispatching directly on the same window we were
     // invoked from would fail (slot already taken). `gpui-component`'s
@@ -624,7 +635,7 @@ fn install_action_handlers(cx: &mut App) {
     // action types are distinct, and gives us an explicit binding in our
     // own keymap regardless of whether gpui-component's inspector is
     // initialized in this build.
-    cx.on_action(|_: &ToggleInspector, cx: &mut App| {
+    cx.on_action(|_: &ToggleElementInspector, cx: &mut App| {
         let Some(handle) = cx.active_window() else {
             return;
         };

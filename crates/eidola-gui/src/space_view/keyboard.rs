@@ -296,6 +296,13 @@ impl SpaceView {
         if self.transient_overlay_open() {
             return false;
         }
+        // A focused inspector field owns the keyboard the way a composing
+        // session does: a printable there is text being typed into a setting,
+        // not the type-to-compose jump (which would consume the press and
+        // apply the character to the composer instead).
+        if self.inspector_field_focused(window, cx) {
+            return false;
+        }
 
         let mv = match ev.keystroke.key.as_str() {
             _ if ev.keystroke.modifiers.modified() => None,
@@ -364,7 +371,13 @@ impl SpaceView {
     /// two from disagreeing about who owns the keyboard, which is the property
     /// [`Self::sync_tree_focus`]'s park-and-restore already depended on.
     pub(crate) fn transient_overlay_open(&self) -> bool {
-        self.context_menu.is_some() || self.band_menu.is_some() || self.highlight_picker.is_some()
+        self.context_menu.is_some()
+            || self.band_menu.is_some()
+            || self.highlight_picker.is_some()
+            // The inspector's router dropdown is one too: it is a choice
+            // hovering over the panel, and a printable behind it would start a
+            // draft the reader cannot see.
+            || self.inspector_router_picker
     }
 
     /// Move tree focus. With no focus yet, an arrow *enters* the conversation
@@ -406,7 +419,7 @@ impl SpaceView {
             }
         }
 
-        let viewport = crate::chrome::content_size(window);
+        let viewport = self.page_size(window);
         let (page_width, window_h) = (viewport.width, viewport.height);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(page_width, &turns);
@@ -574,7 +587,7 @@ impl SpaceView {
     /// *floats* at the window bottom, so the caret reveal a buffer change arms
     /// moves the composer's own internal scroll, never the page.)
     fn type_to_compose(&mut self, ch: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let viewport = crate::chrome::content_size(window);
+        let viewport = self.page_size(window);
         let page_width = viewport.width;
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(page_width, &turns);
@@ -892,7 +905,7 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn focused_post_window_top_for_test(&self, window: &Window, cx: &App) -> Option<f32> {
         let focus = self.tree_focus.as_ref()?;
-        let viewport = crate::chrome::content_size(window);
+        let viewport = self.page_size(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(viewport.width, &turns);
         let top =

@@ -255,6 +255,31 @@ pub struct ParticipantOverride {
     pub notify_policy: Option<Option<String>>,
 }
 
+/// The cascade limit a space falls back to when none is recorded, and the
+/// value a fresh template is created with — how many agent replies in a row
+/// before [`AppCore::plan_notifications`] pauses.
+pub const DEFAULT_CASCADE_LIMIT: i64 = 4;
+
+/// A space's own settings — the values a space carries independently of its
+/// participants, copied from the template it was instantiated from and editable
+/// per space afterwards (the GUI's space inspector).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceSettings {
+    /// How many agent replies in a row before `plan_notifications` pauses.
+    pub cascade_limit: i64,
+    /// The may-decline router model (task 22); `None` = off, the default.
+    pub router_model: Option<String>,
+}
+
+impl Default for SpaceSettings {
+    fn default() -> Self {
+        Self {
+            cascade_limit: DEFAULT_CASCADE_LIMIT,
+            router_model: None,
+        }
+    }
+}
+
 /// A space template (its settings + agent participants).
 #[derive(Clone, Debug)]
 pub struct SpaceTemplateInfo {
@@ -3369,6 +3394,43 @@ impl Inner {
         Ok(())
     }
 
+    /// Set a space's cascade limit — how many agent replies in a row the space
+    /// allows before `plan_notifications` pauses. Emits `Change::Space`; the
+    /// floor (1) mirrors the template setter's.
+    async fn set_space_cascade_limit(
+        &self,
+        space_id: &str,
+        cascade_limit: i64,
+    ) -> Result<(), AppError> {
+        if cascade_limit < 1 {
+            return Err(AppError::Config {
+                message: "cascade limit must be at least 1".into(),
+            });
+        }
+        let conn = self.db_conn().await?;
+        if !db::set_space_cascade_limit(&conn, space_id, cascade_limit).await? {
+            return Err(AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            });
+        }
+        self.bus.emit(Change::Space(space_id.to_string()));
+        Ok(())
+    }
+
+    /// The space's own settings row (the space inspector's read).
+    async fn space_settings(&self, space_id: &str) -> Result<SpaceSettings, AppError> {
+        let conn = self.db_conn().await?;
+        let Some(cascade_limit) = db::space_cascade_limit(&conn, space_id).await? else {
+            return Err(AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            });
+        };
+        Ok(SpaceSettings {
+            cascade_limit,
+            router_model: db::space_router_model(&conn, space_id).await?,
+        })
+    }
+
     /// Set (or clear) a template's may-decline router model — the value every
     /// space instantiated from it is born with. Emits `Change::Templates`.
     async fn set_template_router_model(
@@ -5759,7 +5821,9 @@ impl Inner {
             _ => return Ok(NotificationPlan::Turns(Vec::new())),
         }
 
-        let limit = db::space_cascade_limit(&conn, space_id).await?.unwrap_or(4);
+        let limit = db::space_cascade_limit(&conn, space_id)
+            .await?
+            .unwrap_or(DEFAULT_CASCADE_LIMIT);
         let depth = db::agent_cascade_depth(&conn, post_action_id).await?;
         if depth >= limit {
             return Ok(NotificationPlan::Paused { depth, limit });
@@ -7690,6 +7754,36 @@ impl AppCore {
             .spawn(async move {
                 inner
                     .set_space_router_model(&space_id, router_model.as_deref())
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// This space's own settings (cascade limit + router model) — the read
+    /// behind the GUI's space inspector. Errors when the space does not exist,
+    /// which the per-field reads deliberately cannot say.
+    pub async fn space_settings(&self, space_id: String) -> Result<SpaceSettings, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.space_settings(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Set this space's cascade limit — the guard on how many agent replies in
+    /// a row it allows (see [`Self::plan_notifications`]). Emits
+    /// [`Change::Space`].
+    pub async fn set_space_cascade_limit(
+        &self,
+        space_id: String,
+        cascade_limit: i64,
+    ) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .set_space_cascade_limit(&space_id, cascade_limit)
                     .await
             })
             .await

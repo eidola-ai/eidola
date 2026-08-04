@@ -4108,3 +4108,163 @@ fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
         offenders.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// The space inspector (task 26.2) — the per-space settings panel. Its rows are
+// ordinary probed affordances; the one that has to be exactly right is the
+// router's cost note, which is what discloses per-post billing.
+// ---------------------------------------------------------------------------
+
+fn inspector_stores(cx: &mut TestAppContext, settings: eidola_app_core::SpaceSettings) -> Stores {
+    stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.space_settings = Some(("s".into(), settings));
+    })
+}
+
+fn open_inspector(
+    cx: &mut TestAppContext,
+    settings: eidola_app_core::SpaceSettings,
+) -> (AnyWindowHandle, Entity<SpaceView>) {
+    let stores = inspector_stores(cx, settings);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+    (window, view)
+}
+
+#[gpui::test]
+fn space_inspector_probes_its_rows(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let (window, _view) = open_inspector(cx, eidola_app_core::SpaceSettings::default());
+    let entries = fresh_entries(cx, window);
+
+    // The panel is a complementary landmark: settings *about* the conversation.
+    assert_probe(
+        &entries,
+        "space/inspector",
+        gpui::Role::Complementary,
+        "Inspector",
+    );
+    // The title field's node is the `Input` itself (the two-regime rule), so
+    // the wrapper is bounds-only — role and label describe it for the driver.
+    assert_probe(
+        &entries,
+        "space/inspector/title",
+        gpui::Role::TextInput,
+        "Space title",
+    );
+    // The number is the thing a reader most wants from a stepper, so it rides
+    // its own settled `Label` node rather than living in a node-less div.
+    assert_probe_value(
+        &entries,
+        "space/inspector/cascade",
+        gpui::Role::Label,
+        "Cascade limit",
+        "4",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/cascade/dec",
+        gpui::Role::Button,
+        "Decrease cascade limit",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/cascade/inc",
+        gpui::Role::Button,
+        "Increase cascade limit",
+    );
+    // The picker announces its selection — "Off" is a normal choice, and the
+    // label alone would say nothing about whether this space bills per post.
+    assert_probe_value(
+        &entries,
+        "space/inspector/router",
+        gpui::Role::Button,
+        "Router model",
+        "Off",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn space_inspector_router_cost_note_is_exactly_remote_conditional(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    // A local (engine-served) router is genuinely free — no cost copy.
+    let (window, _view) = open_inspector(
+        cx,
+        eidola_app_core::SpaceSettings {
+            cascade_limit: 4,
+            router_model: Some("tiny@local".into()),
+        },
+    );
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/inspector/router/cost"),
+        "a local router must not claim a per-call cost"
+    );
+
+    // A remote one bills an inference on every post, and says so inline.
+    let (window, _view) = open_inspector(
+        cx,
+        eidola_app_core::SpaceSettings {
+            cascade_limit: 4,
+            router_model: Some("gemma4-31b@eidola".into()),
+        },
+    );
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/inspector/router/cost",
+        gpui::Role::Label,
+        eidola_gui::space_view::inspector::ROUTER_REMOTE_COST_NOTE,
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn space_inspector_failed_settings_read_offers_a_retry_not_a_default(cx: &mut TestAppContext) {
+    // "Failed is not empty": a failed read must not render as cascade 4 /
+    // router Off with live controls that would write over settings we never
+    // managed to read.
+    let _guard = probes_on();
+
+    let stores = inspector_stores(cx, eidola_app_core::SpaceSettings::default());
+    let settings_store = stores.space_settings.clone();
+    cx.update(|cx| {
+        settings_store.update(cx, |s, _| s.set_failed_for_test("s", "database is locked"))
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/inspector/retry",
+        gpui::Role::Button,
+        "Retry",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "space/inspector/cascade"),
+        "a failed read shows no plausible default"
+    );
+
+    probe::set_probes_enabled(false);
+}
