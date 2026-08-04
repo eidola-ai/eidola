@@ -82,6 +82,8 @@ To run the CLI against a local development stack:
    - `ark.pem` + `ark.key` + `ask.pem` + `ask.key` — the **SEV-SNP attestation** chain (RSA-PSS, required by AMD's attestation format). These are *not* TLS roots and should not go in your keychain; they are passed to the CLI via `--hardware-root-ca` / `--hardware-intermediate-ca` instead.
 
    The split exists because Apple's Security framework does not support RSA-PSS in chain validation, so the SEV-SNP chain (which the `sev` crate requires to be PSS) cannot double as the TLS trust anchor. The shim reuses all six files on every subsequent boot, so once you trust `tls-ca.pem` your OS keychain entry survives shim restarts. The trust root flows from the filesystem only — never from the shim's API. To rotate the roots, delete `.dev-certs/` and re-run the steps below.
+
+   Trusting `tls-ca.pem` is a **machine-wide** grant that outlives the stack: whoever can read `.dev-certs/tls-ca.key` can mint a certificate this machine accepts for any host. The shim writes its private keys `0600` (and tightens an existing key it finds more permissive), but remove the trust when you are done with local dev — `just client-reset` prints the command.
    - **macOS (terminal):** `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain .dev-certs/tls-ca.pem`
    - **macOS (UI):** Open Keychain Access, drag `tls-ca.pem` into the **System** keychain, double-click it, expand **Trust**, and set "When using this certificate" to **Always Trust**.
    - **Linux:** `sudo cp .dev-certs/tls-ca.pem /usr/local/share/ca-certificates/eidola-dev.crt && sudo update-ca-certificates`
