@@ -126,9 +126,12 @@ pub fn install(stores: &Stores, opts: LaunchOptions, cx: &mut App) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    let rows: RowMirror = Rc::new(RefCell::new(menu_rows(
-        stores.local_models.read(cx).state().value(),
-    )));
+    let core = stores.app_core();
+    let initial = {
+        let running = core.as_ref().map(|c| c.running_engines());
+        menu_rows(running.as_deref(), stores.local_models.read(cx).state())
+    };
+    let rows: RowMirror = Rc::new(RefCell::new(initial));
     let Some((item, target)) = build(rows.clone(), cx, mtm) else {
         // No door was built, so none is claimed: without the global,
         // `quit_or_retire` sees `status_item_present = false` and ⌘Q stays
@@ -149,8 +152,17 @@ pub fn install(stores: &Stores, opts: LaunchOptions, cx: &mut App) {
 
     // Keep the mirror current. App-lifetime observation, the same sanctioned
     // detach as the template-driven menu rebuild in `lib.rs`.
+    //
+    // **The registry is re-read here, not captured**, and this observer is
+    // what keeps it fresh: `LocalModelsStore` notifies on every
+    // `Change::LocalModels`, which app-core emits for every engine lifecycle
+    // transition — so the live half of the readout is refreshed by exactly
+    // the events that move it, even when the store's own snapshot refresh
+    // failed.
     cx.observe(&stores.local_models, move |store, cx| {
-        *rows.borrow_mut() = menu_rows(store.read(cx).state().value());
+        let listed = store.read(cx).state();
+        let running = core.as_ref().map(|c| c.running_engines());
+        *rows.borrow_mut() = menu_rows(running.as_deref(), listed);
     })
     .detach();
 

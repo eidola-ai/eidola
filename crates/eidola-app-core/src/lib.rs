@@ -41,7 +41,7 @@ pub use db::HUMAN_PARTICIPANT_ID;
 use error::AppError;
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
-    LocalModelStatus, LocalModelsState,
+    LocalModelStatus, LocalModelsState, RunningEngine,
 };
 
 // ============================================================================
@@ -7050,6 +7050,26 @@ impl AppCore {
     /// run them.
     pub fn shutdown_engines(&self) -> usize {
         self.inner.shutdown_all_engines()
+    }
+
+    /// Every engine the in-process registry is holding, right now — the
+    /// read-only sibling of [`Self::shutdown_engines`], and the honest
+    /// answer to "what is running?".
+    ///
+    /// **Not a filter over [`Self::local_models_state`].** That snapshot is
+    /// reconstructed by *scanning* the model directories and consults the
+    /// registry only to decorate a file it already found, so an engine whose
+    /// backing `.gguf` was renamed or deleted mid-session (or whose backend
+    /// row was removed, or whose directory has become unreadable) is missing
+    /// from it while its subprocess is alive and holding gigabytes. Any
+    /// surface that reports running engines must start here and join the
+    /// snapshot on [`RunningEngine::id`] for display names — never the
+    /// other way round.
+    ///
+    /// Synchronous, infallible, no filesystem and no database: one mutex
+    /// acquisition over an in-memory map, safe to call from a UI callback.
+    pub fn running_engines(&self) -> Vec<RunningEngine> {
+        self.inner.running_engines()
     }
 
     /// Pin or unpin a loaded model's engine. Pinned engines are protected
