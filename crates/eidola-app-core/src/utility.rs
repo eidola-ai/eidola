@@ -238,7 +238,11 @@ impl Inner {
                         ),
                     });
                 }
-                let (prep, auth) = self.acquire_spend(&cfg, db_conn, charge, now).await?;
+                // The hold is scoped to the issuer of the route this chore call
+                // will actually post to (`route.base_url`).
+                let (prep, auth) = self
+                    .acquire_spend(&cfg, db_conn, charge, now, &route.base_url)
+                    .await?;
                 spend = Some(prep);
                 Some(auth)
             }

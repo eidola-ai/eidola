@@ -719,9 +719,12 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     if !spending.is_empty() {
                         println!("in-flight credentials:");
                         for c in &spending {
+                            // Naming the holder matters for recovery: a hold
+                            // is only replayable at the server that took it,
+                            // so `recover` skips holds from anywhere else.
                             println!(
-                                "  {}: {} credits, {} charged",
-                                c.nonce, c.credits, c.spend_amount
+                                "  {}: {} credits, {} charged, held by {}",
+                                c.nonce, c.credits, c.spend_amount, c.issuer_base_url
                             );
                         }
                         println!();
@@ -734,9 +737,13 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     if !credentials.is_empty() {
                         println!("active credentials:");
                         for c in &credentials {
+                            // The issuer is printed because credits only spend
+                            // at the server that issued them: after a base-URL
+                            // change this line is the answer to "I have
+                            // credits — why won't they spend?".
                             println!(
-                                "  {}: {} credits (gen {})",
-                                c.nonce, c.credits, c.generation
+                                "  {}: {} credits (gen {}) — issued by {}",
+                                c.nonce, c.credits, c.generation, c.issuer_base_url
                             );
                         }
                     }

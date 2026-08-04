@@ -450,6 +450,14 @@ pub struct CredentialInfo {
     pub nonce: String,
     pub credits: i64,
     pub generation: i64,
+    /// The ACT issuer key this credential was minted under.
+    pub issuer_key_id: String,
+    /// The server that issued it — the only destination it can be spent at
+    /// (see `db::find_spendable_credential`). Surfaced so "I have credits but
+    /// the turn says I don't" is answerable: credits issued by another server
+    /// (a `just client-local` redirect, a changed base URL) are honestly not
+    /// spendable here.
+    pub issuer_base_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -458,6 +466,10 @@ pub struct InFlightCredentialInfo {
     pub credits: i64,
     pub generation: i64,
     pub spend_amount: i64,
+    /// The server holding the spend — the only one that can answer its refund,
+    /// and therefore the only one `recover_spending_credentials` replays it at
+    /// (point the app back there to recover a stranded hold).
+    pub issuer_base_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1998,12 +2010,16 @@ impl Inner {
             .to_string();
         let expires_at = iso_to_ms(&key.issue_until)?;
 
+        // `base_url` is the key's server identity: this listing came from that
+        // destination, so a credential minted under the key is spendable there
+        // and nowhere else. `find_spendable_credential` scopes selection by it.
         db::upsert_issuer_key(
             &db_conn,
             &key.id,
             &params_hash,
             &public_key_cbor,
             key.domain_separator.as_bytes(),
+            base_url,
             expires_at,
             now,
         )
@@ -2110,6 +2126,8 @@ impl Inner {
                 nonce: c.nonce,
                 credits: c.credits,
                 generation: c.generation,
+                issuer_key_id: c.issuer_key_id,
+                issuer_base_url: c.issuer_base_url,
             })
             .collect())
     }
@@ -2124,6 +2142,7 @@ impl Inner {
                 credits: r.credits,
                 generation: r.generation,
                 spend_amount: r.spend_amount,
+                issuer_base_url: r.issuer_base_url,
             })
             .collect())
     }
@@ -2268,6 +2287,16 @@ impl Inner {
         let mut recovered = Vec::new();
 
         for row in rows {
+            // Only the issuing server can answer a refund for its own spend
+            // proof. Replaying one at a different destination could not
+            // recover anything and would hand that server a nullifier it has
+            // no business seeing, so foreign holds are skipped — pointing back
+            // at the issuer and running recovery again picks them up (the
+            // documented cure, unchanged).
+            if row.issuer_base_url != base_url {
+                continue;
+            }
+
             let spend_proof_cbor = row.spend_proof_data;
 
             let spend_proof = match SpendProof::<128>::from_cbor(&spend_proof_cbor) {
@@ -3820,9 +3849,16 @@ impl Inner {
         })
     }
 
-    /// Find a credential that can cover `charge_credits`, auto-provisioning
-    /// one from the account balance when none exists — the pooled body of the
-    /// **ACT provisioning queue**.
+    /// Find a credential that can cover `charge_credits` **at
+    /// `issuer_base_url`**, auto-provisioning one from the account balance
+    /// when none exists — the pooled body of the **ACT provisioning queue**.
+    ///
+    /// Every read here is issuer-scoped, because a spend proof is bound to one
+    /// issuer's key: a credential minted by another server is not money this
+    /// turn can spend, and its in-flight refund can never fund this turn
+    /// either. A wallet holding only foreign-issued credits is therefore an
+    /// ordinary shortfall (`InsufficientBalance` after the allocation attempt),
+    /// deliberately not an error class of its own.
     ///
     /// **The caller must hold [`Inner::spend_gate`]** across this call *and* the
     /// spend-proof + `insert_pre_credential_refund` that follow, so the whole
@@ -3853,10 +3889,14 @@ impl Inner {
         cfg: &Config,
         db_conn: &turso::Connection,
         charge_credits: i64,
+        issuer_base_url: &str,
     ) -> Result<db::SpendableCredential, AppError> {
         let deadline = tokio::time::Instant::now() + PROVISION_WAIT_TIMEOUT;
+        let mut allocated = false;
         loop {
-            if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
+            if let Some(cred) =
+                db::find_spendable_credential(db_conn, charge_credits, issuer_base_url).await?
+            {
                 return Ok(cred);
             }
 
@@ -3866,9 +3906,28 @@ impl Inner {
 
             let balances = self.account_balances().await?;
             if balances.available >= charge_credits {
+                // One allocation always suffices when it lands in scope: it
+                // mints a single credential worth at least the charge, and we
+                // hold `spend_gate`, so nothing can take it before the retry
+                // reads it. Reaching this branch twice therefore means the
+                // fresh credential was issued by a server that is *not* this
+                // turn's destination — auto-allocation goes to the currently
+                // configured eidola row, which a concurrent base-URL change can
+                // move out from under an in-flight turn. Allocating again could
+                // never fund this turn, so fail honestly instead of looping.
+                if allocated {
+                    return Err(AppError::Credential {
+                        message: format!(
+                            "the configured Eidola server changed while this turn was in \
+                             flight — allocated credits are not issued by {issuer_base_url}, \
+                             which this turn is talking to; retry the turn"
+                        ),
+                    });
+                }
                 // Enough to allocate at least the charge — grow the pool.
                 let amount = auto_allocation_amount(balances.available, charge_credits)?;
                 self.account_allocate(amount).await?;
+                allocated = true;
                 continue;
             }
 
@@ -3883,10 +3942,15 @@ impl Inner {
             // cover the charge; a smaller one — even fully refunded — never
             // will, and no allocation is possible either. Wait only when such a
             // credential exists; otherwise this is a true shortfall.
+            //
+            // Issuer-scoped for the same reason selection is: a successor
+            // inherits its predecessor's issuer key, so a foreign credential's
+            // refund lands as money for another server. Waiting on it would
+            // turn a true shortfall into a `ProvisioningTimeout`.
             let recoverable = db::list_spending_credentials(db_conn)
                 .await?
                 .into_iter()
-                .any(|c| c.credits >= charge_credits);
+                .any(|c| c.credits >= charge_credits && c.issuer_base_url == issuer_base_url);
             if recoverable && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
                 continue;
@@ -3918,7 +3982,9 @@ impl Inner {
             // recovery); that is an ordinary post-read TOCTOU no non-serialized
             // check can exclude, and the recoverable error routes the caller to
             // retry, which finds it.
-            if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
+            if let Some(cred) =
+                db::find_spendable_credential(db_conn, charge_credits, issuer_base_url).await?
+            {
                 return Ok(cred);
             }
             if recoverable {
@@ -4630,7 +4696,7 @@ impl Inner {
                 // later rounds re-check it against their own (grown) estimate.
                 check_turn_budget(charge_credits, budget).map_err(wrap)?;
                 let (spend, auth_value) = self
-                    .acquire_spend(&cfg, &db_conn, charge_credits, now)
+                    .acquire_spend(&cfg, &db_conn, charge_credits, now, &base_url)
                     .await
                     .map_err(wrap)?;
                 (charge_credits, Some(spend), Some(auth_value))
@@ -4746,12 +4812,23 @@ impl Inner {
     /// Emits `Change::Wallet` after `insert_pre_credential_refund` — the
     /// credential is in `spending` state from that instant regardless of
     /// whether the rest of the round succeeds.
+    ///
+    /// `issuer_base_url` is **the destination this request will be sent to**,
+    /// and it scopes credential selection to that server's issuer (see
+    /// [`db::find_spendable_credential`]). The caller passes the very URL it
+    /// will `POST` to — not a fresh read of the eidola row — because those can
+    /// diverge mid-turn: `prepare_turn` resolves the row once and every round
+    /// posts to that resolution, so re-reading here could hold a credential for
+    /// a server the request is not going to. Destination and issuer are read
+    /// from one resolution, exactly as the attesting client and the request URL
+    /// already are.
     async fn acquire_spend(
         &self,
         cfg: &Config,
         db_conn: &turso::Connection,
         charge_credits: u128,
         now: i64,
+        issuer_base_url: &str,
     ) -> Result<(SpendPrep, String), AppError> {
         // ACT provisioning queue: serialize acquire → spend-proof →
         // flip-to-`spending` across concurrent turns so two turns fired at
@@ -4760,7 +4837,7 @@ impl Inner {
         // credential becomes `spending`); the HTTP request runs outside it.
         let _spend_guard = self.spend_gate.lock().await;
         let cred = self
-            .ensure_spendable_credential(cfg, db_conn, charge_credits as i64)
+            .ensure_spendable_credential(cfg, db_conn, charge_credits as i64, issuer_base_url)
             .await?;
 
         let credit_token =
@@ -4855,8 +4932,16 @@ impl Inner {
             });
         }
         check_turn_budget(charge_credits, prep.budget)?;
+        // The round posts to `prep.base_url`, so the hold is scoped to that
+        // same destination's issuer.
         let (spend, auth_value) = self
-            .acquire_spend(&cfg, &prep.db_conn, charge_credits, prep.now)
+            .acquire_spend(
+                &cfg,
+                &prep.db_conn,
+                charge_credits,
+                prep.now,
+                &prep.base_url,
+            )
             .await?;
         prep.charge_credits = charge_credits;
         prep.total_credits += charge_credits;

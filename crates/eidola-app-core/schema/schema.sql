@@ -4,11 +4,24 @@ PRAGMA foreign_keys = ON;
 -- #  LAYER 0 — WALLET                                        #
 -- ############################################################
 
+-- An ACT issuer key, learned from a server's /v1/keys listing at allocation
+-- time.
+--
+-- base_url is the destination that advertised this key — the server identity
+-- a credential minted under it is spendable at. Only that issuer can verify
+-- the spend proof, so credential selection is scoped by it (see
+-- `db::find_spendable_credential`); without it a turn against one server
+-- could pick up a credential issued by another, flip it to `spending`, and
+-- fail at an issuer that cannot verify it. Rewritten on every re-observation
+-- (the last destination confirmed to advertise the key), so re-pointing at
+-- the same server under a different spelling of its URL re-binds at the next
+-- allocation instead of stranding the wallet.
 CREATE TABLE issuer_key (
     id              TEXT PRIMARY KEY,
     params_hash     TEXT NOT NULL,
     public_key_data BLOB NOT NULL,
     params_data     BLOB NOT NULL,
+    base_url        TEXT NOT NULL,
     expires_at      INTEGER NOT NULL,         -- ms since epoch
     created_at      INTEGER NOT NULL
 );

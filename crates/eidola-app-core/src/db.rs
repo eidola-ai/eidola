@@ -17,7 +17,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 5;
+const LATEST_VERSION: i64 = 6;
 
 /// Well-known id of the shared human "You" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -470,23 +470,36 @@ async fn set_user_version(conn: &Connection, version: i64) -> Result<(), AppErro
 // Layer 0 — Wallet: Issuer key operations
 // ---------------------------------------------------------------------------
 
+/// Record an issuer key learned from `base_url`'s `/v1/keys` listing.
+///
+/// `base_url` is the key's **server identity** — the destination observed to
+/// advertise it, and therefore the only one that can verify a spend of a
+/// credential minted under it ([`find_spendable_credential`] scopes selection
+/// by it). It is re-written on every observation: seeing the same key
+/// advertised at a destination is proof that destination issues under it, so
+/// the row records the last confirmed destination rather than the first-ever
+/// one (re-pointing at the same server under a different spelling of its URL
+/// re-binds at the next allocation instead of stranding the wallet).
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_issuer_key(
     conn: &Connection,
     id: &str,
     params_hash: &str,
     public_key_data: &[u8],
     params_data: &[u8],
+    base_url: &str,
     expires_at: i64,
     created_at: i64,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT OR IGNORE INTO issuer_key (id, params_hash, public_key_data, params_data, expires_at, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO issuer_key (id, params_hash, public_key_data, params_data, base_url, expires_at, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         (
             Value::Text(id.to_string()),
             Value::Text(params_hash.to_string()),
             Value::Blob(public_key_data.to_vec()),
             Value::Blob(params_data.to_vec()),
+            Value::Text(base_url.to_string()),
             Value::Integer(expires_at),
             Value::Integer(created_at),
         ),
@@ -494,6 +507,17 @@ pub async fn upsert_issuer_key(
     .await
     .map_err(|e| AppError::Database {
         message: format!("failed to upsert issuer key: {e}"),
+    })?;
+    conn.execute(
+        "UPDATE issuer_key SET base_url = ?2 WHERE id = ?1 AND base_url <> ?2",
+        (
+            Value::Text(id.to_string()),
+            Value::Text(base_url.to_string()),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to rebind issuer key to its destination: {e}"),
     })?;
     Ok(())
 }
@@ -603,9 +627,21 @@ pub struct SpendableCredential {
     pub public_key_data: Vec<u8>,
 }
 
+/// The smallest active credential that covers `min_credits` **and was issued
+/// by the server at `issuer_base_url`**.
+///
+/// The issuer predicate is structural, not an optimization: a spend proof is
+/// bound to one issuer's key, so a credential minted by another server can
+/// only fail there — after the spend gate has already flipped it to
+/// `spending`. Scoping selection by the destination the request is about to
+/// go to (`issuer_key.base_url`) makes that pickup unrepresentable. A wallet
+/// holding only foreign-issued credits therefore reads as "no spendable
+/// credential" — the ordinary insufficient-credits path, deliberately not an
+/// error class of its own.
 pub async fn find_spendable_credential(
     conn: &Connection,
     min_credits: i64,
+    issuer_base_url: &str,
 ) -> Result<Option<SpendableCredential>, AppError> {
     let mut stmt = conn
         .prepare(
@@ -613,13 +649,19 @@ pub async fn find_spendable_credential(
              FROM credential_lifecycle cl \
              JOIN credential c ON c.nonce = cl.nonce \
              JOIN issuer_key ik ON ik.id = c.issuer_key_id \
-             WHERE cl.state = 'active' AND c.credits >= ?1 \
+             WHERE cl.state = 'active' AND c.credits >= ?1 AND ik.base_url = ?2 \
              ORDER BY c.credits ASC \
              LIMIT 1",
         )
         .await
         .map_err(AppError::db)?;
-    let mut rows = stmt.query([min_credits]).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Integer(min_credits),
+            Value::Text(issuer_base_url.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
     match rows.next().await.map_err(AppError::db)? {
         None => Ok(None),
         Some(row) => Ok(Some(SpendableCredential {
@@ -639,14 +681,22 @@ pub struct CredentialRow {
     pub generation: i64,
     pub created_at: i64,
     pub state: String,
+    pub issuer_key_id: String,
+    /// The destination that issued this credential — what makes "why won't
+    /// these credits spend?" answerable when the app points somewhere else
+    /// (see [`find_spendable_credential`]).
+    pub issuer_base_url: String,
 }
 
 pub async fn list_active_credentials(conn: &Connection) -> Result<Vec<CredentialRow>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT nonce, credits, generation, created_at, state \
-             FROM credential_lifecycle WHERE state = 'active' \
-             ORDER BY created_at",
+            "SELECT cl.nonce, cl.credits, cl.generation, cl.created_at, cl.state, \
+                    cl.issuer_key_id, ik.base_url \
+             FROM credential_lifecycle cl \
+             JOIN issuer_key ik ON ik.id = cl.issuer_key_id \
+             WHERE cl.state = 'active' \
+             ORDER BY cl.created_at",
         )
         .await
         .map_err(AppError::db)?;
@@ -659,6 +709,8 @@ pub async fn list_active_credentials(conn: &Connection) -> Result<Vec<Credential
             generation: row.get::<i64>(2).map_err(AppError::db)?,
             created_at: row.get::<i64>(3).map_err(AppError::db)?,
             state: row.get::<String>(4).map_err(AppError::db)?,
+            issuer_key_id: row.get::<String>(5).map_err(AppError::db)?,
+            issuer_base_url: row.get::<String>(6).map_err(AppError::db)?,
         });
     }
     Ok(results)
@@ -675,6 +727,9 @@ pub struct SpendingCredentialRow {
     pub spend_proof_data: Vec<u8>,
     pub issuer_key_id: String,
     pub public_key_data: Vec<u8>,
+    /// The destination that issued the spent credential — the only server
+    /// that can answer its refund (see [`find_spendable_credential`]).
+    pub issuer_base_url: String,
 }
 
 pub async fn list_spending_credentials(
@@ -684,7 +739,7 @@ pub async fn list_spending_credentials(
         .prepare(
             "SELECT c.nonce, c.credits, c.generation, c.created_at, \
                     pc.spend_amount, pc.id, pc.data, pc.spend_proof_data, \
-                    pc.issuer_key_id, ik.public_key_data \
+                    pc.issuer_key_id, ik.public_key_data, ik.base_url \
              FROM credential_lifecycle cl \
              JOIN credential c ON c.nonce = cl.nonce \
              JOIN pre_credential pc ON pc.credential_nonce = c.nonce AND pc.type = 'refund' \
@@ -708,6 +763,7 @@ pub async fn list_spending_credentials(
             spend_proof_data: row.get::<Vec<u8>>(7).map_err(AppError::db)?,
             issuer_key_id: row.get::<String>(8).map_err(AppError::db)?,
             public_key_data: row.get::<Vec<u8>>(9).map_err(AppError::db)?,
+            issuer_base_url: row.get::<String>(10).map_err(AppError::db)?,
         });
     }
     Ok(results)
@@ -5551,6 +5607,153 @@ mod tests {
         assert!(table_names.contains(&"request"));
     }
 
+    /// Mint an active credential worth `credits`, issued by the key `key_id`
+    /// of the server at `base_url` (creating the issuer-key row if needed).
+    async fn seed_credential(
+        conn: &Connection,
+        key_id: &str,
+        base_url: &str,
+        nonce: &str,
+        credits: i64,
+    ) {
+        let now = 1_700_000_000_000;
+        // Far-future expiry: the lifecycle view flips a credential to
+        // `expired` off the wall clock, and these tests must not age out.
+        let expires_at = 99_999_999_999_999;
+        upsert_issuer_key(
+            conn,
+            key_id,
+            "params-hash",
+            b"pk",
+            b"ds",
+            base_url,
+            expires_at,
+            now,
+        )
+        .await
+        .unwrap();
+        let pre_id = format!("pre-{nonce}");
+        insert_pre_credential_issuance(conn, &pre_id, key_id, b"pre", credits, now)
+            .await
+            .unwrap();
+        insert_credential(conn, nonce, &pre_id, key_id, b"token", credits, 0, now)
+            .await
+            .unwrap();
+    }
+
+    /// The issuer predicate: a credential is only ever selected for the server
+    /// that issued it. Without it, the `ORDER BY credits ASC` tiebreak below
+    /// would hand a turn against server A the *cheaper* credential issued by
+    /// server B — a hold that can only fail at an issuer that cannot verify
+    /// it (the defect this predicate closes).
+    #[tokio::test]
+    async fn spendable_selection_is_scoped_to_the_targeted_issuer() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+
+        let url_a = "http://a.example";
+        let url_b = "http://b.example";
+        seed_credential(&conn, "key-a", url_a, "nonce-a", 5_000).await;
+        seed_credential(&conn, "key-b", url_b, "nonce-b", 100).await;
+
+        let picked = find_spendable_credential(&conn, 50, url_a)
+            .await
+            .unwrap()
+            .expect("server A's own credential covers the charge");
+        assert_eq!(
+            picked.nonce, "nonce-a",
+            "a turn against A must not pick up B's (cheaper) credential"
+        );
+
+        let picked = find_spendable_credential(&conn, 50, url_b)
+            .await
+            .unwrap()
+            .expect("server B's own credential covers the charge");
+        assert_eq!(picked.nonce, "nonce-b");
+
+        // Foreign-issued credits read as "no spendable credential" — the
+        // ordinary insufficient-credits path, not an error class of its own.
+        assert!(
+            find_spendable_credential(&conn, 50, "http://c.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "credits issued elsewhere are not spendable here"
+        );
+    }
+
+    /// Same-issuer selection is unchanged: the smallest credential that
+    /// covers the charge wins (spend the little ones first).
+    #[tokio::test]
+    async fn spendable_selection_still_prefers_the_smallest_covering_credential() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+
+        let url = "http://a.example";
+        seed_credential(&conn, "key-a", url, "small", 300).await;
+        seed_credential(&conn, "key-a", url, "large", 900).await;
+        // A foreign credential that *would* win the ordering (it covers the
+        // charge and is smaller than both) must still never be selected.
+        seed_credential(&conn, "key-b", "http://b.example", "foreign", 60).await;
+
+        let picked = find_spendable_credential(&conn, 50, url).await.unwrap();
+        assert_eq!(picked.expect("covering credential").nonce, "small");
+
+        let picked = find_spendable_credential(&conn, 500, url).await.unwrap();
+        assert_eq!(
+            picked.expect("only the large one covers 500").nonce,
+            "large"
+        );
+
+        assert!(
+            find_spendable_credential(&conn, 1_000, url)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Re-observing a key at another destination re-binds it: seeing a server
+    /// advertise the key is proof it issues under it, so the row records the
+    /// last confirmed destination. Keeps a re-spelled base URL from stranding
+    /// a wallet.
+    #[tokio::test]
+    async fn re_observing_an_issuer_key_rebinds_it_to_that_destination() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+
+        seed_credential(&conn, "key-a", "http://localhost:8080", "nonce-a", 500).await;
+        let now = 1_700_000_000_000;
+        upsert_issuer_key(
+            &conn,
+            "key-a",
+            "params-hash",
+            b"pk",
+            b"ds",
+            "http://127.0.0.1:8080",
+            99_999_999_999_999,
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            find_spendable_credential(&conn, 50, "http://localhost:8080")
+                .await
+                .unwrap()
+                .is_none(),
+            "the key no longer belongs to the stale spelling"
+        );
+        assert_eq!(
+            find_spendable_credential(&conn, 50, "http://127.0.0.1:8080")
+                .await
+                .unwrap()
+                .expect("re-bound to the observed destination")
+                .nonce,
+            "nonce-a"
+        );
+    }
+
     #[tokio::test]
     async fn initialize_is_idempotent() {
         let db = open_memory_fresh().await;
@@ -5893,6 +6096,7 @@ mod tests {
             "ph",
             b"pub",
             b"params",
+            "http://issuer.test",
             99_999_999_999_999,
             1_000,
         )
@@ -6135,9 +6339,18 @@ mod tests {
         assert_eq!(states, vec![("nonce-2", "active"), ("nonce-1", "spent")]);
 
         // An expired issuer key flips its credentials to expired.
-        upsert_issuer_key(&conn, "ik-exp", "ph", b"pub", b"params", 1, 1_000)
-            .await
-            .unwrap();
+        upsert_issuer_key(
+            &conn,
+            "ik-exp",
+            "ph",
+            b"pub",
+            b"params",
+            "http://issuer.test",
+            1,
+            1_000,
+        )
+        .await
+        .unwrap();
         insert_pre_credential_issuance(&conn, "pc-exp", "ik-exp", b"pre", 5, 4_000)
             .await
             .unwrap();

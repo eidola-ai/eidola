@@ -507,6 +507,211 @@ fn auto_provisioning_empty_wallet_funded_account_succeeds() {
 }
 
 // ===========================================================================
+// Issuer-scoped credential selection
+//
+// A spend proof is bound to one issuer's key, so a credential is money at
+// exactly one server. Selection carries that scope (`issuer_key.base_url`,
+// recorded at allocation from the destination whose `/v1/keys` minted it), so
+// a turn against one server can never pick up — and flip to `spending` — a
+// credential another server issued. Each mock upstream generates its own ACT
+// issuer key, so a second mock *is* a second issuer.
+// ===========================================================================
+
+#[test]
+fn a_foreign_issued_credential_is_never_spent_against_another_server() {
+    run(|| {
+        // Server A issues the wallet's credential.
+        let (mock_a, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("chat against the issuing server");
+
+        let before = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert_eq!(before.len(), 1, "one active successor; got {before:?}");
+        assert_eq!(
+            before[0].issuer_base_url, mock_a.base_url,
+            "the credential is bound to the server that issued it"
+        );
+
+        // Re-point at a second server — a different issuer, and no balance to
+        // allocate a fresh credential from.
+        let mock_b = core.runtime().block_on(chat_harness::start(MockConfig {
+            balance: 1,
+            ..MockConfig::default()
+        }));
+        core.runtime()
+            .block_on(core.set_base_url(mock_b.base_url.clone()))
+            .expect("re-point at server B");
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("second".into(), MODEL.into(), None))
+            .expect_err("A's credits are not spendable at B");
+        // Foreign-issued credits read as an ordinary shortfall, not a class of
+        // their own: the wallet holds credits, but none this server can verify.
+        assert!(
+            matches!(err.root(), AppError::InsufficientBalance { .. }),
+            "got {err:?}"
+        );
+
+        // No request was ever sent to B with A's credential.
+        assert_eq!(
+            mock_b.chat_hits(),
+            0,
+            "the turn must fail at selection, not at the wrong issuer"
+        );
+        // And A's credential is untouched — still active, never flipped to
+        // `spending` (which is what the old unscoped pickup did).
+        let after = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].nonce, before[0].nonce);
+        assert_eq!(after[0].issuer_base_url, mock_a.base_url);
+        let in_flight = core
+            .runtime()
+            .block_on(core.wallet_spending_credentials())
+            .expect("spending");
+        assert!(
+            in_flight.is_empty(),
+            "nothing should have been flipped to spending; got {in_flight:?}"
+        );
+    });
+}
+
+#[test]
+fn each_server_spends_its_own_credential_when_the_base_url_moves() {
+    run(|| {
+        // A funds a turn, leaving an active successor.
+        let (mock_a, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("at A".into(), MODEL.into(), None))
+            .expect("chat at A");
+        let a_nonce = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet")[0]
+            .nonce
+            .clone();
+
+        // B has balance, so its turn auto-allocates its *own* credential
+        // rather than reaching for A's.
+        let mock_b = core.runtime().block_on(chat_harness::start(MockConfig {
+            balance: 10_000_000,
+            ..MockConfig::default()
+        }));
+        core.runtime()
+            .block_on(core.set_base_url(mock_b.base_url.clone()))
+            .expect("re-point at server B");
+        core.runtime()
+            .block_on(core.chat("at B".into(), MODEL.into(), None))
+            .expect("chat at B auto-provisions from B");
+
+        let creds = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert_eq!(creds.len(), 2, "one credential per issuer; got {creds:?}");
+        assert!(
+            creds
+                .iter()
+                .any(|c| c.nonce == a_nonce && c.issuer_base_url == mock_a.base_url),
+            "A's credential is still whole; got {creds:?}"
+        );
+        assert!(
+            creds.iter().any(|c| c.issuer_base_url == mock_b.base_url),
+            "B issued its own; got {creds:?}"
+        );
+
+        // Pointing back at A spends A's existing credential — same-issuer
+        // selection still works, and no second allocation happens there.
+        core.runtime()
+            .block_on(core.set_base_url(mock_a.base_url.clone()))
+            .expect("re-point at server A");
+        core.runtime()
+            .block_on(core.chat("back at A".into(), MODEL.into(), None))
+            .expect("chat at A reuses A's credential");
+
+        let creds = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert_eq!(
+            creds
+                .iter()
+                .filter(|c| c.issuer_base_url == mock_a.base_url)
+                .count(),
+            1,
+            "A's credential was spent and succeeded, not supplemented by a \
+             fresh allocation; got {creds:?}"
+        );
+        assert!(
+            creds.iter().all(|c| c.nonce != a_nonce),
+            "the spent credential was replaced by its successor; got {creds:?}"
+        );
+    });
+}
+
+#[test]
+fn refund_recovery_only_replays_a_hold_at_the_server_that_issued_it() {
+    run(|| {
+        // A hold stranded in `spending` at server A (its refund endpoint 500s).
+        let (mock_a, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::Non2xx(500),
+            refund: RefundMode::Fail,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("boom".into(), MODEL.into(), None))
+            .expect_err("non-2xx fails");
+        let a_refund_hits = mock_a.refund_hits();
+        assert!(a_refund_hits >= 1, "recovery was attempted at A");
+
+        // Point at another server and recover: A's spend proof means nothing
+        // to B, and replaying it there would hand B a nullifier for free.
+        let mock_b = core
+            .runtime()
+            .block_on(chat_harness::start(MockConfig::default()));
+        core.runtime()
+            .block_on(core.set_base_url(mock_b.base_url.clone()))
+            .expect("re-point at server B");
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("recovery runs");
+        assert!(recovered.is_empty(), "got {recovered:?}");
+        assert_eq!(
+            mock_b.refund_hits(),
+            0,
+            "a foreign hold must not be replayed at another server"
+        );
+
+        // The hold is still eligible at its own issuer — the skip is scoped,
+        // not blanket (this mock keeps refusing, so nothing recovers, but the
+        // request is made).
+        core.runtime()
+            .block_on(core.set_base_url(mock_a.base_url.clone()))
+            .expect("re-point at server A");
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("recovery runs");
+        assert!(recovered.is_empty(), "A still refuses; got {recovered:?}");
+        assert!(
+            mock_a.refund_hits() > a_refund_hits,
+            "pointing back at the issuer replays the hold there"
+        );
+    });
+}
+
+// ===========================================================================
 // Typed failure: pre-space errors leave zero durable trace, emit nothing
 // ===========================================================================
 
