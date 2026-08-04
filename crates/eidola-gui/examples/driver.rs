@@ -494,7 +494,7 @@ mod driver {
                     });
                     let space = view.read(cx).space().clone();
                     space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
-                    view.update(cx, |v, cx| v.set_inspector_open_for_test(true, cx));
+                    view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
                     root(view, window, cx)
                 },
             },
@@ -515,7 +515,7 @@ mod driver {
                     });
                     let space = view.read(cx).space().clone();
                     space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
-                    view.update(cx, |v, cx| v.set_inspector_open_for_test(true, cx));
+                    view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
                     root(view, window, cx)
                 },
             },

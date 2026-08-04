@@ -95,7 +95,7 @@ fn register_space(s: &mut Snapshots) {
                 view.space().update(cx, |sp, cx| {
                     sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
                 });
-                view.set_inspector_open_for_test(true, cx);
+                view.set_inspector_open_for_test(true, window, cx);
                 view
             })
         },
