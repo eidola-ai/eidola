@@ -363,6 +363,31 @@ fn validate_hex_field(value: &str, field: &str) -> Result<String, AppError> {
     Ok(value.to_ascii_lowercase())
 }
 
+/// Check an attestation (ATC) endpoint override — the same scheme rule the
+/// `eidola` row applies to `base_url`, which this key had never had. Blank
+/// is accepted here and means *clear* (see `AppCore::set_attestation_url`);
+/// everything else must name an http(s) endpoint, because the value is used
+/// verbatim as a URL and a typo would otherwise persist and fail at every
+/// handshake instead of at the setter.
+pub fn validate_attestation_url(url: &str) -> Result<(), AppError> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Ok(());
+    }
+    Err(AppError::Config {
+        message: "attestation URL must start with http:// or https://".into(),
+    })
+}
+
+/// Check that a certificate value parses, without writing anything — the
+/// pure half of the hardware-CA setters, exposed so a caller applying a
+/// batch of trust-bundle changes can validate every input *before* it
+/// applies the first one. The setters re-validate on write; this is the
+/// same rule read early, not a second one.
+pub fn validate_cert_pem(value: &str, field_name: &str) -> Result<(), AppError> {
+    parse_cert_config(Some(value), field_name).map(|_| ())
+}
+
 /// Parse a PEM or raw base64 DER certificate from a config value.
 pub(crate) fn parse_cert_config(
     value: Option<&str>,

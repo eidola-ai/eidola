@@ -51,9 +51,15 @@ services:
       # Default targets the in-compose `server` container. Override with
       # `SHIM_UPSTREAM_URL=http://host.docker.internal:8080` to forward to a
       # cargo-built server running on the host (see `just services`).
-      UPSTREAM_URL: ${SHIM_UPSTREAM_URL:-http://server:8080}
-      LISTEN_ADDR: 0.0.0.0:8443
-      CERT_DIR: /src/.dev-certs
+      - UPSTREAM_URL=${SHIM_UPSTREAM_URL:-http://server:8080}
+      - LISTEN_ADDR=0.0.0.0:8443
+      - CERT_DIR=/src/.dev-certs
+      # Bare pass-through (no `=`): forwarded only when set in the environment
+      # running compose (or in `.env`), so an unset var leaves the shim on its
+      # all-zeros default instead of an empty measurement, which would panic
+      # it. `scripts/local-client.sh` reads the same variable, so one value
+      # governs both what the shim advertises and what the client trusts.
+      - DEV_MEASUREMENT
     ports:
       - "8443:8443"
     volumes:

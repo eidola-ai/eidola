@@ -34,6 +34,13 @@ enum Command {
         /// Remove a trusted enclave release by SNP measurement
         #[arg(long)]
         untrust_measurement: Option<String>,
+        /// Drop every trusted-measurement override (revert to the pin)
+        #[arg(
+            long,
+            conflicts_with = "trust_measurement",
+            conflicts_with = "untrust_measurement"
+        )]
+        clear_trusted_measurements: bool,
         /// Remove the base-URL override (revert to the trust-root pin)
         #[arg(long, conflicts_with = "base_url")]
         clear_base_url: bool,
@@ -354,6 +361,37 @@ fn build_core() -> Result<AppCore, AppError> {
     AppCore::new(config_dir, data_dir)
 }
 
+/// Read a hardware-CA PEM from disk and check that it parses — the two
+/// input-shaped ways `--hardware-*-ca` can fail, both pulled ahead of every
+/// write so `configure` can't commit half a trust bundle. `None` path in,
+/// `None` out.
+fn read_ca_pem(path: Option<&str>, field_name: &str) -> Result<Option<String>, AppError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let pem = std::fs::read_to_string(path).map_err(|e| AppError::Config {
+        message: format!("failed to read {path}: {e}"),
+    })?;
+    // A path the user typed that points at an empty file is never an
+    // intentional clear. Blank means "no value" on the *config* surface, so
+    // `parse_cert_config` maps it to `None` and the setter then clears the
+    // column — correct there, silent corruption here: a truncated cert would
+    // revert the chain to the production pin while `--base-url` aimed the
+    // client at the mock shim, and `configure` would exit 0 reporting the CA
+    // "set". Clearing has its own verb; a file input has to name a file.
+    if pem.trim().is_empty() {
+        let flag = field_name.replace('_', "-");
+        return Err(AppError::Config {
+            message: format!(
+                "{path} is empty — --{flag} must name a certificate file \
+                 (use --clear-{flag} to revert to the trust-root pin)"
+            ),
+        });
+    }
+    config::validate_cert_pem(&pem, field_name)?;
+    Ok(Some(pem))
+}
+
 /// Print an error plus, for the typed variants a user can act on, a hint.
 ///
 /// Looks through the `ChatFailed` wrapper that `chat`/`chat_stream` attach
@@ -511,6 +549,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             hardware_intermediate_ca,
             trust_measurement,
             untrust_measurement,
+            clear_trusted_measurements,
             clear_base_url,
             clear_hardware_root_ca,
             clear_hardware_intermediate_ca,
@@ -521,6 +560,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 && hardware_intermediate_ca.is_none()
                 && trust_measurement.is_none()
                 && untrust_measurement.is_none()
+                && !clear_trusted_measurements
                 && !clear_base_url
                 && !clear_hardware_root_ca
                 && !clear_hardware_intermediate_ca
@@ -529,6 +569,32 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     message: "specify at least one option (see --help)".into(),
                 });
             }
+            // ── Resolve and validate every input before applying any of
+            // them. `configure` writes the trust bundle one column at a
+            // time, so a late parse failure used to leave the client
+            // half-redirected — base URL committed, measurement rejected,
+            // exit 1. Every input-shaped failure now happens here, before
+            // the first write. (`--base-url` is validated by its own setter,
+            // which is the first write, so an invalid URL still commits
+            // nothing.) What this does not cover is a *write* failing
+            // mid-sequence — a local DB error, not an input shape.
+            let root_ca_pem = read_ca_pem(hardware_root_ca.as_deref(), "hardware_root_ca")?;
+            let intermediate_ca_pem = read_ca_pem(
+                hardware_intermediate_ca.as_deref(),
+                "hardware_intermediate_ca",
+            )?;
+            if let Some(url) = attestation_url.as_deref() {
+                config::validate_attestation_url(url)?;
+            }
+            let trust_entry = match trust_measurement.as_deref() {
+                Some(spec) => Some(config::parse_trust_measurement(spec)?),
+                None => None,
+            };
+            let untrust_key = match untrust_measurement.as_deref() {
+                Some(spec) => Some(config::parse_untrust_key(spec)?),
+                None => None,
+            };
+
             if let Some(url) = base_url {
                 core.set_base_url(url.clone()).await?;
                 println!("base_url set to {url}");
@@ -547,24 +613,27 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             if let Some(url) = attestation_url {
                 core.set_attestation_url(url.clone())?;
-                println!("attestation_url set to {url}");
+                if url.trim().is_empty() {
+                    println!("attestation_url override removed (using the default ATC)");
+                } else {
+                    println!("attestation_url set to {url}");
+                }
             }
-            if let Some(path) = hardware_root_ca {
-                let pem = std::fs::read_to_string(&path).map_err(|e| AppError::Config {
-                    message: format!("failed to read {path}: {e}"),
-                })?;
+            if let Some(pem) = root_ca_pem {
                 core.set_hardware_root_ca(pem).await?;
-                println!("hardware_root_ca set from {path}");
+                println!(
+                    "hardware_root_ca set from {}",
+                    hardware_root_ca.unwrap_or_default()
+                );
             }
-            if let Some(path) = hardware_intermediate_ca {
-                let pem = std::fs::read_to_string(&path).map_err(|e| AppError::Config {
-                    message: format!("failed to read {path}: {e}"),
-                })?;
+            if let Some(pem) = intermediate_ca_pem {
                 core.set_hardware_intermediate_ca(pem).await?;
-                println!("hardware_intermediate_ca set from {path}");
+                println!(
+                    "hardware_intermediate_ca set from {}",
+                    hardware_intermediate_ca.unwrap_or_default()
+                );
             }
-            if let Some(spec) = trust_measurement {
-                let m = config::parse_trust_measurement(&spec)?;
+            if let Some(m) = trust_entry {
                 let added = core
                     .trust_measurement(
                         m.snp_measurement.clone(),
@@ -581,8 +650,11 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     println!("measurement already trusted (snp={})", m.snp_measurement);
                 }
             }
-            if let Some(spec) = untrust_measurement {
-                let key = config::parse_untrust_key(&spec)?;
+            if clear_trusted_measurements {
+                core.clear_trusted_measurements().await?;
+                println!("trusted_measurements override removed (using the trust-root pin)");
+            }
+            if let Some(key) = untrust_key {
                 let removed = core.untrust_measurement(key.clone()).await?;
                 if removed {
                     println!("removed trusted measurement (snp={key})");
