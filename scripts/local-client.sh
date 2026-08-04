@@ -10,8 +10,9 @@
 # Wrapped by `just client-local` / `just client-reset`.
 #
 # What this touches: nothing but the `eidola` backend row in *your* local
-# database (`~/Library/Application Support/eidola/eidola.db` on macOS), via
-# the sanctioned `eidola configure` surface. Each of the four values it
+# database — `eidola.db` in whatever data directory the CLI resolves for this
+# platform (`eidola` prints its config path) — via the sanctioned `eidola
+# configure` surface. Each of the four values it
 # writes — base URL, ARK, ASK, trusted measurement — is a per-column
 # override of the trust-root pin compiled into the binary; `disable` clears
 # every one back to NULL, which *is* the pin. No release behavior is
@@ -273,8 +274,21 @@ untrust_ca_note() {
 # blank input used to read as clear-to-pin). The CLI rejects blank contents
 # too — this just fails earlier, with the hint that names the cause.
 require_certs() {
-    if [ ! -s "$ARK" ] || [ ! -s "$ASK" ]; then
-        echo "ERROR: $ARK / $ASK missing or empty." >&2
+    # All three, including the TLS root: the shim mints them in order (ARK,
+    # ASK, then TLS-CA), so an interrupted first boot leaves a partial set —
+    # and a set without `tls-ca.pem` used to pass, commit every override, and
+    # leave the client redirected to a shim whose chain nothing can verify,
+    # with the trust command naming a file that isn't there.
+    local missing=()
+    local f
+    for f in "$ARK" "$ASK" "$TLS_CA"; do
+        [ -s "$f" ] || missing+=("$f")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "ERROR: missing or empty in $CERT_DIR:" >&2
+        for f in "${missing[@]}"; do
+            echo "         $(basename "$f")" >&2
+        done
         echo "       The mock shim mints its cert set on first boot — start the" >&2
         echo "       stack once with \`just dev\` (or \`just services\`), then retry." >&2
         echo "       (Delete .dev-certs/ to have it mint a fresh set.)" >&2
@@ -294,8 +308,20 @@ require_certs() {
 # pre-flight works with no stack running — verified by running them against an
 # unreachable base URL.
 
-profile_has_account() {
-    cli | grep -q '^account_id: <set>'
+# The config file, taken from the CLI's own answer rather than guessed.
+# `dirs::config_dir()` resolves somewhere different on every platform, and
+# this file holds the only copy of an account secret the user is about to be
+# told to destroy — naming the wrong one sends a Linux user to `account
+# reset` without ever finding their id/secret. Falls back to naming the
+# command when the CLI reports no resolvable path (`None`).
+config_path_from_status() {
+    local path
+    path="$(printf '%s\n' "$1" | sed -n 's/^config path: Some("\(.*\)")$/\1/p')"
+    if [ -n "$path" ]; then
+        printf '%s' "$path"
+    else
+        printf '%s' '(run `eidola` — its "config path" line names the file)'
+    fi
 }
 
 # Prints "<in-flight> <active>" — the two sections of `wallet credentials
@@ -313,10 +339,13 @@ credential_counts() {
 # Pre-flight for `enable`: what this profile is about to carry into a stack
 # that did not issue it. Silent on a clean profile.
 warn_server_bound_state() {
-    local in_flight active
+    local in_flight active status
     read -r in_flight active <<<"$(credential_counts)"
+    status="$(cli)"
 
-    if profile_has_account; then
+    if printf '%s\n' "$status" | grep -q '^account_id: <set>'; then
+        # Quoted heredocs (the literal backticks are prose, not commands),
+        # with the resolved path echoed between them.
         cat <<'EOF'
 ==> WARNING: this profile has an account, and it belongs to the server you
     are leaving. The local stack has never heard of it.
@@ -326,7 +355,9 @@ warn_server_bound_state() {
     the local stack means running `eidola account reset` first — and that
     DISCARDS the id and secret from config.toml. Copy them somewhere first:
 
-        ~/Library/Application Support/eidola/config.toml   (macOS)
+EOF
+        echo "        $(config_path_from_status "$status")"
+        cat <<'EOF'
 
     `eidola account configure --id <id> --secret <secret>` puts them back.
 
