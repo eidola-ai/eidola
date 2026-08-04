@@ -101,13 +101,16 @@ impl LaunchOptions {
 ///   and letting the last visitor leaving stop the service would defeat the
 ///   launch mode entirely.
 /// - **macOS with windows.** Never — the platform idiom, and the reason
-///   `on_reopen` exists. Quit is `⌘Q` / the menu, and it is a full shutdown
-///   (decided): engines, everything.
-/// - **Linux with windows.** With the last window closed. Until the wave-3
-///   tray (best-effort, never load-bearing) and the wave-4 socket, a Linux
-///   process with no window has no way to be reached or quit — a lingering
-///   headless process would just be a leak. A user who *wants* the
-///   long-lived process asks for it explicitly with `--windowless`.
+///   `on_reopen` exists. Leaving is `⌘Q`, which since wave 3b **retires the
+///   app to the background** behind its status item rather than ending it
+///   ([`crate::status_item::quit_or_retire`]); the full shutdown is the
+///   status menu's own Quit.
+/// - **Linux with windows.** With the last window closed. There is no tray
+///   (decided): until the wave-4 socket, a Linux process with no window has
+///   no way to be reached or quit — a lingering headless process would just
+///   be a leak. A user who *wants* the long-lived process asks for it
+///   explicitly with `--windowless`, which is what the systemd user unit
+///   launches.
 pub fn quit_mode(opts: LaunchOptions) -> QuitMode {
     if opts.windowless || cfg!(target_os = "macos") {
         QuitMode::Explicit
@@ -154,10 +157,42 @@ pub fn reactivate(cx: &mut App, open_when_empty: impl FnOnce(&mut App)) {
     cx.activate(true);
 }
 
+/// Close every open window, leaving the process running.
+///
+/// The window half of ⌘Q's retire-to-the-background (task 17 wave 3b;
+/// `status_item::quit_or_retire` pairs it with the `Accessory` flip). It is
+/// deliberately *not* `cx.quit()`: nothing on the quit path runs, so
+/// [`install_engine_shutdown`] never fires and the loaded engines survive.
+///
+/// gpui drops a window as its own `update_window` unwinds (`Window::removed`
+/// is read there), so the registry is genuinely empty when this returns — and
+/// `QuitMode::Explicit`, which macOS uses, means emptying it quits nothing.
+/// The handles are snapshotted first because the removal mutates the very
+/// registry `App::windows` reads.
+///
+/// **Do not call this from inside a window's own update.** A window being
+/// updated is still *listed* by `App::windows`, but `update_window` has taken
+/// its slot for the duration, so `handle.update` on it fails — and this sweep
+/// swallows that (there is nothing sensible to do with it) and moves on. The
+/// window quietly skipped is exactly the one that dispatched, since
+/// `App::dispatch_action` routes an action through the active window; that is
+/// every action handler. The caller defers (`status_item::quit_or_retire`
+/// does), which is why the failure is swallowed rather than reported.
+pub fn close_all_windows(cx: &mut App) {
+    for handle in cx.windows() {
+        handle
+            .update(cx, |_, window, _| window.remove_window())
+            .ok();
+    }
+}
+
 /// Best-effort teardown of local inference engines when the app quits.
 ///
-/// Quit is a full shutdown — engines, everything (decided) — and on macOS
-/// nothing else delivers it: `cx.quit()` becomes `[NSApp terminate:]`, which
+/// The *full* shutdown is a full shutdown — engines, everything — and on
+/// macOS nothing else delivers it. (⌘Q no longer reaches here: it retires the
+/// app and leaves the engines up, which is the point. The full shutdown is
+/// the status menu's Quit, or a `SIGTERM` in windowless mode.)
+/// `cx.quit()` becomes `[NSApp terminate:]`, which
 /// ends in `exit()`, so the tokio runtime is never dropped and the
 /// `kill_on_drop` reaping that covers the Linux path (where the event loop
 /// simply returns and `main` unwinds) never happens. Without this hook a

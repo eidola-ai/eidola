@@ -1,33 +1,58 @@
-//! The macOS status item and the Regular ⇄ Accessory activation flip
-//! (task 17, wave 3).
+//! The macOS status item and the background layer behind it (task 17,
+//! waves 3 and 3b).
 //!
-//! Wave 2 made the process outlive its windows. This wave gives that process
-//! a face: a menu-bar item that is always there, and — because the face
-//! exists — permission to drop the Dock icon when no window is open.
+//! Wave 2 made the process outlive its windows. Wave 3 gave that process a
+//! face — a menu-bar item that is always there. Wave 3b decided **what the
+//! face is for**, and that decision is the whole of this module's policy.
 //!
-//! ## The two halves, and why they ship together
+//! ## The model: LM Studio / 1Password, not "menu-bar app"
+//!
+//! Wave 3 flipped `Regular ⇄ Accessory` on the window count: the Dock icon
+//! left when the last window closed. Living with it showed that to be the
+//! wrong call — closing the last window dropped the app out of the Dock *and*
+//! the menu bar, so the reflexive ⌘N landed in whatever app was now
+//! frontmost. So (Mike, 2026-08-03):
+//!
+//! - **While the app is open it is an ordinary macOS app** — `Regular` even
+//!   with zero windows. Closing the last window changes nothing: Dock icon,
+//!   menu bar, ⌘N. There is no window-count-driven flip left.
+//! - **⌘Q retires to the background**: close every window, go `Accessory`
+//!   (the Dock indicator goes), and keep the process, the status item, the
+//!   stores, the bus bridge, and — the point of task 17 — the loaded engines
+//!   running. [`retire_to_background`].
+//! - **Full shutdown is the status menu's "Quit Eidola"**, which also carries
+//!   the ⌘Q key equivalent on its own `NSMenuItem`. That is wave 2's
+//!   teardown path, engines included; it is the only thing that calls
+//!   `cx.quit()`.
+//!
+//! ## The safety gate, and the one decision that encodes it
 //!
 //! An `Accessory` app has no Dock icon and no menu bar of its own. With zero
 //! windows and no status item it is invisible and unquittable except through
-//! Activity Monitor. So the flip is **gated on the status item existing**:
-//! [`policy_for`] returns `Regular` whenever no status item stands, however
-//! many windows are open. A status bar too full to accept another item (it
-//! happens) leaves the app in the wave-2 shape — Dock icon, reachable — which
-//! is a perfectly good app, not a broken one.
+//! Activity Monitor — so **retiring is gated on the status item existing**.
+//! [`quit_intent`] is that whole decision, and its second input is why ⌘Q is
+//! safe from either side:
 //!
-//! ## Two verbs, not one
+//! - **no status item ⇒ full shutdown.** There is no background layer to
+//!   retire into, so ⌘Q keeps the meaning it has always had rather than
+//!   leaving an invisible process.
+//! - **already retired ⇒ full shutdown.** The only way ⌘Q reaches an
+//!   `Accessory` app is while its status menu is open, and there the answer
+//!   must be "quit" whichever menu AppKit resolves the key equivalent
+//!   against. Encoding it here means we do not depend on AppKit's ordering
+//!   between an open `NSStatusItem` menu and the app's (unshown) main menu:
+//!   both routes land on a full shutdown.
 //!
-//! The policy is driven by the window count, and the two transitions are
-//! observed at different moments:
+//! ## One choke point for the way back
 //!
-//! - [`window_will_open`] runs *before* `cx.open_window` (from
-//!   `lib.rs::base_window_options`, the one choke point every window passes
-//!   through), because at that instant `cx.windows()` does not yet contain
-//!   the window being opened. It always resolves to `Regular` — a window
-//!   without a menu bar cannot dispatch ⌘N.
-//! - [`window_did_close`] runs from `App::on_window_closed`, which gpui fires
-//!   *after* removing the window from its registry — so `cx.windows().len()`
-//!   there is already the post-close count, and zero means the last one went.
+//! [`window_will_open`] is called from `lib.rs::base_window_options` — the
+//! one place every `cx.open_window` passes through — and asserts `Regular`.
+//! Putting it there rather than in each `open_*_window` makes "open a window
+//! while `Accessory`" unrepresentable, which matters because such a window
+//! would sit under some other app's menu bar with no ⌘N. It no longer
+//! consults a window count; it is now simply *the* door out of the
+//! background state, shared by the status menu's Open / New Space, Spotlight,
+//! `open -a`, and `Application::on_reopen`.
 //!
 //! ## The menu's moment of truth
 //!
@@ -60,17 +85,23 @@ pub enum ActivationPolicy {
     Accessory,
 }
 
-/// The one policy decision, as a pure function.
-///
-/// `status_item_present` is not decoration: without a status item an
-/// `Accessory` app with no windows cannot be reached or quit, so a failed
-/// status-item install degrades to the wave-2 behaviour (Dock icon, always)
-/// rather than to an invisible process.
-pub fn policy_for(window_count: usize, status_item_present: bool) -> ActivationPolicy {
-    if window_count > 0 || !status_item_present {
-        ActivationPolicy::Regular
+/// What ⌘Q — the app's own Quit action — should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitIntent {
+    /// Close every window and drop to `Accessory`, keeping the process, the
+    /// status item, the stores and the loaded engines.
+    Retire,
+    /// The wave-2 teardown: engines drained, `cx.quit()`, process gone.
+    FullShutdown,
+}
+
+/// The one quit decision, as a pure function. See the module docs for why
+/// both inputs mean "full shutdown".
+pub fn quit_intent(status_item_present: bool, already_retired: bool) -> QuitIntent {
+    if status_item_present && !already_retired {
+        QuitIntent::Retire
     } else {
-        ActivationPolicy::Accessory
+        QuitIntent::FullShutdown
     }
 }
 
@@ -83,7 +114,9 @@ pub enum StatusCommand {
     Open,
     /// ⌘N.
     NewSpace,
-    /// ⌘Q — a full shutdown, engines included (decided).
+    /// The **full** shutdown — engines included (`crate::actions::QuitApp`),
+    /// as against the app's ⌘Q, which now retires to the background. This is
+    /// the only door that ends the process from the UI.
     Quit,
 }
 
@@ -93,6 +126,21 @@ impl StatusCommand {
             Self::Open => "Open Eidola",
             Self::NewSpace => "New Space",
             Self::Quit => "Quit Eidola",
+        }
+    }
+
+    /// The item's `keyEquivalent` (⌘ implied — AppKit's default modifier
+    /// mask, which we set explicitly anyway).
+    ///
+    /// **Quit carries ⌘Q on the status menu itself**, which is what makes
+    /// "⌘Q while the toolbar app has focus" a full shutdown: an
+    /// `NSStatusItem` menu is not part of the main menu, so this equivalent
+    /// is reachable only while that menu is open — precisely the moment the
+    /// user means the background layer rather than a window.
+    pub fn key_equivalent(self) -> &'static str {
+        match self {
+            Self::Quit => "q",
+            Self::Open | Self::NewSpace => "",
         }
     }
 
@@ -168,9 +216,8 @@ pub fn engine_lines(engines: Option<&LocalModelsState>) -> Vec<String> {
     }
 }
 
-/// Create the status item and wire the activation-policy flip. Called once at
-/// launch, after the action handlers exist (the menu dispatches them) and
-/// before the first window opens.
+/// Create the status item. Called once at launch, after the action handlers
+/// exist (the menu dispatches them) and before the first window opens.
 ///
 /// A no-op off macOS: Linux tray support is deliberately deferred (see the
 /// task-17 discussion — StatusNotifierItem is fragmented and never
@@ -186,8 +233,8 @@ pub fn install(stores: &Stores, opts: LaunchOptions, cx: &mut App) {
 }
 
 /// Declare that a window is about to be opened — the app must be `Regular`
-/// before it appears, or it gets no menu bar. See the module docs for why
-/// this is a separate verb from [`window_did_close`].
+/// before it appears, or it gets no menu bar. The one door out of the
+/// background state; see the module docs for why it lives at a choke point.
 pub fn window_will_open(cx: &mut App) {
     #[cfg(target_os = "macos")]
     macos::window_will_open(cx);
@@ -197,14 +244,18 @@ pub fn window_will_open(cx: &mut App) {
     }
 }
 
-/// Re-decide the policy after a window closed.
-pub fn window_did_close(cx: &mut App) {
+/// The app's ⌘Q: retire to the background where there is a background to
+/// retire into, and otherwise the full shutdown ⌘Q has always been.
+///
+/// The decision is [`quit_intent`]; this is the half that touches the world.
+/// **Off macOS it is always the full shutdown** — Linux's background layer is
+/// the systemd user service (`--windowless`), not a tray, so a windowed Linux
+/// app quitting on Ctrl+Q is exactly right and nothing here changes it.
+pub fn quit_or_retire(cx: &mut App) {
     #[cfg(target_os = "macos")]
-    macos::window_did_close(cx);
+    macos::quit_or_retire(cx);
     #[cfg(not(target_os = "macos"))]
-    {
-        let _ = cx;
-    }
+    cx.quit();
 }
 
 #[cfg(test)]
@@ -242,14 +293,29 @@ mod tests {
     }
 
     #[test]
-    fn the_flip_needs_a_status_item_to_be_survivable() {
-        // With a status item: no windows means menu-bar-only.
-        assert_eq!(policy_for(0, true), ActivationPolicy::Accessory);
-        assert_eq!(policy_for(1, true), ActivationPolicy::Regular);
-        // Without one, Accessory would make the app unreachable — so the
-        // Dock icon stays whatever the window count says.
-        assert_eq!(policy_for(0, false), ActivationPolicy::Regular);
-        assert_eq!(policy_for(3, false), ActivationPolicy::Regular);
+    fn retiring_needs_a_status_item_to_retire_into() {
+        // The ordinary case: a door in the menu bar, so ⌘Q parks the app
+        // behind it instead of killing the engines.
+        assert_eq!(quit_intent(true, false), QuitIntent::Retire);
+        // No door: retiring would leave an invisible, unquittable process,
+        // so ⌘Q keeps the meaning it has always had.
+        assert_eq!(quit_intent(false, false), QuitIntent::FullShutdown);
+    }
+
+    #[test]
+    fn a_second_quit_from_the_background_ends_the_process() {
+        // ⌘Q can only reach an already-retired app through its status menu,
+        // and there it means quit — whichever menu AppKit resolves the key
+        // equivalent against, both routes land here.
+        assert_eq!(quit_intent(true, true), QuitIntent::FullShutdown);
+        assert_eq!(quit_intent(false, true), QuitIntent::FullShutdown);
+    }
+
+    #[test]
+    fn only_quit_claims_a_key_equivalent() {
+        assert_eq!(StatusCommand::Quit.key_equivalent(), "q");
+        assert_eq!(StatusCommand::Open.key_equivalent(), "");
+        assert_eq!(StatusCommand::NewSpace.key_equivalent(), "");
     }
 
     #[test]
