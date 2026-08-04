@@ -413,8 +413,10 @@ impl SpaceView {
             })
     }
 
-    /// Whether the **selected path** carries a live streaming overlay — the
-    /// honest scope for tail-following (`follow_streaming_tail`).
+    /// **Which** turn's streaming leaf the **selected path** carries, if any (a
+    /// streaming overlay is always a leaf, so there is at most one) — the
+    /// honest scope for tail-following (`follow_streaming_tail`), and the
+    /// identity a completed turn is followed by (`follow_completed_turn`).
     ///
     /// "Is some turn streaming?" is a *space*-wide question, and Participants v1
     /// makes concurrent turns on sibling branches ordinary: a fan-out streams
@@ -427,14 +429,19 @@ impl SpaceView {
     /// `caret_into_view` path owns). Like every other selection question here it
     /// is answered by *observation* of the tree the frame actually renders — no
     /// flag, no mode.
-    pub(crate) fn selected_path_is_streaming(
-        &self,
-        roots: &[TreeNode],
-        page_width: Pixels,
-    ) -> bool {
+    ///
+    /// It names the turn rather than merely reporting one because the second
+    /// consumer asks *after the fact*: a completed turn's leaf is gone from the
+    /// tree, so "was the reader parked on it?" can only be answered by what the
+    /// last frame observed — which `render` records in
+    /// [`super::SpaceView::selected_turn`].
+    pub(crate) fn selected_turn_seq(&self, roots: &[TreeNode], page_width: Pixels) -> Option<u64> {
         self.selected_levels(roots, page_width)
             .into_iter()
-            .any(|(sibs, active)| matches!(sibs[active].src, NodeSrc::Streaming(_)))
+            .find_map(|(sibs, active)| match sibs[active].src {
+                NodeSrc::Streaming(seq) => Some(seq),
+                _ => None,
+            })
     }
 
     /// Document-space top of a node that is **on the selected path** (after
