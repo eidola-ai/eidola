@@ -100,6 +100,51 @@ fn library_listing_is_a_named_list(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// The Library's one op-error banner: a refused create / rename / archive is an
+/// `Alert` whose label is the sentence itself (there is no `aria_live` at this
+/// pin, so an Alert is perceivable but silent — the message must therefore be
+/// what a reader lands on), beside a real Dismiss button.
+#[gpui::test]
+fn library_op_error_banner_is_an_alert_with_a_dismiss(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![space_info("s1", Some("Tides and the moon"))];
+    });
+    let refusal = "Couldn't rename this space: space not found: s1";
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(
+            Some("s1".into()),
+            vec![space_info("s1", Some("Tides and the moon"))],
+            Some(refusal),
+            cx,
+        )
+    });
+    let stores_for_view = stores.clone();
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores_for_view, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(&entries, "library/op-error", gpui::Role::Alert, refusal);
+    assert_probe(
+        &entries,
+        "library/op-error/dismiss",
+        gpui::Role::Button,
+        "Dismiss",
+    );
+
+    // Dismissing is the store's, so the banner leaves every window at once.
+    stores.spaces.update(cx, |s, cx| s.clear_op_error(cx));
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries.iter().any(|(n, _)| n == "library/op-error"),
+        "a dismissed refusal leaves no banner behind"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn settings_nav_and_content_are_landmarks(cx: &mut TestAppContext) {
     use eidola_gui::settings::{SettingsPane, SettingsView};

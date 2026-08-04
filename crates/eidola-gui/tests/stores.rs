@@ -835,3 +835,158 @@ fn a_space_change_re_reads_only_cached_settings(cx: &mut TestAppContext) {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// SpacesStore — the Library index's optimistic mutations.
+// ---------------------------------------------------------------------------
+
+/// A listing row the database does not have — the stale-id case (another writer
+/// archived the space; a listing that outlived its rows). Seeded through the
+/// store's own settle, so the cell is exactly what a landed re-list leaves.
+fn stale_row(id: &str) -> eidola_app_core::SpaceInfo {
+    let ts = eidola_app_core::now_ms();
+    eidola_app_core::SpaceInfo {
+        id: id.into(),
+        title: Some("Tides".into()),
+        snippet: None,
+        created_at: ts,
+        last_activity_at: ts,
+        message_count: 2,
+        archived_at: None,
+    }
+}
+
+/// **A refused rename must not stand.** The optimistic title edit is what makes
+/// the Library answer without a round trip; ignoring the write's `Err` left the
+/// Library, the window title, and the inspector's title field all showing a name
+/// nothing ever persisted, until an unrelated refresh took it away without a
+/// word. The cure is the write-through shape: the refusal lands in `op_error`
+/// (tagged with the space it was about) and the re-list runs on the failure
+/// exit, reconciling the cached index back to what the database holds.
+#[gpui::test]
+fn a_refused_rename_reconciles_the_index_and_surfaces_the_refusal(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let real = core
+        .runtime()
+        .block_on(core.create_space(Some("Nile".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(None, vec![stale_row("ghost")], None, cx)
+    });
+
+    stores
+        .spaces
+        .update(cx, |s, cx| s.rename("ghost".into(), "Renamed".into(), cx));
+    wait_until(cx, "the refusal surfaces", |cx| {
+        stores.spaces.read_with(cx, |s, _| s.op_error().is_some())
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        assert!(
+            s.op_error_for("ghost").is_some(),
+            "the refusal is tagged with the space it was about, so only that \
+             space's inspector shows it"
+        );
+        assert!(
+            !s.list().iter().any(|r| r.id == "ghost"),
+            "the optimistic title never stands: the mutation re-lists on its \
+             failure exit"
+        );
+        assert!(
+            s.list().iter().any(|r| r.id == real),
+            "and what it lands is the database's listing"
+        );
+        assert!(
+            !s.index().is_loading(),
+            "the mutation must resolve the cell it took the read from"
+        );
+    });
+}
+
+/// The same rule for archive, over its one refusal that is not an error: a
+/// `false` return means nothing was archived (the space was already archived —
+/// the race the Library's × can lose — or is not there at all), so the row this
+/// operation had already dropped from the listing was not its to drop. Say so
+/// rather than let an optimistic removal read as an unearned success.
+///
+/// The teeth here are the *refusal*: this scenario's listing is empty whether or
+/// not the re-list is conditional (the space really is archived). The re-list's
+/// own teeth live on the rename above, where a refused write's optimistic edit
+/// is what the re-list has to take back.
+#[gpui::test]
+fn an_archive_that_changed_nothing_says_so(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(Some("Tides".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the index loads", |cx| {
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.list().iter().any(|r| r.id == space))
+    });
+
+    // Another writer archives it first. (No bus bridge in these tests, so the
+    // cached index still shows the row — exactly the state a second window is
+    // in between the write and its invalidation.)
+    core.runtime()
+        .block_on(core.archive_space(space.clone()))
+        .expect("archive");
+
+    stores
+        .spaces
+        .update(cx, |s, cx| s.archive(space.clone(), cx));
+    wait_until(cx, "the refusal surfaces", |cx| {
+        stores.spaces.read_with(cx, |s, _| s.op_error().is_some())
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        assert!(s.op_error_for(&space).is_some());
+        assert!(s.list().is_empty(), "and the listing is re-read either way");
+        assert!(!s.index().is_loading());
+    });
+}
+
+/// The refresh-vs-mutation rule for this store — and the sharpest case there
+/// is, because a rename emits the very `Change::SpaceIndex` that routes back
+/// here as a refresh. While the two shared one slot, that refresh replaced the
+/// write's task: the core write still ran (`bridge` drops the tokio
+/// `JoinHandle`), but the continuation carrying its refusal and its re-list
+/// never did — a refused rename indistinguishable from an accepted one.
+#[gpui::test]
+fn a_refresh_landing_mid_rename_keeps_the_spaces_ops_error(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let real = core
+        .runtime()
+        .block_on(core.create_space(Some("Nile".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(None, vec![stale_row("ghost")], None, cx)
+    });
+    stores
+        .spaces
+        .update(cx, |s, cx| s.rename("ghost".into(), "Renamed".into(), cx));
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::SpaceIndex), cx));
+
+    wait_until(cx, "the refusal surfaces", |cx| {
+        stores.spaces.read_with(cx, |s, _| s.op_error().is_some())
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        assert!(
+            s.list().iter().any(|r| r.id == real),
+            "the mutation re-listed on its failure exit"
+        );
+        assert!(
+            !s.index().is_loading(),
+            "the mutation must resolve the cell it took the read from"
+        );
+    });
+}
