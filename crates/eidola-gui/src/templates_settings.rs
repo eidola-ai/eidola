@@ -39,9 +39,9 @@ use gpui_component::{
 };
 
 use crate::participants_view::{
-    DEFAULT_AGENT_SYSTEM_PROMPT, NOTIFY_POLICIES, error_banner, field_label, ghost_button,
-    ghost_button_labeled, load_error_panel, mode_chip, model_display, model_field, model_groups,
-    notify_label, option_label, picker_value,
+    DEFAULT_AGENT_SYSTEM_PROMPT, NOTIFY_POLICIES, RouterField, error_banner, field_label,
+    ghost_button, ghost_button_labeled, load_error_panel, mode_chip, model_display, model_field,
+    notify_label, picker_value, router_field,
 };
 use crate::probe::Probe as _;
 use crate::stores::{ConfigStore, Stores, TemplatesStore};
@@ -355,19 +355,6 @@ impl TemplatesSettingsView {
             draft.picker = None;
         }
         cx.notify();
-    }
-
-    /// True when a model reference routes to the **remote** eidola backend —
-    /// the condition (and only condition) for the per-call cost note. The
-    /// registry answers it; an unloaded registry falls back to the reference's
-    /// own backend id, which `parse_model_ref` canonicalizes (a bare name is
-    /// eidola).
-    fn is_remote_ref(&self, selection: &str, cx: &gpui::App) -> bool {
-        let backend_id = eidola_app_core::parse_model_ref(selection).backend_id;
-        match self.stores.backends.read(cx).get(&backend_id) {
-            Some(b) => b.kind == eidola_app_core::BackendKind::Eidola,
-            None => backend_id == eidola_app_core::EIDOLA_BACKEND_ID,
-        }
     }
 
     pub fn cascade_inc(&mut self, delta: i64, cx: &mut Context<Self>) {
@@ -818,174 +805,26 @@ impl TemplatesSettingsView {
         .into_any_element()
     }
 
-    /// The router-model row: a picker over the same qualified references the
-    /// chat model picker offers, with **Off** as its first option (and its
-    /// resting label) — the default, rendered as a normal choice rather than a
-    /// degraded one. A remote selection always carries the per-call cost note
-    /// beneath the row.
+    /// The router-model row — the shared [`router_field`] with this surface's
+    /// ids, probes, and cost wording (a template's router bills in *every*
+    /// space it makes).
     fn render_router_field(&self, draft: &TemplateDraft, cx: &Context<Self>) -> gpui::AnyElement {
-        let theme = cx.theme();
-        let open = draft.picker == Some(OpenPicker::Router);
-        let selection = draft.router_model.as_deref();
-        let (name, backend) = match selection {
-            Some(sel) => {
-                let (n, b) = model_display(&self.stores, sel, cx);
-                (n, Some(b))
-            }
-            None => ("Off".into(), None),
-        };
-        // The picker's *content* is which router is chosen — settled (it moves
-        // only on a click) and otherwise unreachable to a screen reader, which
-        // would hear "Router model" whether the space bills per post or not.
-        // Same shape as the participant model field, deliberately.
-        let value = picker_value(&name, backend.as_ref());
-
-        let button = h_flex()
-            .id("template-router-button")
-            .probe_value(
-                "settings/templates/editor/router",
-                gpui::Role::Button,
-                "Router model",
-                value,
-            )
-            .w_full()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .items_center()
-            .justify_between()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.secondary.opacity(0.5)))
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .items_baseline()
-                    .child(div().text_sm().child(name))
-                    .when_some(backend, |el, b| {
-                        el.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(SharedString::from(format!("· {b}"))),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("▾"),
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_router_picker(cx)));
-
-        let mut col = v_flex().w_full().gap_1().child(button);
-
-        if open {
-            let mut menu = v_flex()
-                .id("template-router-menu")
-                .probe(
-                    "settings/templates/editor/router/menu",
-                    gpui::Role::ListBox,
-                    "Router models",
-                )
-                .w_full()
-                .max_h(gpui::px(220.))
-                .overflow_y_scroll()
-                .track_scroll(&self.picker_scroll)
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.background)
-                // Off leads the list: it is the default, and it is a choice.
-                .child(
-                    div()
-                        .id("template-router-opt-off")
-                        .probe(
-                            "settings/templates/editor/router/option/off",
-                            gpui::Role::Button,
-                            "Off",
-                        )
-                        .px_3()
-                        .py_1()
-                        .cursor_pointer()
-                        .text_sm()
-                        .hover(|s| s.bg(theme.secondary.opacity(0.6)))
-                        .when(selection.is_none(), |el| el.text_color(theme.link))
-                        .child("Off")
-                        .on_click(cx.listener(|this, _, _, cx| this.set_router_model(None, cx))),
-                );
-            for (gi, (header, models)) in model_groups(&self.stores, cx).into_iter().enumerate() {
-                // The header is node-less chrome; the backend has to ride each
-                // option's own name (see `participants_view::option_label`) —
-                // and here it is also the billing difference.
-                let group = SharedString::from(header);
-                menu = menu.child(
-                    div()
-                        .px_3()
-                        .pt_2()
-                        .pb_1()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(group.clone()),
-                );
-                for (mi, (id, display)) in models.into_iter().enumerate() {
-                    let selected = selection == Some(id.as_str());
-                    let pick_id = id.clone();
-                    let display = SharedString::from(display);
-                    menu = menu.child(
-                        div()
-                            .id(SharedString::from(format!("template-router-opt-{gi}-{mi}")))
-                            .probe(
-                                format!("settings/templates/editor/router/option/{gi}/{mi}"),
-                                gpui::Role::Button,
-                                option_label(&display, &group),
-                            )
-                            .px_3()
-                            .py_1()
-                            .cursor_pointer()
-                            .text_sm()
-                            .hover(|s| s.bg(theme.secondary.opacity(0.6)))
-                            .when(selected, |el| el.text_color(theme.link))
-                            .child(display)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_router_model(Some(&pick_id), cx)
-                            })),
-                    );
-                }
-            }
-            col = col.child(div().relative().w_full().child(menu).child(
-                crate::scrollbar::vertical_floating("router-picker-scrollbar", &self.picker_scroll),
-            ));
-        }
-
-        // The cost note is exactly remote-conditional, and always visible when
-        // it applies (a cost a person only discovers on hover is not disclosed).
-        if selection.is_some_and(|sel| self.is_remote_ref(sel, cx)) {
-            col = col.child(
-                div()
-                    .id("template-router-cost")
-                    .probe(
-                        "settings/templates/editor/router/cost",
-                        gpui::Role::Label,
-                        ROUTER_REMOTE_COST_NOTE,
-                    )
-                    .text_xs()
-                    .text_color(theme.warning)
-                    .child(ROUTER_REMOTE_COST_NOTE),
-            );
-        }
-
-        col.child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground.opacity(0.8))
-                .child(ROUTER_HELP),
+        router_field(
+            &self.stores,
+            RouterField {
+                id_prefix: "template-router",
+                probe_prefix: "settings/templates/editor/router",
+                selection: draft.router_model.as_deref(),
+                open: draft.picker == Some(OpenPicker::Router),
+                cost_note: ROUTER_REMOTE_COST_NOTE,
+                help: ROUTER_HELP,
+                picker_scroll: &self.picker_scroll,
+                scrollbar_id: "router-picker-scrollbar",
+            },
+            cx,
+            |this, _, _, cx| this.toggle_router_picker(cx),
+            |id, this: &mut Self, cx| this.set_router_model(id, cx),
         )
-        .into_any_element()
     }
 
     /// The referenced globals the open editor lists, resolved against the

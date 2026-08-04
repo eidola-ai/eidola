@@ -450,7 +450,7 @@ impl SpaceView {
     fn settle_on_new_post(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.rebuild(cx);
 
-        let page_width = crate::chrome::content_size(window).width;
+        let page_width = self.page_width(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(page_width, &turns);
         // The optimistic turn is the last row of the fresh snapshot.
@@ -603,7 +603,7 @@ impl SpaceView {
     /// Scroll the page so the bottom of the selected branch (the composer /
     /// streaming leaf) sits at the window bottom.
     pub(crate) fn scroll_to_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let viewport = crate::chrome::content_size(window);
+        let viewport = self.page_size(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(viewport.width, &turns);
         self.scroll_to_branch_end(&tree, viewport.width, viewport.height);
@@ -650,7 +650,7 @@ impl SpaceView {
     /// Glided rather than jumped — the reader asked to be taken somewhere, and
     /// the travel is what says where from (see [`super::nav::PageGlide`]).
     pub(crate) fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let viewport = crate::chrome::content_size(window);
+        let viewport = self.page_size(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(viewport.width, &turns);
         if let Some(active) = self.active_draft.clone()

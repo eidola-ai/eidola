@@ -16,6 +16,7 @@
 //! - [`composer`] — the floating/docking draft composer, the Post routing,
 //!   and the action gutter (Post / ⌥ Post quietly).
 //! - [`context_menu`] — the right-click menu over any of the space's editors.
+//! - [`inspector`] — the per-space settings panel that splits the window.
 //! - [`keyboard`] — the two-level keyboard model over the tree (wave B).
 //! - [`minimap`] — the topology minimap.
 //! - [`traces`] — the per-post trace disclosure (what a turn actually did).
@@ -26,6 +27,7 @@
 
 pub mod composer;
 pub mod context_menu;
+pub mod inspector;
 pub mod keyboard;
 pub mod layout;
 pub mod minimap;
@@ -677,6 +679,26 @@ pub struct SpaceView {
     /// exists). Full onboarding is a later, separate window.
     pub(crate) error: Option<String>,
 
+    /// Whether this window's **inspector** (the per-space settings panel) is
+    /// open. Per-window by design — two windows on one space are two vantage
+    /// points, and the panel is a way of looking, not a property of the space
+    /// (STATE.md's scoping table: picker/disclosure state is view state). The
+    /// only doors are `Space ▸ Show/Hide Inspector` and ⌥⌘I.
+    pub(crate) inspector_open: bool,
+    /// The inspector body's own scroll.
+    pub(crate) inspector_scroll: ScrollHandle,
+    /// The inspector's title field + its `PressEnter`/`Blur` subscription,
+    /// minted on first render and re-seeded from the Library index whenever the
+    /// stored title moves while the field is unfocused ([`inspector`]).
+    pub(crate) inspector_title: Option<(Entity<gpui_component::input::InputState>, Subscription)>,
+    /// The title the field was last seeded with, so a re-seed happens exactly
+    /// when the space's real title moves.
+    pub(crate) inspector_title_seed: Option<SharedString>,
+    /// Whether the inspector's router-model dropdown is open.
+    pub(crate) inspector_router_picker: bool,
+    /// That dropdown's own scroll (reset to the top on each open).
+    pub(crate) inspector_picker_scroll: ScrollHandle,
+
     /// The window title last pushed to the platform (and to the a11y root
     /// node), so an unchanged title never re-enters AppKit every frame. The
     /// title tracks the space's Library title, which arrives after the first
@@ -729,6 +751,13 @@ impl SpaceView {
             // The space's participants feed the separator Ask menus, the
             // streaming bylines, and the cascade notice's ask affordances.
             cx.observe(&stores.participants, |_, _, cx| cx.notify()),
+            // This space's own settings are the inspector's rows. Every one of
+            // this store's announcements is asynchronous — the panel's opening
+            // `ensure` load completing or failing, each write's re-read, a bus
+            // `Change::Space` refresh — and none of them is accompanied by
+            // anything else that would repaint this window, so without this the
+            // panel could sit on "Loading…" until an unrelated event redrew it.
+            cx.observe(&stores.space_settings, |_, _, cx| cx.notify()),
             // Local models feed the request panel (a load/unload while it's
             // open must re-render — offline, the models store is quiet, so
             // this is the *only* signal that would refresh it) *and* the
@@ -743,6 +772,14 @@ impl SpaceView {
                 this.rebuild(cx);
                 cx.notify();
             }),
+            // The third of the model-picker read set (`model_groups` reads all
+            // three): a remote catalog's fetch lands long after the window has
+            // drawn, and an open router picker has to gain those options when
+            // it does. No `rebuild` — catalogs feed the picker's list, not the
+            // transcript snapshot. The other two `router_field` consumers
+            // (`ParticipantsView`, the Space Templates pane) observe the same
+            // three.
+            cx.observe(&stores.models, |_, _, cx| cx.notify()),
         ];
 
         let mut this = Self {
@@ -816,6 +853,12 @@ impl SpaceView {
             minimap_bounds: Rc::new(Cell::new(None)),
             minimap_drag: None,
             error: None,
+            inspector_open: false,
+            inspector_scroll: ScrollHandle::new(),
+            inspector_title: None,
+            inspector_title_seed: None,
+            inspector_router_picker: false,
+            inspector_picker_scroll: ScrollHandle::new(),
             window_title: None,
         };
         this.rebuild(cx);
@@ -1204,7 +1247,7 @@ impl SpaceView {
     /// regression (retry must select the failed post's branch).
     #[doc(hidden)]
     pub fn selected_leaf_for_test(&self, window: &Window) -> Option<String> {
-        let page_width = crate::chrome::content_size(window).width;
+        let page_width = self.page_width(window);
         let roots = model::build_tree(&self.posts);
         self.selected_leaf_id(&roots, page_width)
             .map(|s| s.to_string())
@@ -1216,7 +1259,7 @@ impl SpaceView {
     /// the post-only tree above cannot say.
     #[doc(hidden)]
     pub fn selected_effective_path_for_test(&self, window: &Window, cx: &gpui::App) -> Vec<String> {
-        let page_width = crate::chrome::content_size(window).width;
+        let page_width = self.page_size(window).width;
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(page_width, &turns);
         self.selected_levels(&tree, page_width)
@@ -1890,8 +1933,14 @@ impl Render for SpaceView {
         let font_family = theme.font_family.clone();
         // The frame's content box, not the raw viewport: bottom-anchored
         // overlays (floating composer, minimap) and the scroll range must not
-        // reach into the CSD shadow padding.
-        let viewport = crate::chrome::content_size(window);
+        // reach into the CSD shadow padding. The **conversation's** page is
+        // that box less the inspector's column when it splits the window
+        // (`page_size` is the accessor every other page-geometry consumer
+        // reads), so the reading measure, branch strides, composer dock and
+        // minimap all narrow together with it.
+        let window_box = crate::chrome::content_size(window);
+        let inspector_layout = self.inspector_layout(window_box.width);
+        let viewport = self.page_size(window);
         let page_width = viewport.width;
         let window_h = viewport.height;
 
@@ -2093,79 +2142,17 @@ impl Render for SpaceView {
 
         let body = self.render_forest(&tree, doc_reserve, page_width, window_h, streaming, cx);
 
-        crate::chrome::round_client_corners(div(), window)
-            .track_focus(&self.focus_handle)
-            .key_context("SpaceView")
-            .on_action(cx.listener(Self::submit))
-            .on_action(cx.listener(Self::post_only))
-            .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
-                window.remove_window();
-            }))
-            // Space → Participants…: open the per-space Participants window for
-            // this conversation. Registered per-view (like CloseWindow) so the
-            // menu item targets the focused space and macOS greys it when no
-            // space window is open. A no-op on a not-yet-persisted blank space.
-            .on_action(cx.listener(Self::open_participants))
-            // Edit → Quote / Quote in Reply. Registered **only while a
-            // quotable post selection exists**, so `is_action_available` is
-            // false otherwise and macOS greys both items — the same
-            // registration-is-enablement mechanism as CloseWindow, with the
-            // extra selection condition. `note_body_selection` re-renders on
-            // exactly the transitions that flip this.
-            .when(self.post_selection.is_some(), |d| {
-                d.on_action(cx.listener(Self::quote))
-                    .on_action(cx.listener(Self::quote_in_reply))
-            })
-            // **The sole owner of "Escape closes the context menu."** Key
-            // dispatch bubbles inner→outer, so the root runs *last* — after
-            // every inner Escape handler (the composer's, an edit session's)
-            // has yielded via [`Self::context_menu_absorbs_escape`]. One
-            // owner, consulted by one predicate, rather than a copy of the
-            // close per handler that each has to remember to make first. A
-            // no-op when no menu is open.
-            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
-                if ev.keystroke.key == "escape" {
-                    // Rung 1 of the Escape chain (see `keyboard`): the menu
-                    // wins, and consumes the press.
-                    if this.close_context_menu(cx) {
-                        return;
-                    }
-                }
-                // The conversation's own keyboard model — arrows, Enter,
-                // Escape's last two rungs, and type-to-compose. It runs as a
-                // listener, so gpui's *binding* pass has already offered the
-                // press to every inner context (the composer's editor, an
-                // edit session); nothing here can shadow them.
-                //
-                // **A handled press must be consumed.** `gpui_macos`'s
-                // `handle_key_event` reports the key as handled to AppKit only
-                // when the callback comes back with `propagate == false`;
-                // otherwise it falls through to
-                // `[[self inputContext] handleEvent:]`, which hands the *same*
-                // native event to whatever input handler is installed. For
-                // type-to-compose that is the editor this press just focused,
-                // so the character it already applied would be typed a second
-                // time. `Window::dispatch_keystroke` (the test path) has the
-                // same shape — `if !result.propagate { return true }`, else
-                // `input_handler.dispatch_input(...)` — which is what makes
-                // "the press was consumed" assertable here at all.
-                if this.handle_conversation_key(ev, window, cx) {
-                    cx.stop_propagation();
-                }
-            }))
-            // The window's single modifiers listener (see `WindowInput`): the
-            // root is an ancestor of the focused composer, so it sees every
-            // modifier transition and mirrors it into the shared entity for
-            // the action gutter's ⌥ reveal.
-            .on_modifiers_changed(cx.listener(|this, event, _, cx| {
-                this.window_input
-                    .update(cx, |wi, cx| wi.update_modifiers(event, cx));
-            }))
+        // The window is a row: the conversation pane, then (when open and wide
+        // enough) the inspector's column. The pane is `relative` and clipped,
+        // so every absolutely-positioned surface inside it — title band,
+        // composer, notices, minimap, context menu — anchors to the pane rather
+        // than the window and can never paint over the panel.
+        let pane = div()
             .relative()
-            .size_full()
-            .bg(bg)
-            .font_family(font_family)
-            .text_color(fg)
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
             .child({
                 let mut scroll = div()
                     .id("space-scroll")
@@ -2228,7 +2215,100 @@ impl Render for SpaceView {
             // The context menu is the last child of all: a menu opened at the
             // pointer must sit above every surface it can be opened over,
             // the minimap and the floating composer included.
-            .children(self.render_context_menu(window, cx))
+            .children(self.render_context_menu(window, cx));
+
+        crate::chrome::round_client_corners(div(), window)
+            .track_focus(&self.focus_handle)
+            .key_context("SpaceView")
+            .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::post_only))
+            .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
+                window.remove_window();
+            }))
+            // Space → Participants…: open the per-space Participants window for
+            // this conversation. Registered per-view (like CloseWindow) so the
+            // menu item targets the focused space and macOS greys it when no
+            // space window is open. A no-op on a not-yet-persisted blank space.
+            .on_action(cx.listener(Self::open_participants))
+            // Space → Show/Hide Inspector (⌥⌘I). Registered per-view like
+            // `CloseWindow` / `Participants…`, so the item targets the focused
+            // space and macOS greys it when no space window is open.
+            .on_action(cx.listener(Self::toggle_inspector))
+            // Edit → Quote / Quote in Reply. Registered **only while a
+            // quotable post selection exists**, so `is_action_available` is
+            // false otherwise and macOS greys both items — the same
+            // registration-is-enablement mechanism as CloseWindow, with the
+            // extra selection condition. `note_body_selection` re-renders on
+            // exactly the transitions that flip this.
+            .when(self.post_selection.is_some(), |d| {
+                d.on_action(cx.listener(Self::quote))
+                    .on_action(cx.listener(Self::quote_in_reply))
+            })
+            // **The sole owner of "Escape closes the context menu."** Key
+            // dispatch bubbles inner→outer, so the root runs *last* — after
+            // every inner Escape handler (the composer's, an edit session's)
+            // has yielded via [`Self::context_menu_absorbs_escape`]. One
+            // owner, consulted by one predicate, rather than a copy of the
+            // close per handler that each has to remember to make first. A
+            // no-op when no menu is open.
+            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                if ev.keystroke.key == "escape" {
+                    // Rung 1 of the Escape chain (see `keyboard`): the menu
+                    // wins, and consumes the press.
+                    if this.close_context_menu(cx) {
+                        return;
+                    }
+                    // Then the inspector's own dropdown — the same
+                    // one-owner-for-Escape shape, for the same reason: it is a
+                    // transient overlay, so the conversation's handler yields
+                    // to it and something has to close it.
+                    if this.close_inspector_picker(cx) {
+                        return;
+                    }
+                }
+                // The conversation's own keyboard model — arrows, Enter,
+                // Escape's last two rungs, and type-to-compose. It runs as a
+                // listener, so gpui's *binding* pass has already offered the
+                // press to every inner context (the composer's editor, an
+                // edit session); nothing here can shadow them.
+                //
+                // **A handled press must be consumed.** `gpui_macos`'s
+                // `handle_key_event` reports the key as handled to AppKit only
+                // when the callback comes back with `propagate == false`;
+                // otherwise it falls through to
+                // `[[self inputContext] handleEvent:]`, which hands the *same*
+                // native event to whatever input handler is installed. For
+                // type-to-compose that is the editor this press just focused,
+                // so the character it already applied would be typed a second
+                // time. `Window::dispatch_keystroke` (the test path) has the
+                // same shape — `if !result.propagate { return true }`, else
+                // `input_handler.dispatch_input(...)` — which is what makes
+                // "the press was consumed" assertable here at all.
+                if this.handle_conversation_key(ev, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            // The window's single modifiers listener (see `WindowInput`): the
+            // root is an ancestor of the focused composer, so it sees every
+            // modifier transition and mirrors it into the shared entity for
+            // the action gutter's ⌥ reveal.
+            .on_modifiers_changed(cx.listener(|this, event, _, cx| {
+                this.window_input
+                    .update(cx, |wi, cx| wi.update_modifiers(event, cx));
+            }))
+            .relative()
+            .flex()
+            .flex_row()
+            .items_stretch()
+            .size_full()
+            .bg(bg)
+            .font_family(font_family)
+            .text_color(fg)
+            .child(pane)
+            // The inspector renders last: as a column it simply follows the
+            // pane, and as an overlay it must paint after everything it covers
+            // (the containment rule — `src/overlay.rs`).
+            .children(self.render_inspector(inspector_layout, window, cx))
     }
 }
 

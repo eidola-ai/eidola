@@ -469,7 +469,7 @@ impl SpaceView {
         if let Some(id) = self.active_draft.clone() {
             return Some(id);
         }
-        let viewport = crate::chrome::content_size(window);
+        let viewport = self.page_size(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(viewport.width, &turns);
         let path = self.selected_path_nodes(&tree, viewport.width);
@@ -962,7 +962,7 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         self.highlight_picker = None;
-        let page_width = crate::chrome::content_size(window).width;
+        let page_width = self.page_width(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(page_width, &turns);
         if super::model::node_ref(&tree, &action_id).is_some() {
@@ -1039,7 +1039,7 @@ impl SpaceView {
         else {
             return false;
         };
-        let page_width = crate::chrome::content_size(window).width;
+        let page_width = self.page_width(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(page_width, &turns);
         if super::model::node_ref(&tree, &tip).is_none() {
@@ -1064,7 +1064,7 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let viewport = crate::chrome::content_size(window);
+        let viewport = self.page_size(window);
         let Some(doc_top) =
             self.selected_path_doc_top(roots, node_id, viewport.width, viewport.height)
         else {
