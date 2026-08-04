@@ -532,7 +532,7 @@ impl SpaceView {
     /// between the ask and the turn's completion (gpui draws from the
     /// platform's frame callback; a turn completes in an ordinary foreground
     /// task). A turn that lands first is followed onto its post by
-    /// [`Self::retarget_pending_turn_select`].
+    /// [`Self::follow_completed_turn`].
     pub(crate) fn select_turn_branch(&mut self, seq: u64) {
         self.pending_select = Some(PendingSelect {
             node: model::streaming_node_id(seq),
@@ -540,34 +540,62 @@ impl SpaceView {
         });
     }
 
-    /// Follow a selection deferred onto turn `seq`'s streaming leaf across the
-    /// turn's completion: the leaf is gone by then, and the branch the reader
-    /// was to be taken to is the one carrying the post the turn wrote
-    /// (`SpaceEvent::TurnEnded`, delivered before the frame that would consume
-    /// the request). Without this, a turn that finished before its first
-    /// render left the new branch unselected — the very failure the deferral
-    /// exists to prevent (task 46, bug 3), on the timing edge.
+    /// **Selection follows the turn through its completion** — the same
+    /// doctrine as `rethread_drafts` / `retarget_tree_focus` forwarding a
+    /// window-local reference through *item* identity on rebuild. A turn's
+    /// streaming leaf is an ephemeral render key: on `SpaceEvent::TurnEnded`
+    /// the leaf is already gone and the post the turn wrote stands in its
+    /// place, so whatever was aimed at the leaf is re-aimed at that post
+    /// (delivered before the frame that would act on it).
     ///
-    /// A turn that wrote **no** post (a decline) has no branch to offer, so
-    /// the request is dropped rather than left naming a node that can never
-    /// appear. Requests for *other* nodes (a fork draft, a later turn) are
-    /// untouched — the leaf id is unique per turn.
-    pub(crate) fn retarget_pending_turn_select(
-        &mut self,
-        seq: u64,
-        response_action_id: Option<&str>,
-    ) {
-        let waiting = self
+    /// Two things can be aimed at the leaf, and the difference is only where
+    /// the page comes to rest:
+    ///
+    /// - **A pending selection** (an ask/retry whose turn landed before any
+    ///   frame consumed the request — see [`Self::select_turn_branch`]): the
+    ///   reader has not been taken anywhere yet, so the settle stands
+    ///   (`BranchEnd`). Without this the new branch stayed unselected — the
+    ///   very failure the deferral exists to prevent (task 46, bug 3), one
+    ///   frame later.
+    /// - **A reader parked on the leaf** (`selected_turn`, what the last frame
+    ///   observed): branch selection is *positional* — a strip's scroll offset
+    ///   resolved to a child index — and a turn's persisted response is
+    ///   inserted among the target's posts, **ahead of** any still-streaming
+    ///   sibling overlay. In a fan-out where the selected turn completes first,
+    ///   that index then addresses another participant's stream and the view
+    ///   switches away from the answer being read. Re-selecting by identity
+    ///   fixes the index; the page must not move (`Stay`) — the reader is
+    ///   already where they want to be.
+    ///
+    /// A turn that wrote **no** post (a decline) has no branch to offer: a
+    /// pending request is dropped rather than left naming a node that can never
+    /// appear, and a parked reader is left alone (there is nothing to follow —
+    /// the leaf simply collapses). Requests for *other* nodes (a fork draft, a
+    /// later turn) are untouched — the leaf id is unique per turn.
+    pub(crate) fn follow_completed_turn(&mut self, seq: u64, response_action_id: Option<&str>) {
+        let pending = self
             .pending_select
             .as_ref()
             .is_some_and(|p| p.node == model::streaming_node_id(seq));
-        if !waiting {
+        let parked = self.selected_turn.get() == Some(seq);
+        if !pending && !parked {
             return;
         }
-        self.pending_select = response_action_id.map(|id| PendingSelect {
-            node: SharedString::from(id.to_string()),
-            settle: PendingSettle::BranchEnd,
-        });
+        match response_action_id {
+            Some(id) => {
+                self.pending_select = Some(PendingSelect {
+                    node: SharedString::from(id.to_string()),
+                    settle: if pending {
+                        PendingSettle::BranchEnd
+                    } else {
+                        PendingSettle::Stay
+                    },
+                })
+            }
+            // Only the doomed request is dropped; an unrelated one stands.
+            None if pending => self.pending_select = None,
+            None => {}
+        }
     }
 
     // -- Scrolling ---------------------------------------------------------

@@ -3541,6 +3541,90 @@ fn space_ask_selects_the_reply_when_the_turn_lands_before_the_next_render(cx: &m
 }
 
 #[gpui::test]
+fn space_selected_turn_keeps_its_branch_when_it_lands_before_its_sibling(cx: &mut TestAppContext) {
+    // The same swap, one frame later: the reader is already *parked* on a
+    // turn's streaming leaf when that turn lands. Branch selection is
+    // positional (a strip's scroll offset → child index), and a turn's
+    // persisted response is inserted among the target's *posts*, ahead of any
+    // still-streaming sibling overlay. So in a fan-out where the selected
+    // (later) turn completes first, the index the reader is resting on now
+    // addresses the *other* participant's stream, and the view switches away
+    // from the answer they were reading. Selection has to follow the turn
+    // through its completion, the way drafts and tree focus follow item
+    // identity across a rebuild.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "a question")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Two participants answer the same post: two concurrent turns, ordered
+    // siblings under it.
+    for agent in ["agent-b", "agent-c"] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.ask_participant(agent.into(), "a1".into(), window, cx)
+            });
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+    }
+    let (first, second) = view.read_with(cx, |v, cx| {
+        let s = v.space().read(cx);
+        (s.streams()[0].seq, s.streams()[1].seq)
+    });
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&streaming_node_id(second).to_string()),
+        "the reader is parked on the second turn's stream ({path:?})"
+    );
+
+    // The turn they are reading lands first.
+    let mut a3 = fixture_assistant_post("a3", "the second agent's answer");
+    a3.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(
+                second,
+                vec![fixture_user_post("a1", "a question"), a3],
+                false,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&"a3".to_string()),
+        "the reader stays on the reply they were reading once it persists \
+         ({path:?})"
+    );
+    assert!(
+        !path.contains(&streaming_node_id(first).to_string()),
+        "and is not swapped onto the other participant's stream ({path:?})"
+    );
+}
+
+#[gpui::test]
 fn space_tail_ask_keeps_nonempty_draft_as_its_own_branch(cx: &mut TestAppContext) {
     // The tail-draft rule, non-empty half: a draft with content is kept
     // exactly as it is — it becomes its own sibling branch beside the incoming

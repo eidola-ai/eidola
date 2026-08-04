@@ -287,8 +287,10 @@ pub(crate) struct CascadeNotice {
 
 /// A branch selection deferred to the next render, where the effective tree
 /// carrying the node (and the scroll handles the selection writes) both exist.
-/// Two sources: a freshly-created fork draft, and a freshly-started turn whose
-/// streaming leaf is a *new sibling* under its target.
+/// Three sources: a freshly-created fork draft, a freshly-started turn whose
+/// streaming leaf is a *new sibling* under its target, and a completed turn
+/// whose selection has to move from that leaf onto the post it wrote
+/// ([`SpaceView::follow_completed_turn`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingSelect {
     /// The node to bring onto the selected path.
@@ -305,6 +307,10 @@ pub(crate) enum PendingSettle {
     /// Park at the end of the selected branch (a new turn: the answer will
     /// grow there).
     BranchEnd,
+    /// Leave the page where it is — the selection is *following* something the
+    /// reader is already positioned on (a turn's leaf becoming its post), not
+    /// taking them somewhere new.
+    Stay,
 }
 
 /// The open source-highlight picker: a quoted passage that **several** posts
@@ -581,6 +587,13 @@ pub struct SpaceView {
     /// still at the end?") and scrolls to this frame's value, so the two can
     /// never disagree about where "the end" is.
     pub(crate) follow_anchor: Cell<f32>,
+    /// The turn whose streaming leaf the **last rendered frame** had on the
+    /// selected path (`layout::selected_turn_seq`). It is a record rather than
+    /// a live query because the question is asked after the fact: a completed
+    /// turn's leaf is already gone from the tree, so only the last frame can
+    /// say whether the reader was parked on it — see
+    /// [`Self::follow_completed_turn`].
+    pub(crate) selected_turn: Cell<Option<u64>>,
     /// The reader just posted: extend tail-following to the growth that
     /// follows a submit, until the exchange settles. Armed by
     /// [`Self::settle_on_new_post`], cleared in `render` the moment the space
@@ -780,6 +793,7 @@ impl SpaceView {
             page_scroll: ScrollHandle::new(),
             scroll_min_y: Cell::new(0.0),
             follow_anchor: Cell::new(0.0),
+            selected_turn: Cell::new(None),
             tail_pin: false,
             docked_caret_slot_offset: Cell::new(0.0),
             scrolls: HashMap::new(),
@@ -1612,10 +1626,11 @@ impl SpaceView {
                 seq,
                 response_action_id,
             } => {
-                // A selection deferred onto this turn's streaming leaf has to
-                // follow the turn onto the post it wrote — the leaf is already
-                // gone (see `retarget_pending_turn_select`).
-                self.retarget_pending_turn_select(*seq, response_action_id.as_deref());
+                // A selection aimed at this turn's streaming leaf — pending, or
+                // the branch the reader is parked on — has to follow the turn
+                // onto the post it wrote; the leaf is already gone (see
+                // `follow_completed_turn`).
+                self.follow_completed_turn(*seq, response_action_id.as_deref());
             }
             SpaceEvent::Failed(e) => {
                 self.error = Some(error_copy(e));
@@ -1956,6 +1971,7 @@ impl Render for SpaceView {
             match pending.settle {
                 PendingSettle::DockDraft => self.dock_active_draft(&tree, page_width, window_h),
                 PendingSettle::BranchEnd => self.scroll_to_branch_end(&tree, page_width, window_h),
+                PendingSettle::Stay => {}
             }
         }
 
@@ -2021,7 +2037,7 @@ impl Render for SpaceView {
         // the reader is on*, the document grows with every delta; a reader
         // parked at the end wants to stay there, and a reader who has scrolled
         // away must never be yanked back. A sibling branch's stream is not this
-        // reader's tail (see `selected_path_is_streaming`).
+        // reader's tail (see `selected_turn_seq`).
         //
         // A just-posted exchange follows too, via `tail_pin`: between the save
         // landing and the response's first delta there is no stream to observe,
@@ -2029,7 +2045,13 @@ impl Render for SpaceView {
         // optimistic one under a new node id and re-measures from its estimate),
         // which would drift the reader off the end before following could ever
         // engage. The pin ends the moment the exchange settles.
-        let producing = self.selected_path_is_streaming(&tree, page_width);
+        // The same observation answers two questions: whether this frame's
+        // selected path is producing, and *which* turn it is producing from —
+        // recorded because the second question outlives the leaf that answers
+        // it (`follow_completed_turn`).
+        let selected_turn = self.selected_turn_seq(&tree, page_width);
+        self.selected_turn.set(selected_turn);
+        let producing = selected_turn.is_some();
         if self.tail_pin && !producing && !self.space.read(cx).is_busy() {
             self.tail_pin = false;
         }
@@ -2258,7 +2280,7 @@ impl SpaceView {
     /// on rather than disengaging on its own correction.
     ///
     /// Deliberately gated on `producing` — **the selected path carries a live
-    /// stream** ([`Self::selected_path_is_streaming`]), not merely "some turn in
+    /// stream** ([`Self::selected_turn_seq`]), not merely "some turn in
     /// this space is streaming". A growing document is otherwise the composer's
     /// runway or a post measuring for the first time, and neither should move
     /// the reader; composer growth keeps its own caret-into-view path
