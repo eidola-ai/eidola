@@ -3754,6 +3754,75 @@ fn space_selected_turn_keeps_its_branch_when_it_lands_before_its_sibling(cx: &mu
 }
 
 #[gpui::test]
+fn space_newer_branch_navigation_outranks_the_cached_turn_when_it_lands(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "a question")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    for agent in ["agent-b", "agent-c"] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.ask_participant(agent.into(), "a1".into(), window, cx)
+            });
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+    }
+    let (first, second) = view.read_with(cx, |v, cx| {
+        let s = v.space().read(cx);
+        (s.streams()[0].seq, s.streams()[1].seq)
+    });
+
+    // The last frame cached `second`; now navigate to `first` without drawing
+    // another frame before `second` completes.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.select_effective_path_for_test(&streaming_node_id(first), window, cx)
+        });
+    })
+    .unwrap();
+    let mut response = fixture_assistant_post("a3", "the second agent's answer");
+    response.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(
+                second,
+                vec![fixture_user_post("a1", "a question"), response],
+                false,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&streaming_node_id(first).to_string()),
+        "the newer branch navigation survives the old turn landing ({path:?})"
+    );
+    assert!(
+        !path.contains(&"a3".to_string()),
+        "the stale selected-turn cache does not restore the completed reply ({path:?})"
+    );
+}
+
+#[gpui::test]
 fn space_tail_ask_keeps_nonempty_draft_as_its_own_branch(cx: &mut TestAppContext) {
     // The tail-draft rule, non-empty half: a draft with content is kept
     // exactly as it is — it becomes its own sibling branch beside the incoming

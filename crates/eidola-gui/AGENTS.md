@@ -212,6 +212,8 @@ The page geometry is symmetric — `[byline gutter | reading column | action gut
 
 **The parked case yields to a pending request for anything else** — the newest-intent rule: a pending selection is an ask (or a fork draft) the reader made *after* the turn now landing, so following the older turn onto its post would quietly undo it and leave them on the answer they had already read. Regression: `space_a_newer_ask_outranks_a_completing_turns_retarget`.
 
+`selected_turn` is invalidated as soon as any branch navigation steers a strip (including an in-progress horizontal gesture), rather than waiting for the next render to observe the new path. Otherwise a completion in that between-frame window could treat the cached old leaf as still parked and undo the newer navigation. Regression: `space_newer_branch_navigation_outranks_the_cached_turn_when_it_lands`.
+
 A decline wrote no post: the pending request is dropped rather than left naming a node that can never appear, and a parked reader is left alone. The request lives exactly one frame either way: `render`'s `take` is unconditional, so a node that never appears (a failed turn, a retired draft) leaves nothing dangling.
 
 The ask also applies the **tail-draft rule**: an *empty* draft replying to the target is discarded (the response becomes the tail); a draft *with content* is kept as its own sibling branch and stays active. Dismissal: click-out, Esc (the composer's key handler closes the menu before deactivating the draft), a choice, or retiring/sending the draft.
