@@ -56,23 +56,28 @@
 //!
 //! ## The menu's moment of truth
 //!
-//! The rows are a pure projection of the `LocalModelsStore` snapshot
-//! ([`menu_rows`]), mirrored into the platform object by a store observer and
-//! rebuilt into real `NSMenuItem`s in `menuNeedsUpdate:` — AppKit's
-//! "the user is about to see this" callback. Neither end captures authority:
-//! the mirror is refreshed by the store's own notify (never sampled once at
-//! install), and the menu is materialised at open (never rebuilt on every
-//! download-progress tick, which arrives several times a second). See
-//! `macos::Target` for why the mirror exists rather than a live read from
-//! inside the AppKit callback.
+//! The rows are a pure projection ([`menu_rows`]) of two inputs — the **live
+//! engine registry** and the `LocalModelsStore` snapshot — mirrored into the
+//! platform object by a store observer and rebuilt into real `NSMenuItem`s in
+//! `menuNeedsUpdate:`, AppKit's "the user is about to see this" callback.
+//! Neither end captures authority: the mirror is refreshed by the store's own
+//! notify (never sampled once at install), and the menu is materialised at
+//! open (never rebuilt on every download-progress tick, which arrives several
+//! times a second). See `macos::Target` for why the mirror exists rather than
+//! a live read from inside the AppKit callback.
+//!
+//! Which of the two inputs is authoritative is the whole of [`engine_lines`]'
+//! doc comment, and it is not a detail: the snapshot is a *directory scan*,
+//! so it cannot see an engine whose backing file has gone.
 
 #[cfg(target_os = "macos")]
 mod macos;
 
-use eidola_app_core::{LocalModelStatus, LocalModelsState};
+use eidola_app_core::{LocalModelStatus, LocalModelsState, RunningEngine};
 use gpui::App;
 
 use crate::lifecycle::LaunchOptions;
+use crate::loadable::Loadable;
 use crate::stores::Stores;
 
 /// How the app presents itself to the system.
@@ -173,47 +178,147 @@ pub enum StatusRow {
     Separator,
 }
 
-/// The whole status menu, from the local-models snapshot.
+/// The whole status menu.
 ///
-/// `engines` is the `LocalModelsStore`'s loaded value — `None` while the
-/// first refresh is still in flight (or when there is no backend at all, as
-/// in the stub stores), which the engine section says honestly rather than
-/// claiming nothing is running.
-pub fn menu_rows(engines: Option<&LocalModelsState>) -> Vec<StatusRow> {
+/// Both engine inputs are passed down to [`engine_lines`]; see there for why
+/// there are two of them.
+pub fn menu_rows(
+    running: Option<&[RunningEngine]>,
+    installed: &Loadable<LocalModelsState>,
+) -> Vec<StatusRow> {
     let mut rows = vec![
         StatusRow::Command(StatusCommand::Open),
         StatusRow::Command(StatusCommand::NewSpace),
         StatusRow::Separator,
     ];
-    rows.extend(engine_lines(engines).into_iter().map(StatusRow::Info));
+    rows.extend(
+        engine_lines(running, installed)
+            .into_iter()
+            .map(StatusRow::Info),
+    );
     rows.push(StatusRow::Separator);
     rows.push(StatusRow::Command(StatusCommand::Quit));
     rows
 }
 
+/// One engine of the readout, after the two sources have been reconciled.
+struct EngineLine {
+    name: String,
+    ready: bool,
+    /// The live registry holds this engine, but the installed-model listing
+    /// does not know it — its backing `.gguf` has gone while the engine runs.
+    orphaned: bool,
+}
+
 /// The engine section: one line per engine that is up or coming up, across
 /// the managed store *and* every configured `llamacpp` backend (an engine is
 /// an engine — the menu is not a backend registry).
-pub fn engine_lines(engines: Option<&LocalModelsState>) -> Vec<String> {
-    let Some(state) = engines else {
-        return vec!["Checking on-device engines…".to_string()];
-    };
-    let all = state
-        .models
-        .iter()
-        .chain(state.external.iter().flat_map(|b| b.models.iter()));
-    let lines: Vec<String> = all
-        .filter_map(|m| match m.status {
-            LocalModelStatus::Loaded { .. } => Some(format!("{} — running", m.display_name)),
-            LocalModelStatus::Loading => Some(format!("{} — loading…", m.display_name)),
-            _ => None,
+///
+/// **The live registry leads and the listing only decorates it.**
+/// `running` is [`eidola_app_core::AppCore::running_engines`] — synchronous,
+/// infallible, the in-process truth. `installed` is the `LocalModelsStore`
+/// snapshot, which app-core reconstructs by *scanning* the model directories:
+/// an engine whose `.gguf` was renamed or deleted mid-session (or whose
+/// backend row was removed, or whose directory has gone unreadable) is simply
+/// absent from it while the subprocess holds gigabytes. Reading only the
+/// listing therefore said "No models running" over a live engine — the same
+/// scan-versus-registry defect wave 2 fixed on the quit path. So every
+/// registry entry produces a line, named from the listing when the listing
+/// knows it and from the engine's own slug when it does not; an engine the
+/// listing has lost says so, because "why is this model not in Settings
+/// while my memory is gone?" is the question that moment raises.
+///
+/// **`installed` is the whole `Loadable`, not its value.** `value()` folds
+/// `Failed { prior: None }` into the same `None` as an in-flight first load,
+/// so a failed initial refresh left the menu reading "Checking on-device
+/// engines…" forever — a spinner for a request that already failed and (the
+/// store retries only on a bus `Change`) may never be retried. The states are
+/// now distinguished: a failure says so, and does not suppress the registry's
+/// own answer.
+///
+/// **There is no Retry row, deliberately.** The failure costs display names
+/// and the installed listing, never the running truth; the store re-refreshes
+/// on any `Change::LocalModels` / `Change::Backends`; and Settings → Backends
+/// → Local is the surface with room for the error text and the retry. A
+/// fourth verb in a three-verb menu would buy less than the line it displaced.
+pub fn engine_lines(
+    running: Option<&[RunningEngine]>,
+    installed: &Loadable<LocalModelsState>,
+) -> Vec<String> {
+    let mut lines: Vec<String> = reconcile(running, installed)
+        .into_iter()
+        .map(|e| {
+            let state = if e.ready { "running" } else { "loading…" };
+            let lost = if e.orphaned { " (file missing)" } else { "" };
+            format!("{} — {state}{lost}", e.name)
         })
         .collect();
+
     if lines.is_empty() {
-        vec!["No models running".to_string()]
-    } else {
-        lines
+        // Nothing is up — but only say so if something could actually have
+        // told us. The registry always can; the listing can when it has a
+        // value. With neither, the honest word is that we do not know yet.
+        if running.is_some() || installed.has_value() {
+            lines.push("No models running".to_string());
+        } else if installed.error().is_none() {
+            lines.push("Checking on-device engines…".to_string());
+        }
     }
+    if installed.error().is_some() {
+        // Quiet, and always — even beside a full engine list, because a
+        // failed scan is why those names may be bare slugs.
+        lines.push("Couldn't list installed models".to_string());
+    }
+    lines
+}
+
+/// Join the two sources on the model id: the listing's own loaded/loading
+/// rows first (they carry display names), then every registry engine the
+/// listing did not account for.
+fn reconcile(
+    running: Option<&[RunningEngine]>,
+    installed: &Loadable<LocalModelsState>,
+) -> Vec<EngineLine> {
+    let state = installed.value();
+    let listed = state.into_iter().flat_map(|s| {
+        s.models
+            .iter()
+            .chain(s.external.iter().flat_map(|b| b.models.iter()))
+    });
+
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out: Vec<EngineLine> = Vec::new();
+    for m in listed {
+        let ready = match m.status {
+            LocalModelStatus::Loaded { .. } => true,
+            LocalModelStatus::Loading => false,
+            _ => continue,
+        };
+        seen.push(m.id.as_str());
+        out.push(EngineLine {
+            name: m.display_name.clone(),
+            ready,
+            orphaned: false,
+        });
+    }
+
+    for engine in running.unwrap_or(&[]) {
+        if seen.contains(&engine.id.as_str()) {
+            continue;
+        }
+        out.push(EngineLine {
+            // The registry has no display name — that lives in a sidecar
+            // beside the file, which is exactly what may have gone. The slug
+            // is the truest name left.
+            name: engine.slug.clone(),
+            ready: engine.ready,
+            // Only claim the file is missing when the listing actually
+            // answered. A listing that is still loading (or failed) is not
+            // evidence of anything.
+            orphaned: state.is_some(),
+        });
+    }
+    out
 }
 
 /// Create the status item. Called once at launch, after the action handlers
@@ -261,11 +366,23 @@ pub fn quit_or_retire(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eidola_app_core::error::AppError;
     use eidola_app_core::{ExternalEngineBackend, LocalModelInfo};
 
     fn model(name: &str, status: LocalModelStatus) -> LocalModelInfo {
+        model_in("local", name, status)
+    }
+
+    /// The external backend's scan. **The id carries the backend**, exactly
+    /// as `engine_model_id` builds it — the join key against the registry, so
+    /// a fixture that got it wrong would fake a duplicate engine.
+    fn external_model(name: &str, status: LocalModelStatus) -> LocalModelInfo {
+        model_in("mine", name, status)
+    }
+
+    fn model_in(backend: &str, name: &str, status: LocalModelStatus) -> LocalModelInfo {
         LocalModelInfo {
-            id: format!("{name}@local"),
+            id: format!("{name}@{backend}"),
             slug: name.to_string(),
             display_name: name.to_string(),
             file_name: format!("{name}.gguf"),
@@ -318,18 +435,33 @@ mod tests {
         assert_eq!(StatusCommand::NewSpace.key_equivalent(), "");
     }
 
+    fn loaded(port: u16) -> LocalModelStatus {
+        LocalModelStatus::Loaded {
+            port,
+            context_tokens: 4096,
+            pinned: false,
+        }
+    }
+
+    /// A live registry entry. `slug` is all the registry has for a name —
+    /// see `RunningEngine`.
+    fn engine(slug: &str, backend: &str, ready: bool) -> RunningEngine {
+        RunningEngine {
+            id: format!("{slug}@{backend}"),
+            backend_id: backend.to_string(),
+            slug: slug.to_string(),
+            port: 9000,
+            context_tokens: 4096,
+            ready,
+            pinned: false,
+        }
+    }
+
     #[test]
     fn engine_lines_name_running_and_warming_engines_across_backends() {
         let s = state(
             vec![
-                model(
-                    "gemma",
-                    LocalModelStatus::Loaded {
-                        port: 8081,
-                        context_tokens: 4096,
-                        pinned: false,
-                    },
-                ),
+                model("gemma", loaded(8081)),
                 model("idle", LocalModelStatus::Available),
                 model("coming", LocalModelStatus::Loading),
                 model(
@@ -340,17 +472,17 @@ mod tests {
                     },
                 ),
             ],
-            vec![model(
-                "mistral",
-                LocalModelStatus::Loaded {
-                    port: 8082,
-                    context_tokens: 8192,
-                    pinned: true,
-                },
-            )],
+            vec![external_model("mistral", loaded(8082))],
         );
+        // The listing and the registry agree, which is the ordinary case:
+        // every engine is named by its display name, once.
+        let running = [
+            engine("gemma", "local", true),
+            engine("coming", "local", false),
+            engine("mistral", "mine", true),
+        ];
         assert_eq!(
-            engine_lines(Some(&s)),
+            engine_lines(Some(&running), &Loadable::loaded(s)),
             vec![
                 "gemma — running".to_string(),
                 "coming — loading…".to_string(),
@@ -360,20 +492,94 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_or_unknown_engine_section_says_so_rather_than_going_blank() {
-        assert_eq!(engine_lines(None), vec!["Checking on-device engines…"]);
+    fn an_engine_whose_file_vanished_still_shows_as_running() {
+        // The defect this shape exists for: `local_models_state` is a
+        // *directory scan*, so an engine whose backing `.gguf` was renamed or
+        // deleted mid-session drops out of the listing while its subprocess
+        // keeps eating memory. Reading only the listing said "No models
+        // running" over it.
+        let listing = Loadable::loaded(state(vec![], vec![]));
+        let running = [engine("ghost", "local", true)];
         assert_eq!(
-            engine_lines(Some(&state(
-                vec![model("idle", LocalModelStatus::Available)],
-                vec![]
-            ))),
+            engine_lines(Some(&running), &listing),
+            vec!["ghost — running (file missing)"],
+            "named from the slug, and honest about why it is not in Settings"
+        );
+    }
+
+    #[test]
+    fn a_listing_that_has_not_answered_does_not_accuse_an_engine_of_losing_its_file() {
+        // Same registry entry, but the listing is in flight / failed with no
+        // prior — which is not evidence that anything is missing.
+        let running = [engine("ghost", "local", true)];
+        for listing in [
+            Loadable::Loading,
+            Loadable::Failed {
+                error: AppError::Internal {
+                    message: "nope".into(),
+                },
+                prior: None,
+            },
+        ] {
+            assert!(
+                engine_lines(Some(&running), &listing).contains(&"ghost — running".to_string()),
+                "no (file missing) claim without a listing to contradict it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_listing_says_so_instead_of_spinning_forever() {
+        // `Loadable::value()` folds `Failed { prior: None }` into the same
+        // `None` as an in-flight first load, which left the menu reading
+        // "Checking on-device engines…" for a request that had already failed
+        // and (the store only retries on a bus Change) might never be retried.
+        let failed: Loadable<LocalModelsState> = Loadable::Failed {
+            error: AppError::Internal {
+                message: "unreadable".into(),
+            },
+            prior: None,
+        };
+        // With the registry present, the running truth is still answered —
+        // the failure only costs the installed listing.
+        assert_eq!(
+            engine_lines(Some(&[]), &failed),
+            vec!["No models running", "Couldn't list installed models"]
+        );
+        // With neither source, the failure is the whole answer, and it never
+        // reads as a spinner.
+        let lines = engine_lines(None, &failed);
+        assert_eq!(lines, vec!["Couldn't list installed models"]);
+        assert!(!lines.iter().any(|l| l.contains("Checking")));
+    }
+
+    #[test]
+    fn an_idle_or_unknown_engine_section_says_so_rather_than_going_blank() {
+        // Nothing can answer yet: honest, and it resolves on the next notify.
+        assert_eq!(
+            engine_lines(None, &Loadable::NotLoaded),
+            vec!["Checking on-device engines…"]
+        );
+        // The registry can always answer, even with no listing at all.
+        assert_eq!(
+            engine_lines(Some(&[]), &Loadable::NotLoaded),
+            vec!["No models running"]
+        );
+        assert_eq!(
+            engine_lines(
+                None,
+                &Loadable::loaded(state(
+                    vec![model("idle", LocalModelStatus::Available)],
+                    vec![]
+                ))
+            ),
             vec!["No models running"]
         );
     }
 
     #[test]
     fn the_menu_brackets_the_engine_section_with_separators() {
-        let rows = menu_rows(None);
+        let rows = menu_rows(None, &Loadable::NotLoaded);
         assert_eq!(
             rows,
             vec![
