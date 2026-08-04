@@ -723,6 +723,14 @@ impl SpaceView {
                 this.rebuild(cx);
                 cx.notify();
             }),
+            // The third of the model-picker read set (`model_groups` reads all
+            // three): a remote catalog's fetch lands long after the window has
+            // drawn, and an open router picker has to gain those options when
+            // it does. No `rebuild` — catalogs feed the picker's list, not the
+            // transcript snapshot. The other two `router_field` consumers
+            // (`ParticipantsView`, the Space Templates pane) observe the same
+            // three.
+            cx.observe(&stores.models, |_, _, cx| cx.notify()),
         ];
 
         let mut this = Self {
