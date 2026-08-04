@@ -135,18 +135,41 @@ impl SpaceView {
     pub fn toggle_inspector(
         &mut self,
         _: &crate::actions::ToggleInspector,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_inspector_open(!self.inspector_open, cx);
+        self.set_inspector_open(!self.inspector_open, window, cx);
     }
 
-    pub(crate) fn set_inspector_open(&mut self, open: bool, cx: &mut Context<Self>) {
+    /// The **one** door both openers and closers go through (the menu action,
+    /// ⌥⌘I, the overlay scrim), which is what makes the focus handoff below a
+    /// single place rather than a call at each close site.
+    pub(crate) fn set_inspector_open(
+        &mut self,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.inspector_open = open;
         if open {
             self.ensure_inspector_settings(cx);
         } else {
             self.inspector_router_picker = false;
+            // **Focus comes back from the panel** (`RecordView::close_detail`'s
+            // rule). The title field is a view field that survives the close,
+            // so its handle stays the window's focus while its element is gone
+            // — a dead handle: keystrokes reach nothing, `focus_next` restarts
+            // from the top of the window, and type-to-compose is inert until a
+            // click revives it. Hand the keyboard to the conversation the panel
+            // annotated.
+            //
+            // **Only from a panel that is actually holding it** — the
+            // `overlay_borrowed_focus` rule. A reader composing beside an open
+            // inspector never lent the keyboard, and yanking their caret to the
+            // view root on a close would be exactly what they did not ask for.
+            if self.inspector_field_focused(window, cx) {
+                window.focus(&self.focus_handle, cx);
+            }
         }
         cx.notify();
     }
@@ -196,8 +219,13 @@ impl SpaceView {
 
     /// Open/close the inspector without a menu action (driver scenes, tests).
     #[doc(hidden)]
-    pub fn set_inspector_open_for_test(&mut self, open: bool, cx: &mut Context<Self>) {
-        self.set_inspector_open(open, cx);
+    pub fn set_inspector_open_for_test(
+        &mut self,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_inspector_open(open, window, cx);
     }
 
     /// This space's settings cell, for the rows below.
@@ -414,7 +442,9 @@ impl SpaceView {
                     .bottom_0()
                     .bg(gpui::black().opacity(0.28))
                     .contain_mouse(Overlay::Popover)
-                    .on_click(cx.listener(|this, _, _, cx| this.set_inspector_open(false, cx)));
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_inspector_open(false, window, cx)
+                    }));
                 vec![
                     scrim.into_any_element(),
                     panel

@@ -4130,8 +4130,8 @@ fn open_inspector(
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
     });
-    cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, cx))
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
     })
     .unwrap();
     cx.run_until_parked();
@@ -4248,8 +4248,8 @@ fn space_inspector_failed_settings_read_offers_a_retry_not_a_default(cx: &mut Te
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
     });
-    cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, cx))
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
     })
     .unwrap();
     cx.run_until_parked();
