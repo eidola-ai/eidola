@@ -270,6 +270,87 @@ require_certs() {
     fi
 }
 
+# ── Server-bound profile state ───────────────────────────────────────────────
+#
+# Only the connection + trust bundle is per-column overridable; the account
+# (config.toml) and the wallet (local DB) are not, and neither recipe moves
+# them. That is not fixable from a script — a profile carries one account and
+# one credential set — so the honest thing is to say precisely what stays
+# behind and how to get out of each consequence.
+#
+# Both reads below are local (config.toml + local DB) with no network, so the
+# pre-flight works with no stack running — verified by running them against an
+# unreachable base URL.
+
+profile_has_account() {
+    cli | grep -q '^account_id: <set>'
+}
+
+# Prints "<in-flight> <active>" — the two sections of `wallet credentials
+# list`, counted.
+credential_counts() {
+    cli wallet credentials list 2>/dev/null | awk '
+        /^in-flight credentials:/ { s = "f"; next }
+        /^active credentials:/    { s = "a"; next }
+        /^[[:space:]]*$/          { s = "";  next }
+        s == "f" { f++ }
+        s == "a" { a++ }
+        END { printf "%d %d", f + 0, a + 0 }'
+}
+
+# Pre-flight for `enable`: what this profile is about to carry into a stack
+# that did not issue it. Silent on a clean profile.
+warn_server_bound_state() {
+    local in_flight active
+    read -r in_flight active <<<"$(credential_counts)"
+
+    if profile_has_account; then
+        cat <<'EOF'
+==> WARNING: this profile has an account, and it belongs to the server you
+    are leaving. The local stack has never heard of it.
+
+    `eidola account create` REFUSES while one is configured ("account
+    credentials already configured — reset first"), so making an account on
+    the local stack means running `eidola account reset` first — and that
+    DISCARDS the id and secret from config.toml. Copy them somewhere first:
+
+        ~/Library/Application Support/eidola/config.toml   (macOS)
+
+    `eidola account configure --id <id> --secret <secret>` puts them back.
+
+EOF
+    fi
+
+    if [ "${active:-0}" -gt 0 ]; then
+        cat <<EOF
+==> WARNING: $active active credential(s) in this wallet were issued by the
+    server you are leaving. Credential selection has no issuer filter, so a
+    turn against the local stack can pick one, mark it in-flight, and then
+    fail — the local issuer cannot verify a credential it never minted.
+
+    Such a credential is parked, not lost: after \`just client-reset\` run
+        eidola wallet credentials recover
+    which replays the stored spend proof to the server that issued it.
+
+EOF
+    fi
+}
+
+# Closing note for `disable`: anything the local stack left in flight can be
+# settled now that the pinned service is back.
+note_in_flight_credentials() {
+    local in_flight active
+    read -r in_flight active <<<"$(credential_counts)"
+    [ "${in_flight:-0}" -gt 0 ] || return 0
+    cat <<EOF
+==> $in_flight credential(s) are still in flight. You are back on the pinned
+    service, so if they were issued by it, settle them now:
+
+        eidola wallet credentials recover
+
+EOF
+}
+
 warn_if_shim_down() {
     command -v curl >/dev/null 2>&1 || return 0
     # -k: liveness only. Whether the chain verifies is exactly what the OS
@@ -294,6 +375,8 @@ cmd_enable() {
         exit 1
     fi
     echo "==> Pointing the local client at $BASE_URL"
+    # Before the first write, so there is something to abort on.
+    warn_server_bound_state
     trust_ca_note
     cli configure \
         --base-url "$BASE_URL" \
@@ -308,10 +391,10 @@ cmd_enable() {
 ==> The GUI and the CLI share this profile, so both now talk to the local
     stack. Undo with \`just client-reset\`.
 
-    Accounts and wallet credentials are per-server: the account in your
-    config.toml was issued by whichever server you were pointed at. Create
-    one on the local stack with \`eidola account create --accept-terms\`,
-    and expect the reverse mismatch after \`just client-reset\`.
+    Only the connection + trust bundle moved. If this profile has no account
+    yet, \`eidola account create --accept-terms\` makes one on the local
+    stack; if it has one, see the warning above — it is not the local
+    stack's, and creating a local one is destructive to it.
 EOF
 }
 
@@ -330,6 +413,7 @@ cmd_disable() {
         --clear-hardware-intermediate-ca \
         --clear-trusted-measurements
     echo ""
+    note_in_flight_credentials
     untrust_ca_note
     cmd_status
 }
