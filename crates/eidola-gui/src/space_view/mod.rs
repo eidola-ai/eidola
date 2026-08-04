@@ -2061,22 +2061,15 @@ impl Render for SpaceView {
         // `doc_reserve`. Used for the scroll range, the forest origin, and the
         // content's top padding so all three agree.
         let doc_reserve = self.doc_reserve();
-        let total_doc =
-            doc_reserve + self.selected_total_height(&tree, page_width, window_h) + floating_pad;
-        self.scroll_min_y
-            .set((window_h.as_f32() - total_doc).min(0.0));
-        // Where "the end" is for a *following* reader: the end of what has been
-        // written. A trailing draft's slot is a whole window of speculative
-        // runway, and following into it carries the reply the reader was
-        // watching off the top of the window (task 46, bug 2). While a turn
-        // streams there is no trailing draft, so this is the document end and
-        // nothing changes; it differs exactly across the settling window where
-        // the fresh composer appears.
-        let content_end = (window_h.as_f32()
-            - (total_doc - self.trailing_draft_slot_h(&tree, page_width, window_h)))
-        .min(0.0)
-        .max(self.scroll_min_y.get());
-        let prev_content_end = self.follow_anchor.replace(content_end);
+        // Both ends of the branch, from the one definition every settle reads
+        // (`layout::page_end_ys`): the document end bounds the scroll range,
+        // and the *content* end — the document less a trailing draft's
+        // speculative runway — is where a reader comes to rest (task 46,
+        // bug 2). They coincide on every frame a turn is actually streaming.
+        let ends = self.page_end_ys(&tree, page_width, window_h);
+        self.scroll_min_y.set(ends.document);
+        let prev_content_end = self.follow_anchor.replace(ends.content);
+        let content_end = ends.content;
 
         // **Follow the producing tail.** While a turn streams *on the branch
         // the reader is on*, the document grows with every delta; a reader

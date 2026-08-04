@@ -3541,6 +3541,135 @@ fn space_ask_selects_the_reply_when_the_turn_lands_before_the_next_render(cx: &m
 }
 
 #[gpui::test]
+fn space_ask_that_lands_pre_render_settles_at_the_end_of_the_answer(cx: &mut TestAppContext) {
+    // The ask parks the reader at the end of the branch its turn lands on. When
+    // the turn is still streaming that end is the answer's end — but a turn
+    // that completed before the render is followed onto its *post*, and by the
+    // time the request is consumed `sync_tail_drafts` has already docked a
+    // fresh composer under it. Settling at the document end then scrolls
+    // straight past the answer into the draft's window of runway: bug 2's
+    // overshoot, reached through bug 3's path. "The end" has one definition —
+    // the end of what was written.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long)], cx)
+        });
+    })
+    .unwrap();
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Ask, and the turn lands before the next frame.
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-b".into(), "a1".into(), window, cx)
+        });
+        let seq = space.read(cx).streams()[0].seq;
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(seq, vec![fixture_user_post("a1", &long), a2], false, cx)
+        });
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.draft_parents_for_test().contains(&Some("a2".to_string())),
+            "the finished exchange grew its tail draft ({:?})",
+            v.draft_parents_for_test()
+        );
+        let doc_end = v.scroll_min_y_for_test();
+        let content_end = v.content_end_for_test();
+        let offset = v.page_scroll_offset_y_for_test();
+        assert!(
+            content_end > doc_end + 1.0,
+            "the trailing draft's runway is what separates the two (content \
+             end {content_end}, document end {doc_end})"
+        );
+        assert!(
+            (offset - content_end).abs() < 2.0,
+            "the ask settles at the end of the answer, not past it (offset \
+             {offset}, content end {content_end}, document end {doc_end})"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_newer_ask_outranks_a_completing_turns_retarget(cx: &mut TestAppContext) {
+    // Two aims at once: the reader is parked on turn A's stream *and* has just
+    // asked B, so B's leaf is the pending request. If A then lands before the
+    // next render, following A onto its post must not overwrite that request —
+    // a pending selection is the reader's latest ask, and the newest intent
+    // wins. Otherwise the ask silently does nothing and the reader stays on
+    // the answer they had already read.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "a question")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Parked on the first participant's stream.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-b".into(), "a1".into(), window, cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+    let first = view.read_with(cx, |v, cx| v.space().read(cx).streams()[0].seq);
+
+    // Ask a second participant, and the first turn lands before either can
+    // render.
+    let mut a2 = fixture_assistant_post("a2", "the first agent's answer");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-c".into(), "a1".into(), window, cx)
+        });
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(
+                first,
+                vec![fixture_user_post("a1", "a question"), a2],
+                false,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let second = view.read_with(cx, |v, cx| v.space().read(cx).streams()[0].seq);
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&streaming_node_id(second).to_string()),
+        "the reader's newest ask wins over the older turn's landing ({path:?})"
+    );
+    assert!(
+        !path.contains(&"a2".to_string()),
+        "so the completed turn's post does not steal the selection ({path:?})"
+    );
+}
+
+#[gpui::test]
 fn space_selected_turn_keeps_its_branch_when_it_lands_before_its_sibling(cx: &mut TestAppContext) {
     // The same swap, one frame later: the reader is already *parked* on a
     // turn's streaming leaf when that turn lands. Branch selection is
