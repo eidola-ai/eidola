@@ -10407,3 +10407,59 @@ fn space_inspector_closing_leaves_a_composing_reader_alone(cx: &mut TestAppConte
         "and the draft is still the composing session"
     );
 }
+
+/// The same class as `space_inspector_repaints_when_its_settings_land`, closed
+/// for the panel's **whole** read set: the router picker's options come from
+/// `ModelsStore` (via `router_field` → `model_groups`), whose catalog fetches
+/// land well after the window has drawn — a remote catalog arriving with an
+/// open picker must repaint it, or the remote refs simply are not in the list
+/// until something unrelated redraws the window. `ParticipantsView` and the
+/// Space Templates pane (the other two `router_field` consumers) already
+/// observed this store; the space view was the one that did not.
+#[gpui::test]
+fn space_inspector_repaints_when_a_model_catalog_lands(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_space(cx, &stores, Some(space.clone()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_inspector_open_for_test(true, window, cx);
+            v.inspector_toggle_router_picker_for_test(cx);
+        })
+    })
+    .unwrap();
+    // Quiesce: the settings load and every launch-time refresh settle, so the
+    // only thing left to notify this window is the fetch started below.
+    wait_until(cx, "the window quiesces", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).has_value())
+            && stores.models.read_with(cx, |s, _| !s.models().is_loading())
+    });
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_picker_open_for_test()),
+        "precondition: the reader is looking at the open router picker"
+    );
+
+    let repaints = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = repaints.clone();
+    let _sub = cx.update(|cx| cx.observe(&view, move |_, _| counter.set(counter.get() + 1)));
+
+    // A catalog refresh: the registry read, then the per-backend fetch. Both
+    // land asynchronously; the synchronous `to_loading` notify that starts it
+    // is not what this test is about.
+    stores.models.update(cx, |s, cx| s.refresh(cx));
+    repaints.set(0);
+
+    wait_until(cx, "the catalog fetch completes", |cx| {
+        stores
+            .models
+            .read_with(cx, |s, _| s.models().error().is_some())
+    });
+    assert!(
+        repaints.get() > 0,
+        "a catalog landing must schedule a repaint — otherwise the open picker \
+         keeps showing the options it drew before the fetch completed"
+    );
+
+    drain_runtime(&core);
+}
