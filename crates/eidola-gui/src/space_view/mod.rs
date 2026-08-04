@@ -638,7 +638,7 @@ pub struct SpaceView {
     /// The page (vertical) glide carrying the reader to a place they asked to
     /// be taken to — a reference, a footnote's source, "See in context". See
     /// [`PageGlide`]; cancelled by any scroll the reader or the tail drives.
-    pub(crate) page_glide: Option<PageGlide>,
+    pub(crate) page_glide: Cell<Option<PageGlide>>,
     /// The previous frame's page width, to remap branch offsets on resize.
     pub(crate) last_page_width: Option<Pixels>,
 
@@ -803,7 +803,7 @@ impl SpaceView {
             last_h_delta: px(0.),
             snap: None,
             snap_pin: None,
-            page_glide: None,
+            page_glide: Cell::new(None),
             last_page_width: None,
             layout: Layout::new(),
             warm_remaining: Cell::new(0),
@@ -1002,8 +1002,7 @@ impl SpaceView {
     /// which the composer owns its own scroll.
     #[doc(hidden)]
     pub fn scroll_page_to_top_for_test(&self) {
-        let off = self.page_scroll.offset();
-        self.page_scroll.set_offset(gpui::point(off.x, px(0.)));
+        self.set_page_scroll_y(0.);
     }
 
     /// Scroll the whole page by `dy` (negative = toward the document end),
@@ -1012,9 +1011,8 @@ impl SpaceView {
     /// the pre-dock glide at each step.
     #[doc(hidden)]
     pub fn scroll_page_by_for_test(&self, dy: f32) {
-        let off = self.page_scroll.offset();
-        let y = (off.y.as_f32() + dy).clamp(self.scroll_min_y.get(), 0.0);
-        self.page_scroll.set_offset(gpui::point(off.x, px(y)));
+        let y = (self.page_scroll.offset().y.as_f32() + dy).clamp(self.scroll_min_y.get(), 0.0);
+        self.set_page_scroll_y(y);
     }
 
     /// Scroll the whole page to the end of the current document — the position
@@ -1022,9 +1020,7 @@ impl SpaceView {
     /// the reader at the tail before deltas arrive.
     #[doc(hidden)]
     pub fn scroll_page_to_end_for_test(&self) {
-        let off = self.page_scroll.offset();
-        self.page_scroll
-            .set_offset(gpui::point(off.x, px(self.scroll_min_y.get())));
+        self.set_page_scroll_y(self.scroll_min_y.get());
     }
 
     /// Whether the post-submit tail pin is armed — the widened follow gate that
@@ -1059,7 +1055,7 @@ impl SpaceView {
     /// the page is at rest). Drives the animated-navigation regressions.
     #[doc(hidden)]
     pub fn page_glide_target_for_test(&self) -> Option<f32> {
-        self.page_glide.as_ref().map(|g| g.to_y)
+        self.page_glide.get().map(|g| g.to_y)
     }
 
     /// Advance the navigation glide to progress `t` — the frame loop's body
@@ -2300,10 +2296,19 @@ impl SpaceView {
     /// by the exchange (`Space::is_busy`) and by the reader starting a new
     /// draft, so it never reaches the composer-runway growth the gate excludes.
     ///
+    /// **Following yields to a navigation glide**, the one other motion that
+    /// spans frames: a reader who clicked "See in context" while parked at the
+    /// tail is on their way somewhere, and until they land the offset is not
+    /// theirs to hold. Without the guard the two would trade the page for the
+    /// frame or two it takes the glide to clear `TAIL_FOLLOW_EPSILON` (and, on
+    /// a document still growing under them, for longer). The reverse direction
+    /// needs nothing: the glide moves the reader off the end, `at_tail` reads
+    /// false, and following stays disengaged on its own.
+    ///
     /// Runs in `render` immediately after `scroll_min_y` is set for the frame,
     /// so every consumer of `clamped_scroll_y` sees the followed position.
     fn follow_streaming_tail(&self, producing: bool, prev_end: f32, end: f32) {
-        if !producing {
+        if !producing || self.page_glide.get().is_some() {
             return;
         }
         let off = self.page_scroll.offset();
@@ -2312,7 +2317,7 @@ impl SpaceView {
             return; // the reader scrolled away — never yank them back
         }
         if (end - off.y.as_f32()).abs() > 0.5 {
-            self.page_scroll.set_offset(gpui::point(off.x, px(end)));
+            self.set_page_scroll_y(end);
         }
     }
 
@@ -2348,7 +2353,7 @@ impl SpaceView {
         let new_y = (off.y.as_f32() + dy).clamp(self.scroll_min_y.get(), 0.0);
         let scrolled = (new_y - off.y.as_f32()).abs() > 0.01;
         if scrolled {
-            self.page_scroll.set_offset(gpui::point(off.x, px(new_y)));
+            self.set_page_scroll_y(new_y);
         }
         // Re-extend the selection to the row now under the (unmoved) pointer.
         editor.update(cx, |e, cx| e.drag_extend_to(mouse, cx));
