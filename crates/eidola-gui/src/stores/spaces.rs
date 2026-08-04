@@ -21,6 +21,15 @@
 //! successful one). The re-list runs on **every** exit, so the optimism never
 //! outlives the round trip: a refused write is reconciled back to what the
 //! database holds, with its refusal in [`SpacesStore::op_error`].
+//!
+//! **Those slots are keyed per space, and so are the refusals.** One shared
+//! mutation slot has the same defect one slot away: a second rename replaces
+//! the first, and two spaces renamed a keystroke apart (two Library rows, two
+//! windows) lose the first's write or its report. Mutations on different spaces
+//! are independent work — the `Space` entity's `turn_runners` shape — and each
+//! keeps its own refusal, because the space inspector reads per space and a
+//! refusal that another space overwrote is a title field snapping back with no
+//! reason given.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -48,6 +57,14 @@ struct SpaceOpError {
     message: String,
 }
 
+/// How many standing refusals are kept (see [`SpacesStore::op_errors`]). One per
+/// space with an unacknowledged refusal, and a refusal only lands on a write the
+/// user asked for, so the realistic ceiling is a handful; the cap exists so the
+/// list cannot grow without bound in the pathological case. The oldest yields —
+/// the surfaces read the most recent (Library) and the per-space one (inspector),
+/// which are the two an oldest-first drop keeps longest.
+const MAX_STANDING_OP_ERRORS: usize = 8;
+
 pub struct SpacesStore {
     app_core: Option<Arc<AppCore>>,
     /// The Library index (archived excluded), newest activity first.
@@ -55,11 +72,28 @@ pub struct SpacesStore {
     /// Supersede slot for the index **refresh** — deliberately not the
     /// mutation's (see the module docs).
     task: Option<Task<()>>,
-    /// Supersede slot for an index **mutation** (rename / archive), each
-    /// composing `write; re-list`.
-    op_task: Option<Task<()>>,
-    /// A refresh signalled while a mutation held the read: deferred to that
-    /// mutation's completion, where it can only be fresher.
+    /// One supersede slot for an index **mutation** (rename / archive) **per
+    /// space**, each composing `write; re-list`.
+    ///
+    /// Keyed, not one shared slot (the `Space` entity's `turn_runners` shape):
+    /// mutations on *different* spaces are independent work and must coexist —
+    /// a shared slot let a second rename replace the first, dropping the gpui
+    /// half of a write already in flight (its refusal and its re-list lost, the
+    /// silent-loss class this whole shape exists to cure) or cancelling the
+    /// first operation outright before it was ever polled. Two Library rows,
+    /// two windows, or a Library row and an inspector are all one keystroke
+    /// apart.
+    ///
+    /// Two mutations on the *same* space still **replace-cancel**, deliberately:
+    /// a space's title is edited by one control at a time (a row's rename field,
+    /// an inspector's title), so last-wins is the right reading of two rapid
+    /// writes to one — and the residual is bounded, since the superseded write's
+    /// core call still runs (`bridge` cancels nothing) and the winner's own
+    /// re-list reconciles the index either way. Only the superseded write's
+    /// *message* is lost, and it was about the same space the winner reports on.
+    op_tasks: HashMap<String, Task<()>>,
+    /// A refresh signalled while any mutation held the read: deferred to the
+    /// **last** one's completion, where it can only be fresher.
     refresh_pending: bool,
     /// The per-space entity registry. `WeakEntity` so a dropped window's space
     /// (with no other holder) is collected — `open` prunes dead weaks on miss.
@@ -76,11 +110,18 @@ pub struct SpacesStore {
     /// window. Each task removes its own key when it finishes.
     create_ops: HashMap<u64, Task<()>>,
     next_create_op: u64,
-    /// The last refused space operation — a create, a rename, or an archive.
-    /// One slot, because the index it is about is one store-wide snapshot: the
-    /// Library shows it as its single banner and the inspector shows it only
-    /// when it is tagged with the space that inspector is looking at.
-    op_error: Option<SpaceOpError>,
+    /// The standing refusals — a create, a rename, or an archive the store
+    /// could not complete — most recent last, at most one per key (a space id,
+    /// or `None` for a create).
+    ///
+    /// A list rather than one slot for the same reason the task slots are keyed:
+    /// two spaces can be refused at once, and a per-space surface reads only its
+    /// own. A single slot would let the second refusal erase the first, leaving
+    /// the first space's inspector showing a title field that snapped back with
+    /// no reason given — the dishonesty this store's shape exists to prevent.
+    /// The Library, which is the window over the whole index, shows the most
+    /// recent of them.
+    op_errors: Vec<SpaceOpError>,
 }
 
 impl SpacesStore {
@@ -89,13 +130,13 @@ impl SpacesStore {
             app_core,
             index: Loadable::NotLoaded,
             task: None,
-            op_task: None,
+            op_tasks: HashMap::new(),
             refresh_pending: false,
             registry: HashMap::new(),
             pending_blanks: Vec::new(),
             create_ops: HashMap::new(),
             next_create_op: 0,
-            op_error: None,
+            op_errors: Vec::new(),
         }
     }
 
@@ -109,13 +150,13 @@ impl SpacesStore {
                 Loadable::loaded(spaces)
             },
             task: None,
-            op_task: None,
+            op_tasks: HashMap::new(),
             refresh_pending: false,
             registry: HashMap::new(),
             pending_blanks: Vec::new(),
             create_ops: HashMap::new(),
             next_create_op: 0,
-            op_error: None,
+            op_errors: Vec::new(),
         }
     }
 
@@ -134,7 +175,7 @@ impl SpacesStore {
     ) {
         let op = refusal.map_or(Ok(()), |r| Err(r.to_string()));
         if let Some(message) = crate::stores::settle_mutation(&mut self.index, Ok(listing), op) {
-            self.op_error = Some(SpaceOpError { space_id, message });
+            self.record_op_error(space_id, message);
         }
         cx.notify();
     }
@@ -239,26 +280,47 @@ impl SpacesStore {
 
     // -- Refused operations -------------------------------------------------
 
-    /// The last refused space operation, whatever it was about — the Library's
-    /// banner, which is the window over the whole index.
+    /// The most recent refusal, whatever it was about — the Library's banner,
+    /// which is the window over the whole index.
     pub fn op_error(&self) -> Option<&str> {
-        self.op_error.as_ref().map(|e| e.message.as_str())
+        self.op_errors.last().map(|e| e.message.as_str())
     }
 
-    /// The last refusal **about `space_id`** — what a per-space surface (the
+    /// The standing refusal **about `space_id`** — what a per-space surface (the
     /// space inspector) shows, so a rename refused in one space never surfaces
-    /// under another space's title field.
+    /// under another space's title field, and never goes unreported because
+    /// another space was refused after it.
     pub fn op_error_for(&self, space_id: &str) -> Option<&str> {
-        self.op_error
-            .as_ref()
-            .filter(|e| e.space_id.as_deref() == Some(space_id))
+        self.op_errors
+            .iter()
+            .find(|e| e.space_id.as_deref() == Some(space_id))
             .map(|e| e.message.as_str())
     }
 
+    /// Dismiss the refusal the Library is showing — **that one**, not all of
+    /// them: each standing refusal is about a different space and is its own
+    /// message to acknowledge. A second one, if any, takes the banner.
     pub fn clear_op_error(&mut self, cx: &mut Context<Self>) {
-        if self.op_error.take().is_some() {
+        if self.op_errors.pop().is_some() {
             cx.notify();
         }
+    }
+
+    /// Record a refusal, replacing any standing one for the same key (a fresh
+    /// refusal about a space supersedes that space's stale one) and keeping the
+    /// list recency-ordered and bounded.
+    fn record_op_error(&mut self, space_id: Option<String>, message: String) {
+        self.op_errors.retain(|e| e.space_id != space_id);
+        self.op_errors.push(SpaceOpError { space_id, message });
+        if self.op_errors.len() > MAX_STANDING_OP_ERRORS {
+            self.op_errors.remove(0);
+        }
+    }
+
+    /// Drop the standing refusal for a key, if any — a new operation on it is
+    /// about to answer the same question.
+    fn clear_op_error_for(&mut self, space_id: Option<&str>) {
+        self.op_errors.retain(|e| e.space_id.as_deref() != space_id);
     }
 
     // -- New Space from Template ------------------------------------------
@@ -268,9 +330,10 @@ impl SpacesStore {
     /// runs to completion regardless of any window, and each activation is
     /// independent (no supersede) so a committed space always gets its window —
     /// no stranding. A failure is surfaced in [`SpacesStore::op_error`] (the
-    /// Library banner), not silently discarded. `stores` is passed through only to open the
-    /// resulting window (`open_space_window` needs the bundle); it is not
-    /// retained.
+    /// Library banner), not silently discarded — and only the *previous create's*
+    /// refusal is cleared as this one leaves, never another space's standing one.
+    /// `stores` is passed through only to open the resulting window
+    /// (`open_space_window` needs the bundle); it is not retained.
     pub fn create_from_template(
         &mut self,
         template_id: String,
@@ -280,7 +343,7 @@ impl SpacesStore {
         let Some(core) = self.app_core.clone() else {
             return;
         };
-        self.op_error = None;
+        self.clear_op_error_for(None);
         let key = self.next_create_op;
         self.next_create_op += 1;
         self.create_ops.insert(
@@ -301,10 +364,7 @@ impl SpacesStore {
                     }
                     Err(e) => {
                         let _ = this.update(cx, |this, cx| {
-                            this.op_error = Some(SpaceOpError {
-                                space_id: None,
-                                message: format!("Couldn't create the space: {e}"),
-                            });
+                            this.record_op_error(None, format!("Couldn't create the space: {e}"));
                             cx.notify();
                         });
                     }
@@ -321,16 +381,16 @@ impl SpacesStore {
 
     /// Refresh the Library index. Fire-and-notify supersede slot.
     ///
-    /// A refresh signalled while a mutation is in flight is **deferred** to its
-    /// completion rather than started beside it: the mutation has taken over
-    /// the read for its duration (see [`Self::write_then_relist`]), and a read
-    /// that resolves after the mutation's own re-list can only be fresher than
-    /// one racing it.
+    /// A refresh signalled while a mutation is in flight is **deferred** to the
+    /// completion of the **last** one rather than started beside them: a
+    /// mutation has taken over the read for its duration (see
+    /// [`Self::write_then_relist`]), and a read that resolves after their own
+    /// re-lists can only be fresher than one racing them.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(core) = self.app_core.clone() else {
             return;
         };
-        if self.op_task.is_some() {
+        if !self.op_tasks.is_empty() {
             self.refresh_pending = true;
             return;
         }
@@ -347,19 +407,27 @@ impl SpacesStore {
     }
 
     /// The write-through shape for an index mutation: run `op`, then re-list —
-    /// on **every** exit, failure included.
+    /// on **every** exit, failure included — **in `space_id`'s own slot**, so a
+    /// mutation on another space neither cancels this one nor is cancelled by it.
     ///
     /// **The mutation takes over the read.** It drops any in-flight refresh,
     /// which may have been issued *before* this write and would re-stale the
     /// snapshot by resolving after it; cancelling another slot's fetch is a
     /// debt (`crates/eidola-gui/STATE.md` → "Concurrency patterns"), which the
-    /// unconditional re-list discharges. That re-list is also what bounds the
-    /// caller's optimistic edit of the cached row: a refused write is
-    /// reconciled back to what the database holds instead of leaving the
-    /// Library, the window title, and the inspector's title field showing a
-    /// name nothing ever persisted. The refusal itself wins `op_error`, while a
-    /// re-list that fails resolves the *cell* (`Failed { prior }`, keeping the
-    /// listing on screen) — [`crate::stores::settle_mutation`] owns that pairing.
+    /// unconditional re-list discharges. A deferred refresh is dropped for the
+    /// same reason and on the same promise: this operation's own re-list, which
+    /// runs strictly later, is what the refresh would have fetched.
+    ///
+    /// That re-list is also what bounds the caller's optimistic edit of the
+    /// cached row: a refused write is reconciled back to what the database holds
+    /// instead of leaving the Library, the window title, and the inspector's
+    /// title field showing a name nothing ever persisted. (With two mutations in
+    /// flight over one shared cell, the first to settle briefly re-lists the
+    /// second's optimistic edit away — a flicker of the durable truth, corrected
+    /// by the second's own re-list, never a state that outlives the round trip.)
+    /// The refusal itself joins `op_errors`, while a re-list that fails resolves
+    /// the *cell* (`Failed { prior }`, keeping the listing on screen) —
+    /// [`crate::stores::settle_mutation`] owns that pairing.
     ///
     /// `op` returns the complete sentence to show, so each caller words its own
     /// refusal.
@@ -372,30 +440,34 @@ impl SpacesStore {
         let Some(core) = self.app_core.clone() else {
             return;
         };
-        self.op_error = None;
+        self.clear_op_error_for(Some(&space_id));
         // Take over the read for the duration of the write.
         self.task = None;
         self.refresh_pending = false;
         let relist_core = core.clone();
-        self.op_task = Some(cx.spawn(async move |this, cx| {
-            let op_result = op(core).await;
-            let list = bridge(relist_core, |c| async move { c.list_spaces(false).await }).await;
-            let _ = this.update(cx, |this, cx| {
-                if let Some(message) =
-                    crate::stores::settle_mutation(&mut this.index, list, op_result)
-                {
-                    this.op_error = Some(SpaceOpError {
-                        space_id: Some(space_id),
-                        message,
-                    });
-                }
-                this.op_task = None;
-                if std::mem::take(&mut this.refresh_pending) {
-                    this.refresh(cx);
-                }
-                cx.notify();
-            });
-        }));
+        let key = space_id.clone();
+        self.op_tasks.insert(
+            space_id.clone(),
+            cx.spawn(async move |this, cx| {
+                let op_result = op(core).await;
+                let list = bridge(relist_core, |c| async move { c.list_spaces(false).await }).await;
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(message) =
+                        crate::stores::settle_mutation(&mut this.index, list, op_result)
+                    {
+                        this.record_op_error(Some(space_id), message);
+                    }
+                    this.op_tasks.remove(&key);
+                    // The deferred refresh waits for the *last* mutation: an
+                    // earlier one's re-list is not necessarily later than a
+                    // sibling write still in flight.
+                    if this.op_tasks.is_empty() && std::mem::take(&mut this.refresh_pending) {
+                        this.refresh(cx);
+                    }
+                    cx.notify();
+                });
+            }),
+        );
         cx.notify();
     }
 
