@@ -570,12 +570,25 @@ impl SpaceView {
             .id()
             .map(str::to_string)
             .unwrap_or_default();
+        // One banner for this panel's write refusals, from either store that
+        // takes a write from it: the settings rows (`SpaceSettingsStore`) and
+        // the title (`SpacesStore`, which owns the Library index). The index is
+        // a store-wide snapshot, so its refusal is read **tagged with this
+        // space** — a rename refused in another window's space belongs under
+        // that space's field, not this one's.
         let op_error = self
             .stores
             .space_settings
             .read(cx)
             .op_error(&space_id)
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| {
+                self.stores
+                    .spaces
+                    .read(cx)
+                    .op_error_for(&space_id)
+                    .map(str::to_string)
+            });
         let load_error = cell.error().map(|e| e.to_string());
 
         // Title first: it is the space's name, and renaming works whether or

@@ -671,10 +671,12 @@ impl Render for LibraryView {
             crate::titlebar::drag_band("library-titlebar", TITLE_BAR_RESERVE, window, cx);
         let theme = cx.theme();
         let count = self.spaces.read(cx).list().len();
-        // A "New Space from Template" failure is surfaced here (the natural home
-        // for a failed new-space) rather than silently discarded by its owning
-        // store task.
-        let new_space_error = self.spaces.read(cx).new_space_error().map(str::to_string);
+        // A refused space operation — a failed "New Space from Template", or a
+        // rename/archive the database would not take — is surfaced here rather
+        // than silently discarded by its owning store task. **One banner**: the
+        // Library is the window over the whole index, and a second strip for a
+        // second verb would only make the page shout.
+        let op_error = self.spaces.read(cx).op_error().map(str::to_string);
 
         let mut root = crate::chrome::round_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)
@@ -712,12 +714,14 @@ impl Render for LibraryView {
                 .child(div().h(px(1.)).flex_1().bg(theme.border)),
         );
 
-        // A failed "New Space from Template" — a dismissible danger strip.
-        if let Some(err) = new_space_error {
+        // A refused create / rename / archive — a dismissible strip. The store
+        // words the sentence (it knows which verb was refused); the banner just
+        // says it, quietly.
+        if let Some(err) = op_error {
             root = root.child(
                 h_flex()
-                    .id("library-new-space-error")
-                    .probe("library/new-space-error", gpui::Role::Alert, err.clone())
+                    .id("library-op-error")
+                    .probe("library/op-error", gpui::Role::Alert, err.clone())
                     .mx_10()
                     .mb_2()
                     .px_3()
@@ -733,24 +737,18 @@ impl Render for LibraryView {
                             .min_w_0()
                             .text_sm()
                             .text_color(theme.danger)
-                            .child(SharedString::from(format!(
-                                "Couldn't create the space: {err}"
-                            ))),
+                            .child(SharedString::from(err.clone())),
                     )
                     .child(
                         div()
-                            .id("library-new-space-error-dismiss")
-                            .probe(
-                                "library/new-space-error/dismiss",
-                                gpui::Role::Button,
-                                "Dismiss",
-                            )
+                            .id("library-op-error-dismiss")
+                            .probe("library/op-error/dismiss", gpui::Role::Button, "Dismiss")
                             .cursor_pointer()
                             .text_color(theme.muted_foreground)
                             .hover(|s| s.text_color(theme.foreground))
                             .child("×")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.spaces.update(cx, |s, cx| s.clear_new_space_error(cx));
+                                this.spaces.update(cx, |s, cx| s.clear_op_error(cx));
                             })),
                     ),
             );
