@@ -73,7 +73,7 @@
 #[cfg(target_os = "macos")]
 mod macos;
 
-use eidola_app_core::{LocalModelStatus, LocalModelsState, RunningEngine};
+use eidola_app_core::{LocalModelInfo, LocalModelStatus, LocalModelsState, RunningEngine};
 use gpui::App;
 
 use crate::lifecycle::LaunchOptions;
@@ -214,19 +214,31 @@ struct EngineLine {
 /// the managed store *and* every configured `llamacpp` backend (an engine is
 /// an engine — the menu is not a backend registry).
 ///
-/// **The live registry leads and the listing only decorates it.**
-/// `running` is [`eidola_app_core::AppCore::running_engines`] — synchronous,
-/// infallible, the in-process truth. `installed` is the `LocalModelsStore`
-/// snapshot, which app-core reconstructs by *scanning* the model directories:
-/// an engine whose `.gguf` was renamed or deleted mid-session (or whose
-/// backend row was removed, or whose directory has gone unreadable) is simply
-/// absent from it while the subprocess holds gigabytes. Reading only the
-/// listing therefore said "No models running" over a live engine — the same
-/// scan-versus-registry defect wave 2 fixed on the quit path. So every
-/// registry entry produces a line, named from the listing when the listing
-/// knows it and from the engine's own slug when it does not; an engine the
-/// listing has lost says so, because "why is this model not in Settings
-/// while my memory is gone?" is the question that moment raises.
+/// **When the registry answers, it is the running set — in both directions;
+/// the listing only decorates.** `running` is
+/// [`eidola_app_core::AppCore::running_engines`] — synchronous, infallible,
+/// the in-process truth. `installed` is the `LocalModelsStore` snapshot, which
+/// app-core reconstructs by *scanning* the model directories, and which
+/// survives a failed rescan as a preserved `prior`. Both failure modes follow
+/// from that, and they are mirror images:
+///
+/// - **The listing misses a live engine.** Its `.gguf` was renamed or deleted
+///   mid-session, or its backend row was removed, or its directory went
+///   unreadable — so the scan cannot see it while the subprocess holds
+///   gigabytes, and the menu said "No models running" over it. Every registry
+///   entry now produces a line; one the listing has lost is named from the
+///   engine's own slug and says `(file missing)`, because "why is this model
+///   not in Settings while my memory is gone?" is the question that moment
+///   raises.
+/// - **The listing claims a dead one.** An engine exits or is unloaded, the
+///   rescan fails, and `Failed { prior }` keeps the old snapshot standing
+///   indefinitely — so a `Loaded` row outlives its engine. The registry
+///   already knows it is gone, so that row is vetoed rather than printed.
+///
+/// Both are the same scan-versus-registry defect wave 2 fixed on the quit
+/// path, and one rule closes both: membership comes from the registry, names
+/// come from the listing. See [`reconcile`], which also documents why leading
+/// with the registry loses no warming engine.
 ///
 /// **`installed` is the whole `Loadable`, not its value.** `value()` folds
 /// `Failed { prior: None }` into the same `None` as an in-flight first load,
@@ -272,53 +284,97 @@ pub fn engine_lines(
     lines
 }
 
-/// Join the two sources on the model id: the listing's own loaded/loading
-/// rows first (they carry display names), then every registry engine the
-/// listing did not account for.
+/// Resolve the two sources into the readout.
+///
+/// **When the registry answered it is the running set in both directions** —
+/// it adds engines the listing lost, and it *vetoes* engines the listing still
+/// claims. The veto is the half that is easy to miss: a listing is a snapshot
+/// preserved across a failed rescan (`Failed { prior }` keeps the old value so
+/// the UI is never blanked), so after an engine exits or is unloaded, a rescan
+/// that fails leaves a stale `Loaded` row standing indefinitely. Emitting it
+/// would have the menu insist a stopped engine is running while `running`
+/// already knew better. The listing therefore only *decorates* — it supplies
+/// display names for entries the registry vouches for, nothing more.
+///
+/// **The registry owns the warming phase, so nothing is lost by leading with
+/// it.** `reserve_engine` inserts the entry with `ready: false` *before* the
+/// subprocess is spawned, and `scan_engine_dir` derives the listing's
+/// `LocalModelStatus::Loading` from exactly that (`Some(e) if !e.ready`) — so
+/// the listing can never report a warming engine the registry does not already
+/// hold, and the registry's own `ready` bit is the fresher copy of the same
+/// fact. (Before the reservation there is no engine at all: the load is still
+/// doing backend lookup, port picking and `fs::metadata`, and the listing
+/// would say `Available` too.)
 fn reconcile(
     running: Option<&[RunningEngine]>,
     installed: &Loadable<LocalModelsState>,
 ) -> Vec<EngineLine> {
     let state = installed.value();
-    let listed = state.into_iter().flat_map(|s| {
-        s.models
-            .iter()
-            .chain(s.external.iter().flat_map(|b| b.models.iter()))
-    });
+    let Some(running) = running else {
+        // Nothing to ask (no core — the stub stores). The listing is all
+        // there is, so its own rows stand for whatever they are worth.
+        return state.map(listing_lines).unwrap_or_default();
+    };
 
-    let mut seen: Vec<&str> = Vec::new();
-    let mut out: Vec<EngineLine> = Vec::new();
-    for m in listed {
-        let ready = match m.status {
-            LocalModelStatus::Loaded { .. } => true,
-            LocalModelStatus::Loading => false,
-            _ => continue,
-        };
-        seen.push(m.id.as_str());
-        out.push(EngineLine {
-            name: m.display_name.clone(),
-            ready,
-            orphaned: false,
-        });
-    }
-
-    for engine in running.unwrap_or(&[]) {
-        if seen.contains(&engine.id.as_str()) {
-            continue;
-        }
-        out.push(EngineLine {
-            // The registry has no display name — that lives in a sidecar
-            // beside the file, which is exactly what may have gone. The slug
-            // is the truest name left.
-            name: engine.slug.clone(),
-            ready: engine.ready,
-            // Only claim the file is missing when the listing actually
-            // answered. A listing that is still loading (or failed) is not
-            // evidence of anything.
-            orphaned: state.is_some(),
-        });
-    }
+    let mut out: Vec<EngineLine> = running
+        .iter()
+        .map(|engine| {
+            let listed = state.and_then(|s| find_listed(s, &engine.id));
+            EngineLine {
+                // The registry has no display name — that lives in a sidecar
+                // beside the file, which is exactly what may have gone. The
+                // slug is the truest name left.
+                name: listed
+                    .map(|m| m.display_name.clone())
+                    .unwrap_or_else(|| engine.slug.clone()),
+                // The registry's `ready`, not the listing's copy of it: same
+                // fact, read later.
+                ready: engine.ready,
+                // Only claim the file is missing when the listing actually
+                // answered. A listing that is still loading (or failed with
+                // nothing kept) is not evidence of anything.
+                orphaned: state.is_some() && listed.is_none(),
+            }
+        })
+        .collect();
+    // `running_engines` is ordered by id; the reader sees names. Sorting the
+    // way app-core sorts the listing keeps the menu and Settings agreeing on
+    // order — and because this sort is stable over an id-ordered input, two
+    // engines sharing a name across backends still come out in a fixed order.
+    out.sort_by_key(|e| e.name.to_lowercase());
     out
+}
+
+/// Every model in the listing, managed store and llamacpp backends alike — an
+/// engine is an engine, and the menu is not a backend registry.
+fn listed_models(state: &LocalModelsState) -> impl Iterator<Item = &LocalModelInfo> {
+    state
+        .models
+        .iter()
+        .chain(state.external.iter().flat_map(|b| b.models.iter()))
+}
+
+fn find_listed<'a>(state: &'a LocalModelsState, id: &str) -> Option<&'a LocalModelInfo> {
+    listed_models(state).find(|m| m.id == id)
+}
+
+/// The listing's own view of what is up. Reachable only with no registry to
+/// ask, which off the test stubs means no `AppCore` at all.
+fn listing_lines(state: &LocalModelsState) -> Vec<EngineLine> {
+    listed_models(state)
+        .filter_map(|m| {
+            let ready = match m.status {
+                LocalModelStatus::Loaded { .. } => true,
+                LocalModelStatus::Loading => false,
+                _ => return None,
+            };
+            Some(EngineLine {
+                name: m.display_name.clone(),
+                ready,
+                orphaned: false,
+            })
+        })
+        .collect()
 }
 
 /// Create the status item. Called once at launch, after the action handlers
@@ -380,11 +436,17 @@ mod tests {
         model_in("mine", name, status)
     }
 
+    /// **The display name is deliberately not the slug** — it is what the
+    /// sidecar beside the `.gguf` carries, and the whole question in these
+    /// tests is which source named a row. A fixture where the two matched
+    /// could not tell a decorated line from a bare registry one.
     fn model_in(backend: &str, name: &str, status: LocalModelStatus) -> LocalModelInfo {
+        let mut display = name.to_string();
+        display[..1].make_ascii_uppercase();
         LocalModelInfo {
             id: format!("{name}@{backend}"),
             slug: name.to_string(),
-            display_name: name.to_string(),
+            display_name: display,
             file_name: format!("{name}.gguf"),
             size_bytes: None,
             source_url: None,
@@ -481,12 +543,13 @@ mod tests {
             engine("coming", "local", false),
             engine("mistral", "mine", true),
         ];
+        // Named by the listing (capitalised), ordered by that name.
         assert_eq!(
             engine_lines(Some(&running), &Loadable::loaded(s)),
             vec![
-                "gemma — running".to_string(),
-                "coming — loading…".to_string(),
-                "mistral — running".to_string(),
+                "Coming — loading…".to_string(),
+                "Gemma — running".to_string(),
+                "Mistral — running".to_string(),
             ]
         );
     }
@@ -504,6 +567,92 @@ mod tests {
             engine_lines(Some(&running), &listing),
             vec!["ghost — running (file missing)"],
             "named from the slug, and honest about why it is not in Settings"
+        );
+    }
+
+    #[test]
+    fn a_stale_listing_cannot_claim_a_stopped_engine_is_running() {
+        // The mirror of the orphan case, and the reason the registry is
+        // authoritative in *both* directions. An engine exits or is unloaded;
+        // the rescan that would drop its row fails; `Failed { prior }` keeps
+        // the old snapshot standing so the UI is never blanked — and that
+        // preserved row says `Loaded` indefinitely. The registry already knows
+        // it is gone, so the row is vetoed rather than printed.
+        let stale = state(vec![model("ghost", loaded(8081))], vec![]);
+        let listing = Loadable::Failed {
+            error: AppError::Internal {
+                message: "rescan failed".into(),
+            },
+            prior: Some(stale.clone()),
+        };
+        assert_eq!(
+            engine_lines(Some(&[]), &listing),
+            vec!["No models running", "Couldn't list installed models"],
+            "the registry vetoes a row its own emptiness contradicts"
+        );
+
+        // Same veto without any failure in play: a merely stale `Loaded`
+        // snapshot beside an empty registry.
+        assert_eq!(
+            engine_lines(Some(&[]), &Loadable::loaded(stale)),
+            vec!["No models running"]
+        );
+    }
+
+    #[test]
+    fn a_warming_engine_survives_the_registry_leading() {
+        // The registry owns the warming phase: `reserve_engine` inserts the
+        // entry with `ready: false` *before* spawning, and the listing derives
+        // its `Loading` status from exactly that bit — so leading with the
+        // registry can never lose a warming row. Both shapes are pinned: with
+        // the listing agreeing, and with the listing not yet rescanned (the
+        // window between the reservation and the scan that would notice it).
+        let running = [engine("warming", "local", false)];
+
+        let agreeing = Loadable::loaded(state(
+            vec![model("warming", LocalModelStatus::Loading)],
+            vec![],
+        ));
+        assert_eq!(
+            engine_lines(Some(&running), &agreeing),
+            vec!["Warming — loading…"],
+            "named by the listing, status from the registry"
+        );
+
+        // The registry alone still shows it, and does not call it lost — the
+        // listing here simply has nothing to say about that id yet.
+        let behind = Loadable::loaded(state(vec![], vec![]));
+        assert_eq!(
+            engine_lines(Some(&running), &behind),
+            vec!["warming — loading… (file missing)"]
+        );
+    }
+
+    #[test]
+    fn the_readout_is_ordered_by_the_name_the_reader_sees() {
+        // `running_engines` is ordered by id, but the reader sees names —
+        // sorted the way app-core sorts the listing, so the menu and Settings
+        // agree on order.
+        let listing = Loadable::loaded(state(
+            vec![
+                model("aardvark", loaded(1)),
+                model("zebra", loaded(2)),
+                model("moose", loaded(3)),
+            ],
+            vec![],
+        ));
+        let running = [
+            engine("zebra", "local", true),
+            engine("aardvark", "local", true),
+            engine("moose", "local", true),
+        ];
+        assert_eq!(
+            engine_lines(Some(&running), &listing),
+            vec![
+                "Aardvark — running".to_string(),
+                "Moose — running".to_string(),
+                "Zebra — running".to_string(),
+            ]
         );
     }
 
