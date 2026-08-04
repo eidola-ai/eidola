@@ -372,6 +372,22 @@ fn read_ca_pem(path: Option<&str>, field_name: &str) -> Result<Option<String>, A
     let pem = std::fs::read_to_string(path).map_err(|e| AppError::Config {
         message: format!("failed to read {path}: {e}"),
     })?;
+    // A path the user typed that points at an empty file is never an
+    // intentional clear. Blank means "no value" on the *config* surface, so
+    // `parse_cert_config` maps it to `None` and the setter then clears the
+    // column — correct there, silent corruption here: a truncated cert would
+    // revert the chain to the production pin while `--base-url` aimed the
+    // client at the mock shim, and `configure` would exit 0 reporting the CA
+    // "set". Clearing has its own verb; a file input has to name a file.
+    if pem.trim().is_empty() {
+        let flag = field_name.replace('_', "-");
+        return Err(AppError::Config {
+            message: format!(
+                "{path} is empty — --{flag} must name a certificate file \
+                 (use --clear-{flag} to revert to the trust-root pin)"
+            ),
+        });
+    }
     config::validate_cert_pem(&pem, field_name)?;
     Ok(Some(pem))
 }
@@ -594,7 +610,11 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             if let Some(url) = attestation_url {
                 core.set_attestation_url(url.clone())?;
-                println!("attestation_url set to {url}");
+                if url.trim().is_empty() {
+                    println!("attestation_url override removed (using the default ATC)");
+                } else {
+                    println!("attestation_url set to {url}");
+                }
             }
             if let Some(pem) = root_ca_pem {
                 core.set_hardware_root_ca(pem).await?;

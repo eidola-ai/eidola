@@ -261,11 +261,16 @@ untrust_ca_note() {
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
+# `-s`, not `-f`: an empty cert file is the failure mode of a half-finished
+# copy or a mount that didn't land, and it must not reach `configure` (where
+# blank input used to read as clear-to-pin). The CLI rejects blank contents
+# too — this just fails earlier, with the hint that names the cause.
 require_certs() {
-    if [ ! -f "$ARK" ] || [ ! -f "$ASK" ]; then
-        echo "ERROR: $ARK / $ASK not found." >&2
+    if [ ! -s "$ARK" ] || [ ! -s "$ASK" ]; then
+        echo "ERROR: $ARK / $ASK missing or empty." >&2
         echo "       The mock shim mints its cert set on first boot — start the" >&2
         echo "       stack once with \`just dev\` (or \`just services\`), then retry." >&2
+        echo "       (Delete .dev-certs/ to have it mint a fresh set.)" >&2
         exit 1
     fi
 }
