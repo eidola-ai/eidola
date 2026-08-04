@@ -347,6 +347,64 @@ fn router_model_settings_round_trip_and_emit_their_domains() {
 }
 
 #[test]
+fn space_settings_read_together_and_the_cascade_limit_emits_space() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let space = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+
+        // The inspector's read: both settings at their instantiated defaults.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.space_settings(space.clone()))
+                .expect("read"),
+            eidola_app_core::SpaceSettings::default()
+        );
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.set_space_cascade_limit(space.clone(), 7))
+            .expect("set");
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space.clone())),
+            "a space setting emits Space; got {changes:?}"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.space_settings(space.clone()))
+                .expect("read")
+                .cascade_limit,
+            7
+        );
+
+        // The floor is the template setter's, and a refusal writes nothing.
+        assert!(
+            core.runtime()
+                .block_on(core.set_space_cascade_limit(space.clone(), 0))
+                .is_err()
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.space_settings(space.clone()))
+                .expect("read")
+                .cascade_limit,
+            7
+        );
+
+        // A space that does not exist is an error, not a default-shaped answer.
+        assert!(
+            core.runtime()
+                .block_on(core.space_settings("no-such-space".into()))
+                .is_err()
+        );
+    });
+}
+
+#[test]
 fn clear_base_url_override_emits_backends() {
     run_in_thread(|| {
         let (core, _dir) = make_core();

@@ -9848,3 +9848,618 @@ fn reactivating_with_a_window_focuses_it_instead(cx: &mut TestAppContext) {
     );
     cx.update(|cx| assert_eq!(cx.windows().len(), 1));
 }
+
+// ---------------------------------------------------------------------------
+// The space inspector (task 26.2) — the per-space settings panel that splits
+// the space window. Its doors are the Space menu item and ⌥⌘I only; the space
+// itself carries no visual toggle.
+// ---------------------------------------------------------------------------
+
+/// A space whose settings the stub store already holds, so the panel renders
+/// its rows rather than a spinner.
+fn stub_stores_with_space_settings(
+    cx: &mut TestAppContext,
+    space_id: &str,
+    settings: eidola_app_core::SpaceSettings,
+) -> Stores {
+    let space_id = space_id.to_string();
+    stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some((space_id, settings));
+    })
+}
+
+#[gpui::test]
+fn space_inspector_is_closed_until_asked_and_is_per_window(cx: &mut TestAppContext) {
+    let stores =
+        stub_stores_with_space_settings(cx, "s1", eidola_app_core::SpaceSettings::default());
+    let (window_a, view_a) = open_space(cx, &stores, Some("s1".into()));
+    let (_window_b, view_b) = open_space(cx, &stores, Some("s1".into()));
+
+    assert!(
+        !view_a.read_with(cx, |v, _| v.inspector_open_for_test()),
+        "a space opens with no inspector"
+    );
+
+    dispatch_space_action(&view_a, window_a, cx, eidola_gui::actions::ToggleInspector);
+    assert!(view_a.read_with(cx, |v, _| v.inspector_open_for_test()));
+    assert!(
+        !view_b.read_with(cx, |v, _| v.inspector_open_for_test()),
+        "open state is per window — two windows on one space are two vantage points"
+    );
+
+    // The same action closes it again (one item, both directions).
+    dispatch_space_action(&view_a, window_a, cx, eidola_gui::actions::ToggleInspector);
+    assert!(!view_a.read_with(cx, |v, _| v.inspector_open_for_test()));
+}
+
+#[gpui::test]
+fn space_inspector_split_narrows_the_conversation_page(cx: &mut TestAppContext) {
+    let stores =
+        stub_stores_with_space_settings(cx, "s1", eidola_app_core::SpaceSettings::default());
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(1000.), px(700.)));
+    vcx.run_until_parked();
+
+    let width_of = |vcx: &mut VisualTestContext| {
+        vcx.update_window(window, |_, window, cx| {
+            view.read(cx).page_width_for_test(window)
+        })
+        .unwrap()
+    };
+    let closed = width_of(&mut vcx);
+    assert!(
+        (closed - 1000.0).abs() < 1.0,
+        "closed: the page is the window"
+    );
+
+    vcx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    vcx.run_until_parked();
+    let open = width_of(&mut vcx);
+    assert!(
+        (open - (1000.0 - 320.0)).abs() < 1.0,
+        "a real split: the conversation compresses by the panel's column, got {open}"
+    );
+}
+
+#[gpui::test]
+fn space_inspector_overlays_a_window_too_narrow_to_split(cx: &mut TestAppContext) {
+    let stores =
+        stub_stores_with_space_settings(cx, "s1", eidola_app_core::SpaceSettings::default());
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(700.), px(700.)));
+    vcx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    vcx.run_until_parked();
+
+    let width = vcx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).page_width_for_test(window)
+        })
+        .unwrap();
+    assert!(
+        (width - 700.0).abs() < 1.0,
+        "below the floor the panel covers the page instead of squeezing it further, got {width}"
+    );
+}
+
+#[gpui::test]
+fn space_inspector_shows_the_settings_the_store_holds(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_space_settings(
+        cx,
+        "s1",
+        eidola_app_core::SpaceSettings {
+            cascade_limit: 6,
+            router_model: Some("gemma4-31b@eidola".into()),
+        },
+    );
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.inspector_cascade_for_test(cx), Some(6));
+        assert_eq!(
+            v.inspector_router_for_test(cx),
+            Some(Some("gemma4-31b@eidola".into()))
+        );
+    });
+}
+
+#[gpui::test]
+fn space_inspector_title_field_renames_the_space(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    // The field arrives seeded with the space's real title (the Library index's).
+    let state = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("the title field exists once the inspector renders");
+    assert_eq!(state.read_with(cx, |s, _| s.value().to_string()), "Tides");
+
+    cx.update_window(window, |_, window, cx| {
+        state.update(cx, |s, cx| {
+            s.set_value("Tides and the moon".to_string(), window, cx)
+        });
+        view.update(cx, |v, cx| v.inspector_commit_title(cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    stores.spaces.read_with(cx, |s, _| {
+        assert_eq!(
+            s.list()
+                .iter()
+                .find(|r| r.id == "s1")
+                .and_then(|r| r.title.clone()),
+            Some("Tides and the moon".into()),
+            "the title writes through the Library index, like the Library's own rename"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_inspector_on_an_unsaved_space_offers_no_settings_to_edit(cx: &mut TestAppContext) {
+    // A blank ⌘N space has no id, so there is no settings row to write to.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.inspector_cascade_for_test(cx),
+            None,
+            "no settings exist for a space that has never been saved"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_inspector_typing_in_a_field_does_not_jump_to_the_composer(cx: &mut TestAppContext) {
+    // Type-to-compose (task 38) treats any printable in the window as "start
+    // the trailing draft" — and it *consumes* the press, so without a guard a
+    // character typed into the inspector's title field would land in the
+    // composer instead. The scene is one where the jump really would fire: a
+    // transcript with a docked tail draft, and nothing composing.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the question")],
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.draft_count_for_test() > 0),
+        "precondition: a tail draft exists for the jump to land in"
+    );
+
+    let state = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("title field");
+    cx.update_window(window, |_, window, cx| {
+        state.update(cx, |s, cx| s.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // The real keystroke path: the press reaches the focused field, and the
+    // conversation must not treat it as the type-to-compose jump.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "no draft was started behind the panel"
+    );
+    assert!(
+        state
+            .read_with(&vcx, |s, _| s.value().to_string())
+            .contains('x'),
+        "the character went into the field the reader is typing in"
+    );
+}
+
+#[gpui::test]
+fn space_inspector_escape_closes_its_router_picker(cx: &mut TestAppContext) {
+    let stores =
+        stub_stores_with_space_settings(cx, "s1", eidola_app_core::SpaceSettings::default());
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_inspector_open_for_test(true, window, cx);
+            v.inspector_toggle_router_picker_for_test(cx);
+        })
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(view.read_with(cx, |v, _| v.inspector_picker_open_for_test()));
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&focus, cx);
+    })
+    .unwrap();
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.inspector_picker_open_for_test()),
+        "the view root closes the picker, the same rung the context menu owns"
+    );
+}
+
+/// **A view must observe the stores it renders** (STATE.md). The inspector's
+/// rows come from `SpaceSettingsStore`, whose every announcement is
+/// asynchronous — the panel's opening `ensure` load completing, each write's
+/// re-read, a bus-driven refresh — and none of them repaints this window by any
+/// other route. Without the subscription the panel sat on "Loading…" until some
+/// unrelated event happened to redraw it.
+///
+/// Driven against a real core so the load genuinely lands, with the window
+/// quiesced first so the only thing that can notify the view afterwards is the
+/// settings load itself.
+#[gpui::test]
+fn space_inspector_repaints_when_its_settings_land(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_space(cx, &stores, Some(space.clone()));
+    // Let the transcript load and every launch-time refresh settle, so nothing
+    // else is in flight to repaint this window.
+    wait_until(cx, "the window quiesces", |cx| {
+        view.read_with(cx, |v, cx| {
+            !matches!(
+                v.space().read(cx).transcript(),
+                eidola_gui::loadable::Loadable::NotLoaded | eidola_gui::loadable::Loadable::Loading
+            )
+        })
+    });
+
+    let repaints = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = repaints.clone();
+    let _sub = cx.update(|cx| cx.observe(&view, move |_, _| counter.set(counter.get() + 1)));
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    // The toggle's own notify is not what this test is about.
+    repaints.set(0);
+    assert!(
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).is_loading()),
+        "precondition: opening the panel started the settings load"
+    );
+
+    wait_until(cx, "the settings load lands", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).has_value())
+    });
+    assert!(
+        repaints.get() > 0,
+        "the settings landing must schedule a repaint — otherwise the panel \
+         keeps rendering the spinner it drew before the load completed"
+    );
+
+    drain_runtime(&core);
+}
+
+/// The empty-title rejection must leave the *field* honest too. Clearing the
+/// title and committing is read as a mistake rather than an intent (a space's
+/// title is generated), so nothing is written — but the field is then showing a
+/// blank where the space still has a name. The repair is
+/// `sync_inspector_title`, and it only fires when the seed disagrees with the
+/// stored title, so the rejection has to invalidate the seed; leaving it equal
+/// made the sync read "already synchronized" and the field stayed blank.
+#[gpui::test]
+fn space_inspector_rejecting_a_blank_title_restores_the_stored_one(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let state = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("the title field exists once the inspector renders");
+    assert_eq!(state.read_with(cx, |s, _| s.value().to_string()), "Tides");
+
+    // Clear the field and commit — the seam both `PressEnter` and `Blur` route
+    // through, with the field left unfocused as it is after a blur.
+    cx.update_window(window, |_, window, cx| {
+        state.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        view.update(cx, |v, cx| v.inspector_commit_title(cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    stores.spaces.read_with(cx, |s, _| {
+        assert_eq!(
+            s.list()
+                .iter()
+                .find(|r| r.id == "s1")
+                .and_then(|r| r.title.clone()),
+            Some("Tides".into()),
+            "a blanked field writes nothing — the space keeps its name"
+        );
+    });
+    assert_eq!(
+        state.read_with(cx, |s, _| s.value().to_string()),
+        "Tides",
+        "and the field is repaired from the stored title rather than left blank"
+    );
+}
+
+/// Two quick presses of the cascade stepper are two increments. Each press
+/// derives `next` from the store's cached value, and a write's round trip is
+/// slower than a second click — so the store has to advance its own snapshot as
+/// the write leaves (see `SpaceSettingsStore::write_then_reread`). Without that
+/// both presses stepped from the same cached 4, the second write superseded the
+/// first, and 4 + 1 + 1 persisted as 5.
+#[gpui::test]
+fn space_inspector_two_quick_cascade_steps_both_count(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_space(cx, &stores, Some(space.clone()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    wait_until(cx, "the settings load", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).has_value())
+    });
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.inspector_cascade_for_test(cx)),
+        Some(eidola_app_core::DEFAULT_CASCADE_LIMIT),
+        "precondition: the panel shows the space's stored limit"
+    );
+
+    // Two presses with nothing settling in between — the first write has not
+    // round-tripped when the second derives its value.
+    view.update(cx, |v, cx| v.inspector_step_cascade_for_test(1, cx));
+    view.update(cx, |v, cx| v.inspector_step_cascade_for_test(1, cx));
+
+    let target = eidola_app_core::DEFAULT_CASCADE_LIMIT + 2;
+    // Wait on the **durable row**, not the store's cell — the optimistic value
+    // is there the moment the press is handled, and what this test is about is
+    // that both increments survive the round trip.
+    let durable = |core: &std::sync::Arc<AppCore>, space: &str| {
+        core.runtime()
+            .block_on(core.space_settings(space.to_string()))
+            .expect("read the space's settings back")
+            .cascade_limit
+    };
+    wait_until(cx, "both steps persist", |_| {
+        durable(&core, &space) == target
+    });
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.inspector_cascade_for_test(cx)),
+        Some(target),
+        "and the panel agrees with the row it wrote"
+    );
+
+    drain_runtime(&core);
+}
+
+/// **Focus comes back from the panel** — the `RecordView::close_detail` rule
+/// (see the a11y section of the crate's AGENTS.md), here for a surface that
+/// unmounts while its retained `InputState` still holds the window's keyboard.
+/// The handle survives the close (the field is a view field, minted once), so
+/// the window goes on naming a focus node the dispatch tree no longer has:
+/// keystrokes reach nothing, `focus_next` restarts from the top of the window,
+/// and type-to-compose is dead until a click revives it.
+#[gpui::test]
+fn space_inspector_closing_returns_focus_from_its_field(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the question")],
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let state = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("title field");
+    cx.update_window(window, |_, window, cx| {
+        state.update(cx, |s, cx| s.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let field = state.read_with(cx, |s, cx| s.focus_handle(cx));
+    let root = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            field.is_focused(window),
+            "precondition: the reader is typing in the panel"
+        );
+    })
+    .unwrap();
+
+    // ⌥⌘I from inside the field: the action's dispatch path runs from the
+    // focused field up through the space root, which owns the handler. (The
+    // scrim's click listener funnels through the same `set_inspector_open`.)
+    dispatch_space_action(&view, window, cx, eidola_gui::actions::ToggleInspector);
+
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            !field.is_focused(window),
+            "the unmounted field must not keep the window's keyboard"
+        );
+        assert!(
+            root.is_focused(window),
+            "the conversation the panel annotated takes it back"
+        );
+    })
+    .unwrap();
+
+    // The consequence, end to end: the keyboard works again.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "type-to-compose reaches the conversation again"
+    );
+}
+
+/// The other direction of the same rule: **restore only from a panel that
+/// actually holds the keyboard.** A reader composing with the inspector merely
+/// open (its field never focused) must keep their caret when the panel closes —
+/// `overlay_borrowed_focus`'s "a borrow is only returned by a lender who still
+/// has nothing", applied to a surface that never borrowed at all.
+#[gpui::test]
+fn space_inspector_closing_leaves_a_composing_reader_alone(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the question")],
+    );
+    open_space_draft(&view, window, cx, None);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let editor = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("an active draft (composer) is open");
+    let caret = editor.read_with(cx, |e, _| e.focus_handle.clone());
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            caret.is_focused(window),
+            "precondition: the reader is composing, not editing a setting"
+        );
+    })
+    .unwrap();
+
+    dispatch_space_action(&view, window, cx, eidola_gui::actions::ToggleInspector);
+
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            caret.is_focused(window),
+            "closing a panel that never held the keyboard must not take it"
+        );
+    })
+    .unwrap();
+    assert!(
+        view.read_with(cx, |v, _| v.has_active_draft_for_test()),
+        "and the draft is still the composing session"
+    );
+}
+
+/// The same class as `space_inspector_repaints_when_its_settings_land`, closed
+/// for the panel's **whole** read set: the router picker's options come from
+/// `ModelsStore` (via `router_field` → `model_groups`), whose catalog fetches
+/// land well after the window has drawn — a remote catalog arriving with an
+/// open picker must repaint it, or the remote refs simply are not in the list
+/// until something unrelated redraws the window. `ParticipantsView` and the
+/// Space Templates pane (the other two `router_field` consumers) already
+/// observed this store; the space view was the one that did not.
+#[gpui::test]
+fn space_inspector_repaints_when_a_model_catalog_lands(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_space(cx, &stores, Some(space.clone()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_inspector_open_for_test(true, window, cx);
+            v.inspector_toggle_router_picker_for_test(cx);
+        })
+    })
+    .unwrap();
+    // Quiesce: the settings load and every launch-time refresh settle, so the
+    // only thing left to notify this window is the fetch started below.
+    wait_until(cx, "the window quiesces", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).has_value())
+            && stores.models.read_with(cx, |s, _| !s.models().is_loading())
+    });
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_picker_open_for_test()),
+        "precondition: the reader is looking at the open router picker"
+    );
+
+    let repaints = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = repaints.clone();
+    let _sub = cx.update(|cx| cx.observe(&view, move |_, _| counter.set(counter.get() + 1)));
+
+    // A catalog refresh: the registry read, then the per-backend fetch. Both
+    // land asynchronously; the synchronous `to_loading` notify that starts it
+    // is not what this test is about.
+    stores.models.update(cx, |s, cx| s.refresh(cx));
+    repaints.set(0);
+
+    wait_until(cx, "the catalog fetch completes", |cx| {
+        stores
+            .models
+            .read_with(cx, |s, _| s.models().error().is_some())
+    });
+    assert!(
+        repaints.get() > 0,
+        "a catalog landing must schedule a repaint — otherwise the open picker \
+         keeps showing the options it drew before the fetch completed"
+    );
+
+    drain_runtime(&core);
+}

@@ -444,7 +444,7 @@ impl SpaceView {
     fn settle_on_new_post(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.rebuild(cx);
 
-        let page_width = crate::chrome::content_size(window).width;
+        let page_width = self.page_width(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(page_width, &turns);
         // The optimistic turn is the last row of the fresh snapshot.
@@ -508,7 +508,7 @@ impl SpaceView {
             // Select the target's branch *before* the next render so the
             // streaming node attaches under the asked post, not whatever
             // branch was selected (the PR #218 retry lesson).
-            let page_width = crate::chrome::content_size(window).width;
+            let page_width = self.page_width(window);
             let roots = model::build_tree(&self.posts);
             if model::node_ref(&roots, &target_action_id).is_some() {
                 self.select_path_to(&roots, &target_action_id, page_width);
@@ -523,7 +523,7 @@ impl SpaceView {
     /// Scroll the page so the bottom of the selected branch (the composer /
     /// streaming leaf) sits at the window bottom.
     pub(crate) fn scroll_to_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let viewport = crate::chrome::content_size(window);
+        let viewport = self.page_size(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(viewport.width, &turns);
         let total = self.selected_total_height(&tree, viewport.width, viewport.height);
@@ -550,7 +550,7 @@ impl SpaceView {
 
     /// "See in context": dock the active draft back at its place in the branch.
     pub(crate) fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let viewport = crate::chrome::content_size(window);
+        let viewport = self.page_size(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(viewport.width, &turns);
         if let Some(active) = self.active_draft.clone()
