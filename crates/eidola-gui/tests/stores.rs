@@ -990,3 +990,108 @@ fn a_refresh_landing_mid_rename_keeps_the_spaces_ops_error(cx: &mut TestAppConte
         );
     });
 }
+
+/// **Two mutations on two spaces are independent work.** A single mutation slot
+/// made the second supersede the first — dropping the gpui half of a write
+/// already in flight (its re-list and its refusal lost: the silent-loss class
+/// this store's write-through shape exists to cure), or cancelling the first
+/// operation outright when it had not been polled yet. Rapid ops from two
+/// Library rows or two windows are the realistic trigger; issued in one update
+/// here, which is the narrowest form of it (the first has not run at all).
+#[gpui::test]
+fn two_renames_on_two_spaces_both_land(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let a = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let b = core
+        .runtime()
+        .block_on(core.create_space(Some("B".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the index loads", |cx| {
+        stores.spaces.read_with(cx, |s, _| s.list().len() == 2)
+    });
+
+    stores.spaces.update(cx, |s, cx| {
+        s.rename(a.clone(), "Anemone".into(), cx);
+        s.rename(b.clone(), "Bergamot".into(), cx);
+    });
+
+    let durable_titles = |cx: &mut TestAppContext| {
+        let _ = cx;
+        let listing = core
+            .runtime()
+            .block_on(core.list_spaces(false))
+            .expect("list spaces");
+        let mut titles: Vec<String> = listing.iter().filter_map(|s| s.title.clone()).collect();
+        titles.sort();
+        titles
+    };
+    wait_until(cx, "both renames land durably", |cx| {
+        durable_titles(cx) == vec!["Anemone".to_string(), "Bergamot".to_string()]
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        let title = |id: &str| {
+            s.list()
+                .iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.title.clone())
+        };
+        assert_eq!(title(&a).as_deref(), Some("Anemone"));
+        assert_eq!(title(&b).as_deref(), Some("Bergamot"));
+    });
+}
+
+/// The refusal half of the same rule: two refused mutations on two spaces each
+/// owe their own report. One tagged slot could only hold the last, and the
+/// *inspector* reads per space — a lost refusal there is a title field snapping
+/// back with no reason given, exactly the dishonesty this store's shape exists
+/// to prevent. A bus refresh lands mid-write for good measure: it must defer to
+/// the **last** mutation, not eat either one's continuation.
+#[gpui::test]
+fn two_refused_mutations_each_keep_their_own_refusal(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let real = core
+        .runtime()
+        .block_on(core.create_space(Some("Nile".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(
+            None,
+            vec![stale_row("ghost-a"), stale_row("ghost-b")],
+            None,
+            cx,
+        )
+    });
+    stores.spaces.update(cx, |s, cx| {
+        s.rename("ghost-a".into(), "Anemone".into(), cx);
+        s.rename("ghost-b".into(), "Bergamot".into(), cx);
+    });
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::SpaceIndex), cx));
+
+    wait_until(cx, "both refusals surface", |cx| {
+        stores.spaces.read_with(cx, |s, _| {
+            s.op_error_for("ghost-a").is_some() && s.op_error_for("ghost-b").is_some()
+        })
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        assert!(
+            s.op_error().is_some(),
+            "the Library shows one of them (the most recent)"
+        );
+        assert!(
+            s.list().iter().any(|r| r.id == real) && s.list().len() == 1,
+            "and both mutations re-listed: the index is the database's"
+        );
+        assert!(!s.index().is_loading());
+    });
+}
