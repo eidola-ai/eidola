@@ -6538,9 +6538,18 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Set the ATC endpoint override, or clear it when given a blank value.
+    ///
+    /// Blank has to mean *clear*: it is the only unset verb this key has (no
+    /// `--clear-attestation-url` exists), and the alternative is worse —
+    /// `Some("")` is not `None`, so it survives as an override and reaches
+    /// the verifier, whose `atc_url.unwrap_or(DEFAULT_ATC_URL)` then uses the
+    /// empty string as the endpoint. That is a client broken at every
+    /// handshake by a setter that returned success.
     pub fn set_attestation_url(&self, url: String) -> Result<(), AppError> {
+        config::validate_attestation_url(&url)?;
         let mut cfg = self.inner.load_config();
-        cfg.attestation_url = Some(url);
+        cfg.attestation_url = Some(url.trim().to_string()).filter(|u| !u.is_empty());
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
         Ok(())
@@ -6618,6 +6627,31 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.untrust_measurement(key).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Drop the eidola backend row's whole trusted-measurement override list
+    /// (column back to NULL), reverting to the measurement pinned in this
+    /// binary. The unconditional counterpart to [`Self::untrust_measurement`],
+    /// and the member the trust bundle was missing: `base_url` and both
+    /// hardware CAs already have a clear-to-pin verb, so a caller reverting
+    /// the bundle had to know every key it had ever trusted. Emits
+    /// [`Change::Backends`].
+    pub async fn clear_trusted_measurements(&self) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .update_backend(
+                        backends::EIDOLA_BACKEND_ID,
+                        backends::BackendUpdate {
+                            trusted_measurements: Some(None),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
             .await
             .map_err(join_err)?
     }
