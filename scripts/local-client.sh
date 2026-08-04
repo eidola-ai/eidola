@@ -331,15 +331,14 @@ untrust_ca_note() {
     case "$(platform)" in
         Darwin)
             echo ""
-            if [ "$installed" = "current" ]; then
-                printf '    sudo security remove-trusted-cert -d %s\n' "$(printf '%q' "$TLS_CA")"
-            else
-                # The file that produced the installed root is gone, and
-                # `remove-trusted-cert` takes a cert file — so name it in the
-                # keychain instead. (Printed, never run, like every sudo line
-                # here.)
-                printf '    sudo security delete-certificate -c %s -t /Library/Keychains/System.keychain\n' \
-                    "$(printf '%q' "$TLS_CA_CN")"
+            # Always remove by name, and repeat until no match remains. A
+            # current root and one or more rotated roots can coexist in the
+            # System keychain; removing only `$TLS_CA` would leave every old
+            # same-CN root trusted. (Printed, never run, like every sudo line
+            # here.)
+            printf '    while sudo security delete-certificate -c %s -t /Library/Keychains/System.keychain 2>/dev/null; do :; done\n' \
+                "$(printf '%q' "$TLS_CA_CN")"
+            if [ "$installed" = "stale" ]; then
                 echo "    (or Keychain Access → System → search \"$TLS_CA_CN\")"
             fi
             echo ""
@@ -357,7 +356,8 @@ untrust_ca_note() {
     #
     # case "$(platform)" in
     #     Darwin)
-    #         sudo security remove-trusted-cert -d "$TLS_CA"
+    #         while sudo security delete-certificate -c "$TLS_CA_CN" -t \
+    #             /Library/Keychains/System.keychain 2>/dev/null; do :; done
     #         ;;
     #     Linux)
     #         sudo rm "$LINUX_CA_PATH" && sudo update-ca-certificates --fresh
