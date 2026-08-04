@@ -1268,6 +1268,21 @@ impl SpaceView {
             .collect()
     }
 
+    /// Select an effective-tree node without rendering another frame, modeling
+    /// branch navigation racing a turn-completion event.
+    #[doc(hidden)]
+    pub fn select_effective_path_for_test(
+        &mut self,
+        node_id: &str,
+        window: &Window,
+        cx: &gpui::App,
+    ) {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        self.select_path_to(&tree, node_id, page_width);
+    }
+
     /// A post's `(reasoning, expanded)` from the render snapshot.
     #[doc(hidden)]
     pub fn post_reasoning_for_test(&self, i: usize) -> Option<(String, bool)> {
@@ -2596,6 +2611,10 @@ impl SpaceView {
                     match this.resolve_scroll_axis(ev.touch_phase, delta) {
                         ScrollAxis::Horizontal => {
                             cx.stop_propagation();
+                            // The built-in scroller moved before this listener;
+                            // invalidate the last frame's selected leaf even
+                            // before the gesture ends and snap settles.
+                            this.selected_turn.set(None);
                             // Elect the owner on the first horizontal step of the
                             // gesture (the strip actually under the cursor then)
                             // and hold it for the whole gesture.

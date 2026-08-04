@@ -332,6 +332,9 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The gesture may have changed the selected child since the last
+        // rendered frame. Do not let a turn completion use that stale leaf.
+        self.selected_turn.set(None);
         if count <= 1 {
             return;
         }
@@ -375,6 +378,9 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Navigation can race a completion before another frame records the
+        // new selected path.
+        self.selected_turn.set(None);
         let stride = (page_width + BAND_HEIGHT).as_f32();
         if stride <= 0.0 {
             return;
@@ -489,6 +495,10 @@ impl SpaceView {
                 handle.set_offset(point(px(-(idx as f32) * stride), off.y));
             }
         }
+        // This is the shared seam for reference, minimap, keyboard, draft, and
+        // deferred branch selection. Once it steers a strip, the last frame's
+        // selected streaming leaf is no longer an honest parked observation.
+        self.selected_turn.set(None);
         self.cancel_snap();
     }
 }
