@@ -557,7 +557,9 @@ impl SpaceView {
     ///   the branch (`BranchEnd`, which is the end of what was *written* there
     ///   — see [`Self::scroll_to_branch_end`]). Without this the new branch
     ///   stayed unselected — the very failure the deferral exists to prevent
-    ///   (task 46, bug 3), one frame later.
+    ///   (task 46, bug 3), one frame later. The request's **settle mode is
+    ///   kept as it was**: only the node identity forwards, so a request that
+    ///   was preserving a parked reader (below) does not become a jump.
     /// - **A reader parked on the leaf** (`selected_turn`, what the last frame
     ///   observed): branch selection is *positional* — a strip's scroll offset
     ///   resolved to a child index — and a turn's persisted response is
@@ -580,7 +582,17 @@ impl SpaceView {
     /// the leaf simply collapses).
     pub(crate) fn follow_completed_turn(&mut self, seq: u64, response_action_id: Option<&str>) {
         let leaf = model::streaming_node_id(seq);
-        let aimed_at_leaf = self.pending_select.as_ref().is_some_and(|p| p.node == leaf);
+        // The settle mode a pending request carries is the **reader's**
+        // situation, not the turn's: `BranchEnd` because they asked to be taken
+        // to this answer, `Stay` because they are already somewhere they chose.
+        // A retarget forwards the node identity and *keeps* that mode — see the
+        // `match` below.
+        let aimed_settle = self
+            .pending_select
+            .as_ref()
+            .filter(|p| p.node == leaf)
+            .map(|p| p.settle);
+        let aimed_at_leaf = aimed_settle.is_some();
         // Something newer is already asked for: the reader's latest intent wins.
         if !aimed_at_leaf && self.pending_select.is_some() {
             return;
@@ -605,11 +617,16 @@ impl SpaceView {
             Some(id) => {
                 self.pending_select = Some(PendingSelect {
                     node: SharedString::from(id.to_string()),
-                    settle: if aimed_at_leaf {
-                        PendingSettle::BranchEnd
-                    } else {
-                        PendingSettle::Stay
-                    },
+                    // **A retarget never upgrades the settle.** An existing
+                    // request already recorded why the reader is being moved
+                    // (or not); this only changes *which node* answers it. A
+                    // parked reader whose branch was preserved with `Stay` when
+                    // a sibling landed must still be `Stay` when their own turn
+                    // lands a moment later — otherwise the second completion
+                    // scrolls them to a tail they never asked for. A request
+                    // minted here, for a reader with none, is `Stay` for the
+                    // same reason: they chose where they are.
+                    settle: aimed_settle.unwrap_or(PendingSettle::Stay),
                 })
             }
             // Only the doomed request is dropped; an unrelated one already
