@@ -336,6 +336,18 @@ impl SpacesStore {
         }
     }
 
+    /// Dismiss the standing refusal about `space_id` — the per-space surface's
+    /// ×, the counterpart of the Library's. A refusal is otherwise cleared only
+    /// by the next write to the same space, so an unacknowledged one stands
+    /// indefinitely; that is what let one band shadow another.
+    pub fn dismiss_op_error_for(&mut self, space_id: &str, cx: &mut Context<Self>) {
+        let before = self.op_errors.len();
+        self.clear_op_error_for(Some(space_id));
+        if self.op_errors.len() != before {
+            cx.notify();
+        }
+    }
+
     /// Drop the standing refusal for a key, if any — a new operation on it is
     /// about to answer the same question.
     fn clear_op_error_for(&mut self, space_id: Option<&str>) {
