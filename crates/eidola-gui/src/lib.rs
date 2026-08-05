@@ -43,9 +43,8 @@ use gpui_component_assets::Assets;
 use crate::about::AboutView;
 use crate::actions::{
     About, ActualSize, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize,
-    NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenParticipants, OpenRecord, OpenSettings, Quit,
-    QuitApp, Quote, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn,
-    ZoomOut,
+    NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenRecord, OpenSettings, Quit, QuitApp, Quote,
+    QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn, ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::lifecycle::LaunchOptions;
@@ -336,7 +335,6 @@ fn install_menus(cx: &mut App) {
                 MenuItem::action("New Space", NewSpace),
                 new_space_from_template_submenu(cx),
                 MenuItem::Separator,
-                MenuItem::action("Participants…", OpenParticipants),
                 // The inspector's only doors are this item and its ⌥⌘I
                 // equivalent — the space carries no visual toggle (Mike,
                 // 2026-08-01). The label states both directions because
@@ -1020,40 +1018,6 @@ fn open_onboarding_window(cx: &mut App) {
     if let Ok(handle) = handle {
         cx.global_mut::<AppGlobal>().onboarding_window = Some(handle);
     }
-    cx.activate(true);
-}
-
-/// Open the Participants window for a space — a window-local lens over the
-/// space's participant membership. Non-singleton (per-space; two spaces each
-/// get their own), taking the stores explicitly so `SpaceView` and tests can
-/// open it without `AppGlobal`. Sized as a tall, narrow page like the Library.
-pub fn open_participants_window(
-    cx: &mut App,
-    stores: Stores,
-    space_id: String,
-    space_title: Option<String>,
-) {
-    let bounds = centered_window_bounds(cx, 520., 620.);
-    let opts = base_window_options(cx, bounds, 400., 340.);
-
-    let _ = cx.open_window(opts, |window, cx| {
-        theme::observe_window_appearance(window);
-        window.set_window_title(&match space_title.as_deref() {
-            Some(t) => format!("Participants — {t}"),
-            None => "Participants".to_string(),
-        });
-        let view = cx.new(|cx| {
-            participants::ParticipantsView::new(
-                stores.clone(),
-                space_id.clone(),
-                space_title.clone(),
-                window,
-                cx,
-            )
-        });
-        let view = chrome::ChromeRoot::wrap(view.into(), cx);
-        cx.new(|cx| chrome::themed_root(view, window, cx))
-    });
     cx.activate(true);
 }
 

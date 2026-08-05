@@ -791,9 +791,8 @@ impl SpaceView {
             // three): a remote catalog's fetch lands long after the window has
             // drawn, and an open router picker has to gain those options when
             // it does. No `rebuild` — catalogs feed the picker's list, not the
-            // transcript snapshot. The other two `router_field` consumers
-            // (`ParticipantsView`, the Space Templates pane) observe the same
-            // three.
+            // transcript snapshot. The other `router_field` consumer (the
+            // Space Templates pane) observes the same three.
             cx.observe(&stores.models, |_, _, cx| cx.notify()),
         ];
 
@@ -2279,14 +2278,9 @@ impl Render for SpaceView {
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
             }))
-            // Space → Participants…: open the per-space Participants window for
-            // this conversation. Registered per-view (like CloseWindow) so the
-            // menu item targets the focused space and macOS greys it when no
-            // space window is open. A no-op on a not-yet-persisted blank space.
-            .on_action(cx.listener(Self::open_participants))
             // Space → Show/Hide Inspector (⌥⌘I). Registered per-view like
-            // `CloseWindow` / `Participants…`, so the item targets the focused
-            // space and macOS greys it when no space window is open.
+            // `CloseWindow`, so the item targets the focused space and macOS
+            // greys it when no space window is open.
             .on_action(cx.listener(Self::toggle_inspector))
             // Edit → Quote / Quote in Reply. Registered **only while a
             // quotable post selection exists**, so `is_action_available` is
@@ -3074,9 +3068,10 @@ impl SpaceView {
             .into_any_element()
     }
 
-    /// The space's title as the Library index knows it — the same source
-    /// `open_participants` uses for its subtitle. `None` for a blank ⌘N space
-    /// or one the index hasn't caught up with.
+    /// The space's title as the Library index knows it — what the window is
+    /// named, what the inspector's title field edits, and what a saved template
+    /// is proposed as. `None` for a blank ⌘N space or one the index hasn't
+    /// caught up with.
     fn space_title(&self, cx: &gpui::App) -> Option<SharedString> {
         let space_id = self.space.read(cx).id()?.to_string();
         self.stores
@@ -3120,35 +3115,6 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn window_title_for_test(&self) -> Option<&str> {
         self.window_title.as_deref()
-    }
-
-    /// Space → Participants…: open the Participants window for this space. A
-    /// no-op on a blank ⌘N space that hasn't been persisted yet (no id ⇒ no
-    /// per-space participants exist to manage). The space title (if any) rides
-    /// along for the window's subtitle.
-    pub fn open_participants(
-        &mut self,
-        _: &crate::actions::OpenParticipants,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(space_id) = self.space.read(cx).id().map(str::to_string) else {
-            return;
-        };
-        // Resolve the space's title from the Library index (the Space entity
-        // doesn't track it) for the Participants window subtitle.
-        let title = self
-            .stores
-            .spaces
-            .read(cx)
-            .list()
-            .iter()
-            .find(|s| s.id == space_id)
-            .and_then(|s| s.title.clone());
-        let stores = self.stores.clone();
-        cx.defer(move |cx: &mut gpui::App| {
-            crate::open_participants_window(cx, stores.clone(), space_id.clone(), title.clone());
-        });
     }
 }
 

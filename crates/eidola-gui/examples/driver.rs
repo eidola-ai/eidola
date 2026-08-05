@@ -85,7 +85,6 @@ mod driver {
     };
     use eidola_gui::library::LibraryView;
     use eidola_gui::onboarding::OnboardingView;
-    use eidola_gui::participants::ParticipantsView;
     use eidola_gui::probe;
     use eidola_gui::record::RecordView;
     use eidola_gui::settings::{SettingsPane, SettingsView};
@@ -520,6 +519,30 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_inspector_participants",
+                description: "Space view: the inspector's Participants section with one member's disclosure open — the fork chips, model picker, system prompt and notify control",
+                default_size: size(px(1040.), px(760.)),
+                build: |window, cx| {
+                    let stores = inspector_stores(cx, None);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
+                    view.update(cx, |v, cx| {
+                        v.set_inspector_open_for_test(true, window, cx);
+                        v.inspector_toggle_participant("agent-assistant", window, cx);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_traces",
                 description: "Space view: trace disclosures — an answered turn's tool rounds under its reply, and three declines stacked in the gap under the post they answered (two agents, one of them asked twice)",
                 default_size: size(px(860.), px(760.)),
@@ -586,24 +609,6 @@ mod driver {
                 build: |window, cx| {
                     let stores = ready_stores(cx);
                     let view = cx.new(|cx| OnboardingView::new(stores, window, cx));
-                    root(view, window, cx)
-                },
-            },
-            Scene {
-                name: "participants",
-                description: "Participants view: a space's members (You + two owned agents), the add/edit affordances, Save-as-template",
-                default_size: size(px(520.), px(620.)),
-                build: |window, cx| {
-                    let stores = ready_stores(cx);
-                    let view = cx.new(|cx| {
-                        ParticipantsView::new(
-                            stores,
-                            "demo".into(),
-                            Some("Tides and the moon".into()),
-                            window,
-                            cx,
-                        )
-                    });
                     root(view, window, cx)
                 },
             },
