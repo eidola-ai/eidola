@@ -4370,3 +4370,100 @@ fn space_inspector_failed_settings_read_offers_a_retry_not_a_default(cx: &mut Te
 
     probe::set_probes_enabled(false);
 }
+
+/// **Neither refusal may stand in for the other.** The panel writes to two
+/// stores — the title goes through `SpacesStore` (the Library index), the rows
+/// through `SpaceSettingsStore` — and while one band chose between them, an
+/// older settings refusal shadowed a newer rename refusal: the title field
+/// snapped back to the stored name with nothing on screen to say why, and
+/// nothing ever cleared the settings refusal to reveal it. Both bands render,
+/// the title's first, and each carries its own dismiss.
+#[gpui::test]
+fn space_inspector_shows_a_title_refusal_beside_a_standing_settings_one(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.space_settings = Some(("s".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![space_info("s", Some("Tides"))];
+    });
+    // An older settings refusal, standing (nothing has cleared it)…
+    stores.space_settings.update(cx, |s, _| {
+        s.set_op_error_for_test("s", "Couldn't set the cascade limit: below the floor")
+    });
+    // …and then a rename this space refused, which is what the reader just
+    // watched undo itself in the title field.
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(
+            Some("s".into()),
+            Ok(vec![space_info("s", Some("Tides"))]),
+            Some("Couldn't rename this space: space not found: s"),
+            cx,
+        )
+    });
+
+    let view_stores = stores.clone();
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                view_stores,
+                Some("s".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/inspector/title-error",
+        gpui::Role::Alert,
+        "Couldn't rename this space: space not found: s",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/error",
+        gpui::Role::Alert,
+        "Couldn't set the cascade limit: below the floor",
+    );
+    // Each is acknowledged on its own — the × says "I have read this", and the
+    // other fact stays on screen.
+    assert_probe(
+        &entries,
+        "space/inspector/title-error/dismiss",
+        gpui::Role::Button,
+        "Dismiss",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/error/dismiss",
+        gpui::Role::Button,
+        "Dismiss",
+    );
+
+    stores
+        .spaces
+        .update(cx, |s, cx| s.dismiss_op_error_for("s", cx));
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/inspector/title-error"),
+        "the dismissed refusal leaves"
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/error",
+        gpui::Role::Alert,
+        "Couldn't set the cascade limit: below the floor",
+    );
+
+    probe::set_probes_enabled(false);
+}

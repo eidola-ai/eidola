@@ -29,7 +29,7 @@
 //! scroll, which picker is open, the title editor's buffer — are view fields.
 
 use gpui::{
-    AnyElement, AppContext, Context, Entity, Focusable as _, InteractiveElement, IntoElement,
+    AnyElement, AppContext, Context, Div, Entity, Focusable as _, InteractiveElement, IntoElement,
     ParentElement, Pixels, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window,
     div, prelude::FluentBuilder as _, px,
 };
@@ -570,25 +570,31 @@ impl SpaceView {
             .id()
             .map(str::to_string)
             .unwrap_or_default();
-        // One banner for this panel's write refusals, from either store that
-        // takes a write from it: the settings rows (`SpaceSettingsStore`) and
-        // the title (`SpacesStore`, which owns the Library index). The index is
-        // a store-wide snapshot, so its refusal is read **tagged with this
-        // space** — a rename refused in another window's space belongs under
-        // that space's field, not this one's.
+        // **Both** of this panel's write refusals, from either store it writes
+        // to: the title (`SpacesStore`, which owns the Library index) and the
+        // settings rows (`SpaceSettingsStore`). They are different facts about
+        // different controls, and neither may stand in for the other — while one
+        // band chose between them, an older settings refusal (which nothing ever
+        // cleared) shadowed every later rename refusal, so the title field
+        // snapped back with no visible reason. The title's comes first: it is
+        // the control at the top of the panel, and the one whose refusal the
+        // reader has just watched undo itself.
+        //
+        // The index is a store-wide snapshot, so its refusal is read **tagged
+        // with this space** — a rename refused in another window's space belongs
+        // under that space's field, not this one's.
+        let title_error = self
+            .stores
+            .spaces
+            .read(cx)
+            .op_error_for(&space_id)
+            .map(str::to_string);
         let op_error = self
             .stores
             .space_settings
             .read(cx)
             .op_error(&space_id)
-            .map(str::to_string)
-            .or_else(|| {
-                self.stores
-                    .spaces
-                    .read(cx)
-                    .op_error_for(&space_id)
-                    .map(str::to_string)
-            });
+            .map(str::to_string);
         let load_error = cell.error().map(|e| e.to_string());
 
         // Title first: it is the space's name, and renaming works whether or
@@ -620,9 +626,7 @@ impl SpaceView {
                 cx,
                 cx.listener(|this, _, _, cx| this.inspector_retry_settings(cx)),
             ));
-            if let Some(err) = op_error {
-                col = col.child(self.render_inspector_error(&err, cx));
-            }
+            col = self.render_inspector_refusals(col, &title_error, &op_error, &space_id, cx);
             return col.into_any_element();
         }
 
@@ -658,9 +662,7 @@ impl SpaceView {
                 |id, this: &mut Self, cx| this.inspector_set_router(id, cx),
             ));
 
-        if let Some(err) = op_error {
-            col = col.child(self.render_inspector_error(&err, cx));
-        }
+        col = self.render_inspector_refusals(col, &title_error, &op_error, &space_id, cx);
         // A failed *refresh* over a value we still hold: keep the rows, offer a
         // quiet retry beside them.
         if load_error.is_some() {
@@ -741,11 +743,85 @@ impl SpaceView {
             .into_any_element()
     }
 
-    fn render_inspector_error(&self, err: &str, cx: &Context<Self>) -> AnyElement {
-        div()
-            .id("space-inspector-error")
-            .probe("space/inspector/error", gpui::Role::Alert, err.to_string())
-            .child(error_banner(err, cx))
+    /// The panel's refusal bands: the title's, then the settings rows'. Stacked
+    /// rather than chosen between — see the read above for what choosing cost.
+    fn render_inspector_refusals(
+        &self,
+        mut col: Div,
+        title_error: &Option<String>,
+        op_error: &Option<String>,
+        space_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        if let Some(err) = title_error {
+            let id = space_id.to_string();
+            col = col.child(self.render_inspector_error(
+                "space-inspector-title-error",
+                "space/inspector/title-error",
+                err,
+                cx,
+                cx.listener(move |this, _, _, cx| {
+                    let id = id.clone();
+                    this.stores
+                        .spaces
+                        .update(cx, |s, cx| s.dismiss_op_error_for(&id, cx));
+                }),
+            ));
+        }
+        if let Some(err) = op_error {
+            let id = space_id.to_string();
+            col = col.child(self.render_inspector_error(
+                "space-inspector-error",
+                "space/inspector/error",
+                err,
+                cx,
+                cx.listener(move |this, _, _, cx| {
+                    let id = id.clone();
+                    this.stores
+                        .space_settings
+                        .update(cx, |s, cx| s.clear_op_error(&id, cx));
+                }),
+            ));
+        }
+        col
+    }
+
+    /// One refusal band. **Dismissible**, both of them: a refusal is cleared
+    /// otherwise only by the next write to the same control, so an unacknowledged
+    /// one stands indefinitely — which is how the settings band came to shadow
+    /// the title's. The × says "I have read this", nothing more; it never
+    /// pretends the write succeeded.
+    fn render_inspector_error(
+        &self,
+        id: &'static str,
+        probe: &'static str,
+        err: &str,
+        cx: &Context<Self>,
+        on_dismiss: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        h_flex()
+            .id(id)
+            .probe(probe, gpui::Role::Alert, err.to_string())
+            .w_full()
+            .gap_2()
+            .items_start()
+            .justify_between()
+            .child(div().flex_1().min_w_0().child(error_banner(err, cx)))
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id}-dismiss")))
+                    .probe(
+                        SharedString::from(format!("{probe}/dismiss")),
+                        gpui::Role::Button,
+                        "Dismiss",
+                    )
+                    .cursor_pointer()
+                    .text_color(theme.muted_foreground)
+                    .hover(|s| s.text_color(theme.foreground))
+                    .child("×")
+                    .on_click(on_dismiss),
+            )
             .into_any_element()
     }
 }

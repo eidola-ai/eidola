@@ -100,6 +100,16 @@ impl SpaceSettingsStore {
         }
     }
 
+    /// Test-only: stand a write refusal for a space, the state a refused setter
+    /// leaves. Unreachable in stub mode otherwise — the setters need a backend
+    /// to be refused by — and it is what a *standing* refusal (one nothing has
+    /// cleared) is made of.
+    #[doc(hidden)]
+    pub fn set_op_error_for_test(&mut self, space_id: &str, message: &str) {
+        self.op_errors
+            .insert(space_id.to_string(), message.to_string());
+    }
+
     /// Test-only: force a space's cell into `Failed` (no prior), to exercise
     /// the failed-initial-load rendering.
     #[doc(hidden)]
