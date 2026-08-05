@@ -10879,6 +10879,191 @@ fn reactivating_with_no_windows_opens_the_door(cx: &mut TestAppContext) {
     assert_eq!(opened.get(), 1, "no window: reactivation opens one");
 }
 
+// Status item + retire-to-the-background (task 17, waves 3 and 3b).
+//
+// The quit decision itself is the pure `status_item::quit_intent`, unit-tested
+// in the module. What only a real gpui app can answer is what retiring does to
+// the window registry — and the AppKit half (NSStatusItem,
+// setActivationPolicy:, SMAppService) is a live system surface no test
+// platform reaches.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn retiring_closes_every_window_and_leaves_the_app_standing(cx: &mut TestAppContext) {
+    // The window half of ⌘Q's retire-to-the-background. gpui drops a window
+    // as its own `update_window` unwinds, so the registry is genuinely empty
+    // when `close_all_windows` returns — and under `QuitMode::Explicit` (what
+    // macOS uses) emptying it quits nothing, which is the whole trick: the
+    // process, the stores and the loaded engines outlive the windows because
+    // nothing on the quit path ever ran.
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+
+    open_space(cx, &stores, Some("s".into()));
+    open_space(cx, &stores, Some("s2".into()));
+    assert_eq!(cx.update(|cx| cx.windows().len()), 2);
+
+    cx.update(eidola_gui::lifecycle::close_all_windows);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        0,
+        "every window closes, synchronously"
+    );
+
+    // …and the app is still an app: the way back in opens a window again.
+    open_space(cx, &stores, Some("s3".into()));
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        1,
+        "a retired app still opens windows"
+    );
+}
+
+#[gpui::test]
+fn retiring_from_a_windows_own_update_still_closes_that_window(cx: &mut TestAppContext) {
+    // ⌘Q arrives with a window key, and `App::dispatch_action` routes an
+    // action *through* the active window — so the Quit handler runs inside
+    // that window's `update_window`, which has taken it out of the registry.
+    // A sweep from there skips the one window the user is looking at, which
+    // on the real app meant going `Accessory` with a window still on screen
+    // and no menu bar (measured, before the defer). Both halves are pinned
+    // here: the gpui fact, and the cure.
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+    let (first, _) = open_space(cx, &stores, Some("s".into()));
+    open_space(cx, &stores, Some("s2".into()));
+
+    cx.update_window(first, |_, _, cx| {
+        assert_eq!(
+            cx.windows().len(),
+            2,
+            "the updating window is still listed — the trap is that it is not *reachable*"
+        );
+        eidola_gui::lifecycle::close_all_windows(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        1,
+        "its own `update` refuses (the slot is taken), so an undeferred sweep leaves it standing"
+    );
+
+    let (third, _) = open_space(cx, &stores, Some("s3".into()));
+    cx.update_window(third, |_, _, cx| {
+        cx.defer(eidola_gui::lifecycle::close_all_windows);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        0,
+        "deferred until the update unwinds, the sweep reaches every window"
+    );
+}
+
+#[gpui::test]
+fn a_window_open_set_in_motion_before_the_retire_is_abandoned(cx: &mut TestAppContext) {
+    // The real shape of the bug: a click starts a window open that has to
+    // `await` (a launch-time backend read, a create-from-template write, a
+    // cross-space action lookup), ⌘Q retires the app inside that gap, and the
+    // awaited work then opens its window anyway — the app comes back to the
+    // front having just been told to go away.
+    use eidola_gui::lifecycle::{abandon_pending_opens, intend_to_open};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+
+    let opened = Rc::new(Cell::new(0usize));
+    let sink = opened.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let task = cx.update(|cx| {
+        let intent = intend_to_open(cx);
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            let _ = rx.await;
+            cx.update(|cx| {
+                if intent.still_wanted(cx) {
+                    sink.set(sink.get() + 1);
+                }
+            });
+        })
+    });
+
+    // ⌘Q lands while the open is still in flight. `quit_or_retire` bumps the
+    // generation synchronously, which is what the ticket compares against.
+    cx.update(abandon_pending_opens);
+    let _ = tx.send(());
+    cx.run_until_parked();
+    drop(task);
+    assert_eq!(
+        opened.get(),
+        0,
+        "the user's last instruction was ⌘Q, so the stale open is abandoned"
+    );
+
+    // A ticket taken *after* the retire is a fresh instruction and stands —
+    // this is what keeps the status menu's Open / New Space working.
+    let fresh = cx.update(|cx| intend_to_open(cx));
+    assert!(
+        cx.update(|cx| fresh.still_wanted(cx)),
+        "an open asked for after the retire is not stale"
+    );
+    // And the app is still an app: opening still works.
+    open_space(cx, &stores, Some("s".into()));
+    assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+}
+
+#[gpui::test]
+fn a_ticket_survives_everything_except_a_retire(cx: &mut TestAppContext) {
+    // The generation must move on retires and nothing else, or every async
+    // open would be abandoned by unrelated activity.
+    use eidola_gui::lifecycle::{abandon_pending_opens, close_all_windows, intend_to_open};
+
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+    let intent = cx.update(|cx| intend_to_open(cx));
+
+    open_space(cx, &stores, Some("s".into()));
+    cx.update(close_all_windows);
+    cx.run_until_parked();
+    assert!(
+        cx.update(|cx| intent.still_wanted(cx)),
+        "closing windows is not retiring — ⌘W must not abandon a pending open"
+    );
+
+    cx.update(abandon_pending_opens);
+    assert!(!cx.update(|cx| intent.still_wanted(cx)));
+}
+
+#[gpui::test]
+fn the_login_item_row_starts_from_the_system_and_invents_nothing(cx: &mut TestAppContext) {
+    use eidola_gui::general::GeneralView;
+
+    // "Open at login" has no store behind it — the system owns that state,
+    // so the pane reads it at construction and holds no opinion of its own.
+    // An error is only ever the system's words on a refused *write*, and
+    // this test performs none deliberately: registering a login item is a
+    // real change to the machine running the suite.
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx))
+    });
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.login_item(), eidola_gui::login_item::state());
+        assert!(
+            v.login_item_error().is_none(),
+            "nothing was written, so there is nothing to report"
+        );
+        // Whatever the system said, the row has honest copy for it — and an
+        // unmanageable login item never reads as a plain "off".
+        assert!(!v.login_item().description().is_empty());
+    });
+}
+
 #[gpui::test]
 fn reactivating_with_a_window_focuses_it_instead(cx: &mut TestAppContext) {
     use std::cell::Cell;
