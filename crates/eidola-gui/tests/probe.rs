@@ -20,7 +20,6 @@ use eidola_app_core::{
 use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
-use eidola_gui::participants_view::{EditMode, ParticipantsView};
 use eidola_gui::probe;
 use eidola_gui::record::{RecordSection, RecordView};
 use eidola_gui::space_view::SpaceView;
@@ -355,26 +354,29 @@ fn row_verbs_name_the_row_they_act_on(cx: &mut TestAppContext) {
 fn participant_row_verbs_name_the_participant(cx: &mut TestAppContext) {
     let _guard = probes_on();
 
-    let stores = stub_stores(cx, |s| {
-        s.config_state = Some(probe_config_state());
-        s.participants = Some(probe_participants());
-    });
-    let (window, _view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ParticipantsView::new(stores, "demo".into(), None, window, cx))
-    });
+    let (window, view) = open_participants_inspector(cx);
 
-    // Repeated "Edit"/"Remove" with nothing to distinguish them is exactly the
-    // audit's context-free-label finding; the row's subject supplies it.
+    // The row is the disclosure, so it is named by the member it opens.
     let entries = fresh_entries(cx, window);
     assert_probe(
         &entries,
-        "participants/agent-1/edit",
+        "space/inspector/participants/agent-1",
         gpui::Role::Button,
-        "Edit Assistant",
+        "Assistant",
     );
+
+    // Repeated "Remove" with nothing to distinguish it is exactly the audit's
+    // context-free-label finding; the row's subject supplies it.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx)
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
     assert_probe(
         &entries,
-        "participants/agent-1/remove",
+        "space/inspector/participants/agent-1/remove",
         gpui::Role::Button,
         "Remove Assistant",
     );
@@ -2648,79 +2650,110 @@ fn probe_participants() -> (String, Vec<ParticipantInfo>) {
     ("demo".into(), vec![you, agent])
 }
 
-#[gpui::test]
-fn participants_view_probes_cover_rows_editor_and_add(cx: &mut TestAppContext) {
-    let _guard = probes_on();
-    let stores = stub_stores(cx, |s| {
+/// Open a space window with the inspector open over a space whose membership is
+/// the fixture above — the Participants section's home since wave 26.3.
+fn open_participants_inspector(
+    cx: &mut TestAppContext,
+) -> (AnyWindowHandle, Entity<eidola_gui::space_view::SpaceView>) {
+    let stores = participants_inspector_stores(cx);
+    open_participants_inspector_with(cx, stores)
+}
+
+fn participants_inspector_stores(cx: &mut TestAppContext) -> Stores {
+    stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
         s.participants = Some(probe_participants());
-    });
+        s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
+    })
+}
+
+fn open_participants_inspector_with(
+    cx: &mut TestAppContext,
+    stores: Stores,
+) -> (AnyWindowHandle, Entity<eidola_gui::space_view::SpaceView>) {
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| {
-            ParticipantsView::new(
-                stores.clone(),
-                "demo".into(),
-                Some("Demo".into()),
+            SpaceView::new(
+                stores,
+                Some("demo".into()),
+                WindowInput::new(cx),
                 window,
                 cx,
             )
         })
     });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+    (window, view)
+}
 
-    // The resting rows: You is not removable; the agent is; plus the two links.
+#[gpui::test]
+fn space_inspector_participants_probes_cover_rows_editor_and_add(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let (window, view) = open_participants_inspector(cx);
+
+    // The resting rows are the disclosures, plus the two links below them.
     let names = fresh_names(cx, window);
     let you = eidola_app_core::HUMAN_PARTICIPANT_ID;
     for expected in [
-        format!("participants/{you}/edit"),
-        "participants/agent-1/edit".to_string(),
-        "participants/agent-1/remove".to_string(),
-        "participants/add".to_string(),
-        "participants/save-template".to_string(),
+        format!("space/inspector/participants/{you}"),
+        "space/inspector/participants/agent-1".to_string(),
+        "space/inspector/participants/add".to_string(),
+        "space/inspector/participants/template".to_string(),
     ] {
         assert!(
             names.contains(&expected),
             "row probe {expected:?} missing: {names:?}"
         );
     }
+    // A closed row shows no verbs — Remove lives inside the disclosure.
     assert!(
-        !names.contains(&format!("participants/{you}/remove")),
-        "the shared human must not be removable: {names:?}"
+        !names.contains(&"space/inspector/participants/agent-1/remove".to_string()),
+        "a resting row carries no verbs: {names:?}"
     );
 
-    // Editing You surfaces the edit-everywhere-vs-override-here fork.
+    // Opening You surfaces the edit-everywhere-vs-override-here fork, and the
+    // shared human is not removable.
     cx.update_window(window, |_, window, cx| {
-        view.update(cx, |v, cx| v.begin_edit(you, window, cx));
+        view.update(cx, |v, cx| v.inspector_toggle_participant(you, window, cx));
     })
     .unwrap();
     let names = fresh_names(cx, window);
     for expected in [
-        "participants/editor/mode/everywhere",
-        "participants/editor/mode/override",
-        "participants/editor/label",
-        "participants/editor/cancel",
-        "participants/editor/save",
+        "space/inspector/participants/editor/mode/everywhere",
+        "space/inspector/participants/editor/mode/override",
+        "space/inspector/participants/editor/name",
+        "space/inspector/participants/editor/cancel",
+        "space/inspector/participants/editor/save",
     ] {
         assert!(
             names.contains(&expected.to_string()),
             "editor probe {expected:?} missing: {names:?}"
         );
     }
+    assert!(
+        !names.contains(&format!("space/inspector/participants/{you}/remove")),
+        "the shared human must not be removable: {names:?}"
+    );
     // The human editor shows only the mode toggle + name (no model/prompt).
-    assert!(!names.contains(&"participants/editor/model".to_string()));
+    assert!(!names.contains(&"space/inspector/participants/editor/model".to_string()));
 
-    // Editing an agent adds the model field + notify chips.
+    // An agent's disclosure adds the model field, the prompt and notify chips.
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.set_edit_mode(EditMode::Everywhere, window, cx)
+            v.inspector_toggle_participant("agent-1", window, cx)
         });
-        view.update(cx, |v, cx| v.begin_edit("agent-1", window, cx));
     })
     .unwrap();
     let names = fresh_names(cx, window);
     for expected in [
-        "participants/editor/model",
-        "participants/editor/system-prompt",
-        "participants/editor/notify/human",
+        "space/inspector/participants/editor/model",
+        "space/inspector/participants/editor/system-prompt",
+        "space/inspector/participants/editor/notify/human",
+        "space/inspector/participants/agent-1/remove",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -2730,21 +2763,38 @@ fn participants_view_probes_cover_rows_editor_and_add(cx: &mut TestAppContext) {
 
     // The add form.
     cx.update_window(window, |_, window, cx| {
-        view.update(cx, |v, cx| v.begin_add(window, cx));
+        view.update(cx, |v, cx| v.inspector_begin_add_participant(window, cx));
     })
     .unwrap();
     let names = fresh_names(cx, window);
     for expected in [
-        "participants/add/name",
-        "participants/add/model",
-        "participants/add/system-prompt",
-        "participants/add/notify/human",
-        "participants/add/submit",
-        "participants/add/cancel",
+        "space/inspector/participants/add/name",
+        "space/inspector/participants/add/model",
+        "space/inspector/participants/add/system-prompt",
+        "space/inspector/participants/add/notify/human",
+        "space/inspector/participants/add/submit",
+        "space/inspector/participants/add/cancel",
     ] {
         assert!(
             names.contains(&expected.to_string()),
             "add-form probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    // The save-as-template form.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_template(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "space/inspector/participants/template/title",
+        "space/inspector/participants/template/save",
+        "space/inspector/participants/template/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "template-form probe {expected:?} missing: {names:?}"
         );
     }
 
@@ -3106,32 +3156,24 @@ fn model_picker_options_name_their_backend(cx: &mut TestAppContext) {
     );
 
     // The participant model field — the same shared widget, the same shape.
-    let (p_window, p_view) = open_view(cx, |window, cx| {
-        cx.new(|cx| {
-            ParticipantsView::new(
-                stores.clone(),
-                "demo".into(),
-                Some("Demo".into()),
-                window,
-                cx,
-            )
-        })
-    });
+    let (p_window, p_view) = open_participants_inspector_with(cx, stores.clone());
     cx.update_window(p_window, |_, window, cx| {
-        p_view.update(cx, |v, cx| v.begin_add(window, cx));
+        p_view.update(cx, |v, cx| {
+            v.inspector_begin_add_participant(window, cx);
+            v.inspector_open_add_picker_for_test(cx);
+        });
     })
     .unwrap();
-    p_view.update(cx, |v, cx| v.open_add_picker_for_test(cx));
     let entries = fresh_entries(cx, p_window);
     assert_probe(
         &entries,
-        "participants/add/model/option/0/0",
+        "space/inspector/participants/add/model/option/0/0",
         gpui::Role::Button,
         "Gemma 4 E2B · Local",
     );
     assert_probe(
         &entries,
-        "participants/add/model/option/1/0",
+        "space/inspector/participants/add/model/option/1/0",
         gpui::Role::Button,
         "Gemma 4 E2B · My box",
     );
@@ -3183,25 +3225,17 @@ fn model_pickers_announce_their_selection(cx: &mut TestAppContext) {
 
     // The participant model field — the shared widget the Templates pane's own
     // agent rows use too — takes the identical shape.
-    let (p_window, p_view) = open_view(cx, |window, cx| {
-        cx.new(|cx| {
-            ParticipantsView::new(
-                stores.clone(),
-                "demo".into(),
-                Some("Demo".into()),
-                window,
-                cx,
-            )
-        })
-    });
+    let (p_window, p_view) = open_participants_inspector_with(cx, stores.clone());
     cx.update_window(p_window, |_, window, cx| {
-        p_view.update(cx, |v, cx| v.begin_edit("agent-1", window, cx));
+        p_view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx)
+        });
     })
     .unwrap();
     let entries = fresh_entries(cx, p_window);
     assert_probe_value(
         &entries,
-        "participants/editor/model",
+        "space/inspector/participants/editor/model",
         gpui::Role::Button,
         "Model",
         "gemma4-31b · Eidola",
@@ -3211,34 +3245,24 @@ fn model_pickers_announce_their_selection(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn participants_view_failed_load_shows_retry_not_controls(cx: &mut TestAppContext) {
+fn space_inspector_participants_failed_load_shows_retry_not_controls(cx: &mut TestAppContext) {
     let _guard = probes_on();
-    let stores = stub_stores(cx, |s| {
-        s.config_state = Some(probe_config_state());
-    });
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| {
-            ParticipantsView::new(
-                stores.clone(),
-                "demo".into(),
-                Some("Demo".into()),
-                window,
-                cx,
-            )
-        })
-    });
+    let stores = participants_inspector_stores(cx);
+    let (window, _view) = open_participants_inspector_with(cx, stores.clone());
     // A failed *initial* load: no prior data, no live roster.
     stores
         .participants
         .update(cx, |s, _| s.set_failed_for_test("demo", "boom"));
-    let _ = view;
 
     let names = fresh_names(cx, window);
     assert!(
-        names.contains(&"participants/retry".to_string()),
+        names.contains(&"space/inspector/participants/retry".to_string()),
         "failed load must offer Retry: {names:?}"
     );
-    for absent in ["participants/add", "participants/save-template"] {
+    for absent in [
+        "space/inspector/participants/add",
+        "space/inspector/participants/template",
+    ] {
         assert!(
             !names.contains(&absent.to_string()),
             "a failed load must not show live controls ({absent:?}): {names:?}"
@@ -4428,6 +4452,135 @@ fn space_inspector_failed_settings_read_offers_a_retry_not_a_default(cx: &mut Te
     );
 
     probe::set_probes_enabled(false);
+}
+
+/// **Two failed sections, and each Retry has to be its own control.** The Space
+/// section and the Participants section read different stores and fail
+/// independently, so both `load_error_panel`s can stand in one panel — and the
+/// shared helper used to hard-code its button's element id (`load-retry`) while
+/// neither section root carries an id of its own, so the two buttons resolved to
+/// the *same* `GlobalElementId`. gpui keys per-element state on that id (and
+/// derives each AccessKit node id from its hash), so the pair shared one
+/// `pending_mouse_down`: mouse-up dispatches its capture phase in paint order,
+/// the Space panel's handler ran first, found the press the *Participants*
+/// button had armed, saw its own hitbox unhovered and swallowed it — leaving the
+/// second Retry inert in the one state where Retry is the only way forward
+/// (`ensure` declines once a `Failed` cell exists). Codex review, PR #278.
+///
+/// Driven against a real core, because the proof is that the click *lands*: the
+/// retry has to have something to succeed at.
+#[gpui::test]
+fn each_failed_section_gets_a_retry_of_its_own(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, VisualTestContext, px};
+
+    let _guard = probes_on();
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        eidola_app_core::AppCore::new(dir.path().to_path_buf(), dir.path().join("data"))
+            .expect("open core"),
+    );
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
+        .unwrap();
+    let space = core
+        .runtime()
+        .block_on(core.create_space(None))
+        .expect("create space")
+        .id;
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores.clone(),
+                Some(space.clone()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    // Wide enough that the panel splits the window rather than floating over it.
+    let vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+    poll_until(cx, "both sections load", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| !s.list(&space).is_empty())
+    });
+
+    // Both reads fail — two panels, two Retrys.
+    cx.update(|cx| {
+        stores
+            .participants
+            .update(cx, |s, _| s.set_failed_for_test(&space, "boom"));
+        stores
+            .space_settings
+            .update(cx, |s, _| s.set_failed_for_test(&space, "boom"));
+    });
+    let entries = fresh_entries(cx, window);
+    let bounds = |name: &str| {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name} painted"))
+            .1
+            .bounds
+    };
+    let space_retry = bounds("space/inspector/retry");
+    let participants_retry = bounds("space/inspector/participants/retry");
+    assert_ne!(
+        space_retry.center(),
+        participants_retry.center(),
+        "precondition: the two panels stand side by side"
+    );
+
+    // The real gesture, on the *second* panel's button.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_click(participants_retry.center(), Modifiers::default());
+    vcx.run_until_parked();
+
+    poll_until(cx, "the participants read is retried", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.participants(&space).has_value())
+    });
+    assert!(
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).error().is_some()),
+        "and the press belonged to the button it landed on — the Space section's \
+         read was never retried"
+    );
+
+    probe::set_probes_enabled(false);
+    while core.runtime().metrics().num_alive_tasks() > 0 {
+        std::thread::yield_now();
+    }
+}
+
+/// Poll `run_until_parked` until `pred` holds — a real-core read round-trips
+/// through the tokio runtime, which `run_until_parked` alone can return before.
+fn poll_until(
+    cx: &mut TestAppContext,
+    what: &str,
+    mut pred: impl FnMut(&mut TestAppContext) -> bool,
+) {
+    for _ in 0..400 {
+        cx.run_until_parked();
+        if pred(cx) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("timed out waiting until {what}");
 }
 
 /// **Neither refusal may stand in for the other.** The panel writes to two

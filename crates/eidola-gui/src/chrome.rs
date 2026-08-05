@@ -610,8 +610,8 @@ impl ChromeRoot {
     fn render_menu_panel(&self, _window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         use crate::actions::{
             About, ActualSize, CheckForUpdates, NewSpace, NewSpaceFromTemplate, OpenLibrary,
-            OpenParticipants, OpenRecord, OpenSettings, Quit, Quote, QuoteInReply, ToggleInspector,
-            ZoomIn, ZoomOut, primary_alt_chord, primary_chord, primary_shift_chord,
+            OpenRecord, OpenSettings, Quit, Quote, QuoteInReply, ToggleInspector, ZoomIn, ZoomOut,
+            primary_alt_chord, primary_chord, primary_shift_chord,
         };
         let theme = cx.theme();
 
@@ -662,8 +662,8 @@ impl ChromeRoot {
                 cx.notify();
             }))
             // The space-scoped group (the macOS "Space" menu): New Space, the
-            // per-template creators, and Participants… (a no-op without a
-            // focused space window, matching the greyed macOS item). The zoom
+            // per-template creators, and the inspector toggle (a no-op without
+            // a focused space window, matching the greyed macOS item). The zoom
             // trio is the macOS "View" menu, its own group next. Library/Record
             // are app-level and group with Settings below — mirroring the
             // macOS move of Library/Record up into the Eidola app menu.
@@ -675,16 +675,8 @@ impl ChromeRoot {
                 cx,
             ))
             .children(template_rows)
-            .child(menu_item(
-                "participants",
-                "Participants…",
-                None,
-                |w, cx| w.dispatch_action(Box::new(OpenParticipants), cx),
-                cx,
-            ))
             // The space inspector's other door (the space itself carries no
-            // visual toggle) — a no-op without a focused space window, like
-            // Participants… above.
+            // visual toggle) — a no-op without a focused space window.
             .child(menu_item(
                 "inspector",
                 "Show/Hide Inspector",

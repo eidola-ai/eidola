@@ -28,7 +28,7 @@ use gpui_component::{
 
 use crate::actions::CloseWindow;
 use crate::focus::TabRegion as _;
-use crate::participants_view::load_error_panel;
+use crate::participants::load_error_panel;
 use crate::probe::Probe as _;
 use crate::stores::{SpacesStore, Stores};
 
