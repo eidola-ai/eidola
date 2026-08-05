@@ -619,13 +619,18 @@ impl Inner {
                         .unwrap_or_default()
                 };
                 // Every on-disk model is selectable — a request against an
-                // unloaded one loads its engine on demand. Only models
-                // still downloading are excluded (no file to serve yet).
-                // Context length is reported for running engines; 0 for
-                // not-yet-loaded models (honest: it's not known until the
-                // engine starts).
+                // unloaded one loads its engine on demand. `on_disk` is the
+                // whole test, because a snapshot row is not always a file:
+                // one still downloading has only a `.part`, and a failed
+                // download leaves a row carrying nothing but its error.
+                // Offering either would hand the picker an id that can only
+                // fail at load time; both stay visible in the model *list*,
+                // where the error is the point. Context length is reported
+                // for running engines; 0 for not-yet-loaded models (honest:
+                // it's not known until the engine starts).
                 Ok(models
                     .into_iter()
+                    .filter(|m| m.on_disk)
                     .filter_map(|m| match m.status {
                         crate::local_models::LocalModelStatus::Loaded {
                             context_tokens, ..
