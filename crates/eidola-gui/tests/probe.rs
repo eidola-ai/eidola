@@ -4405,6 +4405,135 @@ fn space_inspector_failed_settings_read_offers_a_retry_not_a_default(cx: &mut Te
     probe::set_probes_enabled(false);
 }
 
+/// **Two failed sections, and each Retry has to be its own control.** The Space
+/// section and the Participants section read different stores and fail
+/// independently, so both `load_error_panel`s can stand in one panel — and the
+/// shared helper used to hard-code its button's element id (`load-retry`) while
+/// neither section root carries an id of its own, so the two buttons resolved to
+/// the *same* `GlobalElementId`. gpui keys per-element state on that id (and
+/// derives each AccessKit node id from its hash), so the pair shared one
+/// `pending_mouse_down`: mouse-up dispatches its capture phase in paint order,
+/// the Space panel's handler ran first, found the press the *Participants*
+/// button had armed, saw its own hitbox unhovered and swallowed it — leaving the
+/// second Retry inert in the one state where Retry is the only way forward
+/// (`ensure` declines once a `Failed` cell exists). Codex review, PR #278.
+///
+/// Driven against a real core, because the proof is that the click *lands*: the
+/// retry has to have something to succeed at.
+#[gpui::test]
+fn each_failed_section_gets_a_retry_of_its_own(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, VisualTestContext, px};
+
+    let _guard = probes_on();
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        eidola_app_core::AppCore::new(dir.path().to_path_buf(), dir.path().join("data"))
+            .expect("open core"),
+    );
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
+        .unwrap();
+    let space = core
+        .runtime()
+        .block_on(core.create_space(None))
+        .expect("create space")
+        .id;
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores.clone(),
+                Some(space.clone()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    // Wide enough that the panel splits the window rather than floating over it.
+    let vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+    poll_until(cx, "both sections load", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| !s.list(&space).is_empty())
+    });
+
+    // Both reads fail — two panels, two Retrys.
+    cx.update(|cx| {
+        stores
+            .participants
+            .update(cx, |s, _| s.set_failed_for_test(&space, "boom"));
+        stores
+            .space_settings
+            .update(cx, |s, _| s.set_failed_for_test(&space, "boom"));
+    });
+    let entries = fresh_entries(cx, window);
+    let bounds = |name: &str| {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name} painted"))
+            .1
+            .bounds
+    };
+    let space_retry = bounds("space/inspector/retry");
+    let participants_retry = bounds("space/inspector/participants/retry");
+    assert_ne!(
+        space_retry.center(),
+        participants_retry.center(),
+        "precondition: the two panels stand side by side"
+    );
+
+    // The real gesture, on the *second* panel's button.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_click(participants_retry.center(), Modifiers::default());
+    vcx.run_until_parked();
+
+    poll_until(cx, "the participants read is retried", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.participants(&space).has_value())
+    });
+    assert!(
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).error().is_some()),
+        "and the press belonged to the button it landed on — the Space section's \
+         read was never retried"
+    );
+
+    probe::set_probes_enabled(false);
+    while core.runtime().metrics().num_alive_tasks() > 0 {
+        std::thread::yield_now();
+    }
+}
+
+/// Poll `run_until_parked` until `pred` holds — a real-core read round-trips
+/// through the tokio runtime, which `run_until_parked` alone can return before.
+fn poll_until(
+    cx: &mut TestAppContext,
+    what: &str,
+    mut pred: impl FnMut(&mut TestAppContext) -> bool,
+) {
+    for _ in 0..400 {
+        cx.run_until_parked();
+        if pred(cx) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("timed out waiting until {what}");
+}
+
 /// **Neither refusal may stand in for the other.** The panel writes to two
 /// stores — the title goes through `SpacesStore` (the Library index), the rows
 /// through `SpaceSettingsStore` — and while one band chose between them, an

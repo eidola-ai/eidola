@@ -624,7 +624,21 @@ pub(crate) fn ghost_button_labeled(
 
 /// A centered "couldn't load — retry" panel for a failed *initial* store load
 /// (vs `error_banner`, the inline write-error strip), so a `Loadable::Failed`
-/// never renders as a plausible-empty surface. `retry_probe` is the button's probe name.
+/// never renders as a plausible-empty surface. `retry_probe` is the button's
+/// probe name — **and its element id**, because the probe name is already
+/// required to be unique per painted element, which is exactly what an element
+/// id must be.
+///
+/// A hard-coded id here was a defect the moment a second caller could co-render:
+/// the space inspector's Space and Participants sections read different stores,
+/// fail independently, and stand in one panel with no intervening ids, so both
+/// buttons resolved to the same `GlobalElementId`. gpui keys per-element state
+/// on that id and derives each AccessKit node id from its hash, so the pair
+/// shared one `pending_mouse_down` — the first panel's capture-phase mouse-up
+/// handler swallowed the press armed on the second — and the second's a11y node
+/// was a duplicate id (a `debug_assert`, silently dropped in release). Deriving
+/// the id from the probe makes every present and future caller distinct by
+/// construction. Regression: `each_failed_section_gets_a_retry_of_its_own`.
 pub(crate) fn load_error_panel(
     retry_probe: &'static str,
     headline: &'static str,
@@ -653,7 +667,7 @@ pub(crate) fn load_error_panel(
                 .child(SharedString::from(detail.to_string())),
         )
         .child(ghost_button(
-            "load-retry".into(),
+            SharedString::from(retry_probe),
             SharedString::from(retry_probe),
             "Retry",
             true,
