@@ -835,3 +835,400 @@ fn a_space_change_re_reads_only_cached_settings(cx: &mut TestAppContext) {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// SpacesStore — the Library index's optimistic mutations.
+// ---------------------------------------------------------------------------
+
+/// A listing row the database does not have — the stale-id case (another writer
+/// archived the space; a listing that outlived its rows). Seeded through the
+/// store's own settle, so the cell is exactly what a landed re-list leaves.
+fn stale_row(id: &str) -> eidola_app_core::SpaceInfo {
+    let ts = eidola_app_core::now_ms();
+    eidola_app_core::SpaceInfo {
+        id: id.into(),
+        title: Some("Tides".into()),
+        snippet: None,
+        created_at: ts,
+        last_activity_at: ts,
+        message_count: 2,
+        archived_at: None,
+    }
+}
+
+/// **A refused rename must not stand.** The optimistic title edit is what makes
+/// the Library answer without a round trip; ignoring the write's `Err` left the
+/// Library, the window title, and the inspector's title field all showing a name
+/// nothing ever persisted, until an unrelated refresh took it away without a
+/// word. The cure is the write-through shape: the refusal lands in `op_error`
+/// (tagged with the space it was about) and the re-list runs on the failure
+/// exit, reconciling the cached index back to what the database holds.
+#[gpui::test]
+fn a_refused_rename_reconciles_the_index_and_surfaces_the_refusal(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let real = core
+        .runtime()
+        .block_on(core.create_space(Some("Nile".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(None, Ok(vec![stale_row("ghost")]), None, cx)
+    });
+
+    stores
+        .spaces
+        .update(cx, |s, cx| s.rename("ghost".into(), "Renamed".into(), cx));
+    // The refusal and the reconcile are two events now: the write's refusal is
+    // reported as it settles, and the batch-end read — issued only once no write
+    // is in flight — lands after it.
+    wait_until(cx, "the refusal surfaces and the index reconciles", |cx| {
+        stores.spaces.read_with(cx, |s, _| {
+            s.op_error().is_some() && !s.list().iter().any(|r| r.id == "ghost")
+        })
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        assert!(
+            s.op_error_for("ghost").is_some(),
+            "the refusal is tagged with the space it was about, so only that \
+             space's inspector shows it"
+        );
+        assert!(
+            !s.list().iter().any(|r| r.id == "ghost"),
+            "the optimistic title never stands: the batch-end read reconciles \
+             on the failure exit"
+        );
+        assert!(
+            s.list().iter().any(|r| r.id == real),
+            "and what it lands is the database's listing"
+        );
+        assert!(
+            !s.index().is_loading(),
+            "the mutation must resolve the cell it took the read from"
+        );
+    });
+}
+
+/// The same rule for archive, over its one refusal that is not an error: a
+/// `false` return means nothing was archived (the space was already archived —
+/// the race the Library's × can lose — or is not there at all), so the row this
+/// operation had already dropped from the listing was not its to drop. Say so
+/// rather than let an optimistic removal read as an unearned success.
+///
+/// The teeth here are the *refusal*: this scenario's listing is empty whether or
+/// not the re-list is conditional (the space really is archived). The re-list's
+/// own teeth live on the rename above, where a refused write's optimistic edit
+/// is what the re-list has to take back.
+#[gpui::test]
+fn an_archive_that_changed_nothing_says_so(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(Some("Tides".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the index loads", |cx| {
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.list().iter().any(|r| r.id == space))
+    });
+
+    // Another writer archives it first. (No bus bridge in these tests, so the
+    // cached index still shows the row — exactly the state a second window is
+    // in between the write and its invalidation.)
+    core.runtime()
+        .block_on(core.archive_space(space.clone()))
+        .expect("archive");
+
+    stores
+        .spaces
+        .update(cx, |s, cx| s.archive(space.clone(), cx));
+    wait_until(cx, "the refusal surfaces and the index reconciles", |cx| {
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.op_error().is_some() && s.list().is_empty())
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        assert!(s.op_error_for(&space).is_some());
+        assert!(s.list().is_empty(), "and the listing is re-read either way");
+        assert!(!s.index().is_loading());
+    });
+}
+
+/// The refresh-vs-mutation rule for this store — and the sharpest case there
+/// is, because a rename emits the very `Change::SpaceIndex` that routes back
+/// here as a refresh. While the two shared one slot, that refresh replaced the
+/// write's task: the core write still ran (`bridge` drops the tokio
+/// `JoinHandle`), but the continuation carrying its refusal and its re-list
+/// never did — a refused rename indistinguishable from an accepted one.
+#[gpui::test]
+fn a_refresh_landing_mid_rename_keeps_the_spaces_ops_error(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let real = core
+        .runtime()
+        .block_on(core.create_space(Some("Nile".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(None, Ok(vec![stale_row("ghost")]), None, cx)
+    });
+    stores
+        .spaces
+        .update(cx, |s, cx| s.rename("ghost".into(), "Renamed".into(), cx));
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::SpaceIndex), cx));
+
+    wait_until(cx, "the refusal surfaces and the index reconciles", |cx| {
+        stores.spaces.read_with(cx, |s, _| {
+            s.op_error().is_some() && s.list().iter().any(|r| r.id == real)
+        })
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        assert!(
+            s.list().iter().any(|r| r.id == real),
+            "the mutation's batch-end read landed on its failure exit"
+        );
+        assert!(
+            !s.index().is_loading(),
+            "the mutation must resolve the cell it took the read from"
+        );
+    });
+}
+
+/// **Two mutations on two spaces are independent work.** A single mutation slot
+/// made the second supersede the first — dropping the gpui half of a write
+/// already in flight (its re-list and its refusal lost: the silent-loss class
+/// this store's write-through shape exists to cure), or cancelling the first
+/// operation outright when it had not been polled yet. Rapid ops from two
+/// Library rows or two windows are the realistic trigger; issued in one update
+/// here, which is the narrowest form of it (the first has not run at all).
+#[gpui::test]
+fn two_renames_on_two_spaces_both_land(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let a = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let b = core
+        .runtime()
+        .block_on(core.create_space(Some("B".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the index loads", |cx| {
+        stores.spaces.read_with(cx, |s, _| s.list().len() == 2)
+    });
+
+    stores.spaces.update(cx, |s, cx| {
+        s.rename(a.clone(), "Anemone".into(), cx);
+        s.rename(b.clone(), "Bergamot".into(), cx);
+    });
+
+    let durable_titles = |cx: &mut TestAppContext| {
+        let _ = cx;
+        let listing = core
+            .runtime()
+            .block_on(core.list_spaces(false))
+            .expect("list spaces");
+        let mut titles: Vec<String> = listing.iter().filter_map(|s| s.title.clone()).collect();
+        titles.sort();
+        titles
+    };
+    wait_until(cx, "both renames land durably", |cx| {
+        durable_titles(cx) == vec!["Anemone".to_string(), "Bergamot".to_string()]
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        let title = |id: &str| {
+            s.list()
+                .iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.title.clone())
+        };
+        assert_eq!(title(&a).as_deref(), Some("Anemone"));
+        assert_eq!(title(&b).as_deref(), Some("Bergamot"));
+    });
+}
+
+/// The refusal half of the same rule: two refused mutations on two spaces each
+/// owe their own report. One tagged slot could only hold the last, and the
+/// *inspector* reads per space — a lost refusal there is a title field snapping
+/// back with no reason given, exactly the dishonesty this store's shape exists
+/// to prevent. A bus refresh lands mid-write for good measure: it must defer to
+/// the **last** mutation, not eat either one's continuation.
+#[gpui::test]
+fn two_refused_mutations_each_keep_their_own_refusal(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let real = core
+        .runtime()
+        .block_on(core.create_space(Some("Nile".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(
+            None,
+            Ok(vec![stale_row("ghost-a"), stale_row("ghost-b")]),
+            None,
+            cx,
+        )
+    });
+    stores.spaces.update(cx, |s, cx| {
+        s.rename("ghost-a".into(), "Anemone".into(), cx);
+        s.rename("ghost-b".into(), "Bergamot".into(), cx);
+    });
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::SpaceIndex), cx));
+
+    wait_until(cx, "both refusals surface and the index reconciles", |cx| {
+        stores.spaces.read_with(cx, |s, _| {
+            s.op_error_for("ghost-a").is_some()
+                && s.op_error_for("ghost-b").is_some()
+                && s.list().len() == 1
+        })
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        assert!(
+            s.op_error().is_some(),
+            "the Library shows one of them (the most recent)"
+        );
+        assert!(
+            s.list().iter().any(|r| r.id == real) && s.list().len() == 1,
+            "and the batch-end read landed: the index is the database's"
+        );
+        assert!(!s.index().is_loading());
+    });
+}
+
+/// **A superseded same-space write leaves no optimism behind.** Two mutations on
+/// one space still replace-cancel (one control, last-wins — the documented
+/// residual), and the loser's undo dies with its cancelled task. Its *edit* must
+/// not outlive it: the successor would otherwise treat the loser's optimistic
+/// string as the value to restore, and a refused successor whose re-list also
+/// failed would put back a name the database never held. Here the winner is
+/// refused (a stale id), so the reconciled index must show the database's title
+/// — never either optimistic one.
+#[gpui::test]
+fn a_superseded_rename_leaves_no_optimism_behind(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let real = core
+        .runtime()
+        .block_on(core.create_space(Some("Tides".into())))
+        .expect("create space")
+        .id;
+
+    // The cached index holds a row the database does not, so both writes below
+    // are refused (`rename_space` on a stale id).
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(None, Ok(vec![stale_row("ghost")]), None, cx)
+    });
+    stores.spaces.update(cx, |s, cx| {
+        s.rename("ghost".into(), "Anemone".into(), cx);
+        s.rename("ghost".into(), "Bergamot".into(), cx);
+    });
+
+    wait_until(cx, "the refusal surfaces and the index reconciles", |cx| {
+        stores.spaces.read_with(cx, |s, _| {
+            s.op_error_for("ghost").is_some() && !s.list().iter().any(|r| r.id == "ghost")
+        })
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        let titles: Vec<String> = s.list().iter().filter_map(|r| r.title.clone()).collect();
+        assert_eq!(
+            titles,
+            vec!["Tides".to_string()],
+            "the index is the database's listing — neither optimistic name survives"
+        );
+        assert!(s.list().iter().any(|r| r.id == real));
+        assert!(!s.index().is_loading());
+    });
+}
+
+/// **The index a batch lands on is read after the batch's last write.** Each
+/// mutation used to carry a listing it read right after *its own* write; with
+/// siblings in flight, the operation still standing when the last slot cleared
+/// could be one whose read predated another's commit, and it resolved the shared
+/// index with that snapshot — dropping an accepted rename from view (and, when a
+/// read failed, preserving the stale snapshot as `Failed { prior }`). The
+/// resolving read is now issued only once no write is in flight, so "after every
+/// write of the batch" is a property of when it is taken.
+///
+/// **The assertion has to be a stability one.** A batch's optimistic edits agree
+/// with the database the moment its writes commit, so comparing once passes long
+/// before the resolution lands — the defect is precisely a *later* read putting
+/// something staler on screen. So the comparison is held for a while after it
+/// first holds, and any drift fails.
+#[gpui::test]
+fn a_batch_of_renames_lands_on_a_listing_read_after_all_of_them(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let a = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let b = core
+        .runtime()
+        .block_on(core.create_space(Some("B".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the index loads", |cx| {
+        stores.spaces.read_with(cx, |s, _| s.list().len() == 2)
+    });
+
+    for round in 0..4 {
+        let title_a = format!("A{round}");
+        let title_b = format!("B{round}");
+        let (ta, tb) = (title_a.clone(), title_b.clone());
+        stores.spaces.update(cx, |s, cx| {
+            s.rename(a.clone(), ta, cx);
+            s.rename(b.clone(), tb, cx);
+        });
+
+        // The store's index beside the database's own listing.
+        let agrees = |cx: &mut TestAppContext| -> Result<(), String> {
+            let mut durable: Vec<(String, Option<String>)> = core
+                .runtime()
+                .block_on(core.list_spaces(false))
+                .expect("list spaces")
+                .into_iter()
+                .map(|s| (s.id, s.title))
+                .collect();
+            durable.sort();
+            let mut cached = stores.spaces.read_with(cx, |s, _| {
+                s.list()
+                    .iter()
+                    .map(|r| (r.id.clone(), r.title.clone()))
+                    .collect::<Vec<_>>()
+            });
+            cached.sort();
+            if cached != durable {
+                return Err(format!("cached {cached:?} != durable {durable:?}"));
+            }
+            Ok(())
+        };
+
+        wait_until(cx, "the batch reaches the database's listing", |cx| {
+            agrees(cx).is_ok()
+        });
+        // …and stays there. A resolution taken from a snapshot older than the
+        // batch's last write lands after this point and would drift back.
+        for _ in 0..40 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            if let Err(drift) = agrees(cx) {
+                panic!("the index drifted after the batch settled: {drift}");
+            }
+        }
+    }
+}

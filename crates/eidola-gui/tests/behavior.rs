@@ -7475,7 +7475,8 @@ fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
 }
 
 /// P1: a "New Space from Template" failure is owned by the store (not detached)
-/// and surfaced in `new_space_error`, not silently discarded.
+/// and surfaced in the store's `op_error` (the Library banner), not silently
+/// discarded.
 #[gpui::test]
 fn spaces_store_create_from_template_surfaces_error(cx: &mut TestAppContext) {
     let (stores, core, _dir, _space) = participants_scene(cx);
@@ -7484,9 +7485,13 @@ fn spaces_store_create_from_template_surfaces_error(cx: &mut TestAppContext) {
         s.create_from_template("does-not-exist".into(), stores_clone, cx);
     });
     wait_until(cx, "create error surfaced", |cx| {
-        stores
-            .spaces
-            .read_with(cx, |s, _| s.new_space_error().is_some())
+        stores.spaces.read_with(cx, |s, _| s.op_error().is_some())
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        assert!(
+            s.op_error_for("anything").is_none(),
+            "a create has no space to tag, so no space's inspector claims it"
+        );
     });
 
     drain_runtime(&core);
@@ -11464,6 +11469,74 @@ fn space_inspector_rejecting_a_blank_title_restores_the_stored_one(cx: &mut Test
         "Tides",
         "and the field is repaired from the stored title rather than left blank"
     );
+}
+
+/// **A refused rename takes the field back with it.** The title row writes
+/// through `SpacesStore::rename`, which edits the cached row optimistically —
+/// so a write the database refuses used to leave the field (and the Library, and
+/// the window title) reading a name nothing persisted. With the store
+/// reconciling its index from the re-list on every exit, the panel is honest for
+/// free: the stored title moves back under the field, the seed disagrees with
+/// it, and `sync_inspector_title` re-seeds — and the refusal itself surfaces in
+/// the panel's one op-error banner.
+///
+/// Driven through the store's own settle (the production
+/// `stores::settle_mutation`), which is what a refused write's completion
+/// applies; that the real path reaches it is
+/// `a_refused_rename_reconciles_the_index_and_surfaces_the_refusal`
+/// (`tests/stores.rs`).
+#[gpui::test]
+fn space_inspector_a_refused_rename_restores_the_stored_title(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let state = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("the title field exists once the inspector renders");
+
+    // Type a new name and commit it: the optimistic edit lands everywhere at
+    // once, which is the whole point of it.
+    cx.update_window(window, |_, window, cx| {
+        state.update(cx, |s, cx| s.set_value("Nile".to_string(), window, cx));
+        view.update(cx, |v, cx| v.inspector_commit_title(cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert_eq!(state.read_with(cx, |s, _| s.value().to_string()), "Nile");
+
+    // …and the write is refused. The store settles: the re-list puts the stored
+    // title back, the refusal lands in the op-error slot tagged with this space.
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(
+            Some("s1".into()),
+            Ok(vec![stub_space("s1", Some("Tides"), None, 0)]),
+            Some("Couldn't rename this space: space not found: s1"),
+            cx,
+        )
+    });
+    draw_window(cx, window);
+
+    assert_eq!(
+        state.read_with(cx, |s, _| s.value().to_string()),
+        "Tides",
+        "the field re-seeds from the stored title rather than keeping a name \
+         nothing persisted"
+    );
+    stores.spaces.read_with(cx, |s, _| {
+        assert!(
+            s.op_error_for("s1").is_some(),
+            "and the refusal is the panel's to show"
+        );
+    });
 }
 
 /// Two quick presses of the cascade stepper are two increments. Each press

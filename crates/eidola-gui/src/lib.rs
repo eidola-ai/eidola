@@ -570,7 +570,7 @@ fn install_action_handlers(cx: &mut App) {
     // `SpacesStore` so the create-and-open op is **owned** in an entity task
     // slot (STATE.md — never `.detach()` domain work): the store keys each
     // activation independently so a committed space always gets its window, and
-    // surfaces a failure in `new_space_error` (Library banner) instead of
+    // surfaces a failure in the store's `op_error` (Library banner) instead of
     // silently discarding it.
     cx.on_action(|action: &NewSpaceFromTemplate, cx: &mut App| {
         let stores = cx.global::<AppGlobal>().stores.clone();
