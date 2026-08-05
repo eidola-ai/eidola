@@ -161,20 +161,29 @@ impl SpacesStore {
     }
 
     /// Test seam: apply the settle a mutation's completion applies — the
-    /// re-list's listing, plus the write's refusal when it was refused —
+    /// re-list's outcome, plus the write's refusal when it was refused —
     /// without a backend to fail against. It runs the *production*
     /// [`crate::stores::settle_mutation`], so a view test driven through it is
     /// exercising the reconciliation shape the real path takes.
+    ///
+    /// `listing` is a `Result` because the re-list is one of the two things
+    /// that can fail here, and the *read's* failure is what puts the index cell
+    /// in `Failed` — the state the Library has to render honestly. A local DB
+    /// read cannot be made to fail through the real seam, so this is how that
+    /// quadrant is reachable from a test.
     #[doc(hidden)]
     pub fn settle_for_test(
         &mut self,
         space_id: Option<String>,
-        listing: Vec<SpaceInfo>,
+        listing: Result<Vec<SpaceInfo>, &str>,
         refusal: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         let op = refusal.map_or(Ok(()), |r| Err(r.to_string()));
-        if let Some(message) = crate::stores::settle_mutation(&mut self.index, Ok(listing), op) {
+        let list = listing.map_err(|e| eidola_app_core::error::AppError::Internal {
+            message: e.to_string(),
+        });
+        if let Some(message) = crate::stores::settle_mutation(&mut self.index, list, op) {
             self.record_op_error(space_id, message);
         }
         cx.notify();

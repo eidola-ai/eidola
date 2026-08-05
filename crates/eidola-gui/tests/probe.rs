@@ -115,7 +115,7 @@ fn library_op_error_banner_is_an_alert_with_a_dismiss(cx: &mut TestAppContext) {
     stores.spaces.update(cx, |s, cx| {
         s.settle_for_test(
             Some("s1".into()),
-            vec![space_info("s1", Some("Tides and the moon"))],
+            Ok(vec![space_info("s1", Some("Tides and the moon"))]),
             Some(refusal),
             cx,
         )
@@ -141,6 +141,63 @@ fn library_op_error_banner_is_an_alert_with_a_dismiss(cx: &mut TestAppContext) {
         !entries.iter().any(|(n, _)| n == "library/op-error"),
         "a dismissed refusal leaves no banner behind"
     );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **"Failed is not empty" for the Library.** A failed *initial* read leaves
+/// `list()` answering `&[]` exactly as a genuinely empty Library does, so the
+/// page used to render "Nothing here yet — ⌘N starts a new space": a read error
+/// stated as a fact about the reader's spaces, with no error, no retry, and ⌘N
+/// as the only way forward. The shared `load_error_panel` is the house answer.
+#[gpui::test]
+fn library_failed_initial_load_offers_a_retry_not_an_empty_page(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |_| {});
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(None, Err("database is locked"), None, cx)
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(&entries, "library/retry", gpui::Role::Button, "Retry");
+    assert!(
+        !entries.iter().any(|(n, _)| n == "library/list"),
+        "a failed initial read renders no listing to be mistaken for an empty one"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The other half: a failed *refresh* over a listing we still hold keeps the
+/// rows (never a blank page over a page we had) and adds the quiet retry — the
+/// state a write's unconditional re-list reaches when the write lands and the
+/// read behind it does not.
+#[gpui::test]
+fn library_failed_refresh_keeps_its_rows_and_offers_a_retry(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![space_info("s1", Some("Tides and the moon"))];
+    });
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(None, Err("database is locked"), None, cx)
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0",
+        gpui::Role::ListItem,
+        "Tides and the moon",
+    );
+    assert_probe(&entries, "library/retry", gpui::Role::Button, "Retry");
 
     probe::set_probes_enabled(false);
 }
