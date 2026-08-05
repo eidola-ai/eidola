@@ -1230,6 +1230,7 @@ fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext
                     pinned: false,
                 },
                 last_error: None,
+                on_disk: true,
             }],
         });
     });
@@ -1296,6 +1297,7 @@ fn space_model_display_splits_name_and_backend(cx: &mut TestAppContext) {
                 source_url: None,
                 status: eidola_app_core::LocalModelStatus::Available,
                 last_error: None,
+                on_disk: true,
             }],
         });
     });
@@ -1348,6 +1350,7 @@ fn local_models_store_pin_op_is_stub_safe(cx: &mut TestAppContext) {
                     pinned: false,
                 },
                 last_error: None,
+                on_disk: true,
             }],
         });
     });

@@ -173,6 +173,17 @@ pub struct LocalModelInfo {
     /// The most recent download/load failure for this slug, until a retry
     /// replaces it. Surfaced so failures are visible, never silent.
     pub last_error: Option<String>,
+    /// True when the directory scan found this row's `.gguf`.
+    ///
+    /// A snapshot's rows do not all come from the filesystem: the managed
+    /// store *synthesizes* a row for an in-flight download (which streams to
+    /// `<file>.part` and only becomes a `.gguf` at the final rename) and for
+    /// a standing failure with nothing left on disk, so a re-download of a
+    /// slug whose file was deleted out of band puts a row in the snapshot
+    /// while the file is gone. Any caller reasoning about *file presence* —
+    /// rather than about what to show the user — must read this, not the
+    /// row's existence or its status.
+    pub on_disk: bool,
 }
 
 /// Snapshot of the whole local-inference domain: the managed `local`
@@ -1093,6 +1104,8 @@ impl Inner {
                         total: (total > 0).then_some(total),
                     },
                     last_error: None,
+                    // Streaming to `<file>.part`: no `.gguf` yet.
+                    on_disk: false,
                 });
             }
         }
@@ -1117,6 +1130,8 @@ impl Inner {
                     source_url: None,
                     status: LocalModelStatus::Available,
                     last_error: Some(message.clone()),
+                    // The failure is all that is left — the scan found no file.
+                    on_disk: false,
                 });
             }
         }
@@ -1220,6 +1235,7 @@ impl Inner {
                     source_url: sidecar.map(|s| s.source_url),
                     status,
                     last_error,
+                    on_disk: true,
                 });
             }
         }

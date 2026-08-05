@@ -1178,6 +1178,7 @@ fn space_streaming_turn_reads_loading_model_while_its_engine_warms(cx: &mut Test
             source_url: None,
             status,
             last_error: None,
+            on_disk: true,
         }],
     };
     let scene = |cx: &mut TestAppContext, status: eidola_app_core::LocalModelStatus| {
@@ -2121,6 +2122,7 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
                 source_url: None,
                 status: LocalModelStatus::Available,
                 last_error: None,
+                on_disk: true,
             }],
         }],
         models: vec![
@@ -2133,6 +2135,7 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
                 source_url: None,
                 status: LocalModelStatus::Available,
                 last_error: None,
+                on_disk: true,
             },
             LocalModelInfo {
                 id: "tiny-b@local".into(),
@@ -2147,6 +2150,7 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
                     pinned: false,
                 },
                 last_error: None,
+                on_disk: true,
             },
         ],
     }
@@ -3000,6 +3004,7 @@ fn same_name_on_two_backends() -> eidola_app_core::LocalModelsState {
         source_url: None,
         status: LocalModelStatus::Available,
         last_error: None,
+        on_disk: true,
     };
     LocalModelsState {
         engine_path: Some("/opt/homebrew/bin/llama-server".into()),

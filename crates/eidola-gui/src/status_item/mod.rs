@@ -452,6 +452,7 @@ mod tests {
             source_url: None,
             status,
             last_error: None,
+            on_disk: true,
         }
     }
 
