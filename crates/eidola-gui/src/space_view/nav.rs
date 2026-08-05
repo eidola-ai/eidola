@@ -332,9 +332,6 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The gesture may have changed the selected child since the last
-        // rendered frame. Do not let a turn completion use that stale leaf.
-        self.selected_turn.set(None);
         if count <= 1 {
             return;
         }
@@ -348,6 +345,15 @@ impl SpaceView {
         };
         let from_x = off.x.as_f32();
         let target = snap_target_index(from_x, stride, self.last_h_delta.as_f32(), count);
+        // The gesture is over and its destination is known: record it, for the
+        // same reason a dot click does. (The gesture *itself* cleared the cache
+        // on every moved step — mid-drag there is no destination to name.)
+        {
+            let turns = self.stream_overlays(cx);
+            let tree = self.effective_tree(page_width, &turns);
+            self.selected_turn
+                .set(self.turn_seq_under_child(&tree, &node_id, target, page_width));
+        }
         let to_x = -(target as f32) * stride;
         let dist = (to_x - from_x).abs();
         if dist < 0.5 {
@@ -378,9 +384,18 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Navigation can race a completion before another frame records the
-        // new selected path.
-        self.selected_turn.set(None);
+        // Navigation can race a completion before another frame records the new
+        // selected path — and a dot click is the *least* ambiguous switch there
+        // is, so it records where it is going rather than clearing (see
+        // `layout::turn_seq_under_child`). Both arms below are covered by this
+        // one line: the instant arm never renders in between, and the animating
+        // arm spends its whole slide observing the child being left.
+        {
+            let turns = self.stream_overlays(cx);
+            let tree = self.effective_tree(page_width, &turns);
+            self.selected_turn
+                .set(self.turn_seq_under_child(&tree, &node_id, index, page_width));
+        }
         // A dot click is the reader taking over navigation. It writes no page
         // offset of its own — it is a *horizontal* switch — but it changes
         // which document the page is scrolling through, which leaves any
