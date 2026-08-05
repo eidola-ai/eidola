@@ -20,7 +20,7 @@ use eidola_app_core::{
 use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
-use eidola_gui::participants_view::{EditMode, ParticipantsView};
+use eidola_gui::participants::{EditMode, ParticipantsView};
 use eidola_gui::probe;
 use eidola_gui::record::{RecordSection, RecordView};
 use eidola_gui::space_view::SpaceView;
@@ -2601,7 +2601,7 @@ fn probe_participants() -> (String, Vec<ParticipantInfo>) {
 }
 
 #[gpui::test]
-fn participants_view_probes_cover_rows_editor_and_add(cx: &mut TestAppContext) {
+fn participants_probes_cover_rows_editor_and_add(cx: &mut TestAppContext) {
     let _guard = probes_on();
     let stores = stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
@@ -3162,7 +3162,7 @@ fn model_pickers_announce_their_selection(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn participants_view_failed_load_shows_retry_not_controls(cx: &mut TestAppContext) {
+fn participants_failed_load_shows_retry_not_controls(cx: &mut TestAppContext) {
     let _guard = probes_on();
     let stores = stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());

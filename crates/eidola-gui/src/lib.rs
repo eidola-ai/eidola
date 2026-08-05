@@ -15,7 +15,7 @@ pub mod loadable;
 pub mod login_item;
 pub mod onboarding;
 pub mod overlay;
-pub mod participants_view;
+pub mod participants;
 mod plans;
 pub mod probe;
 pub mod record;
@@ -1043,7 +1043,7 @@ pub fn open_participants_window(
             None => "Participants".to_string(),
         });
         let view = cx.new(|cx| {
-            participants_view::ParticipantsView::new(
+            participants::ParticipantsView::new(
                 stores.clone(),
                 space_id.clone(),
                 space_title.clone(),

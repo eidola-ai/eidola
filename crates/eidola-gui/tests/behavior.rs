@@ -26,7 +26,7 @@ use eidola_gui::account::AccountView;
 use eidola_gui::actions::{PostOnly, Send};
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
-use eidola_gui::participants_view::{EditMode, ParticipantsView};
+use eidola_gui::participants::{EditMode, ParticipantsView};
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
 use eidola_gui::space_view::SpaceView;
@@ -6902,7 +6902,7 @@ fn participant_labels(stores: &Stores, space: &str, cx: &mut TestAppContext) -> 
 }
 
 #[gpui::test]
-fn participants_view_add_and_remove(cx: &mut TestAppContext) {
+fn participants_add_and_remove(cx: &mut TestAppContext) {
     let (stores, core, _dir, space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| ParticipantsView::new(stores.clone(), space.clone(), None, window, cx))
@@ -6920,7 +6920,7 @@ fn participants_view_add_and_remove(cx: &mut TestAppContext) {
     // starting point the Templates pane offers a new agent.
     assert_eq!(
         view.read_with(cx, |v, cx| v.adding_prompt(cx)).as_deref(),
-        Some(eidola_gui::participants_view::DEFAULT_AGENT_SYSTEM_PROMPT),
+        Some(eidola_gui::participants::DEFAULT_AGENT_SYSTEM_PROMPT),
         "a new participant starts from the shared default system prompt"
     );
     let label = view
@@ -6957,7 +6957,7 @@ fn participants_view_add_and_remove(cx: &mut TestAppContext) {
 /// shared config (edit everywhere) or a per-space override (override here). The
 /// view routes to the right store method per its mode.
 #[gpui::test]
-fn participants_view_override_vs_edit_everywhere(cx: &mut TestAppContext) {
+fn participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
     let (stores, core, _dir, space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| ParticipantsView::new(stores.clone(), space.clone(), None, window, cx))
@@ -7282,7 +7282,7 @@ fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &m
 /// that prompt survives the save.
 #[gpui::test]
 fn templates_pane_new_agent_carries_the_default_system_prompt(cx: &mut TestAppContext) {
-    use eidola_gui::participants_view::DEFAULT_AGENT_SYSTEM_PROMPT;
+    use eidola_gui::participants::DEFAULT_AGENT_SYSTEM_PROMPT;
 
     let (stores, core, _dir, _space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
@@ -7398,7 +7398,7 @@ fn templates_pane_system_prompt_round_trips(cx: &mut TestAppContext) {
 /// roster), and Retry must actually re-fetch. `ensure` declines once a `Failed`
 /// cell exists, so `retry_load` is the only path back.
 #[gpui::test]
-fn participants_view_retry_refetches_after_failed_load(cx: &mut TestAppContext) {
+fn participants_retry_refetches_after_failed_load(cx: &mut TestAppContext) {
     let (stores, core, _dir, space) = participants_scene(cx);
     let (_window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| ParticipantsView::new(stores.clone(), space.clone(), None, window, cx))

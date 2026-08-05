@@ -4,7 +4,7 @@
 //! A window-local lens over [`crate::stores::TemplatesStore`] (the registry,
 //! refreshed on `Change::Templates`). Lists templates; creates / edits (title,
 //! cascade limit, and the owned agent participants — the same field set as the
-//! per-space Participants view, via the shared `participants_view` helpers);
+//! per-space Participants view, via the shared `participants` helpers);
 //! soft-removes; and sets the default (the template `New Space` / ⌘N
 //! instantiates, written through `ConfigStore::set_default_template`).
 //!
@@ -38,7 +38,7 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::participants_view::{
+use crate::participants::{
     DEFAULT_AGENT_SYSTEM_PROMPT, NOTIFY_POLICIES, RouterField, error_banner, field_label,
     ghost_button, ghost_button_labeled, load_error_panel, mode_chip, model_display, model_field,
     notify_label, picker_value, router_field,

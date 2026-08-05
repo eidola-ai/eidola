@@ -17,6 +17,8 @@
 //!   and the action gutter (Post / ⌥ Post quietly).
 //! - [`context_menu`] — the right-click menu over any of the space's editors.
 //! - [`inspector`] — the per-space settings panel that splits the window.
+//! - [`inspector_participants`] — that panel's Participants section (the roster
+//!   the standalone Participants window used to hold).
 //! - [`keyboard`] — the two-level keyboard model over the tree (wave B).
 //! - [`minimap`] — the topology minimap.
 //! - [`traces`] — the per-post trace disclosure (what a turn actually did).
@@ -28,6 +30,7 @@
 pub mod composer;
 pub mod context_menu;
 pub mod inspector;
+pub mod inspector_participants;
 pub mod keyboard;
 pub mod layout;
 pub mod minimap;
@@ -698,6 +701,18 @@ pub struct SpaceView {
     pub(crate) inspector_router_picker: bool,
     /// That dropdown's own scroll (reset to the top on each open).
     pub(crate) inspector_picker_scroll: ScrollHandle,
+    /// The Participants section's open disclosure — one at a time, because it
+    /// *is* the editor (live inputs plus an explicit Save). See
+    /// [`inspector_participants`].
+    pub(crate) inspector_participant_edit: Option<inspector_participants::ParticipantEdit>,
+    /// The open add-a-participant form, if any.
+    pub(crate) inspector_participant_add: Option<inspector_participants::ParticipantAdd>,
+    /// The open "save these participants as a template" form, if any.
+    pub(crate) inspector_template_form: Option<inspector_participants::TemplateForm>,
+    /// Which participant model dropdown is open (at most one).
+    pub(crate) inspector_participant_picker: Option<inspector_participants::ParticipantPicker>,
+    /// That dropdown's own scroll (reset to the top on each open).
+    pub(crate) inspector_participant_picker_scroll: ScrollHandle,
 
     /// The window title last pushed to the platform (and to the a11y root
     /// node), so an unchanged title never re-enters AppKit every frame. The
@@ -859,6 +874,11 @@ impl SpaceView {
             inspector_title_seed: None,
             inspector_router_picker: false,
             inspector_picker_scroll: ScrollHandle::new(),
+            inspector_participant_edit: None,
+            inspector_participant_add: None,
+            inspector_template_form: None,
+            inspector_participant_picker: None,
+            inspector_participant_picker_scroll: ScrollHandle::new(),
             window_title: None,
         };
         this.rebuild(cx);
@@ -2297,6 +2317,11 @@ impl Render for SpaceView {
                     // transient overlay, so the conversation's handler yields
                     // to it and something has to close it.
                     if this.close_inspector_picker(cx) {
+                        return;
+                    }
+                    // …and its Participants section's model dropdown, which is
+                    // the same kind of overlay over the same panel.
+                    if this.close_inspector_participant_picker(cx) {
                         return;
                     }
                 }
