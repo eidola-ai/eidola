@@ -57,19 +57,12 @@ actions!(
         /// menu, and opens automatically at launch when no account is
         /// configured. Singleton, like Settings.
         GetStarted,
-        /// Open the Participants window for the focused space (Space menu). The
-        /// listener is registered per-`SpaceView` (like `CloseWindow`), so the
-        /// menu item targets the focused conversation and macOS greys it when
-        /// no space window is open; it is a no-op on a blank ⌘N space that has
-        /// not been persisted yet (there are no per-space participants until a
-        /// first post assigns the space an id).
-        OpenParticipants,
         /// **Quote** the current selection inside a post into the active
         /// draft: attach a reference edge and inject its `{{ embed N }}`
         /// marker at the caret, so the passage renders as a quote block while
         /// composing. Lives in the Edit menu; registered per-`SpaceView` and
         /// only while a quotable post selection exists, so the menu item greys
-        /// out with nothing selected (the `CloseWindow`/`OpenParticipants`
+        /// out with nothing selected (the `CloseWindow`/`ToggleInspector`
         /// pattern, with the extra selection condition).
         Quote,
         /// **Quote in Reply** — the same quote, but into a *new* reply draft

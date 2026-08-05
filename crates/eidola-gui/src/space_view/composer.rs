@@ -16,7 +16,8 @@
 //! `⌘⇧↩` (`PostOnly`, the ⌥-revealed "Post quietly") persists it without
 //! notifying anyone. Both consume the draft. The composer carries no model
 //! picker — who answers, and with what model, is Participants configuration
-//! (`Space > Participants…`); explicit asks live on the separators.
+//! (the inspector's Participants section); explicit asks live on the
+//! separators.
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, BoxShadow, Context, Element, Entity, Focusable,
