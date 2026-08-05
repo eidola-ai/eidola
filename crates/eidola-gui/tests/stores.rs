@@ -1095,3 +1095,48 @@ fn two_refused_mutations_each_keep_their_own_refusal(cx: &mut TestAppContext) {
         assert!(!s.index().is_loading());
     });
 }
+
+/// **A superseded same-space write leaves no optimism behind.** Two mutations on
+/// one space still replace-cancel (one control, last-wins — the documented
+/// residual), and the loser's undo dies with its cancelled task. Its *edit* must
+/// not outlive it: the successor would otherwise treat the loser's optimistic
+/// string as the value to restore, and a refused successor whose re-list also
+/// failed would put back a name the database never held. Here the winner is
+/// refused (a stale id), so the reconciled index must show the database's title
+/// — never either optimistic one.
+#[gpui::test]
+fn a_superseded_rename_leaves_no_optimism_behind(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let real = core
+        .runtime()
+        .block_on(core.create_space(Some("Tides".into())))
+        .expect("create space")
+        .id;
+
+    // The cached index holds a row the database does not, so both writes below
+    // are refused (`rename_space` on a stale id).
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(None, Ok(vec![stale_row("ghost")]), None, cx)
+    });
+    stores.spaces.update(cx, |s, cx| {
+        s.rename("ghost".into(), "Anemone".into(), cx);
+        s.rename("ghost".into(), "Bergamot".into(), cx);
+    });
+
+    wait_until(cx, "the refusal surfaces", |cx| {
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.op_error_for("ghost").is_some())
+    });
+    stores.spaces.read_with(cx, |s, _| {
+        let titles: Vec<String> = s.list().iter().filter_map(|r| r.title.clone()).collect();
+        assert_eq!(
+            titles,
+            vec!["Tides".to_string()],
+            "the index is the database's listing — neither optimistic name survives"
+        );
+        assert!(s.list().iter().any(|r| r.id == real));
+        assert!(!s.index().is_loading());
+    });
+}
