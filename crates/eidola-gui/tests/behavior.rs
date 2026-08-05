@@ -3831,6 +3831,160 @@ fn space_two_turns_landing_together_keep_a_scrolled_away_reader_still(cx: &mut T
 }
 
 #[gpui::test]
+fn space_dot_chosen_branch_survives_its_turn_landing_at_once(cx: &mut TestAppContext) {
+    // The instant arm of a dot switch (reduce-motion, or a strip already at the
+    // target) writes the strip offset directly and returns — so nothing records
+    // which child the reader chose. If that child's own turn then lands before
+    // the next frame, the completion finds neither a pending request nor a
+    // parked seq, and the reader is left on an index that now addresses the
+    // *other* participant's stream: the same positional shift, entering through
+    // the one switch that never told anyone where it went.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "a question")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // Three concurrent turns, so switching to the *middle* one is a real move
+    // whose landing shifts the index under the reader (its post is inserted
+    // ahead of every remaining stream).
+    for agent in ["agent-b", "agent-c", "agent-d"] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.ask_participant(agent.into(), "a1".into(), window, cx)
+            });
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+    }
+    let (first, middle) = view.read_with(cx, |v, cx| {
+        let s = v.space().read(cx);
+        (s.streams()[0].seq, s.streams()[1].seq)
+    });
+
+    // Click to the middle participant, and let *its* turn land before the next
+    // frame.
+    let mut a2 = fixture_assistant_post("a2", "the middle agent's answer");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.click_branch_dot_for_test("a1", 1, window, cx));
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(
+                middle,
+                vec![fixture_user_post("a1", "a question"), a2],
+                false,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&"a2".to_string()),
+        "the branch the reader clicked to carries them onto its answer \
+         ({path:?})"
+    );
+    assert!(
+        !path.contains(&streaming_node_id(first).to_string()),
+        "not onto the stream that slid into the index they were on ({path:?})"
+    );
+}
+
+#[gpui::test]
+fn space_dot_chosen_branch_survives_a_sibling_landing_mid_switch(cx: &mut TestAppContext) {
+    // The animating arm of the same switch. The strip slides over several
+    // frames, and each of those frames observes the *rounded* offset — which is
+    // still the branch being left. A sibling turn landing mid-slide therefore
+    // read the old child as "parked", re-selected it by identity, and cancelled
+    // the snap: the reader's switch silently undone by a completion. What a
+    // switch knows at click time is its destination, and that is what must
+    // stand until it lands.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "a question")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for agent in ["agent-b", "agent-c"] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.ask_participant(agent.into(), "a1".into(), window, cx)
+            });
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+    }
+    let (first, second) = view.read_with(cx, |v, cx| {
+        let s = v.space().read(cx);
+        (s.streams()[0].seq, s.streams()[1].seq)
+    });
+
+    // Switch back to the first participant. The snap animates (no test
+    // dispatcher pumps its frame loop, which is exactly the mid-slide state).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.click_branch_dot_for_test("a1", 0, window, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    // The branch they are *leaving* lands.
+    let mut a2 = fixture_assistant_post("a2", "the second agent's answer");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(
+                second,
+                vec![fixture_user_post("a1", "a question"), a2],
+                false,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&streaming_node_id(first).to_string()),
+        "the reader arrives where they were heading ({path:?})"
+    );
+    assert!(
+        !path.contains(&"a2".to_string()),
+        "the landing turn does not pull them back to the branch they left \
+         ({path:?})"
+    );
+}
+
+#[gpui::test]
 fn space_newer_branch_navigation_outranks_the_cached_turn_when_it_lands(cx: &mut TestAppContext) {
     let stores = stub_stores_with_agents(cx, "s");
     let (window, view) = open_space(cx, &stores, Some("s".into()));

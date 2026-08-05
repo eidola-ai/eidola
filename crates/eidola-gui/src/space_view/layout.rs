@@ -487,6 +487,35 @@ impl SpaceView {
             })
     }
 
+    /// The same question asked of a branch switch's **destination**: the
+    /// streaming turn at the end of the path that will be selected once
+    /// `parent_id`'s strip rests on child `index`.
+    ///
+    /// A switch knows its destination at click time; the strip's offset does
+    /// not say so until the switch lands (and says the *old* child for as long
+    /// as an animation is rounding toward the new one). Recording this is what
+    /// lets a turn completing across that window carry the reader where they
+    /// were going rather than where they were — see
+    /// [`super::SpaceView::follow_completed_turn`].
+    pub(crate) fn turn_seq_under_child(
+        &self,
+        roots: &[TreeNode],
+        parent_id: &str,
+        index: usize,
+        page_width: Pixels,
+    ) -> Option<u64> {
+        let parent = super::model::node_ref(roots, parent_id)?;
+        let mut node = parent.children.get(index)?;
+        while !node.children.is_empty() {
+            let active = self.active_child_index(&node.id, page_width, node.children.len());
+            node = &node.children[active];
+        }
+        match node.src {
+            NodeSrc::Streaming(seq) => Some(seq),
+            _ => None,
+        }
+    }
+
     /// Document-space top of a node that is **on the selected path** (after
     /// `select_path_to`), by accumulating heights down the path. `None` if the
     /// node isn't on the selected path.

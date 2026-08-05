@@ -1283,6 +1283,24 @@ impl SpaceView {
         self.select_path_to(&tree, node_id, page_width);
     }
 
+    /// The branch dot's `on_click` body (`post.rs` → `glide_to_branch`),
+    /// callable without the event plumbing — so a test can sequence a turn
+    /// completion *before* the frame that would follow the click. That a real
+    /// click reaches this handler is covered by
+    /// `space_branch_dot_takes_the_page_from_a_glide_in_flight`, which clicks
+    /// the painted dot.
+    #[doc(hidden)]
+    pub fn click_branch_dot_for_test(
+        &mut self,
+        node_id: &str,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let page_width = self.page_size(window).width;
+        self.glide_to_branch(node_id.to_string().into(), index, page_width, window, cx);
+    }
+
     /// A post's `(reasoning, expanded)` from the render snapshot.
     #[doc(hidden)]
     pub fn post_reasoning_for_test(&self, i: usize) -> Option<(String, bool)> {
@@ -2103,7 +2121,15 @@ impl Render for SpaceView {
         // recorded because the second question outlives the leaf that answers
         // it (`follow_completed_turn`).
         let selected_turn = self.selected_turn_seq(&tree, page_width);
-        self.selected_turn.set(selected_turn);
+        // While a branch switch animates, every frame observes the *rounded*
+        // strip offset — which is the child being left until the slide is more
+        // than half over. The switch already recorded its destination, and that
+        // is the honest answer to "where is the reader?" until it lands. What
+        // is *painted* still follows the observation, so `producing` (and the
+        // tail-following it gates) reads the fresh value either way.
+        if self.snap.is_none() {
+            self.selected_turn.set(selected_turn);
+        }
         let producing = selected_turn.is_some();
         if self.tail_pin && !producing && !self.space.read(cx).is_busy() {
             self.tail_pin = false;
