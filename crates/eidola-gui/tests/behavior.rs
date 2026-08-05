@@ -8206,6 +8206,86 @@ fn space_keyboard_navigation_takes_the_page_from_a_glide_in_flight(cx: &mut Test
 }
 
 #[gpui::test]
+fn space_branch_dot_takes_the_page_from_a_glide_in_flight(cx: &mut TestAppContext) {
+    // A branch dot switches *horizontally*, so it writes no page offset of its
+    // own — but it changes which document the page is scrolling through, which
+    // makes an in-flight vertical glide's trajectory meaningless: it was aimed
+    // at a `y` on the branch the reader just left, and kept dragging them
+    // there. The other reader-driven takeovers already say so (the wheel via
+    // `note_scroll_activity`, the minimap via `minimap_press`, the keyboard
+    // through the instant-scroll door); the dot was the gap.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    // A short root keeps its band (and its branch dots) on screen at the top of
+    // the page; the long replies below give the glide somewhere to travel.
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", &long);
+    a3.parent_action_id = Some("a1".into());
+    let mut a4 = fixture_user_post("a4", &long);
+    a4.parent_action_id = Some("a2".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![fixture_user_post("a1", "a short question"), a2, a4, a3],
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Taken to a post far down the first branch — a glide, in flight.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.navigate_to_action("a4".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    let target = view
+        .read_with(&vcx, |v, _| v.page_glide_target_for_test())
+        .expect("navigating arms a glide");
+
+    // Mid-flight, the reader switches branch by clicking its dot. Reduce-motion
+    // is turned on *after* the glide was armed, so the horizontal switch lands
+    // at once and the test can see it: no test dispatcher pumps the snap's
+    // frame loop, and the switch is the vertical glide's whole problem.
+    vcx.update(|_, cx| cx.set_reduce_motion(true));
+    let dot = vcx
+        .debug_bounds("space-dot-a1-1")
+        .expect("a post with two replies paints a dot per branch");
+    vcx.simulate_click(dot.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let after = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    let path = vcx.update(|window, cx| view.read(cx).selected_effective_path_for_test(window, cx));
+    assert!(
+        path.contains(&"a3".to_string()),
+        "the dot click switched to the other branch ({path:?})"
+    );
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "the branch switch takes the page from the glide it interrupted \
+             (destination {target})"
+        );
+    });
+
+    // And the frame that would have continued it moves nothing.
+    view.update(&mut vcx, |v, _| v.drive_page_glide_for_test(0.5));
+    let settled = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    assert!(
+        (settled - after).abs() < 1.0,
+        "the reader is left where the switch put them, not dragged toward a \
+         `y` on the branch they left (offset {settled}, expected {after}, \
+         abandoned destination {target})"
+    );
+}
+
+#[gpui::test]
 fn space_navigation_lands_at_once_under_reduce_motion(cx: &mut TestAppContext) {
     // The other half of the animated navigation: a reader who asked for less
     // motion gets the destination without the journey. `App::reduce_motion` is
