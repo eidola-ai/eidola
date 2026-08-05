@@ -378,6 +378,8 @@ impl SpaceView {
             // hovering over the panel, and a printable behind it would start a
             // draft the reader cannot see.
             || self.inspector_router_picker
+            // A participant's model dropdown in the same panel is one too.
+            || self.inspector_participant_picker.is_some()
     }
 
     /// Move tree focus. With no focus yet, an arrow *enters* the conversation

@@ -85,7 +85,7 @@ mod driver {
     };
     use eidola_gui::library::LibraryView;
     use eidola_gui::onboarding::OnboardingView;
-    use eidola_gui::participants_view::ParticipantsView;
+    use eidola_gui::participants::ParticipantsView;
     use eidola_gui::probe;
     use eidola_gui::record::RecordView;
     use eidola_gui::settings::{SettingsPane, SettingsView};
