@@ -381,6 +381,15 @@ impl SpaceView {
         // Navigation can race a completion before another frame records the
         // new selected path.
         self.selected_turn.set(None);
+        // A dot click is the reader taking over navigation. It writes no page
+        // offset of its own — it is a *horizontal* switch — but it changes
+        // which document the page is scrolling through, which leaves any
+        // vertical glide aiming at a `y` measured on the branch just left. Its
+        // sibling takeovers cancel at their own entry (the wheel through
+        // `note_scroll_activity`, the minimap through `minimap_press`, the
+        // keyboard through `set_page_scroll_y`); the dot is the only one that
+        // reaches a switch without passing through any of them.
+        self.cancel_page_glide();
         let stride = (page_width + BAND_HEIGHT).as_f32();
         if stride <= 0.0 {
             return;
@@ -497,8 +506,16 @@ impl SpaceView {
         }
         // This is the shared seam for reference, minimap, keyboard, draft, and
         // deferred branch selection. Once it steers a strip, the last frame's
-        // selected streaming leaf is no longer an honest parked observation.
-        self.selected_turn.set(None);
+        // selected streaming leaf is no longer an honest parked observation —
+        // so **re-record it now** rather than waiting for a frame that a
+        // completion may beat. Recording, not clearing: a reader who navigated
+        // onto another turn's stream still has to be carried across the
+        // insertion when some *other* turn lands (`follow_completed_turn`), and
+        // a cleared cache cannot say where they were. The genuinely ambiguous
+        // cases — a strip mid-gesture or mid-snap — clear it at their own
+        // entry, because there is no settled child to name.
+        self.selected_turn
+            .set(self.selected_turn_seq(roots, page_width));
         self.cancel_snap();
     }
 }

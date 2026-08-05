@@ -585,7 +585,19 @@ impl SpaceView {
         if !aimed_at_leaf && self.pending_select.is_some() {
             return;
         }
-        let parked = self.selected_turn.get() == Some(seq);
+        let parked = self.selected_turn.get();
+        // Parked on a *different* turn's stream: the completing turn's post is
+        // inserted ahead of every still-streaming sibling, so the reader's
+        // index now addresses someone else's leaf. Same swap, same cure — hold
+        // their branch by naming the leaf they are actually on.
+        if !aimed_at_leaf && let Some(other) = parked.filter(|s| *s != seq) {
+            self.pending_select = Some(PendingSelect {
+                node: model::streaming_node_id(other),
+                settle: PendingSettle::Stay,
+            });
+            return;
+        }
+        let parked = parked == Some(seq);
         if !aimed_at_leaf && !parked {
             return;
         }
