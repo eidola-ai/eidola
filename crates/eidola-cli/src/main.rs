@@ -1398,9 +1398,14 @@ impl UnlistedEngine {
 /// `llamacpp` backend, whose models this listing never prints at all.
 ///
 /// `orphaned` is the stronger claim and is made only on the stronger
-/// evidence: the id appears in *no* scanned directory, external backends
-/// included. An engine that is merely absent from the printed table is
-/// listed without it.
+/// evidence: **no row the scan actually found** carries this id, external
+/// backends included. Row *existence* is not that evidence — the managed
+/// store synthesizes rows for an in-flight download and for a standing
+/// failure, neither of which has a `.gguf` on disk, so a re-download of the
+/// very slug whose file was deleted under a running engine would otherwise
+/// talk the flag away at exactly the moment it is true
+/// ([`eidola_app_core::LocalModelInfo::on_disk`]). An engine that is merely
+/// absent from the printed table is listed without the flag.
 ///
 /// Ordering follows `running`, which app-core sorts by id.
 fn unaccounted_engines(
@@ -1410,7 +1415,7 @@ fn unaccounted_engines(
     running
         .iter()
         .filter_map(|engine| {
-            let listed = state.models.iter().find(|m| m.id == engine.id);
+            let listed = state.models.iter().find(|m| m.id == engine.id && m.on_disk);
             let spoken_for = listed.is_some_and(|m| {
                 matches!(
                     m.status,
@@ -1421,11 +1426,14 @@ fn unaccounted_engines(
             if spoken_for {
                 return None;
             }
+            // Same evidence bar on the external side: those rows are
+            // scan-only today, but the rule is about files, not about which
+            // vec a row landed in.
             let anywhere = listed.is_some()
                 || state
                     .external
                     .iter()
-                    .any(|b| b.models.iter().any(|m| m.id == engine.id));
+                    .any(|b| b.models.iter().any(|m| m.id == engine.id && m.on_disk));
             Some(UnlistedEngine {
                 id: engine.id.clone(),
                 port: engine.port,
@@ -1627,6 +1635,18 @@ mod tests {
             source_url: None,
             status,
             last_error: None,
+            on_disk: true,
+        }
+    }
+
+    /// A row app-core synthesized with nothing on disk behind it: an
+    /// in-flight download, or a failure that left no file.
+    fn synthetic(id: &str, status: LocalModelStatus, last_error: Option<&str>) -> LocalModelInfo {
+        LocalModelInfo {
+            size_bytes: None,
+            last_error: last_error.map(str::to_string),
+            on_disk: false,
+            ..model(id, status)
         }
     }
 
@@ -1747,6 +1767,50 @@ mod tests {
         let out = unaccounted_engines(&running, &snapshot);
         assert_eq!(out.len(), 1);
         assert!(!out[0].orphaned);
+    }
+
+    /// The file was deleted under a running engine and the user started the
+    /// same slug downloading again: app-core puts a `Downloading` row in the
+    /// snapshot while the bytes are still going to `<file>.part`. The row is
+    /// not a file, and the engine is still serving a model that is gone.
+    #[test]
+    fn a_re_download_of_the_deleted_slug_does_not_talk_away_the_orphan_flag() {
+        let running = vec![engine("gemma@local", 52341, true)];
+        let snapshot = state(
+            vec![synthetic(
+                "gemma@local",
+                LocalModelStatus::Downloading {
+                    received: 1_000,
+                    total: Some(1_000_000_000),
+                },
+                None,
+            )],
+            vec![],
+        );
+
+        let out = unaccounted_engines(&running, &snapshot);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].orphaned);
+        assert!(out[0].line().contains("backing file missing"));
+    }
+
+    /// The same, one step later: the re-download failed, leaving a row that
+    /// carries only the error — `Available` with no file behind it.
+    #[test]
+    fn a_failed_re_download_row_does_not_talk_away_the_orphan_flag() {
+        let running = vec![engine("gemma@local", 52341, true)];
+        let snapshot = state(
+            vec![synthetic(
+                "gemma@local",
+                LocalModelStatus::Available,
+                Some("connection reset"),
+            )],
+            vec![],
+        );
+
+        let out = unaccounted_engines(&running, &snapshot);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].orphaned);
     }
 
     #[test]
