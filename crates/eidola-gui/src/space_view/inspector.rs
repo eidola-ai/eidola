@@ -41,7 +41,7 @@ use gpui_component::{
 
 use crate::focus::TabRegion as _;
 use crate::overlay::{Contain as _, Overlay};
-use crate::participants_view::{
+use crate::participants::{
     RouterField, error_banner, field_label, ghost_button_labeled, load_error_panel, router_field,
 };
 use crate::probe::Probe as _;
@@ -155,6 +155,10 @@ impl SpaceView {
             self.ensure_inspector_settings(cx);
         } else {
             self.inspector_router_picker = false;
+            // The dropdowns are transient by nature and must not come back with
+            // the panel; the open editor's typing does (a mis-hit ⌥⌘I is not a
+            // reason to throw away a half-written charter).
+            self.inspector_participant_picker = None;
             // **Focus comes back from the panel** (`RecordView::close_detail`'s
             // rule). The title field is a view field that survives the close,
             // so its handle stays the window's focus while its element is gone
@@ -297,11 +301,15 @@ impl SpaceView {
 
     /// Whether one of the inspector's text fields holds the window's focus —
     /// the conversation's keyboard model yields to it (see
-    /// [`SpaceView::handle_conversation_key`]).
+    /// [`SpaceView::handle_conversation_key`]), and the close hands the keyboard
+    /// back only from a panel that is actually holding it. **Every field the
+    /// panel paints counts**, the Participants section's included: a character
+    /// typed into a system prompt is text, not the type-to-compose jump.
     pub(crate) fn inspector_field_focused(&self, window: &Window, cx: &gpui::App) -> bool {
         self.inspector_title
             .as_ref()
             .is_some_and(|(state, _)| state.read(cx).focus_handle(cx).is_focused(window))
+            || self.inspector_participant_field_focused(window, cx)
     }
 
     /// Close the router dropdown, reporting whether it was open — the Escape
@@ -515,7 +523,8 @@ impl SpaceView {
                                     .pt(TITLE_BAR_RESERVE)
                                     .pb_5()
                                     .gap_3()
-                                    .child(self.render_inspector_space_section(cx)),
+                                    .child(self.render_inspector_space_section(cx))
+                                    .children(self.render_inspector_participants_section(cx)),
                             ),
                     )
                     .child(crate::scrollbar::vertical(
