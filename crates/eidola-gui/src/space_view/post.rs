@@ -836,8 +836,10 @@ impl SpaceView {
                         base.alpha(0.5)
                     };
                     let pid = parent_id.clone();
+                    let selector = format!("space-dot-{parent_id}-{i}");
                     div()
-                        .id(SharedString::from(format!("space-dot-{parent_id}-{i}")))
+                        .id(SharedString::from(selector.clone()))
+                        .debug_selector(move || selector.clone())
                         .probe(
                             format!("space/band/dot/{i}"),
                             gpui::Role::Button,

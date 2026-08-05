@@ -967,7 +967,7 @@ impl SpaceView {
         let tree = self.effective_tree(page_width, &turns);
         if super::model::node_ref(&tree, &action_id).is_some() {
             self.select_path_to(&tree, &action_id, page_width);
-            self.scroll_node_into_view(&tree, &action_id, window);
+            self.scroll_node_into_view(&tree, &action_id, window, cx);
             cx.notify();
             return;
         }
@@ -997,6 +997,7 @@ impl SpaceView {
         };
         let rx = crate::bridge::action_location(app_core, action_id);
         let stores = self.stores.clone();
+        let intent = crate::lifecycle::intend_to_open(cx);
         self.navigate_task = Some(cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some((item_id, space_id)))) = rx.await else {
                 return;
@@ -1010,7 +1011,9 @@ impl SpaceView {
                 return;
             }
             let _ = cx.update(|_, cx| {
-                crate::open_space_window(cx, stores.clone(), space_id);
+                if intent.still_wanted(cx) {
+                    crate::open_space_window(cx, stores.clone(), space_id);
+                }
             });
         }));
     }
@@ -1046,14 +1049,24 @@ impl SpaceView {
             return false;
         }
         self.select_path_to(&tree, &tip, page_width);
-        self.scroll_node_into_view(&tree, &tip, window);
+        self.scroll_node_into_view(&tree, &tip, window, cx);
         cx.notify();
         true
     }
 
     /// Scroll the page so `node_id` rests near the top of the reading area —
     /// enough to read the quoted passage in place without hunting for it.
-    fn scroll_node_into_view(&self, roots: &[TreeNode], node_id: &str, window: &mut Window) {
+    ///
+    /// **Glided, not jumped** (task 46, bug 4): the reader asked to be taken
+    /// somewhere, and the travel is what tells them it is the same conversation
+    /// rather than a new page. See [`super::nav::PageGlide`].
+    fn scroll_node_into_view(
+        &mut self,
+        roots: &[TreeNode],
+        node_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let viewport = self.page_size(window);
         let Some(doc_top) =
             self.selected_path_doc_top(roots, node_id, viewport.width, viewport.height)
@@ -1062,8 +1075,7 @@ impl SpaceView {
         };
         let target = super::TITLE_BAR_RESERVE.as_f32() + 24.0;
         let y = (target - doc_top).min(0.0);
-        let off = self.page_scroll.offset();
-        self.page_scroll.set_offset(gpui::point(off.x, px(y)));
+        self.glide_page_to(y, window, cx);
     }
 
     // -- Source highlights --------------------------------------------------

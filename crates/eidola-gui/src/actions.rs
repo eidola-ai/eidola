@@ -34,11 +34,22 @@ actions!(
         /// Library's ⌘L). Singleton, like Settings and Library.
         OpenRecord,
         /// Close the focused window (chat or settings). Bound to ⌘W on
-        /// macOS. Closing the last chat window does not quit the app —
-        /// that's ⌘Q.
+        /// macOS. Closing the last window does not quit the app, and (since
+        /// task 17 wave 3b) does not even retire it — the Dock icon and menu
+        /// bar stay, so ⌘N still works.
         CloseWindow,
-        /// Quit the application.
+        /// The app's own ⌘Q. **On macOS with a status item this retires the
+        /// app to the background** — every window closes, the Dock indicator
+        /// goes, and the process, the status item and the loaded engines keep
+        /// running (task 17 wave 3b). Without a status item, and everywhere
+        /// off macOS, it is the full shutdown it has always been. The
+        /// decision is `status_item::quit_intent`.
         Quit,
+        /// End the process — the wave-2 teardown, engines included. Raised
+        /// only by the status menu's "Quit Eidola" (which carries its own ⌘Q
+        /// key equivalent), because that is the door that means it. Bound to
+        /// no keystroke: ⌘Q belongs to [`Quit`].
+        QuitApp,
         /// Show the About panel.
         About,
         /// Open the onboarding window — the from-scratch "Get Started" flow

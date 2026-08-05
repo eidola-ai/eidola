@@ -612,6 +612,69 @@ fn shutdown_reaches_an_engine_the_model_scan_cannot_see() {
     });
 }
 
+/// The read-only sibling of the test above, and the same defect class.
+///
+/// Any surface that *reports* running engines has the problem the teardown
+/// had: `local_models_state` is a directory scan, so an engine whose backing
+/// `.gguf` is gone reads as "nothing running" while the subprocess holds its
+/// memory. `running_engines` is the registry read that answers honestly, and
+/// it carries enough identity (`id`, `slug`, `port`) to name the engine even
+/// though the display name died with the sidecar beside the file.
+#[test]
+fn running_engines_reports_an_engine_the_model_scan_cannot_see() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let models_dir = _dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        core.test_register_engine("local", "ghost", 4321, GIB, false, 100);
+
+        let state = core
+            .runtime()
+            .block_on(core.local_models_state())
+            .expect("state");
+        assert!(
+            !state.models.iter().any(|m| m.slug == "ghost"),
+            "precondition: the scan-based snapshot cannot see this engine"
+        );
+
+        let running = core.running_engines();
+        assert_eq!(running.len(), 1, "the registry sees it");
+        let engine = &running[0];
+        assert_eq!(engine.id, "ghost@local", "the join key against the listing");
+        assert_eq!(engine.slug, "ghost", "the name that survives the file");
+        assert_eq!(engine.backend_id, "local");
+        assert_eq!(engine.port, 4321);
+        assert!(engine.ready);
+
+        // And it is genuinely read-only: asking twice changes nothing, unlike
+        // the draining teardown next door.
+        assert_eq!(core.running_engines().len(), 1);
+        assert_eq!(core.shutdown_engines(), 1);
+        assert!(core.running_engines().is_empty(), "drained");
+    });
+}
+
+/// The registry read is ordered, because the menu it feeds is re-read every
+/// time the user opens it. A `HashMap`'s iteration order changes between
+/// runs, which would reshuffle a readout that had not changed.
+#[test]
+fn running_engines_is_ordered_by_id() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        for slug in ["zeta", "alpha", "mid"] {
+            core.test_register_engine("local", slug, 1, GIB, false, 100);
+        }
+        core.test_register_engine("mine", "alpha", 1, GIB, false, 100);
+
+        let ids: Vec<String> = core.running_engines().into_iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec!["alpha@local", "alpha@mine", "mid@local", "zeta@local"],
+            "stable across runs, and the backend disambiguates a shared name"
+        );
+    });
+}
+
 /// The quit-time drain must stay **silent** on the invalidation bus.
 ///
 /// Every other engine transition emits `Change::LocalModels` because

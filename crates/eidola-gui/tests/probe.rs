@@ -413,6 +413,15 @@ fn appearance_and_text_size_chips_carry_their_group(cx: &mut TestAppContext) {
         gpui::Role::Button,
         "Larger text, currently 100%",
     );
+    // The login-item switch is a `Switch` with no node of its own; the
+    // probed wrapper is the control, and its name has to be self-contained
+    // (the "Open at login" field label is a node-less `div`).
+    assert_probe(
+        &entries,
+        "settings/general/login-item",
+        gpui::Role::CheckBox,
+        "Open Eidola at login",
+    );
 
     probe::set_probes_enabled(false);
 }
@@ -1685,7 +1694,7 @@ fn wallet_pane_probes_cover_refresh(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn general_pane_probes_cover_appearance_only(cx: &mut TestAppContext) {
+fn general_pane_probes_cover_appearance_and_startup(cx: &mut TestAppContext) {
     let _guard = probes_on();
 
     let stores = ready_stores(cx);
@@ -1693,12 +1702,13 @@ fn general_pane_probes_cover_appearance_only(cx: &mut TestAppContext) {
         cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx))
     });
 
-    // The pane is the appearance chips and nothing else — every trust /
-    // connection affordance lives in Backends → Eidola now.
+    // The pane is the appearance chips plus the one startup row — every
+    // trust / connection affordance lives in Backends → Eidola now.
     let names = fresh_names(cx, window);
     for expected in [
         "settings/general/appearance/system",
         "settings/general/time-of-day/on",
+        "settings/general/login-item",
     ] {
         assert!(
             names.contains(&expected.to_string()),

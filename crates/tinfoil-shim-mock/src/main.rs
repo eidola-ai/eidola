@@ -28,6 +28,12 @@
 //!   cannot share an identity with the SEV-SNP chain. Developers trust this
 //!   cert in their OS keychain, not the ARK.
 //!
+//! **Private keys are written 0600, and an existing key found more permissive
+//! is tightened in place with a warning.** These are CA signing keys, and
+//! developers are told to trust the TLS-CA root machine-wide: a key any other
+//! local account can read is a certificate for *any* hostname that machine
+//! will then accept. Certificates keep default modes — they are public.
+//!
 //! On boot the shim loads any existing key+cert files unchanged and only
 //! generates fresh material for files that are missing — the trust root never
 //! flows from the shim's API, only from the filesystem. The VCEK and the TLS
@@ -67,7 +73,7 @@ use sha2::{Digest, Sha256};
 use spki::{AlgorithmIdentifierOwned, ObjectIdentifier, SubjectPublicKeyInfoOwned};
 use tokio::net::TcpListener;
 use tower_service::Service;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use x509_cert::Certificate;
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::time::{Time, Validity};
@@ -561,15 +567,83 @@ fn load_or_generate_rsa_key(
     if path.exists() {
         info!("Loading persistent {label} key from {}", path.display());
         let pem = fs::read_to_string(path)?;
+        tighten_key_permissions(path);
         Ok(<rsa::RsaPrivateKey as rsa::pkcs8::DecodePrivateKey>::from_pkcs8_pem(&pem)?)
     } else {
         info!("Generating new {RSA_KEY_BITS}-bit {label} key...");
         let key = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, RSA_KEY_BITS)?;
         let pem = rsa::pkcs8::EncodePrivateKey::to_pkcs8_pem(&key, rsa::pkcs8::LineEnding::LF)?;
-        fs::write(path, pem.as_bytes())?;
+        write_private_key_pem(path, pem.as_bytes())?;
         Ok(key)
     }
 }
+
+/// Persist private key material owner-only (0600).
+///
+/// Every key this file mints is a **CA signing key**, and `tls-ca.key` is the
+/// sharp one: developers are told to trust its root in the OS store, so
+/// whoever can read it can mint a certificate for *any* hostname that machine
+/// will then accept. That is a local MITM primitive for every other account
+/// on the box, not something scoped to the shim — so it does not get the
+/// 0644 a plain `fs::write` leaves under the usual umask. Certificates are
+/// public material and keep default modes.
+fn write_private_key_pem(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // `mode` applies at creation, which is the only case here (the caller
+        // writes solely when the path does not exist).
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+    }
+    #[cfg(not(unix))]
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// Narrow an existing key file to 0600 when it is more permissive.
+///
+/// A `.dev-certs/` minted before the 0600 write above is exactly the exposure
+/// this closes, and the shim already opens these files on every boot — so the
+/// cheapest way to fix existing checkouts is to fix them in place, loudly.
+/// Best-effort by design: a bind mount whose backing filesystem or uid
+/// mapping refuses `chmod` must not stop the shim from starting.
+#[cfg(unix)]
+fn tighten_key_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 == 0 {
+        return;
+    }
+    match fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+        Ok(()) => warn!(
+            "Tightened {} from {mode:o} to 600 — a private key readable by \
+             other accounts can mint certs for any host this machine trusts",
+            path.display()
+        ),
+        Err(e) => warn!(
+            "{} is mode {mode:o} (group/world readable) and could not be \
+             tightened: {e}. Anyone who can read it can mint certs for any \
+             host this machine trusts.",
+            path.display()
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+fn tighten_key_permissions(_path: &Path) {}
 
 /// A persisted PSS CA (ARK / ASK): signing key, cert DER, parsed subject,
 /// and the key identifier used by downstream certs to populate AKI.

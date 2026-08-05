@@ -45,7 +45,10 @@ use super::model::{self, TreeNode};
 const SHADOW_OFFSET_Y: Pixels = px(-3.);
 const SHADOW_BLUR: Pixels = px(18.);
 use super::nav::ScrollOwner;
-use super::{Draft, GUTTER_GAP, POST_PAD_Y, PostOnly, Send, SpaceView, prose_style};
+use super::{
+    Draft, GUTTER_GAP, POST_PAD_Y, PendingSelect, PendingSettle, PostOnly, Send, SpaceView,
+    prose_style,
+};
 
 impl SpaceView {
     // -- Draft lifecycle ---------------------------------------------------
@@ -181,7 +184,10 @@ impl SpaceView {
         let id = self.create_draft_node(parent, window, cx);
         let focus = self.drafts.last().unwrap().editor.read(cx).focus_handle(cx);
         self.activate_draft(id.clone(), cx);
-        self.pending_select = Some(id);
+        self.pending_select = Some(PendingSelect {
+            node: id,
+            settle: PendingSettle::DockDraft,
+        });
         window.focus(&focus, cx);
     }
 
@@ -463,8 +469,16 @@ impl SpaceView {
     /// Route an explicit ask — a separator's `Ask ▸ <participant>`, the
     /// cascade notice's "Ask to continue", or a retry — to the shared
     /// [`Space::ask`]. Closes any open band menu + the cascade notice, applies
-    /// the tail-draft rule, selects the target's branch so the streaming node
-    /// renders where the reply will land, and scrolls it into view.
+    /// the tail-draft rule, selects **the branch the new turn's streaming leaf
+    /// lands on**, and parks the page at its end.
+    ///
+    /// Selecting the *target's* path is not enough: an ask on a post that has
+    /// already been replied to mints a **new sibling** branch, and the target's
+    /// strip stays on the branch it was resting on — the reply then streams
+    /// somewhere the reader can't see (task 46, bug 3). The new leaf does not
+    /// exist in this frame's tree, so the selection is deferred through
+    /// [`SpaceView::pending_select`], which runs after the next frame's
+    /// `sync_scrolls` has minted the strip's handle.
     ///
     /// **The tail-draft rule** (asking at the end of a branch): an **empty**
     /// draft replying to the target is discarded — the UI tracks the new tail
@@ -501,21 +515,125 @@ impl SpaceView {
             self.delete_draft(&id);
         }
 
-        let accepted = self.space.update(cx, |s, cx| {
+        let started = self.space.update(cx, |s, cx| {
             s.ask(participant_id, target_action_id.clone(), cx)
         });
-        if accepted {
-            // Select the target's branch *before* the next render so the
-            // streaming node attaches under the asked post, not whatever
-            // branch was selected (the PR #218 retry lesson).
-            let page_width = self.page_width(window);
-            let roots = model::build_tree(&self.posts);
-            if model::node_ref(&roots, &target_action_id).is_some() {
-                self.select_path_to(&roots, &target_action_id, page_width);
-            }
-            self.scroll_to_tail(window, cx);
+        if let Some(seq) = started {
+            self.select_turn_branch(seq);
         }
         cx.notify();
+    }
+
+    /// Bring the branch turn `seq`'s streaming leaf lands on onto the selected
+    /// path, and park the page at its end — on the next render, where the leaf
+    /// exists in the tree (see [`SpaceView::ask_participant`]).
+    ///
+    /// The leaf is an **ephemeral** render key, and nothing sequences a render
+    /// between the ask and the turn's completion (gpui draws from the
+    /// platform's frame callback; a turn completes in an ordinary foreground
+    /// task). A turn that lands first is followed onto its post by
+    /// [`Self::follow_completed_turn`].
+    pub(crate) fn select_turn_branch(&mut self, seq: u64) {
+        self.pending_select = Some(PendingSelect {
+            node: model::streaming_node_id(seq),
+            settle: PendingSettle::BranchEnd,
+        });
+    }
+
+    /// **Selection follows the turn through its completion** — the same
+    /// doctrine as `rethread_drafts` / `retarget_tree_focus` forwarding a
+    /// window-local reference through *item* identity on rebuild. A turn's
+    /// streaming leaf is an ephemeral render key: on `SpaceEvent::TurnEnded`
+    /// the leaf is already gone and the post the turn wrote stands in its
+    /// place, so whatever was aimed at the leaf is re-aimed at that post
+    /// (delivered before the frame that would act on it).
+    ///
+    /// Two things can be aimed at the leaf, and the difference is only where
+    /// the page comes to rest:
+    ///
+    /// - **A pending selection** (an ask/retry whose turn landed before any
+    ///   frame consumed the request — see [`Self::select_turn_branch`]): the
+    ///   reader has not been taken anywhere yet, so it settles at the end of
+    ///   the branch (`BranchEnd`, which is the end of what was *written* there
+    ///   — see [`Self::scroll_to_branch_end`]). Without this the new branch
+    ///   stayed unselected — the very failure the deferral exists to prevent
+    ///   (task 46, bug 3), one frame later. The request's **settle mode is
+    ///   kept as it was**: only the node identity forwards, so a request that
+    ///   was preserving a parked reader (below) does not become a jump.
+    /// - **A reader parked on the leaf** (`selected_turn`, what the last frame
+    ///   observed): branch selection is *positional* — a strip's scroll offset
+    ///   resolved to a child index — and a turn's persisted response is
+    ///   inserted among the target's posts, **ahead of** any still-streaming
+    ///   sibling overlay. In a fan-out where the selected turn completes first,
+    ///   that index then addresses another participant's stream and the view
+    ///   switches away from the answer being read. Re-selecting by identity
+    ///   fixes the index; the page must not move (`Stay`) — the reader is
+    ///   already where they want to be.
+    ///
+    /// **The parked case yields to a pending request for anything else**, which
+    /// is the newest-intent rule: a pending selection is an ask (or a fork
+    /// draft) the reader made *after* the turn now landing, and following the
+    /// older turn would quietly undo it. The pending case has no such conflict
+    /// — the request being re-aimed is the reader's latest intent.
+    ///
+    /// A turn that wrote **no** post (a decline) has no branch to offer: a
+    /// pending request is dropped rather than left naming a node that can never
+    /// appear, and a parked reader is left alone (there is nothing to follow —
+    /// the leaf simply collapses).
+    pub(crate) fn follow_completed_turn(&mut self, seq: u64, response_action_id: Option<&str>) {
+        let leaf = model::streaming_node_id(seq);
+        // The settle mode a pending request carries is the **reader's**
+        // situation, not the turn's: `BranchEnd` because they asked to be taken
+        // to this answer, `Stay` because they are already somewhere they chose.
+        // A retarget forwards the node identity and *keeps* that mode — see the
+        // `match` below.
+        let aimed_settle = self
+            .pending_select
+            .as_ref()
+            .filter(|p| p.node == leaf)
+            .map(|p| p.settle);
+        let aimed_at_leaf = aimed_settle.is_some();
+        // Something newer is already asked for: the reader's latest intent wins.
+        if !aimed_at_leaf && self.pending_select.is_some() {
+            return;
+        }
+        let parked = self.selected_turn.get();
+        // Parked on a *different* turn's stream: the completing turn's post is
+        // inserted ahead of every still-streaming sibling, so the reader's
+        // index now addresses someone else's leaf. Same swap, same cure — hold
+        // their branch by naming the leaf they are actually on.
+        if !aimed_at_leaf && let Some(other) = parked.filter(|s| *s != seq) {
+            self.pending_select = Some(PendingSelect {
+                node: model::streaming_node_id(other),
+                settle: PendingSettle::Stay,
+            });
+            return;
+        }
+        let parked = parked == Some(seq);
+        if !aimed_at_leaf && !parked {
+            return;
+        }
+        match response_action_id {
+            Some(id) => {
+                self.pending_select = Some(PendingSelect {
+                    node: SharedString::from(id.to_string()),
+                    // **A retarget never upgrades the settle.** An existing
+                    // request already recorded why the reader is being moved
+                    // (or not); this only changes *which node* answers it. A
+                    // parked reader whose branch was preserved with `Stay` when
+                    // a sibling landed must still be `Stay` when their own turn
+                    // lands a moment later — otherwise the second completion
+                    // scrolls them to a tail they never asked for. A request
+                    // minted here, for a reader with none, is `Stay` for the
+                    // same reason: they chose where they are.
+                    settle: aimed_settle.unwrap_or(PendingSettle::Stay),
+                })
+            }
+            // Only the doomed request is dropped; an unrelated one already
+            // returned above.
+            None if aimed_at_leaf => self.pending_select = None,
+            None => {}
+        }
     }
 
     // -- Scrolling ---------------------------------------------------------
@@ -526,11 +644,24 @@ impl SpaceView {
         let viewport = self.page_size(window);
         let turns = self.stream_overlays(cx);
         let tree = self.effective_tree(viewport.width, &turns);
-        let total = self.selected_total_height(&tree, viewport.width, viewport.height);
-        let doc = self.doc_reserve() + total;
-        let y = (viewport.height.as_f32() - doc).min(0.0);
-        let off = self.page_scroll.offset();
-        self.page_scroll.set_offset(point(off.x, px(y)));
+        self.scroll_to_branch_end(&tree, viewport.width, viewport.height);
+    }
+
+    /// The same, against a tree the caller already has (`render`'s).
+    ///
+    /// **"The end" is the end of what was written** (`layout::page_end_ys`),
+    /// not the end of the document: by the time a settle runs,
+    /// `sync_tail_drafts` may already have docked a fresh composer under the
+    /// branch, and its runway is a whole window of speculative space to scroll
+    /// past the last word into (task 46, bug 2 — the same rule tail-following
+    /// obeys, from the same definition).
+    pub(crate) fn scroll_to_branch_end(
+        &self,
+        roots: &[TreeNode],
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+    ) {
+        self.set_page_scroll_y(self.page_end_ys(roots, page_width, window_h).content);
     }
 
     /// Dock the active draft at its "home": its slot top around 40% of the
@@ -541,14 +672,25 @@ impl SpaceView {
         page_width: gpui::Pixels,
         window_h: gpui::Pixels,
     ) {
+        let y = self.dock_active_draft_y(roots, page_width, window_h);
+        self.set_page_scroll_y(y);
+    }
+
+    /// The page scroll `y` [`Self::dock_active_draft`] rests at.
+    fn dock_active_draft_y(
+        &self,
+        roots: &[TreeNode],
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+    ) -> f32 {
         let doc_top = self.placeholder_doc_top(roots, page_width, window_h);
         let target = window_h.as_f32() * 0.4;
-        let y = (target - doc_top).min(0.0);
-        let off = self.page_scroll.offset();
-        self.page_scroll.set_offset(point(off.x, px(y)));
+        (target - doc_top).min(0.0)
     }
 
     /// "See in context": dock the active draft back at its place in the branch.
+    /// Glided rather than jumped — the reader asked to be taken somewhere, and
+    /// the travel is what says where from (see [`super::nav::PageGlide`]).
     pub(crate) fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let viewport = self.page_size(window);
         let turns = self.stream_overlays(cx);
@@ -557,7 +699,8 @@ impl SpaceView {
             && model::node_ref(&tree, &active).is_some()
         {
             self.select_path_to(&tree, &active, viewport.width);
-            self.dock_active_draft(&tree, viewport.width, viewport.height);
+            let y = self.dock_active_draft_y(&tree, viewport.width, viewport.height);
+            self.glide_page_to(y, window, cx);
         }
         cx.notify();
     }
@@ -1920,8 +2063,7 @@ fn caret_into_view(
                     // `next` (gpui-clamped) or a cross-frame content read (lags).
                     this.docked_caret_slot_offset.set(caret_doc_bot - caret_bot);
                     if (next - cur).abs() > 0.5 {
-                        let off = this.page_scroll.offset();
-                        this.page_scroll.set_offset(point(off.x, px(next)));
+                        this.set_page_scroll_y(next);
                         true
                     } else {
                         false
