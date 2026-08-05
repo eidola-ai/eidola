@@ -1002,6 +1002,19 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                         }
                     }
                 }
+                // The table above is a *scan*: an engine whose backing file
+                // went away mid-session has no row there while it still holds
+                // a port and its memory. The registry is the honest answer.
+                let unaccounted = unaccounted_engines(&core.running_engines(), &state);
+                if !unaccounted.is_empty() {
+                    println!("\nrunning engines not listed above:");
+                    for engine in &unaccounted {
+                        println!("{}", engine.line());
+                    }
+                    if unaccounted.iter().any(|e| e.orphaned) {
+                        println!("stop one with `eidola model unload <id>`");
+                    }
+                }
                 println!("\ncatalog (download with `eidola model download <id>`):");
                 for entry in core.local_model_catalog() {
                     let installed = state.models.iter().any(|m| m.file_name == entry.file_name);
@@ -1338,6 +1351,91 @@ fn fmt_size(bytes: u64) -> String {
     }
 }
 
+/// One live engine the models table above did not speak for.
+#[derive(Debug, PartialEq, Eq)]
+struct UnlistedEngine {
+    /// The `<slug>@<backend>` selection id — also the `model unload` argument.
+    id: String,
+    port: u16,
+    /// False while the engine is still warming.
+    ready: bool,
+    /// No scanned model anywhere in the snapshot — managed store or any
+    /// `llamacpp` backend — carries this id: the backing `.gguf` went away
+    /// while the subprocess kept its port and its memory.
+    orphaned: bool,
+}
+
+impl UnlistedEngine {
+    fn line(&self) -> String {
+        format!(
+            "{:<40} {} (127.0.0.1:{}){}",
+            self.id,
+            if self.ready { "loaded" } else { "loading" },
+            self.port,
+            if self.orphaned {
+                " — backing file missing"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+/// Which running engines `eidola model list` must name for itself.
+///
+/// **Membership comes from the registry; the scan only decorates.**
+/// [`AppCore::running_engines`] is the in-process truth, while
+/// [`AppCore::local_models_state`] is reconstructed by *scanning* the model
+/// directories and consults the registry only to decorate a `.gguf` it
+/// already found — so an engine whose file was deleted or renamed under it
+/// (or whose backend row went away, or whose directory became unreadable) is
+/// absent from the table while it still holds a port and gigabytes of RAM.
+/// The table alone therefore claims less is running than actually is.
+///
+/// An engine is dropped here only when the printed table already said it is
+/// up: a managed-store row with the same id whose status is `Loaded` or
+/// `Loading`. Everything else earns a line — including an engine on a
+/// `llamacpp` backend, whose models this listing never prints at all.
+///
+/// `orphaned` is the stronger claim and is made only on the stronger
+/// evidence: the id appears in *no* scanned directory, external backends
+/// included. An engine that is merely absent from the printed table is
+/// listed without it.
+///
+/// Ordering follows `running`, which app-core sorts by id.
+fn unaccounted_engines(
+    running: &[eidola_app_core::RunningEngine],
+    state: &eidola_app_core::LocalModelsState,
+) -> Vec<UnlistedEngine> {
+    running
+        .iter()
+        .filter_map(|engine| {
+            let listed = state.models.iter().find(|m| m.id == engine.id);
+            let spoken_for = listed.is_some_and(|m| {
+                matches!(
+                    m.status,
+                    eidola_app_core::LocalModelStatus::Loaded { .. }
+                        | eidola_app_core::LocalModelStatus::Loading
+                )
+            });
+            if spoken_for {
+                return None;
+            }
+            let anywhere = listed.is_some()
+                || state
+                    .external
+                    .iter()
+                    .any(|b| b.models.iter().any(|m| m.id == engine.id));
+            Some(UnlistedEngine {
+                id: engine.id.clone(),
+                port: engine.port,
+                ready: engine.ready,
+                orphaned: !anywhere,
+            })
+        })
+        .collect()
+}
+
 /// Print one `update check` outcome — the same five states the GUI's
 /// Updates window renders, sharing the core types.
 fn print_update_check(snapshot: &eidola_app_core::updates::UpdateCheckSnapshot) {
@@ -1495,5 +1593,168 @@ fn print_indented(text: &str, indent: usize) {
         if !line.is_empty() {
             println!("{pad}{line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eidola_app_core::{
+        ExternalEngineBackend, LocalModelInfo, LocalModelStatus, LocalModelsState, RunningEngine,
+    };
+
+    fn engine(id: &str, port: u16, ready: bool) -> RunningEngine {
+        let (slug, backend_id) = id.split_once('@').expect("qualified id");
+        RunningEngine {
+            id: id.to_string(),
+            backend_id: backend_id.to_string(),
+            slug: slug.to_string(),
+            port,
+            context_tokens: 4096,
+            ready,
+            pinned: false,
+        }
+    }
+
+    fn model(id: &str, status: LocalModelStatus) -> LocalModelInfo {
+        let slug = id.split_once('@').expect("qualified id").0;
+        LocalModelInfo {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            display_name: slug.to_string(),
+            file_name: format!("{slug}.gguf"),
+            size_bytes: Some(1_000_000_000),
+            source_url: None,
+            status,
+            last_error: None,
+        }
+    }
+
+    fn state(
+        models: Vec<LocalModelInfo>,
+        external: Vec<ExternalEngineBackend>,
+    ) -> LocalModelsState {
+        LocalModelsState {
+            engine_path: Some("/usr/bin/llama-server".into()),
+            models,
+            external,
+        }
+    }
+
+    fn backend(id: &str, models: Vec<LocalModelInfo>) -> ExternalEngineBackend {
+        ExternalEngineBackend {
+            backend_id: id.to_string(),
+            display_name: id.to_string(),
+            enabled: true,
+            models_dir: "/models".into(),
+            engine_path: None,
+            auto_start: true,
+            models,
+        }
+    }
+
+    /// The whole point: the scan lost the file, the registry did not lose the
+    /// engine, and the listing must say so.
+    #[test]
+    fn an_engine_whose_file_vanished_is_reported_as_orphaned() {
+        let running = vec![engine("gemma@local", 52341, true)];
+        let snapshot = state(vec![], vec![]);
+
+        let out = unaccounted_engines(&running, &snapshot);
+
+        assert_eq!(
+            out,
+            vec![UnlistedEngine {
+                id: "gemma@local".into(),
+                port: 52341,
+                ready: true,
+                orphaned: true,
+            }]
+        );
+        assert!(out[0].line().contains("127.0.0.1:52341"));
+        assert!(out[0].line().contains("backing file missing"));
+    }
+
+    /// The normal case must add no noise: a loaded model already has its row.
+    #[test]
+    fn an_engine_the_table_already_shows_adds_nothing() {
+        let running = vec![engine("gemma@local", 52341, true)];
+        let snapshot = state(
+            vec![model(
+                "gemma@local",
+                LocalModelStatus::Loaded {
+                    port: 52341,
+                    context_tokens: 4096,
+                    pinned: false,
+                },
+            )],
+            vec![],
+        );
+
+        assert!(unaccounted_engines(&running, &snapshot).is_empty());
+    }
+
+    /// A warming engine's row says `loading` in the table — also spoken for.
+    #[test]
+    fn a_warming_engine_the_table_shows_adds_nothing() {
+        let running = vec![engine("gemma@local", 52341, false)];
+        let snapshot = state(
+            vec![model("gemma@local", LocalModelStatus::Loading)],
+            vec![],
+        );
+
+        assert!(unaccounted_engines(&running, &snapshot).is_empty());
+    }
+
+    /// An engine on a `llamacpp` backend is invisible to this listing (which
+    /// prints only the managed store), so it earns a line — but its file is
+    /// right there, so it is not an orphan.
+    #[test]
+    fn an_external_backend_engine_is_listed_but_not_orphaned() {
+        let running = vec![engine("qwen@work", 52350, true)];
+        let snapshot = state(
+            vec![],
+            vec![backend(
+                "work",
+                vec![model(
+                    "qwen@work",
+                    LocalModelStatus::Loaded {
+                        port: 52350,
+                        context_tokens: 4096,
+                        pinned: false,
+                    },
+                )],
+            )],
+        );
+
+        let out = unaccounted_engines(&running, &snapshot);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].orphaned);
+        assert!(!out[0].line().contains("backing file missing"));
+    }
+
+    /// A stale `Available` row (the scan ran before the engine registered)
+    /// is not a claim that anything is running, so the engine still gets its
+    /// line — but the file is there, so no orphan flag.
+    #[test]
+    fn a_row_that_does_not_claim_to_be_running_does_not_speak_for_the_engine() {
+        let running = vec![engine("gemma@local", 52341, true)];
+        let snapshot = state(
+            vec![model("gemma@local", LocalModelStatus::Available)],
+            vec![],
+        );
+
+        let out = unaccounted_engines(&running, &snapshot);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].orphaned);
+    }
+
+    #[test]
+    fn nothing_running_says_nothing() {
+        let snapshot = state(
+            vec![model("gemma@local", LocalModelStatus::Available)],
+            vec![],
+        );
+        assert!(unaccounted_engines(&[], &snapshot).is_empty());
     }
 }
