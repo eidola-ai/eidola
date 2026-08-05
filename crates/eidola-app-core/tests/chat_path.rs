@@ -1690,8 +1690,10 @@ fn single_agent_thread_renders_alternating_roles_with_headers() {
 }
 
 /// Strip-on-receipt: a model that mimics the visible header scaffolding has
-/// that leading line removed before anything is persisted — the durable post
-/// and the returned `ChatResult` both carry the bare answer.
+/// that leading line removed before anything is persisted — the durable post,
+/// the returned `ChatResult`, **and the live stream** all carry the bare
+/// answer. The stream is included because the alternative is a header that
+/// shows while a reply arrives and vanishes when it lands (task 46, bug 1).
 #[test]
 fn model_emitted_header_is_stripped_before_persisting() {
     run(|| {
@@ -1723,11 +1725,10 @@ fn model_emitted_header_is_stripped_before_persisting() {
             .expect("stream");
         let (result, streamed) = result;
 
-        // The deltas reach the caller verbatim (the emission contract is
-        // untouched); the *persisted* and *reported* text is stripped.
-        assert!(
-            streamed.starts_with('#'),
-            "the raw deltas are forwarded as received: {streamed:?}"
+        // What the reader watched arrive is what lands durably.
+        assert_eq!(
+            streamed, "Hello from the stream.",
+            "the header never reaches the caller either"
         );
         assert_eq!(result.content, "Hello from the stream.");
 
@@ -1748,6 +1749,52 @@ fn model_emitted_header_is_stripped_before_persisting() {
             text_block.text.as_deref(),
             Some("Hello from the stream."),
             "the header-shaped first line never reaches the durable trail"
+        );
+    });
+}
+
+/// The real shape of the same defect: a token stream chops the mimicked header
+/// across deltas (mid-handle, mid-separator, and with the blank line attached
+/// to the first body token). The incremental strip must still show the reader
+/// exactly the persisted text, and must not hold body text back once the first
+/// line is decided.
+#[test]
+fn a_header_split_across_deltas_is_stripped_from_the_stream() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreamingWithSplitHeader,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (result, deltas) = core
+            .runtime()
+            .block_on(async {
+                let collector = async {
+                    let mut deltas: Vec<String> = Vec::new();
+                    while let Some(ev) = rx.recv().await {
+                        if let ChatStreamEvent::ContentDelta(d) = ev {
+                            deltas.push(d);
+                        }
+                    }
+                    deltas
+                };
+                let chat = core.chat_stream("hi".into(), MODEL.into(), None, tx);
+                let (res, deltas) = tokio::join!(chat, collector);
+                res.map(|r| (r, deltas))
+            })
+            .expect("stream");
+
+        assert_eq!(
+            deltas.concat(),
+            "Hello from the stream.",
+            "the header is gone from the stream however it was chopped up"
+        );
+        assert_eq!(result.content, "Hello from the stream.");
+        assert!(
+            !deltas.is_empty(),
+            "the body still arrives as deltas, not as one flush at the end"
         );
     });
 }

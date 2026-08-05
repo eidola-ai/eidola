@@ -176,6 +176,18 @@ pub(crate) fn body_width(page_width: Pixels) -> f32 {
         .as_f32()
 }
 
+/// The selected branch's two ends as page-scroll `y`s (both ≤ 0). See
+/// [`SpaceView::page_end_ys`] — `content` is where a reader comes to rest,
+/// `document` is only the scroll floor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PageEnds {
+    /// The end of the document — the scroll range's floor.
+    pub(crate) document: f32,
+    /// The end of what has been **written**: the document less a trailing
+    /// draft's speculative runway. Never past `document`.
+    pub(crate) content: f32,
+}
+
 impl SpaceView {
     /// Which child page a node's scroller is resting on, from its scroll offset.
     /// Pages are `page_width + BAND_HEIGHT` apart, so the nearest is
@@ -312,6 +324,63 @@ impl SpaceView {
         Some(node.id.clone())
     }
 
+    /// **The selected branch's two ends**, as page-scroll `y`s — the single
+    /// definition every "scroll to the end" reads, so no caller can invent a
+    /// second one.
+    ///
+    /// The distinction is task 46, bug 2: a trailing draft's slot is a whole
+    /// window of *speculative* runway ([`Self::trailing_draft_slot_h`]), and
+    /// coming to rest past the last written word carries the reply the reader
+    /// was reading off the top of the window. So tail-following stops at
+    /// `content` ([`super::SpaceView::follow_streaming_tail`]) — and so does
+    /// every programmatic settle at a branch's end
+    /// ([`super::SpaceView::scroll_to_branch_end`]), which lands on frames
+    /// where `sync_tail_drafts` has already docked that composer. The two
+    /// coincide whenever no draft trails the path, which is every frame a turn
+    /// is actually streaming.
+    pub(crate) fn page_end_ys(
+        &self,
+        roots: &[TreeNode],
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+    ) -> PageEnds {
+        let total_doc = self.doc_reserve()
+            + self.selected_total_height(roots, page_width, window_h)
+            + self.floating_pad(roots, page_width, window_h);
+        let document = (window_h.as_f32() - total_doc).min(0.0);
+        let content = (window_h.as_f32()
+            - (total_doc - self.trailing_draft_slot_h(roots, page_width, window_h)))
+        .min(0.0)
+        .max(document);
+        PageEnds { document, content }
+    }
+
+    /// The slot height a **trailing draft** claims at the end of the selected
+    /// path, or `0.0` when the path ends in a post or a streaming leaf.
+    ///
+    /// That slot is speculative — an empty composer reserves a whole window of
+    /// runway — which is why "the end" has two values (see
+    /// [`Self::page_end_ys`]).
+    pub(crate) fn trailing_draft_slot_h(
+        &self,
+        roots: &[TreeNode],
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+    ) -> f32 {
+        let mut node = match self.active_root(roots, page_width) {
+            Some(n) => n,
+            None => return 0.0,
+        };
+        while !node.children.is_empty() {
+            let active = self.active_child_index(&node.id, page_width, node.children.len());
+            node = &node.children[active];
+        }
+        match node.src {
+            NodeSrc::Draft => self.node_height(node, page_width, window_h),
+            _ => 0.0,
+        }
+    }
+
     /// The selected root (the active page of the implicit top-level scroller).
     fn active_root<'a>(
         &self,
@@ -387,8 +456,10 @@ impl SpaceView {
             })
     }
 
-    /// Whether the **selected path** carries a live streaming overlay — the
-    /// honest scope for tail-following (`follow_streaming_tail`).
+    /// **Which** turn's streaming leaf the **selected path** carries, if any (a
+    /// streaming overlay is always a leaf, so there is at most one) — the
+    /// honest scope for tail-following (`follow_streaming_tail`), and the
+    /// identity a completed turn is followed by (`follow_completed_turn`).
     ///
     /// "Is some turn streaming?" is a *space*-wide question, and Participants v1
     /// makes concurrent turns on sibling branches ordinary: a fan-out streams
@@ -401,14 +472,48 @@ impl SpaceView {
     /// `caret_into_view` path owns). Like every other selection question here it
     /// is answered by *observation* of the tree the frame actually renders — no
     /// flag, no mode.
-    pub(crate) fn selected_path_is_streaming(
-        &self,
-        roots: &[TreeNode],
-        page_width: Pixels,
-    ) -> bool {
+    ///
+    /// It names the turn rather than merely reporting one because the second
+    /// consumer asks *after the fact*: a completed turn's leaf is gone from the
+    /// tree, so "was the reader parked on it?" can only be answered by what the
+    /// last frame observed — which `render` records in
+    /// [`super::SpaceView::selected_turn`].
+    pub(crate) fn selected_turn_seq(&self, roots: &[TreeNode], page_width: Pixels) -> Option<u64> {
         self.selected_levels(roots, page_width)
             .into_iter()
-            .any(|(sibs, active)| matches!(sibs[active].src, NodeSrc::Streaming(_)))
+            .find_map(|(sibs, active)| match sibs[active].src {
+                NodeSrc::Streaming(seq) => Some(seq),
+                _ => None,
+            })
+    }
+
+    /// The same question asked of a branch switch's **destination**: the
+    /// streaming turn at the end of the path that will be selected once
+    /// `parent_id`'s strip rests on child `index`.
+    ///
+    /// A switch knows its destination at click time; the strip's offset does
+    /// not say so until the switch lands (and says the *old* child for as long
+    /// as an animation is rounding toward the new one). Recording this is what
+    /// lets a turn completing across that window carry the reader where they
+    /// were going rather than where they were — see
+    /// [`super::SpaceView::follow_completed_turn`].
+    pub(crate) fn turn_seq_under_child(
+        &self,
+        roots: &[TreeNode],
+        parent_id: &str,
+        index: usize,
+        page_width: Pixels,
+    ) -> Option<u64> {
+        let parent = super::model::node_ref(roots, parent_id)?;
+        let mut node = parent.children.get(index)?;
+        while !node.children.is_empty() {
+            let active = self.active_child_index(&node.id, page_width, node.children.len());
+            node = &node.children[active];
+        }
+        match node.src {
+            NodeSrc::Streaming(seq) => Some(seq),
+            _ => None,
+        }
     }
 
     /// Document-space top of a node that is **on the selected path** (after

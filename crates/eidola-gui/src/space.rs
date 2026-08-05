@@ -312,6 +312,21 @@ pub enum SpaceEvent {
     /// when a plain post persists — either way the space now has a durable id,
     /// which is what the registry's blank-space adoption keys off.
     StreamEnded,
+    /// A **keyed turn** finished successfully, naming itself by the `seq`
+    /// [`Space::ask`] handed back and by the post it wrote (`None` for a
+    /// decline — the turn produced no post). Emitted beside `StreamEnded`,
+    /// which says only *that* an exchange settled.
+    ///
+    /// It exists because a turn's streaming leaf is an ephemeral render key:
+    /// the moment the turn lands, the leaf is gone and the persisted response
+    /// takes its place. Anything that deferred work onto the leaf — the view's
+    /// branch selection ([`crate::space_view::SpaceView::select_turn_branch`])
+    /// — must be able to follow the turn across that swap, which needs both
+    /// halves of the identity in one event.
+    TurnEnded {
+        seq: u64,
+        response_action_id: Option<String>,
+    },
     /// A mutation or turn failed with a typed error. The view routes
     /// onboarding-degraded states (`InsufficientBalance`) off this; a failed
     /// *turn* additionally records [`Space::failed_turn`] so the notice's
@@ -892,6 +907,15 @@ impl Space {
                 cx.emit(SpaceEvent::Failed(e));
             }
         }
+        // The turn names itself on the way out: its streaming leaf no longer
+        // exists, and anything the view deferred onto that leaf has to follow
+        // the turn onto the post it wrote (`SpaceEvent::TurnEnded`). Emitted on
+        // both arms — a failed *reload* still ended the turn, and a listener
+        // that can't find the post simply drops the request.
+        cx.emit(SpaceEvent::TurnEnded {
+            seq,
+            response_action_id: result.response_action_id.clone(),
+        });
         cx.notify();
     }
 
@@ -1326,22 +1350,26 @@ impl Space {
     /// (`AppCore::respond_stream_as`). Runs as an independent keyed turn, so
     /// asking is legal while other turns still stream; a duplicate ask (same
     /// participant, same target, already in flight) and an ask during the
-    /// exclusive mutation are no-ops. Returns whether the ask was accepted.
+    /// exclusive mutation are no-ops. Returns the **seq of the turn that
+    /// started** — the render key of the streaming leaf the answer will grow
+    /// in, so the view can select *that branch* (a new sibling of whatever the
+    /// target already replied with) rather than merely the target's path.
+    /// `None` when nothing started: a refusal, or a space with no id yet.
     pub fn ask(
         &mut self,
         participant_id: String,
         target_action_id: String,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Option<u64> {
         if self.post_runner.is_some() {
-            return false;
+            return None;
         }
         let duplicate = self.streams.iter().any(|s| {
             s.participant_id.as_deref() == Some(participant_id.as_str())
                 && s.target_action_id.as_deref() == Some(target_action_id.as_str())
         });
         if duplicate {
-            return false;
+            return None;
         }
         // Re-asking the *failed turn itself* (same participant **and** same
         // target) is the Retry; clear the recorded failure so `can_retry` reads
@@ -1367,12 +1395,12 @@ impl Space {
             });
             cx.emit(SpaceEvent::MessagesChanged);
             cx.notify();
-            return true;
+            return Some(seq);
         }
-        self.start_turn(participant_id, target_action_id, cx);
+        let seq = self.start_turn(participant_id, target_action_id, cx);
         cx.emit(SpaceEvent::MessagesChanged);
         cx.notify();
-        true
+        seq
     }
 
     fn mint_turn_seq(&mut self) -> u64 {
@@ -1392,13 +1420,9 @@ impl Space {
         participant_id: String,
         target_action_id: String,
         cx: &mut Context<Self>,
-    ) {
-        let Some(app_core) = self.app_core.clone() else {
-            return;
-        };
-        let Some(space_id) = self.id.clone() else {
-            return;
-        };
+    ) -> Option<u64> {
+        let app_core = self.app_core.clone()?;
+        let space_id = self.id.clone()?;
         let seq = self.mint_turn_seq();
         self.streams.push(StreamingTurn {
             seq,
@@ -1425,6 +1449,7 @@ impl Space {
         );
         self.turn_runners.insert(seq, runner);
         cx.notify();
+        Some(seq)
     }
 
     /// The keyed turn runner: pump this turn's deltas, then finalize —
@@ -1552,19 +1577,16 @@ impl Space {
 
     /// Re-ask the failed turn's participant about the same post — **without**
     /// re-posting anything (the post is already durable; the ask bypasses the
-    /// cascade guard). Returns the **target action id** the retry ran against
-    /// (so the view can select its branch before the streaming node renders —
-    /// PR #218 review), or `None` if nothing is retryable.
-    pub fn retry(&mut self, cx: &mut Context<Self>) -> Option<String> {
+    /// cascade guard). Returns the retried turn's **seq** (so the view can
+    /// select the branch its streaming leaf lands on before it renders — PR
+    /// #218 review), or `None` if nothing is retryable.
+    pub fn retry(&mut self, cx: &mut Context<Self>) -> Option<u64> {
         let failed = self.failed_turn.clone()?;
-        if !self.ask(
+        self.ask(
             failed.participant_id.clone(),
             failed.target_action_id.clone(),
             cx,
-        ) {
-            return None;
-        }
-        Some(failed.target_action_id)
+        )
     }
 
     // -- Test seams --------------------------------------------------------
@@ -1694,8 +1716,9 @@ impl Space {
     }
 
     /// Test-only: complete one streaming turn **successfully** — drop its stream
-    /// entry and emit `MessagesChanged` + `StreamEnded`, exactly as a real turn
-    /// runner's success arm does (minus the DB reload a stub can't perform).
+    /// entry and emit `MessagesChanged` + `StreamEnded`, as a real turn
+    /// runner's success arm does (minus the DB reload a stub can't perform,
+    /// and minus `TurnEnded`: there is no reloaded post to name).
     /// Drives the sibling-success-keeps-the-failed-turn-notice regression: a
     /// sibling of a fan-out finishing must not hide a still-recorded failed
     /// turn's recovery notice.
