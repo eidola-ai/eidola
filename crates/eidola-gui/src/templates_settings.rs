@@ -4,7 +4,7 @@
 //! A window-local lens over [`crate::stores::TemplatesStore`] (the registry,
 //! refreshed on `Change::Templates`). Lists templates; creates / edits (title,
 //! cascade limit, and the owned agent participants — the same field set as the
-//! per-space Participants view, via the shared `participants` helpers);
+//! inspector's Participants section, via the shared `participants` helpers);
 //! soft-removes; and sets the default (the template `New Space` / ⌘N
 //! instantiates, written through `ConfigStore::set_default_template`).
 //!
@@ -96,8 +96,8 @@ pub struct TemplatesSettingsView {
     config: Entity<ConfigStore>,
     draft: Option<TemplateDraft>,
     /// Tracks the open model-picker dropdown's own scroll (see the identical
-    /// field on `ParticipantsView`) — one handle, reset to the top on each
-    /// open, since at most one participant's picker is open at a time.
+    /// field on the inspector's Participants section) — one handle, reset to
+    /// the top on each open, since at most one picker is open at a time.
     picker_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }

@@ -188,6 +188,14 @@ impl SpaceView {
         self.inspector_participant_picker.is_some()
     }
 
+    /// Open the add form's model dropdown without a click (tests, driver).
+    #[doc(hidden)]
+    pub fn inspector_open_add_picker_for_test(&mut self, cx: &mut Context<Self>) {
+        if self.inspector_participant_picker != Some(ParticipantPicker::Add) {
+            self.inspector_toggle_participant_picker(ParticipantPicker::Add, cx);
+        }
+    }
+
     // -- Editing -----------------------------------------------------------
 
     /// Open (or close) a participant's disclosure. Opening seeds the fields from
@@ -729,8 +737,10 @@ impl SpaceView {
 
         // The identifying line under the name: for an agent, `model · backend`;
         // for the human it would be meaningless (people have no model), and its
-        // absence is what says "person" on a row this compact.
-        let detail: Option<SharedString> = if is_human {
+        // absence is what says "person" on a row this compact. An open row drops
+        // it — the editor's own Model field is two lines below, and one of them
+        // would be repeating the other.
+        let detail: Option<SharedString> = if is_human || expanded {
             None
         } else if let Some(model) = p.model_ref.as_deref() {
             let (name, backend) = model_display(&self.stores, model, cx);

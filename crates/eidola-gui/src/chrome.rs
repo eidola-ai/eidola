@@ -610,8 +610,8 @@ impl ChromeRoot {
     fn render_menu_panel(&self, _window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         use crate::actions::{
             About, ActualSize, CheckForUpdates, NewSpace, NewSpaceFromTemplate, OpenLibrary,
-            OpenParticipants, OpenRecord, OpenSettings, Quit, Quote, QuoteInReply, ToggleInspector,
-            ZoomIn, ZoomOut, primary_alt_chord, primary_chord, primary_shift_chord,
+            OpenRecord, OpenSettings, Quit, Quote, QuoteInReply, ToggleInspector, ZoomIn, ZoomOut,
+            primary_alt_chord, primary_chord, primary_shift_chord,
         };
         let theme = cx.theme();
 
@@ -675,13 +675,6 @@ impl ChromeRoot {
                 cx,
             ))
             .children(template_rows)
-            .child(menu_item(
-                "participants",
-                "Participants…",
-                None,
-                |w, cx| w.dispatch_action(Box::new(OpenParticipants), cx),
-                cx,
-            ))
             // The space inspector's other door (the space itself carries no
             // visual toggle) — a no-op without a focused space window, like
             // Participants… above.
