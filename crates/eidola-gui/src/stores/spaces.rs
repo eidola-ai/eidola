@@ -183,7 +183,7 @@ impl SpacesStore {
         let list = listing.map_err(|e| eidola_app_core::error::AppError::Internal {
             message: e.to_string(),
         });
-        if let Some(message) = crate::stores::settle_mutation(&mut self.index, list, op) {
+        if let Some(message) = settle_index_mutation(&mut self.index, None, list, op) {
             self.record_op_error(space_id, message);
         }
         cx.notify();
@@ -427,7 +427,7 @@ impl SpacesStore {
     /// same reason and on the same promise: this operation's own re-list, which
     /// runs strictly later, is what the refresh would have fetched.
     ///
-    /// That re-list is also what bounds the caller's optimistic edit of the
+    /// That re-list is also what bounds `optimistic`, the caller's edit of the
     /// cached row: a refused write is reconciled back to what the database holds
     /// instead of leaving the Library, the window title, and the inspector's
     /// title field showing a name nothing ever persisted. (With two mutations in
@@ -436,16 +436,36 @@ impl SpacesStore {
     /// by the second's own re-list, never a state that outlives the round trip.)
     /// The refusal itself joins `op_errors`, while a re-list that fails resolves
     /// the *cell* (`Failed { prior }`, keeping the listing on screen) —
-    /// [`crate::stores::settle_mutation`] owns that pairing.
+    /// [`settle_index_mutation`] owns that pairing, including the case where
+    /// **both** halves fail and the re-list is therefore unavailable to take the
+    /// edit back.
+    ///
+    /// **The edit is applied here, not by the caller**, so the snapshot it
+    /// replaces is captured in the same breath — the ordering the honest failure
+    /// exit depends on cannot be forgotten at a call site. (`SpaceSettingsStore`
+    /// takes its `advance` closure for the same reason.)
     ///
     /// `op` returns the complete sentence to show, so each caller words its own
     /// refusal.
-    fn write_then_relist<F>(&mut self, space_id: String, cx: &mut Context<Self>, op: F)
-    where
+    fn write_then_relist<F>(
+        &mut self,
+        space_id: String,
+        cx: &mut Context<Self>,
+        optimistic: impl FnOnce(&mut Vec<SpaceInfo>),
+        op: F,
+    ) where
         F: FnOnce(Arc<AppCore>) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
             + Send
             + 'static,
     {
+        // The snapshot and the edit, in that order and with nothing between
+        // them: this is what a refused write restores.
+        let pre_optimistic = self.index.value().cloned();
+        if let Some(rows) = self.index.value_mut() {
+            optimistic(rows);
+        }
+        cx.notify();
+
         let Some(core) = self.app_core.clone() else {
             return;
         };
@@ -462,7 +482,7 @@ impl SpacesStore {
                 let list = bridge(relist_core, |c| async move { c.list_spaces(false).await }).await;
                 let _ = this.update(cx, |this, cx| {
                     if let Some(message) =
-                        crate::stores::settle_mutation(&mut this.index, list, op_result)
+                        settle_index_mutation(&mut this.index, pre_optimistic, list, op_result)
                     {
                         this.record_op_error(Some(space_id), message);
                     }
@@ -490,25 +510,28 @@ impl SpacesStore {
     /// optimistic update is the only visible effect — which is exactly what
     /// behavior tests assert.
     pub fn rename(&mut self, space_id: String, title: String, cx: &mut Context<Self>) {
-        // Optimistic local update.
-        if let Some(list) = self.index.value_mut()
-            && let Some(row) = list.iter_mut().find(|s| s.id == space_id)
-        {
-            row.title = Some(title.clone());
-        }
-        cx.notify();
-
         let id = space_id.clone();
-        self.write_then_relist(space_id, cx, move |core| {
-            Box::pin(async move {
-                bridge(
-                    core,
-                    move |c| async move { c.rename_space(id, title).await },
-                )
-                .await
-                .map_err(|e| format!("Couldn't rename this space: {e}"))
-            })
-        });
+        let optimistic_title = title.clone();
+        let row_id = space_id.clone();
+        self.write_then_relist(
+            space_id,
+            cx,
+            move |rows| {
+                if let Some(row) = rows.iter_mut().find(|s| s.id == row_id) {
+                    row.title = Some(optimistic_title);
+                }
+            },
+            move |core| {
+                Box::pin(async move {
+                    bridge(
+                        core,
+                        move |c| async move { c.rename_space(id, title).await },
+                    )
+                    .await
+                    .map_err(|e| format!("Couldn't rename this space: {e}"))
+                })
+            },
+        );
     }
 
     /// Archive a space: drop the cached row immediately (so the Library
@@ -517,31 +540,186 @@ impl SpacesStore {
     /// is what makes it safe to start from a closing window: the core write
     /// completes regardless, and the bus reconciles every other window.
     pub fn archive(&mut self, space_id: String, cx: &mut Context<Self>) {
-        // Optimistic local removal — edit whatever value is present, keeping
-        // the cell's state (a stale or failed-with-prior listing stays what it
-        // is; only its rows move).
-        if let Some(list) = self.index.value_mut() {
-            list.retain(|s| s.id != space_id);
-        }
-        cx.notify();
-
         let id = space_id.clone();
-        self.write_then_relist(space_id, cx, move |core| {
-            Box::pin(async move {
-                match bridge(core, move |c| async move { c.archive_space(id).await }).await {
-                    Ok(true) => Ok(()),
-                    // The row was dropped on the assumption the write would
-                    // take. `false` says it did not (the space was already
-                    // archived, or is not there at all), so the removal was not
-                    // this operation's to claim — say so, and let the re-list
-                    // put the truth back.
-                    Ok(false) => Err(
-                        "Couldn't archive this space — it is no longer in your library."
-                            .to_string(),
-                    ),
-                    Err(e) => Err(format!("Couldn't archive this space: {e}")),
-                }
-            })
-        });
+        let row_id = space_id.clone();
+        self.write_then_relist(
+            space_id,
+            cx,
+            // Optimistic local removal — an edit of whatever value is present,
+            // so the cell's state is unchanged (a stale or failed-with-prior
+            // listing stays what it is; only its rows move).
+            move |rows| rows.retain(|s| s.id != row_id),
+            move |core| {
+                Box::pin(async move {
+                    match bridge(core, move |c| async move { c.archive_space(id).await }).await {
+                        Ok(true) => Ok(()),
+                        // The row was dropped on the assumption the write would
+                        // take. `false` says it did not (the space was already
+                        // archived, or is not there at all), so the removal was
+                        // not this operation's to claim — say so, and let the
+                        // re-list put the truth back.
+                        Ok(false) => Err(
+                            "Couldn't archive this space — it is no longer in your library."
+                                .to_string(),
+                        ),
+                        Err(e) => Err(format!("Couldn't archive this space: {e}")),
+                    }
+                })
+            },
+        );
+    }
+}
+
+/// Settle an index mutation: the write's outcome, the re-list's outcome, and the
+/// listing the optimistic edit replaced.
+///
+/// [`crate::stores::settle_mutation`] resolves the cell and hands back the
+/// refusal to record; the one thing it cannot know is that *this* store's cell
+/// was **edited in advance**. When the write is refused, the re-list is what
+/// takes that edit back — but a re-list can fail too, and then
+/// `Failed { prior }` keeps the cell's current rows on screen (the Library goes
+/// on showing them beside its retry, per "Failed is not empty"). Those rows
+/// would be the optimistic edit: a title `rename_space` refused, or a row a
+/// refused archive keeps hidden, standing until some later read happens to
+/// succeed. Reconciliation-by-re-list is exactly what is unavailable in that
+/// quadrant, so the snapshot is what keeps the promise instead.
+///
+/// **Order is load-bearing.** The restore lands *before* the resolve, so a
+/// **successful** re-list — fresh truth, and strictly later than any snapshot —
+/// supersedes it wholesale; the restore only ever fills the `prior` that a
+/// failed re-list keeps showing. And it is gated on the write being *refused*:
+/// a write that landed durably is honest to keep on screen even when the read
+/// behind it failed.
+fn settle_index_mutation(
+    index: &mut Loadable<Vec<SpaceInfo>>,
+    pre_optimistic: Option<Vec<SpaceInfo>>,
+    list: Result<Vec<SpaceInfo>, eidola_app_core::error::AppError>,
+    op: Result<(), String>,
+) -> Option<String> {
+    if op.is_err()
+        && let Some(pre) = pre_optimistic
+        && let Some(rows) = index.value_mut()
+    {
+        // Only where a value is present to be wrong: a cell holding no rows is
+        // showing no optimistic edit either.
+        *rows = pre;
+    }
+    crate::stores::settle_mutation(index, list, op)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SpaceInfo, settle_index_mutation};
+    use crate::loadable::Loadable;
+    use eidola_app_core::error::AppError;
+
+    fn row(id: &str, title: &str) -> SpaceInfo {
+        SpaceInfo {
+            id: id.into(),
+            title: Some(title.into()),
+            snippet: None,
+            created_at: 0,
+            last_activity_at: 0,
+            message_count: 0,
+            archived_at: None,
+        }
+    }
+
+    fn titles(cell: &Loadable<Vec<SpaceInfo>>) -> Vec<String> {
+        cell.value()
+            .map(|rows| rows.iter().filter_map(|r| r.title.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn read_err() -> AppError {
+        AppError::Internal {
+            message: "db read failed".into(),
+        }
+    }
+
+    /// The double-failure quadrant. The write was refused *and* the re-list that
+    /// would have taken the optimistic edit back failed too — so `Failed { prior }`
+    /// keeps the cell's rows on screen (the Library shows them beside its retry),
+    /// and those rows must not be the edit the database refused.
+    #[test]
+    fn a_refused_write_whose_relist_also_fails_shows_the_pre_edit_rows() {
+        // The cell as `rename` left it: optimistically renamed.
+        let mut cell = Loadable::loaded(vec![row("s1", "Nile")]);
+        let recorded = settle_index_mutation(
+            &mut cell,
+            Some(vec![row("s1", "Tides")]),
+            Err(read_err()),
+            Err("Couldn't rename this space: space not found: s1".into()),
+        );
+        assert_eq!(
+            titles(&cell),
+            vec!["Tides".to_string()],
+            "a name the database refused must not stand in as the prior snapshot"
+        );
+        assert!(
+            cell.error().is_some(),
+            "the read's failure still resolves the cell"
+        );
+        assert!(
+            recorded.is_some(),
+            "and the write's refusal still gets reported"
+        );
+    }
+
+    /// Archive's shape of the same quadrant: the row a refused archive removed
+    /// comes back rather than staying hidden behind a failed read.
+    #[test]
+    fn a_refused_archive_whose_relist_also_fails_puts_the_row_back() {
+        let mut cell = Loadable::loaded(vec![row("s2", "Bergamot")]);
+        settle_index_mutation(
+            &mut cell,
+            Some(vec![row("s1", "Tides"), row("s2", "Bergamot")]),
+            Err(read_err()),
+            Err("Couldn't archive this space — it is no longer in your library.".into()),
+        );
+        assert_eq!(
+            titles(&cell),
+            vec!["Tides".to_string(), "Bergamot".to_string()],
+            "the optimistic removal is undone when nothing else can undo it"
+        );
+    }
+
+    /// **Order matters.** A successful re-list is fresh truth and strictly later
+    /// than the snapshot, so it supersedes it — including a listing that moved
+    /// for reasons this operation knows nothing about.
+    #[test]
+    fn a_successful_relist_supersedes_the_snapshot() {
+        let mut cell = Loadable::loaded(vec![row("s1", "Nile")]);
+        settle_index_mutation(
+            &mut cell,
+            Some(vec![row("s1", "Tides")]),
+            Ok(vec![row("s1", "Renamed in another window")]),
+            Err("refused".into()),
+        );
+        assert_eq!(
+            titles(&cell),
+            vec!["Renamed in another window".to_string()],
+            "the re-list wins over the snapshot, never the other way round"
+        );
+        assert!(!cell.is_loading() && cell.error().is_none());
+    }
+
+    /// The restore is gated on the *write* failing: a write that landed durably
+    /// is honest to keep on screen even when the read behind it failed.
+    #[test]
+    fn an_accepted_write_whose_relist_fails_keeps_its_edit() {
+        let mut cell = Loadable::loaded(vec![row("s1", "Nile")]);
+        let recorded = settle_index_mutation(
+            &mut cell,
+            Some(vec![row("s1", "Tides")]),
+            Err(read_err()),
+            Ok(()),
+        );
+        assert_eq!(
+            titles(&cell),
+            vec!["Nile".to_string()],
+            "the rename persisted — showing it is the truth, not optimism"
+        );
+        assert_eq!(recorded, None);
     }
 }
