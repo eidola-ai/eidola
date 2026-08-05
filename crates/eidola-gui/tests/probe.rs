@@ -100,6 +100,108 @@ fn library_listing_is_a_named_list(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// The Library's one op-error banner: a refused create / rename / archive is an
+/// `Alert` whose label is the sentence itself (there is no `aria_live` at this
+/// pin, so an Alert is perceivable but silent — the message must therefore be
+/// what a reader lands on), beside a real Dismiss button.
+#[gpui::test]
+fn library_op_error_banner_is_an_alert_with_a_dismiss(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![space_info("s1", Some("Tides and the moon"))];
+    });
+    let refusal = "Couldn't rename this space: space not found: s1";
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(
+            Some("s1".into()),
+            Ok(vec![space_info("s1", Some("Tides and the moon"))]),
+            Some(refusal),
+            cx,
+        )
+    });
+    let stores_for_view = stores.clone();
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores_for_view, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(&entries, "library/op-error", gpui::Role::Alert, refusal);
+    assert_probe(
+        &entries,
+        "library/op-error/dismiss",
+        gpui::Role::Button,
+        "Dismiss",
+    );
+
+    // Dismissing is the store's, so the banner leaves every window at once.
+    stores.spaces.update(cx, |s, cx| s.clear_op_error(cx));
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries.iter().any(|(n, _)| n == "library/op-error"),
+        "a dismissed refusal leaves no banner behind"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **"Failed is not empty" for the Library.** A failed *initial* read leaves
+/// `list()` answering `&[]` exactly as a genuinely empty Library does, so the
+/// page used to render "Nothing here yet — ⌘N starts a new space": a read error
+/// stated as a fact about the reader's spaces, with no error, no retry, and ⌘N
+/// as the only way forward. The shared `load_error_panel` is the house answer.
+#[gpui::test]
+fn library_failed_initial_load_offers_a_retry_not_an_empty_page(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |_| {});
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(None, Err("database is locked"), None, cx)
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(&entries, "library/retry", gpui::Role::Button, "Retry");
+    assert!(
+        !entries.iter().any(|(n, _)| n == "library/list"),
+        "a failed initial read renders no listing to be mistaken for an empty one"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The other half: a failed *refresh* over a listing we still hold keeps the
+/// rows (never a blank page over a page we had) and adds the quiet retry — the
+/// state a write's unconditional re-list reaches when the write lands and the
+/// read behind it does not.
+#[gpui::test]
+fn library_failed_refresh_keeps_its_rows_and_offers_a_retry(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![space_info("s1", Some("Tides and the moon"))];
+    });
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(None, Err("database is locked"), None, cx)
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0",
+        gpui::Role::ListItem,
+        "Tides and the moon",
+    );
+    assert_probe(&entries, "library/retry", gpui::Role::Button, "Retry");
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn settings_nav_and_content_are_landmarks(cx: &mut TestAppContext) {
     use eidola_gui::settings::{SettingsPane, SettingsView};
@@ -4274,6 +4376,103 @@ fn space_inspector_failed_settings_read_offers_a_retry_not_a_default(cx: &mut Te
     assert!(
         !entries.iter().any(|(n, _)| n == "space/inspector/cascade"),
         "a failed read shows no plausible default"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **Neither refusal may stand in for the other.** The panel writes to two
+/// stores — the title goes through `SpacesStore` (the Library index), the rows
+/// through `SpaceSettingsStore` — and while one band chose between them, an
+/// older settings refusal shadowed a newer rename refusal: the title field
+/// snapped back to the stored name with nothing on screen to say why, and
+/// nothing ever cleared the settings refusal to reveal it. Both bands render,
+/// the title's first, and each carries its own dismiss.
+#[gpui::test]
+fn space_inspector_shows_a_title_refusal_beside_a_standing_settings_one(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.space_settings = Some(("s".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![space_info("s", Some("Tides"))];
+    });
+    // An older settings refusal, standing (nothing has cleared it)…
+    stores.space_settings.update(cx, |s, _| {
+        s.set_op_error_for_test("s", "Couldn't set the cascade limit: below the floor")
+    });
+    // …and then a rename this space refused, which is what the reader just
+    // watched undo itself in the title field.
+    stores.spaces.update(cx, |s, cx| {
+        s.settle_for_test(
+            Some("s".into()),
+            Ok(vec![space_info("s", Some("Tides"))]),
+            Some("Couldn't rename this space: space not found: s"),
+            cx,
+        )
+    });
+
+    let view_stores = stores.clone();
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                view_stores,
+                Some("s".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/inspector/title-error",
+        gpui::Role::Alert,
+        "Couldn't rename this space: space not found: s",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/error",
+        gpui::Role::Alert,
+        "Couldn't set the cascade limit: below the floor",
+    );
+    // Each is acknowledged on its own — the × says "I have read this", and the
+    // other fact stays on screen.
+    assert_probe(
+        &entries,
+        "space/inspector/title-error/dismiss",
+        gpui::Role::Button,
+        "Dismiss",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/error/dismiss",
+        gpui::Role::Button,
+        "Dismiss",
+    );
+
+    stores
+        .spaces
+        .update(cx, |s, cx| s.dismiss_op_error_for("s", cx));
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/inspector/title-error"),
+        "the dismissed refusal leaves"
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/error",
+        gpui::Role::Alert,
+        "Couldn't set the cascade limit: below the floor",
     );
 
     probe::set_probes_enabled(false);

@@ -28,6 +28,7 @@ use gpui_component::{
 
 use crate::actions::CloseWindow;
 use crate::focus::TabRegion as _;
+use crate::participants_view::load_error_panel;
 use crate::probe::Probe as _;
 use crate::stores::{SpacesStore, Stores};
 
@@ -671,10 +672,19 @@ impl Render for LibraryView {
             crate::titlebar::drag_band("library-titlebar", TITLE_BAR_RESERVE, window, cx);
         let theme = cx.theme();
         let count = self.spaces.read(cx).list().len();
-        // A "New Space from Template" failure is surfaced here (the natural home
-        // for a failed new-space) rather than silently discarded by its owning
-        // store task.
-        let new_space_error = self.spaces.read(cx).new_space_error().map(str::to_string);
+        // A refused space operation — a failed "New Space from Template", or a
+        // rename/archive the database would not take — is surfaced here rather
+        // than silently discarded by its owning store task. **One banner**: the
+        // Library is the window over the whole index, and a second strip for a
+        // second verb would only make the page shout.
+        let op_error = self.spaces.read(cx).op_error().map(str::to_string);
+        // The *read's* error is a different question from a write's refusal
+        // (STATE.md), so it gets its own two answers below rather than sharing
+        // the banner: "we couldn't load your spaces" and "we couldn't refresh
+        // them" are the reader's cue to retry, not to acknowledge.
+        let index = self.spaces.read(cx).index();
+        let load_error = index.error().map(|e| e.to_string());
+        let has_listing = index.has_value();
 
         let mut root = crate::chrome::round_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)
@@ -712,12 +722,14 @@ impl Render for LibraryView {
                 .child(div().h(px(1.)).flex_1().bg(theme.border)),
         );
 
-        // A failed "New Space from Template" — a dismissible danger strip.
-        if let Some(err) = new_space_error {
+        // A refused create / rename / archive — a dismissible strip. The store
+        // words the sentence (it knows which verb was refused); the banner just
+        // says it, quietly.
+        if let Some(err) = op_error {
             root = root.child(
                 h_flex()
-                    .id("library-new-space-error")
-                    .probe("library/new-space-error", gpui::Role::Alert, err.clone())
+                    .id("library-op-error")
+                    .probe("library/op-error", gpui::Role::Alert, err.clone())
                     .mx_10()
                     .mb_2()
                     .px_3()
@@ -733,26 +745,71 @@ impl Render for LibraryView {
                             .min_w_0()
                             .text_sm()
                             .text_color(theme.danger)
-                            .child(SharedString::from(format!(
-                                "Couldn't create the space: {err}"
-                            ))),
+                            .child(SharedString::from(err.clone())),
                     )
                     .child(
                         div()
-                            .id("library-new-space-error-dismiss")
-                            .probe(
-                                "library/new-space-error/dismiss",
-                                gpui::Role::Button,
-                                "Dismiss",
-                            )
+                            .id("library-op-error-dismiss")
+                            .probe("library/op-error/dismiss", gpui::Role::Button, "Dismiss")
                             .cursor_pointer()
                             .text_color(theme.muted_foreground)
                             .hover(|s| s.text_color(theme.foreground))
                             .child("×")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.spaces.update(cx, |s, cx| s.clear_new_space_error(cx));
+                                this.spaces.update(cx, |s, cx| s.clear_op_error(cx));
                             })),
                     ),
+            );
+        }
+
+        // "Failed is not empty" (STATE.md). A failed *initial* read has no
+        // listing to stand on, and `list()` answers `&[]` for it exactly as it
+        // does for a real empty Library — so without this branch a read error
+        // renders as "Nothing here yet", the friendliest possible lie: it states
+        // as fact the one thing we just failed to find out, and offers ⌘N as the
+        // only way forward. The shared panel says what happened and offers the
+        // door back (the Participants / Space Templates idiom).
+        if let Some(err) = &load_error
+            && !has_listing
+        {
+            return root.child(
+                h_flex()
+                    .flex_1()
+                    .w_full()
+                    .justify_center()
+                    .items_center()
+                    .child(load_error_panel(
+                        "library/retry",
+                        "Couldn't load your spaces.",
+                        err,
+                        cx,
+                        cx.listener(|this, _, _, cx| {
+                            this.spaces.update(cx, |s, cx| s.refresh(cx));
+                        }),
+                    )),
+            );
+        }
+
+        // A failed *refresh* over a listing we still hold keeps the listing —
+        // never a blank page over a page we had — and adds the quiet retry
+        // beside it. (Also the shape of an empty-but-stale Library: the rows
+        // are honest as of the last read, and the strip says the last read is
+        // no longer the last word.)
+        if load_error.is_some() {
+            root = root.child(
+                h_flex().w_full().px_10().pb_2().justify_center().child(
+                    div()
+                        .id("library-refresh-retry")
+                        .probe("library/retry", gpui::Role::Button, "Retry")
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .hover(|s| s.text_color(theme.foreground))
+                        .child("Couldn't refresh — retry")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.spaces.update(cx, |s, cx| s.refresh(cx));
+                        })),
+                ),
             );
         }
 
