@@ -12,6 +12,7 @@ pub mod general;
 pub mod library;
 pub mod lifecycle;
 pub mod loadable;
+pub mod login_item;
 pub mod onboarding;
 pub mod overlay;
 pub mod participants_view;
@@ -23,6 +24,7 @@ pub mod settings;
 pub mod solar;
 pub mod space;
 pub mod space_view;
+pub mod status_item;
 pub mod stores;
 pub mod templates_settings;
 pub mod theme;
@@ -42,7 +44,8 @@ use crate::about::AboutView;
 use crate::actions::{
     About, ActualSize, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize,
     NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenParticipants, OpenRecord, OpenSettings, Quit,
-    Quote, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn, ZoomOut,
+    QuitApp, Quote, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn,
+    ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::lifecycle::LaunchOptions;
@@ -99,8 +102,10 @@ pub fn run() {
 /// this; tests do not call this — they use `tests/visual.rs` instead.
 ///
 /// **The process outlives its windows** (task 17 wave 2) — see
-/// [`crate::lifecycle`] for the seams and the per-platform rules. Quit
-/// (`⌘Q` / the menu) stays a full shutdown: engines, everything.
+/// [`crate::lifecycle`] for the seams and the per-platform rules. On macOS
+/// ⌘Q retires it to the background behind the status item rather than ending
+/// it (wave 3b, [`crate::status_item`]); the full shutdown is the status
+/// menu's own Quit.
 pub fn run_with(opts: LaunchOptions) {
     let application = gpui_platform::application()
         .with_assets(Assets)
@@ -118,14 +123,7 @@ pub fn run_with(opts: LaunchOptions) {
     // than `Self` so we can't chain it before `run()` (which consumes by
     // value). On Linux gpui stores the callback and nothing ever fires it —
     // there is no platform mechanism; that door is the wave-4 socket.
-    application.on_reopen(|cx: &mut App| {
-        lifecycle::reactivate(cx, |cx| {
-            // A reopen can in principle arrive before launch finishes.
-            if cx.has_global::<AppGlobal>() {
-                open_library_window(cx);
-            }
-        });
-    });
+    application.on_reopen(|cx: &mut App| reactivate_app(cx));
 
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
@@ -181,8 +179,10 @@ pub fn run_with(opts: LaunchOptions) {
         // the next time one opens — no banners in chat windows.
         stores.update.read(cx).start_polling();
 
-        // Quit is a full shutdown — engines, everything (decided). On macOS
-        // this hook is the only thing that delivers it; see
+        // The *full* shutdown drains the engines — and on macOS this hook
+        // is the only thing that delivers it. ⌘Q no longer reaches it (it
+        // retires the app instead, keeping the engines up, which is the
+        // point); the status menu's Quit and a windowless SIGTERM do. See
         // `lifecycle::install_engine_shutdown`.
         lifecycle::install_engine_shutdown(&stores, bus_bridge, cx);
 
@@ -206,6 +206,13 @@ pub fn run_with(opts: LaunchOptions) {
         // (the sanctioned detach); `install_menus` is idempotent.
         cx.observe(&stores.templates, |_, cx| install_menus(cx))
             .detach();
+
+        // The menu-bar face — and, because it exists, the thing ⌘Q retires
+        // *into* (task 17 waves 3/3b). After the action handlers, because
+        // the status menu dispatches them; before any window opens, because
+        // `base_window_options` asks it to assert `Regular`. A windowless
+        // macOS launch gets one too — that is exactly the toolbar-app shape.
+        status_item::install(&stores, opts, cx);
 
         // Windowless: the process *is* the app — no window at launch, no
         // foreground activation, and (per `lifecycle::quit_mode`) nothing
@@ -247,6 +254,9 @@ pub fn run_with(opts: LaunchOptions) {
             .unwrap_or(false);
         match stores.app_core().filter(|_| needs_account) {
             Some(core) => {
+                // A cold start can be slow enough to ⌘Q through; see
+                // `lifecycle::OpenIntent`.
+                let intent = lifecycle::intend_to_open(cx);
                 let task: gpui::Task<()> = cx.spawn(async move |cx: &mut gpui::AsyncApp| {
                     let backends =
                         crate::bridge::bridge(core, |c| async move { c.list_backends().await })
@@ -258,6 +268,9 @@ pub fn run_with(opts: LaunchOptions) {
                         // the window is dismissible; a silent skip is not.
                         .unwrap_or(true);
                     cx.update(|cx| {
+                        if !intent.still_wanted(cx) {
+                            return;
+                        }
                         if eidola_enabled {
                             open_onboarding_window(cx);
                         } else {
@@ -271,6 +284,21 @@ pub fn run_with(opts: LaunchOptions) {
                 task.detach();
             }
             None => open_main_window(cx),
+        }
+    });
+}
+
+/// The app's door back in when it has been running without a face: focus a
+/// window, or open the Library when there is none.
+///
+/// Shared by `Application::on_reopen` (Dock click, Spotlight, a second
+/// `open -a Eidola`) and the status menu's "Open Eidola" — one behaviour, so
+/// the two can never drift.
+pub(crate) fn reactivate_app(cx: &mut App) {
+    lifecycle::reactivate(cx, |cx| {
+        // A reopen can in principle arrive before launch finishes.
+        if cx.has_global::<AppGlobal>() {
+            open_library_window(cx);
         }
     });
 }
@@ -487,7 +515,16 @@ pub fn install_keybindings(cx: &mut App) {
 }
 
 fn install_action_handlers(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx: &mut App| {
+    // ⌘Q is now two-tier (task 17 wave 3b). Where a background layer exists —
+    // macOS with a status item standing — it retires into it: windows close,
+    // the Dock indicator goes, the process and its loaded engines stay. Where
+    // one does not (no status item; every non-macOS build, whose background
+    // layer is the systemd user service, not a tray), it is the full shutdown
+    // it has always been. Ending the process deliberately is `QuitApp`, which
+    // the status menu's "Quit Eidola" raises.
+    cx.on_action(|_: &Quit, cx: &mut App| status_item::quit_or_retire(cx));
+
+    cx.on_action(|_: &QuitApp, cx: &mut App| {
         cx.quit();
     });
 
@@ -750,7 +787,22 @@ fn centered_window_bounds(cx: &mut App, w: f32, h: f32) -> Option<WindowBounds> 
 /// `chrome::ChromeRoot` is actually see-through) and the Wayland `app_id`
 /// (matching the shipped `.desktop` file so the shell can associate windows
 /// with the app's identity and icon).
-fn base_window_options(bounds: Option<WindowBounds>, min_w: f32, min_h: f32) -> WindowOptions {
+///
+/// **It is also the one choke point every window open passes through**, and
+/// therefore the single door out of the retired-to-the-background state
+/// (`status_item::window_will_open`, which asserts `Regular`) — an
+/// `Accessory` app has no menu bar, so a window opened without it would
+/// appear under someone else's. Taking `cx` for a side effect is deliberate:
+/// putting the call here rather than in each `open_*_window` makes "open a
+/// window while `Accessory`" unrepresentable, and it covers every reopen path
+/// at once (the status menu, Spotlight, `open -a`, `on_reopen`).
+fn base_window_options(
+    cx: &mut App,
+    bounds: Option<WindowBounds>,
+    min_w: f32,
+    min_h: f32,
+) -> WindowOptions {
+    status_item::window_will_open(cx);
     WindowOptions {
         window_bounds: bounds,
         titlebar: Some(transparent_titlebar()),
@@ -777,7 +829,7 @@ const APP_ID: &str = "tech.m6i.Eidola";
 /// license note, and a "View on GitHub" link.
 fn open_about_window(cx: &mut App) {
     let bounds = centered_window_bounds(cx, 360., 420.);
-    let opts = base_window_options(bounds, 300., 340.);
+    let opts = base_window_options(cx, bounds, 300., 340.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -834,7 +886,7 @@ fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
     // Square chat window — a sheet of paper, not a wide chat pane.
     let side = writing_surface_side(cx);
     let bounds = centered_window_bounds(cx, side, side);
-    let opts = base_window_options(bounds, 480., 360.);
+    let opts = base_window_options(cx, bounds, 480., 360.);
 
     let _ = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -857,7 +909,7 @@ fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
 fn open_library_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 520., 620.);
-    let opts = base_window_options(bounds, 380., 320.);
+    let opts = base_window_options(cx, bounds, 380., 320.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -878,7 +930,7 @@ fn open_library_window(cx: &mut App) {
 fn open_updates_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 480., 360.);
-    let opts = base_window_options(bounds, 420., 300.);
+    let opts = base_window_options(cx, bounds, 420., 300.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -900,7 +952,7 @@ fn open_updates_window(cx: &mut App) {
 fn open_record_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 860., 640.);
-    let opts = base_window_options(bounds, 560., 400.);
+    let opts = base_window_options(cx, bounds, 560., 400.);
 
     // The view is minted inside the window builder; capture it on the way out
     // so a deep link can reach it later (see `AppGlobal::record_view`).
@@ -955,7 +1007,7 @@ fn open_onboarding_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let side = writing_surface_side(cx);
     let bounds = centered_window_bounds(cx, side, side);
-    let opts = base_window_options(bounds, 480., 360.);
+    let opts = base_window_options(cx, bounds, 480., 360.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -982,7 +1034,7 @@ pub fn open_participants_window(
     space_title: Option<String>,
 ) {
     let bounds = centered_window_bounds(cx, 520., 620.);
-    let opts = base_window_options(bounds, 400., 340.);
+    let opts = base_window_options(cx, bounds, 400., 340.);
 
     let _ = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
@@ -1008,7 +1060,7 @@ pub fn open_participants_window(
 fn open_settings_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 620., 520.);
-    let opts = base_window_options(bounds, 420., 320.);
+    let opts = base_window_options(cx, bounds, 420., 320.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);

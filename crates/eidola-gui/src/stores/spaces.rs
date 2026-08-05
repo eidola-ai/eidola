@@ -381,6 +381,9 @@ impl SpacesStore {
             return;
         };
         self.clear_op_error_for(None);
+        // The space commits durably either way; only its window is abandoned
+        // if the app retires meanwhile (`lifecycle::OpenIntent`).
+        let intent = crate::lifecycle::intend_to_open(cx);
         let key = self.next_create_op;
         self.next_create_op += 1;
         self.create_ops.insert(
@@ -396,7 +399,9 @@ impl SpacesStore {
                         // already committed (and emitted `Change::SpaceIndex`),
                         // so even if this update is missed the Library reflects it.
                         cx.update(|cx| {
-                            crate::open_space_window(cx, stores.clone(), space.id);
+                            if intent.still_wanted(cx) {
+                                crate::open_space_window(cx, stores.clone(), space.id);
+                            }
                         });
                     }
                     Err(e) => {

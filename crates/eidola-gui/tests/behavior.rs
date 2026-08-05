@@ -30,6 +30,7 @@ use eidola_gui::participants_view::{EditMode, ParticipantsView};
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
 use eidola_gui::space_view::SpaceView;
+use eidola_gui::space_view::model::streaming_node_id;
 use eidola_gui::stores::{self, Stores, StoresStub};
 use eidola_gui::templates_settings::TemplatesSettingsView;
 use eidola_gui::updates::{UpdatesDisplay, UpdatesView, relative_time};
@@ -3421,6 +3422,638 @@ fn space_tail_ask_discards_empty_draft(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_ask_selects_the_new_branch_the_reply_will_stream_in(cx: &mut TestAppContext) {
+    // Asking about a post that has *already* been replied to forks a new
+    // branch: the streaming leaf is a second child of the target, and the
+    // target's strip is resting on the first. Selecting the target's path
+    // alone left the strip where it was, so the reply streamed on a branch the
+    // reader never saw (task 46, bug 3) — the ask must select the branch its
+    // own turn lands on.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = fixture_assistant_post("a2", "the first answer");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "a question"), a2], cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    // Resting on the existing reply.
+    let before = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        before.contains(&"a2".to_string()),
+        "the reader starts on the existing reply's branch ({before:?})"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-b".into(), "a1".into(), window, cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let seq = view.read_with(cx, |v, cx| v.space().read(cx).streams()[0].seq);
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&streaming_node_id(seq).to_string()),
+        "the ask selects the branch its own turn streams in ({path:?})"
+    );
+    assert!(
+        !path.contains(&"a2".to_string()),
+        "and leaves the sibling branch it forked away from ({path:?})"
+    );
+}
+
+#[gpui::test]
+fn space_ask_selects_the_reply_when_the_turn_lands_before_the_next_render(cx: &mut TestAppContext) {
+    // The ordering edge of the test above. Nothing sequences a render between
+    // the ask and its turn's completion: gpui draws from the platform's frame
+    // callback (`flush_effects` draws only in test builds), while a turn's
+    // completion is an ordinary foreground-task update — so a turn that lands
+    // fast (a decline, an immediate refusal, a cached answer) removes its
+    // streaming entry and puts the persisted response in its place *before*
+    // any frame runs. A selection deferred by streaming-leaf id then names a
+    // node that no longer exists and is dropped: bug 3 again, one frame later.
+    // Modelled by doing both in one update — gpui flushes effects, and only
+    // then draws, when the outermost update unwinds.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = fixture_assistant_post("a2", "the first answer");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", "the second answer");
+    a3.parent_action_id = Some("a1".into());
+    let before_tree = vec![fixture_user_post("a1", "a question"), a2.clone()];
+    let after_tree = vec![fixture_user_post("a1", "a question"), a2, a3];
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(before_tree, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-b".into(), "a1".into(), window, cx)
+        });
+        let seq = space.read(cx).streams()[0].seq;
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(seq, after_tree, false, cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&"a3".to_string()),
+        "the reply the ask started must be selected even when its turn \
+         finished before the selection could be consumed ({path:?})"
+    );
+    assert!(
+        !path.contains(&"a2".to_string()),
+        "and the branch it forked away from is left behind ({path:?})"
+    );
+}
+
+#[gpui::test]
+fn space_ask_that_lands_pre_render_settles_at_the_end_of_the_answer(cx: &mut TestAppContext) {
+    // The ask parks the reader at the end of the branch its turn lands on. When
+    // the turn is still streaming that end is the answer's end — but a turn
+    // that completed before the render is followed onto its *post*, and by the
+    // time the request is consumed `sync_tail_drafts` has already docked a
+    // fresh composer under it. Settling at the document end then scrolls
+    // straight past the answer into the draft's window of runway: bug 2's
+    // overshoot, reached through bug 3's path. "The end" has one definition —
+    // the end of what was written.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long)], cx)
+        });
+    })
+    .unwrap();
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Ask, and the turn lands before the next frame.
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-b".into(), "a1".into(), window, cx)
+        });
+        let seq = space.read(cx).streams()[0].seq;
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(seq, vec![fixture_user_post("a1", &long), a2], false, cx)
+        });
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.draft_parents_for_test().contains(&Some("a2".to_string())),
+            "the finished exchange grew its tail draft ({:?})",
+            v.draft_parents_for_test()
+        );
+        let doc_end = v.scroll_min_y_for_test();
+        let content_end = v.content_end_for_test();
+        let offset = v.page_scroll_offset_y_for_test();
+        assert!(
+            content_end > doc_end + 1.0,
+            "the trailing draft's runway is what separates the two (content \
+             end {content_end}, document end {doc_end})"
+        );
+        assert!(
+            (offset - content_end).abs() < 2.0,
+            "the ask settles at the end of the answer, not past it (offset \
+             {offset}, content end {content_end}, document end {doc_end})"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_newer_ask_outranks_a_completing_turns_retarget(cx: &mut TestAppContext) {
+    // Two aims at once: the reader is parked on turn A's stream *and* has just
+    // asked B, so B's leaf is the pending request. If A then lands before the
+    // next render, following A onto its post must not overwrite that request —
+    // a pending selection is the reader's latest ask, and the newest intent
+    // wins. Otherwise the ask silently does nothing and the reader stays on
+    // the answer they had already read.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "a question")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Parked on the first participant's stream.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-b".into(), "a1".into(), window, cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+    let first = view.read_with(cx, |v, cx| v.space().read(cx).streams()[0].seq);
+
+    // Ask a second participant, and the first turn lands before either can
+    // render.
+    let mut a2 = fixture_assistant_post("a2", "the first agent's answer");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.ask_participant("agent-c".into(), "a1".into(), window, cx)
+        });
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(
+                first,
+                vec![fixture_user_post("a1", "a question"), a2],
+                false,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let second = view.read_with(cx, |v, cx| v.space().read(cx).streams()[0].seq);
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&streaming_node_id(second).to_string()),
+        "the reader's newest ask wins over the older turn's landing ({path:?})"
+    );
+    assert!(
+        !path.contains(&"a2".to_string()),
+        "so the completed turn's post does not steal the selection ({path:?})"
+    );
+}
+
+#[gpui::test]
+fn space_selected_turn_keeps_its_branch_when_it_lands_before_its_sibling(cx: &mut TestAppContext) {
+    // The same swap, one frame later: the reader is already *parked* on a
+    // turn's streaming leaf when that turn lands. Branch selection is
+    // positional (a strip's scroll offset → child index), and a turn's
+    // persisted response is inserted among the target's *posts*, ahead of any
+    // still-streaming sibling overlay. So in a fan-out where the selected
+    // (later) turn completes first, the index the reader is resting on now
+    // addresses the *other* participant's stream, and the view switches away
+    // from the answer they were reading. Selection has to follow the turn
+    // through its completion, the way drafts and tree focus follow item
+    // identity across a rebuild.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "a question")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Two participants answer the same post: two concurrent turns, ordered
+    // siblings under it.
+    for agent in ["agent-b", "agent-c"] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.ask_participant(agent.into(), "a1".into(), window, cx)
+            });
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+    }
+    let (first, second) = view.read_with(cx, |v, cx| {
+        let s = v.space().read(cx);
+        (s.streams()[0].seq, s.streams()[1].seq)
+    });
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&streaming_node_id(second).to_string()),
+        "the reader is parked on the second turn's stream ({path:?})"
+    );
+
+    // The turn they are reading lands first.
+    let mut a3 = fixture_assistant_post("a3", "the second agent's answer");
+    a3.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(
+                second,
+                vec![fixture_user_post("a1", "a question"), a3],
+                false,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&"a3".to_string()),
+        "the reader stays on the reply they were reading once it persists \
+         ({path:?})"
+    );
+    assert!(
+        !path.contains(&streaming_node_id(first).to_string()),
+        "and is not swapped onto the other participant's stream ({path:?})"
+    );
+}
+
+#[gpui::test]
+fn space_two_turns_landing_together_keep_a_scrolled_away_reader_still(cx: &mut TestAppContext) {
+    // A settle mode records the *reader's* situation: parked means don't move
+    // them, asked means take them there. When a sibling turn lands first, the
+    // reader's own branch is preserved with `Stay` — and if their turn then
+    // lands too, before any frame consumed that request, re-aiming it onto the
+    // written post must forward the node identity **only**. Upgrading the
+    // settle to `BranchEnd` would scroll a reader who had deliberately gone
+    // back up the branch down to the tail of a reply they never asked to be
+    // taken to.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long)], cx)
+        });
+    })
+    .unwrap();
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Two participants answer at once; the ask leaves the reader on the second.
+    for agent in ["agent-b", "agent-c"] {
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.ask_participant(agent.into(), "a1".into(), window, cx)
+            });
+        });
+        vcx.run_until_parked();
+    }
+    let (first, second) = view.read_with(&vcx, |v, cx| {
+        let s = v.space().read(cx);
+        (s.streams()[0].seq, s.streams()[1].seq)
+    });
+
+    // The reader goes back up their own branch to re-read the question.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+    let parked_at = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    // Both turns land before the next frame — the sibling first.
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", &long);
+    a3.parent_action_id = Some("a1".into());
+    let question = fixture_user_post("a1", &long);
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(first, vec![question.clone(), a2.clone()], false, cx);
+            s.apply_turn_success_for_test(second, vec![question.clone(), a2, a3], false, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let path = vcx.update(|window, cx| view.read(cx).selected_effective_path_for_test(window, cx));
+    assert!(
+        path.contains(&"a3".to_string()),
+        "the reader keeps the branch they were reading ({path:?})"
+    );
+    let offset = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    let content_end = view.read_with(&vcx, |v, _| v.content_end_for_test());
+    assert!(
+        content_end < parked_at - 1.0,
+        "the answers must have given the page somewhere to be dragged to \
+         (parked at {parked_at}, content end {content_end})"
+    );
+    assert!(
+        (offset - parked_at).abs() < 2.0,
+        "and they are left where they scrolled to, not carried to the reply's \
+         tail (offset {offset}, parked at {parked_at}, content end \
+         {content_end})"
+    );
+}
+
+#[gpui::test]
+fn space_dot_chosen_branch_survives_its_turn_landing_at_once(cx: &mut TestAppContext) {
+    // The instant arm of a dot switch (reduce-motion, or a strip already at the
+    // target) writes the strip offset directly and returns — so nothing records
+    // which child the reader chose. If that child's own turn then lands before
+    // the next frame, the completion finds neither a pending request nor a
+    // parked seq, and the reader is left on an index that now addresses the
+    // *other* participant's stream: the same positional shift, entering through
+    // the one switch that never told anyone where it went.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "a question")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // Three concurrent turns, so switching to the *middle* one is a real move
+    // whose landing shifts the index under the reader (its post is inserted
+    // ahead of every remaining stream).
+    for agent in ["agent-b", "agent-c", "agent-d"] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.ask_participant(agent.into(), "a1".into(), window, cx)
+            });
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+    }
+    let (first, middle) = view.read_with(cx, |v, cx| {
+        let s = v.space().read(cx);
+        (s.streams()[0].seq, s.streams()[1].seq)
+    });
+
+    // Click to the middle participant, and let *its* turn land before the next
+    // frame.
+    let mut a2 = fixture_assistant_post("a2", "the middle agent's answer");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.click_branch_dot_for_test("a1", 1, window, cx));
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(
+                middle,
+                vec![fixture_user_post("a1", "a question"), a2],
+                false,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&"a2".to_string()),
+        "the branch the reader clicked to carries them onto its answer \
+         ({path:?})"
+    );
+    assert!(
+        !path.contains(&streaming_node_id(first).to_string()),
+        "not onto the stream that slid into the index they were on ({path:?})"
+    );
+}
+
+#[gpui::test]
+fn space_dot_chosen_branch_survives_a_sibling_landing_mid_switch(cx: &mut TestAppContext) {
+    // The animating arm of the same switch. The strip slides over several
+    // frames, and each of those frames observes the *rounded* offset — which is
+    // still the branch being left. A sibling turn landing mid-slide therefore
+    // read the old child as "parked", re-selected it by identity, and cancelled
+    // the snap: the reader's switch silently undone by a completion. What a
+    // switch knows at click time is its destination, and that is what must
+    // stand until it lands.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "a question")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for agent in ["agent-b", "agent-c"] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.ask_participant(agent.into(), "a1".into(), window, cx)
+            });
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+    }
+    let (first, second) = view.read_with(cx, |v, cx| {
+        let s = v.space().read(cx);
+        (s.streams()[0].seq, s.streams()[1].seq)
+    });
+
+    // Switch back to the first participant. The snap animates (no test
+    // dispatcher pumps its frame loop, which is exactly the mid-slide state).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.click_branch_dot_for_test("a1", 0, window, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    // The branch they are *leaving* lands.
+    let mut a2 = fixture_assistant_post("a2", "the second agent's answer");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(
+                second,
+                vec![fixture_user_post("a1", "a question"), a2],
+                false,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&streaming_node_id(first).to_string()),
+        "the reader arrives where they were heading ({path:?})"
+    );
+    assert!(
+        !path.contains(&"a2".to_string()),
+        "the landing turn does not pull them back to the branch they left \
+         ({path:?})"
+    );
+}
+
+#[gpui::test]
+fn space_newer_branch_navigation_outranks_the_cached_turn_when_it_lands(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "a question")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    for agent in ["agent-b", "agent-c"] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.ask_participant(agent.into(), "a1".into(), window, cx)
+            });
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+    }
+    let (first, second) = view.read_with(cx, |v, cx| {
+        let s = v.space().read(cx);
+        (s.streams()[0].seq, s.streams()[1].seq)
+    });
+
+    // The last frame cached `second`; now navigate to `first` without drawing
+    // another frame before `second` completes.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.select_effective_path_for_test(&streaming_node_id(first), window, cx)
+        });
+    })
+    .unwrap();
+    let mut response = fixture_assistant_post("a3", "the second agent's answer");
+    response.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(
+                second,
+                vec![fixture_user_post("a1", "a question"), response],
+                false,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    let path = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).selected_effective_path_for_test(window, cx)
+        })
+        .unwrap();
+    assert!(
+        path.contains(&streaming_node_id(first).to_string()),
+        "the newer branch navigation survives the old turn landing ({path:?})"
+    );
+    assert!(
+        !path.contains(&"a3".to_string()),
+        "the stale selected-turn cache does not restore the completed reply ({path:?})"
+    );
+}
+
+#[gpui::test]
 fn space_tail_ask_keeps_nonempty_draft_as_its_own_branch(cx: &mut TestAppContext) {
     // The tail-draft rule, non-empty half: a draft with content is kept
     // exactly as it is — it becomes its own sibling branch beside the incoming
@@ -4694,6 +5327,61 @@ fn space_streaming_tail_follows_when_parked_at_the_end(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+fn space_streaming_tail_yields_to_a_navigation_glide(cx: &mut TestAppContext) {
+    // A reader parked at the tail who asks to be taken somewhere is on their
+    // way — the glide owns the page until it lands. Following and the glide are
+    // the only two motions that span frames, and both write the offset every
+    // frame (each delta moves "the end"), so without the stand-down the
+    // follower takes the page straight back — through the very seam that lets
+    // an instant scroll retire a glide, on the first frame after the
+    // navigation.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let seq = seed_streaming_tall_space(&view, window, cx);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+    let end = view.read_with(&vcx, |v, _| v.scroll_min_y_for_test());
+
+    // Taken to the top of the conversation, mid-stream.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.navigate_to_action("a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.page_glide_target_for_test())
+            .is_some(),
+        "the navigation armed a glide"
+    );
+    view.update(&mut vcx, |v, _| v.drive_page_glide_for_test(0.4));
+    let mid = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    // The reply keeps coming while the reader travels.
+    space.update(&mut vcx, |s, cx| {
+        s.push_content_delta_for_test(seq, &"streamed answer line\n".repeat(60), cx)
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let grown = v.scroll_min_y_for_test();
+        assert!(
+            grown < end - 1.0,
+            "the streamed reply grew the document ({end} -> {grown})"
+        );
+        assert!(
+            (v.page_scroll_offset_y_for_test() - mid).abs() < 2.0,
+            "the traveling reader is not dragged back to the tail (offset {}, \
+             on the glide at {mid}, new end {grown})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
 fn space_streaming_tail_does_not_yank_a_reader_who_scrolled_away(cx: &mut TestAppContext) {
     // The other half of the contract: a reader who has scrolled back up to
     // re-read something must be left exactly where they are, however much the
@@ -4827,6 +5515,101 @@ fn space_streaming_tail_ignores_a_sibling_branchs_stream(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn space_following_reader_stops_at_the_end_of_the_streamed_content(cx: &mut TestAppContext) {
+    // When the stream ends, the finished exchange grows a fresh tail draft — a
+    // whole window of empty runway. A reader who was following the tail must
+    // come to rest at the end of what was *written*, not be carried down into
+    // the speculative reply below it (task 46, bug 2). The window is real: the
+    // turn runner reloads the tree and re-plans the cascade after its stream
+    // entry is gone, so the space is still busy (and the reader still pinned)
+    // while `sync_tail_drafts` docks the new composer.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2], cx)
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Post, then watch the answer stream in (the pin is armed by the post).
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a2".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the draft is the active composer");
+    editor.update(&mut vcx, |e, cx| e.set_value("a new post", cx));
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| focus.dispatch_action(&Send, window, cx));
+    vcx.run_until_parked();
+
+    let seq = view.read_with(&vcx, |v, cx| v.space().read(cx).streams()[0].seq);
+    space.update(&mut vcx, |s, cx| {
+        s.push_content_delta_for_test(seq, &"streamed answer line\n".repeat(60), cx)
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            (v.page_scroll_offset_y_for_test() - v.scroll_min_y_for_test()).abs() < 2.0,
+            "while streaming, the end of content *is* the end of the document"
+        );
+    });
+
+    // The stream closes; the runner is still settling (the post runner stands
+    // in for it), so the pin still holds while the tail draft appears.
+    let mut a2b = fixture_assistant_post("a2", &long);
+    a2b.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "a new post");
+    a3.parent_action_id = Some("a2".into());
+    let mut a4 = fixture_assistant_post("a4", &"streamed answer line\n".repeat(60));
+    a4.parent_action_id = Some("a3".into());
+    space.update(&mut vcx, |s, cx| {
+        s.finish_streaming_turn_for_test(seq, cx);
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2b, a3, a4], cx);
+        s.arm_post_runner_for_test(cx);
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.tail_pin_for_test(),
+            "the pin outlives the stream while the turn settles"
+        );
+        assert!(
+            v.draft_parents_for_test().contains(&Some("a4".to_string())),
+            "the finished exchange grew its tail draft"
+        );
+        let doc_end = v.scroll_min_y_for_test();
+        let content_end = v.content_end_for_test();
+        let offset = v.page_scroll_offset_y_for_test();
+        assert!(
+            content_end > doc_end + 1.0,
+            "the trailing draft's runway is what separates the two \
+             (content end {content_end}, document end {doc_end})"
+        );
+        assert!(
+            (offset - content_end).abs() < 2.0,
+            "the reader rests at the end of the streamed content, not at the \
+             end of the document (offset {offset}, content end {content_end}, \
+             document end {doc_end})"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_post_parks_the_reader_at_the_tail_and_holds_it_there(cx: &mut TestAppContext) {
     // Posting from a reader parked anywhere (here: the top of a long space)
     // must land them at the *end* of the branch the post joined — including the
@@ -4924,10 +5707,15 @@ fn space_post_parks_the_reader_at_the_tail_and_holds_it_there(cx: &mut TestAppCo
             after < end - 1.0,
             "the persisted post must have moved the document end ({end} -> {after})"
         );
+        // "The end" the pin holds is the end of the *written* content: by now
+        // the exchange has grown its tail draft, whose runway is not something
+        // to follow into (see `space_following_reader_stops_at_the_end_of_the_
+        // streamed_content`).
+        let content_end = v.content_end_for_test();
         assert!(
-            (v.page_scroll_offset_y_for_test() - after).abs() < 2.0,
+            (v.page_scroll_offset_y_for_test() - content_end).abs() < 2.0,
             "the reader is held at the end across the save (offset {} should \
-             track the new end {after})",
+             track the new content end {content_end}; document end {after})",
             v.page_scroll_offset_y_for_test()
         );
     });
@@ -7514,6 +8302,269 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_navigation_glides_to_its_destination_instead_of_jumping(cx: &mut TestAppContext) {
+    // "See in context", a footnote row, a highlight's referencer: every
+    // navigation that takes the reader somewhere in *this* space animates the
+    // travel (task 46, bug 4). A jump gives no sense of where you were taken
+    // from; the glide carries the intervening page past you. The landing is
+    // still exact.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2], cx)
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+    let from = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    assert!(
+        from < -100.0,
+        "the reader starts well down the page ({from})"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.navigate_to_action("a1".into(), window, cx));
+    });
+
+    let (target, mid) = view.read_with(&vcx, |v, _| {
+        (
+            v.page_glide_target_for_test(),
+            v.page_scroll_offset_y_for_test(),
+        )
+    });
+    let target = target.expect("navigating arms a glide rather than jumping");
+    assert!(
+        (mid - target).abs() > 1.0,
+        "the page has not teleported to the destination (offset {mid}, \
+         destination {target})"
+    );
+
+    // It still lands exactly, and the glide retires itself. (Driven by hand:
+    // no test dispatcher pumps `on_next_frame`, so the frame loop's body is
+    // exercised through its own seam.)
+    view.update(&mut vcx, |v, _| v.drive_page_glide_for_test(0.5));
+    let half = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    assert!(
+        half > from + 1.0 && half < target - 1.0,
+        "mid-glide the page is between where it was and where it is going \
+         (from {from}, half {half}, destination {target})"
+    );
+    view.update(&mut vcx, |v, _| v.drive_page_glide_for_test(1.0));
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "the glide retires when it arrives"
+        );
+        assert!(
+            (v.page_scroll_offset_y_for_test() - target).abs() < 1.0,
+            "and lands exactly on the destination (offset {}, destination \
+             {target})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_keyboard_navigation_takes_the_page_from_a_glide_in_flight(cx: &mut TestAppContext) {
+    // A glide owns `page_scroll` until something else takes it. The wheel and
+    // the minimap say so (`note_scroll_activity` / `minimap_press`); the
+    // *programmatic instant* scrolls did not, so a keyboard move (or a caret
+    // reveal, or a post settling) wrote an offset the glide's next frame
+    // overwrote from its own trajectory — the reader's own navigation undone,
+    // repeatedly, until the glide landed.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2], cx)
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+    let from = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    // Taken to the top of the conversation — a glide, in flight.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.navigate_to_action("a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    let target = view
+        .read_with(&vcx, |v, _| v.page_glide_target_for_test())
+        .expect("navigating arms a glide");
+
+    // Mid-flight the reader navigates themselves: arrow into the conversation,
+    // which reveals the focused post instantly.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    let after = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    assert!(
+        (after - from).abs() > 1.0,
+        "the keyboard reveal moved the page ({from} -> {after})"
+    );
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "an instant scroll takes the page from the glide, rather than \
+             leaving it to be overwritten (destination {target})"
+        );
+    });
+
+    // And the frame that would have continued the glide moves nothing.
+    view.update(&mut vcx, |v, _| v.drive_page_glide_for_test(0.5));
+    let settled = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    assert!(
+        (settled - after).abs() < 1.0,
+        "the reader stays where their own navigation put them (offset \
+         {settled}, expected {after}; the abandoned glide ran from {from} to \
+         {target})"
+    );
+}
+
+#[gpui::test]
+fn space_branch_dot_takes_the_page_from_a_glide_in_flight(cx: &mut TestAppContext) {
+    // A branch dot switches *horizontally*, so it writes no page offset of its
+    // own — but it changes which document the page is scrolling through, which
+    // makes an in-flight vertical glide's trajectory meaningless: it was aimed
+    // at a `y` on the branch the reader just left, and kept dragging them
+    // there. The other reader-driven takeovers already say so (the wheel via
+    // `note_scroll_activity`, the minimap via `minimap_press`, the keyboard
+    // through the instant-scroll door); the dot was the gap.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    // A short root keeps its band (and its branch dots) on screen at the top of
+    // the page; the long replies below give the glide somewhere to travel.
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", &long);
+    a3.parent_action_id = Some("a1".into());
+    let mut a4 = fixture_user_post("a4", &long);
+    a4.parent_action_id = Some("a2".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![fixture_user_post("a1", "a short question"), a2, a4, a3],
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Taken to a post far down the first branch — a glide, in flight.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.navigate_to_action("a4".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    let target = view
+        .read_with(&vcx, |v, _| v.page_glide_target_for_test())
+        .expect("navigating arms a glide");
+
+    // Mid-flight, the reader switches branch by clicking its dot. Reduce-motion
+    // is turned on *after* the glide was armed, so the horizontal switch lands
+    // at once and the test can see it: no test dispatcher pumps the snap's
+    // frame loop, and the switch is the vertical glide's whole problem.
+    vcx.update(|_, cx| cx.set_reduce_motion(true));
+    let dot = vcx
+        .debug_bounds("space-dot-a1-1")
+        .expect("a post with two replies paints a dot per branch");
+    vcx.simulate_click(dot.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let after = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    let path = vcx.update(|window, cx| view.read(cx).selected_effective_path_for_test(window, cx));
+    assert!(
+        path.contains(&"a3".to_string()),
+        "the dot click switched to the other branch ({path:?})"
+    );
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "the branch switch takes the page from the glide it interrupted \
+             (destination {target})"
+        );
+    });
+
+    // And the frame that would have continued it moves nothing.
+    view.update(&mut vcx, |v, _| v.drive_page_glide_for_test(0.5));
+    let settled = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    assert!(
+        (settled - after).abs() < 1.0,
+        "the reader is left where the switch put them, not dragged toward a \
+         `y` on the branch they left (offset {settled}, expected {after}, \
+         abandoned destination {target})"
+    );
+}
+
+#[gpui::test]
+fn space_navigation_lands_at_once_under_reduce_motion(cx: &mut TestAppContext) {
+    // The other half of the animated navigation: a reader who asked for less
+    // motion gets the destination without the journey. `App::reduce_motion` is
+    // gpui's own flag (it also stills every `Animation` element); nothing feeds
+    // it from the platform at this pin, so honoring it is all we can do.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2], cx)
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.navigate_to_action("a1".into(), window, cx));
+    });
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "no glide is armed under reduce-motion"
+        );
+        assert!(
+            v.page_scroll_offset_y_for_test().abs() < 1.0,
+            "the page is at the destination already (offset {})",
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
 fn space_quote_survives_the_round_trip_into_the_ask_path(cx: &mut TestAppContext) {
     // Ask-path integrity, end to end against a **real** core: selecting a
     // passage, quoting it into the tail draft, and posting must land a durable
@@ -9831,6 +10882,191 @@ fn reactivating_with_no_windows_opens_the_door(cx: &mut TestAppContext) {
         eidola_gui::lifecycle::reactivate(cx, move |_| counter.set(counter.get() + 1));
     });
     assert_eq!(opened.get(), 1, "no window: reactivation opens one");
+}
+
+// Status item + retire-to-the-background (task 17, waves 3 and 3b).
+//
+// The quit decision itself is the pure `status_item::quit_intent`, unit-tested
+// in the module. What only a real gpui app can answer is what retiring does to
+// the window registry — and the AppKit half (NSStatusItem,
+// setActivationPolicy:, SMAppService) is a live system surface no test
+// platform reaches.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn retiring_closes_every_window_and_leaves_the_app_standing(cx: &mut TestAppContext) {
+    // The window half of ⌘Q's retire-to-the-background. gpui drops a window
+    // as its own `update_window` unwinds, so the registry is genuinely empty
+    // when `close_all_windows` returns — and under `QuitMode::Explicit` (what
+    // macOS uses) emptying it quits nothing, which is the whole trick: the
+    // process, the stores and the loaded engines outlive the windows because
+    // nothing on the quit path ever ran.
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+
+    open_space(cx, &stores, Some("s".into()));
+    open_space(cx, &stores, Some("s2".into()));
+    assert_eq!(cx.update(|cx| cx.windows().len()), 2);
+
+    cx.update(eidola_gui::lifecycle::close_all_windows);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        0,
+        "every window closes, synchronously"
+    );
+
+    // …and the app is still an app: the way back in opens a window again.
+    open_space(cx, &stores, Some("s3".into()));
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        1,
+        "a retired app still opens windows"
+    );
+}
+
+#[gpui::test]
+fn retiring_from_a_windows_own_update_still_closes_that_window(cx: &mut TestAppContext) {
+    // ⌘Q arrives with a window key, and `App::dispatch_action` routes an
+    // action *through* the active window — so the Quit handler runs inside
+    // that window's `update_window`, which has taken it out of the registry.
+    // A sweep from there skips the one window the user is looking at, which
+    // on the real app meant going `Accessory` with a window still on screen
+    // and no menu bar (measured, before the defer). Both halves are pinned
+    // here: the gpui fact, and the cure.
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+    let (first, _) = open_space(cx, &stores, Some("s".into()));
+    open_space(cx, &stores, Some("s2".into()));
+
+    cx.update_window(first, |_, _, cx| {
+        assert_eq!(
+            cx.windows().len(),
+            2,
+            "the updating window is still listed — the trap is that it is not *reachable*"
+        );
+        eidola_gui::lifecycle::close_all_windows(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        1,
+        "its own `update` refuses (the slot is taken), so an undeferred sweep leaves it standing"
+    );
+
+    let (third, _) = open_space(cx, &stores, Some("s3".into()));
+    cx.update_window(third, |_, _, cx| {
+        cx.defer(eidola_gui::lifecycle::close_all_windows);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        0,
+        "deferred until the update unwinds, the sweep reaches every window"
+    );
+}
+
+#[gpui::test]
+fn a_window_open_set_in_motion_before_the_retire_is_abandoned(cx: &mut TestAppContext) {
+    // The real shape of the bug: a click starts a window open that has to
+    // `await` (a launch-time backend read, a create-from-template write, a
+    // cross-space action lookup), ⌘Q retires the app inside that gap, and the
+    // awaited work then opens its window anyway — the app comes back to the
+    // front having just been told to go away.
+    use eidola_gui::lifecycle::{abandon_pending_opens, intend_to_open};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+
+    let opened = Rc::new(Cell::new(0usize));
+    let sink = opened.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let task = cx.update(|cx| {
+        let intent = intend_to_open(cx);
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            let _ = rx.await;
+            cx.update(|cx| {
+                if intent.still_wanted(cx) {
+                    sink.set(sink.get() + 1);
+                }
+            });
+        })
+    });
+
+    // ⌘Q lands while the open is still in flight. `quit_or_retire` bumps the
+    // generation synchronously, which is what the ticket compares against.
+    cx.update(abandon_pending_opens);
+    let _ = tx.send(());
+    cx.run_until_parked();
+    drop(task);
+    assert_eq!(
+        opened.get(),
+        0,
+        "the user's last instruction was ⌘Q, so the stale open is abandoned"
+    );
+
+    // A ticket taken *after* the retire is a fresh instruction and stands —
+    // this is what keeps the status menu's Open / New Space working.
+    let fresh = cx.update(|cx| intend_to_open(cx));
+    assert!(
+        cx.update(|cx| fresh.still_wanted(cx)),
+        "an open asked for after the retire is not stale"
+    );
+    // And the app is still an app: opening still works.
+    open_space(cx, &stores, Some("s".into()));
+    assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+}
+
+#[gpui::test]
+fn a_ticket_survives_everything_except_a_retire(cx: &mut TestAppContext) {
+    // The generation must move on retires and nothing else, or every async
+    // open would be abandoned by unrelated activity.
+    use eidola_gui::lifecycle::{abandon_pending_opens, close_all_windows, intend_to_open};
+
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+    let intent = cx.update(|cx| intend_to_open(cx));
+
+    open_space(cx, &stores, Some("s".into()));
+    cx.update(close_all_windows);
+    cx.run_until_parked();
+    assert!(
+        cx.update(|cx| intent.still_wanted(cx)),
+        "closing windows is not retiring — ⌘W must not abandon a pending open"
+    );
+
+    cx.update(abandon_pending_opens);
+    assert!(!cx.update(|cx| intent.still_wanted(cx)));
+}
+
+#[gpui::test]
+fn the_login_item_row_starts_from_the_system_and_invents_nothing(cx: &mut TestAppContext) {
+    use eidola_gui::general::GeneralView;
+
+    // "Open at login" has no store behind it — the system owns that state,
+    // so the pane reads it at construction and holds no opinion of its own.
+    // An error is only ever the system's words on a refused *write*, and
+    // this test performs none deliberately: registering a login item is a
+    // real change to the machine running the suite.
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx))
+    });
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.login_item(), eidola_gui::login_item::state());
+        assert!(
+            v.login_item_error().is_none(),
+            "nothing was written, so there is nothing to report"
+        );
+        // Whatever the system said, the row has honest copy for it — and an
+        // unmanageable login item never reads as a plain "off".
+        assert!(!v.login_item().description().is_empty());
+    });
 }
 
 #[gpui::test]

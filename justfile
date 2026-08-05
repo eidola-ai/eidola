@@ -18,6 +18,14 @@ services:
 down:
     docker compose --profile server --profile stripe down --remove-orphans
 
+# Point this machine's client (GUI + CLI) at the local dev stack
+client-local:
+    ./scripts/local-client.sh enable
+
+# Undo `just client-local` — back to the built-in trust-root pins
+client-reset:
+    ./scripts/local-client.sh disable
+
 # Drop and recreate the eidola database, then apply schema.sql
 db-reset:
     docker compose exec postgres dropdb -U eidola --if-exists eidola

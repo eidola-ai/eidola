@@ -192,6 +192,32 @@ pub struct LocalModelsState {
     pub external: Vec<ExternalEngineBackend>,
 }
 
+/// One live engine, straight from the in-process registry.
+///
+/// This is deliberately **not** a [`LocalModelInfo`]: it carries only what
+/// the registry itself knows, and nothing that came from a directory scan.
+/// There is no `display_name` here because the registry has none — the
+/// pretty name lives in a `.meta.json` sidecar beside the `.gguf`, and the
+/// whole point of this type is to describe an engine whose file may be gone.
+/// A caller that wants a nice name joins this to
+/// [`LocalModelsState`] on `id` and falls back to `slug`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningEngine {
+    /// The chat-routable selection id, `<slug>@<backend-id>` — the join key
+    /// against [`LocalModelInfo::id`].
+    pub id: String,
+    pub backend_id: String,
+    /// The file stem the engine was loaded from. The truest name we still
+    /// have when the file itself has gone.
+    pub slug: String,
+    /// The loopback port the engine serves on.
+    pub port: u16,
+    pub context_tokens: u32,
+    /// False while the engine is still warming (the `Loading` state).
+    pub ready: bool,
+    pub pinned: bool,
+}
+
 /// One `llamacpp` backend's scanned models.
 #[derive(Clone, Debug)]
 pub struct ExternalEngineBackend {
@@ -1638,6 +1664,41 @@ impl Inner {
             let _ = entry.shutdown.send(());
         }
         count
+    }
+
+    /// Every engine the registry is holding, right now.
+    ///
+    /// The read-only sibling of [`Self::shutdown_all_engines`], and it exists
+    /// for the same reason: `local_models_state` answers "what engines are
+    /// running?" by *scanning the model directories* and consulting this map
+    /// only to decorate a file it already found, so an engine whose backing
+    /// `.gguf` was renamed or deleted mid-session — or whose backend row was
+    /// removed, or whose directory has become unreadable — is absent from
+    /// that snapshot while its subprocess is very much alive and holding
+    /// gigabytes. A readout of running engines must start here.
+    ///
+    /// Synchronous, infallible, and touches no filesystem or database: it is
+    /// one mutex acquisition over an in-memory map, which is what makes it
+    /// safe to call from a UI callback.
+    pub(crate) fn running_engines(&self) -> Vec<RunningEngine> {
+        let engines = self.local.engines.lock().expect("engines lock");
+        let mut out: Vec<RunningEngine> = engines
+            .iter()
+            .map(|((backend_id, slug), entry)| RunningEngine {
+                id: engine_model_id(backend_id, slug),
+                backend_id: backend_id.clone(),
+                slug: slug.clone(),
+                port: entry.port,
+                context_tokens: entry.context_tokens,
+                ready: entry.ready,
+                pinned: entry.pinned,
+            })
+            .collect();
+        // A `HashMap` iterates in an arbitrary order that changes between
+        // runs; a readout that reshuffles itself between openings would read
+        // as churn. Sort by the join key, which is stable and unique.
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
     }
 }
 

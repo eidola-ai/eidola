@@ -13,8 +13,7 @@
 use gpui::{
     Animation, AnimationExt, AnyElement, Context, Hsla, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, WeakEntity, Window, div, point,
-    prelude::FluentBuilder as _, px,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
@@ -364,6 +363,9 @@ impl SpaceView {
         }
         if moved {
             self.minimap_visible = true;
+            // The reader's own scrolling takes the page back from any
+            // navigation glide in flight (`nav::PageGlide`).
+            self.cancel_page_glide();
         }
         if moved || matches!(phase, gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled) {
             self.arm_minimap_hide(cx);
@@ -747,6 +749,9 @@ impl SpaceView {
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
+        // Direct manipulation of the page — it takes the offset from any
+        // navigation glide in flight.
+        self.cancel_page_glide();
         let m = self.minimap_local_y(window_y);
         // Content box, not the raw surface — on Linux CSD the surface includes
         // the shadow padding, which must not enter the scroll/branch geometry.
@@ -779,8 +784,7 @@ impl SpaceView {
                     + self.floating_pad(&tree, page_width, window_h);
                 let floor = (window_h.as_f32() - total).min(0.0);
                 let y = scroll_for_press(m, doc_click, floor);
-                let off = self.page_scroll.offset();
-                self.page_scroll.set_offset(point(off.x, px(y)));
+                self.set_page_scroll_y(y);
             }
             self.minimap_visible = true;
             self.arm_minimap_hide(cx);
@@ -795,8 +799,7 @@ impl SpaceView {
         let grab = drag_grab(m, scroll_y, window_h.as_f32(), scale);
         let floor = self.scroll_min_y.get();
         let y = drag_scroll(m, grab, scale, floor);
-        let off = self.page_scroll.offset();
-        self.page_scroll.set_offset(point(off.x, px(y)));
+        self.set_page_scroll_y(y);
         self.minimap_drag = Some(MinimapDrag { grab, scale, floor });
         self.minimap_visible = true;
         self.arm_minimap_hide(cx);
@@ -811,8 +814,7 @@ impl SpaceView {
         };
         let m = self.minimap_local_y(window_y);
         let y = drag_scroll(m, drag.grab, drag.scale, drag.floor);
-        let off = self.page_scroll.offset();
-        self.page_scroll.set_offset(point(off.x, px(y)));
+        self.set_page_scroll_y(y);
         self.minimap_visible = true;
         self.arm_minimap_hide(cx);
         cx.notify();
