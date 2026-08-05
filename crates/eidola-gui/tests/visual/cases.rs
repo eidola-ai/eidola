@@ -58,15 +58,17 @@ fn register_space(s: &mut Snapshots) {
         })
     });
 
-    // The space inspector (task 26.2): the per-space settings panel splitting
-    // the window — chrome type beside the paper, with a remote router selected
-    // so the mandatory per-call cost copy is in frame.
+    // The space inspector (tasks 26.2 + 26.3): the per-space settings panel
+    // splitting the window — chrome type beside the paper, with a remote router
+    // selected so the mandatory per-call cost copy is in frame, and the
+    // Participants section resting below it.
     s.add(
         "space_inspector",
         size(px(1040.), px(760.)),
         |window, cx| {
             let stores = stub_stores(cx, |s| {
                 s.config_state = Some(stub_config_state(true));
+                s.participants = Some(inspector_participants());
                 s.spaces = vec![SpaceInfo {
                     id: "demo".into(),
                     title: Some("Tides and the moon".into()),
@@ -96,6 +98,41 @@ fn register_space(s: &mut Snapshots) {
                     sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
                 });
                 view.set_inspector_open_for_test(true, window, cx);
+                view
+            })
+        },
+    );
+
+    // The Participants section with a member's disclosure open — the editor the
+    // standalone window used to hold, now inside the panel.
+    s.add(
+        "space_inspector_participants",
+        size(px(1040.), px(760.)),
+        |window, cx| {
+            let stores = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(true));
+                s.participants = Some(inspector_participants());
+                s.space_settings = Some((
+                    "demo".into(),
+                    eidola_app_core::SpaceSettings {
+                        cascade_limit: 4,
+                        router_model: None,
+                    },
+                ));
+            });
+            cx.new(|cx| {
+                let mut view = SpaceView::new(
+                    stores,
+                    Some("demo".into()),
+                    WindowInput::new(cx),
+                    window,
+                    cx,
+                );
+                view.space().update(cx, |sp, cx| {
+                    sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
+                });
+                view.set_inspector_open_for_test(true, window, cx);
+                view.inspector_toggle_participant("agent-b", window, cx);
                 view
             })
         },
@@ -1415,6 +1452,29 @@ fn agent_participant(id: &str, label: &str) -> eidola_app_core::ParticipantInfo 
         role: "member".into(),
         reference: None,
     }
+}
+
+/// The membership the inspector's Participants section renders: the shared
+/// human (so the "shared" tag and the fork are in frame) plus two owned agents.
+fn inspector_participants() -> (String, Vec<eidola_app_core::ParticipantInfo>) {
+    let you = eidola_app_core::ParticipantInfo {
+        id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+        scope: "global".into(),
+        source: "referenced".into(),
+        kind: "human".into(),
+        label: "You".into(),
+        model_ref: None,
+        system_prompt: None,
+        notify_policy: "explicit".into(),
+        role: "member".into(),
+        reference: None,
+    };
+    let mut ida = agent_participant("agent-b", "Ida");
+    ida.system_prompt = Some("Keep the thread honest; challenge weak claims.".into());
+    (
+        "demo".into(),
+        vec![you, ida, agent_participant("agent-c", "Sage")],
+    )
 }
 
 /// Stub stores with two agent participants seeded for `space_id`.

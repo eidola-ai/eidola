@@ -26,7 +26,7 @@ use eidola_gui::account::AccountView;
 use eidola_gui::actions::{PostOnly, Send};
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
-use eidola_gui::participants_view::{EditMode, ParticipantsView};
+use eidola_gui::participants::EditMode;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
 use eidola_gui::space_view::SpaceView;
@@ -2130,7 +2130,7 @@ fn updates_renders_with_scroll_indicator(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn participants_renders_with_scroll_indicator(cx: &mut TestAppContext) {
+fn inspector_participants_render_with_scroll_indicator(cx: &mut TestAppContext) {
     // Seed enough eidola-catalog models that the model-picker dropdown
     // overflows its 220px max-height — the nested scroller whose own overlay
     // indicator this exercises (a Codex P1 on PR #232). The draw below opens
@@ -2138,6 +2138,7 @@ fn participants_renders_with_scroll_indicator(cx: &mut TestAppContext) {
     let stores = stub_stores(cx, |s| {
         s.config_state = Some(config_state(true));
         s.eidola_trust = Some(eidola_trust());
+        s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
         s.models = (0..12)
             .map(|i| eidola_app_core::ModelInfo {
                 id: format!("model-{i:02}"),
@@ -2148,25 +2149,19 @@ fn participants_renders_with_scroll_indicator(cx: &mut TestAppContext) {
             })
             .collect();
     });
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| {
-            ParticipantsView::new(
-                stores.clone(),
-                "demo".into(),
-                Some("Demo".into()),
-                window,
-                cx,
-            )
-        })
-    });
-    // Roster body indicator.
+    let (window, view) = open_space(cx, &stores, Some("demo".into()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    })
+    .unwrap();
+    // The panel body's indicator.
     draw_frame(cx, window);
     // Open the add form + its overflowing model picker; the picker's own
-    // overlay indicator binds to `picker_scroll`.
+    // overlay indicator binds to `inspector_participant_picker_scroll`.
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.begin_add(window, cx);
-            v.open_add_picker_for_test(cx);
+            v.inspector_begin_add_participant(window, cx);
+            v.inspector_open_add_picker_for_test(cx);
         });
     })
     .unwrap();
@@ -6988,54 +6983,137 @@ fn participant_labels(stores: &Stores, space: &str, cx: &mut TestAppContext) -> 
     })
 }
 
+/// Open a space window on a real space with the inspector already open — the
+/// Participants section's live surface (wave 26.3).
+fn open_participants_inspector(
+    cx: &mut TestAppContext,
+    stores: &Stores,
+    space: &str,
+) -> (AnyWindowHandle, Entity<SpaceView>) {
+    let (window, view) = open_space(cx, stores, Some(space.to_string()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    })
+    .unwrap();
+    (window, view)
+}
+
 #[gpui::test]
-fn participants_view_add_and_remove(cx: &mut TestAppContext) {
+fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
     let (stores, core, _dir, space) = participants_scene(cx);
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ParticipantsView::new(stores.clone(), space.clone(), None, window, cx))
-    });
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
     });
 
     // Add a participant: open the form, set its name, save.
     cx.update_window(window, |_, window, cx| {
-        view.update(cx, |v, cx| v.begin_add(window, cx));
+        view.update(cx, |v, cx| v.inspector_begin_add_participant(window, cx));
     })
     .unwrap();
     // The form arrives prefilled with the shared default charter — the same
     // starting point the Templates pane offers a new agent.
     assert_eq!(
-        view.read_with(cx, |v, cx| v.adding_prompt(cx)).as_deref(),
-        Some(eidola_gui::participants_view::DEFAULT_AGENT_SYSTEM_PROMPT),
+        view.read_with(cx, |v, cx| v.inspector_adding_prompt(cx))
+            .as_deref(),
+        Some(eidola_gui::participants::DEFAULT_AGENT_SYSTEM_PROMPT),
         "a new participant starts from the shared default system prompt"
     );
     let label = view
-        .read_with(cx, |v, _| v.adding_label_state())
+        .read_with(cx, |v, _| v.inspector_adding_label_state())
         .expect("add form open");
     cx.update_window(window, |_, window, cx| {
         label.update(cx, |s, cx| s.set_value("Reviewer", window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.save_add(cx));
+    view.update(cx, |v, cx| v.inspector_save_add_participant(cx));
     wait_until(cx, "participant added", |cx| {
         participant_labels(&stores, &space, cx).contains(&"Reviewer".to_string())
     });
     assert_eq!(participant_labels(&stores, &space, cx).len(), 3);
 
-    // Remove it.
-    let reviewer_id = stores.participants.read_with(cx, |s, _| {
+    // The prompt it was created with round-trips into the durable row.
+    let reviewer = stores.participants.read_with(cx, |s, _| {
         s.list(&space)
             .iter()
             .find(|p| p.label == "Reviewer")
             .unwrap()
-            .id
             .clone()
     });
-    view.update(cx, |v, cx| v.remove(&reviewer_id, cx));
+    assert_eq!(
+        reviewer.system_prompt.as_deref(),
+        Some(eidola_gui::participants::DEFAULT_AGENT_SYSTEM_PROMPT),
+        "the default charter is what was written, not just what was shown"
+    );
+
+    // Remove it, from its own disclosure.
+    view.update(cx, |v, cx| v.inspector_remove_participant(&reviewer.id, cx));
     wait_until(cx, "participant removed", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
     });
+
+    drain_runtime(&core);
+}
+
+/// The system prompt is editable where the participant lives: open a member's
+/// disclosure, rewrite its charter, save, and the durable row moves.
+#[gpui::test]
+fn inspector_participant_system_prompt_round_trips(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    let agent = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .id
+            .clone()
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx)
+        });
+    })
+    .unwrap();
+    let prompt = view
+        .read_with(cx, |v, _| v.inspector_editing_prompt_state())
+        .expect("the disclosure is the editor");
+    cx.update_window(window, |_, window, cx| {
+        prompt.update(cx, |s, cx| {
+            s.set_value("Answer only in questions.", window, cx)
+        });
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.inspector_save_participant_edit(cx));
+    wait_until(cx, "system prompt persisted", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .find(|p| p.id == agent)
+                .and_then(|p| p.system_prompt.clone())
+                .as_deref()
+                == Some("Answer only in questions.")
+        })
+    });
+
+    // Re-opening the disclosure seeds the field from what was stored.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx)
+        });
+    })
+    .unwrap();
+    let reopened = view
+        .read_with(cx, |v, _| v.inspector_editing_prompt_state())
+        .expect("reopened");
+    assert_eq!(
+        reopened.read_with(cx, |s, _| s.value().to_string()),
+        "Answer only in questions."
+    );
 
     drain_runtime(&core);
 }
@@ -7044,11 +7122,9 @@ fn participants_view_add_and_remove(cx: &mut TestAppContext) {
 /// shared config (edit everywhere) or a per-space override (override here). The
 /// view routes to the right store method per its mode.
 #[gpui::test]
-fn participants_view_override_vs_edit_everywhere(cx: &mut TestAppContext) {
+fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
     let (stores, core, _dir, space) = participants_scene(cx);
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ParticipantsView::new(stores.clone(), space.clone(), None, window, cx))
-    });
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
     });
@@ -7057,19 +7133,21 @@ fn participants_view_override_vs_edit_everywhere(cx: &mut TestAppContext) {
 
     // Override here: a referenced global defaults to the this-space-only mode.
     cx.update_window(window, |_, window, cx| {
-        view.update(cx, |v, cx| v.begin_edit(you, window, cx));
+        view.update(cx, |v, cx| v.inspector_toggle_participant(you, window, cx));
     })
     .unwrap();
     assert_eq!(
-        view.read_with(cx, |v, _| v.editing_mode()),
+        view.read_with(cx, |v, _| v.inspector_editing_mode()),
         Some(EditMode::OverrideHere)
     );
-    let label = view.read_with(cx, |v, _| v.editing_label_state()).unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .unwrap();
     cx.update_window(window, |_, window, cx| {
         label.update(cx, |s, cx| s.set_value("Me", window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.save_edit(cx));
+    view.update(cx, |v, cx| v.inspector_save_participant_edit(cx));
     wait_until(cx, "override applied", |cx| {
         stores.participants.read_with(cx, |s, _| {
             s.list(&space)
@@ -7089,22 +7167,24 @@ fn participants_view_override_vs_edit_everywhere(cx: &mut TestAppContext) {
 
     // Edit everywhere: switch mode, change the name, save — now the base moves.
     cx.update_window(window, |_, window, cx| {
-        view.update(cx, |v, cx| v.begin_edit(you, window, cx));
+        view.update(cx, |v, cx| v.inspector_toggle_participant(you, window, cx));
         view.update(cx, |v, cx| {
-            v.set_edit_mode(EditMode::Everywhere, window, cx)
+            v.inspector_set_edit_mode(EditMode::Everywhere, window, cx)
         });
     })
     .unwrap();
     assert_eq!(
-        view.read_with(cx, |v, _| v.editing_mode()),
+        view.read_with(cx, |v, _| v.inspector_editing_mode()),
         Some(EditMode::Everywhere)
     );
-    let label = view.read_with(cx, |v, _| v.editing_label_state()).unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .unwrap();
     cx.update_window(window, |_, window, cx| {
         label.update(cx, |s, cx| s.set_value("Myself", window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.save_edit(cx));
+    view.update(cx, |v, cx| v.inspector_save_participant_edit(cx));
     wait_until(cx, "edit-everywhere applied", |cx| {
         stores.participants.read_with(cx, |s, _| {
             s.list(&space)
@@ -7369,7 +7449,7 @@ fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &m
 /// that prompt survives the save.
 #[gpui::test]
 fn templates_pane_new_agent_carries_the_default_system_prompt(cx: &mut TestAppContext) {
-    use eidola_gui::participants_view::DEFAULT_AGENT_SYSTEM_PROMPT;
+    use eidola_gui::participants::DEFAULT_AGENT_SYSTEM_PROMPT;
 
     let (stores, core, _dir, _space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
@@ -7485,11 +7565,9 @@ fn templates_pane_system_prompt_round_trips(cx: &mut TestAppContext) {
 /// roster), and Retry must actually re-fetch. `ensure` declines once a `Failed`
 /// cell exists, so `retry_load` is the only path back.
 #[gpui::test]
-fn participants_view_retry_refetches_after_failed_load(cx: &mut TestAppContext) {
+fn inspector_participants_retry_refetches_after_failed_load(cx: &mut TestAppContext) {
     let (stores, core, _dir, space) = participants_scene(cx);
-    let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ParticipantsView::new(stores.clone(), space.clone(), None, window, cx))
-    });
+    let (_window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
     });
@@ -7505,7 +7583,7 @@ fn participants_view_retry_refetches_after_failed_load(cx: &mut TestAppContext) 
     });
 
     // Retry re-fetches; the real list lands again.
-    view.update(cx, |v, cx| v.retry_load(cx));
+    view.update(cx, |v, cx| v.inspector_retry_participants(cx));
     wait_until(cx, "retry reloads", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
     });
@@ -11450,6 +11528,320 @@ fn space_inspector_escape_closes_its_router_picker(cx: &mut TestAppContext) {
     );
 }
 
+/// The same Escape rung, for the Participants section's model dropdown: it is a
+/// transient overlay over the same panel, so the conversation's key handler
+/// yields to it and the view root has to be what closes it.
+#[gpui::test]
+fn space_inspector_escape_closes_a_participants_model_picker(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_inspector_open_for_test(true, window, cx);
+            v.inspector_begin_add_participant(window, cx);
+            v.inspector_open_add_picker_for_test(cx);
+        })
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()));
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&focus, cx);
+    })
+    .unwrap();
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.inspector_participant_picker_open_for_test()),
+        "the view root closes it, beside the router picker's rung"
+    );
+}
+
+/// A scene with one agent participant, a post to hang a tail draft off, and the
+/// inspector open — the surface the dropdown-ownership tests below drive.
+fn inspector_participants_stub_scene(
+    cx: &mut TestAppContext,
+) -> (AnyWindowHandle, Entity<SpaceView>) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.participants = Some((
+            "s1".into(),
+            vec![eidola_app_core::ParticipantInfo {
+                id: "agent-1".into(),
+                scope: "space".into(),
+                source: "owned".into(),
+                kind: "agent".into(),
+                label: "Assistant".into(),
+                model_ref: Some("gemma4-31b".into()),
+                system_prompt: Some("Be concise.".into()),
+                notify_policy: "human".into(),
+                role: "member".into(),
+                reference: None,
+            }],
+        ));
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the question")],
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.draft_count_for_test() > 0),
+        "precondition: a tail draft exists for the jump to land in"
+    );
+    (window, view)
+}
+
+/// Type a printable at the view root and report whether it reached
+/// type-to-compose — the observable consequence of `transient_overlay_open`,
+/// which yields the conversation's keyboard to whatever it believes is on top.
+fn printable_reaches_the_conversation(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    view: &Entity<SpaceView>,
+) -> bool {
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&focus, cx);
+    })
+    .unwrap();
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.has_active_draft_for_test())
+}
+
+/// **A form that leaves takes its dropdown with it** (Codex review, PR #278).
+/// The model dropdown is painted *inside* a form, so any transition that
+/// unmounts that form takes the dropdown off the screen — and the flag
+/// recording the click must stop claiming an overlay owns the keyboard, or the
+/// window goes on yielding every arrow, Escape and printable to something
+/// nobody can see. "Save these participants as a template…" is such a
+/// transition: it drops the add form (and the editor) to make room for itself.
+#[gpui::test]
+fn space_inspector_a_form_that_leaves_takes_its_dropdown_with_it(cx: &mut TestAppContext) {
+    let (window, view) = inspector_participants_stub_scene(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_begin_add_participant(window, cx);
+            v.inspector_open_add_picker_for_test(cx);
+        })
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()));
+
+    // The reader reaches past the open dropdown for "Save these participants as
+    // a template…", then thinks better of it.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_begin_template(window, cx);
+            v.inspector_cancel_template(cx);
+        })
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    assert!(
+        !view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()),
+        "the dropdown went with the form that painted it"
+    );
+    assert!(
+        printable_reaches_the_conversation(cx, window, &view),
+        "the conversation answers the keyboard again, with no Escape needed"
+    );
+}
+
+/// The same rule at the sibling transition: **Remove** unmounts the very editor
+/// its dropdown hangs in.
+#[gpui::test]
+fn space_inspector_removing_a_participant_takes_its_dropdown_with_it(cx: &mut TestAppContext) {
+    let (window, view) = inspector_participants_stub_scene(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx);
+            v.inspector_open_editor_picker_for_test(cx);
+        })
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()));
+
+    view.update(cx, |v, cx| v.inspector_remove_participant("agent-1", cx));
+    draw_window(cx, window);
+
+    assert!(
+        !view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()),
+        "the dropdown went with the editor Remove closed"
+    );
+    assert!(
+        printable_reaches_the_conversation(cx, window, &view),
+        "the conversation answers the keyboard again"
+    );
+}
+
+/// And when the row itself leaves under the open editor — another window
+/// removed the participant, so the store's re-list drops it — the editor is
+/// unmounted by the roster rather than by a verb. It owes the same two things:
+/// its dropdown, and the keyboard its field was holding.
+#[gpui::test]
+fn space_inspector_a_participant_leaving_the_roster_retires_its_editor(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        !participant_labels(&stores, &space, cx).is_empty()
+    });
+    let agent = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("a seeded agent")
+            .id
+            .clone()
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx);
+            v.inspector_open_editor_picker_for_test(cx);
+        })
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()));
+    // The editor's own field is holding the keyboard — the borrow the unmount
+    // has to give back.
+    let name = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .expect("the disclosure is the editor");
+    cx.update_window(window, |_, window, cx| {
+        name.update(cx, |s, cx| s.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // The other window's removal, straight through the store — this view never
+    // hears a verb, only the re-list.
+    let (sid, pid) = (space.clone(), agent.clone());
+    stores
+        .participants
+        .update(cx, |s, cx| s.remove(sid, pid, cx));
+    wait_until(cx, "participant removed", |cx| {
+        !participant_labels(&stores, &space, cx).is_empty()
+            && stores
+                .participants
+                .read_with(cx, |s, _| s.list(&space).iter().all(|p| p.id != agent))
+    });
+    draw_window(cx, window);
+
+    assert_eq!(
+        view.read_with(cx, |v, _| v
+            .inspector_editing_participant()
+            .map(str::to_string)),
+        None,
+        "an editor whose row is gone is not an editor"
+    );
+    assert!(
+        !view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()),
+        "and its dropdown went with it"
+    );
+    // The keyboard is back with the conversation — no click on the page first,
+    // which is the whole point of the handoff: the field it was in is gone.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "the press reached the conversation instead of a dead input"
+    );
+    drain_runtime(&core);
+}
+
+/// Type-to-compose must yield to **every** field the panel paints, not just the
+/// title: a character typed into a participant's system prompt is text, and the
+/// jump would consume the press and apply it to the composer instead.
+#[gpui::test]
+fn space_inspector_typing_in_a_system_prompt_does_not_jump_to_the_composer(
+    cx: &mut TestAppContext,
+) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.participants = Some((
+            "s1".into(),
+            vec![eidola_app_core::ParticipantInfo {
+                id: "agent-1".into(),
+                scope: "space".into(),
+                source: "owned".into(),
+                kind: "agent".into(),
+                label: "Assistant".into(),
+                model_ref: Some("gemma4-31b".into()),
+                system_prompt: Some("Be concise.".into()),
+                notify_policy: "human".into(),
+                role: "member".into(),
+                reference: None,
+            }],
+        ));
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the question")],
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_inspector_open_for_test(true, window, cx);
+            v.inspector_toggle_participant("agent-1", window, cx);
+        })
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.draft_count_for_test() > 0),
+        "precondition: a tail draft exists for the jump to land in"
+    );
+
+    let prompt = view
+        .read_with(cx, |v, _| v.inspector_editing_prompt_state())
+        .expect("the disclosure is the editor");
+    cx.update_window(window, |_, window, cx| {
+        prompt.update(cx, |s, cx| s.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "no draft was started behind the panel"
+    );
+    assert!(
+        prompt
+            .read_with(&vcx, |s, _| s.value().to_string())
+            .contains('x'),
+        "the character went into the charter the reader is writing"
+    );
+}
+
 /// **A view must observe the stores it renders** (STATE.md). The inspector's
 /// rows come from `SpaceSettingsStore`, whose every announcement is
 /// asynchronous — the panel's opening `ensure` load completing, each write's
@@ -11809,9 +12201,9 @@ fn space_inspector_closing_leaves_a_composing_reader_alone(cx: &mut TestAppConte
 /// `ModelsStore` (via `router_field` → `model_groups`), whose catalog fetches
 /// land well after the window has drawn — a remote catalog arriving with an
 /// open picker must repaint it, or the remote refs simply are not in the list
-/// until something unrelated redraws the window. `ParticipantsView` and the
-/// Space Templates pane (the other two `router_field` consumers) already
-/// observed this store; the space view was the one that did not.
+/// until something unrelated redraws the window. The Space Templates pane (the
+/// other `router_field` consumer) already observed this store; the space view
+/// was the one that did not.
 #[gpui::test]
 fn space_inspector_repaints_when_a_model_catalog_lands(cx: &mut TestAppContext) {
     let (stores, core, _dir, space) = participants_scene(cx);
