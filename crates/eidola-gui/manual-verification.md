@@ -29,27 +29,29 @@ Build: `just build gui` (or `cargo build -p eidola-gui && ./scripts/package-gui-
 8. **Loaded engines survive.** Load a local model first (Settings → Backends → Local → Load), confirm `pgrep -fl llama-server` lists a child, then ⌘Q. Expected: the app is `UIElement` **and the `llama-server` child is still running**. Open the status menu — the engine line still says "running", so the bus bridge and the stores are alive too.
 9. **The way back.** From the retired state, each of these must bring the app back to `Foreground` with a window, **same pid**: the status menu's **Open Eidola**; the status menu's **New Space**; **Spotlight** "Eidola"; **`open -a Eidola`**; double-clicking the app in Finder. (There is no Dock icon while retired, so there is no Dock click to test.) After any of them, ⌘N / ⌘, / ⌘W all work — that is the check that matters.
 10. Retire and reopen a couple of times. No flicker, no stuck state, no duplicate status items.
+11. **⌘Q sticks even against work in flight.** Pick "New Space from Template ▸" (or click a Library row) and press ⌘Q immediately. Expected: the app retires and **stays** retired — no window appears a moment later and the app does not come back to the front. (The space itself still commits; only its window is abandoned.)
 
 ## Full shutdown
 
-11. With a model loaded (as in 8), pick **Quit Eidola** from the status menu. Expected: process gone, and `pgrep -fl llama-server` empty — the status menu's Quit is the wave-2 `on_app_quit` teardown path.
-12. Repeat, but this time open the status menu and press **⌘Q** while it is open, instead of clicking the row. Expected: the same full shutdown. *If nothing happens*, note it — the `NSMenuItem` key equivalent is the "⌘Q while focused on the toolbar app" affordance and the clickable row is the guaranteed door; report it so the doc can be corrected rather than worked around.
-13. **⌘Q must not be stolen by the status menu while a window is open.** With a window focused and the status menu **closed**, ⌘Q must *retire* (step 7), never full-quit. (`NSStatusItem` menus are not part of the main menu, so their key equivalents should fire only while the menu is open — this step is the check on that assumption.)
-14. From the **already retired** state, ⌘Q (whichever menu takes it) is a **full shutdown**, not a second retire — there is nothing left to retire.
-15. **No status item ⇒ ⌘Q is the old full quit.** Hard to force deliberately; if you ever see the app launch without the menu-bar glyph, ⌘Q there must end the process rather than leave an invisible one.
+12. With a model loaded (as in 8), pick **Quit Eidola** from the status menu. Expected: process gone, and `pgrep -fl llama-server` empty — the status menu's Quit is the wave-2 `on_app_quit` teardown path.
+13. Repeat, but this time open the status menu and press **⌘Q** while it is open, instead of clicking the row. Expected: the same full shutdown. *If nothing happens*, note it — the `NSMenuItem` key equivalent is the "⌘Q while focused on the toolbar app" affordance and the clickable row is the guaranteed door; report it so the doc can be corrected rather than worked around.
+14. **⌘Q must not be stolen by the status menu while a window is open.** With a window focused and the status menu **closed**, ⌘Q must *retire* (step 7), never full-quit. (`NSStatusItem` menus are not part of the main menu, so their key equivalents should fire only while the menu is open — this step is the check on that assumption.)
+15. From the **already retired** state, ⌘Q (whichever menu takes it) is a **full shutdown**, not a second retire — there is nothing left to retire.
+16. **No status item ⇒ ⌘Q is the old full quit.** Hard to force deliberately; if you ever see the app launch without the menu-bar glyph, ⌘Q there must end the process rather than leave an invisible one.
 
 ## Open at login
 
-16. Settings → General ends with a **Startup** section: "Open at login" with a switch and one muted line.
-17. Running from `crates/eidola-gui/build/Eidola.app` (ad-hoc signed, not in /Applications), expect the honest unavailable state: switch dimmed and inert, line reads "Unavailable — this needs macOS 13 or later, and an installed, signed app." **This is the expected dev-build state**, not a bug. If it *is* settable in your build, so much the better — go on.
-18. Copy the bundle to /Applications and launch it from there. Turn the switch on: System Settings → General → Login Items should list Eidola under "Open at Login". Turn it off: the entry disappears.
-19. Turn it on, then remove/deny Eidola in System Settings → Login Items, then reopen Eidola's Settings → General. Expected: the switch still reads on and the line says macOS is waiting for you (`RequiresApproval`) — not a silent "off".
-20. A refusal (unsigned bundle, denied) shows macOS's own wording in a red banner under the row and leaves the switch where the system actually is — it never flips optimistically.
-21. Nothing is remembered app-side: the switch's state comes only from the system, so deleting `~/Library/Application Support/eidola` must not change it.
+17. Settings → General ends with a **Startup** section: "Open at login" with a switch and one muted line.
+18. **Known gap, not a bug to file:** turning this on makes login open the ordinary **windowed** app, not the background/menu-bar layer — `SMAppService.mainAppService` takes no arguments, so `--windowless` is unreachable through it (options recorded in `src/login_item.rs`). The row's copy says "Eidola opens with your session" for exactly that reason; if it ever promises the menu bar again without the LaunchAgent change landing, that is the bug.
+19. Running from `crates/eidola-gui/build/Eidola.app` (ad-hoc signed, not in /Applications), expect the honest unavailable state: switch dimmed and inert, line reads "Unavailable — this needs macOS 13 or later, and an installed, signed app." **This is the expected dev-build state**, not a bug. If it *is* settable in your build, so much the better — go on.
+20. Copy the bundle to /Applications and launch it from there. Turn the switch on: System Settings → General → Login Items should list Eidola under "Open at Login". Turn it off: the entry disappears.
+21. Turn it on, then remove/deny Eidola in System Settings → Login Items, then reopen Eidola's Settings → General. Expected: the switch still reads on and the line says macOS is waiting for you (`RequiresApproval`) — not a silent "off".
+22. A refusal (unsigned bundle, denied) shows macOS's own wording in a red banner under the row and leaves the switch where the system actually is — it never flips optimistically.
+23. Nothing is remembered app-side: the switch's state comes only from the system, so deleting `~/Library/Application Support/eidola` must not change it.
 
 ## Regression sweep (nothing here should have moved)
 
-22. Every window still opens and closes normally: space, Library, Record, Settings, Participants, About, Updates, onboarding.
-23. Dock right-click → New Space / Library… still works while a window is open.
-24. `--windowless` still runs with no window and quits on `SIGTERM`. On macOS it starts retired (`UIElement`) with a status item, and its status-menu Quit is a full shutdown.
-25. **Linux is unchanged:** no tray, the windowed app quits with its last window / Ctrl+Q (a full shutdown), and the background layer is `eidola service` + `--windowless`.
+24. Every window still opens and closes normally: space, Library, Record, Settings, Participants, About, Updates, onboarding.
+25. Dock right-click → New Space / Library… still works while a window is open.
+26. `--windowless` still runs with no window and quits on `SIGTERM`. On macOS it starts retired (`UIElement`) with a status item, and its status-menu Quit is a full shutdown.
+27. **Linux is unchanged:** no tray, the windowed app quits with its last window / Ctrl+Q (a full shutdown), and the background layer is `eidola service` + `--windowless`.
