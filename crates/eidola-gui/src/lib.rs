@@ -254,6 +254,9 @@ pub fn run_with(opts: LaunchOptions) {
             .unwrap_or(false);
         match stores.app_core().filter(|_| needs_account) {
             Some(core) => {
+                // A cold start can be slow enough to ⌘Q through; see
+                // `lifecycle::OpenIntent`.
+                let intent = lifecycle::intend_to_open(cx);
                 let task: gpui::Task<()> = cx.spawn(async move |cx: &mut gpui::AsyncApp| {
                     let backends =
                         crate::bridge::bridge(core, |c| async move { c.list_backends().await })
@@ -265,6 +268,9 @@ pub fn run_with(opts: LaunchOptions) {
                         // the window is dismissible; a silent skip is not.
                         .unwrap_or(true);
                     cx.update(|cx| {
+                        if !intent.still_wanted(cx) {
+                            return;
+                        }
                         if eidola_enabled {
                             open_onboarding_window(cx);
                         } else {

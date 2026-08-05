@@ -5,6 +5,39 @@
 //! install` enabling the systemd user unit, which wave 2 shipped and which
 //! this module deliberately does not duplicate.
 //!
+//! **What login actually launches — and what it should (open question).**
+//! `SMAppService.mainAppService` registers *the app bundle* as a login item,
+//! and launchd launches it exactly as a Dock click would: the ordinary
+//! windowed app, Dock icon and all. It takes **no arguments** — the class
+//! exposes no way to pass any (see `SMAppService.h`), so `--windowless`, the
+//! background/toolbar shape wave 3b made ⌘Q retire *into*, is unreachable
+//! this way. Under the background-app model login ought to start that
+//! background layer, not put a window in the user's face at every login.
+//!
+//! Nothing detects the difference at runtime, either:
+//! `NSApplicationLaunchIsDefaultLaunchKey` distinguishes only file/print/
+//! Service/state-restoration launches (a login launch *is* a "default"
+//! launch, same as a Dock click), and the process shape is identical —
+//! measured on an ordinary `open -a`: `ppid` is 1 and `XPC_SERVICE_NAME` is
+//! `application.<bundle-id>.<hash>.<hash>`, because LaunchServices routes
+//! every GUI launch through launchd. A timing or environment guess would
+//! misfire on normal launches, which is worse than the current wrong.
+//!
+//! **The documented cure is a LaunchAgent**, not this class:
+//! `SMAppService.agentServiceWithPlistName:` reads a plist from the bundle's
+//! `Contents/Library/LaunchAgents`, and (per the header) accepts "the
+//! standard launchd.plist keys" — including `ProgramArguments`, hence
+//! `--windowless`. It is deliberately **not** done here: it moves the toggle
+//! from System Settings' "Open at Login" to "Allow in the Background",
+//! requires the plist to ship from both `package-gui-app.sh` and the Nix
+//! bundle, needs a real signature to register at all (our ad-hoc dev build
+//! reports `Unsupported`, so it cannot be exercised locally), wants a
+//! migration for anyone already registered through `mainAppService`, and
+//! re-opens the TCC-identity question task 17 settled by keeping one
+//! app-bundle process. That is a product-and-packaging decision with a
+//! logout/login verification cycle, not a code tidy. Until it is taken, the
+//! copy below says what actually happens rather than what we intend.
+//!
 //! **The system is the source of truth, not our config.** `SMAppService`
 //! already stores the registration, the user can revoke it in System Settings
 //! → General → Login Items, and a second copy in our database would be a
@@ -48,7 +81,9 @@ impl LoginItemState {
     pub fn description(self) -> &'static str {
         match self {
             Self::Off => "Eidola stays out of the way until you open it.",
-            Self::On => "Eidola starts with your session, ready in the menu bar.",
+            // Not "ready in the menu bar": `mainAppService` launches the
+            // ordinary windowed app (see the module docs). Say what happens.
+            Self::On => "Eidola opens with your session.",
             Self::NeedsApproval => {
                 "Turned on, but macOS is waiting for you — allow Eidola in System Settings → \
                  General → Login Items."

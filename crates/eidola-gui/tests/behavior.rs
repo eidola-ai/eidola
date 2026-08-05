@@ -9913,6 +9913,81 @@ fn retiring_from_a_windows_own_update_still_closes_that_window(cx: &mut TestAppC
 }
 
 #[gpui::test]
+fn a_window_open_set_in_motion_before_the_retire_is_abandoned(cx: &mut TestAppContext) {
+    // The real shape of the bug: a click starts a window open that has to
+    // `await` (a launch-time backend read, a create-from-template write, a
+    // cross-space action lookup), ⌘Q retires the app inside that gap, and the
+    // awaited work then opens its window anyway — the app comes back to the
+    // front having just been told to go away.
+    use eidola_gui::lifecycle::{abandon_pending_opens, intend_to_open};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+
+    let opened = Rc::new(Cell::new(0usize));
+    let sink = opened.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let task = cx.update(|cx| {
+        let intent = intend_to_open(cx);
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            let _ = rx.await;
+            cx.update(|cx| {
+                if intent.still_wanted(cx) {
+                    sink.set(sink.get() + 1);
+                }
+            });
+        })
+    });
+
+    // ⌘Q lands while the open is still in flight. `quit_or_retire` bumps the
+    // generation synchronously, which is what the ticket compares against.
+    cx.update(abandon_pending_opens);
+    let _ = tx.send(());
+    cx.run_until_parked();
+    drop(task);
+    assert_eq!(
+        opened.get(),
+        0,
+        "the user's last instruction was ⌘Q, so the stale open is abandoned"
+    );
+
+    // A ticket taken *after* the retire is a fresh instruction and stands —
+    // this is what keeps the status menu's Open / New Space working.
+    let fresh = cx.update(|cx| intend_to_open(cx));
+    assert!(
+        cx.update(|cx| fresh.still_wanted(cx)),
+        "an open asked for after the retire is not stale"
+    );
+    // And the app is still an app: opening still works.
+    open_space(cx, &stores, Some("s".into()));
+    assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+}
+
+#[gpui::test]
+fn a_ticket_survives_everything_except_a_retire(cx: &mut TestAppContext) {
+    // The generation must move on retires and nothing else, or every async
+    // open would be abandoned by unrelated activity.
+    use eidola_gui::lifecycle::{abandon_pending_opens, close_all_windows, intend_to_open};
+
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    let stores = stub_stores_with_config(cx);
+    let intent = cx.update(|cx| intend_to_open(cx));
+
+    open_space(cx, &stores, Some("s".into()));
+    cx.update(close_all_windows);
+    cx.run_until_parked();
+    assert!(
+        cx.update(|cx| intent.still_wanted(cx)),
+        "closing windows is not retiring — ⌘W must not abandon a pending open"
+    );
+
+    cx.update(abandon_pending_opens);
+    assert!(!cx.update(|cx| intent.still_wanted(cx)));
+}
+
+#[gpui::test]
 fn the_login_item_row_starts_from_the_system_and_invents_nothing(cx: &mut TestAppContext) {
     use eidola_gui::general::GeneralView;
 

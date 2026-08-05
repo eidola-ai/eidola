@@ -997,6 +997,7 @@ impl SpaceView {
         };
         let rx = crate::bridge::action_location(app_core, action_id);
         let stores = self.stores.clone();
+        let intent = crate::lifecycle::intend_to_open(cx);
         self.navigate_task = Some(cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some((item_id, space_id)))) = rx.await else {
                 return;
@@ -1010,7 +1011,9 @@ impl SpaceView {
                 return;
             }
             let _ = cx.update(|_, cx| {
-                crate::open_space_window(cx, stores.clone(), space_id);
+                if intent.still_wanted(cx) {
+                    crate::open_space_window(cx, stores.clone(), space_id);
+                }
             });
         }));
     }

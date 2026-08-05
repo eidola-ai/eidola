@@ -157,6 +157,61 @@ pub fn reactivate(cx: &mut App, open_when_empty: impl FnOnce(&mut App)) {
     cx.activate(true);
 }
 
+/// How many times the app has retired to the background this session.
+///
+/// Only ever read through [`intend_to_open`] / [`OpenIntent::still_wanted`].
+#[derive(Default)]
+struct RetireGeneration(u64);
+
+impl gpui::Global for RetireGeneration {}
+
+/// A claim on opening a window, taken where the user asks for it and checked
+/// where the window is finally opened (task 17 wave 3b).
+///
+/// **The gap between the two is the problem.** Several window opens are set in
+/// motion by a click but completed by an `await` — the launch-time onboarding
+/// branch waits on a backend read, "New Space from Template" waits on a
+/// durable write, a cross-space reference waits on an action lookup. A ⌘Q
+/// landing inside that gap retires the app, and then the awaited work opens
+/// its window anyway: the app comes back to the front and un-retires itself,
+/// having been told to go away. The user's last instruction wins instead.
+///
+/// **`cx.defer`d opens need no ticket.** gpui flushes effects FIFO within one
+/// cycle and the retire's own sweep is deferred too, so a defer queued before
+/// it runs before it and its window is swept; a defer queued after it belongs
+/// to a later instruction. Only work that crosses an `await` can land after
+/// the sweep has finished.
+///
+/// **A missed site degrades to the old behaviour, never to a broken one.**
+/// `status_item::window_will_open` still asserts `Regular` from the
+/// `base_window_options` choke point, so an unticketed stale open is an
+/// unwanted window — not a window with no menu bar. That is why the ticket is
+/// an opt-in at the async sites rather than a veto at the choke point: a veto
+/// would have to *refuse* opens, and a refusal at a door we failed to sanction
+/// means a user clicking "Open Eidola" and getting nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenIntent(u64);
+
+/// Take a ticket for a window open that is about to cross an `await`.
+pub fn intend_to_open(cx: &App) -> OpenIntent {
+    OpenIntent(cx.try_global::<RetireGeneration>().map_or(0, |g| g.0))
+}
+
+impl OpenIntent {
+    /// Whether the app has retired since this ticket was taken.
+    pub fn still_wanted(self, cx: &App) -> bool {
+        self.0 == cx.try_global::<RetireGeneration>().map_or(0, |g| g.0)
+    }
+}
+
+/// Invalidate every outstanding [`OpenIntent`]. Called synchronously by ⌘Q's
+/// retire — the instant the user asks the app to go away, work already in
+/// flight toward a window is stale, whatever it does next.
+pub fn abandon_pending_opens(cx: &mut App) {
+    let next = cx.try_global::<RetireGeneration>().map_or(0, |g| g.0) + 1;
+    cx.set_global(RetireGeneration(next));
+}
+
 /// Close every open window, leaving the process running.
 ///
 /// The window half of ⌘Q's retire-to-the-background (task 17 wave 3b;

@@ -275,10 +275,18 @@ pub fn quit_or_retire(cx: &mut App) {
         // screen and no menu bar. `defer` runs the pair once the window update
         // has unwound, and keeps the order that matters — windows first, then
         // the policy over a bare process.
-        QuitIntent::Retire => cx.defer(|cx| {
-            crate::lifecycle::close_all_windows(cx);
-            apply(ActivationPolicy::Accessory, cx);
-        }),
+        QuitIntent::Retire => {
+            // **Synchronously, before the deferred sweep.** The instant ⌘Q is
+            // pressed, any window open already crossing an `await` is stale —
+            // waiting until the sweep runs would leave a gap in which one
+            // could still be ticketed as wanted. The sweep itself only sees
+            // windows that already exist.
+            crate::lifecycle::abandon_pending_opens(cx);
+            cx.defer(|cx| {
+                crate::lifecycle::close_all_windows(cx);
+                apply(ActivationPolicy::Accessory, cx);
+            });
+        }
     }
 }
 
