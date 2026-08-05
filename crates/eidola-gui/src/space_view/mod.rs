@@ -1996,6 +1996,11 @@ impl Render for SpaceView {
         let page_width = viewport.width;
         let window_h = viewport.height;
 
+        // An open disclosure whose participant left the roster paints nothing;
+        // retire it (and its dropdown, and the keyboard its field was holding)
+        // before anything reads what it claims — `sync_tree_focus` below asks
+        // whether an overlay owns the keyboard.
+        self.sync_inspector_participant_edit(window, cx);
         // Tree focus is *observed*, not merely bookkept: see
         // `keyboard::sync_tree_focus`.
         self.sync_tree_focus(window, cx);

@@ -11476,6 +11476,214 @@ fn space_inspector_escape_closes_a_participants_model_picker(cx: &mut TestAppCon
     );
 }
 
+/// A scene with one agent participant, a post to hang a tail draft off, and the
+/// inspector open — the surface the dropdown-ownership tests below drive.
+fn inspector_participants_stub_scene(
+    cx: &mut TestAppContext,
+) -> (AnyWindowHandle, Entity<SpaceView>) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.participants = Some((
+            "s1".into(),
+            vec![eidola_app_core::ParticipantInfo {
+                id: "agent-1".into(),
+                scope: "space".into(),
+                source: "owned".into(),
+                kind: "agent".into(),
+                label: "Assistant".into(),
+                model_ref: Some("gemma4-31b".into()),
+                system_prompt: Some("Be concise.".into()),
+                notify_policy: "human".into(),
+                role: "member".into(),
+                reference: None,
+            }],
+        ));
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "the question")],
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.draft_count_for_test() > 0),
+        "precondition: a tail draft exists for the jump to land in"
+    );
+    (window, view)
+}
+
+/// Type a printable at the view root and report whether it reached
+/// type-to-compose — the observable consequence of `transient_overlay_open`,
+/// which yields the conversation's keyboard to whatever it believes is on top.
+fn printable_reaches_the_conversation(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    view: &Entity<SpaceView>,
+) -> bool {
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&focus, cx);
+    })
+    .unwrap();
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.has_active_draft_for_test())
+}
+
+/// **A form that leaves takes its dropdown with it** (Codex review, PR #278).
+/// The model dropdown is painted *inside* a form, so any transition that
+/// unmounts that form takes the dropdown off the screen — and the flag
+/// recording the click must stop claiming an overlay owns the keyboard, or the
+/// window goes on yielding every arrow, Escape and printable to something
+/// nobody can see. "Save these participants as a template…" is such a
+/// transition: it drops the add form (and the editor) to make room for itself.
+#[gpui::test]
+fn space_inspector_a_form_that_leaves_takes_its_dropdown_with_it(cx: &mut TestAppContext) {
+    let (window, view) = inspector_participants_stub_scene(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_begin_add_participant(window, cx);
+            v.inspector_open_add_picker_for_test(cx);
+        })
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()));
+
+    // The reader reaches past the open dropdown for "Save these participants as
+    // a template…", then thinks better of it.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_begin_template(window, cx);
+            v.inspector_cancel_template(cx);
+        })
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    assert!(
+        !view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()),
+        "the dropdown went with the form that painted it"
+    );
+    assert!(
+        printable_reaches_the_conversation(cx, window, &view),
+        "the conversation answers the keyboard again, with no Escape needed"
+    );
+}
+
+/// The same rule at the sibling transition: **Remove** unmounts the very editor
+/// its dropdown hangs in.
+#[gpui::test]
+fn space_inspector_removing_a_participant_takes_its_dropdown_with_it(cx: &mut TestAppContext) {
+    let (window, view) = inspector_participants_stub_scene(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx);
+            v.inspector_open_editor_picker_for_test(cx);
+        })
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()));
+
+    view.update(cx, |v, cx| v.inspector_remove_participant("agent-1", cx));
+    draw_window(cx, window);
+
+    assert!(
+        !view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()),
+        "the dropdown went with the editor Remove closed"
+    );
+    assert!(
+        printable_reaches_the_conversation(cx, window, &view),
+        "the conversation answers the keyboard again"
+    );
+}
+
+/// And when the row itself leaves under the open editor — another window
+/// removed the participant, so the store's re-list drops it — the editor is
+/// unmounted by the roster rather than by a verb. It owes the same two things:
+/// its dropdown, and the keyboard its field was holding.
+#[gpui::test]
+fn space_inspector_a_participant_leaving_the_roster_retires_its_editor(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        !participant_labels(&stores, &space, cx).is_empty()
+    });
+    let agent = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("a seeded agent")
+            .id
+            .clone()
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx);
+            v.inspector_open_editor_picker_for_test(cx);
+        })
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()));
+    // The editor's own field is holding the keyboard — the borrow the unmount
+    // has to give back.
+    let name = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .expect("the disclosure is the editor");
+    cx.update_window(window, |_, window, cx| {
+        name.update(cx, |s, cx| s.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // The other window's removal, straight through the store — this view never
+    // hears a verb, only the re-list.
+    let (sid, pid) = (space.clone(), agent.clone());
+    stores
+        .participants
+        .update(cx, |s, cx| s.remove(sid, pid, cx));
+    wait_until(cx, "participant removed", |cx| {
+        !participant_labels(&stores, &space, cx).is_empty()
+            && stores
+                .participants
+                .read_with(cx, |s, _| s.list(&space).iter().all(|p| p.id != agent))
+    });
+    draw_window(cx, window);
+
+    assert_eq!(
+        view.read_with(cx, |v, _| v
+            .inspector_editing_participant()
+            .map(str::to_string)),
+        None,
+        "an editor whose row is gone is not an editor"
+    );
+    assert!(
+        !view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()),
+        "and its dropdown went with it"
+    );
+    // The keyboard is back with the conversation — no click on the page first,
+    // which is the whole point of the handoff: the field it was in is gone.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "the press reached the conversation instead of a dead input"
+    );
+    drain_runtime(&core);
+}
+
 /// Type-to-compose must yield to **every** field the panel paints, not just the
 /// title: a character typed into a participant's system prompt is text, and the
 /// jump would consume the press and apply it to the composer instead.

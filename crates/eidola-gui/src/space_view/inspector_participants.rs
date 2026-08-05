@@ -185,7 +185,7 @@ impl SpaceView {
 
     #[doc(hidden)]
     pub fn inspector_participant_picker_open_for_test(&self) -> bool {
-        self.inspector_participant_picker.is_some()
+        self.open_inspector_participant_picker().is_some()
     }
 
     /// Open the add form's model dropdown without a click (tests, driver).
@@ -193,6 +193,14 @@ impl SpaceView {
     pub fn inspector_open_add_picker_for_test(&mut self, cx: &mut Context<Self>) {
         if self.inspector_participant_picker != Some(ParticipantPicker::Add) {
             self.inspector_toggle_participant_picker(ParticipantPicker::Add, cx);
+        }
+    }
+
+    /// The same, for the open disclosure's model dropdown.
+    #[doc(hidden)]
+    pub fn inspector_open_editor_picker_for_test(&mut self, cx: &mut Context<Self>) {
+        if self.inspector_participant_picker != Some(ParticipantPicker::Editor) {
+            self.inspector_toggle_participant_picker(ParticipantPicker::Editor, cx);
         }
     }
 
@@ -499,36 +507,119 @@ impl SpaceView {
 
     // -- Pickers & errors --------------------------------------------------
 
+    /// The dropdown that is **actually on screen**, if any — the one door every
+    /// reader of the flag goes through.
+    ///
+    /// The field records a click; this answers the question its readers actually
+    /// have. A model dropdown is painted *inside* a form — the open disclosure's
+    /// editor, or the add form — so every transition that unmounts that form
+    /// takes the dropdown off the screen with it, while the flag stands. A
+    /// standing flag then tells [`SpaceView::transient_overlay_open`] that an
+    /// overlay owns the keyboard, and the window goes on yielding every arrow,
+    /// Escape and printable to something nobody can see (Codex review, PR #278:
+    /// "Save these participants as a template…" drops the form the dropdown
+    /// hangs in; **Remove** does the same to the editor; so does a re-list that
+    /// drops the edited row — see
+    /// [`SpaceView::sync_inspector_participant_edit`]).
+    ///
+    /// Deriving the answer from the owning form is what makes the class
+    /// unrepresentable, rather than a clear-the-flag at each transition — the
+    /// next of which would forget. A stale flag can never be *revived* either:
+    /// the only two things that mount a form ([`Self::inspector_toggle_participant`],
+    /// [`Self::inspector_begin_add_participant`]) both reset it. The panel close
+    /// keeps its own explicit clear for the other reason — the half-written
+    /// editor deliberately survives a mis-hit ⌥⌘I, and the dropdown deliberately
+    /// does not.
+    pub(crate) fn open_inspector_participant_picker(&self) -> Option<ParticipantPicker> {
+        let target = self.inspector_participant_picker?;
+        let mounted = match target {
+            ParticipantPicker::Editor => self.inspector_participant_edit.is_some(),
+            ParticipantPicker::Add => self.inspector_participant_add.is_some(),
+        };
+        mounted.then_some(target)
+    }
+
+    /// Retire an open disclosure whose participant has **left the roster** —
+    /// another window removed it, and the store's re-list is the only news this
+    /// view gets. Nothing paints the editor once its row is gone, so every
+    /// window-local thing hanging off it becomes a claim about a surface that is
+    /// not there: its dropdown (above), and — worse — the field focus, which
+    /// would go on reporting through `inspector_field_focused` that a **dead**
+    /// input holds the keyboard, leaving type-to-compose inert until a click
+    /// revived it. That is the unmount no verb can clean up after, which is why
+    /// it is reconciled at the head of `render` instead: the roster is what
+    /// decides whether the editor paints, so the roster is what has to retire it.
+    ///
+    /// **Focus comes back from a panel that is holding it** — `set_inspector_open`'s
+    /// rule, restored only to a lender who still has nothing.
+    pub(crate) fn sync_inspector_participant_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pid) = self
+            .inspector_participant_edit
+            .as_ref()
+            .map(|e| e.participant_id.clone())
+        else {
+            return;
+        };
+        let Some(space_id) = self.space_id(cx) else {
+            return;
+        };
+        // Only a listing that has answered can say a row is gone: a first load
+        // in flight, or a failed one with nothing prior, knows nothing.
+        let gone = {
+            let store = self.stores.participants.read(cx);
+            match store.participants(&space_id).value() {
+                Some(list) => !list.iter().any(|p| p.id == pid),
+                None => false,
+            }
+        };
+        if !gone {
+            return;
+        }
+        let held = self.inspector_field_focused(window, cx);
+        self.inspector_participant_edit = None;
+        self.inspector_participant_picker = None;
+        if held && !self.inspector_field_focused(window, cx) {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
     pub(crate) fn inspector_toggle_participant_picker(
         &mut self,
         target: ParticipantPicker,
         cx: &mut Context<Self>,
     ) {
-        self.inspector_participant_picker = if self.inspector_participant_picker == Some(target) {
-            None
-        } else {
-            // A freshly opened picker starts at the top.
-            self.inspector_participant_picker_scroll = gpui::ScrollHandle::new();
-            Some(target)
-        };
+        self.inspector_participant_picker =
+            if self.open_inspector_participant_picker() == Some(target) {
+                None
+            } else {
+                // A freshly opened picker starts at the top.
+                self.inspector_participant_picker_scroll = gpui::ScrollHandle::new();
+                Some(target)
+            };
         cx.notify();
     }
 
     /// Close an open participant model picker, reporting whether it was open —
-    /// the Escape rung the view root owns, beside the router picker's.
+    /// the Escape rung the view root owns, beside the router picker's. Only a
+    /// dropdown the reader can *see* consumes the press; a flag standing behind
+    /// an unmounted form is tidied away and the press falls to the next rung.
     pub(crate) fn close_inspector_participant_picker(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.inspector_participant_picker.is_none() {
+        let was_visible = self.open_inspector_participant_picker().is_some();
+        if self.inspector_participant_picker.take().is_none() {
             return false;
         }
-        self.inspector_participant_picker = None;
         cx.notify();
-        true
+        was_visible
     }
 
     /// Select a model into whichever form is open (the picker's target, or the
     /// open form when driven from a test).
     pub fn inspector_select_participant_model(&mut self, model_id: &str, cx: &mut Context<Self>) {
-        let target = self.inspector_participant_picker.take().or({
+        let target = self.open_inspector_participant_picker().or({
             if self.inspector_participant_edit.is_some() {
                 Some(ParticipantPicker::Editor)
             } else if self.inspector_participant_add.is_some() {
@@ -537,6 +628,8 @@ impl SpaceView {
                 None
             }
         });
+        // The choice closes the dropdown either way.
+        self.inspector_participant_picker = None;
         match target {
             Some(ParticipantPicker::Editor) => {
                 if let Some(edit) = self.inspector_participant_edit.as_mut() {
@@ -1083,7 +1176,7 @@ impl SpaceView {
         target: ParticipantPicker,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let open = self.inspector_participant_picker == Some(target);
+        let open = self.open_inspector_participant_picker() == Some(target);
         let probe_prefix: SharedString = match target {
             ParticipantPicker::Editor => "space/inspector/participants/editor/model".into(),
             ParticipantPicker::Add => "space/inspector/participants/add/model".into(),
