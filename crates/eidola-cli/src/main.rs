@@ -1017,7 +1017,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 }
                 println!("\ncatalog (download with `eidola model download <id>`):");
                 for entry in core.local_model_catalog() {
-                    let installed = state.models.iter().any(|m| m.file_name == entry.file_name);
+                    let installed = catalog_installed(&state.models, entry.file_name);
                     println!(
                         "{:<18} {:>9}  {}{}",
                         entry.id,
@@ -1444,6 +1444,18 @@ fn unaccounted_engines(
         .collect()
 }
 
+/// Whether a catalog entry's `.gguf` is actually on this machine.
+///
+/// The same evidence bar as [`unaccounted_engines`], asked of the other join
+/// key: a *file name*, not an id. `on_disk` rather than row existence,
+/// because a download of this very entry that failed — or is still streaming
+/// to `<file>.part` — leaves a synthesized row named `<slug>.gguf` with
+/// nothing behind it. Marking that installed would talk the reader out of the
+/// retry the row's own error line is asking for.
+fn catalog_installed(models: &[eidola_app_core::LocalModelInfo], file_name: &str) -> bool {
+    models.iter().any(|m| m.file_name == file_name && m.on_disk)
+}
+
 /// Print one `update check` outcome — the same five states the GUI's
 /// Updates window renders, sharing the core types.
 fn print_update_check(snapshot: &eidola_app_core::updates::UpdateCheckSnapshot) {
@@ -1811,6 +1823,28 @@ mod tests {
         let out = unaccounted_engines(&running, &snapshot);
         assert_eq!(out.len(), 1);
         assert!(out[0].orphaned);
+    }
+
+    /// The catalog marker answers "is this file here", so it reads the same
+    /// evidence: a failed download of a catalog entry leaves a row named
+    /// exactly like the entry, and calling that installed hides the retry.
+    #[test]
+    fn a_catalog_entry_is_installed_only_when_its_file_is() {
+        let real = model("gemma-4-E2B_q4_0-it@local", LocalModelStatus::Available);
+        assert!(catalog_installed(
+            std::slice::from_ref(&real),
+            "gemma-4-E2B_q4_0-it.gguf"
+        ));
+
+        let failed = synthetic(
+            "gemma-4-E2B_q4_0-it@local",
+            LocalModelStatus::Available,
+            Some("connection reset"),
+        );
+        assert!(!catalog_installed(
+            std::slice::from_ref(&failed),
+            "gemma-4-E2B_q4_0-it.gguf"
+        ));
     }
 
     #[test]

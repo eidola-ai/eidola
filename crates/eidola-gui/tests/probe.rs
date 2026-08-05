@@ -2294,6 +2294,50 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
     probe::set_probes_enabled(false);
 }
 
+/// A catalog entry whose download failed leaves a row named exactly like the
+/// entry, with no file behind it. "Installed" *replaces* the Download verb,
+/// so reading that row as installed would take away the retry the row's own
+/// error line is asking for.
+#[gpui::test]
+fn a_failed_catalog_download_still_affords_downloading(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::{BackendsSettingsView, BackendsTab};
+
+    let _guard = probes_on();
+
+    let entry = &eidola_app_core::LOCAL_MODEL_CATALOG[0];
+    let mut state = local_models_fixture();
+    state.models = vec![eidola_app_core::LocalModelInfo {
+        id: format!("{}@local", entry.id),
+        slug: entry.id.into(),
+        display_name: entry.display_name.into(),
+        file_name: entry.file_name.into(),
+        size_bytes: None,
+        source_url: None,
+        status: eidola_app_core::LocalModelStatus::Available,
+        last_error: Some("connection reset".into()),
+        on_disk: false,
+    }];
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.backends = backends_fixture();
+        s.local_models = Some(state);
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| v.select_tab(BackendsTab::Local, cx));
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/backends/local/catalog/0/download".to_string()),
+        "a row with no file behind it must keep its Download verb: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContext) {
     use eidola_gui::backends_settings::BackendsSettingsView;
