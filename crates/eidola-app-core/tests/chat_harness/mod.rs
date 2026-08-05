@@ -86,6 +86,11 @@ pub enum ChatBehavior {
     /// scaffolding: its content starts with a header-shaped line. Exercises
     /// strip-on-receipt.
     OkStreamingWithHeader,
+    /// As `OkStreamingWithHeader`, but the mimicked header is **split across
+    /// deltas** (mid-handle, mid-separator, and across the blank line) — what a
+    /// real token stream looks like, and what the incremental strip must cope
+    /// with.
+    OkStreamingWithSplitHeader,
     /// 200 SSE stream that the server aborts mid-event (writes a partial event,
     /// then drops the TCP connection). Exercises the mid-SSE read failure arm.
     StreamingMidAbort,
@@ -938,16 +943,37 @@ async fn handle_chat(
             // all reqwest surfaces a transport error from `send`.
             Ok(())
         }
-        ChatBehavior::OkStreaming => write_sse_stream(stream, true, STREAM_CONTENT).await,
+        ChatBehavior::OkStreaming => write_sse_stream(stream, true, &[STREAM_CONTENT]).await,
         ChatBehavior::OkStreamingWithHeader => {
             write_sse_stream(
                 stream,
                 true,
-                &format!("{MIMICKED_HEADER}\n\n{STREAM_CONTENT}"),
+                &[&format!("{MIMICKED_HEADER}\n\n{STREAM_CONTENT}")],
             )
             .await
         }
-        ChatBehavior::StreamingMidAbort => write_sse_stream(stream, false, STREAM_CONTENT).await,
+        ChatBehavior::OkStreamingWithSplitHeader => {
+            // Chopped the way a token stream chops: mid-handle, mid-separator,
+            // and with the blank line arriving attached to the first body token.
+            let (handle, label) = MIMICKED_HEADER
+                .split_once(" \u{b7} ")
+                .expect("the mimicked header carries the separator");
+            let (h1, h2) = handle.split_at(4);
+            write_sse_stream(
+                stream,
+                true,
+                &[
+                    h1,
+                    h2,
+                    " \u{b7}",
+                    " ",
+                    label,
+                    &format!("\n\n{STREAM_CONTENT}"),
+                ],
+            )
+            .await
+        }
+        ChatBehavior::StreamingMidAbort => write_sse_stream(stream, false, &[STREAM_CONTENT]).await,
         ChatBehavior::ToolRoundsBlocking(rounds) => {
             if hit <= rounds {
                 let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
@@ -1002,14 +1028,14 @@ async fn handle_chat(
             if hit <= rounds {
                 write_sse_tool_stream(stream, hit, false).await
             } else {
-                write_sse_stream(stream, true, TOOL_FINAL_CONTENT).await
+                write_sse_stream(stream, true, &[TOOL_FINAL_CONTENT]).await
             }
         }
         ChatBehavior::ToolRoundsStreamingWithExtras(rounds) => {
             if hit <= rounds {
                 write_sse_tool_stream(stream, hit, true).await
             } else {
-                write_sse_stream(stream, true, TOOL_FINAL_CONTENT).await
+                write_sse_stream(stream, true, &[TOOL_FINAL_CONTENT]).await
             }
         }
         ChatBehavior::ToolCallsNotAnArray => {
@@ -1304,13 +1330,14 @@ pub const STREAM_CONTENT: &str = "Hello from the stream.";
 /// anything — strip-on-receipt is shape-based, not identity-based.
 pub const MIMICKED_HEADER: &str = "#a2c3d4e · Gemma4 31b";
 
-/// Write a chunked SSE stream. When `complete`, emits reasoning + content
-/// deltas, a usage chunk, and `[DONE]`. When not complete, emits one partial
-/// event and then drops the connection mid-stream (simulating an abort).
+/// Write a chunked SSE stream. When `complete`, emits reasoning + one content
+/// delta per entry of `content_chunks`, a usage chunk, and `[DONE]`. When not
+/// complete, emits one partial event and then drops the connection mid-stream
+/// (simulating an abort).
 async fn write_sse_stream(
     stream: &mut TcpStream,
     complete: bool,
-    content_text: &str,
+    content_chunks: &[&str],
 ) -> std::io::Result<()> {
     let head = "HTTP/1.1 200 OK\r\n\
                 Content-Type: text/event-stream\r\n\
@@ -1339,10 +1366,13 @@ async fn write_sse_stream(
         return Ok(());
     }
 
-    let content = serde_json::json!({
-        "choices": [{ "delta": { "content": content_text } }]
-    });
-    stream.write_all(&send_event(content.to_string())).await?;
+    for chunk in content_chunks {
+        let content = serde_json::json!({
+            "choices": [{ "delta": { "content": chunk } }]
+        });
+        stream.write_all(&send_event(content.to_string())).await?;
+        stream.flush().await?;
+    }
 
     let usage = serde_json::json!({
         "choices": [],

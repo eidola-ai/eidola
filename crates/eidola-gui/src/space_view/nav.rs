@@ -58,6 +58,35 @@ pub struct SnapAnim {
     pub duration: Duration,
 }
 
+/// An in-flight glide of the **page** (vertical) scroll toward a destination
+/// the reader asked to be taken to — a footnote's source, a highlight's
+/// referencer, "See in context". The horizontal twin is [`SnapAnim`]; both ride
+/// the same easing and the same frame loop shape.
+///
+/// Navigation is animated because a jump gives the reader no way to tell
+/// *where* they were taken from: the glide carries the intervening page past
+/// them, which is the whole difference between "this is elsewhere in the same
+/// conversation" and "the page changed". Gesture-driven scrolls (the wheel, a
+/// minimap drag) are never animated — they are already the reader's own motion.
+#[derive(Clone, Copy, Debug)]
+pub struct PageGlide {
+    /// Page scroll `y` (≤ 0) at the start and end of the glide.
+    pub from_y: f32,
+    pub to_y: f32,
+    pub start: Instant,
+    pub duration: Duration,
+}
+
+/// The current eased `y` of a page glide at progress fraction `t` (clamped).
+pub fn glide_y_at(a: &PageGlide, t: f32) -> f32 {
+    a.from_y + (a.to_y - a.from_y) * ease_out_cubic(t.clamp(0.0, 1.0))
+}
+
+/// Elapsed progress `t` (0..=1) of a page glide as of now.
+pub fn glide_progress(a: &PageGlide) -> f32 {
+    (a.start.elapsed().as_secs_f32() / a.duration.as_secs_f32().max(f32::EPSILON)).clamp(0.0, 1.0)
+}
+
 /// Cubic ease-out: fast departure, gentle arrival — reads as a thrown page
 /// floating to rest on its snap point.
 pub fn ease_out_cubic(t: f32) -> f32 {
@@ -166,6 +195,7 @@ pub fn proximity_snap_target(
 
 use super::model::TreeNode;
 use super::{BAND_HEIGHT, SpaceView};
+
 use gpui::{Context, IsZero, Pixels, Point, ScrollHandle, TouchPhase, Window, point, px};
 
 impl SpaceView {
@@ -199,6 +229,99 @@ impl SpaceView {
         self.snap_pin = None;
     }
 
+    /// Glide the page to `y` (a page scroll offset, ≤ 0) instead of jumping —
+    /// the navigation motion (see [`PageGlide`]). A short hop, an equal
+    /// destination, or a destination the page is already at lands immediately.
+    pub(crate) fn glide_page_to(&mut self, y: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let from_y = self.page_scroll.offset().y.as_f32();
+        let dist = (y - from_y).abs();
+        // A reader who asked for less motion gets the destination, not the
+        // journey. `App::reduce_motion` is gpui's own flag (it also drives every
+        // `Animation` element); nothing feeds it from the platform at this pin —
+        // see the note in `crates/eidola-gui/AGENTS.md`.
+        if dist < 1.0 || cx.reduce_motion() {
+            self.set_page_scroll_y(y);
+            cx.notify();
+            return;
+        }
+        let window_h = self.page_size(window).height.as_f32().max(1.0);
+        self.page_glide.set(Some(PageGlide {
+            from_y,
+            to_y: y,
+            start: std::time::Instant::now(),
+            duration: snap_duration(dist, window_h),
+        }));
+        self.drive_page_glide(window, cx);
+    }
+
+    /// **The one door for a programmatic page scroll that lands at once.**
+    /// Retires any glide in flight, then writes `y` (the horizontal offset is
+    /// preserved — branch selection is the strips' business).
+    ///
+    /// It exists because a glide *owns* `page_scroll` for its whole duration:
+    /// [`Self::apply_page_glide`] writes each frame's position from the
+    /// trajectory alone, so anything that set the offset between two glide
+    /// frames was silently overwritten on the next one — a keyboard move, a
+    /// caret reveal, a settling post, all undone until the glide landed. The
+    /// gesture paths said this already ([`Self::cancel_page_glide`] from
+    /// `note_scroll_activity` / `minimap_press`); the instant family had no
+    /// such seam, and "remember to cancel first" is exactly the discipline a
+    /// new call site forgets. **Nothing else in `space_view` writes
+    /// `page_scroll`'s offset** — only this and the glide's own frame body.
+    ///
+    /// The reader's own navigation therefore wins by construction: whoever
+    /// writes last owns the page, and a glide can never take it back.
+    pub(crate) fn set_page_scroll_y(&self, y: f32) {
+        self.cancel_page_glide();
+        let off = self.page_scroll.offset();
+        self.page_scroll.set_offset(point(off.x, px(y)));
+    }
+
+    /// One frame of the page glide: ease the offset toward the target and,
+    /// until it arrives, schedule the next frame.
+    pub(crate) fn drive_page_glide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = self.page_glide.get().as_ref().map(glide_progress) else {
+            return;
+        };
+        if !self.apply_page_glide(t) {
+            let entity = cx.entity();
+            window.on_next_frame(move |window, cx| {
+                entity.update(cx, |this, cx| this.drive_page_glide(window, cx));
+            });
+        }
+        cx.notify();
+    }
+
+    /// Place the page at the glide's eased position for progress `t`, retiring
+    /// the glide once it arrives. Returns whether it arrived. Split from the
+    /// frame loop so the landing is testable without a real clock (no test
+    /// dispatcher pumps `on_next_frame`).
+    /// The glide is the **only** writer that does not go through
+    /// [`Self::set_page_scroll_y`] — it is the motion that seam takes the page
+    /// away from.
+    pub(crate) fn apply_page_glide(&mut self, t: f32) -> bool {
+        let Some(a) = self.page_glide.get() else {
+            return true;
+        };
+        let off = self.page_scroll.offset();
+        self.page_scroll
+            .set_offset(point(off.x, px(glide_y_at(&a, t))));
+        if t >= 1.0 {
+            self.page_glide.set(None);
+            return true;
+        }
+        false
+    }
+
+    /// Drop any in-flight page glide — the reader's own scrolling or a gesture
+    /// now owns the offset. Programmatic scrolls get this for free through
+    /// [`Self::set_page_scroll_y`]; the direct callers are the gesture paths,
+    /// which take the page over without writing an offset of their own (gpui's
+    /// built-in scroller does that).
+    pub(crate) fn cancel_page_glide(&self) {
+        self.page_glide.set(None);
+    }
+
     /// Begin (or immediately resolve) a snap glide for `node_id` from its
     /// current resting position to the nearest/flicked-toward branch.
     pub(crate) fn start_snap(
@@ -222,6 +345,15 @@ impl SpaceView {
         };
         let from_x = off.x.as_f32();
         let target = snap_target_index(from_x, stride, self.last_h_delta.as_f32(), count);
+        // The gesture is over and its destination is known: record it, for the
+        // same reason a dot click does. (The gesture *itself* cleared the cache
+        // on every moved step — mid-drag there is no destination to name.)
+        {
+            let turns = self.stream_overlays(cx);
+            let tree = self.effective_tree(page_width, &turns);
+            self.selected_turn
+                .set(self.turn_seq_under_child(&tree, &node_id, target, page_width));
+        }
         let to_x = -(target as f32) * stride;
         let dist = (to_x - from_x).abs();
         if dist < 0.5 {
@@ -252,6 +384,27 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Navigation can race a completion before another frame records the new
+        // selected path — and a dot click is the *least* ambiguous switch there
+        // is, so it records where it is going rather than clearing (see
+        // `layout::turn_seq_under_child`). Both arms below are covered by this
+        // one line: the instant arm never renders in between, and the animating
+        // arm spends its whole slide observing the child being left.
+        {
+            let turns = self.stream_overlays(cx);
+            let tree = self.effective_tree(page_width, &turns);
+            self.selected_turn
+                .set(self.turn_seq_under_child(&tree, &node_id, index, page_width));
+        }
+        // A dot click is the reader taking over navigation. It writes no page
+        // offset of its own — it is a *horizontal* switch — but it changes
+        // which document the page is scrolling through, which leaves any
+        // vertical glide aiming at a `y` measured on the branch just left. Its
+        // sibling takeovers cancel at their own entry (the wheel through
+        // `note_scroll_activity`, the minimap through `minimap_press`, the
+        // keyboard through `set_page_scroll_y`); the dot is the only one that
+        // reaches a switch without passing through any of them.
+        self.cancel_page_glide();
         let stride = (page_width + BAND_HEIGHT).as_f32();
         if stride <= 0.0 {
             return;
@@ -266,7 +419,8 @@ impl SpaceView {
         let to_x = -(index as f32) * stride;
         self.cancel_snap();
         let dist = (to_x - from_x).abs();
-        if dist < 0.5 {
+        // Navigation, so it honors reduce-motion (see `glide_page_to`).
+        if dist < 0.5 || cx.reduce_motion() {
             if let Some(h) = self.scrolls.get(&node_id) {
                 h.set_offset(point(px(to_x), off_y));
             }
@@ -365,6 +519,18 @@ impl SpaceView {
                 handle.set_offset(point(px(-(idx as f32) * stride), off.y));
             }
         }
+        // This is the shared seam for reference, minimap, keyboard, draft, and
+        // deferred branch selection. Once it steers a strip, the last frame's
+        // selected streaming leaf is no longer an honest parked observation —
+        // so **re-record it now** rather than waiting for a frame that a
+        // completion may beat. Recording, not clearing: a reader who navigated
+        // onto another turn's stream still has to be carried across the
+        // insertion when some *other* turn lands (`follow_completed_turn`), and
+        // a cleared cache cannot say where they were. The genuinely ambiguous
+        // cases — a strip mid-gesture or mid-snap — clear it at their own
+        // entry, because there is no settled child to name.
+        self.selected_turn
+            .set(self.selected_turn_seq(roots, page_width));
         self.cancel_snap();
     }
 }
@@ -381,6 +547,21 @@ mod tests {
             ease_out_cubic(0.5) > 0.5,
             "ease-out is ahead at the midpoint"
         );
+    }
+
+    #[test]
+    fn page_glide_eases_between_its_endpoints() {
+        let g = PageGlide {
+            from_y: -1000.0,
+            to_y: 0.0,
+            start: Instant::now(),
+            duration: Duration::from_millis(300),
+        };
+        assert!((glide_y_at(&g, 0.0) - g.from_y).abs() < 1e-3);
+        assert!((glide_y_at(&g, 1.0) - g.to_y).abs() < 1e-3);
+        // Clamped outside 0..=1, and ahead of linear at the midpoint.
+        assert!((glide_y_at(&g, 2.0) - g.to_y).abs() < 1e-3);
+        assert!(glide_y_at(&g, 0.5) > -500.0);
     }
 
     #[test]
