@@ -3754,6 +3754,83 @@ fn space_selected_turn_keeps_its_branch_when_it_lands_before_its_sibling(cx: &mu
 }
 
 #[gpui::test]
+fn space_two_turns_landing_together_keep_a_scrolled_away_reader_still(cx: &mut TestAppContext) {
+    // A settle mode records the *reader's* situation: parked means don't move
+    // them, asked means take them there. When a sibling turn lands first, the
+    // reader's own branch is preserved with `Stay` — and if their turn then
+    // lands too, before any frame consumed that request, re-aiming it onto the
+    // written post must forward the node identity **only**. Upgrading the
+    // settle to `BranchEnd` would scroll a reader who had deliberately gone
+    // back up the branch down to the tail of a reply they never asked to be
+    // taken to.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long)], cx)
+        });
+    })
+    .unwrap();
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Two participants answer at once; the ask leaves the reader on the second.
+    for agent in ["agent-b", "agent-c"] {
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.ask_participant(agent.into(), "a1".into(), window, cx)
+            });
+        });
+        vcx.run_until_parked();
+    }
+    let (first, second) = view.read_with(&vcx, |v, cx| {
+        let s = v.space().read(cx);
+        (s.streams()[0].seq, s.streams()[1].seq)
+    });
+
+    // The reader goes back up their own branch to re-read the question.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+    let parked_at = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    // Both turns land before the next frame — the sibling first.
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", &long);
+    a3.parent_action_id = Some("a1".into());
+    let question = fixture_user_post("a1", &long);
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_success_for_test(first, vec![question.clone(), a2.clone()], false, cx);
+            s.apply_turn_success_for_test(second, vec![question.clone(), a2, a3], false, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let path = vcx.update(|window, cx| view.read(cx).selected_effective_path_for_test(window, cx));
+    assert!(
+        path.contains(&"a3".to_string()),
+        "the reader keeps the branch they were reading ({path:?})"
+    );
+    let offset = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    let content_end = view.read_with(&vcx, |v, _| v.content_end_for_test());
+    assert!(
+        content_end < parked_at - 1.0,
+        "the answers must have given the page somewhere to be dragged to \
+         (parked at {parked_at}, content end {content_end})"
+    );
+    assert!(
+        (offset - parked_at).abs() < 2.0,
+        "and they are left where they scrolled to, not carried to the reply's \
+         tail (offset {offset}, parked at {parked_at}, content end \
+         {content_end})"
+    );
+}
+
+#[gpui::test]
 fn space_newer_branch_navigation_outranks_the_cached_turn_when_it_lands(cx: &mut TestAppContext) {
     let stores = stub_stores_with_agents(cx, "s");
     let (window, view) = open_space(cx, &stores, Some("s".into()));
