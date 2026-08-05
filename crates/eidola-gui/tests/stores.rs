@@ -880,8 +880,13 @@ fn a_refused_rename_reconciles_the_index_and_surfaces_the_refusal(cx: &mut TestA
     stores
         .spaces
         .update(cx, |s, cx| s.rename("ghost".into(), "Renamed".into(), cx));
-    wait_until(cx, "the refusal surfaces", |cx| {
-        stores.spaces.read_with(cx, |s, _| s.op_error().is_some())
+    // The refusal and the reconcile are two events now: the write's refusal is
+    // reported as it settles, and the batch-end read — issued only once no write
+    // is in flight — lands after it.
+    wait_until(cx, "the refusal surfaces and the index reconciles", |cx| {
+        stores.spaces.read_with(cx, |s, _| {
+            s.op_error().is_some() && !s.list().iter().any(|r| r.id == "ghost")
+        })
     });
     stores.spaces.read_with(cx, |s, _| {
         assert!(
@@ -891,8 +896,8 @@ fn a_refused_rename_reconciles_the_index_and_surfaces_the_refusal(cx: &mut TestA
         );
         assert!(
             !s.list().iter().any(|r| r.id == "ghost"),
-            "the optimistic title never stands: the mutation re-lists on its \
-             failure exit"
+            "the optimistic title never stands: the batch-end read reconciles \
+             on the failure exit"
         );
         assert!(
             s.list().iter().any(|r| r.id == real),
@@ -942,8 +947,10 @@ fn an_archive_that_changed_nothing_says_so(cx: &mut TestAppContext) {
     stores
         .spaces
         .update(cx, |s, cx| s.archive(space.clone(), cx));
-    wait_until(cx, "the refusal surfaces", |cx| {
-        stores.spaces.read_with(cx, |s, _| s.op_error().is_some())
+    wait_until(cx, "the refusal surfaces and the index reconciles", |cx| {
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.op_error().is_some() && s.list().is_empty())
     });
     stores.spaces.read_with(cx, |s, _| {
         assert!(s.op_error_for(&space).is_some());
@@ -976,13 +983,15 @@ fn a_refresh_landing_mid_rename_keeps_the_spaces_ops_error(cx: &mut TestAppConte
         .update(cx, |s, cx| s.rename("ghost".into(), "Renamed".into(), cx));
     cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::SpaceIndex), cx));
 
-    wait_until(cx, "the refusal surfaces", |cx| {
-        stores.spaces.read_with(cx, |s, _| s.op_error().is_some())
+    wait_until(cx, "the refusal surfaces and the index reconciles", |cx| {
+        stores.spaces.read_with(cx, |s, _| {
+            s.op_error().is_some() && s.list().iter().any(|r| r.id == real)
+        })
     });
     stores.spaces.read_with(cx, |s, _| {
         assert!(
             s.list().iter().any(|r| r.id == real),
-            "the mutation re-listed on its failure exit"
+            "the mutation's batch-end read landed on its failure exit"
         );
         assert!(
             !s.index().is_loading(),
@@ -1078,9 +1087,11 @@ fn two_refused_mutations_each_keep_their_own_refusal(cx: &mut TestAppContext) {
     });
     cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::SpaceIndex), cx));
 
-    wait_until(cx, "both refusals surface", |cx| {
+    wait_until(cx, "both refusals surface and the index reconciles", |cx| {
         stores.spaces.read_with(cx, |s, _| {
-            s.op_error_for("ghost-a").is_some() && s.op_error_for("ghost-b").is_some()
+            s.op_error_for("ghost-a").is_some()
+                && s.op_error_for("ghost-b").is_some()
+                && s.list().len() == 1
         })
     });
     stores.spaces.read_with(cx, |s, _| {
@@ -1090,7 +1101,7 @@ fn two_refused_mutations_each_keep_their_own_refusal(cx: &mut TestAppContext) {
         );
         assert!(
             s.list().iter().any(|r| r.id == real) && s.list().len() == 1,
-            "and both mutations re-listed: the index is the database's"
+            "and the batch-end read landed: the index is the database's"
         );
         assert!(!s.index().is_loading());
     });
@@ -1124,10 +1135,10 @@ fn a_superseded_rename_leaves_no_optimism_behind(cx: &mut TestAppContext) {
         s.rename("ghost".into(), "Bergamot".into(), cx);
     });
 
-    wait_until(cx, "the refusal surfaces", |cx| {
-        stores
-            .spaces
-            .read_with(cx, |s, _| s.op_error_for("ghost").is_some())
+    wait_until(cx, "the refusal surfaces and the index reconciles", |cx| {
+        stores.spaces.read_with(cx, |s, _| {
+            s.op_error_for("ghost").is_some() && !s.list().iter().any(|r| r.id == "ghost")
+        })
     });
     stores.spaces.read_with(cx, |s, _| {
         let titles: Vec<String> = s.list().iter().filter_map(|r| r.title.clone()).collect();
@@ -1139,4 +1150,85 @@ fn a_superseded_rename_leaves_no_optimism_behind(cx: &mut TestAppContext) {
         assert!(s.list().iter().any(|r| r.id == real));
         assert!(!s.index().is_loading());
     });
+}
+
+/// **The index a batch lands on is read after the batch's last write.** Each
+/// mutation used to carry a listing it read right after *its own* write; with
+/// siblings in flight, the operation still standing when the last slot cleared
+/// could be one whose read predated another's commit, and it resolved the shared
+/// index with that snapshot — dropping an accepted rename from view (and, when a
+/// read failed, preserving the stale snapshot as `Failed { prior }`). The
+/// resolving read is now issued only once no write is in flight, so "after every
+/// write of the batch" is a property of when it is taken.
+///
+/// **The assertion has to be a stability one.** A batch's optimistic edits agree
+/// with the database the moment its writes commit, so comparing once passes long
+/// before the resolution lands — the defect is precisely a *later* read putting
+/// something staler on screen. So the comparison is held for a while after it
+/// first holds, and any drift fails.
+#[gpui::test]
+fn a_batch_of_renames_lands_on_a_listing_read_after_all_of_them(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let a = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let b = core
+        .runtime()
+        .block_on(core.create_space(Some("B".into())))
+        .expect("create space")
+        .id;
+
+    stores.spaces.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the index loads", |cx| {
+        stores.spaces.read_with(cx, |s, _| s.list().len() == 2)
+    });
+
+    for round in 0..4 {
+        let title_a = format!("A{round}");
+        let title_b = format!("B{round}");
+        let (ta, tb) = (title_a.clone(), title_b.clone());
+        stores.spaces.update(cx, |s, cx| {
+            s.rename(a.clone(), ta, cx);
+            s.rename(b.clone(), tb, cx);
+        });
+
+        // The store's index beside the database's own listing.
+        let agrees = |cx: &mut TestAppContext| -> Result<(), String> {
+            let mut durable: Vec<(String, Option<String>)> = core
+                .runtime()
+                .block_on(core.list_spaces(false))
+                .expect("list spaces")
+                .into_iter()
+                .map(|s| (s.id, s.title))
+                .collect();
+            durable.sort();
+            let mut cached = stores.spaces.read_with(cx, |s, _| {
+                s.list()
+                    .iter()
+                    .map(|r| (r.id.clone(), r.title.clone()))
+                    .collect::<Vec<_>>()
+            });
+            cached.sort();
+            if cached != durable {
+                return Err(format!("cached {cached:?} != durable {durable:?}"));
+            }
+            Ok(())
+        };
+
+        wait_until(cx, "the batch reaches the database's listing", |cx| {
+            agrees(cx).is_ok()
+        });
+        // …and stays there. A resolution taken from a snapshot older than the
+        // batch's last write lands after this point and would drift back.
+        for _ in 0..40 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            if let Err(drift) = agrees(cx) {
+                panic!("the index drifted after the batch settled: {drift}");
+            }
+        }
+    }
 }
