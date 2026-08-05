@@ -189,14 +189,13 @@ impl SpacesStore {
         refusal: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        let op = refusal.map_or(Ok(()), |r| Err(r.to_string()));
+        if let Some(refusal) = refusal {
+            self.record_op_error(space_id, refusal.to_string());
+        }
         let list = listing.map_err(|e| eidola_app_core::error::AppError::Internal {
             message: e.to_string(),
         });
-        let noop_undo: UndoEdit = Box::new(|_| {});
-        if let Some(message) = settle_index_mutation(&mut self.index, noop_undo, list, op, true) {
-            self.record_op_error(space_id, message);
-        }
+        self.index = std::mem::take(&mut self.index).resolve(list);
         cx.notify();
     }
 
@@ -404,7 +403,7 @@ impl SpacesStore {
     /// A refresh signalled while a mutation is in flight is **deferred** to the
     /// completion of the **last** one rather than started beside them: a
     /// mutation has taken over the read for its duration (see
-    /// [`Self::write_then_relist`]), and a read that resolves after their own
+    /// [`Self::write_then_reconcile`]), and a read that resolves after their own
     /// re-lists can only be fresher than one racing them.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(core) = self.app_core.clone() else {
@@ -426,52 +425,52 @@ impl SpacesStore {
         cx.notify();
     }
 
-    /// The write-through shape for an index mutation: run `op`, then re-list —
-    /// on **every** exit, failure included — **in `space_id`'s own slot**, so a
-    /// mutation on another space neither cancels this one nor is cancelled by it.
+    /// The write-through shape for an index mutation: apply the optimistic edit,
+    /// run `op`, settle it — **in `space_id`'s own slot**, so a mutation on
+    /// another space neither cancels this one nor is cancelled by it — and, once
+    /// no write is left in flight, take the read that resolves the shared index.
     ///
     /// **The mutation takes over the read.** It drops any in-flight refresh,
     /// which may have been issued *before* this write and would re-stale the
-    /// snapshot by resolving after it; cancelling another slot's fetch is a
-    /// debt (`crates/eidola-gui/STATE.md` → "Concurrency patterns"), which the
-    /// unconditional re-list discharges. A deferred refresh is dropped for the
-    /// same reason and on the same promise: this operation's own re-list, which
-    /// runs strictly later, is what the refresh would have fetched.
+    /// snapshot by resolving after it; cancelling another slot's fetch is a debt
+    /// (`crates/eidola-gui/STATE.md` → "Concurrency patterns"), which the
+    /// batch-end read discharges. A deferred refresh is dropped for the same
+    /// reason and on the same promise: the read below runs strictly later, so it
+    /// is everything the dropped refresh would have fetched.
     ///
-    /// That re-list is also what bounds `optimistic`, the caller's edit of the
+    /// **The resolving read is taken after the last write, not carried from
+    /// before it.** The cell is one listing for every space, so *which* read
+    /// lands matters: a read each operation issues for itself begins right after
+    /// *its own* write, which can be long before a sibling's commits — and if
+    /// that operation is the one still standing when the last slot clears, it
+    /// resolves the index with a snapshot that predates an accepted write (worse,
+    /// a failed read then preserves that snapshot as `Failed { prior }`, so a
+    /// durable rename or archive disappears behind a mere refresh error). Issuing
+    /// the read only once `op_tasks` is empty makes "after every write of the
+    /// batch" a property of *when it is taken*, which no interleaving can
+    /// falsify. The read goes through [`Self::refresh`], so the rule re-arms
+    /// recursively: a mutation starting while it is in flight drops it and owes
+    /// the next one. Bounded and honest under continuous mutation — the newest
+    /// batch-end read is the one that wins, and until it lands the cell shows the
+    /// writes' own edits.
+    ///
+    /// That read is also what bounds `optimistic`, the caller's edit of the
     /// cached row: a refused write is reconciled back to what the database holds
     /// instead of leaving the Library, the window title, and the inspector's
-    /// title field showing a name nothing ever persisted. (With two mutations in
-    /// flight over one shared cell, the first to settle briefly re-lists the
-    /// second's optimistic edit away — a flicker of the durable truth, corrected
-    /// by the second's own re-list, never a state that outlives the round trip.)
-    /// The refusal itself joins `op_errors`, while a re-list that fails resolves
-    /// the *cell* (`Failed { prior }`, keeping the listing on screen) —
-    /// [`settle_index_mutation`] owns that pairing, including the case where
-    /// **both** halves fail and the re-list is therefore unavailable to take the
-    /// edit back.
+    /// title field showing a name nothing ever persisted.
     ///
     /// **The edit is applied here, not by the caller**, so the undo that pairs
     /// with it is built in the same breath — the ordering the honest failure
     /// exit depends on cannot be forgotten at a call site. (`SpaceSettingsStore`
     /// takes its `advance` closure for the same reason.) `optimistic` returns
-    /// **its own inverse**, which is what lets a refused write take back its
-    /// edit without touching a sibling's; see [`settle_index_mutation`].
-    ///
-    /// **Only the last mutation in flight resolves the shared index.** The cell
-    /// is one listing for every space, so an earlier sibling resolving it from
-    /// *its* re-list replaces rows that a still-running write is about to
-    /// change — and that listing was read before the sibling's write committed,
-    /// so a landed change would be dropped from view and, if the last re-list
-    /// then failed, kept out of `Failed { prior }` too. Nothing is lost by
-    /// waiting: a later sibling's re-list is strictly fresher than an earlier
-    /// one's, so the last to settle carries the freshest listing there is. This
-    /// is the same rule as the refresh deferral one level down — reads defer to
-    /// writes, and a write's read defers to the last write.
+    /// **its own inverse**, which is what lets a refused write take back its edit
+    /// without touching a sibling's — and what keeps the cell honest in the
+    /// quadrant where the resolving read fails too, since `Failed { prior }` then
+    /// keeps exactly the rows the undos have shaped. See [`settle_index_mutation`].
     ///
     /// `op` returns the complete sentence to show, so each caller words its own
     /// refusal.
-    fn write_then_relist<F>(
+    fn write_then_reconcile<F>(
         &mut self,
         space_id: String,
         cx: &mut Context<Self>,
@@ -507,37 +506,38 @@ impl SpacesStore {
         // Take over the read for the duration of the write.
         self.task = None;
         self.refresh_pending = false;
-        let relist_core = core.clone();
         let key = space_id.clone();
         self.op_undos.insert(space_id.clone(), undo);
         self.op_tasks.insert(
             space_id.clone(),
             cx.spawn(async move |this, cx| {
                 let op_result = op(core).await;
-                let list = bridge(relist_core, |c| async move { c.list_spaces(false).await }).await;
                 let _ = this.update(cx, |this, cx| {
                     // Drop this op's slot *first*: whether it is the last one in
-                    // flight is what decides if it may resolve the shared cell.
+                    // flight is what decides who owes the resolving read.
                     this.op_tasks.remove(&key);
                     // Ours, unless a superseding write already took it back.
                     let undo = this
                         .op_undos
                         .remove(&key)
                         .unwrap_or_else(|| -> UndoEdit { Box::new(|_| {}) });
-                    let resolves_index = this.op_tasks.is_empty();
-                    if let Some(message) = settle_index_mutation(
-                        &mut this.index,
-                        undo,
-                        list,
-                        op_result,
-                        resolves_index,
-                    ) {
+                    if let Some(message) = settle_index_mutation(&mut this.index, undo, op_result) {
                         this.record_op_error(Some(space_id), message);
                     }
-                    // The deferred refresh waits for the *last* mutation too: an
-                    // earlier one's re-list is not necessarily later than a
-                    // sibling write still in flight.
-                    if resolves_index && std::mem::take(&mut this.refresh_pending) {
+                    // **The resolving read is taken here, not carried here.**
+                    // It is issued only once no write is in flight, so it is
+                    // taken strictly after every write of the batch has
+                    // committed. A read each operation started for itself could
+                    // not say that: it begins right after *its own* write, which
+                    // may be long before a sibling's commits, and if that
+                    // operation happened to be the last to settle it would land
+                    // a snapshot predating an accepted write (and a failed read
+                    // would preserve it as `prior`). `refresh` also re-arms the
+                    // deferral recursively — a mutation starting during this
+                    // read drops it and owes the next one — so the batch always
+                    // ends on the newest read, and never on an older one.
+                    if this.op_tasks.is_empty() {
+                        this.refresh_pending = false;
                         this.refresh(cx);
                     }
                     cx.notify();
@@ -560,7 +560,7 @@ impl SpacesStore {
         let id = space_id.clone();
         let optimistic_title = title.clone();
         let row_id = space_id.clone();
-        self.write_then_relist(
+        self.write_then_reconcile(
             space_id,
             cx,
             move |rows| {
@@ -600,7 +600,7 @@ impl SpacesStore {
     pub fn archive(&mut self, space_id: String, cx: &mut Context<Self>) {
         let id = space_id.clone();
         let row_id = space_id.clone();
-        self.write_then_relist(
+        self.write_then_reconcile(
             space_id,
             cx,
             // Optimistic local removal — an edit of whatever value is present,
@@ -679,17 +679,19 @@ type UndoEdit = Box<dyn FnOnce(&mut Vec<SpaceInfo>)>;
 /// that landed durably is honest to keep on screen even when the read behind it
 /// failed.
 ///
-/// **Only the last mutation resolves.** `resolves_index` false discards this
-/// operation's listing entirely: it was read before a sibling write that is
-/// still running, so the sibling's own re-list — strictly later — is the one the
-/// cell should land on. The refusal is still reported either way; deferral is
-/// about the *index*, never about what the operation owes the reader.
+/// **Settling never resolves the cell.** This function carries no listing, by
+/// construction: any listing an operation could hand it was read before the
+/// batch finished writing, and resolving from one is precisely the defect the
+/// batch-end read exists to prevent. The cell is resolved by the fresh read
+/// [`SpacesStore::write_then_reconcile`] takes once no write is in flight — so
+/// "the resolution reads the database *after* the last write" is a property of
+/// when the read is issued, not of which captured snapshot gets applied. The
+/// refusal is reported here either way: what an operation owes the reader is
+/// never deferred.
 fn settle_index_mutation(
     index: &mut Loadable<Vec<SpaceInfo>>,
     undo: UndoEdit,
-    list: Result<Vec<SpaceInfo>, eidola_app_core::error::AppError>,
     op: Result<(), String>,
-    resolves_index: bool,
 ) -> Option<String> {
     if op.is_err()
         && let Some(rows) = index.value_mut()
@@ -698,11 +700,7 @@ fn settle_index_mutation(
         // showing no optimistic edit either.
         undo(rows);
     }
-    if resolves_index {
-        crate::stores::settle_mutation(index, list, op)
-    } else {
-        op.err()
-    }
+    op.err()
 }
 #[cfg(test)]
 mod tests {
@@ -767,27 +765,30 @@ mod tests {
         })
     }
 
-    fn no_undo() -> UndoEdit {
-        Box::new(|_| {})
+    /// The batch-end read landing, as `refresh` applies it.
+    fn resolving_read(
+        cell: &mut Loadable<Vec<SpaceInfo>>,
+        result: Result<Vec<SpaceInfo>, AppError>,
+    ) {
+        *cell = std::mem::take(cell).to_loading().resolve(result);
     }
 
-    // -- The double-failure quadrant (round 3) -------------------------------
+    // -- The double-failure quadrant -----------------------------------------
 
-    /// The write was refused *and* the re-list that would have taken the
-    /// optimistic edit back failed too — so `Failed { prior }` keeps the cell's
-    /// rows on screen (the Library shows them beside its retry), and those rows
-    /// must not be the edit the database refused.
+    /// The write was refused *and* the read that would have taken the optimistic
+    /// edit back failed too — so `Failed { prior }` keeps the cell's rows on
+    /// screen (the Library shows them beside its retry), and those rows must not
+    /// be the edit the database refused.
     #[test]
-    fn a_refused_write_whose_relist_also_fails_shows_the_pre_edit_rows() {
+    fn a_refused_write_whose_read_also_fails_shows_the_pre_edit_rows() {
         let mut cell = Loadable::loaded(vec![row("s1", "Tides")]);
         let undo = rename(&mut cell, "s1", "Nile");
         let recorded = settle_index_mutation(
             &mut cell,
             undo,
-            Err(read_err()),
             Err("Couldn't rename this space: space not found: s1".into()),
-            true,
         );
+        resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
             vec!["Tides".to_string()],
@@ -806,16 +807,11 @@ mod tests {
     /// Archive's shape of the same quadrant: the row a refused archive removed
     /// comes back, in its place, rather than staying hidden behind a failed read.
     #[test]
-    fn a_refused_archive_whose_relist_also_fails_puts_the_row_back() {
+    fn a_refused_archive_whose_read_also_fails_puts_the_row_back() {
         let mut cell = Loadable::loaded(vec![row("s1", "Tides"), row("s2", "Bergamot")]);
         let undo = archive(&mut cell, "s1");
-        settle_index_mutation(
-            &mut cell,
-            undo,
-            Err(read_err()),
-            Err("refused".into()),
-            true,
-        );
+        settle_index_mutation(&mut cell, undo, Err("refused".into()));
+        resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
             vec!["Tides".to_string(), "Bergamot".to_string()],
@@ -823,24 +819,19 @@ mod tests {
         );
     }
 
-    /// **Order matters.** A successful re-list is fresh truth and strictly later
-    /// than the edit, so it supersedes it — including a listing that moved for
-    /// reasons this operation knows nothing about.
+    /// **Order matters.** The batch-end read is fresh truth and strictly later
+    /// than every edit, so it supersedes them — including a listing that moved
+    /// for reasons this operation knows nothing about.
     #[test]
-    fn a_successful_relist_supersedes_the_undo() {
+    fn the_resolving_read_supersedes_the_undo() {
         let mut cell = Loadable::loaded(vec![row("s1", "Tides")]);
         let undo = rename(&mut cell, "s1", "Nile");
-        settle_index_mutation(
-            &mut cell,
-            undo,
-            Ok(vec![row("s1", "Renamed in another window")]),
-            Err("refused".into()),
-            true,
-        );
+        settle_index_mutation(&mut cell, undo, Err("refused".into()));
+        resolving_read(&mut cell, Ok(vec![row("s1", "Renamed in another window")]));
         assert_eq!(
             titles(&cell),
             vec!["Renamed in another window".to_string()],
-            "the re-list wins over the undo, never the other way round"
+            "the read wins over the undo, never the other way round"
         );
         assert!(!cell.is_loading() && cell.error().is_none());
     }
@@ -848,10 +839,11 @@ mod tests {
     /// The undo is gated on the *write* failing: a write that landed durably is
     /// honest to keep on screen even when the read behind it failed.
     #[test]
-    fn an_accepted_write_whose_relist_fails_keeps_its_edit() {
+    fn an_accepted_write_whose_read_fails_keeps_its_edit() {
         let mut cell = Loadable::loaded(vec![row("s1", "Tides")]);
         let undo = rename(&mut cell, "s1", "Nile");
-        let recorded = settle_index_mutation(&mut cell, undo, Err(read_err()), Ok(()), true);
+        let recorded = settle_index_mutation(&mut cell, undo, Ok(()));
+        resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
             vec!["Nile".to_string()],
@@ -860,31 +852,31 @@ mod tests {
         assert_eq!(recorded, None);
     }
 
-    // -- Sibling mutations over the one shared cell (round 4) ----------------
+    // -- Sibling mutations over the one shared cell --------------------------
 
-    /// **A sibling settling first must not resolve the shared index.** Its
-    /// listing was read before this still-running write committed, so landing it
-    /// drops a change that is about to be (or already is) durable — and if the
-    /// last re-list then fails, `Failed { prior }` preserves that stale listing
-    /// and the landed change stays invisible behind a mere refresh error.
+    /// **A settling sibling contributes no listing at all** — the whole point of
+    /// the batch-end read. Whatever a sibling read for itself was read before
+    /// this still-running write committed, so a landed change would be dropped
+    /// from view (and, if the resolving read then failed, kept out of
+    /// `Failed { prior }` as well). Here both writes land and the read fails: the
+    /// cell must still show both.
     #[test]
-    fn a_landed_sibling_edit_survives_an_earlier_mutations_relist() {
+    fn a_landed_sibling_edit_survives_an_earlier_mutations_settle() {
         let mut cell = Loadable::loaded(vec![row("a", "A"), row("b", "B")]);
         let undo_a = rename(&mut cell, "a", "Anemone");
         let undo_b = rename(&mut cell, "b", "Bergamot");
 
-        // A settles first, with B still in flight: its listing predates B's
-        // commit, so it is discarded rather than landed.
-        let stale_listing = vec![row("a", "Anemone"), row("b", "B")];
-        settle_index_mutation(&mut cell, undo_a, Ok(stale_listing), Ok(()), false);
+        // A settles first, with B still in flight. It resolves nothing.
+        settle_index_mutation(&mut cell, undo_a, Ok(()));
         assert_eq!(
             titles(&cell),
             vec!["Anemone".to_string(), "Bergamot".to_string()],
-            "an earlier sibling's listing never replaces a pending edit"
+            "an earlier sibling's settle never replaces a pending edit"
         );
 
-        // B settles last: its write landed, its re-list did not.
-        settle_index_mutation(&mut cell, undo_b, Err(read_err()), Ok(()), true);
+        // B settles last; the batch-end read is the only resolution, and it fails.
+        settle_index_mutation(&mut cell, undo_b, Ok(()));
+        resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
             vec!["Anemone".to_string(), "Bergamot".to_string()],
@@ -902,20 +894,15 @@ mod tests {
         let undo_a = rename(&mut cell, "a", "Anemone");
         let undo_b = rename(&mut cell, "b", "Bergamot");
 
-        settle_index_mutation(
-            &mut cell,
-            undo_a,
-            Err(read_err()),
-            Err("refused".into()),
-            false,
-        );
+        settle_index_mutation(&mut cell, undo_a, Err("refused".into()));
         assert_eq!(
             titles(&cell),
             vec!["A".to_string(), "Bergamot".to_string()],
             "A's refusal is undone; B's pending edit is untouched"
         );
 
-        settle_index_mutation(&mut cell, undo_b, Err(read_err()), Ok(()), true);
+        settle_index_mutation(&mut cell, undo_b, Ok(()));
+        resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
             vec!["A".to_string(), "Bergamot".to_string()],
@@ -933,20 +920,9 @@ mod tests {
         let undo_a = rename(&mut cell, "a", "Anemone");
         let undo_b = rename(&mut cell, "b", "Bergamot");
 
-        settle_index_mutation(
-            &mut cell,
-            undo_a,
-            Err(read_err()),
-            Err("refused".into()),
-            false,
-        );
-        settle_index_mutation(
-            &mut cell,
-            undo_b,
-            Err(read_err()),
-            Err("refused".into()),
-            true,
-        );
+        settle_index_mutation(&mut cell, undo_a, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo_b, Err("refused".into()));
+        resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
             vec!["A".to_string(), "B".to_string()],
@@ -954,18 +930,14 @@ mod tests {
         );
     }
 
-    /// Deferral is about the *index* only: an operation that may not resolve the
-    /// cell still owes the reader its refusal.
+    /// Settling reports the refusal whether or not this operation is the one that
+    /// owes the resolving read: deferral is about the *index*, never about what
+    /// an operation owes the reader.
     #[test]
-    fn a_deferred_settle_still_reports_its_refusal() {
+    fn every_settle_reports_its_refusal() {
         let mut cell = Loadable::loaded(vec![row("s1", "Tides")]);
-        let recorded = settle_index_mutation(
-            &mut cell,
-            no_undo(),
-            Ok(vec![row("s1", "Tides")]),
-            Err("refused".into()),
-            false,
-        );
+        let undo = rename(&mut cell, "s1", "Nile");
+        let recorded = settle_index_mutation(&mut cell, undo, Err("refused".into()));
         assert_eq!(recorded.as_deref(), Some("refused"));
     }
 }
