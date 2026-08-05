@@ -874,7 +874,7 @@ fn a_refused_rename_reconciles_the_index_and_surfaces_the_refusal(cx: &mut TestA
         .id;
 
     stores.spaces.update(cx, |s, cx| {
-        s.settle_for_test(None, vec![stale_row("ghost")], None, cx)
+        s.settle_for_test(None, Ok(vec![stale_row("ghost")]), None, cx)
     });
 
     stores
@@ -969,7 +969,7 @@ fn a_refresh_landing_mid_rename_keeps_the_spaces_ops_error(cx: &mut TestAppConte
         .id;
 
     stores.spaces.update(cx, |s, cx| {
-        s.settle_for_test(None, vec![stale_row("ghost")], None, cx)
+        s.settle_for_test(None, Ok(vec![stale_row("ghost")]), None, cx)
     });
     stores
         .spaces
@@ -1067,7 +1067,7 @@ fn two_refused_mutations_each_keep_their_own_refusal(cx: &mut TestAppContext) {
     stores.spaces.update(cx, |s, cx| {
         s.settle_for_test(
             None,
-            vec![stale_row("ghost-a"), stale_row("ghost-b")],
+            Ok(vec![stale_row("ghost-a"), stale_row("ghost-b")]),
             None,
             cx,
         )

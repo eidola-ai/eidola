@@ -10282,7 +10282,7 @@ fn space_inspector_a_refused_rename_restores_the_stored_title(cx: &mut TestAppCo
     stores.spaces.update(cx, |s, cx| {
         s.settle_for_test(
             Some("s1".into()),
-            vec![stub_space("s1", Some("Tides"), None, 0)],
+            Ok(vec![stub_space("s1", Some("Tides"), None, 0)]),
             Some("Couldn't rename this space: space not found: s1"),
             cx,
         )
