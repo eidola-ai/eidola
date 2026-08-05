@@ -662,8 +662,8 @@ impl ChromeRoot {
                 cx.notify();
             }))
             // The space-scoped group (the macOS "Space" menu): New Space, the
-            // per-template creators, and Participants… (a no-op without a
-            // focused space window, matching the greyed macOS item). The zoom
+            // per-template creators, and the inspector toggle (a no-op without
+            // a focused space window, matching the greyed macOS item). The zoom
             // trio is the macOS "View" menu, its own group next. Library/Record
             // are app-level and group with Settings below — mirroring the
             // macOS move of Library/Record up into the Eidola app menu.
@@ -676,8 +676,7 @@ impl ChromeRoot {
             ))
             .children(template_rows)
             // The space inspector's other door (the space itself carries no
-            // visual toggle) — a no-op without a focused space window, like
-            // Participants… above.
+            // visual toggle) — a no-op without a focused space window.
             .child(menu_item(
                 "inspector",
                 "Show/Hide Inspector",

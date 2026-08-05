@@ -480,8 +480,9 @@ pub fn install_keybindings(cx: &mut App) {
         // (the composer is the inner focus) and break the inversion.
         // The former ⌥⌘M (`ToggleModelPicker`) is gone with the request
         // panel: the composer no longer carries a model choice — who answers
-        // (and with what model) is Participants configuration (`Space >
-        // Participants…`), and explicit asks live on the separator bands. Esc
+        // (and with what model) is Participants configuration (the
+        // inspector's Participants section), and explicit asks live on the
+        // separator bands. Esc
         // routes through the composer's own key handler (band menu first, then
         // draft deactivation), so no Esc binding here.
     ]);
