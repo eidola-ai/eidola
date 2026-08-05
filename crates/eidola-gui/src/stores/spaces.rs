@@ -13,14 +13,20 @@
 //! **The index's mutations follow the write-through rules** the other stores
 //! do (`crates/eidola-gui/STATE.md` → "Concurrency patterns"): rename and
 //! archive edit the cached row optimistically so the Library answers without a
-//! round trip, then compose `write; re-list` in a slot of their **own** — never
-//! the refresh's, because a rename emits the very `Change::SpaceIndex` that
-//! drives the refresh, and a shared slot would let it cancel the write's own
-//! completion (the core write still runs; the continuation carrying its refusal
-//! and its re-list never does — a refused write indistinguishable from a
-//! successful one). The re-list runs on **every** exit, so the optimism never
-//! outlives the round trip: a refused write is reconciled back to what the
-//! database holds, with its refusal in [`SpacesStore::op_error`].
+//! round trip, then write in a slot of their **own** — never the refresh's,
+//! because a rename emits the very `Change::SpaceIndex` that drives the refresh,
+//! and a shared slot would let it cancel the write's own completion (the core
+//! write still runs; the continuation carrying its refusal never does — a
+//! refused write indistinguishable from a successful one). Every batch of
+//! mutations ends in a read, so the optimism never outlives the round trip: a
+//! refused write is reconciled back to what the database holds, with its refusal
+//! in [`SpacesStore::op_error`].
+//!
+//! **The resolving read is taken after the last write, not carried from before
+//! it** — see [`SpacesStore::write_then_reconcile`] — and each refused write
+//! takes its own edit back through an inverse that stores no position: seats
+//! come from the row's own sort key, names from its id, so no undo can go stale
+//! behind a sibling's edit.
 //!
 //! **Those slots are keyed per space, and so are the refusals.** One shared
 //! mutation slot has the same defect one slot away: a second rename replaces
@@ -618,15 +624,27 @@ impl SpacesStore {
             // Optimistic local removal — an edit of whatever value is present,
             // so the cell's state is unchanged (a stale or failed-with-prior
             // listing stays what it is; only its rows move). Its inverse puts
-            // the row back where it was.
+            // the row back where the *listing's own order* puts it.
+            //
+            // **The position is derived, never stored.** A recorded slot is
+            // stale the moment another optimistic removal shifts the list under
+            // it: two archives of `[A, B, C]` record slot 0 apiece (B's after
+            // A's removal), and undoing them in the order they settle can seat
+            // them as `[B, A, C]` — an order the database never held, left
+            // standing as `Failed { prior }` when the batch-end read fails too.
+            // `list_spaces` orders by `last_activity_at DESC` and every row
+            // carries that key, so the seat is a question the row answers about
+            // itself, in any order, however many siblings moved meanwhile.
             move |rows| {
                 let removed = rows
                     .iter()
                     .position(|s| s.id == row_id)
-                    .map(|at| (at, rows.remove(at)));
+                    .map(|at| rows.remove(at));
                 Box::new(move |rows: &mut Vec<SpaceInfo>| {
-                    if let Some((at, row)) = removed {
-                        rows.insert(at.min(rows.len()), row);
+                    if let Some(row) = removed {
+                        let at =
+                            rows.partition_point(|r| r.last_activity_at >= row.last_activity_at);
+                        rows.insert(at, row);
                     }
                 })
             },
@@ -720,16 +738,24 @@ mod tests {
     use crate::loadable::Loadable;
     use eidola_app_core::error::AppError;
 
-    fn row(id: &str, title: &str) -> SpaceInfo {
+    /// A listing row. `at` is `last_activity_at`, the key `list_spaces` orders
+    /// by (descending) — the fixtures carry real ones because the archive undo
+    /// derives its seat from them.
+    fn row_at(id: &str, title: &str, at: i64) -> SpaceInfo {
         SpaceInfo {
             id: id.into(),
             title: Some(title.into()),
             snippet: None,
-            created_at: 0,
-            last_activity_at: 0,
+            created_at: at,
+            last_activity_at: at,
             message_count: 0,
             archived_at: None,
         }
+    }
+
+    /// Rows whose order does not matter to the test.
+    fn row(id: &str, title: &str) -> SpaceInfo {
+        row_at(id, title, 0)
     }
 
     fn titles(cell: &Loadable<Vec<SpaceInfo>>) -> Vec<String> {
@@ -763,16 +789,17 @@ mod tests {
         })
     }
 
-    /// Likewise for archive.
+    /// Likewise for archive — the seat derived from the row's own sort key.
     fn archive(cell: &mut Loadable<Vec<SpaceInfo>>, id: &'static str) -> UndoEdit {
         let rows = cell.value_mut().expect("a cell with rows");
         let removed = rows
             .iter()
             .position(|s| s.id == id)
-            .map(|at| (at, rows.remove(at)));
+            .map(|at| rows.remove(at));
         Box::new(move |rows: &mut Vec<SpaceInfo>| {
-            if let Some((at, r)) = removed {
-                rows.insert(at.min(rows.len()), r);
+            if let Some(r) = removed {
+                let at = rows.partition_point(|x| x.last_activity_at >= r.last_activity_at);
+                rows.insert(at, r);
             }
         })
     }
@@ -820,14 +847,92 @@ mod tests {
     /// comes back, in its place, rather than staying hidden behind a failed read.
     #[test]
     fn a_refused_archive_whose_read_also_fails_puts_the_row_back() {
-        let mut cell = Loadable::loaded(vec![row("s1", "Tides"), row("s2", "Bergamot")]);
+        let mut cell = Loadable::loaded(vec![
+            row_at("s1", "Tides", 300),
+            row_at("s2", "Bergamot", 200),
+        ]);
         let undo = archive(&mut cell, "s1");
         settle_index_mutation(&mut cell, undo, Err("refused".into()));
         resolving_read(&mut cell, Err(read_err()));
         assert_eq!(
             titles(&cell),
             vec!["Tides".to_string(), "Bergamot".to_string()],
-            "the optimistic removal is undone when nothing else can undo it"
+            "the optimistic removal is undone when nothing else can undo it, \
+             and the row lands where the listing's order puts it"
+        );
+    }
+
+    /// **Two refused archives restore the database's order, in either settle
+    /// order.** While the undo recorded a numeric slot, each archive of
+    /// `[A, B, C]` recorded slot 0 — B's *after* A's removal had already shifted
+    /// the list — so undoing them in one of the two orders seated them as
+    /// `[B, A, C]`, an order the database never held, left standing as
+    /// `Failed { prior }` when the batch-end read failed too. The seat is now
+    /// derived from `last_activity_at`, the key `list_spaces` sorts by, so it
+    /// cannot go stale behind a sibling's edit.
+    #[test]
+    fn two_refused_archives_restore_the_databases_order_first_settling_first() {
+        let mut cell = Loadable::loaded(vec![
+            row_at("a", "A", 300),
+            row_at("b", "B", 200),
+            row_at("c", "C", 100),
+        ]);
+        let undo_a = archive(&mut cell, "a");
+        let undo_b = archive(&mut cell, "b");
+        assert_eq!(titles(&cell), vec!["C".to_string()], "both rows are gone");
+
+        settle_index_mutation(&mut cell, undo_a, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo_b, Err("refused".into()));
+        resolving_read(&mut cell, Err(read_err()));
+        assert_eq!(
+            titles(&cell),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            "the listing is the database's order, not the undos' arrival order"
+        );
+    }
+
+    /// The same, settled the other way round — the order-independence is the
+    /// property, so both orders are the test.
+    #[test]
+    fn two_refused_archives_restore_the_databases_order_last_settling_first() {
+        let mut cell = Loadable::loaded(vec![
+            row_at("a", "A", 300),
+            row_at("b", "B", 200),
+            row_at("c", "C", 100),
+        ]);
+        let undo_a = archive(&mut cell, "a");
+        let undo_b = archive(&mut cell, "b");
+
+        settle_index_mutation(&mut cell, undo_b, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo_a, Err("refused".into()));
+        resolving_read(&mut cell, Err(read_err()));
+        assert_eq!(
+            titles(&cell),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            "the listing is the database's order, not the undos' arrival order"
+        );
+    }
+
+    /// An archive and a rename over the same listing: the rename's undo is
+    /// by-id and moves nothing, so the archive's seat is unaffected by it —
+    /// order-independence holds across *kinds* of edit, not just archives.
+    #[test]
+    fn a_refused_archive_and_a_refused_rename_both_land_honestly() {
+        let mut cell = Loadable::loaded(vec![
+            row_at("a", "A", 300),
+            row_at("b", "B", 200),
+            row_at("c", "C", 100),
+        ]);
+        let undo_a = archive(&mut cell, "a");
+        let undo_b = rename(&mut cell, "b", "Bergamot");
+
+        settle_index_mutation(&mut cell, undo_b, Err("refused".into()));
+        settle_index_mutation(&mut cell, undo_a, Err("refused".into()));
+        resolving_read(&mut cell, Err(read_err()));
+        assert_eq!(
+            titles(&cell),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            "the row is back in its place and the refused name is gone"
         );
     }
 
