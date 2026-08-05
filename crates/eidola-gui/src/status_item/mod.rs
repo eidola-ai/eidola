@@ -332,8 +332,11 @@ fn reconcile(
                 ready: engine.ready,
                 // Only claim the file is missing when the listing actually
                 // answered. A listing that is still loading (or failed with
-                // nothing kept) is not evidence of anything.
-                orphaned: state.is_some() && listed.is_none(),
+                // nothing kept) is not evidence of anything — and neither is
+                // a row the scan never found: a re-download of the vanished
+                // slug puts one in the snapshot while the file is still gone,
+                // so *presence* is asked of `on_disk`, not of the join above.
+                orphaned: state.is_some() && !listed.is_some_and(|m| m.on_disk),
             }
         })
         .collect();
@@ -354,6 +357,12 @@ fn listed_models(state: &LocalModelsState) -> impl Iterator<Item = &LocalModelIn
         .chain(state.external.iter().flat_map(|b| b.models.iter()))
 }
 
+/// The **naming** join: any row that carries this id may lend its display
+/// name, `on_disk` or not. A row the scan never found still knows what the
+/// model is called (a re-download row carries the catalog's own name), and a
+/// name is not a claim about a file — `reconcile` asks that question of
+/// `LocalModelInfo::on_disk` separately, so "Gemma 4 12B — running (file
+/// missing)" says both true things at once.
 fn find_listed<'a>(state: &'a LocalModelsState, id: &str) -> Option<&'a LocalModelInfo> {
     listed_models(state).find(|m| m.id == id)
 }
@@ -568,6 +577,42 @@ mod tests {
             engine_lines(Some(&running), &listing),
             vec!["ghost — running (file missing)"],
             "named from the slug, and honest about why it is not in Settings"
+        );
+    }
+
+    /// The mirror of the case above, one step later: the reader starts the
+    /// vanished model downloading again. That puts a row in the listing while
+    /// the bytes are still going to a `.part`, and the file the engine is
+    /// serving is just as gone as before — so the marker stands. The *name*
+    /// still comes from the row (it knows what the model is called), which is
+    /// the point of splitting the naming join from the presence one.
+    #[test]
+    fn a_row_the_scan_never_found_does_not_cover_for_the_missing_file() {
+        let mut fetching = model(
+            "ghost",
+            LocalModelStatus::Downloading {
+                received: 1,
+                total: None,
+            },
+        );
+        fetching.on_disk = false;
+        let listing = Loadable::loaded(state(vec![fetching], vec![]));
+        let running = [engine("ghost", "local", true)];
+        assert_eq!(
+            engine_lines(Some(&running), &listing),
+            vec!["Ghost — running (file missing)"],
+            "named by the row, honest about the file"
+        );
+
+        // The same once that re-download fails: a row carrying only its
+        // error, with `Available` — the status a scanned idle file has.
+        let mut failed = model("ghost", LocalModelStatus::Available);
+        failed.on_disk = false;
+        failed.last_error = Some("connection reset".into());
+        let listing = Loadable::loaded(state(vec![failed], vec![]));
+        assert_eq!(
+            engine_lines(Some(&running), &listing),
+            vec!["Ghost — running (file missing)"]
         );
     }
 
