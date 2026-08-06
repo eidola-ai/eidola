@@ -9,6 +9,7 @@ A small in-workspace static-site generator (pure Rust: `pulldown-cmark` + `toml`
 - Output: pretty URLs (`/docs/client/`, `/blog/<slug>/`), a blog index + Atom feed, `sitemap.xml`, GitHub-convention heading anchors (authored `#fragment` links keep working). Deterministic (sorted input order, no timestamps).
 - **Docs navigation:** the sidebar structure lives in `www/docs-nav.toml` (`[path, label]` entries in titled sections). **Adding a doc requires adding a nav entry** — the build fails on a missing or stale entry. Rendered as a sticky left rail on wide screens, a `<details>` disclosure on narrow ones. Docs and posts with ≥3 h2/h3 headings get an "On this page" right-gutter rail (scroll-spy in `www/static/toc.js`); every docs page ends with an edit-on-GitHub link.
 - Legal documents publish their exact source bytes at `/terms/source.md` and `/privacy/source.md` for the server's terms-feed poller (see `crates/eidola-server/AGENTS.md`); rendered pages carry `eidola:version` / `eidola:source-sha256` meta tags.
+- GFM alert blockquotes (`> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` / `[!CAUTION]`, via `ENABLE_GFM`) render through pulldown-cmark's `markdown-alert-*` classes; `site.css` styles them in the hairline blockquote idiom using the app's status slots (`info`/`success`/`warning`/`danger` in `circadian.rs`; important = `accent-foreground`).
 
 ## Visual system
 

@@ -98,6 +98,7 @@ pub fn render(body: &str, source_dir: &str) -> Rendered {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_SMART_PUNCTUATION);
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    options.insert(Options::ENABLE_GFM);
 
     let mut events: Vec<Event> = Parser::new_ext(body, options).collect();
 
@@ -240,6 +241,19 @@ mod tests {
         assert!(r.html.contains("<h1 id=\"the-title\">"));
         assert!(r.html.contains("<h2 id=\"a-section\">"));
         assert!(r.html.contains("<h2 id=\"a-section-2\">"));
+    }
+
+    #[test]
+    fn gfm_alerts_render_with_kind_classes() {
+        // ENABLE_GFM: the `[!NOTE]` marker line is consumed and the kind
+        // arrives as a class site.css styles (colored rule + label).
+        let r = render("> [!NOTE]\n> Markers become classes.\n", "");
+        assert!(
+            r.html
+                .contains("<blockquote class=\"markdown-alert-note\">")
+        );
+        assert!(r.html.contains("Markers become classes."));
+        assert!(!r.html.contains("[!NOTE]"));
     }
 
     #[test]
