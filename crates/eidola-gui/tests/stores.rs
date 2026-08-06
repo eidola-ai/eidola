@@ -1678,3 +1678,61 @@ fn a_stale_owned_save_refuses_once_the_row_is_shared(cx: &mut TestAppContext) {
     );
     assert_eq!(after.scope, "global");
 }
+
+/// **Two writes on one control are sequenced, not raced** (Codex review, PR
+/// #279). Replace-cancel was documented as "last-wins", but it only dropped the
+/// *gpui* half: `bridge` leaves the core write running, so the superseded write
+/// could reach the database after its successor — last-wins reversed — or, when
+/// the successor arrived before the first was ever polled, vanish entirely.
+///
+/// The successor now takes ownership of its predecessor's task and awaits it, so
+/// it starts strictly after that write's round trip. Both land, in order: the
+/// first's charter survives (it ran), and the second's name is what stands (it
+/// ran last).
+#[gpui::test]
+fn two_saves_on_one_agent_are_sequenced(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let (agent, _b) = two_shared_agents(cx, &stores);
+
+    stores.agents.update(cx, |s, cx| {
+        s.update_agent(
+            agent.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("First".into()),
+                system_prompt: Some(Some("Written by the first save.".into())),
+                ..Default::default()
+            },
+            cx,
+        );
+        s.update_agent(
+            agent.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("Second".into()),
+                ..Default::default()
+            },
+            cx,
+        );
+    });
+
+    wait_until(cx, "both saves land in order", |_cx| {
+        core.runtime()
+            .block_on(core.list_global_agents())
+            .expect("library")
+            .iter()
+            .any(|a| a.id == agent && a.label == "Second")
+    });
+    let row = core
+        .runtime()
+        .block_on(core.list_global_agents())
+        .expect("library")
+        .into_iter()
+        .find(|a| a.id == agent)
+        .expect("the agent");
+    assert_eq!(
+        row.system_prompt.as_deref(),
+        Some("Written by the first save."),
+        "the superseded save still ran — its charter is the proof"
+    );
+    assert_eq!(row.label, "Second", "and the later save is what stands");
+}

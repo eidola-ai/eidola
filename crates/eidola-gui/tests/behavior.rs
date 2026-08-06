@@ -7540,6 +7540,43 @@ fn inspector_hands_the_keyboard_back_when_a_form_closes(cx: &mut TestAppContext)
     })
     .unwrap();
 
+    // The inspector's own sync path: a row that leaves the roster takes the
+    // whole editor — **including an armed share confirmation** — and the
+    // round-5 handback fires for it, because the question is containment of the
+    // form and the confirm lives inside it (Codex review, PR #279 asked; this
+    // is the answer, pinned).
+    open_the_disclosure(cx);
+    let form = view
+        .read_with(cx, |v, _| v.inspector_editing_focus_handle())
+        .expect("the disclosure is open");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+        window.focus(&form, cx);
+    })
+    .unwrap();
+    assert!(!view_holds_the_keyboard(cx), "the form holds the keyboard");
+    stores
+        .participants
+        .update(cx, |s, cx| s.remove(space.clone(), agent.clone(), cx));
+    wait_until(cx, "the row leaves the roster", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| !s.list(&space).iter().any(|p| p.id == agent))
+    });
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_editing_participant().is_none()),
+        "the editor went with its row"
+    );
+    assert!(
+        !view.read_with(cx, |v, _| v.inspector_promote_confirming()),
+        "and the armed confirmation with it"
+    );
+    assert!(
+        view_holds_the_keyboard(cx),
+        "the roster-driven unmount hands the keyboard back too"
+    );
+
     // The add form is the same shape, and its Cancel is the same door.
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.inspector_begin_add_participant(window, cx));
@@ -7969,6 +8006,60 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
         view.update(cx, |v, cx| v.cancel_retire(window, cx));
     })
     .unwrap();
+
+    // The same unmount, over an armed **confirmation** rather than an editor:
+    // its Keep/Retire are tab stops too, and a roster refresh that drops the
+    // agent takes them away without anyone pressing anything. A second shared
+    // agent, so the roster still has a row for the editor case below.
+    let core_handle = stores.app_core().expect("a real core");
+    let space_b = core_handle
+        .runtime()
+        .block_on(core_handle.create_space(Some("B".into())))
+        .expect("a space")
+        .id;
+    let agent_b = core_handle
+        .runtime()
+        .block_on(core_handle.list_space_participants(space_b.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the seeded agent")
+        .id;
+    core_handle
+        .runtime()
+        .block_on(core_handle.promote_participant(agent_b.clone(), None))
+        .expect("share the second agent");
+    stores.agents.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the library lists both", |cx| {
+        stores.agents.read_with(cx, |s, _| s.list().len() == 2)
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent_b, window, cx));
+    })
+    .unwrap();
+    let confirm_focus = view.read_with(cx, |v, _| v.retire_focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&confirm_focus, cx);
+    })
+    .unwrap();
+    assert!(!pane_holds_the_keyboard(cx), "the confirmation holds it");
+    core_handle
+        .runtime()
+        .block_on(core_handle.retire_participant(agent_b.clone()))
+        .expect("the other window's retirement");
+    stores.agents.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the roster drops it", |cx| {
+        stores.agents.read_with(cx, |s, _| s.list().len() == 1)
+    });
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.retiring_agent().is_none()),
+        "the confirmation went with its row"
+    );
+    assert!(
+        pane_holds_the_keyboard(cx),
+        "and so did the keyboard it was holding"
+    );
 
     // And the unmount no verb pressed: the agent leaves the roster under an
     // open editor, and `sync_open_forms` retires it at the head of `render`.

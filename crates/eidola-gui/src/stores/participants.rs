@@ -47,8 +47,12 @@ pub struct ParticipantsStore {
     /// its refusal and the read that resolves the roster were discarded (Codex
     /// review, PR #279; the doctrine is `crates/eidola-gui/AGENTS.md` →
     /// "Independent mutations get keyed slots"). Two writes on the **same** row
-    /// still replace-cancel: that is one control, and last-wins is intended.
-    op_tasks: HashMap<(String, String), Task<()>>,
+    /// are **chained**, not replaced — see [`Self::write_then_settle`] — with a
+    /// generation beside each task so a settling op can tell whether it is
+    /// still the current one.
+    op_tasks: HashMap<(String, String), (u64, Task<()>)>,
+    /// Monotonic op counter; a task settles only while its key still names it.
+    next_op_gen: u64,
     /// The last write error per `(space, participant)` — keyed exactly as the
     /// slots are. Space-keying alone cross-contaminated two open windows; adding
     /// the participant is what lets two refusals in *one* space both stand,
@@ -71,6 +75,7 @@ impl ParticipantsStore {
             spaces: HashMap::new(),
             refresh_tasks: HashMap::new(),
             op_tasks: HashMap::new(),
+            next_op_gen: 0,
             op_errors: HashMap::new(),
         }
     }
@@ -86,6 +91,7 @@ impl ParticipantsStore {
             spaces,
             refresh_tasks: HashMap::new(),
             op_tasks: HashMap::new(),
+            next_op_gen: 0,
             op_errors: HashMap::new(),
         }
     }
@@ -262,23 +268,40 @@ impl ParticipantsStore {
         self.op_errors.remove(&key);
         // Take over this space's read for the duration of the write.
         self.refresh_tasks.remove(&space_id);
+        self.next_op_gen += 1;
+        let generation = self.next_op_gen;
+        // **Chained, not replaced** — the same rule `AgentsStore` states in
+        // full: dropping the predecessor's `Task` cancels only its gpui half,
+        // so owning it and awaiting it is what makes last-wins true by
+        // sequencing (Codex review, PR #279).
+        let previous = self.op_tasks.remove(&key).map(|(_, task)| task);
         self.op_tasks.insert(
             key.clone(),
-            cx.spawn(async move |this, cx| {
-                let op_result = op(core).await;
-                let _ = this.update(cx, |this, cx| {
-                    // Drop this op's slot *first*: whether any write is still in
-                    // flight for the space is what decides who owes the read.
-                    this.op_tasks.remove(&key);
-                    if let Err(message) = op_result {
-                        this.op_errors.insert(key.clone(), message);
+            (
+                generation,
+                cx.spawn(async move |this, cx| {
+                    if let Some(previous) = previous {
+                        previous.await;
                     }
-                    if !this.writes_in_flight(&space_id) {
-                        this.refresh(space_id.clone(), cx);
-                    }
-                    cx.notify();
-                });
-            }),
+                    let op_result = op(core).await;
+                    let _ = this.update(cx, |this, cx| {
+                        // Only the current generation settles; a superseded op
+                        // reports nothing and must not take the slot that is now
+                        // its successor's.
+                        if this.op_tasks.get(&key).map(|(g, _)| *g) != Some(generation) {
+                            return;
+                        }
+                        this.op_tasks.remove(&key);
+                        if let Err(message) = op_result {
+                            this.op_errors.insert(key.clone(), message);
+                        }
+                        if !this.writes_in_flight(&space_id) {
+                            this.refresh(space_id.clone(), cx);
+                        }
+                        cx.notify();
+                    });
+                }),
+            ),
         );
         cx.notify();
     }
