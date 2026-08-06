@@ -929,6 +929,7 @@ fn settings_backends_stores(cx: &mut App) -> Stores {
                     source_url: None,
                     status: LocalModelStatus::Available,
                     last_error: None,
+                    on_disk: true,
                 }],
             }],
             models: vec![
@@ -941,6 +942,7 @@ fn settings_backends_stores(cx: &mut App) -> Stores {
                     source_url: None,
                     status: LocalModelStatus::Available,
                     last_error: None,
+                    on_disk: true,
                 },
                 LocalModelInfo {
                     id: "gemma-4-E4B_q4_0-it@local".into(),
@@ -955,6 +957,7 @@ fn settings_backends_stores(cx: &mut App) -> Stores {
                         pinned: true,
                     },
                     last_error: None,
+                    on_disk: true,
                 },
             ],
         });
