@@ -473,9 +473,19 @@ impl SpaceView {
                 .update(cx, |s, cx| s.set_override(space_id, pid, ov, cx));
         } else {
             let update = edit.as_everywhere_update(cx);
-            self.stores
-                .participants
-                .update(cx, |s, cx| s.update_everywhere(space_id, pid, update, cx));
+            // The premise the editor was seeded on: an owned row belongs to this
+            // space, a referenced one is a shared identity. Either can move
+            // under an open editor (promotion), and the write is where that is
+            // caught.
+            let expected = match edit.is_referenced {
+                true => eidola_app_core::ExpectedScope::Global,
+                false => eidola_app_core::ExpectedScope::SpaceOwned {
+                    space_id: space_id.clone(),
+                },
+            };
+            self.stores.participants.update(cx, |s, cx| {
+                s.update_everywhere(space_id, pid, update, expected, cx)
+            });
         }
         self.inspector_participant_picker = None;
         self.hand_back_inspector_focus(held, window, cx);
@@ -490,18 +500,38 @@ impl SpaceView {
     /// memberships and memory), so it asks first. The confirmation is also where
     /// the reassurance is spoken: promotion moves the row's ownership, never its
     /// configuration, so the agent answers in this space exactly as it does now.
-    pub fn inspector_begin_promote(&mut self, cx: &mut Context<Self>) {
-        if let Some(edit) = self.inspector_participant_edit.as_mut() {
-            edit.promote_confirm = true;
-            cx.notify();
+    /// Arm or stand down the share confirmation.
+    ///
+    /// **Either direction unmounts the control that was pressed** — arming
+    /// replaces "Share this agent…" with the confirmation, standing down does
+    /// the reverse — and these are real tab stops (`probe(Role::Button)` derives
+    /// `focusable()` + `tab_index(0)`), so a keyboard reader is left holding a
+    /// handle to something nobody paints. The form itself survives, so the
+    /// keyboard goes **to the form**, not out to the view root: the reader is
+    /// still editing this participant (Codex review, PR #279).
+    fn set_inspector_promote_confirm(
+        &mut self,
+        armed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(edit) = self.inspector_participant_edit.as_mut() else {
+            return;
+        };
+        edit.promote_confirm = armed;
+        let form = edit.focus.clone();
+        if form.contains_focused(window, cx) {
+            window.focus(&form, cx);
         }
+        cx.notify();
     }
 
-    pub fn inspector_cancel_promote(&mut self, cx: &mut Context<Self>) {
-        if let Some(edit) = self.inspector_participant_edit.as_mut() {
-            edit.promote_confirm = false;
-            cx.notify();
-        }
+    pub fn inspector_begin_promote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_inspector_promote_confirm(true, window, cx);
+    }
+
+    pub fn inspector_cancel_promote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_inspector_promote_confirm(false, window, cx);
     }
 
     /// Confirm the share: `ParticipantsStore::promote` — the open editor's
@@ -1253,7 +1283,7 @@ impl SpaceView {
                         format!("Share {subject} across spaces"),
                         false,
                         cx,
-                        cx.listener(|this, _, _, cx| this.inspector_begin_promote(cx)),
+                        cx.listener(|this, _, window, cx| this.inspector_begin_promote(window, cx)),
                     ))
                     .into_any_element(),
             });
@@ -1366,7 +1396,9 @@ impl SpaceView {
                         format!("Keep {name} in this space"),
                         false,
                         cx,
-                        cx.listener(|this, _, _, cx| this.inspector_cancel_promote(cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.inspector_cancel_promote(window, cx)
+                        }),
                     ))
                     .child(ghost_button_labeled(
                         "space-inspector-p-share-confirm-button".into(),

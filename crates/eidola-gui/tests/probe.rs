@@ -2813,7 +2813,10 @@ fn space_inspector_participants_probes_cover_rows_editor_and_add(cx: &mut TestAp
 
     // The share asks first — the verb is replaced by its confirmation, which
     // carries the reassurance as a readable node rather than only as pixels.
-    view.update(cx, |v, cx| v.inspector_begin_promote(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
     let names = fresh_names(cx, window);
     for expected in [
         "space/inspector/participants/agent-1/share/note",
@@ -2829,7 +2832,10 @@ fn space_inspector_participants_probes_cover_rows_editor_and_add(cx: &mut TestAp
         !names.contains(&"space/inspector/participants/agent-1/share".to_string()),
         "the armed confirmation replaces the verb: {names:?}"
     );
-    view.update(cx, |v, cx| v.inspector_cancel_promote(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_promote(window, cx));
+    })
+    .unwrap();
 
     // The add form.
     cx.update_window(window, |_, window, cx| {
@@ -3092,6 +3098,34 @@ fn agents_pane_probes_cover_rows_editor_and_retire(cx: &mut TestAppContext) {
             "retire-confirm probe {expected:?} missing: {names:?}"
         );
     }
+
+    probe::set_probes_enabled(false);
+}
+
+/// The third state the other two are measured against: a cell that **has not
+/// answered**. `Loadable`'s rule is that it says nothing — so rendering the
+/// "share one from a space" invitation over it tells a cold-opening reader their
+/// shared agents are gone (Codex review, PR #279).
+#[gpui::test]
+fn agents_pane_unread_library_is_not_an_empty_one(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        // No fixture: the stub store stays `NotLoaded` and never answers.
+        s.agents = None;
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/agents/loading".to_string()),
+        "an unread library says it is unread: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/agents/empty".to_string()),
+        "and must not read as an empty one: {names:?}"
+    );
 
     probe::set_probes_enabled(false);
 }

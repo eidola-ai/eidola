@@ -261,7 +261,14 @@ impl AgentsStore {
         self.write_then_settle(key, cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
-                    c.update_space_participant(participant_id, update).await
+                    // The library edits a shared identity by definition; a row
+                    // that is not one is not this pane's to write.
+                    c.update_space_participant(
+                        participant_id,
+                        update,
+                        eidola_app_core::ExpectedScope::Global,
+                    )
+                    .await
                 })
                 .await
                 .map_err(|e| e.to_string())

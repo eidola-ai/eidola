@@ -1514,39 +1514,48 @@ pub async fn get_participant(
 pub async fn update_participant_config(
     conn: &Connection,
     id: &str,
-    label: Option<&str>,
-    model_ref: Option<Option<&str>>,
-    system_prompt: Option<Option<&str>>,
-    notify_policy: Option<&str>,
-    role: Option<&str>,
+    write: &PersonaWrite,
 ) -> Result<bool, AppError> {
     let mut sets: Vec<String> = Vec::new();
     let mut params: Vec<Value> = vec![Value::Text(id.to_string())];
-    if let Some(l) = label {
-        params.push(Value::Text(l.to_string()));
+    if let Some(l) = &write.label {
+        params.push(Value::Text(l.clone()));
         sets.push(format!("label = ?{}", params.len()));
     }
-    if let Some(m) = model_ref {
-        params.push(opt_str(m));
+    if let Some(m) = &write.model_ref {
+        params.push(opt_str(m.as_deref()));
         sets.push(format!("model_ref = ?{}", params.len()));
     }
-    if let Some(s) = system_prompt {
-        params.push(opt_str(s));
+    if let Some(s) = &write.system_prompt {
+        params.push(opt_str(s.as_deref()));
         sets.push(format!("system_prompt = ?{}", params.len()));
     }
-    if let Some(n) = notify_policy {
-        params.push(Value::Text(n.to_string()));
+    if let Some(n) = &write.notify_policy {
+        params.push(Value::Text(n.clone()));
         sets.push(format!("notify_policy = ?{}", params.len()));
     }
-    if let Some(r) = role {
-        params.push(Value::Text(r.to_string()));
+    if let Some(r) = &write.role {
+        params.push(Value::Text(r.clone()));
         sets.push(format!("role = ?{}", params.len()));
     }
     if sets.is_empty() {
         return Ok(false);
     }
+    // Liveness, plus whatever the caller believed it was editing.
+    let mut premise = String::from(" AND removed_at IS NULL");
+    match &write.premise {
+        ScopePremise::Any => {}
+        ScopePremise::Global => premise.push_str(" AND scope = 'global'"),
+        ScopePremise::SpaceOwned { space_id } => {
+            params.push(Value::Text(space_id.clone()));
+            premise.push_str(&format!(
+                " AND scope = 'space' AND owner_space_id = ?{}",
+                params.len()
+            ));
+        }
+    }
     let sql = format!(
-        "UPDATE participant SET {} WHERE id = ?1 AND removed_at IS NULL",
+        "UPDATE participant SET {} WHERE id = ?1{premise}",
         sets.join(", ")
     );
     let n = conn.execute(&sql, params).await.map_err(AppError::db)?;
@@ -1660,6 +1669,28 @@ pub struct PersonaWrite {
     pub model_ref: Option<Option<String>>,
     pub system_prompt: Option<Option<String>>,
     pub notify_policy: Option<String>,
+    /// The participant's `role` column — only the seeding paths set it.
+    pub role: Option<String>,
+    /// **What the caller believed it was editing.** Liveness is not the whole
+    /// premise of a config write: an editor opened on a *space-owned* row was
+    /// composed against a persona that promotion moves out from under it, and a
+    /// write that carries only `removed_at IS NULL` will happily republish the
+    /// old values to every space the agent has since joined. Carried into the
+    /// statement, the premise makes that stale write strike nothing (Codex
+    /// review, PR #279).
+    pub premise: ScopePremise,
+}
+
+/// The scope a config write was composed against.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ScopePremise {
+    /// No premise — the write is about a row by id alone.
+    #[default]
+    Any,
+    /// This space's own row (the inspector's owned-agent editor).
+    SpaceOwned { space_id: String },
+    /// A shared identity (the Agents pane; the inspector's "Everyone" mode).
+    Global,
 }
 
 impl PersonaWrite {
@@ -1675,16 +1706,7 @@ impl PersonaWrite {
     /// here, so "a persona write" is one statement builder
     /// ([`update_participant_config`]) with one set of semantics.
     pub async fn apply(&self, conn: &Connection, participant_id: &str) -> Result<bool, AppError> {
-        update_participant_config(
-            conn,
-            participant_id,
-            self.label.as_deref(),
-            self.model_ref.as_ref().map(|inner| inner.as_deref()),
-            self.system_prompt.as_ref().map(|inner| inner.as_deref()),
-            self.notify_policy.as_deref(),
-            None,
-        )
-        .await
+        update_participant_config(conn, participant_id, self).await
     }
 }
 
@@ -6868,11 +6890,13 @@ mod tests {
         update_participant_config(
             &conn,
             &agent.participant_id,
-            Some("Justin"),
-            Some(Some("kimi-k2-6")),
-            Some(Some("Be terse.")),
-            Some("all"),
-            None,
+            &PersonaWrite {
+                label: Some("Justin".into()),
+                model_ref: Some(Some("kimi-k2-6".into())),
+                system_prompt: Some(Some("Be terse.".into())),
+                notify_policy: Some("all".into()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
