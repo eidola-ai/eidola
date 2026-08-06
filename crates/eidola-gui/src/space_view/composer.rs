@@ -201,7 +201,7 @@ impl SpaceView {
         if self.space.read(cx).is_streaming() {
             return;
         }
-        if !self.space.read(cx).transcript_loaded() {
+        if !self.space.read(cx).transcript_visible() {
             return;
         }
 

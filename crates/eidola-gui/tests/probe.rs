@@ -4952,12 +4952,14 @@ fn space_inspector_shows_a_title_refusal_beside_a_standing_settings_one(cx: &mut
     probe::set_probes_enabled(false);
 }
 
-/// **The destination list is bounded and scrolls.** The Library is unbounded,
-/// and an unbounded column inside a popover clips its own overflow: the far
-/// conversations become unreachable, and every frame builds a row for all of
-/// them (Codex review, PR #280). The model picker's shape — a capped height
-/// with its own scroller — so the popover's painted height stays a popover's
-/// however long the Library gets.
+/// **The destination list is bounded *and* virtualized.** An unbounded column
+/// inside a popover clipped its own overflow, putting the far conversations out
+/// of reach; a capped height alone fixed the reach and left the cost, building
+/// an element — hover style, click closure, probe — for every conversation the
+/// reader has ever had, on every frame the picker stood open (Codex review, PR
+/// #280). The Library is a history, not a menu, so this takes the shape the
+/// doctrine already names for fixed-height lists: `uniform_list` renders the
+/// visible window and nothing else.
 #[gpui::test]
 fn space_quote_destination_list_is_bounded(cx: &mut TestAppContext) {
     let _guard = probes_on();
@@ -4998,11 +5000,32 @@ fn space_quote_destination_list_is_bounded(cx: &mut TestAppContext) {
         "59 destinations must not grow the popover past a popover's height: {:?}",
         picker.bounds.size.height
     );
+    // Only the visible window materializes. The count is what the frame paid
+    // for: 59 candidates, a 220px cap, 22px rows — a dozen or so, never the
+    // whole Library.
+    let rows = entries
+        .iter()
+        .filter(|(n, _)| {
+            n.starts_with("space/quote-destination/") && n[24..].parse::<u32>().is_ok()
+        })
+        .count();
+    assert!(
+        rows > 0 && rows <= 16,
+        "the list renders its visible window, not all 59 destinations: {rows}"
+    );
     assert!(
         entries
             .iter()
-            .any(|(n, _)| n == "space/quote-destination/58"),
-        "and every destination is still a row inside the scroller"
+            .any(|(n, _)| n == "space/quote-destination/0"),
+        "starting at the top"
+    );
+    // And the list itself is the `List` landmark, since `uniform_list` cannot
+    // carry a role.
+    assert_probe(
+        &entries,
+        "space/quote-destination/list",
+        gpui::Role::List,
+        "Conversations",
     );
 
     probe::set_probes_enabled(false);
