@@ -3090,16 +3090,33 @@ impl Inner {
                 message: "Eidola itself is not a conversation participant".into(),
             });
         }
-        db::ensure_space_participant(&conn, space_id, participant_id, &row.role, now_ms()).await?;
-        self.bus.emit(Change::Participants);
+        // The checks above give the typed refusals a caller can act on; the
+        // insert's own `WHERE EXISTS` is what makes them terminal, since a
+        // retirement can commit between a read and a write that follows it.
+        let joined =
+            db::ensure_space_participant(&conn, space_id, participant_id, &row.role, now_ms())
+                .await?;
         let member = db::space_participants(&conn, space_id)
             .await?
             .into_iter()
-            .find(|m| m.participant_id == participant_id)
-            .ok_or_else(|| AppError::Internal {
-                message: "participant vanished after joining".into(),
-            })?;
-        Ok(ParticipantInfo::from_effective(member))
+            .find(|m| m.participant_id == participant_id);
+        match member {
+            // Joined now, or already a member — either way it is one, and the
+            // emission is honest (an idempotent re-join changes nothing, but
+            // `INSERT OR IGNORE` cannot tell us so without a second read).
+            Some(member) => {
+                if joined {
+                    self.bus.emit(Change::Participants);
+                }
+                Ok(ParticipantInfo::from_effective(member))
+            }
+            // Nothing inserted and not a member: the premise expired between
+            // the read above and the write — a retirement won. Zero trace, and
+            // a typed refusal rather than the `Internal` this used to raise.
+            None => Err(AppError::Config {
+                message: format!("{} has been retired and cannot rejoin a space", row.label),
+            }),
+        }
     }
 
     /// Promote a space-owned agent to a **global** identity — one colleague in
