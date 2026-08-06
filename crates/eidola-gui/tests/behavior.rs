@@ -13597,6 +13597,86 @@ fn space_a_quote_into_an_unloaded_conversation_waits_for_its_tail(cx: &mut TestA
 }
 
 #[gpui::test]
+fn space_a_quote_lands_in_a_conversation_whose_refresh_failed(cx: &mut TestAppContext) {
+    // The other side of the wait: `Failed { prior: Some(..) }` is a *refresh*
+    // that failed over posts we still hold, and those posts are what the reader
+    // is looking at — `messages()` reads through `Loadable::value` — with the
+    // tail composer already hanging off them. A gate that accepted only
+    // `Loaded` left a quote sent to such a window waiting in the mailbox
+    // indefinitely, in plain sight of somewhere to land (Codex review, PR
+    // #280). A retained value is an answer.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("dest".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // The next reload fails; the conversation stays on screen.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.fail_transcript_refresh_for_test(cx));
+    })
+    .unwrap();
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.transcript().error().is_some(),
+            "the refresh failed, as the premise requires"
+        );
+        assert_eq!(
+            s.messages().len(),
+            1,
+            "and the posts it failed over are still the ones on screen"
+        );
+    });
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.offer_quote(
+                eidola_gui::space::OfferedQuote {
+                    spec: eidola_app_core::ReferenceSpec {
+                        antecedent_action_id: "a1".into(),
+                        content_block_id: Some("b1".into()),
+                        range_start: Some(4),
+                        range_end: Some(15),
+                        annotation: None,
+                    },
+                    byline: "You".into(),
+                    snippet: "quick brown".into(),
+                },
+                None,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "the passage lands in the conversation the reader can see"
+        );
+        assert_eq!(
+            v.active_draft_parent_for_test().as_deref(),
+            Some("d1"),
+            "in its real tail composer, not a root draft"
+        );
+    });
+    assert!(
+        space.read_with(cx, |s, _| !s.has_offered_quote()),
+        "and the mailbox is empty rather than holding it forever"
+    );
+}
+
+#[gpui::test]
 fn space_a_quote_from_another_window_lands_in_this_ones_draft(cx: &mut TestAppContext) {
     // The receiving half. A draft is window-local, so the shared `Space`
     // entity is the courier: the window the offer names takes it and attaches

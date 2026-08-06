@@ -121,6 +121,16 @@ pub(crate) struct QuoteDestination {
     pub(crate) focus: gpui::FocusHandle,
 }
 
+/// Row height for the virtualized destination list. The rows are one line by
+/// construction (a conversation's title, truncated), so `uniform_list`'s
+/// single-measure layout holds — the doctrine's "normalize rows to an explicit
+/// `.h(ROW_H)`".
+const DESTINATION_ROW_H: gpui::Pixels = gpui::px(22.);
+
+/// The picker's list stops growing here: a popover, not a page. Below it the
+/// list is exactly as tall as its rows.
+const DESTINATION_LIST_MAX_H: gpui::Pixels = gpui::px(220.);
+
 /// **The sentence the creation UI must show** (task 37): what quoting into
 /// `title` means, in two facts a reader needs before they do it — who will be
 /// able to read the passage, and that it is a *copy* (references name concrete
@@ -675,7 +685,7 @@ impl SpaceView {
         // Ask for a fresh index as the picker opens — what `OpenLibrary` does
         // on every invocation, and the only thing that re-reads a `Failed` one
         // besides a bus signal. A fresh scroll for a freshly opened list.
-        self.quote_destination_scroll = gpui::ScrollHandle::new();
+        self.quote_destination_scroll = gpui::UniformListScrollHandle::new();
         self.stores.spaces.update(cx, |s, cx| s.refresh(cx));
         cx.notify();
     }
@@ -856,7 +866,7 @@ impl SpaceView {
         // space is empty" and "root because we had not read it yet" are the
         // same value. A draft minted against an unloaded tree is a guess; the
         // doctrine's drafts attach to what exists.
-        if !self.space.read(cx).transcript_loaded() {
+        if !self.space.read(cx).transcript_visible() {
             return;
         }
         let Some(offer) = self
@@ -999,17 +1009,11 @@ impl SpaceView {
         // conversations yet" about a read that failed, with nothing to press:
         // quoting elsewhere was simply dead for the session, since the index is
         // re-read only on a bus signal or an `OpenLibrary`.
-        let (load_error, has_listing, destinations) = {
-            let store = self.stores.spaces.read(cx);
-            let cell = store.index();
-            let rows: Vec<(String, SharedString)> = store
-                .list()
-                .iter()
-                .filter(|s| here.as_deref() != Some(s.id.as_str()))
-                .map(|s| (s.id.clone(), space_label(s)))
-                .collect();
-            (cell.error().map(|e| e.to_string()), cell.has_value(), rows)
+        let (load_error, has_listing) = {
+            let cell = self.stores.spaces.read(cx).index();
+            (cell.error().map(|e| e.to_string()), cell.has_value())
         };
+        let destinations = self.quote_destinations(here.as_deref(), cx);
 
         if destinations.is_empty() {
             let (line, retry) = match (&load_error, has_listing) {
@@ -1048,50 +1052,52 @@ impl SpaceView {
             return Some(col.into_any_element());
         }
 
-        // **A bounded, scrolling list** — the Library is unbounded, and an
-        // unbounded column inside a popover clipped its own overflow: every
-        // conversation past the first handful was unreachable, and each frame
-        // built a row for all of them. The model picker's shape, because a
-        // dropdown of conversations is a dropdown (Codex review, PR #280).
-        let mut menu = v_flex()
-            .id("space-quote-destination-list")
-            .w_full()
-            .max_h(px(220.))
-            .overflow_y_scroll()
-            .track_scroll(&self.quote_destination_scroll)
-            .gap_0p5();
-        for (offered, (id, label)) in destinations.into_iter().enumerate() {
-            let for_arm = label.clone();
-            menu = menu.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "space-quote-destination-{offered}"
-                    )))
-                    .probe(
-                        format!("space/quote-destination/{offered}"),
-                        gpui::Role::Button,
-                        label.clone(),
-                    )
-                    .w_full()
-                    .px_1()
-                    .py_0p5()
-                    .rounded_sm()
-                    .text_xs()
-                    .truncate()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.muted))
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.arm_quote_destination(id.clone(), for_arm.clone(), window, cx);
-                    })),
-            );
-        }
-        col = col.child(div().relative().w_full().child(menu).child(
-            crate::scrollbar::vertical_floating(
-                "quote-destination-scrollbar",
-                &self.quote_destination_scroll,
-            ),
-        ));
+        // **A bounded, virtualized list.** Bounded because an unbounded column
+        // inside a popover clipped its own overflow — every conversation past
+        // the first handful unreachable — and **virtualized** because the
+        // Library is a history, not a menu: a capped height alone still built
+        // an element, with its own hover and click closures, for every
+        // conversation the reader has ever had, on every frame the picker
+        // stood open (Codex review, PR #280). This is the shape the doctrine
+        // already names for fixed-height lists (the Library's, the Record's):
+        // a dumb indexer over `uniform_list` rendering exactly the visible
+        // window. The height is exact rather than flex-derived — the rows are
+        // one line by construction, so the list is `count × ROW_H` capped at
+        // `MAX_H`, and `uniform_list` scrolls inside it.
+        let shown = px(
+            (destinations.len() as f32 * DESTINATION_ROW_H.to_f64() as f32)
+                .min(DESTINATION_LIST_MAX_H.to_f64() as f32),
+        );
+        let list = gpui::uniform_list(
+            "space-quote-destination-list",
+            destinations.len(),
+            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                this.render_quote_destination_rows(range, cx)
+            }),
+        )
+        .h(shown)
+        .w_full()
+        .track_scroll(&self.quote_destination_scroll);
+        col = col.child(
+            div()
+                .id("space-quote-destination-list-wrap")
+                // `uniform_list` implements `InteractiveElement` but not
+                // `StatefulInteractiveElement`, where gpui's aria builders
+                // live, so the `List` parent goes on the wrapper that already
+                // spans it — the Library's rule.
+                .probe(
+                    "space/quote-destination/list",
+                    gpui::Role::List,
+                    "Conversations",
+                )
+                .relative()
+                .w_full()
+                .child(list)
+                .child(crate::scrollbar::vertical_floating(
+                    "quote-destination-scrollbar",
+                    &self.quote_destination_scroll,
+                )),
+        );
         // A failed *refresh* over a listing we still hold keeps the rows — they
         // are honest as of the last read — and says the last read is no longer
         // the last word.
@@ -1099,6 +1105,81 @@ impl SpaceView {
             col = col.child(self.quote_destination_retry(cx));
         }
         Some(col.into_any_element())
+    }
+
+    /// The destination list's **dumb indexer**: exactly the rows
+    /// `uniform_list` asks for, rebuilt from the store each frame.
+    ///
+    /// Reconstructed rather than cached because a bare range *can* reconstruct
+    /// it — the Library index plus "not this conversation" is the whole display
+    /// model — and a cached one would be another thing to invalidate when the
+    /// index moves. The scan is over `SpaceInfo` references; what virtualizing
+    /// removes is the per-row **element** (its hover style, its click closure,
+    /// its probe), which is what the frame actually pays for.
+    fn render_quote_destination_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let theme = cx.theme();
+        let muted = theme.muted;
+        let here = self.space.read(cx).id().map(str::to_string);
+        let destinations = self.quote_destinations(here.as_deref(), cx);
+        let total = destinations.len();
+        destinations
+            .into_iter()
+            .enumerate()
+            .skip(range.start)
+            .take(range.len())
+            .map(|(i, (id, label))| {
+                let for_arm = label.clone();
+                div()
+                    .id(SharedString::from(format!("space-quote-destination-{i}")))
+                    .probe(
+                        format!("space/quote-destination/{i}"),
+                        gpui::Role::Button,
+                        label.clone(),
+                    )
+                    // **Set position on a virtualized row**: AT sees six of six
+                    // hundred otherwise, and the index is over the *data* rows
+                    // (there are no other kinds here).
+                    .aria_position_in_set(i + 1)
+                    .aria_size_of_set(total)
+                    .w_full()
+                    .h(DESTINATION_ROW_H)
+                    .flex()
+                    .items_center()
+                    .px_1()
+                    .rounded_sm()
+                    .text_xs()
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(muted))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.arm_quote_destination(id.clone(), for_arm.clone(), window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// The conversations this space may be quoted into: the Library index less
+    /// this one. One reading, shared by the render (which needs the count and
+    /// the empty-state question) and the indexer (which needs the rows).
+    fn quote_destinations(
+        &self,
+        here: Option<&str>,
+        cx: &gpui::App,
+    ) -> Vec<(String, SharedString)> {
+        self.stores
+            .spaces
+            .read(cx)
+            .list()
+            .iter()
+            .filter(|s| here != Some(s.id.as_str()))
+            .map(|s| (s.id.clone(), space_label(s)))
+            .collect()
     }
 
     /// The picker's quiet retry line — the Library's "couldn't refresh" strip,

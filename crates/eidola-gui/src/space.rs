@@ -574,8 +574,19 @@ impl Space {
     /// picks a parent from what it can see picks the root (see
     /// `SpaceView::adopt_offered_quote`). One predicate, so the two cannot
     /// drift.
-    pub fn transcript_loaded(&self) -> bool {
-        matches!(self.transcript, Loadable::Loaded { .. })
+    ///
+    /// **A retained value is an answer.** The question is "is there a tree on
+    /// screen to attach to", and `Failed { prior: Some(..) }` — a *refresh*
+    /// that failed over a listing we still hold — is exactly that: `messages()`
+    /// reads through `Loadable::value`, so those posts are what the reader is
+    /// looking at and what the tail composer already hangs off. Asking only for
+    /// `Loaded` left a quote sent to such a window waiting in the mailbox
+    /// indefinitely, with a usable tail draft in plain sight (Codex review, PR
+    /// #280). What still waits is a load with **no** value behind it —
+    /// `NotLoaded`, `Loading`, and a failed *initial* read — which is the state
+    /// the gate was introduced for.
+    pub fn transcript_visible(&self) -> bool {
+        self.transcript.value().is_some()
     }
 
     /// The transcript as a slice (empty if not loaded).
@@ -1751,6 +1762,18 @@ impl Space {
     #[doc(hidden)]
     pub fn set_post_tree_for_test(&mut self, nodes: Vec<PostNode>, cx: &mut Context<Self>) {
         self.transcript = Loadable::loaded(views_from_nodes(nodes));
+        cx.notify();
+    }
+
+    /// Test-only: fail the transcript's *refresh*, keeping the posts already
+    /// loaded — `Failed { prior: Some(..) }`, the state a bus-driven reload
+    /// lands in when the read behind it fails. The reader still sees the
+    /// conversation; only its freshness is in doubt.
+    #[doc(hidden)]
+    pub fn fail_transcript_refresh_for_test(&mut self, cx: &mut Context<Self>) {
+        self.transcript = std::mem::take(&mut self.transcript).resolve(Err(AppError::Internal {
+            message: "database is locked".into(),
+        }));
         cx.notify();
     }
 
