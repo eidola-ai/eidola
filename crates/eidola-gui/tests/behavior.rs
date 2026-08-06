@@ -13632,9 +13632,9 @@ fn space_quote_destination_frame_work_is_constant_in_library_size(cx: &mut TestA
             s.spaces = rows;
         });
         let (window, view) = open_space(cx, &stores, Some("s0".into()));
-        cx.update_window(window, |_, _, cx| {
+        cx.update_window(window, |_, window, cx| {
             view.update(cx, |v, cx| {
-                v.quote_destination_frame_work_for_test(visible.clone(), cx)
+                v.quote_destination_frame_work_for_test(visible.clone(), window, cx)
             })
         })
         .unwrap()
@@ -14070,11 +14070,22 @@ fn space_the_quote_picker_takes_the_keyboard_and_gives_it_back(cx: &mut TestAppC
 
     // Opening it — from either door; both funnel through this action, which is
     // why one focus call covers the context menu's row and the Edit menu's item.
+    // The keyboard lands on the **list**, the surface's single tab stop, so ↑/↓
+    // work the moment it opens; the popover subtree contains it either way,
+    // which is what the handback below asks about.
     let picker = open_the_picker(cx);
+    let list = view
+        .read_with(cx, |v, _| v.quote_destination_list_focus_handle())
+        .expect("the picker is open");
     assert!(
-        cx.update_window(window, |_, window, _| picker.is_focused(window))
+        cx.update_window(window, |_, window, _| list.is_focused(window))
             .unwrap(),
-        "the picker holds the keyboard it revealed"
+        "the list holds the keyboard the picker revealed"
+    );
+    assert!(
+        cx.update_window(window, |_, window, cx| picker.contains_focused(window, cx))
+            .unwrap(),
+        "…inside the picker, so a close still knows it is holding it"
     );
 
     // Escape: the picker goes, and the keyboard comes back to the view root —
@@ -14167,6 +14178,143 @@ fn space_the_quote_picker_takes_the_keyboard_and_gives_it_back(cx: &mut TestAppC
             .unwrap(),
         "closing a picker that was not holding the keyboard takes nothing"
     );
+}
+
+#[gpui::test]
+fn space_the_quote_picker_roves_a_cursor_over_its_whole_index(cx: &mut TestAppContext) {
+    // A virtualized list is **one** tab stop with a roving cursor. Per-row tab
+    // stops describe a tab order that does not contain the rows nobody has
+    // scrolled to: Tab walked off the end of the materialized slice and out of
+    // the picker, and every conversation past the first dozen was unreachable
+    // by keyboard (Codex review, PR #280). ↑/↓/Home/End move the cursor,
+    // `scroll_to_item` materializes what it lands on, Enter arms it.
+    let many: Vec<_> = (0..60)
+        .map(|i| {
+            stub_space(
+                &format!("s{i}"),
+                Some(&format!("Conversation {i}")),
+                None,
+                i as i64,
+            )
+        })
+        .collect();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = many;
+    });
+    let (window, view) = open_space(cx, &stores, Some("s0".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.quote_destination_cursor_for_test(cx),
+            Some(0),
+            "the cursor starts at the top"
+        );
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("down down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, cx| {
+        assert_eq!(
+            v.quote_destination_cursor_for_test(cx),
+            Some(2),
+            "↓ moves it"
+        );
+    });
+    vcx.simulate_keystrokes("up");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, cx| {
+        assert_eq!(
+            v.quote_destination_cursor_for_test(cx),
+            Some(1),
+            "↑ moves it back"
+        );
+    });
+
+    // **End reaches the last destination — one the visible slice never held.**
+    // This is the arc the single tab stop exists for: the cursor moves, the
+    // list scrolls it into being, and it is readable and activatable there.
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, cx| {
+        assert_eq!(
+            v.quote_destination_cursor_for_test(cx),
+            Some(58),
+            "End lands on the last of 59 destinations, far past the ten that painted"
+        );
+    });
+
+    // Enter arms *that* one — the statement names it, so what the cursor
+    // reached is what the reader is about to quote into.
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let statement = view
+        .read_with(&vcx, |v, _| v.quote_destination_for_test())
+        .expect("still open")
+        .expect("a destination is armed");
+    assert!(
+        statement.contains("Conversation 59"),
+        "Enter armed the destination the cursor was on: {statement}"
+    );
+}
+
+#[gpui::test]
+fn space_the_quote_pickers_cursor_leaves_escape_alone(cx: &mut TestAppContext) {
+    // The roving idiom answers five keys and nothing else. Escape over this
+    // surface means *dismiss* — a rung of the space root's own chain — so a
+    // cursor that consumed it would shadow the picker's only way out.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.quote_destination_for_test().is_some(),
+            "the picker is open"
+        );
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.quote_destination_for_test().is_none(),
+            "Escape still closes it — the cursor took no rung of the chain"
+        );
+    });
 }
 
 #[gpui::test]
@@ -14277,6 +14425,88 @@ fn inspector_a_notebook_offers_no_grant_door(cx: &mut TestAppContext) {
     );
     let _ = window;
     drain_runtime(&core);
+}
+
+#[gpui::test]
+fn inspector_the_invite_list_roves_a_cursor_over_all_its_candidates(cx: &mut TestAppContext) {
+    // The candidate list's half of the same rule: one tab stop, a roving
+    // cursor, `scroll_to_item` materializing what it lands on — because the
+    // candidates are every agent this reader could add, and per-row tab stops
+    // reach only the dozen that painted (Codex review, PR #280).
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.participants = Some(("s".into(), vec![agent_participant("a-1", "Mara")]));
+        s.space_settings = Some(("s".into(), eidola_app_core::SpaceSettings::default()));
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+        view.update(cx, |v, cx| {
+            v.seed_invite_candidates_for_test(
+                (0..40)
+                    .map(|i| eidola_app_core::GrantableAgent {
+                        id: format!("agent-{i}"),
+                        label: format!("Agent {i}"),
+                        shared: true,
+                        home_space_title: None,
+                    })
+                    .collect(),
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    // The list is the tab stop; put the keyboard there as a Tab would.
+    let list = view
+        .read_with(cx, |v, _| v.invite_list_focus_handle())
+        .expect("the form is open");
+    cx.update_window(window, |_, window, cx| window.focus(&list, cx))
+        .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.invite_cursor_for_test(), Some(0), "starting at the top");
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("down down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.invite_cursor_for_test(), Some(2));
+    });
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.invite_cursor_for_test(),
+            Some(39),
+            "End reaches the last candidate — far past the visible slice"
+        );
+    });
+
+    // Enter arms it: the grant statement names the agent the cursor reached.
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let (_, statement) = view
+        .read_with(&vcx, |v, _| v.inspector_invite_for_test())
+        .expect("the form is open");
+    let statement = statement.expect("a candidate is armed");
+    assert!(
+        statement.contains("Agent 39"),
+        "Enter armed what the cursor was on: {statement}"
+    );
+
+    // And Escape is none of its business — the form's exit is its Cancel, and
+    // the panel's Escape rungs belong to its dropdowns.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.inspector_invite_for_test().is_some(),
+            "the cursor consumed no Escape, and none of the rungs closes this form"
+        );
+    });
 }
 
 #[gpui::test]
