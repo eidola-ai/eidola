@@ -955,6 +955,7 @@ fn the_agent_library_lists_shared_agents_with_their_notebooks() {
                     label: Some("Ada".into()),
                     ..Default::default()
                 },
+                eidola_app_core::ExpectedScope::Any,
             ))
             .expect("edit everywhere");
         assert_eq!(
@@ -1424,6 +1425,7 @@ fn a_save_that_lands_after_retirement_is_refused() {
                     label: Some("Renamed after retirement".into()),
                     ..Default::default()
                 },
+                eidola_app_core::ExpectedScope::Any,
             ))
             .expect_err("a retired participant takes no more configuration");
         assert!(err.to_string().contains("retired"), "{err}");

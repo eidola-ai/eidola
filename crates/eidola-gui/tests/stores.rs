@@ -684,6 +684,7 @@ fn a_refresh_landing_mid_write_keeps_the_participants_ops_error(cx: &mut TestApp
                 label: Some("You\nand me".into()),
                 ..Default::default()
             },
+            eidola_app_core::ExpectedScope::Any,
             cx,
         );
     });
@@ -1576,6 +1577,7 @@ fn two_refused_participant_writes_each_keep_their_own_refusal(cx: &mut TestAppCo
                 label: Some("   ".into()),
                 ..Default::default()
             },
+            eidola_app_core::ExpectedScope::Any,
             cx,
         );
         s.remove(space.clone(), human.clone(), cx);
@@ -1601,4 +1603,78 @@ fn two_refused_participant_writes_each_keep_their_own_refusal(cx: &mut TestAppCo
             "the removal's refusal: {subjects:?}"
         );
     });
+}
+
+/// **A Save carries the premise it was composed under** (Codex review, PR #279).
+///
+/// Save and Share are the same control on one row, so the second replaces the
+/// first's slot — sanctioned last-wins. But a replaced write's *core* call keeps
+/// running, and the two writes do not share a premise: the Save was composed
+/// against a **space-owned** row, and if the promotion commits first the stale
+/// Save lands on a row that is now **global**, republishing the old persona to
+/// every space the agent joins. Liveness alone cannot see that; the premise has
+/// to ride the write.
+#[gpui::test]
+fn a_stale_owned_save_refuses_once_the_row_is_shared(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the seeded agent")
+        .id;
+    let before = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.id == agent)
+        .expect("the agent")
+        .label;
+
+    // The other window's Share lands first.
+    core.runtime()
+        .block_on(core.promote_participant(agent.clone(), None))
+        .expect("the share");
+
+    // The Save that was already in flight, composed against the owned row.
+    stores.participants.update(cx, |s, cx| {
+        s.update_everywhere(
+            space.clone(),
+            agent.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("Stale name from the owned editor".into()),
+                ..Default::default()
+            },
+            eidola_app_core::ExpectedScope::SpaceOwned {
+                space_id: space.clone(),
+            },
+            cx,
+        )
+    });
+    wait_until(cx, "the stale save is refused", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| !s.op_errors_for(&space).is_empty())
+    });
+    let after = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.id == agent)
+        .expect("the agent");
+    assert_eq!(
+        after.label, before,
+        "a save composed against an owned row must not rewrite the shared identity"
+    );
+    assert_eq!(after.scope, "global");
 }

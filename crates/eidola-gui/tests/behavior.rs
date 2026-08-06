@@ -7257,9 +7257,15 @@ fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
     .unwrap();
 
     // The confirmation is armed, then stood down — nothing is written.
-    view.update(cx, |v, cx| v.inspector_begin_promote(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
     assert!(view.read_with(cx, |v, _| v.inspector_promote_confirming()));
-    view.update(cx, |v, cx| v.inspector_cancel_promote(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_promote(window, cx));
+    })
+    .unwrap();
     assert!(!view.read_with(cx, |v, _| v.inspector_promote_confirming()));
     cx.run_until_parked();
     assert_eq!(
@@ -7273,7 +7279,10 @@ fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
         "declining the confirmation shares nothing"
     );
 
-    view.update(cx, |v, cx| v.inspector_begin_promote(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.inspector_confirm_promote(window, cx));
     })
@@ -7370,7 +7379,10 @@ fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAp
     });
 
     // Share, without touching Save first.
-    view.update(cx, |v, cx| v.inspector_begin_promote(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.inspector_confirm_promote(window, cx));
     })
@@ -7497,6 +7509,37 @@ fn inspector_hands_the_keyboard_back_when_a_form_closes(cx: &mut TestAppContext)
     .unwrap();
     assert!(view_holds_the_keyboard(cx), "Save hands it back");
 
+    // **The share confirmation's buttons are tab stops too**, and arming or
+    // standing down unmounts the one that was pressed while the form itself
+    // survives — so the keyboard goes back *to the form*, where the reader
+    // still is (Codex review, PR #279).
+    open_the_disclosure(cx);
+    let form = view
+        .read_with(cx, |v, _| v.inspector_editing_focus_handle())
+        .expect("the disclosure is open");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _cx| form.is_focused(window))
+            .unwrap(),
+        "arming the share leaves the keyboard on the form it replaced a button in"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_promote(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _cx| form.is_focused(window))
+            .unwrap(),
+        "and so does standing it down"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_participant_edit(window, cx));
+    })
+    .unwrap();
+
     // The add form is the same shape, and its Cancel is the same door.
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.inspector_begin_add_participant(window, cx));
@@ -7565,7 +7608,10 @@ fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
     .unwrap();
     // With the share armed, too: an irreversible verb aimed at a row that has
     // since become something else must not survive either.
-    view.update(cx, |v, cx| v.inspector_begin_promote(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
 
     // Another window shares the same agent. Its id does not move — only what it
     // *is* — so the roster-leave rule alone sees nothing.
@@ -7889,6 +7935,29 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
     .unwrap();
     assert!(pane_holds_the_keyboard(cx), "Save hands it back");
 
+    // **The confirmation's own buttons are tab stops** (`probe(Role::Button)`
+    // derives `focusable()` + `tab_index(0)`), so Keep and Retire unmount a
+    // focused control just as an editor's fields do — and owe the keyboard back
+    // the same way (Codex review, PR #279).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent, window, cx));
+    })
+    .unwrap();
+    let confirm = view.read_with(cx, |v, _| v.retire_focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&confirm, cx);
+    })
+    .unwrap();
+    assert!(
+        !pane_holds_the_keyboard(cx),
+        "the confirmation holds the keyboard"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_retire(window, cx));
+    })
+    .unwrap();
+    assert!(pane_holds_the_keyboard(cx), "Keep hands it back");
+
     // Arming a retirement, which replaces the editor.
     open_and_focus_the_charter(cx);
     cx.update_window(window, |_, window, cx| {
@@ -7896,7 +7965,10 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
     })
     .unwrap();
     assert!(pane_holds_the_keyboard(cx), "arming Retire hands it back");
-    view.update(cx, |v, cx| v.cancel_retire(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_retire(window, cx));
+    })
+    .unwrap();
 
     // And the unmount no verb pressed: the agent leaves the roster under an
     // open editor, and `sync_open_forms` retires it at the head of `render`.
@@ -7959,7 +8031,10 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
         view.read_with(cx, |v, _| v.editing_agent().is_none()),
         "arming the retirement closes the editor it replaces"
     );
-    view.update(cx, |v, cx| v.cancel_retire(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_retire(window, cx));
+    })
+    .unwrap();
     cx.run_until_parked();
     assert!(
         stores.agents.read_with(cx, |s, _| s
@@ -7978,7 +8053,10 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
         view.read_with(cx, |v, _| v.retiring_agent().map(str::to_string)),
         Some(agent.clone())
     );
-    view.update(cx, |v, cx| v.cancel_retire(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_retire(window, cx));
+    })
+    .unwrap();
     assert!(view.read_with(cx, |v, _| v.retiring_agent().is_none()));
     cx.run_until_parked();
     assert_eq!(
@@ -7991,7 +8069,25 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.arm_retire(&agent, window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.confirm_retire(cx));
+    // The confirmation's Retire is a real tab stop, and pressing it unmounts
+    // the button — so it owes the keyboard back like every other closing path
+    // (Codex review, PR #279).
+    let confirm = view.read_with(cx, |v, _| v.retire_focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&confirm, cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.confirm_retire(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, cx| {
+            view.read(cx).focus_handle().is_focused(window)
+        })
+        .unwrap(),
+        "Retire hands the keyboard back to the pane"
+    );
     wait_until(cx, "the retirement lands", |cx| {
         stores.agents.read_with(cx, |s, _| s.list().is_empty())
     });
@@ -8277,6 +8373,7 @@ fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &m
                 label: Some("Myself".into()),
                 ..Default::default()
             },
+            eidola_app_core::ExpectedScope::Any,
             cx,
         );
     });

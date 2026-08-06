@@ -466,6 +466,7 @@ fn effective_system_prompt_edit_is_honored_next_turn() {
                     system_prompt: Some(Some("Second prompt.".into())),
                     ..Default::default()
                 },
+                eidola_app_core::ExpectedScope::Any,
             ))
             .expect("edit prompt");
         let p2 = core
@@ -877,6 +878,7 @@ fn referenced_global_override_and_edit_everywhere_fork() {
                     label: Some("Myself".to_string()),
                     ..Default::default()
                 },
+                eidola_app_core::ExpectedScope::Any,
             ))
             .expect("edit everywhere");
         let you = core

@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use eidola_app_core::{
-    AppCore, NewParticipant, ParticipantInfo, ParticipantOverride, ParticipantUpdate,
+    AppCore, ExpectedScope, NewParticipant, ParticipantInfo, ParticipantOverride, ParticipantUpdate,
 };
 use gpui::{Context, Task};
 
@@ -300,18 +300,27 @@ impl ParticipantsStore {
 
     /// "Edit everywhere": write the participant's **own** config (edits the
     /// shared global everywhere, or the space-owned row for this space).
+    /// `expected` is the shape the editor was seeded on. Save and Share are the
+    /// same control on one row, so the second replaces the first's slot — but a
+    /// replaced write's core call keeps running, and the two do not share a
+    /// premise: a Save composed against the **owned** row would otherwise land
+    /// on a row promotion had just made global, republishing the old persona to
+    /// every space it joins. Carried into the write, the expired premise makes
+    /// it strike nothing (Codex review, PR #279).
     pub fn update_everywhere(
         &mut self,
         space_id: String,
         participant_id: String,
         update: ParticipantUpdate,
+        expected: ExpectedScope,
         cx: &mut Context<Self>,
     ) {
         let key = participant_id.clone();
         self.write_then_settle(space_id, key, cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
-                    c.update_space_participant(participant_id, update).await
+                    c.update_space_participant(participant_id, update, expected)
+                        .await
                 })
                 .await
                 .map_err(|e| e.to_string())

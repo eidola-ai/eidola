@@ -1469,6 +1469,7 @@ fn add_update_remove_participant_emit_participants() {
                     label: Some("Justin 2".into()),
                     ..Default::default()
                 },
+                eidola_app_core::ExpectedScope::Any,
             ))
             .unwrap();
         assert!(
@@ -1485,6 +1486,7 @@ fn add_update_remove_participant_emit_participants() {
                         notify_policy: Some("sometimes".into()),
                         ..Default::default()
                     },
+                    eidola_app_core::ExpectedScope::Any,
                 ))
                 .is_err()
         );
@@ -1674,6 +1676,7 @@ fn participant_labels_reject_control_characters() {
                             label: Some(label.into()),
                             ..Default::default()
                         },
+                        eidola_app_core::ExpectedScope::Any,
                     ))
                     .is_err(),
                 "update_space_participant must reject {label:?}"
@@ -1758,6 +1761,7 @@ fn participant_labels_reject_control_characters() {
                     label: Some("Ada Lovelace".into()),
                     ..Default::default()
                 },
+                eidola_app_core::ExpectedScope::Any,
             ))
             .unwrap();
     });

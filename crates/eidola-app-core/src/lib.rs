@@ -307,6 +307,16 @@ impl Default for SpaceSettings {
     }
 }
 
+/// What a caller believed it was editing when it composed a participant change
+/// — carried into the write so a premise that expired refuses instead of
+/// landing (task 36; Codex review, PR #279).
+///
+/// Liveness is not the whole premise: an editor opened on a **space-owned** row
+/// composes values for that row, and promotion moves the row out from under it.
+/// A write carrying only "still live" would republish those values to every
+/// space the agent has since joined.
+pub type ExpectedScope = db::ScopePremise;
+
 /// A space template (its settings + agent participants).
 #[derive(Clone, Debug)]
 pub struct SpaceTemplateInfo {
@@ -400,8 +410,13 @@ fn validate_notify_policy(policy: &str) -> Result<String, AppError> {
 /// of a promotion that can be judged without reading the row). One function, so
 /// "what an update means" — the trimmed label, the checked policy, the empty
 /// string that clears a nullable column — cannot drift between them.
-fn validate_persona(update: &ParticipantUpdate) -> Result<db::PersonaWrite, AppError> {
+fn validate_persona(
+    update: &ParticipantUpdate,
+    premise: db::ScopePremise,
+) -> Result<db::PersonaWrite, AppError> {
     Ok(db::PersonaWrite {
+        premise,
+        role: None,
         label: match &update.label {
             Some(l) => Some(validate_label(l, "participant label")?),
             None => None,
@@ -3004,8 +3019,9 @@ impl Inner {
         &self,
         participant_id: &str,
         update: ParticipantUpdate,
+        expected: ExpectedScope,
     ) -> Result<(), AppError> {
-        let persona = validate_persona(&update)?;
+        let persona = validate_persona(&update, expected)?;
         let conn = self.db_conn().await?;
         if persona.apply(&conn, participant_id).await? {
             self.bus.emit(Change::Participants);
@@ -3033,6 +3049,16 @@ impl Inner {
             Some(row) if row.removed_at.is_some() => Err(AppError::Config {
                 message: format!(
                     "{} has been retired, so this change was not saved",
+                    row.label
+                ),
+            }),
+            // The row is live, so what expired was the *other* half of the
+            // premise: it is no longer the space-owned row this change was
+            // composed against. Promotion is the only way that happens.
+            Some(row) if row.scope == "global" => Err(AppError::Config {
+                message: format!(
+                    "{} is now shared across spaces, so this change was not saved — reopen it \
+                     to edit the shared agent",
                     row.label
                 ),
             }),
@@ -3158,7 +3184,12 @@ impl Inner {
     ) -> Result<PromotionOutcome, AppError> {
         // Before anything is read, let alone written: a refusal about the
         // persona must not depend on how far the promotion got.
-        let persona = persona.as_ref().map(validate_persona).transpose()?;
+        // `Any`: the promoting transaction's own guard has already proved this
+        // row is the space-owned one, so a second premise would be theatre.
+        let persona = persona
+            .as_ref()
+            .map(|u| validate_persona(u, db::ScopePremise::Any))
+            .transpose()?;
         let conn = self.db_conn().await?;
         let row = db::get_participant(&conn, participant_id)
             .await?
@@ -7874,12 +7905,13 @@ impl AppCore {
         &self,
         participant_id: String,
         update: ParticipantUpdate,
+        expected: ExpectedScope,
     ) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move {
                 inner
-                    .update_space_participant(&participant_id, update)
+                    .update_space_participant(&participant_id, update, expected)
                     .await
             })
             .await

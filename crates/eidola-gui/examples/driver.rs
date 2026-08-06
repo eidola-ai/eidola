@@ -562,7 +562,7 @@ mod driver {
                     view.update(cx, |v, cx| {
                         v.set_inspector_open_for_test(true, window, cx);
                         v.inspector_toggle_participant("agent-assistant", window, cx);
-                        v.inspector_begin_promote(cx);
+                        v.inspector_begin_promote(window, cx);
                     });
                     root(view, window, cx)
                 },

@@ -84,6 +84,12 @@ pub struct AgentsSettingsView {
     retiring: Option<String>,
     /// The open dropdown's own scroll (reset to the top on each open).
     picker_scroll: ScrollHandle,
+    /// The retire confirmation's subtree focus handle. One handle, because one
+    /// confirmation renders at a time — and its two buttons are real tab stops
+    /// (`probe(Role::Button)` derives `focusable()` + `tab_index(0)`), so
+    /// unmounting them without a handback strands the keyboard exactly as an
+    /// editor would.
+    retire_focus: FocusHandle,
     /// Where the keyboard goes when an editor holding it closes — the pane's
     /// own root, tracked on the element below, so Tab resumes from the roster
     /// rather than from the window.
@@ -116,6 +122,7 @@ impl AgentsSettingsView {
             retiring: None,
             picker_scroll: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
+            retire_focus: cx.focus_handle(),
             notebooks_opened: 0,
             _subscriptions: subscriptions,
         }
@@ -135,6 +142,12 @@ impl AgentsSettingsView {
     #[doc(hidden)]
     pub fn editing_agent(&self) -> Option<&str> {
         self.draft.as_ref().map(|d| d.participant_id.as_str())
+    }
+
+    /// The armed confirmation's subtree focus handle (tests).
+    #[doc(hidden)]
+    pub fn retire_focus_handle(&self) -> FocusHandle {
+        self.retire_focus.clone()
     }
 
     #[doc(hidden)]
@@ -221,14 +234,15 @@ impl AgentsSettingsView {
         }
     }
 
-    /// Whether the keyboard is anywhere **inside** the open editor — the
-    /// question the handback has to ask, since the editor is a subtree and not a
-    /// list of two inputs (`contains_focused` is the same idiom the Library's
-    /// reveal uses).
+    /// Whether the keyboard is anywhere **inside** one of the pane's two open
+    /// forms — the editor or the retire confirmation. The question the handback
+    /// has to ask, since each is a subtree and not a list of inputs
+    /// (`contains_focused` is the same idiom the Library's reveal uses).
     fn draft_field_focused(&self, window: &Window, cx: &gpui::App) -> bool {
         self.draft
             .as_ref()
             .is_some_and(|d| d.focus.contains_focused(window, cx))
+            || (self.retiring.is_some() && self.retire_focus.contains_focused(window, cx))
     }
 
     pub fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -306,16 +320,22 @@ impl AgentsSettingsView {
         cx.notify();
     }
 
-    pub fn cancel_retire(&mut self, cx: &mut Context<Self>) {
+    /// "Keep" — and the button that was pressed unmounts with the
+    /// confirmation, so the keyboard comes back the same way an editor's does.
+    pub fn cancel_retire(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.draft_field_focused(window, cx);
         self.retiring = None;
+        self.hand_back_focus(held, window, cx);
         cx.notify();
     }
 
-    pub fn confirm_retire(&mut self, cx: &mut Context<Self>) {
+    pub fn confirm_retire(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.draft_field_focused(window, cx);
         let Some(id) = self.retiring.take() else {
             return;
         };
         self.agents_store.update(cx, |s, cx| s.retire(id, cx));
+        self.hand_back_focus(held, window, cx);
         cx.notify();
     }
 
@@ -408,6 +428,24 @@ impl Render for AgentsSettingsView {
                 col = col.child(self.render_op_error(agent, err, cx));
             }
             return col;
+        }
+
+        // **A listing that has not answered is not an empty library.** `Loadable`'s
+        // rule (`crates/eidola-gui/STATE.md`): `NotLoaded`/`Loading` with no
+        // value says nothing, and rendering the "share one from a space"
+        // invitation over it tells a cold-opening reader their library is empty
+        // when it is merely unread (Codex review, PR #279). The quiet one-line
+        // readout is the Participants section's idiom, matched here.
+        if !has_value {
+            return col.child(
+                div()
+                    .id("agents-loading")
+                    .probe("settings/agents/loading", gpui::Role::Label, "Loading…")
+                    .py_4()
+                    .text_xs()
+                    .text_color(theme.muted_foreground.opacity(0.8))
+                    .child("Loading…"),
+            );
         }
 
         if agents.is_empty() {
@@ -807,6 +845,7 @@ impl AgentsSettingsView {
         let subject = agent.label.clone();
         v_flex()
             .id("agent-retire-confirm")
+            .track_focus(&self.retire_focus)
             .w_full()
             .p_3()
             .gap_2()
@@ -837,7 +876,7 @@ impl AgentsSettingsView {
                         format!("Keep {subject}"),
                         false,
                         cx,
-                        cx.listener(|this, _, _, cx| this.cancel_retire(cx)),
+                        cx.listener(|this, _, window, cx| this.cancel_retire(window, cx)),
                     ))
                     .child(ghost_button_labeled(
                         "agent-retire-confirm-button".into(),
@@ -846,7 +885,7 @@ impl AgentsSettingsView {
                         format!("Retire {}", agent.label),
                         true,
                         cx,
-                        cx.listener(|this, _, _, cx| this.confirm_retire(cx)),
+                        cx.listener(|this, _, window, cx| this.confirm_retire(window, cx)),
                     )),
             )
             .into_any_element()
