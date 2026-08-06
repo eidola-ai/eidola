@@ -669,7 +669,7 @@ mod driver {
                     view.update(cx, |v, cx| {
                         v.select(SettingsPane::Agents, cx);
                         v.agents_pane()
-                            .update(cx, |p, cx| p.arm_retire("agent-ada", cx));
+                            .update(cx, |p, cx| p.arm_retire("agent-ada", window, cx));
                     });
                     root(view, window, cx)
                 },

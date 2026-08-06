@@ -248,7 +248,7 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         if self.inspector_editing_participant() == Some(participant_id) {
-            self.inspector_cancel_participant_edit(cx);
+            self.inspector_cancel_participant_edit(window, cx);
             return;
         }
         let Some(p) = self
@@ -364,18 +364,46 @@ impl SpaceView {
         }
     }
 
-    pub fn inspector_cancel_participant_edit(&mut self, cx: &mut Context<Self>) {
+    /// Hand the keyboard back to the view root when a form that **was** holding
+    /// it has gone and left nothing focused.
+    ///
+    /// `held` is an observation taken *before* the form was dropped, and it has
+    /// to be: the question is asked of the form's own `InputState`s, which die
+    /// with it. Every path that closes one of this section's three forms goes
+    /// through here — the verbs a reader presses as well as the roster-driven
+    /// retire, which is where the rule started (Codex review, PR #279). And the
+    /// restore is `set_inspector_open`'s: only from a lender still holding it,
+    /// so a form that never had the keyboard cannot take it from whatever does.
+    pub(crate) fn hand_back_inspector_focus(
+        &mut self,
+        held: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if held && !self.inspector_field_focused(window, cx) {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
+    pub fn inspector_cancel_participant_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let held = self.inspector_field_focused(window, cx);
         self.inspector_participant_edit = None;
         self.inspector_participant_picker = None;
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
     /// Commit the open editor — "edit everywhere" or "override here" per its
     /// mode; an owned participant is always an edit of its own config.
-    pub fn inspector_save_participant_edit(&mut self, cx: &mut Context<Self>) {
+    pub fn inspector_save_participant_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
+        let held = self.inspector_field_focused(window, cx);
         let Some(edit) = self.inspector_participant_edit.take() else {
             return;
         };
@@ -408,6 +436,7 @@ impl SpaceView {
                 .update(cx, |s, cx| s.update_everywhere(space_id, pid, update, cx));
         }
         self.inspector_participant_picker = None;
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
@@ -457,10 +486,11 @@ impl SpaceView {
     /// carries the everywhere-vs-here fork this one was seeded without. Nothing
     /// else is view work — the roster's "shared" tag falls out of the same
     /// re-list.
-    pub fn inspector_confirm_promote(&mut self, cx: &mut Context<Self>) {
+    pub fn inspector_confirm_promote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
+        let held = self.inspector_field_focused(window, cx);
         let Some(edit) = self.inspector_participant_edit.take() else {
             return;
         };
@@ -473,6 +503,7 @@ impl SpaceView {
         self.stores.participants.update(cx, |s, cx| {
             s.promote(space_id, edit.participant_id, Some(update), cx)
         });
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
@@ -484,7 +515,12 @@ impl SpaceView {
             .is_some_and(|e| e.promote_confirm)
     }
 
-    pub fn inspector_remove_participant(&mut self, participant_id: &str, cx: &mut Context<Self>) {
+    pub fn inspector_remove_participant(
+        &mut self,
+        participant_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
@@ -493,7 +529,9 @@ impl SpaceView {
             .participants
             .update(cx, |s, cx| s.remove(space_id, pid, cx));
         if self.inspector_editing_participant() == Some(participant_id) {
+            let held = self.inspector_field_focused(window, cx);
             self.inspector_participant_edit = None;
+            self.hand_back_inspector_focus(held, window, cx);
         }
         cx.notify();
     }
@@ -531,16 +569,23 @@ impl SpaceView {
         }
     }
 
-    pub fn inspector_cancel_add_participant(&mut self, cx: &mut Context<Self>) {
+    pub fn inspector_cancel_add_participant(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let held = self.inspector_field_focused(window, cx);
         self.inspector_participant_add = None;
         self.inspector_participant_picker = None;
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
-    pub fn inspector_save_add_participant(&mut self, cx: &mut Context<Self>) {
+    pub fn inspector_save_add_participant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
+        let held = self.inspector_field_focused(window, cx);
         let Some(add) = self.inspector_participant_add.take() else {
             return;
         };
@@ -562,6 +607,7 @@ impl SpaceView {
             .participants
             .update(cx, |s, cx| s.add(space_id, participant, cx));
         self.inspector_participant_picker = None;
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
@@ -580,15 +626,18 @@ impl SpaceView {
         cx.notify();
     }
 
-    pub fn inspector_cancel_template(&mut self, cx: &mut Context<Self>) {
+    pub fn inspector_cancel_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.inspector_field_focused(window, cx);
         self.inspector_template_form = None;
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
-    pub fn inspector_save_template(&mut self, cx: &mut Context<Self>) {
+    pub fn inspector_save_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
+        let held = self.inspector_field_focused(window, cx);
         let Some(form) = self.inspector_template_form.take() else {
             return;
         };
@@ -600,6 +649,7 @@ impl SpaceView {
         self.stores
             .templates
             .update(cx, |s, cx| s.create_from_space(space_id, title, cx));
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
@@ -710,9 +760,7 @@ impl SpaceView {
         let held = self.inspector_field_focused(window, cx);
         self.inspector_participant_edit = None;
         self.inspector_participant_picker = None;
-        if held && !self.inspector_field_focused(window, cx) {
-            window.focus(&self.focus_handle, cx);
-        }
+        self.hand_back_inspector_focus(held, window, cx);
     }
 
     pub(crate) fn inspector_toggle_participant_picker(
@@ -1175,8 +1223,8 @@ impl SpaceView {
                         format!("Remove {subject}"),
                         false,
                         cx,
-                        cx.listener(move |this, _, _, cx| {
-                            this.inspector_remove_participant(&remove_id, cx)
+                        cx.listener(move |this, _, window, cx| {
+                            this.inspector_remove_participant(&remove_id, window, cx)
                         }),
                     ))
                 }))
@@ -1189,8 +1237,8 @@ impl SpaceView {
                             "Cancel",
                             false,
                             cx,
-                            cx.listener(|this, _, _, cx| {
-                                this.inspector_cancel_participant_edit(cx)
+                            cx.listener(|this, _, window, cx| {
+                                this.inspector_cancel_participant_edit(window, cx)
                             }),
                         ))
                         .child(ghost_button(
@@ -1199,7 +1247,9 @@ impl SpaceView {
                             "Save",
                             true,
                             cx,
-                            cx.listener(|this, _, _, cx| this.inspector_save_participant_edit(cx)),
+                            cx.listener(|this, _, window, cx| {
+                                this.inspector_save_participant_edit(window, cx)
+                            }),
                         )),
                 ),
         )
@@ -1276,7 +1326,9 @@ impl SpaceView {
                         format!("Share {name} across spaces"),
                         true,
                         cx,
-                        cx.listener(|this, _, _, cx| this.inspector_confirm_promote(cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.inspector_confirm_promote(window, cx)
+                        }),
                     )),
             )
             .into_any_element()
@@ -1336,7 +1388,9 @@ impl SpaceView {
                         "Cancel",
                         false,
                         cx,
-                        cx.listener(|this, _, _, cx| this.inspector_cancel_add_participant(cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.inspector_cancel_add_participant(window, cx)
+                        }),
                     ))
                     .child(ghost_button(
                         "space-inspector-add-submit".into(),
@@ -1344,7 +1398,9 @@ impl SpaceView {
                         "Add",
                         true,
                         cx,
-                        cx.listener(|this, _, _, cx| this.inspector_save_add_participant(cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.inspector_save_add_participant(window, cx)
+                        }),
                     )),
             )
             .into_any_element()
@@ -1385,7 +1441,9 @@ impl SpaceView {
                         "Cancel",
                         false,
                         cx,
-                        cx.listener(|this, _, _, cx| this.inspector_cancel_template(cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.inspector_cancel_template(window, cx)
+                        }),
                     ))
                     .child(ghost_button(
                         "space-inspector-template-save".into(),
@@ -1393,7 +1451,7 @@ impl SpaceView {
                         "Save template",
                         true,
                         cx,
-                        cx.listener(|this, _, _, cx| this.inspector_save_template(cx)),
+                        cx.listener(|this, _, window, cx| this.inspector_save_template(window, cx)),
                     )),
             )
             .into_any_element()
