@@ -178,8 +178,16 @@ pub(crate) enum MemoryRefusal {
     NameTooLong,
     NameNotOneLine,
     EmptyText,
-    TextTooLarge { bytes: usize },
-    TooManyBlocks { existing: Vec<String> },
+    TextTooLarge {
+        bytes: usize,
+    },
+    TooManyBlocks {
+        existing: Vec<String>,
+    },
+    /// The owner was retired while its turn was still running. Memory is
+    /// durable and its notebook is archived, so the write is refused rather
+    /// than landing behind the retirement.
+    OwnerRetired,
 }
 
 impl std::fmt::Display for MemoryRefusal {
@@ -197,6 +205,10 @@ impl std::fmt::Display for MemoryRefusal {
             Self::NameNotOneLine => write!(
                 f,
                 "a block name must be a single line without control characters"
+            ),
+            Self::OwnerRetired => write!(
+                f,
+                "you have been retired, so your memory is closed — nothing was written"
             ),
             Self::EmptyText => write!(
                 f,
@@ -478,77 +490,106 @@ impl Inner {
             None => (Uuid::now_v7().to_string(), None, new_residence, 1usize),
         };
 
-        db::insert_action(
-            &conn,
-            &db::ActionEntry {
-                id: action_id.clone(),
-                space_id: residence.clone(),
-                // The **author** of this generation — which in v1 is always
-                // the owner, and is the field a later human correction would
-                // differ in.
-                participant_id: owner_participant_id.to_string(),
-                item_id: item_id.clone(),
-                supersedes_action_id: supersedes,
-                action_type: db::MEMORY_ACTION_TYPE.to_string(),
-                status: "complete".to_string(),
-                // The block's name as of this revision — readable in the
-                // Record without a join. The `memory_block` row is the
-                // authority.
-                intent: Some(name.clone()),
-                model: None,
-                input_tokens: None,
-                output_tokens: None,
-                credits_consumed: None,
-                created_at: now,
-            },
-        )
-        .await?;
-        db::insert_text_content_block(
-            &conn,
-            &Uuid::now_v7().to_string(),
-            &action_id,
-            0,
-            "text",
-            &text,
-        )
-        .await?;
-        // Provenance: ordinals 1..=N, ordinal 0 reserved for the structural
-        // `reply` edge a memory block does not have.
-        for (i, source) in req.sources.iter().take(MAX_SOURCES).enumerate() {
-            db::insert_reference_antecedent(
+        // **The owner's liveness is asked inside the transaction that carries
+        // the writes.** A turn binds its tools to the responding participant
+        // when it starts, so a retirement can land between two rounds — and the
+        // scope read above is not liveness. Asked out here it would be another
+        // read-then-write window; asked in there, no retirement can commit
+        // between the question and the answer, and a refusal leaves nothing at
+        // all (Codex review, PR #279).
+        conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+        let written: Result<Option<usize>, AppError> = async {
+            if !db::participant_is_live(&conn, owner_participant_id).await? {
+                return Ok(None);
+            }
+            db::insert_action(
                 &conn,
-                &action_id,
-                source,
-                (i + 1) as i64,
-                None,
-                None,
-                None,
-                req.annotation.as_deref(),
+                &db::ActionEntry {
+                    id: action_id.clone(),
+                    space_id: residence.clone(),
+                    // The **author** of this generation — which in v1 is always
+                    // the owner, and is the field a later human correction would
+                    // differ in.
+                    participant_id: owner_participant_id.to_string(),
+                    item_id: item_id.clone(),
+                    supersedes_action_id: supersedes,
+                    action_type: db::MEMORY_ACTION_TYPE.to_string(),
+                    status: "complete".to_string(),
+                    // The block's name as of this revision — readable in the
+                    // Record without a join. The `memory_block` row is the
+                    // authority.
+                    intent: Some(name.clone()),
+                    model: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    credits_consumed: None,
+                    created_at: now,
+                },
             )
             .await?;
-        }
-
-        let blocks = match &existing {
-            Some(b) => {
-                db::touch_memory_block(&conn, &b.item_id, &req.scope, now).await?;
-                owned.len()
-            }
-            None => {
-                db::insert_memory_block(
+            db::insert_text_content_block(
+                &conn,
+                &Uuid::now_v7().to_string(),
+                &action_id,
+                0,
+                "text",
+                &text,
+            )
+            .await?;
+            // Provenance: ordinals 1..=N, ordinal 0 reserved for the structural
+            // `reply` edge a memory block does not have.
+            for (i, source) in req.sources.iter().take(MAX_SOURCES).enumerate() {
+                db::insert_reference_antecedent(
                     &conn,
-                    &db::NewMemoryBlock {
-                        item_id: item_id.clone(),
-                        root_action_id: action_id.clone(),
-                        owner_participant_id: owner_participant_id.to_string(),
-                        name: name.clone(),
-                        scope: req.scope.clone(),
-                        space_id: residence.clone(),
-                        created_at: now,
-                        updated_at: now,
-                    },
+                    &action_id,
+                    source,
+                    (i + 1) as i64,
+                    None,
+                    None,
+                    None,
+                    req.annotation.as_deref(),
                 )
                 .await?;
-                owned.len() + 1
+            }
+
+            let blocks = match &existing {
+                Some(b) => {
+                    db::touch_memory_block(&conn, &b.item_id, &req.scope, now).await?;
+                    owned.len()
+                }
+                None => {
+                    db::insert_memory_block(
+                        &conn,
+                        &db::NewMemoryBlock {
+                            item_id: item_id.clone(),
+                            root_action_id: action_id.clone(),
+                            owner_participant_id: owner_participant_id.to_string(),
+                            name: name.clone(),
+                            scope: req.scope.clone(),
+                            space_id: residence.clone(),
+                            created_at: now,
+                            updated_at: now,
+                        },
+                    )
+                    .await?;
+                    owned.len() + 1
+                }
+            };
+            Ok(Some(blocks))
+        }
+        .await;
+        let blocks = match written {
+            Ok(Some(blocks)) => {
+                conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+                blocks
+            }
+            Ok(None) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Ok(MemoryOutcome::Refused(MemoryRefusal::OwnerRetired));
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
             }
         };
 

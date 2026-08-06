@@ -1553,6 +1553,15 @@ pub async fn update_participant_config(
     Ok(n > 0)
 }
 
+/// Whether a participant row exists and has not been retired/removed — the
+/// liveness question a write asks **inside its own transaction** when it cannot
+/// carry the predicate in its statement (see `memory::Inner::remember`).
+pub async fn participant_is_live(conn: &Connection, id: &str) -> Result<bool, AppError> {
+    Ok(get_participant(conn, id)
+        .await?
+        .is_some_and(|p| p.removed_at.is_none()))
+}
+
 /// Soft-remove a participant row (global: library soft-remove; owned:
 /// left/deactivated). The row survives so `action.participant_id` references
 /// stay resolvable.
@@ -2200,27 +2209,36 @@ pub async fn ensure_space_participant(
     participant_id: &str,
     role: &str,
     joined_at: i64,
-) -> Result<(), AppError> {
-    insert_participant_ref(
-        conn,
-        "space_participant",
-        "space_id",
-        space_id,
-        participant_id,
-        role,
-        joined_at,
-        &ParticipantRefRow {
-            participant_id: participant_id.to_string(),
-            role: role.to_string(),
-            joined_at,
-            override_label: None,
-            override_model_ref: None,
-            override_system_prompt: None,
-            override_notify_policy: None,
-        },
-        true,
-    )
-    .await
+) -> Result<bool, AppError> {
+    // **Liveness rides the insert.** The caller reads the participant first for
+    // its typed refusals, but a read cannot answer for a write that lands after
+    // it: a retirement committing in between left a durable membership joined
+    // *after* retirement, plus an invalidation and an `Internal` error where a
+    // refusal belonged (Codex review, PR #279). `INSERT … SELECT … WHERE EXISTS`
+    // makes the premise part of the statement, so a lost race writes nothing.
+    // `OR IGNORE` keeps the join idempotent, as it has always been.
+    let n = conn
+        .execute(
+            "INSERT OR IGNORE INTO space_participant \
+             (space_id, participant_id, participant_scope, role, joined_at, \
+              override_label, override_model_ref, override_system_prompt, \
+              override_notify_policy) \
+             SELECT ?1, ?2, 'global', ?3, ?4, NULL, NULL, NULL, NULL \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM participant WHERE id = ?2 AND removed_at IS NULL \
+             )",
+            (
+                Value::Text(space_id.to_string()),
+                Value::Text(participant_id.to_string()),
+                Value::Text(role.to_string()),
+                Value::Integer(joined_at),
+            ),
+        )
+        .await
+        .map_err(|e| AppError::Database {
+            message: format!("failed to insert space_participant: {e}"),
+        })?;
+    Ok(n > 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7312,6 +7330,67 @@ mod tests {
                 .await
                 .unwrap(),
             SpaceRemoval::NothingToDo
+        );
+    }
+
+    /// **A join decides at its write** (Codex review, PR #279). The caller reads
+    /// the participant first — for its typed refusals — but a read cannot answer
+    /// for a write that lands after it: a retirement committing in between left
+    /// a durable membership row joined *after* retirement. The old shape's two
+    /// halves are played out around a retirement below, then the same interleave
+    /// goes through the guarded insert.
+    #[tokio::test]
+    async fn a_join_decided_before_a_retirement_inserts_no_membership() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        insert_space(&conn, "s", Some("Home"), "unlinked", 1)
+            .await
+            .unwrap();
+        insert_participant(
+            &conn, "g", "global", None, None, "agent", "Ada", None, None, "explicit", "member",
+            None, 1,
+        )
+        .await
+        .unwrap();
+
+        // The read that decided: live and global.
+        let read = get_participant(&conn, "g").await.unwrap().unwrap();
+        assert!(read.removed_at.is_none());
+        // ...the retirement...
+        assert!(soft_remove_participant(&conn, "g", 2).await.unwrap());
+        // ...and the write it decided on, now guarded.
+        assert!(
+            !ensure_space_participant(&conn, "s", "g", "member", 3)
+                .await
+                .unwrap(),
+            "the premise expired, so the insert strikes nothing"
+        );
+        assert!(
+            space_participants(&conn, "s")
+                .await
+                .unwrap()
+                .iter()
+                .all(|m| m.participant_id != "g"),
+            "and no membership row was left behind"
+        );
+
+        // The ordinary case still joins, and stays idempotent.
+        insert_participant(
+            &conn, "h", "global", None, None, "agent", "Bo", None, None, "explicit", "member",
+            None, 1,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ensure_space_participant(&conn, "s", "h", "member", 3)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !ensure_space_participant(&conn, "s", "h", "member", 4)
+                .await
+                .unwrap(),
+            "re-adding an existing member changes nothing"
         );
     }
 }

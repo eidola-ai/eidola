@@ -1451,3 +1451,92 @@ fn a_save_that_lands_after_retirement_is_refused() {
         assert_eq!(agent_byline(&core, &space), before);
     });
 }
+
+/// **A retired agent writes no memory** (Codex review, PR #279). `remember` read
+/// the owner's *scope* but never its liveness, so a retirement landing mid-turn
+/// left a later round free to mutate durable memory inside a notebook that had
+/// just been archived.
+#[test]
+fn a_retired_agent_cannot_remember_mid_turn() {
+    run(|| {
+        let script = tool_script();
+        let (_mock, core, _dir) = setup(script.clone());
+        let core = std::sync::Arc::new(core);
+        core.set_memory_enabled(true);
+
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        promote(&core, &agent);
+        let before = blocks(&core, &agent).len();
+
+        core.register_tool(std::sync::Arc::new(RetireMidTurn {
+            core: std::sync::Arc::downgrade(&core),
+            participant: agent.clone(),
+        }))
+        .expect("register");
+
+        // Round 1 retires it; round 2 — same turn, same bound participant —
+        // tries to write memory.
+        *script.lock().unwrap() = vec![
+            ("retire_now".into(), "{}".into()),
+            (
+                "remember".into(),
+                serde_json::json!({
+                    "block": "after the end",
+                    "text": "Written after I was retired.",
+                    "scope": "core",
+                })
+                .to_string(),
+            ),
+        ];
+        turn(
+            &core,
+            "Retire yourself, then remember something.",
+            Some(space),
+        );
+
+        assert_eq!(
+            blocks(&core, &agent).len(),
+            before,
+            "a retired agent's memory is closed"
+        );
+    });
+}
+
+/// **A join that loses a race to a retirement writes nothing** (Codex review, PR
+/// #279). `add_global_participant` read the participant as live and *then*
+/// inserted the reference, so a retirement committing in between left a durable
+/// membership row joined after retirement, a spurious invalidation, and an
+/// `Internal` error where a typed refusal belonged.
+#[test]
+fn a_join_refused_by_retirement_leaves_no_membership() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        promote(&core, &agent);
+        let other = core
+            .runtime()
+            .block_on(core.create_space(Some("Elsewhere".into())))
+            .expect("a space")
+            .id;
+        core.runtime()
+            .block_on(core.retire_participant(agent.clone()))
+            .expect("retirement");
+
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.add_global_participant(other.clone(), agent.clone()))
+            .expect_err("a retired agent cannot join");
+        assert!(
+            !matches!(err, eidola_app_core::error::AppError::Internal { .. }),
+            "the refusal is typed, not an internal error: {err}"
+        );
+        assert!(drain(&mut rx).is_empty(), "a refusal emits nothing");
+        assert!(
+            member(&core, &other, &agent).is_none(),
+            "and leaves no membership behind"
+        );
+    });
+}
