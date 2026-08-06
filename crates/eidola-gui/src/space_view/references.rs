@@ -1223,6 +1223,34 @@ impl SpaceView {
         cx.notify();
     }
 
+    /// **The cursor as the row renders it** — `None` unless the list itself
+    /// holds the keyboard. The invite list's twin, and the Library's rule: the
+    /// cursor is the row's focus identity, so a row may only claim it while the
+    /// list is the focused element. This surface reaches the ungated state
+    /// through Tab (its failed-index retry line is a stop beside the list) and
+    /// through a reader clicking back into the page with the picker still open
+    /// — where a persisting ring is two focus indications for one focus, and
+    /// the active descendant names a row that is not where focus is (Codex
+    /// review, PR #280).
+    fn quote_destination_cursor_row(&self, window: &Window, cx: &gpui::App) -> Option<usize> {
+        let dest = self.quote_destination.as_ref()?;
+        dest.list_focus
+            .is_focused(window)
+            .then(|| self.quote_destination_cursor(cx))
+            .flatten()
+    }
+
+    /// Test seam over [`Self::quote_destination_cursor_row`] — the computation
+    /// the rows render from.
+    #[doc(hidden)]
+    pub fn quote_destination_cursor_row_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Option<usize> {
+        self.quote_destination_cursor_row(window, cx)
+    }
+
     /// Test seam: where the picker's roving cursor effectively sits.
     #[doc(hidden)]
     pub fn quote_destination_cursor_for_test(&self, cx: &gpui::App) -> Option<usize> {
@@ -1276,7 +1304,8 @@ impl SpaceView {
                 .collect();
             (rows.count(), visible)
         };
-        let cursor = self.quote_destination_cursor(cx);
+        // Focus-gated, then modality-gated again for the ring alone.
+        let cursor = self.quote_destination_cursor_row(window, cx);
         let on_cursor = |i: usize| cursor == Some(i);
         let keyboard = window.last_input_was_keyboard();
         visible

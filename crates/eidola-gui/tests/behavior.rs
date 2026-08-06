@@ -14258,6 +14258,39 @@ fn space_the_quote_picker_roves_a_cursor_over_its_whole_index(cx: &mut TestAppCo
         );
     });
 
+    // **The same focus gate the invite list has.** The stored cursor is where
+    // ↑/↓ left it; whether a row *claims* it is a question about where the
+    // keyboard is — this surface reaches the ungated state by Tab (its retry
+    // line is a stop beside the list) and by a reader clicking back into the
+    // page with the picker still open.
+    let popover = view
+        .read_with(&vcx, |v, _| v.quote_destination_focus_handle())
+        .expect("the picker is open");
+    vcx.update(|window, cx| window.focus(&popover, cx));
+    let (stored, shown) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, app| {
+            (
+                v.quote_destination_cursor_for_test(app),
+                v.quote_destination_cursor_row_for_test(window, app),
+            )
+        })
+    });
+    assert_eq!(stored, Some(58), "the cursor stands");
+    assert_eq!(
+        shown, None,
+        "…and no row claims it from a focus it doesn't have"
+    );
+    let list = view
+        .read_with(&vcx, |v, _| v.quote_destination_list_focus_handle())
+        .expect("the picker is open");
+    vcx.update(|window, cx| window.focus(&list, cx));
+    let shown = vcx.update(|window, cx| {
+        view.read_with(cx, |v, app| {
+            v.quote_destination_cursor_row_for_test(window, app)
+        })
+    });
+    assert_eq!(shown, Some(58), "and returns with the keyboard");
+
     // Enter arms *that* one — the statement names it, so what the cursor
     // reached is what the reader is about to quote into.
     vcx.simulate_keystrokes("enter");
@@ -14496,6 +14529,33 @@ fn inspector_the_invite_list_roves_a_cursor_over_all_its_candidates(cx: &mut Tes
         statement.contains("Agent 39"),
         "Enter armed what the cursor was on: {statement}"
     );
+
+    // **The cursor is the row's focus identity, so it belongs to the row only
+    // while the list holds the keyboard.** Gated on modality alone it painted a
+    // ring on the first candidate the moment the read landed — the door's own
+    // reveal focuses the *form* — and left it there after Tab reached Cancel:
+    // two focus indications for one focus (Codex review, PR #280).
+    let form = view
+        .read_with(&vcx, |v, _| v.inspector_invite_focus_handle())
+        .expect("the form is open");
+    vcx.update(|window, cx| window.focus(&form, cx));
+    let (stored, shown) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, _| {
+            (
+                v.invite_cursor_for_test(),
+                v.invite_cursor_row_for_test(window),
+            )
+        })
+    });
+    assert_eq!(stored, Some(39), "the cursor is still where ↑/↓ left it");
+    assert_eq!(
+        shown, None,
+        "…but no row claims it while the keyboard is elsewhere in the form"
+    );
+    vcx.update(|window, cx| window.focus(&list, cx));
+    let shown =
+        vcx.update(|window, cx| view.read_with(cx, |v, _| v.invite_cursor_row_for_test(window)));
+    assert_eq!(shown, Some(39), "and it comes back with the keyboard");
 
     // And Escape is none of its business — the form's exit is its Cancel, and
     // the panel's Escape rungs belong to its dropdowns.
