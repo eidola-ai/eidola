@@ -31,8 +31,6 @@ use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorEvent, MarkdownEditorSt
 
 use std::collections::HashSet;
 
-use crate::loadable::Loadable;
-
 use crate::overlay::{Contain as _, Overlay};
 
 use super::context_menu::ContextTarget;
@@ -203,7 +201,7 @@ impl SpaceView {
         if self.space.read(cx).is_streaming() {
             return;
         }
-        if !matches!(self.space.read(cx).transcript(), Loadable::Loaded { .. }) {
+        if !self.space.read(cx).transcript_loaded() {
             return;
         }
 

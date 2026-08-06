@@ -13381,14 +13381,34 @@ fn space_quoting_elsewhere_names_who_will_see_the_passage(cx: &mut TestAppContex
         handed_over,
         "the passage is handed to the destination's entity — the only thing two windows share"
     );
-    // …and the deferred window open takes it from there: the destination's own
-    // window drains the mailbox into its composer (the receiving half is
-    // pinned on its own below).
+    // …and the deferred window open takes it from there — once that window has
+    // actually read the conversation. Until then the offer waits rather than
+    // guessing a tail (see `space_a_quote_into_an_unloaded_conversation_waits_
+    // for_its_tail`), which in stub mode is where it would stay.
+    cx.run_until_parked();
+    destination.read_with(cx, |space, _| {
+        assert!(
+            space.has_offered_quote(),
+            "the window opened, but it has not read the conversation yet"
+        );
+    });
+    cx.update(|cx| {
+        destination.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![fixture_post_with_block(
+                    "d1",
+                    "db1",
+                    "a conversation over here",
+                )],
+                cx,
+            );
+        });
+    });
     cx.run_until_parked();
     destination.read_with(cx, |space, _| {
         assert!(
             !space.has_offered_quote(),
-            "the window that opened on it took the offer"
+            "the transcript landed, so the window that opened on it took the offer"
         );
     });
     view.read_with(cx, |v, _| {
@@ -13427,7 +13447,19 @@ fn space_a_quote_into_an_open_conversation_lands_in_the_window_it_raises(cx: &mu
     // renders first" stops being a shape and starts being a coin flip: the
     // offer is addressed, so only the raised one — the newest — may take it.
     let (_older_window, older_view) = open_space(cx, &stores, Some("other".into()));
-    let (_dest_window, dest_view) = open_space(cx, &stores, Some("other".into()));
+    let (dest_window, dest_view) = open_space(cx, &stores, Some("other".into()));
+    // Both windows share the one entity, so seeding through either gives the
+    // destination the loaded tail an offer waits for.
+    seed_quotable_space(
+        &dest_view,
+        dest_window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
     let (window, view) = open_space(cx, &stores, Some("s".into()));
     let windows_before = cx.update(|cx| cx.windows().len());
     seed_quotable_space(
@@ -13477,6 +13509,91 @@ fn space_a_quote_into_an_open_conversation_lands_in_the_window_it_raises(cx: &mu
             "and nothing was attached here"
         );
     });
+}
+
+#[gpui::test]
+fn space_a_quote_into_an_unloaded_conversation_waits_for_its_tail(cx: &mut TestAppContext) {
+    // Quoting into a conversation that was **not** already open lands in a
+    // window whose first frames run while the transcript is still loading.
+    // `sync_tail_drafts` deliberately does nothing in that state, so a take on
+    // that frame minted a draft against a tree with no posts in it: a *root*
+    // draft, visually attached to nothing, that submitted with no `reply_to`
+    // and was persisted under whatever the tail turned out to be — a guess
+    // that looked like an answer (Codex review, PR #280). The mailbox already
+    // survives frames, so the offer simply waits for the tail it belongs to.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("dest".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    assert!(
+        space.read_with(cx, |s, _| !matches!(
+            s.transcript(),
+            eidola_gui::loadable::Loadable::Loaded { .. }
+        )),
+        "the premise: this window opened on a conversation it has not read yet"
+    );
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.offer_quote(
+                eidola_gui::space::OfferedQuote {
+                    spec: eidola_app_core::ReferenceSpec {
+                        antecedent_action_id: "a1".into(),
+                        content_block_id: Some("b1".into()),
+                        range_start: Some(4),
+                        range_end: Some(15),
+                        annotation: None,
+                    },
+                    byline: "You".into(),
+                    snippet: "quick brown".into(),
+                },
+                None,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    assert!(
+        space.read_with(cx, |s, _| s.has_offered_quote()),
+        "the offer waits in the mailbox rather than minting a draft against a tree with no tail"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.active_draft_references_for_test().is_empty(),
+            "nothing is attached yet"
+        );
+    });
+
+    // The transcript lands, `sync_tail_drafts` mints the real tail composer,
+    // and the offer is taken on that same frame.
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "the passage lands once there is somewhere for it to land"
+        );
+        assert_eq!(
+            v.active_draft_parent_for_test().as_deref(),
+            Some("d1"),
+            "and in the branch's real tail composer — what a submit will carry \
+             as its reply antecedent, rather than a root draft's nothing"
+        );
+    });
+    assert!(
+        space.read_with(cx, |s, _| !s.has_offered_quote()),
+        "taken exactly once"
+    );
 }
 
 #[gpui::test]

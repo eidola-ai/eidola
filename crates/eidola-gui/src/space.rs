@@ -565,6 +565,19 @@ impl Space {
         &self.transcript
     }
 
+    /// Whether the transcript has **answered** — the precondition for anything
+    /// that attaches itself to the post tree.
+    ///
+    /// A window opened on an existing conversation draws several frames before
+    /// its first read lands, and in those frames the tree is not "empty", it is
+    /// *unknown*: `sync_tail_drafts` mints no tail composer, and anything that
+    /// picks a parent from what it can see picks the root (see
+    /// `SpaceView::adopt_offered_quote`). One predicate, so the two cannot
+    /// drift.
+    pub fn transcript_loaded(&self) -> bool {
+        matches!(self.transcript, Loadable::Loaded { .. })
+    }
+
     /// The transcript as a slice (empty if not loaded).
     pub fn messages(&self) -> &[ChatMessageView] {
         self.transcript.value().map(|v| v.as_slice()).unwrap_or(&[])
