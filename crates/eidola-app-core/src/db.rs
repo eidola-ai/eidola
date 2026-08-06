@@ -212,6 +212,40 @@ pub async fn open(data_dir: &Path) -> Result<Database, AppError> {
     Ok(db)
 }
 
+/// Open a **write** transaction — `BEGIN IMMEDIATE`, reserving the writer
+/// before the first read.
+///
+/// Every transaction in this module reads before it writes: it checks a scope,
+/// a membership, a `left_at`, and decides what to write from what it found.
+/// That is the whole point of deciding at the write — and a *deferred* `BEGIN`
+/// (what plain `BEGIN` means, here as in SQLite) does not reserve anything, so
+/// two connections could both read the old state and the second one's write
+/// would be refused rather than serialized. Measured on turso at our pin, with
+/// two live connections on one `Database` (`AppCore::db_conn` mints a fresh one
+/// per call, so this is an in-process race, not just a cross-process one):
+///
+/// ```text
+/// BEGIN            A reads scope=space
+///                  B begins, writes scope=global, commits   (A is not blocked)
+///                  A writes -> Err(BusySnapshot("database snapshot is stale"))
+/// BEGIN IMMEDIATE  A reserves the writer, reads, writes
+///                  B waits on its own BEGIN IMMEDIATE (328ms, the hold)
+///                  …then acquires and reads scope=global — the join branch
+/// ```
+///
+/// `busy_timeout` does not rescue the deferred case: a stale snapshot cannot be
+/// waited out, only retried, and the whole decision would have to be re-taken.
+/// Reserving up front converts the race into an ordinary wait — the loser reads
+/// the winner's committed state and decides against *that*, which is what the
+/// grant's promote-or-join branch (and #279's promote / retire / remove
+/// guards) were always meant to do (Codex review, PR #280).
+async fn begin_write(conn: &Connection) -> Result<(), AppError> {
+    conn.execute("BEGIN IMMEDIATE", ())
+        .await
+        .map_err(AppError::db)?;
+    Ok(())
+}
+
 /// Open a connection with FK enforcement enabled. turso defaults
 /// `foreign_keys` **OFF** (every `REFERENCES`/composite FK is then unenforced
 /// documentation), and the scope-owned participant model relies on the tuple
@@ -358,7 +392,7 @@ async fn ensure_default_participants(conn: &Connection) -> Result<(), AppError> 
 /// unrepresentable instead: there is nothing to detect, so nothing to
 /// misinterpret, and the seed simply stays retryable on the next open.
 async fn ensure_default_template_tx(conn: &Connection, now: i64) -> Result<(), AppError> {
-    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    begin_write(conn).await?;
     match ensure_default_template_tx_body(conn, now).await {
         Ok(()) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
@@ -1773,7 +1807,7 @@ pub async fn promote_participant_tx(
     conn: &Connection,
     promotion: &Promotion<'_>,
 ) -> Result<(), AppError> {
-    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    begin_write(conn).await?;
     match promote_participant_tx_body(conn, promotion).await {
         Ok(()) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
@@ -2004,7 +2038,7 @@ pub async fn grant_space_membership_tx(
     notebook_space_id: &str,
     now: i64,
 ) -> Result<GrantDecision, AppError> {
-    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    begin_write(conn).await?;
     let body = grant_space_membership_tx_body(
         conn,
         space_id,
@@ -2211,7 +2245,7 @@ pub async fn retire_participant_tx(
     participant_id: &str,
     now: i64,
 ) -> Result<bool, AppError> {
-    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    begin_write(conn).await?;
     match retire_participant_tx_body(conn, participant_id, now).await {
         Ok(retired) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
@@ -2716,7 +2750,7 @@ pub async fn remove_space_participant_tx(
     participant_id: &str,
     now: i64,
 ) -> Result<SpaceRemoval, AppError> {
-    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    begin_write(conn).await?;
     match remove_space_participant_tx_body(conn, space_id, participant_id, now).await {
         Ok(outcome) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
@@ -3225,7 +3259,7 @@ pub async fn update_template_tx(
     participants: Option<&[TemplateParticipantInput]>,
     now: i64,
 ) -> Result<(), AppError> {
-    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    begin_write(conn).await?;
     match update_template_tx_body(conn, id, title, cascade_limit, participants, now).await {
         Ok(()) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
