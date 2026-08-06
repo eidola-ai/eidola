@@ -110,7 +110,7 @@ fn blocks(core: &AppCore, participant: &str) -> Vec<eidola_app_core::memory::Mem
 
 fn promote(core: &AppCore, participant: &str) -> eidola_app_core::PromotionOutcome {
     core.runtime()
-        .block_on(core.promote_participant(participant.to_string()))
+        .block_on(core.promote_participant(participant.to_string(), None))
         .expect("promotion")
 }
 
@@ -569,7 +569,7 @@ fn promotion_is_one_way_and_refuses_everything_else() {
 
         let refuse = |participant: &str| -> String {
             core.runtime()
-                .block_on(core.promote_participant(participant.to_string()))
+                .block_on(core.promote_participant(participant.to_string(), None))
                 .expect_err("must be refused")
                 .to_string()
         };
@@ -756,7 +756,7 @@ impl eidola_app_core::tools::Tool for PromoteMidTurn {
                 .unwrap()
                 .clone()
                 .expect("participant id set");
-            core.promote_participant(id).await.map_err(|e| {
+            core.promote_participant(id, None).await.map_err(|e| {
                 eidola_app_core::tools::ToolError::new(format!("promote failed: {e}"))
             })?;
             Ok("promoted".to_string())
@@ -1074,6 +1074,137 @@ fn retirement_refuses_everything_that_is_not_a_shared_agent() {
             core.runtime()
                 .block_on(core.test_space_archived(notebook))
                 .expect("notebook row")
+        );
+    });
+}
+
+/// **A persona travels *into* the promoting transaction** (Codex review, PR
+/// #279) — the write a surface would otherwise do just before promoting.
+///
+/// The GUI's "Share this agent…" is pressed from inside an open editor whose
+/// fields stay on screen behind the confirmation, so what it shares is what the
+/// reader is looking at. Done as an edit followed by a promotion that is two
+/// transactions, and the gap between them is reachable: two windows share one
+/// `AppCore`, so the agent can be shared or removed in between — after which the
+/// edit commits (on a row that is by then **global**, and therefore in every
+/// space that follows it) while the promotion is refused. The reader is told
+/// nothing happened; their draft went everywhere.
+///
+/// Carried here, the persona is validated before the transaction opens and
+/// applied inside it, so both halves of a refusal — the ones decided up front,
+/// and the raced one the transaction's own guard catches — leave zero trace.
+#[test]
+fn a_persona_travels_into_the_promoting_transaction() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        let before = member(&core, &space, &agent).expect("member");
+
+        let outcome = core
+            .runtime()
+            .block_on(core.promote_participant(
+                agent.clone(),
+                Some(eidola_app_core::ParticipantUpdate {
+                    label: Some("Cartographer".into()),
+                    system_prompt: Some(Some("Draw the map before arguing about it.".into())),
+                    notify_policy: Some("all".into()),
+                    ..Default::default()
+                }),
+            ))
+            .expect("promotion carrying a persona");
+
+        // The shared row is the persona that was handed in — and the home
+        // space's membership still has NULL overrides, so what the space sees is
+        // that same row rather than a stale copy pinned over it.
+        let after = member(&core, &space, &agent).expect("still a member");
+        assert_eq!(after.scope, "global");
+        assert_eq!(after.source, "referenced");
+        assert_eq!(after.label, "Cartographer");
+        assert_eq!(
+            after.system_prompt.as_deref(),
+            Some("Draw the map before arguing about it.")
+        );
+        assert_eq!(after.notify_policy, "all");
+        assert_eq!(
+            after.model_ref, before.model_ref,
+            "a field the persona left alone is untouched"
+        );
+        let reference = after.reference.expect("a referenced global carries detail");
+        assert_eq!(reference.base_label, "Cartographer");
+        assert!(
+            reference.override_label.is_none()
+                && reference.override_system_prompt.is_none()
+                && reference.override_notify_policy.is_none(),
+            "promotion writes no per-space override"
+        );
+        let library = core
+            .runtime()
+            .block_on(core.list_global_agents())
+            .expect("library");
+        assert_eq!(library.len(), 1);
+        assert_eq!(library[0].label, "Cartographer");
+        // The notebook is named for the agent being shared, which is the name
+        // that came with the promotion — not the one still in the row.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.test_space_title(outcome.notebook_space_id))
+                .expect("notebook row"),
+            Some("Cartographer — notebook".to_string())
+        );
+
+        // A refusal decided up front — the persona's own validation, which runs
+        // before the row is even read.
+        let space_b = core
+            .runtime()
+            .block_on(core.create_space(Some("B".into())))
+            .expect("create space")
+            .id;
+        let agent_b = core
+            .runtime()
+            .block_on(core.list_space_participants(space_b.clone()))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template's agent")
+            .id;
+        let before_b = member(&core, &space_b, &agent_b).expect("member");
+        let err = core
+            .runtime()
+            .block_on(core.promote_participant(
+                agent_b.clone(),
+                Some(eidola_app_core::ParticipantUpdate {
+                    label: Some("   ".into()),
+                    system_prompt: Some(Some("Never written.".into())),
+                    ..Default::default()
+                }),
+            ))
+            .expect_err("a blank name is refused");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+        let still = member(&core, &space_b, &agent_b).expect("member");
+        assert_eq!(still.label, before_b.label, "the refusal wrote nothing");
+        assert_eq!(still.system_prompt, before_b.system_prompt);
+        assert_eq!(still.scope, "space", "and shared nothing");
+
+        // And the refusal the *race* produces: the other window shared this
+        // agent first, so the promotion is refused — with the persona still
+        // unwritten, where a separate edit before it would already have
+        // published it to every space that follows the now-global row.
+        let err = core
+            .runtime()
+            .block_on(core.promote_participant(
+                agent.clone(),
+                Some(eidola_app_core::ParticipantUpdate {
+                    label: Some("Renamed by a lost race".into()),
+                    ..Default::default()
+                }),
+            ))
+            .expect_err("already shared");
+        assert!(err.to_string().contains("already a shared agent"), "{err}");
+        assert_eq!(
+            member(&core, &space, &agent).expect("member").label,
+            "Cartographer",
+            "a refused share must not rename the agent it failed to share"
         );
     });
 }

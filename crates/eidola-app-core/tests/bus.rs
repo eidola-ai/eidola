@@ -1537,7 +1537,7 @@ fn promote_and_retire_emit_participants_only() {
         let mut rx = core.subscribe_changes();
         let outcome = core
             .runtime()
-            .block_on(core.promote_participant(agent.clone()))
+            .block_on(core.promote_participant(agent.clone(), None))
             .expect("promotion");
         let emitted = drain(&mut rx);
         assert!(
@@ -1547,6 +1547,37 @@ fn promote_and_retire_emit_participants_only() {
         assert!(
             !emitted.contains(&Change::SpaceIndex),
             "the notebook it created is not a Library entry: {emitted:?}"
+        );
+
+        // A promotion **carrying a persona** is still one transaction and one
+        // signal. That the persona used to be a separate `update_space_participant`
+        // — a second write, a second emission, and a second chance to commit
+        // half of what the reader asked for — is exactly what moving it inside
+        // this call retired (Codex review, PR #279).
+        let space_b = core.runtime().block_on(core.create_space(None)).unwrap();
+        let agent_b = core
+            .runtime()
+            .block_on(core.list_space_participants(space_b.id.clone()))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template's agent")
+            .id;
+        let _ = drain(&mut rx);
+        core.runtime()
+            .block_on(core.promote_participant(
+                agent_b,
+                Some(eidola_app_core::ParticipantUpdate {
+                    label: Some("Cartographer".into()),
+                    ..Default::default()
+                }),
+            ))
+            .expect("promotion carrying a persona");
+        let emitted = drain(&mut rx);
+        assert_eq!(
+            emitted,
+            vec![Change::Participants],
+            "a persona-carrying promotion is one signal, not two: {emitted:?}"
         );
 
         core.runtime()
@@ -1576,7 +1607,7 @@ fn promote_and_retire_emit_participants_only() {
         );
         assert!(
             core.runtime()
-                .block_on(core.promote_participant(agent))
+                .block_on(core.promote_participant(agent, None))
                 .is_err()
         );
         assert!(drain(&mut rx).is_empty(), "refusals must not emit");

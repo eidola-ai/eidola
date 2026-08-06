@@ -305,19 +305,25 @@ impl ParticipantsStore {
     /// `source == "referenced"` — so the row's **"shared"** tag and the editor's
     /// override fork appear by themselves, with nothing view-side to update.
     ///
-    /// **The optional update is what makes the promise true.** The affordance is
-    /// pressed from inside the open editor, and its confirmation says the agent
-    /// keeps this space's persona *exactly as it is* — which a reader reads
-    /// against the fields still on screen behind it. So the visible values are
-    /// saved (an "edit everywhere" on a row this space still owns) and *then*
-    /// promoted, and promotion's byte-for-byte guarantee applies to what was
-    /// just written. **Both calls in one `bridge` closure** — the update emits
-    /// `Change::Participants`, and a return to gpui between them would let the
-    /// refresh that drives replace this mutation's slot and swallow the
-    /// promotion (`crates/eidola-gui/AGENTS.md` → "Multi-call ops stay in one
-    /// bridge closure"). Ordered update-first for the same reason: a refused
-    /// update leaves nothing at all, where a refused update *after* a promotion
-    /// would have shared the persona the reader had just replaced.
+    /// **The optional persona is what makes the promise true.** The affordance
+    /// is pressed from inside the open editor, and its confirmation says the
+    /// agent keeps this space's persona *exactly as it is* — which a reader
+    /// reads against the fields still on screen behind it. So the visible values
+    /// are what gets shared.
+    ///
+    /// **They travel into the one core call, not as a write before it.** An
+    /// update-then-promote pair kept in a single `bridge` closure fixes the
+    /// gpui-side hazard (no refresh lands between them to replace this
+    /// mutation's slot) but not the durable one: two calls are two
+    /// transactions, and two windows share one `AppCore`. Let another window
+    /// share or remove the same agent in between and the persona commits — on a
+    /// row that is now **global**, so in every space that follows it — while the
+    /// promotion is refused and this store reports that sharing failed. One
+    /// closure is not one transaction; `AppCore::promote_participant` applies
+    /// the persona inside the promoting transaction, behind the same guard, so
+    /// every refusal leaves zero trace (`crates/eidola-gui/AGENTS.md` →
+    /// "Multi-call ops stay in one bridge closure"). Regression:
+    /// `a_share_that_loses_the_race_writes_no_persona` (`tests/stores.rs`).
     ///
     /// **One-way**: app-core offers no demotion (it would strand memberships and
     /// memory), so there is no unshare here either — retirement is the
@@ -326,19 +332,16 @@ impl ParticipantsStore {
         &mut self,
         space_id: String,
         participant_id: String,
-        update: Option<ParticipantUpdate>,
+        persona: Option<ParticipantUpdate>,
         cx: &mut Context<Self>,
     ) {
         self.write_then_relist(space_id, cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
-                    if let Some(update) = update {
-                        c.update_space_participant(participant_id.clone(), update)
-                            .await?;
-                    }
-                    c.promote_participant(participant_id).await.map(|_| ())
+                    c.promote_participant(participant_id, persona).await
                 })
                 .await
+                .map(|_| ())
                 .map_err(|e| e.to_string())
             })
         });

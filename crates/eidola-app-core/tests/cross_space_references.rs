@@ -217,7 +217,7 @@ fn quoting_a_conversation_you_are_not_in_is_refused_with_zero_trace() {
         let agent = agent_id(&core, &home);
         let notebook = core
             .runtime()
-            .block_on(core.promote_participant(agent.clone()))
+            .block_on(core.promote_participant(agent.clone(), None))
             .expect("promotion")
             .notebook_space_id;
         let private = post(&core, "A private note to self.", Some(notebook.clone()));
@@ -407,7 +407,7 @@ fn an_agent_follows_a_quote_only_once_it_is_granted_membership() {
         // Ordinary membership, which for a space-owned agent means promotion
         // first: anything cross-space implies a shared identity (task 36).
         core.runtime()
-            .block_on(core.promote_participant(s.agent.clone()))
+            .block_on(core.promote_participant(s.agent.clone(), None))
             .expect("promotion");
         core.runtime()
             .block_on(core.add_global_participant(s.source_space.clone(), s.agent.clone()))
@@ -539,7 +539,7 @@ fn inbound_references_are_filtered_to_referrers_the_viewer_takes_part_in() {
         );
 
         core.runtime()
-            .block_on(core.promote_participant(source_agent.clone()))
+            .block_on(core.promote_participant(source_agent.clone(), None))
             .expect("promotion");
         core.runtime()
             .block_on(core.add_global_participant(s.space.clone(), source_agent.clone()))

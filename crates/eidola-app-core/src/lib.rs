@@ -384,6 +384,36 @@ fn validate_notify_policy(policy: &str) -> Result<String, AppError> {
     }
 }
 
+/// Resolve a [`ParticipantUpdate`] into the validated columns a write applies.
+///
+/// **Validation is separated from the write** because two callers need it at
+/// different moments: an ordinary edit validates and writes in one breath, while
+/// `promote_participant` must validate *before* opening its transaction so a
+/// bad name refuses with nothing written (a `ParticipantUpdate` is the only part
+/// of a promotion that can be judged without reading the row). One function, so
+/// "what an update means" — the trimmed label, the checked policy, the empty
+/// string that clears a nullable column — cannot drift between them.
+fn validate_persona(update: &ParticipantUpdate) -> Result<db::PersonaWrite, AppError> {
+    Ok(db::PersonaWrite {
+        label: match &update.label {
+            Some(l) => Some(validate_label(l, "participant label")?),
+            None => None,
+        },
+        model_ref: update
+            .model_ref
+            .as_ref()
+            .map(|inner| inner.clone().filter(|s| !s.is_empty())),
+        system_prompt: update
+            .system_prompt
+            .as_ref()
+            .map(|inner| inner.clone().filter(|s| !s.is_empty())),
+        notify_policy: match &update.notify_policy {
+            Some(p) => Some(validate_notify_policy(p.trim())?),
+            None => None,
+        },
+    })
+}
+
 /// True for characters that must never appear inside a display label: any
 /// Unicode control character (C0/C1 — CR, LF, tab, BEL, …) plus the Unicode
 /// line and paragraph separators, which `char::is_control` does not cover.
@@ -2950,34 +2980,9 @@ impl Inner {
         participant_id: &str,
         update: ParticipantUpdate,
     ) -> Result<(), AppError> {
-        let policy = match &update.notify_policy {
-            Some(p) => Some(validate_notify_policy(p.trim())?),
-            None => None,
-        };
-        let label = match &update.label {
-            Some(l) => Some(validate_label(l, "participant label")?),
-            None => None,
-        };
+        let persona = validate_persona(&update)?;
         let conn = self.db_conn().await?;
-        let model_ref = update
-            .model_ref
-            .as_ref()
-            .map(|inner| inner.as_deref().filter(|s| !s.is_empty()));
-        let system_prompt = update
-            .system_prompt
-            .as_ref()
-            .map(|inner| inner.as_deref().filter(|s| !s.is_empty()));
-        let changed = db::update_participant_config(
-            &conn,
-            participant_id,
-            label.as_deref(),
-            model_ref,
-            system_prompt,
-            policy.as_deref(),
-            None,
-        )
-        .await?;
-        if changed {
+        if persona.apply(&conn, participant_id).await? {
             self.bus.emit(Change::Participants);
         }
         Ok(())
@@ -3058,10 +3063,29 @@ impl Inner {
     /// only the config columns), and this entry point refuses a participant
     /// that is not a live space-owned agent — so every conceivable "demote"
     /// call is a typed error rather than a partial write.
+    ///
+    /// **`persona` promotes what a surface is showing** (task 36; Codex review,
+    /// PR #279). The GUI's "Share this agent…" is pressed from inside an open
+    /// editor whose fields stay on screen behind the confirmation, so the values
+    /// it promotes are the visible ones, not the stored ones. That has to be
+    /// *this* call and not an edit before it: the caller's two writes are two
+    /// transactions, and between them another window can share or remove the
+    /// same agent — after which the edit lands durably (on a row that is now
+    /// **global**, so across every space that follows it) and the promotion is
+    /// refused, telling the reader nothing happened while their draft was
+    /// published everywhere. Carried here, the persona is validated before the
+    /// transaction opens and applied inside it, behind the same
+    /// `scope = 'space' AND removed_at IS NULL` guard the flip uses — so every
+    /// refusal, raced or not, leaves zero trace. Exactly one
+    /// `Change::Participants` is emitted either way.
     async fn promote_participant(
         &self,
         participant_id: &str,
+        persona: Option<ParticipantUpdate>,
     ) -> Result<PromotionOutcome, AppError> {
+        // Before anything is read, let alone written: a refusal about the
+        // persona must not depend on how far the promotion got.
+        let persona = persona.as_ref().map(validate_persona).transpose()?;
         let conn = self.db_conn().await?;
         let row = db::get_participant(&conn, participant_id)
             .await?
@@ -3115,15 +3139,27 @@ impl Inner {
             })?;
 
         let notebook_space_id = Uuid::now_v7().to_string();
-        let notebook_title = format!("{} — notebook", row.label);
+        // The notebook is named for the agent being shared — which, when a
+        // persona travels with the promotion, is the name the reader typed, not
+        // the one still in the row.
+        let notebook_title = format!(
+            "{} — notebook",
+            persona
+                .as_ref()
+                .and_then(|p| p.label.as_deref())
+                .unwrap_or(&row.label)
+        );
         db::promote_participant_tx(
             &conn,
-            participant_id,
-            &home_space_id,
-            &row.role,
-            &notebook_space_id,
-            &notebook_title,
-            now_ms(),
+            &db::Promotion {
+                participant_id,
+                home_space_id: &home_space_id,
+                role: &row.role,
+                notebook_space_id: &notebook_space_id,
+                notebook_title: &notebook_title,
+                persona: persona.as_ref(),
+                now: now_ms(),
+            },
         )
         .await?;
 
@@ -7335,6 +7371,22 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Test-only seam: a space's title, for the same reason as the one above —
+    /// a **notebook**'s title has no production reader (`list_spaces` excludes
+    /// notebooks), and the promoting transaction names the notebook after the
+    /// agent it is sharing, including the name a persona brought with it.
+    #[doc(hidden)]
+    pub async fn test_space_title(&self, space_id: String) -> Result<Option<String>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                Ok(db::get_space(&conn, &space_id).await?.and_then(|s| s.title))
+            })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Test-only seam: write a `reference` edge **below** the validation gate,
     /// quoting the whole of the antecedent's first content block.
     ///
@@ -7770,16 +7822,29 @@ impl AppCore {
     /// from [`Self::list_spaces`]; the residence of the core memory blocks it
     /// writes from now on).
     ///
+    /// `persona`, when given, is adopted **in the promoting transaction** —
+    /// how a surface shares the agent it is *showing* rather than the one that
+    /// was last saved. It is the same `ParticipantUpdate`
+    /// [`Self::update_space_participant`] takes, validated before the
+    /// transaction opens and applied behind the same guard as the scope flip,
+    /// so a promotion refused for any reason (including losing a race to
+    /// another window's share or removal) writes nothing at all. Doing it as an
+    /// edit followed by a promotion cannot offer that — two transactions, and
+    /// the gap between them is where a persona gets published under a failure
+    /// message.
+    ///
     /// **One-way**: there is no demotion. Typed errors for a participant that
     /// is already global, belongs to a template, is the shared human, is not
-    /// an agent, or is unknown/removed. Emits [`Change::Participants`].
+    /// an agent, or is unknown/removed. Emits exactly one
+    /// [`Change::Participants`], persona or no persona.
     pub async fn promote_participant(
         &self,
         participant_id: String,
+        persona: Option<ParticipantUpdate>,
     ) -> Result<PromotionOutcome, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.promote_participant(&participant_id).await })
+            .spawn(async move { inner.promote_participant(&participant_id, persona).await })
             .await
             .map_err(join_err)?
     }

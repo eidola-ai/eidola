@@ -1284,7 +1284,7 @@ fn two_shared_agents(cx: &mut TestAppContext, stores: &Stores) -> (String, Strin
             .expect("the default template seeds one agent")
             .id;
         core.runtime()
-            .block_on(core.promote_participant(agent.clone()))
+            .block_on(core.promote_participant(agent.clone(), None))
             .expect("promotion");
         ids.push(agent);
     }
@@ -1382,4 +1382,83 @@ fn two_refused_agent_writes_each_keep_their_own_refusal(cx: &mut TestAppContext)
         assert_eq!(s.list().len(), 2);
         assert!(!s.list().iter().any(|x| x.label == "Ada" || x.label == "Bo"));
     });
+}
+
+/// **One `bridge` closure is not one transaction** (Codex review, PR #279).
+///
+/// The share's two core calls travel together so no gpui-side refresh can land
+/// between them — but their *database* writes are still two, and two windows
+/// share one `AppCore`. Let another window promote (or a Settings retire remove)
+/// the same agent after the editor took its snapshot, and the persona write
+/// lands on a row the promotion then refuses: the reader is told sharing failed
+/// while their draft was persisted — across **every** space, since the row they
+/// wrote to is now a global one. The cure is that the persona travels *into*
+/// `AppCore::promote_participant`, which applies it inside the promoting
+/// transaction, behind the same `scope = 'space'` guard — so a lost race rolls
+/// the persona back with it and the refusal leaves zero trace.
+#[gpui::test]
+fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent")
+        .id;
+
+    // The other window shares it first. The editor open here still believes it
+    // is looking at a space-owned agent — that snapshot is what makes the draft
+    // stale, and nothing about the two-call shape can notice.
+    core.runtime()
+        .block_on(core.promote_participant(agent.clone(), None))
+        .expect("the other window's share");
+    let before = core
+        .runtime()
+        .block_on(core.list_global_agents())
+        .expect("library")
+        .into_iter()
+        .find(|a| a.id == agent)
+        .expect("the shared agent");
+
+    stores.participants.update(cx, |s, cx| {
+        s.promote(
+            space.clone(),
+            agent.clone(),
+            Some(eidola_app_core::ParticipantUpdate {
+                label: Some("Cartographer".into()),
+                system_prompt: Some(Some("Draw the map before arguing about it.".into())),
+                ..Default::default()
+            }),
+            cx,
+        )
+    });
+    wait_until(cx, "the share is refused", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_error(&space).is_some())
+    });
+
+    let after = core
+        .runtime()
+        .block_on(core.list_global_agents())
+        .expect("library")
+        .into_iter()
+        .find(|a| a.id == agent)
+        .expect("the shared agent is still there");
+    assert_eq!(
+        after.label, before.label,
+        "a refused share must not rename the agent it failed to share"
+    );
+    assert_eq!(
+        after.system_prompt, before.system_prompt,
+        "nor rewrite its charter — across every space that follows the shared row"
+    );
 }
