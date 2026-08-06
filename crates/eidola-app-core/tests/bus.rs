@@ -147,8 +147,11 @@
 //! and emitting it would spuriously invalidate a store that reads nothing new
 //! (STATE.md's 1:1 variant↔store rule). `add_global_participant` (a shared
 //! agent joining another space) emits `Change::Participants` like the rest of
-//! the membership CRUD; it is idempotent, and a re-join of an existing member
-//! still emits (the write is an upsert, not a no-op check). Memory is
+//! the membership CRUD — **when the membership changed**: a fresh join, or a
+//! **revive** of one that had left (the join is an insert-or-revive upsert,
+//! task 37 / Codex review PR #280). Re-adding a member that is already live
+//! writes nothing and emits nothing, which is what its idempotence has always
+//! meant; the older wording here claimed the opposite and was never true. Memory is
 //! untouched by promotion — no block moves, so nothing memory-shaped emits.
 //! Both are refusal-first: every typed error (already global, template-scoped,
 //! the shared human, unknown, retired, not-a-global) is decided before any
