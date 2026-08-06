@@ -3005,6 +3005,33 @@ fn agents_pane_probes_cover_rows_editor_and_retire(cx: &mut TestAppContext) {
         );
     }
 
+    // A refused write stands **under its own row**, keyed like the store's slot,
+    // so two of them can be told apart — and its accessible name carries the
+    // agent's, which the row above it cannot supply to a screen reader.
+    view.update(cx, |v, cx| v.cancel_edit(cx));
+    let refusal = "Couldn't save: notify policy must be explicit, human or all";
+    stores
+        .agents
+        .update(cx, |s, _| s.set_op_error_for_test("agent-ada", refusal));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/agents/agent-ada/error",
+        gpui::Role::Alert,
+        &format!("Ada: {refusal}"),
+    );
+    assert_probe(
+        &entries,
+        "settings/agents/agent-ada/error/dismiss",
+        gpui::Role::Button,
+        "Dismiss the message about Ada",
+    );
+    let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+    assert!(
+        !names.contains(&"settings/agents/agent-bo/error".to_string()),
+        "another agent's row carries no band: {names:?}"
+    );
+
     // The retire confirmation — its note is a readable node, not only pixels.
     view.update(cx, |v, cx| v.arm_retire("agent-ada", cx));
     let names = fresh_names(cx, window);

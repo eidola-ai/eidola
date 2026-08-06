@@ -7502,7 +7502,7 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
     assert!(
         stores
             .agents
-            .read_with(cx, |s, _| s.op_error().map(str::to_string))
+            .read_with(cx, |s, _| s.op_error(&agent).map(str::to_string))
             .is_none(),
         "the retirement was accepted"
     );

@@ -1263,3 +1263,123 @@ fn a_participants_change_reaches_the_agent_library(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// Promote each space's seeded agent and hand back the two participant ids —
+/// the only way an agent reaches the library.
+fn two_shared_agents(cx: &mut TestAppContext, stores: &Stores) -> (String, String) {
+    let core = stores.app_core().expect("backed stores carry a core");
+    let mut ids = Vec::new();
+    for title in ["A", "B"] {
+        let space = core
+            .runtime()
+            .block_on(core.create_space(Some(title.into())))
+            .expect("create space")
+            .id;
+        let agent = core
+            .runtime()
+            .block_on(core.list_space_participants(space))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .id;
+        core.runtime()
+            .block_on(core.promote_participant(agent.clone()))
+            .expect("promotion");
+        ids.push(agent);
+    }
+    stores.agents.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the library lists both", |cx| {
+        stores.agents.read_with(cx, |s, _| s.list().len() == 2)
+    });
+    (ids[0].clone(), ids[1].clone())
+}
+
+/// **Two writes on two agents both land** (Codex review, PR #279). The Agents
+/// pane offers Edit and Retire on every row at once, so editing one agent and
+/// retiring another are independent operations a reader can start a moment
+/// apart. With one store-wide slot the second replaced the first: unpolled, the
+/// first write simply never happened; polled, it ran core-side while its
+/// refusal and its re-list were discarded. Keyed slots are what make them
+/// independent — and the resolving read is taken once the **last** one settles.
+#[gpui::test]
+fn two_writes_on_two_agents_both_land(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let (a, b) = two_shared_agents(cx, &stores);
+
+    // Both issued before either future is polled — the narrowest interleaving.
+    stores.agents.update(cx, |s, cx| {
+        s.update_agent(
+            a.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("Ada".into()),
+                ..Default::default()
+            },
+            cx,
+        );
+        s.retire(b.clone(), cx);
+    });
+
+    let durable = |_cx: &mut TestAppContext| {
+        core.runtime()
+            .block_on(core.list_global_agents())
+            .expect("library")
+    };
+    wait_until(cx, "both writes land durably", |cx| {
+        let rows = durable(cx);
+        rows.len() == 1 && rows[0].label == "Ada"
+    });
+    // And the roster the pane reads agrees — the batch-end read was taken after
+    // the last write, so it carries both.
+    wait_until(cx, "the roster resolves on a read after both", |cx| {
+        stores
+            .agents
+            .read_with(cx, |s, _| s.list().len() == 1 && s.list()[0].label == "Ada")
+    });
+    stores.agents.read_with(cx, |s, _| {
+        assert!(s.op_error(&a).is_none(), "the edit was accepted");
+        assert!(s.op_error(&b).is_none(), "the retirement was accepted");
+    });
+}
+
+/// The refusal half: two refused writes each keep their own report. One
+/// store-wide slot could hold only the last, and the pane renders a band **per
+/// row** — a lost refusal there is an edit that silently did nothing under the
+/// row the reader was looking at.
+#[gpui::test]
+fn two_refused_agent_writes_each_keep_their_own_refusal(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let (a, b) = two_shared_agents(cx, &stores);
+
+    // An invalid notify policy is refused before any write (zero trace).
+    let refused = |label: &str| eidola_app_core::ParticipantUpdate {
+        label: Some(label.into()),
+        notify_policy: Some("sometimes".into()),
+        ..Default::default()
+    };
+    stores.agents.update(cx, |s, cx| {
+        s.update_agent(a.clone(), refused("Ada"), cx);
+        s.update_agent(b.clone(), refused("Bo"), cx);
+    });
+
+    wait_until(cx, "both refusals stand", |cx| {
+        stores.agents.read_with(cx, |s, _| {
+            s.op_error(&a).is_some() && s.op_error(&b).is_some()
+        })
+    });
+    // Each × acknowledges its own, and leaves the other standing.
+    stores.agents.update(cx, |s, cx| s.clear_op_error(&a, cx));
+    stores.agents.read_with(cx, |s, _| {
+        assert!(s.op_error(&a).is_none());
+        assert!(
+            s.op_error(&b).is_some(),
+            "dismissing one refusal must not discard the other"
+        );
+    });
+    // Neither refusal wrote anything: both agents are still there, unrenamed.
+    stores.agents.read_with(cx, |s, _| {
+        assert_eq!(s.list().len(), 2);
+        assert!(!s.list().iter().any(|x| x.label == "Ada" || x.label == "Bo"));
+    });
+}
