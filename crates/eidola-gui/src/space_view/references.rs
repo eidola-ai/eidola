@@ -40,6 +40,8 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
+use eidola_app_core::error::AppError;
+
 use crate::actions::{Quote, QuoteInReply};
 use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
@@ -83,6 +85,59 @@ impl PostSelection {
             range_end: Some(self.range.end as i64),
             annotation: None,
         }
+    }
+}
+
+/// What a reader is told when a quote points into a conversation they take no
+/// part in (task 37's denial, the human arm).
+///
+/// It may confirm that the passage came from somewhere — existence is public
+/// **within this conversation**, which is the one the reader is in — and names
+/// nothing else: no title, no participants, not a byte of what is there. The
+/// wording is ours rather than the error's, so no future change to a typed
+/// error's `Display` can widen what this surface says.
+pub(crate) const FOLLOW_DENIED_HERE: SharedString = SharedString::new_static(
+    "That passage was quoted from a conversation you don't take part in, so there is nowhere \
+     to go from here.",
+);
+
+/// The open "quote into another conversation" picker (task 37's creation UI).
+///
+/// It holds the passage, because the reader's selection in the source post is
+/// dropped the moment the quote lands somewhere and because the picker outlives
+/// a click that lands elsewhere in the page. `confirming` is the second step:
+/// a chosen destination, held so the **visibility statement can name it** —
+/// which is the whole reason this is two steps and not a menu of one-click
+/// verbs.
+#[derive(Clone, Debug)]
+pub(crate) struct QuoteDestination {
+    pub(crate) selection: PostSelection,
+    pub(crate) confirming: Option<(String, SharedString)>,
+}
+
+/// **The sentence the creation UI must show** (task 37): what quoting into
+/// `title` means, in two facts a reader needs before they do it — who will be
+/// able to read the passage, and that it is a *copy* (references name concrete
+/// generations and are never remapped, so what leaves this conversation is
+/// exactly the bytes chosen, once).
+///
+/// Pure, so the wording is asserted directly rather than through a painted
+/// band, and so no destination can ever be shown without it.
+pub(crate) fn visibility_statement(title: &str) -> SharedString {
+    SharedString::from(format!(
+        "This passage will be visible to everyone in {title}. Quoting copies it — later edits \
+         here won't change it there."
+    ))
+}
+
+/// How a conversation reads in the destination picker — the Library's own
+/// rule (title, else the opening line, else "Untitled space"), so the two
+/// surfaces name the same conversation the same way.
+fn space_label(space: &eidola_app_core::SpaceInfo) -> SharedString {
+    match (&space.title, &space.snippet) {
+        (Some(t), _) => SharedString::from(t.clone()),
+        (None, Some(s)) => SharedString::from(s.clone()),
+        (None, None) => SharedString::from("Untitled space"),
     }
 }
 
@@ -514,15 +569,41 @@ impl SpaceView {
     }
 
     /// Push `selection` onto `draft_id` as its next reference and inject the
-    /// marker: the editor learns the embed map first (so the marker
-    /// materializes as a quote block the instant it lands), then the marker is
-    /// inserted at the caret through the editor's normal update pipeline (one
-    /// undo step; a marker dropped into a verbatim region degrades to literal
-    /// text, which is the documented honest behavior).
+    /// marker.
     fn attach_quote(
         &mut self,
         draft_id: &SharedString,
         selection: PostSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.attach_reference(
+            draft_id,
+            selection.spec(),
+            selection.byline.clone(),
+            selection.snippet.clone(),
+            window,
+            cx,
+        );
+    }
+
+    /// Push a reference onto `draft_id` and inject the marker: the editor
+    /// learns the embed map first (so the marker materializes as a quote block
+    /// the instant it lands), then the marker is inserted at the caret through
+    /// the editor's normal update pipeline (one undo step; a marker dropped
+    /// into a verbatim region degrades to literal text, which is the documented
+    /// honest behavior).
+    ///
+    /// Takes the reference's three parts rather than a [`PostSelection`],
+    /// because a **cross-space** quote arrives from another window with no
+    /// selection of ours behind it — the spec names a concrete generation, and
+    /// that is all that travels.
+    fn attach_reference(
+        &mut self,
+        draft_id: &SharedString,
+        spec: eidola_app_core::ReferenceSpec,
+        byline: SharedString,
+        snippet: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -532,9 +613,9 @@ impl SpaceView {
         let ordinal = draft.next_ordinal();
         draft.references.push(PendingReference {
             ordinal,
-            spec: selection.spec(),
-            byline: selection.byline.clone(),
-            snippet: selection.snippet.clone(),
+            spec,
+            byline,
+            snippet,
         });
         let embeds = draft.embed_map();
         let editor = draft.editor.clone();
@@ -548,6 +629,288 @@ impl SpaceView {
         let focus = editor.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    // -- Quote into another conversation ------------------------------------
+
+    /// `Edit > Quote in Another Conversation…` — the cross-space arm of the
+    /// quote affordances (task 37's creation UI).
+    ///
+    /// **The mechanism is a destination picker, not a drag**: a quote is a
+    /// write into a conversation, so it is chosen from a list of conversations
+    /// (the Library's own index), and the reader confirms a sentence naming
+    /// the one they picked. Cross-window drag would be a second, gestural way
+    /// to say the same thing with nowhere to put the sentence.
+    pub fn quote_elsewhere(
+        &mut self,
+        _: &crate::actions::QuoteElsewhere,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.post_selection.clone() else {
+            return;
+        };
+        self.quote_destination = Some(QuoteDestination {
+            selection,
+            confirming: None,
+        });
+        cx.notify();
+    }
+
+    /// Close the destination picker (Escape, click-out, Cancel). Returns
+    /// whether it was open — the Escape rung's answer.
+    pub fn close_quote_destination(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.quote_destination.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Arm the confirmation for one destination: the picker keeps the passage
+    /// and grows the sentence that says who will be able to read it.
+    fn arm_quote_destination(
+        &mut self,
+        space_id: String,
+        title: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(dest) = self.quote_destination.as_mut() {
+            dest.confirming = Some((space_id, title));
+            cx.notify();
+        }
+    }
+
+    /// Send the quote to the confirmed destination: hand it to that space's
+    /// entity and open its window.
+    ///
+    /// The two windows share nothing but the [`Space`](crate::space::Space)
+    /// entity (a draft is window-local by design), so the entity is the
+    /// courier — see [`Space::offer_quote`](crate::space::Space::offer_quote).
+    /// Nothing durable happens here: the passage lands in a **draft**, which
+    /// the reader still has to post, and app-core validates the reference at
+    /// that write (a quote into a conversation you have left is refused there,
+    /// with zero trace, rather than being second-guessed here).
+    fn send_quote_to_destination(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dest) = self.quote_destination.take() else {
+            return;
+        };
+        let Some((space_id, _)) = dest.confirming else {
+            return;
+        };
+        let quote = crate::space::OfferedQuote {
+            spec: dest.selection.spec(),
+            byline: dest.selection.byline.clone(),
+            snippet: dest.selection.snippet.clone(),
+        };
+        // The same space may already be open in another window; `open` is
+        // get-or-create, so the offer reaches the one shared entity either way.
+        let space = self
+            .stores
+            .spaces
+            .update(cx, |spaces, cx| spaces.open(space_id.clone(), cx));
+        space.update(cx, |space, cx| space.offer_quote(quote, cx));
+        // The quote has left this post; drop the selection so the same passage
+        // can't be sent twice by a second press (the in-space quote's rule).
+        self.post_selection = None;
+        let stores = self.stores.clone();
+        let intent = crate::lifecycle::intend_to_open(cx);
+        cx.defer(move |cx: &mut gpui::App| {
+            if intent.still_wanted(cx) {
+                crate::open_space_window(cx, stores, space_id);
+            }
+        });
+        let _ = window;
+        cx.notify();
+    }
+
+    /// Take a quote another window handed this space and attach it to a draft
+    /// — the receiving half of the handoff, drained once per offer at the head
+    /// of `render`.
+    ///
+    /// It lands exactly where `Edit > Quote` would put it (the branch's tail
+    /// composer, activated), because from here on it *is* an ordinary pending
+    /// reference: same ordinal minting, same footnote row, same
+    /// accept-before-consume.
+    pub(crate) fn adopt_offered_quote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.space.read(cx).has_offered_quote() {
+            return;
+        }
+        let Some(offer) = self.space.update(cx, |space, _| space.take_offered_quote()) else {
+            return;
+        };
+        let Some(draft_id) = self.draft_for_quote(window, cx) else {
+            return;
+        };
+        self.attach_reference(
+            &draft_id,
+            offer.spec,
+            offer.byline,
+            offer.snippet,
+            window,
+            cx,
+        );
+    }
+
+    /// The destination picker: which conversation to quote into, and — once one
+    /// is chosen — **the sentence that says what choosing it means**.
+    ///
+    /// The statement is the point of the surface (task 37): references name
+    /// concrete generations and are never remapped, so the source space leaks
+    /// exactly the bytes deliberately quoted, once — and the person doing the
+    /// quoting is the flow-control point. So the destination is named in the
+    /// sentence, and the verb below it is the only way through.
+    pub(crate) fn render_quote_destination(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let dest = self.quote_destination.as_ref()?;
+        let theme = cx.theme();
+        let here = self.space.read(cx).id().map(str::to_string);
+
+        let mut col = v_flex()
+            .id("space-quote-destination")
+            .probe(
+                "space/quote-destination",
+                gpui::Role::Group,
+                "Quote into another conversation",
+            )
+            // An opaque popover over the page (see `crate::overlay`).
+            .contain_mouse(Overlay::Popover)
+            .absolute()
+            .right(GUTTER_GAP)
+            .bottom(px(96.))
+            .w(px(320.))
+            .p_1()
+            .gap_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.close_quote_destination(cx);
+            }));
+
+        if let Some((_, title)) = dest.confirming.clone() {
+            // The mandatory statement, naming the destination.
+            let statement = visibility_statement(&title);
+            col = col
+                .child(
+                    div()
+                        .id("space-quote-destination-note")
+                        .px_1()
+                        .py_0p5()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .probe_value(
+                            "space/quote-destination/note",
+                            gpui::Role::Label,
+                            "What quoting there means",
+                            statement.clone(),
+                        )
+                        .child(statement),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .px_1()
+                        .py_0p5()
+                        .child(
+                            div()
+                                .id("space-quote-destination-confirm")
+                                .probe(
+                                    "space/quote-destination/confirm",
+                                    gpui::Role::Button,
+                                    SharedString::from(format!("Quote into {title}")),
+                                )
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .text_color(theme.foreground)
+                                .hover(|s| s.bg(theme.muted))
+                                .child("Quote there")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.send_quote_to_destination(window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("space-quote-destination-cancel")
+                                .probe(
+                                    "space/quote-destination/cancel",
+                                    gpui::Role::Button,
+                                    "Cancel",
+                                )
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .text_color(theme.muted_foreground)
+                                .hover(|s| s.bg(theme.muted))
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_quote_destination(cx);
+                                })),
+                        ),
+                );
+            return Some(col.into_any_element());
+        }
+
+        col = col.child(
+            div()
+                .px_1()
+                .pb_0p5()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Quote into"),
+        );
+        let spaces = self.stores.spaces.read(cx);
+        let mut offered = 0usize;
+        for space in spaces.list() {
+            if here.as_deref() == Some(space.id.as_str()) {
+                continue;
+            }
+            let label = space_label(space);
+            let id = space.id.clone();
+            let for_arm = label.clone();
+            col = col.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "space-quote-destination-{offered}"
+                    )))
+                    .probe(
+                        format!("space/quote-destination/{offered}"),
+                        gpui::Role::Button,
+                        label.clone(),
+                    )
+                    .w_full()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .text_xs()
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.muted))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.arm_quote_destination(id.clone(), for_arm.clone(), cx);
+                    })),
+            );
+            offered += 1;
+        }
+        if offered == 0 {
+            // Honest empty: the Library may not have answered yet, and a reader
+            // with one conversation has nowhere else to quote into.
+            col = col.child(
+                div()
+                    .px_1()
+                    .py_0p5()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("No other conversations yet."),
+            );
+        }
+        Some(col.into_any_element())
     }
 
     /// Drop a pending reference from a draft: remove the row **and** its embed
@@ -999,7 +1362,23 @@ impl SpaceView {
         let stores = self.stores.clone();
         let intent = crate::lifecycle::intend_to_open(cx);
         self.navigate_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some((item_id, space_id)))) = rx.await else {
+            let located = match rx.await {
+                Ok(Ok(located)) => located,
+                // **The denial the reader is allowed to see** (task 37 rule 4):
+                // the resolve is membership-gated, so a quote into a
+                // conversation this reader takes no part in refuses here. It is
+                // said in the app's voice and says nothing about that space —
+                // the typed error carries no title, participant or content, and
+                // the copy adds none. Any other failure is an ordinary error
+                // band; a cancelled receiver is a closing window, and silent.
+                Ok(Err(err)) => {
+                    this.update(cx, |this, cx| this.report_navigation_failure(err, cx))
+                        .ok();
+                    return;
+                }
+                Err(_) => return,
+            };
+            let Some((item_id, space_id)) = located else {
                 return;
             };
             let selected = this
@@ -1016,6 +1395,21 @@ impl SpaceView {
                 }
             });
         }));
+    }
+
+    /// A follow that could not be taken. A **refusal** is not a failure: it
+    /// gets the quiet notice (the cascade band's family — muted, dismissible),
+    /// worded in the app's own voice so nothing about the refused conversation
+    /// can ride along in a rendered error. Anything else is a real error and
+    /// takes the danger band.
+    fn report_navigation_failure(&mut self, err: AppError, cx: &mut Context<Self>) {
+        match err {
+            AppError::NotAParticipant { .. } => {
+                self.reference_notice = Some(FOLLOW_DENIED_HERE);
+            }
+            other => self.error = Some(other.to_string()),
+        }
+        cx.notify();
     }
 
     /// Select the post now carrying `item_id`'s current generation, if this
@@ -1244,6 +1638,56 @@ impl SpaceView {
             );
         }
         Some(col.into_any_element())
+    }
+
+    // -- Test seams ---------------------------------------------------------
+
+    /// Whether the quote-destination picker is open, and the statement it is
+    /// showing (`None` while it is still a list of conversations).
+    #[doc(hidden)]
+    pub fn quote_destination_for_test(&self) -> Option<Option<SharedString>> {
+        let dest = self.quote_destination.as_ref()?;
+        Some(
+            dest.confirming
+                .as_ref()
+                .map(|(_, title)| visibility_statement(title)),
+        )
+    }
+
+    /// Choose a destination without a pointer (the rows are painted from the
+    /// Library index; the behavior tier drives the transition, the driver the
+    /// pixels).
+    #[doc(hidden)]
+    pub fn arm_quote_destination_for_test(
+        &mut self,
+        space_id: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.arm_quote_destination(
+            space_id.to_string(),
+            SharedString::from(title.to_string()),
+            cx,
+        );
+    }
+
+    /// Confirm the armed destination — the "Quote there" verb.
+    #[doc(hidden)]
+    pub fn confirm_quote_destination_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_quote_to_destination(window, cx);
+    }
+
+    /// Feed a resolve failure through the follow path's reporting rule — what
+    /// the app *says* when a follow is refused. The refusal itself is app-core's
+    /// (`action_location` is membership-gated, and its own tests pin both the
+    /// gate and the non-leaking payload); this seam pins the voice.
+    #[doc(hidden)]
+    pub fn report_navigation_failure_for_test(&mut self, err: AppError, cx: &mut Context<Self>) {
+        self.report_navigation_failure(err, cx);
     }
 }
 

@@ -10174,6 +10174,7 @@ fn space_post_context_menu_offers_select_all_then_the_selection_verbs(cx: &mut T
                 "Copy".to_string(),
                 "Quote".to_string(),
                 "Quote in Reply".to_string(),
+                "Quote Elsewhere…".to_string(),
                 "Select All".to_string(),
             ]),
             "a quotable selection adds Copy and the Edit menu's quote pair"
@@ -13298,4 +13299,220 @@ fn space_inspector_repaints_when_a_model_catalog_lands(cx: &mut TestAppContext) 
     );
 
     drain_runtime(&core);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-space references (task 37) — creation, handoff, denied follow
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn space_quoting_elsewhere_names_who_will_see_the_passage(cx: &mut TestAppContext) {
+    // The creation UI's whole point: choosing a destination makes the app say
+    // what choosing it *means* — the passage becomes visible to everyone in
+    // that conversation, as a copy. The reader is the flow-control point, so
+    // the sentence stands between the choice and the write.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.quote_destination_for_test(),
+            Some(None),
+            "the picker opens on the list of conversations, with nothing said yet"
+        );
+    });
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.arm_quote_destination_for_test("other", "Tides", cx)
+        });
+    })
+    .unwrap();
+    let statement = view
+        .read_with(cx, |v, _| v.quote_destination_for_test())
+        .expect("still open")
+        .expect("a destination is armed");
+    assert!(
+        statement.contains("visible to everyone in Tides"),
+        "the statement names the destination: {statement}"
+    );
+    assert!(
+        statement.contains("copies"),
+        "…and says the passage is copied, not linked: {statement}"
+    );
+
+    // Confirming hands the quote to the destination's own entity — nothing
+    // durable, and nothing written into this conversation.
+    let destination = stores
+        .spaces
+        .update(cx, |spaces, cx| spaces.open("other".into(), cx));
+    // Read the mailbox *inside* the same update: the confirm's deferred window
+    // open runs when this closure's effects flush, and that window drains the
+    // offer at once — which is the feature working, not a race to observe.
+    let handed_over = cx
+        .update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.confirm_quote_destination_for_test(window, cx));
+            destination.read(cx).has_offered_quote()
+        })
+        .unwrap();
+    assert!(
+        handed_over,
+        "the passage is handed to the destination's entity — the only thing two windows share"
+    );
+    // …and the deferred window open takes it from there: the destination's own
+    // window drains the mailbox into its composer (the receiving half is
+    // pinned on its own below).
+    cx.run_until_parked();
+    destination.read_with(cx, |space, _| {
+        assert!(
+            !space.has_offered_quote(),
+            "the window that opened on it took the offer"
+        );
+    });
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.quote_destination_for_test().is_none(),
+            "the picker closed"
+        );
+        assert!(
+            !v.has_post_selection_for_test(),
+            "the passage has left this post; a second press can't re-send it"
+        );
+        assert!(
+            v.active_draft_references_for_test().is_empty(),
+            "…and nothing was attached to a draft *here*"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_quote_from_another_window_lands_in_this_ones_draft(cx: &mut TestAppContext) {
+    // The receiving half. A draft is window-local, so the shared `Space`
+    // entity is the courier: the first window to render this space takes the
+    // offer and attaches it exactly as `Edit > Quote` would — ordinal 1, a
+    // footnote row, a marker in the body, and nothing durable until it posts.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("dest".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.offer_quote(
+                eidola_gui::space::OfferedQuote {
+                    spec: eidola_app_core::ReferenceSpec {
+                        antecedent_action_id: "a1".into(),
+                        content_block_id: Some("b1".into()),
+                        range_start: Some(4),
+                        range_end: Some(15),
+                        annotation: None,
+                    },
+                    byline: "You".into(),
+                    snippet: "quick brown".into(),
+                },
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "the offered passage is an ordinary pending reference now"
+        );
+    });
+    space.read_with(cx, |s, _| {
+        assert!(
+            !s.has_offered_quote(),
+            "the mailbox is a one-shot: a second window must not paste it again"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_denied_follow_says_so_without_naming_the_conversation(cx: &mut TestAppContext) {
+    // Rule 4's human arm. The refusal is app-core's (the resolve behind a
+    // footnote click is membership-gated, and its tests pin both the gate and
+    // the non-leaking payload); what this pins is the **voice**: a quiet
+    // notice, not a failure — nothing broke and there is nothing to retry —
+    // and one that names nothing about the conversation it refused.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.report_navigation_failure_for_test(
+                eidola_app_core::error::AppError::NotAParticipant {
+                    participant_id: "p-cartographer".into(),
+                    action_id: "a-private-post".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    let notice = view
+        .read_with(cx, |v, _| v.reference_notice_for_test())
+        .expect("the reader is told the follow went nowhere");
+    assert!(
+        notice.contains("don't take part in"),
+        "said in the app's voice: {notice}"
+    );
+    for leak in ["a-private-post", "p-cartographer"] {
+        assert!(
+            !notice.contains(leak),
+            "the notice leaked {leak:?}: {notice}"
+        );
+    }
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.error_for_test().is_none(),
+            "a refusal is not a failure — no danger band, no Retry"
+        );
+    });
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.dismiss_reference_notice(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(v.reference_notice_for_test().is_none(), "and it dismisses");
+    });
 }

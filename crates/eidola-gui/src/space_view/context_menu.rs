@@ -94,6 +94,7 @@ enum ItemAction {
     Command(EditorCommand),
     Quote,
     QuoteInReply,
+    QuoteElsewhere,
 }
 
 /// The menu's width — wide enough for "Quote in Reply" at the UI size, narrow
@@ -250,6 +251,11 @@ impl SpaceView {
                         label: "Quote in Reply",
                         action: ItemAction::QuoteInReply,
                     });
+                    items.push(Item {
+                        slug: "quote-elsewhere",
+                        label: "Quote Elsewhere…",
+                        action: ItemAction::QuoteElsewhere,
+                    });
                 }
                 items.push(Item {
                     slug: "select-all",
@@ -279,6 +285,9 @@ impl SpaceView {
             ItemAction::Quote => self.quote(&crate::actions::Quote, window, cx),
             ItemAction::QuoteInReply => {
                 self.quote_in_reply(&crate::actions::QuoteInReply, window, cx)
+            }
+            ItemAction::QuoteElsewhere => {
+                self.quote_elsewhere(&crate::actions::QuoteElsewhere, window, cx)
             }
         }
         cx.notify();
