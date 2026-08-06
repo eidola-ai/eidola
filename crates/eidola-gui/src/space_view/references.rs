@@ -113,6 +113,12 @@ pub(crate) const FOLLOW_DENIED_HERE: SharedString = SharedString::new_static(
 pub(crate) struct QuoteDestination {
     pub(crate) selection: PostSelection,
     pub(crate) confirming: Option<(String, SharedString)>,
+    /// The popover subtree's focus handle. The destination rows are tab stops
+    /// and **arming replaces them** with the statement and its two verbs, so
+    /// the pressed row unmounts: without somewhere inside the surface to put
+    /// the keyboard, a reader who chose a destination from the keyboard is left
+    /// on a dead handle (the rule `set_inspector_promote_confirm` states).
+    pub(crate) focus: gpui::FocusHandle,
 }
 
 /// **The sentence the creation UI must show** (task 37): what quoting into
@@ -653,6 +659,7 @@ impl SpaceView {
         self.quote_destination = Some(QuoteDestination {
             selection,
             confirming: None,
+            focus: cx.focus_handle(),
         });
         cx.notify();
     }
@@ -673,16 +680,25 @@ impl SpaceView {
         &mut self,
         space_id: String,
         title: SharedString,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(dest) = self.quote_destination.as_mut() {
-            dest.confirming = Some((space_id, title));
-            cx.notify();
+        let Some(dest) = self.quote_destination.as_mut() else {
+            return;
+        };
+        dest.confirming = Some((space_id, title));
+        // The chosen row unmounts with the list it was in; the surface itself
+        // survives, so the keyboard stays on it — and only if it was the
+        // surface holding it, so a pointer press elsewhere takes nothing.
+        let focus = dest.focus.clone();
+        if focus.contains_focused(window, cx) {
+            window.focus(&focus, cx);
         }
+        cx.notify();
     }
 
     /// Send the quote to the confirmed destination: hand it to that space's
-    /// entity and open its window.
+    /// entity and present that conversation's window.
     ///
     /// The two windows share nothing but the [`Space`](crate::space::Space)
     /// entity (a draft is window-local by design), so the entity is the
@@ -691,6 +707,17 @@ impl SpaceView {
     /// the reader still has to post, and app-core validates the reference at
     /// that write (a quote into a conversation you have left is refused there,
     /// with zero trace, rather than being second-guessed here).
+    ///
+    /// **The window presented is the window holding the quote.** The
+    /// destination may already be open — the `Space` registry joins windows on
+    /// one entity — so this raises that window rather than opening a second one
+    /// onto the same conversation, and *addresses* the offer to it so the
+    /// one-shot mailbox cannot be drained by a window the reader never sees
+    /// (Codex review, PR #280: opening unconditionally left the reader looking
+    /// at a fresh, empty composer while an existing window had taken the
+    /// passage). This is a targeted navigation, not a `⌘N`/Library open, which
+    /// is what the window model's "no window dedup" residual covers; the
+    /// raise-or-open shape is [`crate::open_record_request`]'s.
     fn send_quote_to_destination(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dest) = self.quote_destination.take() else {
             return;
@@ -709,16 +736,31 @@ impl SpaceView {
             .stores
             .spaces
             .update(cx, |spaces, cx| spaces.open(space_id.clone(), cx));
-        space.update(cx, |space, cx| space.offer_quote(quote, cx));
+        // The newest window on this conversation, if any — the one a reader who
+        // has several open was last working in.
+        let target = space.update(cx, |space, cx| space.open_windows(cx).last().copied());
+        space.update(cx, |space, cx| {
+            space.offer_quote(quote, target.map(|w| w.window_id()), cx)
+        });
         // The quote has left this post; drop the selection so the same passage
         // can't be sent twice by a second press (the in-space quote's rule).
         self.post_selection = None;
         let stores = self.stores.clone();
         let intent = crate::lifecycle::intend_to_open(cx);
         cx.defer(move |cx: &mut gpui::App| {
-            if intent.still_wanted(cx) {
-                crate::open_space_window(cx, stores, space_id);
+            if !intent.still_wanted(cx) {
+                return;
             }
+            if let Some(handle) = target {
+                if crate::raise_space_window(cx, handle) {
+                    return;
+                }
+                // The window went away between the offer and this defer. Its
+                // address now names nobody, so hand the offer back to whoever
+                // draws this space next — the window opened just below.
+                space.update(cx, |space, cx| space.readdress_offer_to_any_window(cx));
+            }
+            crate::open_space_window(cx, stores, space_id);
         });
         let _ = window;
         cx.notify();
@@ -732,11 +774,19 @@ impl SpaceView {
     /// composer, activated), because from here on it *is* an ordinary pending
     /// reference: same ordinal minting, same footnote row, same
     /// accept-before-consume.
+    ///
+    /// The offer is addressed, so a window that shares this space with the one
+    /// the sender presented draws straight past it (see
+    /// [`Space::take_offered_quote`](crate::space::Space::take_offered_quote)).
     pub(crate) fn adopt_offered_quote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.space.read(cx).has_offered_quote() {
+        let here = window.window_handle().window_id();
+        if !self.space.read(cx).has_offered_quote_for(here) {
             return;
         }
-        let Some(offer) = self.space.update(cx, |space, _| space.take_offered_quote()) else {
+        let Some(offer) = self
+            .space
+            .update(cx, |space, _| space.take_offered_quote(here))
+        else {
             return;
         };
         let Some(draft_id) = self.draft_for_quote(window, cx) else {
@@ -767,6 +817,7 @@ impl SpaceView {
 
         let mut col = v_flex()
             .id("space-quote-destination")
+            .track_focus(&dest.focus)
             .probe(
                 "space/quote-destination",
                 gpui::Role::Group,
@@ -892,8 +943,8 @@ impl SpaceView {
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.muted))
                     .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.arm_quote_destination(id.clone(), for_arm.clone(), cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.arm_quote_destination(id.clone(), for_arm.clone(), window, cx);
                     })),
             );
             offered += 1;
@@ -1680,6 +1731,7 @@ impl SpaceView {
             },
             confirming: armed
                 .map(|(id, title)| (id.to_string(), SharedString::from(title.to_string()))),
+            focus: cx.focus_handle(),
         });
         cx.notify();
     }
@@ -1692,13 +1744,21 @@ impl SpaceView {
         &mut self,
         space_id: &str,
         title: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.arm_quote_destination(
             space_id.to_string(),
             SharedString::from(title.to_string()),
+            window,
             cx,
         );
+    }
+
+    /// The open destination picker's subtree focus handle (tests).
+    #[doc(hidden)]
+    pub fn quote_destination_focus_handle(&self) -> Option<gpui::FocusHandle> {
+        self.quote_destination.as_ref().map(|d| d.focus.clone())
     }
 
     /// Confirm the armed destination — the "Quote there" verb.

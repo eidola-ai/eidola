@@ -38,7 +38,7 @@ use eidola_app_core::{
     AppCore, ChatResult, ChatStreamEvent, IncomingReference, NotificationPlan, PostNode,
     PostReference, PostTrace, ReferenceSpec, SpaceMessage,
 };
-use gpui::{Context, EventEmitter, Task};
+use gpui::{AnyWindowHandle, Context, EventEmitter, Task, WindowId};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::bridge;
@@ -421,10 +421,38 @@ pub struct Space {
     /// are two cursors), so a quote made in space A's window cannot be written
     /// into space B's composer directly: the two windows share nothing but this
     /// entity. So the entity is the courier — a **one-shot mailbox**, not
-    /// state: the first `SpaceView` to render on this space takes it and
-    /// attaches it to its draft, and nothing durable happens until that draft
-    /// is posted (accept-before-consume, exactly as an in-space quote).
-    offered_quote: Option<OfferedQuote>,
+    /// state: one `SpaceView` takes it and attaches it to its draft, and
+    /// nothing durable happens until that draft is posted
+    /// (accept-before-consume, exactly as an in-space quote).
+    ///
+    /// The offer is **addressed** (see [`PendingOffer::to`]) because "one" has
+    /// to mean "the window the reader is looking at".
+    offered_quote: Option<PendingOffer>,
+    /// The windows currently drawing this space, in the order they opened.
+    ///
+    /// A space is *not* a singleton on screen (see the GUI AGENTS.md window
+    /// model), and the entity is the only thing its windows share — so a
+    /// cross-window handoff that must land somewhere the reader can see has to
+    /// ask *here* whether this conversation is already open. Weakly, in effect:
+    /// a handle whose window has gone is dropped by [`Space::open_windows`],
+    /// the only reader, which answers against `cx.windows()`.
+    windows: Vec<AnyWindowHandle>,
+}
+
+/// A quote waiting in the mailbox, and the window it is waiting *for*.
+struct PendingOffer {
+    quote: OfferedQuote,
+    /// The window the sender presented to the reader — the only one allowed to
+    /// take this offer. `None` addresses no one in particular: the sender found
+    /// no window on this space and opened one, which does not exist yet at
+    /// offer time, so the next view to draw this space takes it.
+    ///
+    /// Without the address the mailbox is first-render-wins among *all* windows
+    /// on the space, which is a coin flip between the window that was raised
+    /// and any other one sharing this entity — the reader then looks at an
+    /// empty composer while the passage sits in a window behind it (Codex
+    /// review, PR #280).
+    to: Option<WindowId>,
 }
 
 /// A quote travelling between windows (see [`Space::offer_quote`]): the write
@@ -464,6 +492,7 @@ impl Space {
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
             offered_quote: None,
+            windows: Vec::new(),
         }
     }
 
@@ -491,6 +520,7 @@ impl Space {
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
             offered_quote: None,
+            windows: Vec::new(),
         };
         space.load_transcript(cx);
         space
@@ -519,6 +549,7 @@ impl Space {
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
             offered_quote: None,
+            windows: Vec::new(),
         }
     }
 
@@ -544,28 +575,79 @@ impl Space {
         &self.streams
     }
 
+    // -- The windows drawing this space ------------------------------------
+
+    /// Record that a window has opened onto this space. Called once per
+    /// `SpaceView`, at construction — the view's whole life is its window's.
+    pub fn attach_window(&mut self, window: AnyWindowHandle) {
+        self.windows.push(window);
+    }
+
+    /// The windows drawing this space right now, oldest first — dead handles
+    /// dropped in passing, since nothing tells the entity when a window closes.
+    ///
+    /// Deriving liveness from `cx.windows()` rather than tracking closes is the
+    /// same self-healing shape the singleton raise uses
+    /// (`try_focus_existing_singleton`): a stale id is simply not in the list.
+    pub fn open_windows(&mut self, cx: &gpui::App) -> &[AnyWindowHandle] {
+        let live: Vec<_> = cx.windows().iter().map(|w| w.window_id()).collect();
+        self.windows.retain(|h| live.contains(&h.window_id()));
+        &self.windows
+    }
+
     // -- Cross-space quote handoff -----------------------------------------
 
-    /// Hand this space a quote made in another window (task 37's creation UI).
+    /// Hand this space a quote made in another window (task 37's creation UI),
+    /// addressed to the window the sender is presenting (`to`); `None` when the
+    /// sender is opening one and there is no window to name yet.
     ///
     /// It is deliberately **not** merged with anything: a second offer replaces
-    /// the first, because an undelivered offer means no window has drawn this
-    /// space yet and the newer one is what the reader just asked for. Nothing
-    /// durable happens here — the receiving view attaches it to a draft, and the
-    /// draft is what a post consumes.
-    pub fn offer_quote(&mut self, quote: OfferedQuote, cx: &mut Context<Self>) {
-        self.offered_quote = Some(quote);
+    /// the first, because an undelivered offer means the addressed window has
+    /// not drawn yet and the newer one is what the reader just asked for.
+    /// Nothing durable happens here — the receiving view attaches it to a
+    /// draft, and the draft is what a post consumes.
+    pub fn offer_quote(
+        &mut self,
+        quote: OfferedQuote,
+        to: Option<WindowId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.offered_quote = Some(PendingOffer { quote, to });
         cx.notify();
     }
 
-    /// Take the pending offer, if any — a one-shot: whichever `SpaceView`
-    /// renders first attaches it to its own draft, and two windows never both
-    /// receive it (a quote pasted twice would be two references to write).
-    pub fn take_offered_quote(&mut self) -> Option<OfferedQuote> {
-        self.offered_quote.take()
+    /// Take the pending offer if it is `window`'s to take — a one-shot, so two
+    /// windows never both receive it (a quote pasted twice would be two
+    /// references to write), and an **addressed** one, so the window that takes
+    /// it is the window the reader was just shown.
+    pub fn take_offered_quote(&mut self, window: WindowId) -> Option<OfferedQuote> {
+        match self.offered_quote.as_ref()?.to {
+            Some(to) if to != window => None,
+            _ => self.offered_quote.take().map(|o| o.quote),
+        }
     }
 
-    /// Whether an offer is waiting (the `&self` render path's question).
+    /// Re-address a standing offer to no one in particular — the sender's
+    /// recovery when the window it addressed turned out to be gone by the time
+    /// it went to raise it. An unaddressed offer is taken by the next view to
+    /// draw this space, which is the window the sender opens instead.
+    pub fn readdress_offer_to_any_window(&mut self, cx: &mut Context<Self>) {
+        if let Some(offer) = self.offered_quote.as_mut() {
+            offer.to = None;
+            cx.notify();
+        }
+    }
+
+    /// Whether an offer is waiting for `window` (the `&self` render path's
+    /// question, asked before the `&mut` take).
+    pub fn has_offered_quote_for(&self, window: WindowId) -> bool {
+        self.offered_quote
+            .as_ref()
+            .is_some_and(|o| o.to.is_none_or(|to| to == window))
+    }
+
+    /// Whether any offer is waiting, addressed or not (tests, and the sender's
+    /// own "is it still standing" question).
     pub fn has_offered_quote(&self) -> bool {
         self.offered_quote.is_some()
     }

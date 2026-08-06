@@ -763,6 +763,14 @@ impl SpaceView {
             Some(id) => spaces.update(cx, |s, cx| s.open(id, cx)),
             None => spaces.update(cx, |s, cx| s.blank(cx)),
         };
+        // Tell the entity this window is drawing it. A space is not a singleton
+        // on screen, so a cross-window handoff (task 37's quote) has to be able
+        // to ask whether this conversation is *already* open, and to address
+        // itself to one of the windows that has it. Registered on the entity
+        // rather than by space id because a blank ⌘N space is adopted into the
+        // registry only once it earns an id — the entity is what stays put.
+        let handle = window.window_handle();
+        space.update(cx, |space, _| space.attach_window(handle));
 
         let _subs = vec![
             // Any space change re-derives the render snapshot and re-renders.
