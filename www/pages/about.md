@@ -5,7 +5,7 @@ description = "Eidola, Inc. is a public benefit corporation led by Mike Marcacci
 
 # About us
 
-**Eidola, Inc.** is a Delaware Public Benefit Corporation, incorporated to:
+**Eidola, Inc.** is a Delaware public benefit corporation, incorporated to:
 
 > ...build artificial intelligence systems that advance each individual's assertion of their own agency, rather than subsume it, by maximizing the verifiability of those systems to the individuals who rely on them, and minimizing the consolidated trust those individuals must extend.
 
