@@ -13423,6 +13423,10 @@ fn space_a_quote_into_an_open_conversation_lands_in_the_window_it_raises(cx: &mu
             stub_space("other", Some("Tides"), None, 1),
         ];
     });
+    // Two windows on the destination, because that is where "whichever view
+    // renders first" stops being a shape and starts being a coin flip: the
+    // offer is addressed, so only the raised one — the newest — may take it.
+    let (_older_window, older_view) = open_space(cx, &stores, Some("other".into()));
     let (_dest_window, dest_view) = open_space(cx, &stores, Some("other".into()));
     let (window, view) = open_space(cx, &stores, Some("s".into()));
     let windows_before = cx.update(|cx| cx.windows().len());
@@ -13459,6 +13463,12 @@ fn space_a_quote_into_an_open_conversation_lands_in_the_window_it_raises(cx: &mu
             v.active_draft_references_for_test(),
             vec![(1u64, "quick brown".to_string())],
             "the window the reader is shown is the one holding the passage"
+        );
+    });
+    older_view.read_with(cx, |v, _| {
+        assert!(
+            v.active_draft_references_for_test().is_empty(),
+            "the window sharing the conversation drew straight past an offer              addressed to its sibling"
         );
     });
     view.read_with(cx, |v, _| {
