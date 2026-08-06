@@ -4347,8 +4347,8 @@ fn space_sibling_success_keeps_failed_turn_notice(cx: &mut TestAppContext) {
     });
 
     // Dismiss ends the recovery: the notice is gone and nothing is retryable.
-    cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.dismiss_error(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_error(window, cx));
     })
     .unwrap();
     view.read_with(cx, |v, cx| {
@@ -4385,8 +4385,8 @@ fn space_cascade_notice_renders_dismisses_and_asks_to_continue(cx: &mut TestAppC
     });
 
     // Dismissible (window-local; nothing else changes).
-    cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.dismiss_cascade(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_cascade(window, cx));
     })
     .unwrap();
     view.read_with(cx, |v, _| assert!(v.cascade_notice_for_test().is_none()));
@@ -6030,8 +6030,8 @@ fn space_failed_ask_notice_is_dismissible(cx: &mut TestAppContext) {
     });
 
     // Dismissing clears only the notice — the space is untouched.
-    cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.dismiss_error(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_error(window, cx));
     })
     .unwrap();
     view.read_with(cx, |v, cx| {
@@ -13803,6 +13803,109 @@ fn space_a_quote_from_another_window_lands_in_this_ones_draft(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+fn space_dismissing_a_bottom_band_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    // Every bottom band's Dismiss is a real tab stop (`probe(Role::Button)`
+    // derives `focusable()` + `tab_index(0)`), and pressing it unmounts the
+    // band around it — the dead-handle class, on the denied-follow notice this
+    // PR added and on the two bands beside it (Codex review, PR #280). Each
+    // asks containment before it clears, so a reader composing beside a notice
+    // keeps their caret.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let root = view.read_with(cx, |v, _| v.focus_handle());
+
+    // The denied-follow notice.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.report_navigation_failure_for_test(
+                eidola_app_core::error::AppError::NotAParticipant {
+                    participant_id: "p1".into(),
+                    action_id: "a-private".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    let band = view
+        .read_with(cx, |v, _| v.band_focus_for_test(1))
+        .expect("the notice paints");
+    cx.update_window(window, |_, window, cx| window.focus(&band, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_reference_notice(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "the notice handed the keyboard back rather than leaving it on a band nobody paints"
+    );
+
+    // The cascade notice — same family, same rule (pre-existing gap).
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.emit_cascade_paused_for_test(2, 2, "a1".into(), cx)
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    let band = view
+        .read_with(cx, |v, _| v.band_focus_for_test(2))
+        .expect("the cascade notice paints");
+    cx.update_window(window, |_, window, cx| window.focus(&band, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_cascade(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "and so does the cascade band"
+    );
+
+    // …and a band that was not holding the keyboard takes nothing.
+    open_space_draft(&view, window, cx, Some("a1"));
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("a draft is open");
+    let caret = composer.read_with(cx, |e, cx| e.focus_handle(cx));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.report_navigation_failure_for_test(
+                eidola_app_core::error::AppError::NotAParticipant {
+                    participant_id: "p1".into(),
+                    action_id: "a-private".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    cx.update_window(window, |_, window, cx| window.focus(&caret, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_reference_notice(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| caret.is_focused(window))
+            .unwrap(),
+        "a reader composing beside a notice keeps their caret"
+    );
+}
+
+#[gpui::test]
 fn space_a_denied_follow_says_so_without_naming_the_conversation(cx: &mut TestAppContext) {
     // Rule 4's human arm. The refusal is app-core's (the resolve behind a
     // footnote click is membership-gated, and its tests pin both the gate and
@@ -13845,8 +13948,8 @@ fn space_a_denied_follow_says_so_without_naming_the_conversation(cx: &mut TestAp
         );
     });
 
-    cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.dismiss_reference_notice(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_reference_notice(window, cx));
     })
     .unwrap();
     view.read_with(cx, |v, _| {
