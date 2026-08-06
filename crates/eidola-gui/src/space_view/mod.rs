@@ -2033,6 +2033,9 @@ impl Render for SpaceView {
         // before anything reads what it claims — `sync_tree_focus` below asks
         // whether an overlay owns the keyboard.
         self.sync_inspector_participant_edit(window, cx);
+        // …and an invite form over a space that turns out to be a notebook: the
+        // grant door is withheld there, and a form is a door left standing.
+        self.sync_inspector_invite(window, cx);
         // Tree focus is *observed*, not merely bookkept: see
         // `keyboard::sync_tree_focus`.
         self.sync_tree_focus(window, cx);

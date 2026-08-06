@@ -13878,3 +13878,72 @@ fn inspector_a_notebook_offers_no_grant_door(cx: &mut TestAppContext) {
     let _ = window;
     drain_runtime(&core);
 }
+
+#[gpui::test]
+fn inspector_withholds_the_grant_door_until_the_settings_say_what_this_space_is(
+    cx: &mut TestAppContext,
+) {
+    // The withheld door is only as good as the question behind it. That
+    // question is a **settings read**, and a cell that has not answered is not
+    // an answer of "ordinary" — folding the two offered the grant in the window
+    // before the read landed, and confirming it succeeds, because app-core
+    // deliberately does not refuse a notebook grant (task 37 left that decision
+    // open, which is exactly why the GUI's withholding is the only thing
+    // standing between the reader and a notebook's whole history). Codex
+    // review, PR #280.
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the template seeds an agent")
+        .id;
+    let notebook = core
+        .runtime()
+        .block_on(core.promote_participant(agent.clone(), None, None))
+        .expect("promotion")
+        .notebook_space_id;
+
+    let (window, view) = open_participants_inspector(cx, &stores, &notebook);
+    assert!(
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&notebook).value().is_none()),
+        "the premise of this test: the panel has asked, and nothing has answered yet"
+    );
+    assert!(
+        !view.read_with(cx, |v, cx| v.inspector_offers_grant_door_for_test(cx)),
+        "unknown withholds the door — it comes back on the frame the read answers"
+    );
+
+    // And the form is a door left standing: one opened while the answer was
+    // still unknown must not be confirmable once it arrives.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+    })
+    .unwrap();
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_invite_for_test().is_some()),
+        "the form is open over a space nobody has classified yet"
+    );
+
+    wait_until(cx, "the notebook's settings land", |cx| {
+        stores.space_settings.read_with(cx, |s, _| {
+            s.settings(&notebook)
+                .value()
+                .is_some_and(|s| s.notebook_participant_id.is_some())
+        })
+    });
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_invite_for_test().is_none()),
+        "the answer retires the form, rather than leaving a grant one press away"
+    );
+    assert!(
+        !view.read_with(cx, |v, cx| v.inspector_offers_grant_door_for_test(cx)),
+        "…and the door stays withheld, now on evidence"
+    );
+    drain_runtime(&core);
+}
