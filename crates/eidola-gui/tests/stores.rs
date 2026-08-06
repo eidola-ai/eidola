@@ -1285,7 +1285,7 @@ fn two_shared_agents(cx: &mut TestAppContext, stores: &Stores) -> (String, Strin
             .expect("the default template seeds one agent")
             .id;
         core.runtime()
-            .block_on(core.promote_participant(agent.clone(), None))
+            .block_on(core.promote_participant(agent.clone(), None, None))
             .expect("promotion");
         ids.push(agent);
     }
@@ -1419,7 +1419,7 @@ fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
     // is looking at a space-owned agent — that snapshot is what makes the draft
     // stale, and nothing about the two-call shape can notice.
     core.runtime()
-        .block_on(core.promote_participant(agent.clone(), None))
+        .block_on(core.promote_participant(agent.clone(), None, None))
         .expect("the other window's share");
     let before = core
         .runtime()
@@ -1642,7 +1642,7 @@ fn a_stale_owned_save_refuses_once_the_row_is_shared(cx: &mut TestAppContext) {
 
     // The other window's Share lands first.
     core.runtime()
-        .block_on(core.promote_participant(agent.clone(), None))
+        .block_on(core.promote_participant(agent.clone(), None, None))
         .expect("the share");
 
     // The Save that was already in flight, composed against the owned row.

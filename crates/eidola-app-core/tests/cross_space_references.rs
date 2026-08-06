@@ -217,7 +217,7 @@ fn quoting_a_conversation_you_are_not_in_is_refused_with_zero_trace() {
         let agent = agent_id(&core, &home);
         let notebook = core
             .runtime()
-            .block_on(core.promote_participant(agent.clone(), None))
+            .block_on(core.promote_participant(agent.clone(), None, None))
             .expect("promotion")
             .notebook_space_id;
         let private = post(&core, "A private note to self.", Some(notebook.clone()));
@@ -405,13 +405,32 @@ fn an_agent_follows_a_quote_only_once_it_is_granted_membership() {
 
         // --- granted ---------------------------------------------------
         // Ordinary membership, which for a space-owned agent means promotion
-        // first: anything cross-space implies a shared identity (task 36).
-        core.runtime()
-            .block_on(core.promote_participant(s.agent.clone(), None))
-            .expect("promotion");
-        core.runtime()
-            .block_on(core.add_global_participant(s.source_space.clone(), s.agent.clone()))
-            .expect("the grant");
+        // first: anything cross-space implies a shared identity (task 36). Both
+        // halves travel in **one** call — "Share this agent and add it to *A*
+        // as an observer" — so the irreversible half can never land alone.
+        let outcome = core
+            .runtime()
+            .block_on(core.promote_participant(
+                s.agent.clone(),
+                None,
+                Some(eidola_app_core::SpaceGrant {
+                    space_id: s.source_space.clone(),
+                    role: eidola_app_core::MembershipRole::Observer,
+                }),
+            ))
+            .expect("share and grant");
+        assert_eq!(
+            outcome.granted_space_id.as_deref(),
+            Some(s.source_space.as_str())
+        );
+        let granted = core
+            .runtime()
+            .block_on(core.list_space_participants(s.source_space.clone()))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.id == s.agent)
+            .expect("the agent is a member of the source space");
+        assert_eq!(granted.role, "observer", "read-only is what was granted");
 
         // --- retry -----------------------------------------------------
         script_follow(&script, &s.quoting_handle, 1);
@@ -479,10 +498,10 @@ fn a_retirement_mid_turn_closes_the_passage_it_had_opened() {
 
         // Promote and grant, so the follow is genuinely permitted first.
         core.runtime()
-            .block_on(core.promote_participant(s.agent.clone(), None))
+            .block_on(core.promote_participant(s.agent.clone(), None, None))
             .expect("promotion");
         core.runtime()
-            .block_on(core.add_global_participant(s.source_space.clone(), s.agent.clone()))
+            .block_on(core.add_global_participant(s.source_space.clone(), s.agent.clone(), None))
             .expect("the grant");
         core.register_tool(std::sync::Arc::new(RetireMidTurn {
             core: std::sync::Arc::downgrade(&core),
@@ -625,10 +644,10 @@ fn inbound_references_are_filtered_to_referrers_the_viewer_takes_part_in() {
         );
 
         core.runtime()
-            .block_on(core.promote_participant(source_agent.clone(), None))
+            .block_on(core.promote_participant(source_agent.clone(), None, None))
             .expect("promotion");
         core.runtime()
-            .block_on(core.add_global_participant(s.space.clone(), source_agent.clone()))
+            .block_on(core.add_global_participant(s.space.clone(), source_agent.clone(), None))
             .expect("the grant");
 
         let after = core
@@ -862,5 +881,277 @@ fn an_unvalidated_reference_to_a_non_post_is_withheld_by_every_read() {
         // (3) The follow refuses to render it, without saying what it is.
         let followed = last_tool_result(&mock);
         assert_eq!(followed, "That quote does not point at a readable post.");
+    });
+}
+
+// ===========================================================================
+// The grant — promotion and membership as one act
+// ===========================================================================
+
+/// The grant is two writes and **one** transaction. A space-owned agent can
+/// only join another space by being shared first, and promotion is one-way —
+/// so a grant refused after the promotion committed would leave a reader with
+/// an irreversible change they never asked for on its own, under a message
+/// saying the operation failed. Naming an unknown space is the refusal that
+/// makes the point: nothing at all happened.
+#[test]
+fn a_share_whose_grant_is_refused_shares_nothing() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let home = turn(&core, "Hello there.", None).space_id;
+        let agent = agent_id(&core, &home);
+
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.promote_participant(
+                agent.clone(),
+                None,
+                Some(eidola_app_core::SpaceGrant {
+                    space_id: "no-such-space".into(),
+                    role: eidola_app_core::MembershipRole::Observer,
+                }),
+            ))
+            .expect_err("an unknown space is refused");
+        assert!(err.to_string().contains("space not found"), "{err}");
+        assert!(drain(&mut rx).is_empty(), "a refusal must not emit");
+
+        let still = core
+            .runtime()
+            .block_on(core.list_space_participants(home))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.id == agent)
+            .expect("still there");
+        assert_eq!(
+            still.scope, "space",
+            "the irreversible half must not land alone"
+        );
+        assert_eq!(still.source, "owned");
+    });
+}
+
+/// A grant naming the promotion's *own* home space asks for a membership the
+/// promotion already writes, so it is satisfied rather than refused (a second
+/// insert on the same key would fail the whole transaction).
+#[test]
+fn a_grant_naming_the_home_space_is_satisfied_by_the_promotion() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let home = turn(&core, "Hello there.", None).space_id;
+        let agent = agent_id(&core, &home);
+
+        let outcome = core
+            .runtime()
+            .block_on(core.promote_participant(
+                agent.clone(),
+                None,
+                Some(eidola_app_core::SpaceGrant {
+                    space_id: home.clone(),
+                    role: eidola_app_core::MembershipRole::Observer,
+                }),
+            ))
+            .expect("promotion");
+        assert_eq!(outcome.granted_space_id, None, "nothing extra was granted");
+        let member = core
+            .runtime()
+            .block_on(core.list_space_participants(home))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.id == agent)
+            .expect("still a member of its home space");
+        assert_eq!(member.source, "referenced");
+    });
+}
+
+/// The picker behind the grant obeys the same ACL as everything else: it lists
+/// agents a reader could actually add here, and nothing about spaces they take
+/// no part in.
+#[test]
+fn the_grant_picker_offers_only_agents_that_could_join_and_only_ones_you_know_of() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let home = turn(&core, "Hello there.", None).space_id;
+        let agent = agent_id(&core, &home);
+        let elsewhere = core
+            .runtime()
+            .block_on(core.create_space(Some("Elsewhere".into())))
+            .expect("a space")
+            .id;
+
+        // A space-owned agent of a space the human takes part in: offered
+        // *here*, and never in its own space (it is already a member there).
+        let offered = core
+            .runtime()
+            .block_on(core.list_grantable_agents(
+                elsewhere.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            ))
+            .expect("candidates");
+        let row = offered
+            .iter()
+            .find(|c| c.id == agent)
+            .expect("a space-owned agent from elsewhere is offered");
+        assert!(!row.shared, "it is not shared yet");
+        assert!(row.home_space_title.is_some(), "named by where it works");
+        assert!(
+            core.runtime()
+                .block_on(core.list_grantable_agents(
+                    home.clone(),
+                    eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                ))
+                .expect("candidates")
+                .iter()
+                .all(|c| c.id != agent),
+            "an agent is never offered its own space"
+        );
+
+        // Once shared and granted, it drops out of the listing here too — an
+        // affordance that could only be a no-op is not offered.
+        core.runtime()
+            .block_on(core.promote_participant(
+                agent.clone(),
+                None,
+                Some(eidola_app_core::SpaceGrant {
+                    space_id: elsewhere.clone(),
+                    role: eidola_app_core::MembershipRole::Observer,
+                }),
+            ))
+            .expect("share and grant");
+        assert!(
+            core.runtime()
+                .block_on(core.list_grantable_agents(
+                    elsewhere.clone(),
+                    eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                ))
+                .expect("candidates")
+                .iter()
+                .all(|c| c.id != agent),
+            "a member is not a candidate"
+        );
+
+        // Retired: it cannot rejoin a space, so it is not offered either.
+        let other = turn(&core, "Another conversation.", None).space_id;
+        let other_agent = agent_id(&core, &other);
+        core.runtime()
+            .block_on(core.promote_participant(other_agent.clone(), None, None))
+            .expect("promotion");
+        core.runtime()
+            .block_on(core.retire_participant(other_agent.clone()))
+            .expect("retirement");
+        assert!(
+            core.runtime()
+                .block_on(core.list_grantable_agents(
+                    elsewhere.clone(),
+                    eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                ))
+                .expect("candidates")
+                .iter()
+                .all(|c| c.id != other_agent),
+            "a retired agent cannot rejoin, so it is not offered"
+        );
+
+        // And the ACL: the listing is a read like any other. A viewer that
+        // takes no part in a space is told nothing about the agents working
+        // there — nor, through their home titles, about the conversations
+        // themselves. `other`'s seeded agent is the fixture: the viewer below
+        // belongs only to `home` and its own notebook.
+        let outsider = any_agent_id(&core, &other);
+        let seen = core
+            .runtime()
+            .block_on(core.list_grantable_agents(elsewhere, agent.clone()))
+            .expect("candidates");
+        assert!(
+            seen.iter().any(|c| c.id == any_agent_id(&core, &home)),
+            "its own space's agents are its own to know about: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|c| c.id != outsider),
+            "an agent of a space the viewer has no part in is not announced: {seen:?}"
+        );
+    });
+}
+
+// ===========================================================================
+// Rule 4, the human arm — a click follows the same rule as a tool call
+// ===========================================================================
+
+/// Following is following, whoever does it. The GUI resolves a quoted post's
+/// home before navigating to it, and that read is membership-gated: the one
+/// space the shared human is genuinely not in is an agent's notebook, and an
+/// ungated resolve would have opened its window. The refusal names nothing.
+#[test]
+fn a_human_following_a_quote_into_a_space_they_are_not_in_is_refused() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let home = turn(&core, "Hello there.", None).space_id;
+        let agent = agent_id(&core, &home);
+        let notebook = core
+            .runtime()
+            .block_on(core.promote_participant(agent.clone(), None, None))
+            .expect("promotion")
+            .notebook_space_id;
+        let private = post(&core, "A private note to self.", Some(notebook.clone()));
+        core.runtime()
+            .block_on(core.rename_space(notebook.clone(), "Cartographer — notebook".into()))
+            .expect("rename");
+
+        // An ordinary post in a space the human takes part in resolves.
+        let ordinary = post(&core, "Ordinary.", Some(home.clone()));
+        let located = core
+            .runtime()
+            .block_on(core.action_location(
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                ordinary.action_id.clone(),
+            ))
+            .expect("a member resolves it")
+            .expect("some location");
+        assert_eq!(located.1, home);
+
+        // The notebook post does not.
+        let err = core
+            .runtime()
+            .block_on(core.action_location(
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                private.action_id.clone(),
+            ))
+            .expect_err("a non-member may not follow");
+        match &err {
+            AppError::NotAParticipant { action_id, .. } => {
+                assert_eq!(action_id, &private.action_id);
+            }
+            other => panic!("expected NotAParticipant, got {other:?}"),
+        }
+        let rendered = err.to_string();
+        for secret in [
+            notebook.as_str(),
+            "Cartographer — notebook",
+            "A private note to self.",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "the denial leaked {secret:?}: {rendered}"
+            );
+        }
+
+        // An unknown action is "no such action", not a refusal — conflating the
+        // two would make this read a membership oracle.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.action_location(
+                    eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                    "no-such-action".into(),
+                ))
+                .expect("unknown is not a refusal"),
+            None
+        );
+
+        // The agent, which does take part, resolves its own notebook post.
+        assert!(
+            core.runtime()
+                .block_on(core.action_location(agent, private.action_id))
+                .expect("the member resolves it")
+                .is_some()
+        );
     });
 }

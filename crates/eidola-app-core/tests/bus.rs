@@ -1200,14 +1200,20 @@ fn action_location_resolves_a_posts_item_and_space_without_emitting() {
         let mut rx = core.subscribe_changes();
         let (item_id, space_id) = core
             .runtime()
-            .block_on(core.action_location(posted.action_id.clone()))
+            .block_on(core.action_location(
+                eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+                posted.action_id.clone(),
+            ))
             .unwrap()
             .expect("a persisted post resolves");
         assert_eq!(space_id, posted.space_id);
         assert!(!item_id.is_empty());
         let unknown = core
             .runtime()
-            .block_on(core.action_location("no-such-action".into()))
+            .block_on(core.action_location(
+                eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+                "no-such-action".into(),
+            ))
             .unwrap();
         assert_eq!(unknown, None);
         assert!(
@@ -1224,7 +1230,10 @@ fn action_location_resolves_a_posts_item_and_space_without_emitting() {
             .unwrap();
         let (edited_item, _) = core
             .runtime()
-            .block_on(core.action_location(edited.action_id.clone()))
+            .block_on(core.action_location(
+                eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+                edited.action_id.clone(),
+            ))
             .unwrap()
             .expect("the edit resolves");
         assert_eq!(
@@ -1539,7 +1548,7 @@ fn promote_and_retire_emit_participants_only() {
         let mut rx = core.subscribe_changes();
         let outcome = core
             .runtime()
-            .block_on(core.promote_participant(agent.clone(), None))
+            .block_on(core.promote_participant(agent.clone(), None, None))
             .expect("promotion");
         let emitted = drain(&mut rx);
         assert!(
@@ -1573,6 +1582,7 @@ fn promote_and_retire_emit_participants_only() {
                     label: Some("Cartographer".into()),
                     ..Default::default()
                 }),
+                None,
             ))
             .expect("promotion carrying a persona");
         let emitted = drain(&mut rx);
@@ -1609,7 +1619,7 @@ fn promote_and_retire_emit_participants_only() {
         );
         assert!(
             core.runtime()
-                .block_on(core.promote_participant(agent, None))
+                .block_on(core.promote_participant(agent, None, None))
                 .is_err()
         );
         assert!(drain(&mut rx).is_empty(), "refusals must not emit");
