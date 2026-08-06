@@ -2037,7 +2037,7 @@ pub async fn grant_space_membership_tx(
     role: &str,
     notebook_space_id: &str,
     now: i64,
-) -> Result<GrantDecision, AppError> {
+) -> Result<GrantOutcome, AppError> {
     begin_write(conn).await?;
     let body = grant_space_membership_tx_body(
         conn,
@@ -2049,15 +2049,74 @@ pub async fn grant_space_membership_tx(
     )
     .await;
     match body {
-        Ok(decision) => {
+        Ok(outcome) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
-            Ok(decision)
+            Ok(outcome)
         }
         Err(e) => {
             let _ = conn.execute("ROLLBACK", ()).await;
             Err(e)
         }
     }
+}
+
+/// Join a global into a space and answer with the membership **as of the
+/// commit** — the insert-or-revive plus the read that describes it, in one
+/// transaction.
+///
+/// `add_global_participant` used to run the join and then read the roster
+/// outside any transaction, which is the same window the grant had: a removal
+/// or retirement landing in between made the read find nothing, and the call
+/// reported a failure for a join that had committed (Codex review, PR #280).
+/// `None` means the join struck nothing — the liveness premise expired — with
+/// nothing written and nothing to announce.
+pub async fn join_space_participant_tx(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    role: &str,
+    now: i64,
+) -> Result<Option<(bool, EffectiveParticipantRow)>, AppError> {
+    begin_write(conn).await?;
+    let body = async {
+        let joined = ensure_space_participant(conn, space_id, participant_id, role, now).await?;
+        let member = space_participants(conn, space_id)
+            .await?
+            .into_iter()
+            .find(|m| m.participant_id == participant_id);
+        Ok::<_, AppError>(member.map(|m| (joined, m)))
+    }
+    .await;
+    match body {
+        Ok(found) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(found)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+/// What the grant did **and what it left behind** — the membership as of the
+/// commit point.
+///
+/// The caller's answer is built here rather than from a roster read *after* the
+/// transaction, because between that commit and that read another window can
+/// remove the membership or retire the agent: the read then finds nothing and
+/// the call returns an error about an operation that committed — and, for a
+/// space-owned candidate, committed an **irreversible promotion** (Codex
+/// review, PR #280). That is precisely the failure-message-beside-a-committed-
+/// write state this transaction exists to prevent, reintroduced one line after
+/// it. A result that describes the commit point cannot be overtaken by what
+/// happens next.
+#[derive(Clone, Debug)]
+pub struct GrantOutcome {
+    pub decision: GrantDecision,
+    /// The membership as the transaction wrote it — effective label, role and
+    /// overrides, read inside the same `BEGIN IMMEDIATE`.
+    pub member: EffectiveParticipantRow,
 }
 
 async fn grant_space_membership_tx_body(
@@ -2067,7 +2126,7 @@ async fn grant_space_membership_tx_body(
     role: &str,
     notebook_space_id: &str,
     now: i64,
-) -> Result<GrantDecision, AppError> {
+) -> Result<GrantOutcome, AppError> {
     let row = get_participant(conn, participant_id)
         .await?
         .ok_or_else(|| AppError::NotConfigured {
@@ -2085,14 +2144,17 @@ async fn grant_space_membership_tx_body(
     let already = space_participants(conn, space_id)
         .await?
         .into_iter()
-        .any(|m| m.participant_id == participant_id);
-    if already {
-        return Ok(GrantDecision::AlreadyAMember);
+        .find(|m| m.participant_id == participant_id);
+    if let Some(member) = already {
+        return Ok(GrantOutcome {
+            decision: GrantDecision::AlreadyAMember,
+            member,
+        });
     }
-    match row.scope.as_str() {
+    let decision = match row.scope.as_str() {
         "global" => {
             ensure_space_participant(conn, space_id, participant_id, role, now).await?;
-            Ok(GrantDecision::Joined)
+            GrantDecision::Joined
         }
         "space" => {
             let home_space_id = row
@@ -2121,19 +2183,32 @@ async fn grant_space_membership_tx_body(
                 },
             )
             .await?;
-            Ok(GrantDecision::Promoted {
+            GrantDecision::Promoted {
                 home_space_id,
                 notebook_space_id: notebook_space_id.to_string(),
-            })
+            }
         }
-        other => Err(AppError::Config {
-            message: format!(
-                "{} belongs to a space template, not a space, so it cannot be given membership \
-                 (scope: {other})",
-                row.label
-            ),
-        }),
-    }
+        other => {
+            return Err(AppError::Config {
+                message: format!(
+                    "{} belongs to a space template, not a space, so it cannot be given \
+                     membership (scope: {other})",
+                    row.label
+                ),
+            });
+        }
+    };
+    // Read **inside** the transaction: the membership this write just made, as
+    // of the commit point. A row missing here is a genuine failure of the write
+    // (and rolls back with it), never the race a post-commit read invents.
+    let member = space_participants(conn, space_id)
+        .await?
+        .into_iter()
+        .find(|m| m.participant_id == participant_id)
+        .ok_or_else(|| AppError::Internal {
+            message: format!("membership for {participant_id} vanished inside its own write"),
+        })?;
+    Ok(GrantOutcome { decision, member })
 }
 
 /// One candidate for task 37's grant — an agent a reader could give membership
