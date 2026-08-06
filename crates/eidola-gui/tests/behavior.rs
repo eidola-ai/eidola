@@ -12171,6 +12171,7 @@ fn space_inspector_shows_the_settings_the_store_holds(cx: &mut TestAppContext) {
         eidola_app_core::SpaceSettings {
             cascade_limit: 6,
             router_model: Some("gemma4-31b@eidola".into()),
+            ..Default::default()
         },
     );
     let (window, view) = open_space(cx, &stores, Some("s1".into()));

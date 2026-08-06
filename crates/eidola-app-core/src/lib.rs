@@ -289,6 +289,12 @@ pub struct SpaceSettings {
     pub cascade_limit: i64,
     /// The may-decline router model (task 22); `None` = off, the default.
     pub router_model: Option<String>,
+    /// The participant this space is the **notebook** of, if it is one (task
+    /// 36). Carried with the space's settings because it is a per-space fact a
+    /// surface needs before it can render the roster honestly: that agent's
+    /// membership is structural, so no Remove may be offered beside it — an
+    /// affordance that could only ever be refused.
+    pub notebook_participant_id: Option<String>,
 }
 
 impl Default for SpaceSettings {
@@ -296,6 +302,7 @@ impl Default for SpaceSettings {
         Self {
             cascade_limit: DEFAULT_CASCADE_LIMIT,
             router_model: None,
+            notebook_participant_id: None,
         }
     }
 }
@@ -3280,9 +3287,27 @@ impl Inner {
         // be overtaken by another window's promotion, and a soft-remove aimed at
         // a row that has since become global retires a shared agent outright.
         // See `db::remove_space_participant_tx`.
-        let removed = db::remove_space_participant_tx(&conn, space_id, participant_id, now_ms())
-            .await?
-            != db::SpaceRemoval::NothingToDo;
+        let removed =
+            match db::remove_space_participant_tx(&conn, space_id, participant_id, now_ms()).await?
+            {
+                // Structural, and unrecoverable if obeyed: the notebook exists only
+                // for this agent, is where its `core` memory lives, and nothing can
+                // grant a notebook membership back. Refused by the write itself, so
+                // a promotion landing mid-flight cannot slip one past.
+                db::SpaceRemoval::RefusedNotebookOwner => {
+                    let who = db::get_participant(&conn, participant_id)
+                        .await?
+                        .map(|p| p.label)
+                        .unwrap_or_else(|| "that agent".to_string());
+                    return Err(AppError::Config {
+                        message: format!(
+                            "this space is {who}'s notebook — it is where its memory lives, so it \
+                         cannot leave it"
+                        ),
+                    });
+                }
+                outcome => outcome != db::SpaceRemoval::NothingToDo,
+            };
         if removed {
             self.bus.emit(Change::Participants);
         }
@@ -3568,6 +3593,7 @@ impl Inner {
         Ok(SpaceSettings {
             cascade_limit,
             router_model: db::space_router_model(&conn, space_id).await?,
+            notebook_participant_id: db::notebook_participant_of(&conn, space_id).await?,
         })
     }
 

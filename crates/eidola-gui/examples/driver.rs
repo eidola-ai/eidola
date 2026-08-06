@@ -783,6 +783,7 @@ mod driver {
                 eidola_app_core::SpaceSettings {
                     cascade_limit: 4,
                     router_model: router,
+                    ..Default::default()
                 },
             ));
         })

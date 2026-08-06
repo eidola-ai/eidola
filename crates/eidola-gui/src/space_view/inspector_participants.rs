@@ -131,6 +131,25 @@ impl SpaceView {
         self.space.read(cx).id().map(str::to_string)
     }
 
+    /// Whether this space is `participant_id`'s own notebook — the one
+    /// membership no roster may offer to end.
+    fn inspector_participant_owns_this_notebook(
+        &self,
+        participant_id: &str,
+        cx: &gpui::App,
+    ) -> bool {
+        let Some(space_id) = self.space_id(cx) else {
+            return false;
+        };
+        self.stores
+            .space_settings
+            .read(cx)
+            .settings(&space_id)
+            .value()
+            .and_then(|s| s.notebook_participant_id.as_deref())
+            == Some(participant_id)
+    }
+
     /// This space's membership as the store holds it.
     fn inspector_participants(&self, cx: &gpui::App) -> Vec<ParticipantInfo> {
         match self.space_id(cx) {
@@ -1099,7 +1118,17 @@ impl SpaceView {
             return div().into_any_element();
         };
         let is_agent = edit.kind == "agent";
-        let can_remove = p.id != eidola_app_core::HUMAN_PARTICIPANT_ID;
+        // Two members are never removable: the shared "You", and — when this
+        // space is an agent's **notebook** — that agent. The notebook exists
+        // only for it and is where its `core` memory lives, so the membership is
+        // structural and app-core refuses to end it. Withholding the affordance
+        // is the courtesy; the refusal is the guarantee (task 36; Codex review,
+        // PR #279). Until the space's settings have landed the space cannot be
+        // known to be a notebook, and Remove is offered as it is anywhere else —
+        // the honest degradation, since pressing it is refused rather than
+        // obeyed.
+        let can_remove = p.id != eidola_app_core::HUMAN_PARTICIPANT_ID
+            && !self.inspector_participant_owns_this_notebook(&p.id, cx);
         let remove_id = p.id.clone();
         let subject = p.label.clone();
         // Only a **space-owned** agent can be shared: a referenced global
