@@ -79,6 +79,30 @@ pub(crate) struct ParticipantEdit {
     promote_confirm: bool,
 }
 
+impl ParticipantEdit {
+    /// The visible fields as an **"edit everywhere"** update — the participant's
+    /// own config.
+    ///
+    /// Shared by the two verbs that write it: Save (for an owned participant, or
+    /// a referenced global in Everyone mode) and Share, which saves the draft
+    /// before promoting. One reading of "what the fields mean" for both, so the
+    /// share can never write a different persona than the save beside it would.
+    fn as_everywhere_update(&self, cx: &gpui::App) -> ParticipantUpdate {
+        let label = self.label.read(cx).value().trim().to_string();
+        let system_prompt = self.system_prompt.read(cx).value().trim().to_string();
+        let mut update = ParticipantUpdate {
+            label: Some(label),
+            notify_policy: Some(self.notify_policy.clone()),
+            ..Default::default()
+        };
+        if self.kind == "agent" {
+            update.model_ref = Some(self.model_ref.clone().filter(|s| !s.is_empty()));
+            update.system_prompt = Some((!system_prompt.is_empty()).then_some(system_prompt));
+        }
+        update
+    }
+}
+
 /// The open add-a-participant form (agents only).
 pub(crate) struct ParticipantAdd {
     label: Entity<InputState>,
@@ -378,15 +402,7 @@ impl SpaceView {
                 .participants
                 .update(cx, |s, cx| s.set_override(space_id, pid, ov, cx));
         } else {
-            let mut update = ParticipantUpdate {
-                label: Some(label),
-                notify_policy: Some(edit.notify_policy.clone()),
-                ..Default::default()
-            };
-            if is_agent {
-                update.model_ref = Some(edit.model_ref.clone().filter(|s| !s.is_empty()));
-                update.system_prompt = Some((!system_prompt.is_empty()).then_some(system_prompt));
-            }
+            let update = edit.as_everywhere_update(cx);
             self.stores
                 .participants
                 .update(cx, |s, cx| s.update_everywhere(space_id, pid, update, cx));
@@ -417,7 +433,24 @@ impl SpaceView {
         }
     }
 
-    /// Confirm the share: `ParticipantsStore::promote` → `AppCore::promote_participant`.
+    /// Confirm the share: `ParticipantsStore::promote` — the open editor's
+    /// fields saved, then `AppCore::promote_participant`, in one store op.
+    ///
+    /// **The draft is what is being shared.** The confirmation renders *inside*
+    /// the editor, with name, model, charter and notify policy still on screen
+    /// above it, and it promises the agent "keeps this space's persona exactly as
+    /// it is" — a sentence a reader can only read against those visible values.
+    /// Consuming the draft and promoting the stored row would make it false about
+    /// everything they had just typed (Codex review, PR #279). The participant is
+    /// space-**owned** at this moment (that is what `can_share` means), so the
+    /// save is an ordinary edit of its own config, and promotion's byte-for-byte
+    /// guarantee then applies to the values just written. Both core calls travel
+    /// in one `bridge` closure — see [`crate::stores::ParticipantsStore::promote`].
+    ///
+    /// A blank name is refused **before** the first write, the way the add form
+    /// refuses one: app-core would reject it anyway, and returning the draft
+    /// keeps the rest of the reader's typing (with the confirmation still armed,
+    /// over the empty field that is the reason).
     ///
     /// The editor closes, because what it was editing has changed shape: the row
     /// comes back from the re-list as a **referenced global**, whose editor
@@ -431,10 +464,15 @@ impl SpaceView {
         let Some(edit) = self.inspector_participant_edit.take() else {
             return;
         };
+        let update = edit.as_everywhere_update(cx);
+        if update.label.as_deref().is_some_and(str::is_empty) {
+            self.inspector_participant_edit = Some(edit);
+            return;
+        }
         self.inspector_participant_picker = None;
-        self.stores
-            .participants
-            .update(cx, |s, cx| s.promote(space_id, edit.participant_id, cx));
+        self.stores.participants.update(cx, |s, cx| {
+            s.promote(space_id, edit.participant_id, Some(update), cx)
+        });
         cx.notify();
     }
 

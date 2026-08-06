@@ -7298,6 +7298,111 @@ fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
     drain_runtime(&core);
 }
 
+/// **The confirmation is about the persona on screen.** "Share this agent…" is
+/// pressed from inside the open editor, whose fields stay visible behind the
+/// confirmation — so "keeps this space's persona exactly as it is" is read
+/// against the values the reader is looking at, which are the ones they just
+/// typed. Sharing therefore saves the draft and *then* promotes; discarding it
+/// would make the reassurance false about everything the reader could see
+/// (Codex review, PR #279).
+#[gpui::test]
+fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    let before = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .clone()
+    });
+    let agent = before.id.clone();
+    assert_ne!(
+        before.notify_policy, "explicit",
+        "the notify change below has to be a change"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx)
+        });
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .expect("the disclosure is the editor");
+    let prompt = view
+        .read_with(cx, |v, _| v.inspector_editing_prompt_state())
+        .expect("the disclosure is the editor");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Cartographer", window, cx));
+        prompt.update(cx, |s, cx| {
+            s.set_value("Draw the map before arguing about it.", window, cx)
+        });
+    })
+    .unwrap();
+    view.update(cx, |v, cx| {
+        v.inspector_select_participant_model("gemma4-31b@eidola", cx);
+        v.inspector_set_edit_notify("explicit", cx);
+    });
+
+    // Share, without touching Save first.
+    view.update(cx, |v, cx| v.inspector_begin_promote(cx));
+    view.update(cx, |v, cx| v.inspector_confirm_promote(cx));
+
+    wait_until(cx, "the share lands", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent && p.source == "referenced")
+        })
+    });
+    let after = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.id == agent)
+            .expect("the shared agent is still a member")
+            .clone()
+    });
+    assert_eq!(after.scope, "global");
+    assert_eq!(
+        after.label, "Cartographer",
+        "the name on screen is the name that was shared"
+    );
+    assert_eq!(
+        after.system_prompt.as_deref(),
+        Some("Draw the map before arguing about it."),
+        "the charter on screen is the charter that was shared"
+    );
+    assert_eq!(after.model_ref.as_deref(), Some("gemma4-31b@eidola"));
+    assert_eq!(after.notify_policy, "explicit");
+    // The membership keeps NULL overrides, so the persona above is the shared
+    // agent's own — not this space papering over a stale one.
+    let reference = after.reference.expect("a referenced global carries detail");
+    assert_eq!(reference.base_label, "Cartographer");
+    assert_eq!(
+        reference.base_system_prompt.as_deref(),
+        Some("Draw the map before arguing about it.")
+    );
+    assert!(
+        reference.override_label.is_none() && reference.override_system_prompt.is_none(),
+        "promotion writes no per-space override"
+    );
+    assert!(
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_error(&space).map(str::to_string))
+            .is_none(),
+        "the share was accepted"
+    );
+
+    drain_runtime(&core);
+}
+
 /// A shared agent's **notebook** is a real space, and the Library is the list of
 /// the human's conversations — so promotion must not put a new row in it.
 /// `AppCore::list_spaces` excludes notebooks unconditionally; this is the GUI's
@@ -7326,9 +7431,9 @@ fn a_shared_agents_notebook_stays_out_of_the_library(cx: &mut TestAppContext) {
             .id
             .clone()
     });
-    stores
-        .participants
-        .update(cx, |s, cx| s.promote(space.clone(), agent.clone(), cx));
+    stores.participants.update(cx, |s, cx| {
+        s.promote(space.clone(), agent.clone(), None, cx)
+    });
     wait_until(cx, "the share lands", |cx| {
         stores.participants.read_with(cx, |s, _| {
             s.list(&space)
@@ -7376,9 +7481,9 @@ fn share_the_seeded_agent(cx: &mut TestAppContext, stores: &Stores, space: &str)
             .id
             .clone()
     });
-    stores
-        .participants
-        .update(cx, |s, cx| s.promote(space.to_string(), agent.clone(), cx));
+    stores.participants.update(cx, |s, cx| {
+        s.promote(space.to_string(), agent.clone(), None, cx)
+    });
     // Behavior tests run bus-less (`Stores::for_test` installs no bridge), so
     // the library is re-listed here the way `Change::Participants` does it in
     // the app — the dispatch itself is pinned by
@@ -7474,10 +7579,42 @@ fn agents_pane_lists_edits_and_opens_the_notebook(cx: &mut TestAppContext) {
 #[gpui::test]
 fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
     let (stores, core, _dir, space) = participants_scene(cx);
-    let (_window, view) = open_view(cx, |window, cx| {
+    let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
     });
     let agent = share_the_seeded_agent(cx, &stores, &space);
+
+    // Armed from over an open editor, the retirement takes that editor with it —
+    // and unlike the share, discarding the draft is the honest reading: the
+    // confirmation *replaces* the editor on screen rather than standing under
+    // its still-visible fields, it promises nothing about configuration, and a
+    // config edit to an agent leaving the library is a value nothing will read
+    // again.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_edit(&agent, window, cx));
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.editing_label_state())
+        .expect("the row's editor is open");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Renamed in passing", window, cx));
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.arm_retire(&agent, cx));
+    assert!(
+        view.read_with(cx, |v, _| v.editing_agent().is_none()),
+        "arming the retirement closes the editor it replaces"
+    );
+    view.update(cx, |v, cx| v.cancel_retire(cx));
+    cx.run_until_parked();
+    assert!(
+        stores.agents.read_with(cx, |s, _| s
+            .list()
+            .iter()
+            .all(|a| a.label != "Renamed in passing")),
+        "the draft the retirement discarded was never written"
+    );
 
     // Armed, then stood down — nothing is written.
     view.update(cx, |v, cx| v.arm_retire(&agent, cx));

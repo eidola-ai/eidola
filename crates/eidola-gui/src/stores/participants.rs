@@ -296,7 +296,8 @@ impl ParticipantsStore {
     }
 
     /// **Share** a space-owned agent across spaces — task 36's in-place
-    /// promotion (`scope: 'space' → 'global'` on the same row).
+    /// promotion (`scope: 'space' → 'global'` on the same row), optionally
+    /// saving `update` first.
     ///
     /// It rides the same `write; re-list` shape as every other mutation here,
     /// and that is the whole GUI story: the participant keeps its id, the space
@@ -304,17 +305,40 @@ impl ParticipantsStore {
     /// `source == "referenced"` — so the row's **"shared"** tag and the editor's
     /// override fork appear by themselves, with nothing view-side to update.
     ///
+    /// **The optional update is what makes the promise true.** The affordance is
+    /// pressed from inside the open editor, and its confirmation says the agent
+    /// keeps this space's persona *exactly as it is* — which a reader reads
+    /// against the fields still on screen behind it. So the visible values are
+    /// saved (an "edit everywhere" on a row this space still owns) and *then*
+    /// promoted, and promotion's byte-for-byte guarantee applies to what was
+    /// just written. **Both calls in one `bridge` closure** — the update emits
+    /// `Change::Participants`, and a return to gpui between them would let the
+    /// refresh that drives replace this mutation's slot and swallow the
+    /// promotion (`crates/eidola-gui/AGENTS.md` → "Multi-call ops stay in one
+    /// bridge closure"). Ordered update-first for the same reason: a refused
+    /// update leaves nothing at all, where a refused update *after* a promotion
+    /// would have shared the persona the reader had just replaced.
+    ///
     /// **One-way**: app-core offers no demotion (it would strand memberships and
     /// memory), so there is no unshare here either — retirement is the
     /// soft-remove.
-    pub fn promote(&mut self, space_id: String, participant_id: String, cx: &mut Context<Self>) {
+    pub fn promote(
+        &mut self,
+        space_id: String,
+        participant_id: String,
+        update: Option<ParticipantUpdate>,
+        cx: &mut Context<Self>,
+    ) {
         self.write_then_relist(space_id, cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
-                    c.promote_participant(participant_id).await
+                    if let Some(update) = update {
+                        c.update_space_participant(participant_id.clone(), update)
+                            .await?;
+                    }
+                    c.promote_participant(participant_id).await.map(|_| ())
                 })
                 .await
-                .map(|_| ())
                 .map_err(|e| e.to_string())
             })
         });
