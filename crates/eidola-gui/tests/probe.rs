@@ -5176,9 +5176,9 @@ fn space_probes_record_the_quote_destination_and_denied_follow(cx: &mut TestAppC
 
     // The denied follow's quiet notice: an Alert carrying its sentence, plus a
     // dismiss.
-    cx.update_window(window, |_, _, cx| {
+    cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.close_quote_destination(cx);
+            v.close_quote_destination(window, cx);
             v.report_navigation_failure_for_test(
                 eidola_app_core::error::AppError::NotAParticipant {
                     participant_id: "p1".into(),

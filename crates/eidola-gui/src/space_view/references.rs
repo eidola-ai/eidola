@@ -650,16 +650,27 @@ impl SpaceView {
     pub fn quote_elsewhere(
         &mut self,
         _: &crate::actions::QuoteElsewhere,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(selection) = self.post_selection.clone() else {
             return;
         };
+        // **A reveal focuses what it revealed** — the mount-side rule, owed by
+        // both doors this action has. The context-menu row is the one that
+        // makes it a defect rather than an inconvenience: `run_context_item`
+        // unmounts the focused menu row *before* dispatching here, so a
+        // keyboard reader was left holding a handle to a row nobody paints —
+        // keystrokes reaching nothing, Tab restarting from the window root —
+        // while the surface they had just asked for stood unfocused (Codex
+        // review, PR #280). The Edit-menu door owes it for the plainer reason:
+        // a picker you have to hunt for with Tab is not reachable.
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
         self.quote_destination = Some(QuoteDestination {
             selection,
             confirming: None,
-            focus: cx.focus_handle(),
+            focus,
         });
         // Ask for a fresh index as the picker opens — what `OpenLibrary` does
         // on every invocation, and the only thing that re-reads a `Failed` one
@@ -671,12 +682,41 @@ impl SpaceView {
 
     /// Close the destination picker (Escape, click-out, Cancel). Returns
     /// whether it was open — the Escape rung's answer.
-    pub fn close_quote_destination(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.quote_destination.take().is_some() {
-            cx.notify();
-            return true;
+    ///
+    /// **A surface that took the keyboard owes it back.** The picker focuses
+    /// itself as it opens (above) and its rows and verbs are real tab stops, so
+    /// dropping it while it holds the focus leaves the window on a dead handle:
+    /// the reader's next keystroke reaches nothing and Tab restarts from the
+    /// window root (Codex review, PR #280). One door, so Escape, the click-out
+    /// and Cancel are covered by construction.
+    ///
+    /// Asked as **containment of the picker's subtree**, before the drop — the
+    /// idiom `hand_back_inspector_focus` uses — so a reader who clicked into
+    /// the page or the composer while it stood open keeps their caret: a
+    /// surface that was not holding the keyboard has none to give back.
+    pub fn close_quote_destination(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(dest) = self.quote_destination.take() else {
+            return false;
+        };
+        self.hand_back_quote_focus(&dest, window, cx);
+        cx.notify();
+        true
+    }
+
+    /// The picker's half of the handback: if its subtree still holds the
+    /// keyboard, put it where a closing overlay's keyboard belongs
+    /// ([`SpaceView::keyboard_home`] — the reader's place in the conversation
+    /// if they have one, else the view root), which is also what keeps the
+    /// falling edge of `sync_tree_focus` from disagreeing a frame later.
+    fn hand_back_quote_focus(
+        &self,
+        dest: &QuoteDestination,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if dest.focus.contains_focused(window, cx) {
+            window.focus(&self.keyboard_home(), cx);
         }
-        false
     }
 
     /// Arm the confirmation for one destination: the picker keeps the passage
@@ -727,6 +767,11 @@ impl SpaceView {
         let Some(dest) = self.quote_destination.take() else {
             return;
         };
+        // The same handback: "Quote there" unmounts the verb that was pressed.
+        // The passage leaves for another window — which this raises — so what
+        // is owed *here* is only that this window's keyboard stays live, at the
+        // reader's place in the conversation they quoted from.
+        self.hand_back_quote_focus(&dest, window, cx);
         let Some((space_id, _)) = dest.confirming else {
             return;
         };
@@ -866,8 +911,8 @@ impl SpaceView {
             .border_1()
             .border_color(theme.border)
             .bg(theme.popover)
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.close_quote_destination(cx);
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.close_quote_destination(window, cx);
             }));
 
         if let Some((_, title)) = dest.confirming.clone() {
@@ -930,8 +975,8 @@ impl SpaceView {
                                 .text_color(theme.muted_foreground)
                                 .hover(|s| s.bg(theme.muted))
                                 .child("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.close_quote_destination(cx);
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_quote_destination(window, cx);
                                 })),
                         ),
                 );
