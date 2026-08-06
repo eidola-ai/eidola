@@ -5062,3 +5062,38 @@ fn space_probes_record_the_quote_destination_and_denied_follow(cx: &mut TestAppC
 
     probe::set_probes_enabled(false);
 }
+
+/// The grant door (task 37): "Invite an agent…" beside Add, and the form it
+/// opens — whose exit is probed in every state, including the one where the
+/// stub has no backend to list candidates from.
+#[gpui::test]
+fn space_inspector_invite_probes_its_door_and_its_form(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let (window, view) = open_participants_inspector(cx);
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/inspector/participants/invite".to_string()),
+        "the grant door sits with the roster's other verbs: {names:?}"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/inspector/participants/invite/form".to_string()),
+        "the form is a named group: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/inspector/participants/invite/cancel".to_string()),
+        "and its way out is offered even with nothing to list: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/inspector/participants/invite".to_string()),
+        "the door is replaced by the form it opened: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}

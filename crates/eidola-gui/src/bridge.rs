@@ -189,6 +189,20 @@ pub fn references_to(
     })
 }
 
+/// The agents a reader could grant membership of a space — task 37's grant
+/// picker. Viewer-scoped in app-core (a space-owned agent is listed only where
+/// the viewer takes part in the space that owns it), so this passes the shared
+/// human, the reader every GUI window acts as. Pure read.
+pub fn list_grantable_agents(
+    core: Arc<AppCore>,
+    space_id: String,
+) -> oneshot::Receiver<Result<Vec<eidola_app_core::GrantableAgent>, AppError>> {
+    spawn_oneshot(core, move |core| async move {
+        core.list_grantable_agents(space_id, eidola_app_core::HUMAN_PARTICIPANT_ID.to_string())
+            .await
+    })
+}
+
 /// Every turn's operational trace in a space — the tool rounds and decline
 /// decisions the post tree collapses out, each anchored to a post the tree
 /// does render (task 34). Pure read.

@@ -1654,6 +1654,36 @@ impl SpaceView {
         )
     }
 
+    /// Open the destination picker on a made-up selection — the driver and the
+    /// visual harness build a scene before any frame has minted the post
+    /// editors a real selection would come from (the same reason
+    /// `seed_draft_quote_for_test` exists).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_quote_destination_for_test(
+        &mut self,
+        action_id: &str,
+        block_id: &str,
+        byline: &str,
+        snippet: &str,
+        armed: Option<(&str, &str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.quote_destination = Some(QuoteDestination {
+            selection: PostSelection {
+                node_id: SharedString::from(action_id.to_string()),
+                action_id: action_id.to_string(),
+                block_id: block_id.to_string(),
+                range: 0..snippet.len(),
+                snippet: SharedString::from(snippet.to_string()),
+                byline: SharedString::from(byline.to_string()),
+            },
+            confirming: armed
+                .map(|(id, title)| (id.to_string(), SharedString::from(title.to_string()))),
+        });
+        cx.notify();
+    }
+
     /// Choose a destination without a pointer (the rows are painted from the
     /// Library index; the behavior tier drives the transition, the driver the
     /// pixels).

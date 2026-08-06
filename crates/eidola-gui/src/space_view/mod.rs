@@ -721,6 +721,14 @@ pub struct SpaceView {
     pub(crate) inspector_participant_add: Option<inspector_participants::ParticipantAdd>,
     /// The open "save these participants as a template" form, if any.
     pub(crate) inspector_template_form: Option<inspector_participants::TemplateForm>,
+    /// The open "Invite an agent…" form, if any — task 37's grant, where a
+    /// space gives an agent (shared, or one that has to be shared first)
+    /// membership as an observer.
+    pub(crate) inspector_invite: Option<inspector_participants::InviteForm>,
+    /// The invite form's own candidate read. View-owned: the list is only ever
+    /// looked at while the form is open, so a window closing mid-read strands
+    /// nothing (STATE.md — owner = blast radius).
+    pub(crate) inspector_invite_task: Option<Task<()>>,
     /// Which participant model dropdown is open (at most one).
     pub(crate) inspector_participant_picker: Option<inspector_participants::ParticipantPicker>,
     /// That dropdown's own scroll (reset to the top on each open).
@@ -890,6 +898,8 @@ impl SpaceView {
             inspector_participant_edit: None,
             inspector_participant_add: None,
             inspector_template_form: None,
+            inspector_invite: None,
+            inspector_invite_task: None,
             inspector_participant_picker: None,
             inspector_participant_picker_scroll: ScrollHandle::new(),
             window_title: None,

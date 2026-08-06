@@ -321,6 +321,57 @@ impl ParticipantsStore {
         });
     }
 
+    /// **The grant** (task 37): give an agent membership of this space as an
+    /// **observer** — the read-only role the blocked-follow → grant → retry
+    /// loop asks for.
+    ///
+    /// One core call either way, and which one is decided by what the agent
+    /// already is: a shared agent joins by plain membership; a **space-owned**
+    /// one has to be shared first, and that pair travels as a single
+    /// transaction (`AppCore::promote_participant` carrying a `SpaceGrant`)
+    /// rather than two calls. Promotion is one-way, so a grant refused after a
+    /// promotion committed would leave the reader with an irreversible change
+    /// they never asked for on its own — the multi-call hazard this store's
+    /// share path already learned once (Codex review, PR #279).
+    pub fn grant_membership(
+        &mut self,
+        space_id: String,
+        participant_id: String,
+        shared: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let space = space_id.clone();
+        let pid = participant_id.clone();
+        self.write_then_settle(space_id, participant_id, cx, move |core| {
+            Box::pin(async move {
+                bridge(core, move |c| async move {
+                    if shared {
+                        c.add_global_participant(
+                            space,
+                            pid,
+                            Some(eidola_app_core::MembershipRole::Observer),
+                        )
+                        .await
+                        .map(|_| ())
+                    } else {
+                        c.promote_participant(
+                            pid,
+                            None,
+                            Some(eidola_app_core::SpaceGrant {
+                                space_id: space,
+                                role: eidola_app_core::MembershipRole::Observer,
+                            }),
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                })
+                .await
+                .map_err(|e| e.to_string())
+            })
+        });
+    }
+
     /// "Edit everywhere": write the participant's **own** config (edits the
     /// shared global everywhere, or the space-owned row for this space).
     /// `expected` is the shape the editor was seeded on. Save and Share are the

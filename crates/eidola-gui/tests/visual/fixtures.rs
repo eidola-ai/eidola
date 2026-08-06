@@ -636,3 +636,44 @@ pub fn trace_posts() -> (Vec<PostNode>, Vec<eidola_app_core::PostTrace>) {
         vec![answered, declined, also_declined, declined_again],
     )
 }
+
+/// The Library index behind task 37's destination picker: the conversation
+/// being read plus two others to quote into.
+#[allow(dead_code)]
+pub fn destination_spaces() -> Vec<eidola_app_core::SpaceInfo> {
+    let space = |id: &str, title: &str, ts: i64| eidola_app_core::SpaceInfo {
+        id: id.into(),
+        title: Some(title.into()),
+        snippet: None,
+        created_at: ts,
+        last_activity_at: ts,
+        message_count: 6,
+        archived_at: None,
+    };
+    vec![
+        space("demo", "Thrasymachus and the shepherd", 3),
+        space("tides", "Tides and the moon", 2),
+        space("reading", "What to read next", 1),
+    ]
+}
+
+/// The candidates behind task 37's grant picker: one already-shared agent, and
+/// one that works in a single conversation and would have to be shared to join
+/// this one.
+#[allow(dead_code)]
+pub fn grantable_agents() -> Vec<eidola_app_core::GrantableAgent> {
+    vec![
+        eidola_app_core::GrantableAgent {
+            id: "agent-ada".into(),
+            label: "Ada".into(),
+            shared: true,
+            home_space_title: None,
+        },
+        eidola_app_core::GrantableAgent {
+            id: "agent-mara".into(),
+            label: "Mara".into(),
+            shared: false,
+            home_space_title: Some("Tides and the moon".into()),
+        },
+    ]
+}
