@@ -1496,6 +1496,21 @@ pub async fn get_participant(
 /// notify_policy, role). Editing a global edits it everywhere; editing an owned
 /// row edits that space/template only. Each `Some` replaces; the inner `Option`
 /// clears/sets the two nullable columns.
+///
+/// **Liveness rides the `WHERE`, so retirement wins terminally** (Codex review,
+/// PR #279). Save and Retire are independent operations in independent slots,
+/// and a `bridge`d core call runs to completion even after its gpui task is
+/// replaced — so a Save started in another window can commit *after* a
+/// retirement. Updating by `id` alone let that stale write rename a retired
+/// participant, and since the trail renders an author's byline by joining this
+/// row, the record retirement promises to leave alone changed silently
+/// underneath it. Asking `removed_at` here rather than in a caller's earlier
+/// read is what makes the answer terminal: no interleaving can put a live read
+/// in front of a write that lands after the retirement.
+///
+/// `false` therefore means "nothing to set, or nothing live to set it on"; the
+/// caller distinguishes them (the read only *explains* a write that struck
+/// nothing — it never decides one).
 pub async fn update_participant_config(
     conn: &Connection,
     id: &str,
@@ -1530,7 +1545,10 @@ pub async fn update_participant_config(
     if sets.is_empty() {
         return Ok(false);
     }
-    let sql = format!("UPDATE participant SET {} WHERE id = ?1", sets.join(", "));
+    let sql = format!(
+        "UPDATE participant SET {} WHERE id = ?1 AND removed_at IS NULL",
+        sets.join(", ")
+    );
     let n = conn.execute(&sql, params).await.map_err(AppError::db)?;
     Ok(n > 0)
 }
@@ -1636,6 +1654,14 @@ pub struct PersonaWrite {
 }
 
 impl PersonaWrite {
+    /// Whether it would write nothing at all (every column left alone).
+    pub fn is_empty(&self) -> bool {
+        self.label.is_none()
+            && self.model_ref.is_none()
+            && self.system_prompt.is_none()
+            && self.notify_policy.is_none()
+    }
+
     /// Apply it, reporting whether any row changed. Every caller writes through
     /// here, so "a persona write" is one statement builder
     /// ([`update_participant_config`]) with one set of semantics.
@@ -2238,6 +2264,14 @@ async fn insert_participant_ref(
 
 /// Update a space membership's overrides (each `Some` replaces; inner `Option`
 /// clears/sets). Only meaningful for referenced globals ("override here").
+///
+/// Same rule as [`update_participant_config`], at the membership level: the
+/// write lands only on a **live membership of a live participant** — the
+/// definition [`is_space_member`] reads, now asked of a write. A stale
+/// "override here" arriving after the member left (or after the agent was
+/// retired) is refused rather than parked in columns nothing reads, which is
+/// what keeps "your write was refused" from meaning "your write is waiting to
+/// reappear".
 pub async fn update_space_participant_override(
     conn: &Connection,
     space_id: &str,
@@ -2267,7 +2301,11 @@ pub async fn update_space_participant_override(
         return Ok(false);
     }
     let sql = format!(
-        "UPDATE space_participant SET {} WHERE space_id = ?1 AND participant_id = ?2",
+        "UPDATE space_participant SET {} \
+         WHERE space_id = ?1 AND participant_id = ?2 AND left_at IS NULL \
+           AND EXISTS ( \
+               SELECT 1 FROM participant p WHERE p.id = ?2 AND p.removed_at IS NULL \
+           )",
         sets.join(", ")
     );
     let n = conn.execute(&sql, params).await.map_err(AppError::db)?;

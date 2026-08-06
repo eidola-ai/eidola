@@ -2924,6 +2924,24 @@ impl Inner {
         .await?;
         if changed {
             self.bus.emit(Change::Participants);
+            return Ok(());
+        }
+        // Same rule as the config write above, at the membership level: the
+        // write lands only on a live membership of a live participant, so a
+        // zero-strike with something to write means one of them has ended.
+        if ov.label.is_none()
+            && ov.model_ref.is_none()
+            && ov.system_prompt.is_none()
+            && ov.notify_policy.is_none()
+        {
+            return Ok(());
+        }
+        if !db::is_space_member(&conn, space_id, participant_id).await? {
+            return Err(AppError::Config {
+                message: "that participant is no longer part of this space, so this change \
+                          was not saved"
+                    .to_string(),
+            });
         }
         Ok(())
     }
@@ -2991,8 +3009,39 @@ impl Inner {
         let conn = self.db_conn().await?;
         if persona.apply(&conn, participant_id).await? {
             self.bus.emit(Change::Participants);
+            return Ok(());
         }
-        Ok(())
+        // The write struck nothing. Its own `WHERE` is what decided that (see
+        // `db::update_participant_config`) — this read only says which of the
+        // two reasons it was, so a Save that lost a race to a retirement is
+        // told so instead of reporting success.
+        if persona.is_empty() {
+            return Ok(());
+        }
+        self.refuse_dead_participant(&conn, participant_id).await
+    }
+
+    /// Explain a config write that struck no row: the participant is gone, or
+    /// retired. Never *decides* a write — every caller has already been refused
+    /// by the write's own liveness predicate.
+    async fn refuse_dead_participant(
+        &self,
+        conn: &turso::Connection,
+        participant_id: &str,
+    ) -> Result<(), AppError> {
+        match db::get_participant(conn, participant_id).await? {
+            Some(row) if row.removed_at.is_some() => Err(AppError::Config {
+                message: format!(
+                    "{} has been retired, so this change was not saved",
+                    row.label
+                ),
+            }),
+            None => Err(AppError::NotConfigured {
+                message: format!("participant not found: {participant_id}"),
+            }),
+            // Live, and still nothing struck: nothing to explain.
+            Some(_) => Ok(()),
+        }
     }
 
     /// Add an existing **global** participant to a space as a member — the

@@ -1380,3 +1380,74 @@ fn a_notebook_owner_cannot_be_removed_from_its_own_notebook() {
         );
     });
 }
+
+/// The byline a reader sees on the agent's own post in `space`.
+fn agent_byline(core: &AppCore, space: &str) -> String {
+    core.runtime()
+        .block_on(core.get_space_tree(space.to_string()))
+        .expect("tree")
+        .into_iter()
+        .find(|n| n.action_type == "inference")
+        .expect("the agent answered once")
+        .participant
+        .label
+}
+
+/// **Retirement wins terminally** (Codex review, PR #279).
+///
+/// Save and Retire are independent operations in independent slots, so a Save
+/// running in another window can still be in flight when a retirement commits —
+/// and a `bridge`d core call runs to completion even after its gpui task is
+/// replaced. The config write updated by `id` alone, so the stale Save landed
+/// *after* retirement and renamed the retired participant. The trail renders an
+/// author's label by joining the participant row, so the record the retirement
+/// promised to leave alone changed silently underneath it.
+#[test]
+fn a_save_that_lands_after_retirement_is_refused() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        promote(&core, &agent);
+        let before = agent_byline(&core, &space);
+
+        core.runtime()
+            .block_on(core.retire_participant(agent.clone()))
+            .expect("retirement");
+
+        // The stale Save, arriving after the retirement committed.
+        let err = core
+            .runtime()
+            .block_on(core.update_space_participant(
+                agent.clone(),
+                eidola_app_core::ParticipantUpdate {
+                    label: Some("Renamed after retirement".into()),
+                    ..Default::default()
+                },
+            ))
+            .expect_err("a retired participant takes no more configuration");
+        assert!(err.to_string().contains("retired"), "{err}");
+        assert_eq!(
+            agent_byline(&core, &space),
+            before,
+            "the trail retirement promised to leave alone is unchanged"
+        );
+
+        // The membership-level door answers the same way: an "override here"
+        // for a participant that is no longer part of the space is refused
+        // rather than parked in columns nothing reads.
+        let err = core
+            .runtime()
+            .block_on(core.set_space_participant_override(
+                space.clone(),
+                agent.clone(),
+                eidola_app_core::ParticipantOverride {
+                    label: Some(Some("Renamed here instead".into())),
+                    ..Default::default()
+                },
+            ))
+            .expect_err("a retired participant is no longer a member either");
+        assert!(err.to_string().contains("no longer part"), "{err}");
+        assert_eq!(agent_byline(&core, &space), before);
+    });
+}
