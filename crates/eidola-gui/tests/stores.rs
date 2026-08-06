@@ -692,7 +692,7 @@ fn a_refresh_landing_mid_write_keeps_the_participants_ops_error(cx: &mut TestApp
     wait_until(cx, "the refusal surfaces", |cx| {
         stores
             .participants
-            .read_with(cx, |s, _| s.op_error(&space).is_some())
+            .read_with(cx, |s, _| !s.op_errors_for(&space).is_empty())
     });
     stores.participants.read_with(cx, |s, _| {
         assert!(
@@ -1443,7 +1443,7 @@ fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
     wait_until(cx, "the share is refused", |cx| {
         stores
             .participants
-            .read_with(cx, |s, _| s.op_error(&space).is_some())
+            .read_with(cx, |s, _| !s.op_errors_for(&space).is_empty())
     });
 
     let after = core
@@ -1461,4 +1461,144 @@ fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
         after.system_prompt, before.system_prompt,
         "nor rewrite its charter — across every space that follows the shared row"
     );
+}
+
+/// **Two writes on two participants of one space both land** (Codex review, PR
+/// #279). The inspector offers a verb on every roster row at once — share this
+/// agent, remove that one — so two mutations a moment apart are independent.
+/// `ParticipantsStore` keyed its mutation slot by **space** alone, so the second
+/// replaced the first: unpolled, the first write simply never ran; polled, its
+/// refusal and its re-list were discarded. Keyed by `(space, participant)` they
+/// are independent, and the resolving read is taken once that space's last write
+/// settles.
+#[gpui::test]
+fn two_writes_on_two_participants_of_one_space_both_land(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let seeded = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent")
+        .id;
+    let second = core
+        .runtime()
+        .block_on(core.add_space_participant(
+            space.clone(),
+            eidola_app_core::NewParticipant {
+                label: "Bo".into(),
+                model_ref: None,
+                system_prompt: None,
+                notify_policy: "explicit".into(),
+            },
+        ))
+        .expect("a second agent")
+        .id;
+
+    // Both issued before either future is polled — the narrowest interleaving.
+    stores.participants.update(cx, |s, cx| {
+        s.promote(space.clone(), seeded.clone(), None, cx);
+        s.remove(space.clone(), second.clone(), cx);
+    });
+
+    wait_until(cx, "both writes land durably", |_cx| {
+        let rows = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .expect("participants");
+        rows.iter()
+            .any(|p| p.id == seeded && p.source == "referenced")
+            && !rows.iter().any(|p| p.id == second)
+    });
+    // And the roster the panel reads agrees — the batch-end read was taken after
+    // the last of them, so it carries both.
+    wait_until(cx, "the roster resolves on a read after both", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            let rows = s.list(&space);
+            rows.iter()
+                .any(|p| p.id == seeded && p.source == "referenced")
+                && !rows.iter().any(|p| p.id == second)
+        })
+    });
+    assert!(
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_errors_for(&space).is_empty()),
+        "both writes were accepted"
+    );
+}
+
+/// The refusal half: two refused writes in one space each keep their own report.
+/// The inspector renders **one band per space** by design (the panel is 320px),
+/// so the store keeps every standing refusal and the band lists them, each named
+/// — where a single slot could only have shown the last, and the reader would
+/// never learn their other action was refused too.
+#[gpui::test]
+fn two_refused_participant_writes_each_keep_their_own_refusal(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let rows = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants");
+    let agent = rows
+        .iter()
+        .find(|p| p.kind == "agent")
+        .expect("the seeded agent")
+        .id
+        .clone();
+    let human = rows
+        .iter()
+        .find(|p| p.kind == "human")
+        .expect("the shared You")
+        .id
+        .clone();
+
+    // Two refusals app-core decides for itself: a blank label, and removing the
+    // shared human.
+    stores.participants.update(cx, |s, cx| {
+        s.update_everywhere(
+            space.clone(),
+            agent.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("   ".into()),
+                ..Default::default()
+            },
+            cx,
+        );
+        s.remove(space.clone(), human.clone(), cx);
+    });
+
+    wait_until(cx, "both refusals stand", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_errors_for(&space).len() == 2)
+    });
+    stores.participants.read_with(cx, |s, _| {
+        let subjects: Vec<String> = s
+            .op_errors_for(&space)
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect();
+        assert!(
+            subjects.contains(&agent),
+            "the edit's refusal: {subjects:?}"
+        );
+        assert!(
+            subjects.contains(&human),
+            "the removal's refusal: {subjects:?}"
+        );
+    });
 }
