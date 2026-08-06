@@ -1754,6 +1754,109 @@ pub async fn notebook_space_for(
     }
 }
 
+/// One row of the **global agent library** — a shared identity plus the door to
+/// its notebook (see [`list_global_agents`]).
+#[derive(Clone, Debug)]
+pub struct GlobalAgentRow {
+    pub id: String,
+    pub label: String,
+    pub model_ref: Option<String>,
+    pub system_prompt: Option<String>,
+    pub notify_policy: String,
+    /// The agent's private notebook space, `None` for a global agent that has
+    /// none. Only promotion creates one, and it does so in the same
+    /// transaction as the scope flip — so a `None` here is a row from some
+    /// future path that mints globals another way, never a half-promoted one.
+    pub notebook_space_id: Option<String>,
+}
+
+/// The live **global agents** — the shared agent library (task 36).
+///
+/// `kind = 'agent'` is what keeps the two seeded non-agent globals out: the
+/// shared human ("You") and Eidola-the-system are global rows too, and neither
+/// is a colleague anyone manages. The notebook is **joined here rather than
+/// looked up per row**, because the only consumer is a roster that offers the
+/// notebook door on every line.
+///
+/// Ordered by the label the reader sees (id breaking ties), so the management
+/// surface and any future listing agree on an order a person can predict.
+pub async fn list_global_agents(conn: &Connection) -> Result<Vec<GlobalAgentRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.id, p.label, p.model_ref, p.system_prompt, p.notify_policy, s.id \
+             FROM participant p \
+             LEFT JOIN space s ON s.notebook_participant_id = p.id \
+             WHERE p.scope = 'global' AND p.kind = 'agent' AND p.removed_at IS NULL \
+             ORDER BY p.label, p.id",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(GlobalAgentRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            label: row.get::<String>(1).map_err(AppError::db)?,
+            model_ref: row.get::<Option<String>>(2).map_err(AppError::db)?,
+            system_prompt: row.get::<Option<String>>(3).map_err(AppError::db)?,
+            notify_policy: row.get::<String>(4).map_err(AppError::db)?,
+            notebook_space_id: row.get::<Option<String>>(5).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Retire a global agent: the soft-remove **and** its notebook's archival, in
+/// one transaction (task 36 — "archival tied to retirement").
+///
+/// The two belong together because the notebook exists only for the agent: a
+/// retired agent whose notebook stayed open would leave a live space nobody
+/// owns, and an archived notebook beside a live agent would take away the
+/// residence its next `core` memory block needs. Answers `false` when the row
+/// was already retired — the caller decides whether that is a refusal.
+///
+/// The participant row itself always survives (soft-remove), so every
+/// `action.participant_id` in the trail stays resolvable; retirement is about
+/// the *library*, never the history.
+pub async fn retire_participant_tx(
+    conn: &Connection,
+    participant_id: &str,
+    now: i64,
+) -> Result<bool, AppError> {
+    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    match retire_participant_tx_body(conn, participant_id, now).await {
+        Ok(retired) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(retired)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn retire_participant_tx_body(
+    conn: &Connection,
+    participant_id: &str,
+    now: i64,
+) -> Result<bool, AppError> {
+    if !soft_remove_participant(conn, participant_id, now).await? {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE space SET archived_at = ?2 \
+         WHERE notebook_participant_id = ?1 AND archived_at IS NULL",
+        (Value::Text(participant_id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to archive the retired agent's notebook: {e}"),
+    })?;
+    Ok(true)
+}
+
 /// Whether a participant is a member of one space — **owned row ∪ live
 /// reference row**, the same membership definition [`participant_spaces`] and
 /// [`space_participants`] read from their two sides, asked of a single space.
@@ -4121,6 +4224,23 @@ pub async fn first_user_text(
     match rows.next().await.map_err(AppError::db)? {
         None => Ok(None),
         Some(row) => Ok(row.get::<Option<String>>(0).map_err(AppError::db)?),
+    }
+}
+
+/// Whether a space is archived. Answers `false` for a space that does not
+/// exist — the question is "is this one hidden", not "does this one exist".
+pub async fn space_is_archived(conn: &Connection, space_id: &str) -> Result<bool, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT archived_at IS NOT NULL FROM space WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(false),
+        Some(row) => Ok(row.get::<i64>(0).map_err(AppError::db)? != 0),
     }
 }
 

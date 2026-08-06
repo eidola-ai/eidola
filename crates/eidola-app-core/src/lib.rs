@@ -221,6 +221,26 @@ pub struct PromotionOutcome {
     pub notebook_space_id: String,
 }
 
+/// One **global agent** — a shared identity in the agent library (task 36), as
+/// the management surface reads it: the agent's own config (there is no
+/// override layer on a global's own row) plus the door to its notebook.
+///
+/// Agents only. The shared human and Eidola-the-system are global rows too, and
+/// neither is a colleague anyone manages — see [`db::list_global_agents`].
+#[derive(Clone, Debug)]
+pub struct GlobalAgentInfo {
+    pub id: String,
+    pub label: String,
+    pub model_ref: Option<String>,
+    pub system_prompt: Option<String>,
+    pub notify_policy: String,
+    /// The agent's private notebook space — the residence of its core memory
+    /// blocks, hidden from [`AppCore::list_spaces`] and opened from here.
+    /// Every promoted agent has one (promotion creates it in the same
+    /// transaction as the scope flip).
+    pub notebook_space_id: Option<String>,
+}
+
 /// A new agent participant to add to a space (agents only — the human is the
 /// seeded shared "You"). `notify_policy` empty ⇒ `explicit`.
 #[derive(Clone, Debug, Default)]
@@ -3121,6 +3141,89 @@ impl Inner {
             home_space_id,
             notebook_space_id,
         })
+    }
+
+    /// The live global agents — the shared library a promotion adds to.
+    async fn list_global_agents(&self) -> Result<Vec<GlobalAgentInfo>, AppError> {
+        let conn = self.db_conn().await?;
+        Ok(db::list_global_agents(&conn)
+            .await?
+            .into_iter()
+            .map(|r| GlobalAgentInfo {
+                id: r.id,
+                label: r.label,
+                model_ref: r.model_ref,
+                system_prompt: r.system_prompt,
+                notify_policy: r.notify_policy,
+                notebook_space_id: r.notebook_space_id,
+            })
+            .collect())
+    }
+
+    /// Retire a global agent — the library soft-remove, with its notebook
+    /// archived in the same transaction (task 36).
+    ///
+    /// This is the counterpart to promotion, **not its inverse**: the row keeps
+    /// its scope and its id, every past `action` still resolves to it, and its
+    /// memory is untouched. What ends is its availability — it leaves the
+    /// library and stops being offerable as a member. Demotion remains
+    /// unrepresentable.
+    ///
+    /// Refusal-first: unknown, already retired, the shared human, a non-global
+    /// (whose "removal" is per space — `remove_space_participant`), and a
+    /// non-agent are each decided before any write.
+    async fn retire_participant(&self, participant_id: &str) -> Result<(), AppError> {
+        let conn = self.db_conn().await?;
+        let row = db::get_participant(&conn, participant_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("participant not found: {participant_id}"),
+            })?;
+        if row.removed_at.is_some() {
+            return Err(AppError::NotConfigured {
+                message: format!("{} has already been retired", row.label),
+            });
+        }
+        if participant_id == db::HUMAN_PARTICIPANT_ID {
+            return Err(AppError::Config {
+                message: "you can't retire yourself".into(),
+            });
+        }
+        if row.scope != "global" {
+            return Err(AppError::Config {
+                message: format!(
+                    "{} belongs to one space, so it is removed there rather than retired",
+                    row.label
+                ),
+            });
+        }
+        if row.kind != "agent" {
+            return Err(AppError::Config {
+                message: format!(
+                    "only a shared agent can be retired (this is a {})",
+                    row.kind
+                ),
+            });
+        }
+
+        if !db::retire_participant_tx(&conn, participant_id, now_ms()).await? {
+            // The pre-check read a live row, so a `false` here means another
+            // writer retired it in between. Same fact, same message.
+            return Err(AppError::NotConfigured {
+                message: format!("{} has already been retired", row.label),
+            });
+        }
+
+        // `Change::Participants` and nothing else — the same reasoning
+        // `promote_participant` states: the space this archived is a notebook,
+        // which `list_spaces` excludes unconditionally (in **both** its
+        // `include_archived` branches), so the Library listing provably did not
+        // change and a `SpaceIndex` here would invalidate a store that reads
+        // nothing new. `archive_space` emits `SpaceIndex` because the space it
+        // archives is one the Library lists; the rule is the same, the answer
+        // differs because the space does.
+        self.bus.emit(Change::Participants);
+        Ok(())
     }
 
     async fn remove_space_participant(
@@ -7213,6 +7316,25 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Test-only seam: whether a space is archived.
+    ///
+    /// It exists for exactly one claim — retirement archives the agent's
+    /// **notebook** ([`Self::retire_participant`]) — which no production read
+    /// can observe: `list_spaces` excludes notebooks in both its
+    /// `include_archived` branches, and nothing else reports `archived_at`. A
+    /// behavior with no observer is a behavior no test can pin.
+    #[doc(hidden)]
+    pub async fn test_space_archived(&self, space_id: String) -> Result<bool, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                db::space_is_archived(&conn, &space_id).await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Test-only seam: write a `reference` edge **below** the validation gate,
     /// quoting the whole of the antecedent's first content block.
     ///
@@ -7658,6 +7780,33 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.promote_participant(&participant_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The shared **agent library**: every live global agent with its config
+    /// and its notebook space id (task 36). Agents only — the shared human and
+    /// Eidola-the-system are globals nobody manages. Pure read.
+    pub async fn list_global_agents(&self) -> Result<Vec<GlobalAgentInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.list_global_agents().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Retire a shared agent: the library soft-remove, archiving its notebook
+    /// in the same transaction.
+    ///
+    /// **Not a demotion** — the row keeps its id and its scope, the trail still
+    /// resolves it, and its memory is untouched; what ends is its availability.
+    /// Typed errors for an unknown or already-retired participant, the shared
+    /// human, a space-owned participant (removed per space instead), and a
+    /// non-agent. Emits [`Change::Participants`].
+    pub async fn retire_participant(&self, participant_id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.retire_participant(&participant_id).await })
             .await
             .map_err(join_err)?
     }
