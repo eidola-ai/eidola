@@ -2660,6 +2660,47 @@ fn open_participants_inspector(
     open_participants_inspector_with(cx, stores)
 }
 
+/// **A notebook's owner carries no Remove** (task 36; Codex review, PR #279).
+///
+/// A notebook is a real space, so opening one renders its owner as an ordinary
+/// referenced participant. Its membership is structural, though — the space
+/// exists only for that agent and is where its `core` memory lives — so
+/// app-core refuses to end it, and an affordance that could only be refused has
+/// no business on the row. The space's own settings are what say which
+/// participant that is.
+#[gpui::test]
+fn space_inspector_a_notebooks_owner_is_not_removable(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some(probe_participants());
+        s.space_settings = Some((
+            "demo".into(),
+            eidola_app_core::SpaceSettings {
+                notebook_participant_id: Some("agent-1".into()),
+                ..Default::default()
+            },
+        ));
+    });
+    let (window, view) = open_participants_inspector_with(cx, stores);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx)
+        });
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/inspector/participants/editor/save".to_string()),
+        "the row is still an editor: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/inspector/participants/agent-1/remove".to_string()),
+        "a notebook's owner must not be offered removal from its own notebook: {names:?}"
+    );
+}
+
 fn participants_inspector_stores(cx: &mut TestAppContext) -> Stores {
     stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
@@ -4584,6 +4625,7 @@ fn space_inspector_router_cost_note_is_exactly_remote_conditional(cx: &mut TestA
         eidola_app_core::SpaceSettings {
             cascade_limit: 4,
             router_model: Some("tiny@local".into()),
+            ..Default::default()
         },
     );
     let entries = fresh_entries(cx, window);
@@ -4600,6 +4642,7 @@ fn space_inspector_router_cost_note_is_exactly_remote_conditional(cx: &mut TestA
         eidola_app_core::SpaceSettings {
             cascade_limit: 4,
             router_model: Some("gemma4-31b@eidola".into()),
+            ..Default::default()
         },
     );
     let entries = fresh_entries(cx, window);

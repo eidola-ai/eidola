@@ -2306,6 +2306,11 @@ pub enum SpaceRemoval {
     Left,
     /// Nothing live to end — already removed, already left, or never a member.
     NothingToDo,
+    /// The participant owns this space as its **notebook**, and that membership
+    /// is structural: the notebook exists only for it, and is the residence of
+    /// the `core` memory it writes. Refused rather than obeyed, because nothing
+    /// can grant a notebook membership back.
+    RefusedNotebookOwner,
 }
 
 /// Take a participant out of one space, **deciding at the write** whether that
@@ -2371,9 +2376,55 @@ async fn remove_space_participant_tx_body(
     if struck > 0 {
         return Ok(SpaceRemoval::SoftRemoved);
     }
-    match leave_space_participant(conn, space_id, participant_id, now).await? {
-        true => Ok(SpaceRemoval::Left),
+    // The notebook owner's membership is guarded **in the leave's own `WHERE`**,
+    // for the reason the soft-remove is guarded above: a promotion mints the
+    // notebook and its membership in one transaction, so a removal that read the
+    // space a moment earlier saw an ordinary conversation. The read below only
+    // *explains* a write that struck nothing — it never decides one.
+    let left = conn
+        .execute(
+            "UPDATE space_participant SET left_at = ?3 \
+             WHERE space_id = ?1 AND participant_id = ?2 AND left_at IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM space s \
+                   WHERE s.id = ?1 AND s.notebook_participant_id = ?2 \
+               )",
+            (
+                Value::Text(space_id.to_string()),
+                Value::Text(participant_id.to_string()),
+                Value::Integer(now),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    if left > 0 {
+        return Ok(SpaceRemoval::Left);
+    }
+    match notebook_participant_of(conn, space_id).await?.as_deref() == Some(participant_id) {
+        true => Ok(SpaceRemoval::RefusedNotebookOwner),
         false => Ok(SpaceRemoval::NothingToDo),
+    }
+}
+
+/// The participant a space is the **notebook** of, if it is one — the reverse of
+/// [`notebook_space_for`]. Read by the removal guard above, and surfaced to the
+/// GUI (via `SpaceSettings`) so the roster can withhold a Remove that could only
+/// be refused.
+pub async fn notebook_participant_of(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT notebook_participant_id FROM space WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(space_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(row.get::<Option<String>>(0).map_err(AppError::db)?),
     }
 }
 

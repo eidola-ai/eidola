@@ -1336,3 +1336,47 @@ impl eidola_app_core::tools::Tool for RetireMidTurn {
         })
     }
 }
+
+/// **A notebook's owner cannot be removed from it** (Codex review, PR #279).
+///
+/// The notebook is a real space, so opening it from Settings renders its owner
+/// as an ordinary referenced participant — with the inspector's Remove beside
+/// it. That removal would set `left_at` on the one membership that is
+/// structural: the agent would still be live, but unable to answer in or
+/// discover the space that is the designated residence of its core memory, and
+/// nothing in the GUI can grant a membership back to a notebook.
+#[test]
+fn a_notebook_owner_cannot_be_removed_from_its_own_notebook() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        let notebook = promote(&core, &agent).notebook_space_id;
+
+        let err = core
+            .runtime()
+            .block_on(core.remove_space_participant(notebook.clone(), agent.clone()))
+            .expect_err("the notebook's owner is not removable");
+        assert!(
+            err.to_string().contains("notebook"),
+            "the refusal says why: {err}"
+        );
+        assert!(
+            member(&core, &notebook, &agent).is_some(),
+            "it is still a member of its own notebook"
+        );
+        // And the ordinary case is untouched: it can still be taken out of a
+        // conversation it merely works in.
+        assert!(
+            core.runtime()
+                .block_on(core.remove_space_participant(space.clone(), agent.clone()))
+                .expect("an ordinary removal"),
+            "leaving a conversation still works"
+        );
+        assert!(member(&core, &space, &agent).is_none());
+        assert!(
+            member(&core, &notebook, &agent).is_some(),
+            "and its notebook membership is untouched by that"
+        );
+    });
+}
