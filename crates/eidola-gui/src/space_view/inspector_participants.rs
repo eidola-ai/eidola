@@ -637,16 +637,43 @@ impl SpaceView {
         mounted.then_some(target)
     }
 
-    /// Retire an open disclosure whose participant has **left the roster** —
-    /// another window removed it, and the store's re-list is the only news this
-    /// view gets. Nothing paints the editor once its row is gone, so every
-    /// window-local thing hanging off it becomes a claim about a surface that is
-    /// not there: its dropdown (above), and — worse — the field focus, which
-    /// would go on reporting through `inspector_field_focused` that a **dead**
-    /// input holds the keyboard, leaving type-to-compose inert until a click
-    /// revived it. That is the unmount no verb can clean up after, which is why
-    /// it is reconciled at the head of `render` instead: the roster is what
-    /// decides whether the editor paints, so the roster is what has to retire it.
+    /// Retire an open disclosure whose participant **no longer answers to the
+    /// shape it was seeded from** — the roster is what decides whether the
+    /// editor paints, so the roster is what has to retire it. Two ways a row
+    /// stops answering, and the same reconcile covers both:
+    ///
+    /// * **It left.** Another window removed it, and the store's re-list is the
+    ///   only news this view gets. Nothing paints the editor once its row is
+    ///   gone, so every window-local thing hanging off it becomes a claim about
+    ///   a surface that is not there: its dropdown (above), and — worse — the
+    ///   field focus, which would go on reporting through
+    ///   `inspector_field_focused` that a **dead** input holds the keyboard,
+    ///   leaving type-to-compose inert until a click revived it.
+    /// * **It became something else.** Promotion keeps the participant's id, so
+    ///   the re-list carries the same row with `source` flipped to
+    ///   `referenced` — invisible to an id check, and the editor is seeded on
+    ///   exactly that distinction. Left standing it paints the *owned* form over
+    ///   a shared agent: no Everyone/This-space fork, a live "Share this agent…"
+    ///   over something that already is one, and a **Save** routed to
+    ///   `update_everywhere` — publishing the draft to every space the agent
+    ///   joins without the reader ever being shown the choice (Codex review, PR
+    ///   #279).
+    ///
+    /// **Retire rather than re-seed**, because the fork is a decision only the
+    /// reader can make: adopting a mode for them would silently retarget the
+    /// values on screen to a different destination, which is the very thing
+    /// [`Self::inspector_set_edit_mode`] re-seeds to prevent. Re-opening the row
+    /// gives the referenced editor, its chips, and its safe default. This is the
+    /// same rule [`Self::inspector_confirm_promote`] already applies when *this*
+    /// window does the promoting ("what it was editing has changed shape"); all
+    /// that is new is that another window's promotion arrives as a re-list
+    /// rather than as a verb, and a re-list is not a thing anyone can clean up
+    /// after by hand. The armed share confirmation needs no separate handling —
+    /// it lives **inside** `ParticipantEdit`, so it cannot outlive it.
+    ///
+    /// The mirror case cannot arise: promotion is one-way (app-core offers no
+    /// demotion), so a `referenced` row never becomes `owned` under an open
+    /// editor. `scope` moves with `source` and adds nothing to ask about.
     ///
     /// **Focus comes back from a panel that is holding it** — `set_inspector_open`'s
     /// rule, restored only to a lender who still has nothing.
@@ -655,26 +682,29 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pid) = self
+        let Some((pid, was_referenced)) = self
             .inspector_participant_edit
             .as_ref()
-            .map(|e| e.participant_id.clone())
+            .map(|e| (e.participant_id.clone(), e.is_referenced))
         else {
             return;
         };
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
-        // Only a listing that has answered can say a row is gone: a first load
-        // in flight, or a failed one with nothing prior, knows nothing.
-        let gone = {
+        // Only a listing that has answered can say anything about a row: a first
+        // load in flight, or a failed one with nothing prior, knows nothing.
+        let stale = {
             let store = self.stores.participants.read(cx);
             match store.participants(&space_id).value() {
-                Some(list) => !list.iter().any(|p| p.id == pid),
+                Some(list) => match list.iter().find(|p| p.id == pid) {
+                    None => true,
+                    Some(p) => (p.source == "referenced") != was_referenced,
+                },
                 None => false,
             }
         };
-        if !gone {
+        if !stale {
             return;
         }
         let held = self.inspector_field_focused(window, cx);

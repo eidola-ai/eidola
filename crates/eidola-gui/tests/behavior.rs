@@ -7403,6 +7403,118 @@ fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAp
     drain_runtime(&core);
 }
 
+/// **An open editor is valid only while its row still answers to the shape it
+/// was seeded from** (Codex review, PR #279).
+///
+/// Promotion keeps the participant's id, so the roster's re-list carries the
+/// same row — with `source` flipped to `referenced`. An editor seeded on the
+/// *owned* shape then goes on painting the owned form: no Everyone/This-space
+/// fork, a live "Share this agent…" over an agent that already is one, and — the
+/// harm — a **Save** that routes to `update_everywhere`, publishing the draft to
+/// every space the shared agent joins without ever showing the reader the choice
+/// they were entitled to make.
+#[gpui::test]
+fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
+    cx: &mut TestAppContext,
+) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    let before = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .clone()
+    });
+    let agent = before.id.clone();
+    assert_eq!(before.source, "owned");
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx)
+        });
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .expect("the disclosure is the editor");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| {
+            s.set_value("Published to every space", window, cx)
+        });
+    })
+    .unwrap();
+    // With the share armed, too: an irreversible verb aimed at a row that has
+    // since become something else must not survive either.
+    view.update(cx, |v, cx| v.inspector_begin_promote(cx));
+
+    // Another window shares the same agent. Its id does not move — only what it
+    // *is* — so the roster-leave rule alone sees nothing.
+    core.runtime()
+        .block_on(core.promote_participant(agent.clone(), None))
+        .expect("the other window's share");
+    stores
+        .participants
+        .update(cx, |s, cx| s.refresh(space.clone(), cx));
+    wait_until(cx, "the roster re-lists it as shared", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent && p.source == "referenced")
+        })
+    });
+    draw_window(cx, window);
+
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_editing_participant().is_none()),
+        "an editor seeded on an owned agent must not go on describing a shared one"
+    );
+    assert!(
+        !view.read_with(cx, |v, _| v.inspector_promote_confirming()),
+        "the armed share dies with the editor that owned it"
+    );
+
+    // The verb the stale editor was still offering writes nothing now. Read the
+    // database, not the cached roster: the claim is about what was durably
+    // published, and `drain_runtime` is what makes "no write was issued" and "a
+    // write landed" distinguishable in one bounded step.
+    view.update(cx, |v, cx| v.inspector_save_participant_edit(cx));
+    cx.run_until_parked();
+    drain_runtime(&core);
+    cx.run_until_parked();
+    let durable = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.id == agent)
+        .expect("still a member");
+    assert_eq!(
+        durable.label, before.label,
+        "the draft was never published to every space that follows the shared row"
+    );
+
+    // Re-opening seeds the editor the row now deserves: the fork, in its safe
+    // mode, with nothing armed.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx)
+        });
+    })
+    .unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.inspector_editing_mode()),
+        Some(EditMode::OverrideHere),
+        "a referenced global opens in this-space-only"
+    );
+
+    drain_runtime(&core);
+}
+
 /// A shared agent's **notebook** is a real space, and the Library is the list of
 /// the human's conversations — so promotion must not put a new row in it.
 /// `AppCore::list_spaces` excludes notebooks unconditionally; this is the GUI's
