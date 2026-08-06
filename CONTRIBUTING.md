@@ -14,4 +14,4 @@ Contribute using a name and email address you are comfortable making permanently
 
 ## Runbooks
 
-Operational guides for maintainers and release engineers live in [docs/contributing/](docs/contributing/README.md).
+Operational guides for maintainers and release officers live in [docs/contributing/](docs/contributing/README.md).

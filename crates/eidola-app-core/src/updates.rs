@@ -12,7 +12,7 @@
 //! ## Source of truth
 //!
 //! Only the GitHub release **marked `latest`** counts. That marker is
-//! applied by the release engineer's tooling *after* the human attestation
+//! applied by the release officer's tooling *after* the human attestation
 //! is signed and uploaded (see `.github/workflows/tinfoil-build.yml` — CI
 //! deliberately does not mark its release `latest`), so it is the
 //! human-attested signal. A `v*` release that exists but isn't `latest` is
