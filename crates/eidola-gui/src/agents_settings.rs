@@ -399,6 +399,16 @@ impl AgentsSettingsView {
     /// Retire an open editor or an armed retirement whose agent has left the
     /// roster. Only a listing that has *answered* can say a row is gone — a load
     /// in flight, or a failed one with nothing prior, knows nothing.
+    ///
+    /// **Here presence is the whole question**, where the space inspector's twin
+    /// must also ask whether the row still *is* what its editor was seeded from
+    /// (see `sync_inspector_participant_edit`). The difference is structural, not
+    /// an oversight: this roster is `list_global_agents`, and "a live shared
+    /// agent, edited everywhere" is both the only shape this editor assumes and
+    /// the roster's own membership predicate — so leaving is the only way to stop
+    /// answering to it. Nothing shape-like is cached either: `AgentDraft` holds
+    /// values, and the row's one conditional affordance (the Notebook door) is
+    /// re-derived from the live row every frame rather than snapshotted.
     fn sync_open_forms(&mut self, cx: &mut Context<Self>) {
         let Some(list) = self.agents_store.read(cx).agents().value() else {
             return;
