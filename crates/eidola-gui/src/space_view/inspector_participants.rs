@@ -826,6 +826,13 @@ impl SpaceView {
         self.inspector_participant_picker = None;
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        // **A fresh list starts where its cursor does.** The scroll handle is a
+        // view field, so it outlives the form: reopening built a form whose
+        // cursor is 0 while the list still showed wherever the last one was
+        // left, and Enter armed a candidate nobody could see (Codex review, PR
+        // #280). Replaced with the form, the way `quote_elsewhere` replaces the
+        // picker's.
+        self.inspector_invite_scroll = gpui::UniformListScrollHandle::new();
         self.inspector_invite = Some(InviteForm {
             focus,
             list_focus: cx
@@ -2076,6 +2083,33 @@ impl SpaceView {
         cx.notify();
     }
 
+    /// **The cursor as the row renders it** — `None` unless the list itself
+    /// holds the keyboard.
+    ///
+    /// The stored cursor is where ↑/↓ left it; whether a row should *say* so is
+    /// a different question, and the answer is the Library's: the cursor is the
+    /// row's focus identity, so it belongs to the row only while the list is
+    /// the focused element. Otherwise the form's own focus (the door's reveal,
+    /// before the read has even landed) painted a ring on the first candidate,
+    /// and Tab moving on to Cancel left it there — two focus indications for
+    /// one focus, and an `aria_active_descendant` claiming a row is focused
+    /// while the real focus is a button beside it (Codex review, PR #280).
+    fn invite_cursor_row(&self, window: &Window) -> Option<usize> {
+        let form = self.inspector_invite.as_ref()?;
+        form.list_focus
+            .is_focused(window)
+            .then(|| self.invite_cursor())
+            .flatten()
+    }
+
+    /// Test seam over [`Self::invite_cursor_row`] — the same computation the
+    /// rows render from, so pinning it pins the render (the Library's
+    /// `cursor_and_reveal_for_test` idiom).
+    #[doc(hidden)]
+    pub fn invite_cursor_row_for_test(&self, window: &Window) -> Option<usize> {
+        self.invite_cursor_row(window)
+    }
+
     /// Test seam: where the invite list's roving cursor effectively sits.
     #[doc(hidden)]
     pub fn invite_cursor_for_test(&self) -> Option<usize> {
@@ -2125,7 +2159,10 @@ impl SpaceView {
                 (range.start + offset, c.id.clone(), line)
             })
             .collect();
-        let cursor = self.invite_cursor();
+        // Focus-gated (the row's focus identity), then modality-gated again for
+        // the ring alone: a programmatic cursor must not paint a keyboard
+        // indicator for a pointer reader.
+        let cursor = self.invite_cursor_row(window);
         let on_cursor = |i: usize| cursor == Some(i);
         let keyboard = window.last_input_was_keyboard();
         visible

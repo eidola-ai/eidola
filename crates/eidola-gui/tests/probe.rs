@@ -5338,6 +5338,42 @@ fn space_inspector_invite_list_is_bounded(cx: &mut TestAppContext) {
         .expect("the cursor scrolled the last candidate into being");
     assert_eq!(last.role, gpui::Role::ListItem, "a managed descendant");
 
+    // **Reopening starts at the top.** The scroll handle is a view field, so it
+    // outlives the form: a reopened list left showing the far end while its
+    // fresh cursor sat on candidate 0 would arm someone nobody could see
+    // (Codex review, PR #280).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_invite(window, cx));
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+        view.update(cx, |v, cx| {
+            v.seed_invite_candidates_for_test(
+                (0..60)
+                    .map(|i| eidola_app_core::GrantableAgent {
+                        id: format!("agent-{i}"),
+                        label: format!("Agent {i}"),
+                        shared: true,
+                        home_space_title: None,
+                    })
+                    .collect(),
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert!(
+        entries
+            .iter()
+            .any(|(n, _)| n == "space/inspector/participants/invite/0"),
+        "the reopened list shows the candidate its cursor is on"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/inspector/participants/invite/59"),
+        "…and not where the last one was left"
+    );
+
     probe::set_probes_enabled(false);
 }
 
