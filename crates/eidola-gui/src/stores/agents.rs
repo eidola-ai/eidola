@@ -1,10 +1,11 @@
 //! `AgentsStore` — the shared **agent library** (Settings → Agents), task 36.
 //!
 //! Per `crates/eidola-gui/STATE.md`: one gpui entity owning the
-//! `Loadable<Vec<GlobalAgentInfo>>` snapshot, one task slot per operation (a
-//! refresh slot and a mutation slot, ordered exactly as `TemplatesStore`'s are),
-//! its subscription to `Change::Participants` (routed in
-//! `stores::dispatch_change`), and all mutations of the global-agent domain.
+//! `Loadable<Vec<GlobalAgentInfo>>` snapshot, a refresh slot plus **one write
+//! slot per agent** (keyed, because editing one agent and retiring another are
+//! independent — see [`AgentsStore::write_then_settle`]), its subscription to
+//! `Change::Participants` (routed in `stores::dispatch_change`), and all
+//! mutations of the global-agent domain.
 //!
 //! **Why not `ParticipantsStore`.** That store is keyed **per space** all the
 //! way down — its snapshots, its refresh slots, its mutation slots and its
@@ -22,6 +23,7 @@
 //! same row through the same door. What is unique to the library is what only it
 //! can do: **retire** an agent, and **open its notebook**.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use eidola_app_core::{AppCore, GlobalAgentInfo, ParticipantUpdate};
@@ -36,14 +38,21 @@ pub struct AgentsStore {
     /// Supersede slot for the **list refresh** (launch, the pane's Retry, and
     /// every bus-driven `Change::Participants`).
     refresh_task: Option<Task<()>>,
-    /// Supersede slot for the **write-through ops** (each composes
-    /// `write; re-list`). Separate from the refresh slot because a write emits
-    /// `Change::Participants` itself — see [`AgentsStore::refresh`].
-    op_task: Option<Task<()>>,
-    /// A refresh signalled while a mutation held the read; run once it lands.
-    refresh_pending: bool,
-    /// The last write error, surfaced by the pane's op-error banner.
-    op_error: Option<String>,
+    /// **One write slot per agent.** Editing one agent and retiring another are
+    /// independent operations, and the roster offers both verbs on every row at
+    /// once — so a store-wide slot would let the second write replace the first,
+    /// dropping an in-flight write's continuation (its refusal, and the read
+    /// that resolves the roster) or cancelling an unpolled one outright. The
+    /// user's other action then either disappears or, worse, reads as accepted
+    /// (Codex review, PR #279; the doctrine is `crates/eidola-gui/AGENTS.md` →
+    /// "Independent mutations get keyed slots"). Two writes on the **same**
+    /// agent still replace-cancel: that is one control, and last-wins is the
+    /// intended reading.
+    op_tasks: HashMap<String, Task<()>>,
+    /// The last write error **per agent** — keyed exactly as the slots are,
+    /// because a per-row band reading a store-wide slot could not tell "no
+    /// refusal" from "another agent's refusal replaced mine".
+    op_errors: HashMap<String, String>,
 }
 
 impl AgentsStore {
@@ -52,9 +61,8 @@ impl AgentsStore {
             app_core,
             agents: Loadable::NotLoaded,
             refresh_task: None,
-            op_task: None,
-            refresh_pending: false,
-            op_error: None,
+            op_tasks: HashMap::new(),
+            op_errors: HashMap::new(),
         }
     }
 
@@ -67,9 +75,8 @@ impl AgentsStore {
                 None => Loadable::NotLoaded,
             },
             refresh_task: None,
-            op_task: None,
-            refresh_pending: false,
-            op_error: None,
+            op_tasks: HashMap::new(),
+            op_errors: HashMap::new(),
         }
     }
 
@@ -93,14 +100,40 @@ impl AgentsStore {
         };
     }
 
-    pub fn op_error(&self) -> Option<&str> {
-        self.op_error.as_deref()
+    /// Test-only: stand a refusal against one agent, the way a refused write
+    /// leaves one — the stub stores have no backend, so this is how a view test
+    /// reaches the per-row band (`SpacesStore::settle_for_test`'s reason).
+    #[doc(hidden)]
+    pub fn set_op_error_for_test(&mut self, participant_id: &str, message: &str) {
+        self.op_errors
+            .insert(participant_id.to_string(), message.to_string());
     }
 
-    pub fn clear_op_error(&mut self, cx: &mut Context<Self>) {
-        if self.op_error.take().is_some() {
+    /// The standing refusal for one agent's last write, if any.
+    pub fn op_error(&self, participant_id: &str) -> Option<&str> {
+        self.op_errors.get(participant_id).map(String::as_str)
+    }
+
+    /// Whether any refusal stands (the pane's cheap "is there a band anywhere"
+    /// question — it renders each under its own row).
+    pub fn has_op_error(&self) -> bool {
+        !self.op_errors.is_empty()
+    }
+
+    pub fn clear_op_error(&mut self, participant_id: &str, cx: &mut Context<Self>) {
+        if self.op_errors.remove(participant_id).is_some() {
             cx.notify();
         }
+    }
+
+    /// Drop the refusals of agents the roster no longer carries. A refusal about
+    /// an agent that has since been retired (here or in another window) has no
+    /// row left to render under, and the fact it reported is moot — the agent is
+    /// gone. Called by the pane's own roster reconciliation, so nothing is
+    /// dropped on a listing that has not answered.
+    pub fn forget_op_errors_absent_from(&mut self, present: &[String]) {
+        self.op_errors
+            .retain(|id, _| present.iter().any(|p| p == id));
     }
 
     /// Refresh the roster — its own supersede slot, deliberately not the
@@ -119,8 +152,14 @@ impl AgentsStore {
         let Some(core) = self.app_core.clone() else {
             return;
         };
-        if self.op_task.is_some() {
-            self.refresh_pending = true;
+        // A refresh signalled while any write is in flight is **dropped, not
+        // queued**: every write's completion issues the batch-end read
+        // unconditionally once the last slot clears, and that read runs strictly
+        // later than this one would have — so it fetches everything the dropped
+        // refresh was going to. (`SpacesStore` keeps a `refresh_pending` flag
+        // for this, but its batch end is unconditional too, so nothing reads it;
+        // a bool nobody consults is state that can only go stale.)
+        if !self.op_tasks.is_empty() {
             return;
         }
         self.agents = std::mem::take(&mut self.agents).to_loading();
@@ -144,12 +183,34 @@ impl AgentsStore {
         }
     }
 
-    /// The shared write-through shape: run `op`, then re-list. The re-list runs
-    /// on **every** exit, failure included — it discharges the debt of having
-    /// taken over the read, and `settle_mutation` resolves the cell either way
-    /// (the write's refusal wins `op_error`; a re-list that itself fails lands
-    /// `Failed { prior }` rather than a spinner with no live task).
-    fn write_then_relist<F>(&mut self, cx: &mut Context<Self>, op: F)
+    /// The write-through shape: run `op` in **that agent's own slot**, record
+    /// its refusal under the same key, and — once no write is left in flight —
+    /// take the read that resolves the roster.
+    ///
+    /// **The mutation takes over the read.** It drops any in-flight refresh,
+    /// which may have been issued before this write and would re-stale the
+    /// snapshot by resolving after it; cancelling another slot's fetch is a debt
+    /// (`crates/eidola-gui/STATE.md` → "Concurrency patterns") that the
+    /// batch-end read below discharges — including the `Loading` a cancelled
+    /// initial load left behind, which `refresh` resolves either way.
+    ///
+    /// **The resolving read is taken after the last write, not carried from
+    /// before it.** The cell is one listing for every agent, so a read each
+    /// operation issued for itself would begin right after *its own* write —
+    /// possibly long before a sibling's commits — and the operation that
+    /// happened to settle last would resolve the roster with a snapshot
+    /// predating an accepted write. Issuing it only once `op_tasks` is empty
+    /// makes "after every write of the batch" a property of *when it is taken*.
+    /// It goes through [`Self::refresh`], so the rule re-arms recursively: a
+    /// mutation starting during that read drops it and owes the next one.
+    ///
+    /// **No optimism, so no inverse.** Unlike `SpacesStore`, nothing here edits
+    /// the cached listing before the write returns — a retirement or a rename
+    /// shows when the re-list says so. That is what keeps this the *simple*
+    /// keyed shape: with no local edit outstanding there is nothing a refused
+    /// write must take back, and the roster can never show a value the database
+    /// refused.
+    fn write_then_settle<F>(&mut self, participant_id: String, cx: &mut Context<Self>, op: F)
     where
         F: FnOnce(
                 Arc<AppCore>,
@@ -161,23 +222,28 @@ impl AgentsStore {
         let Some(core) = self.app_core.clone() else {
             return;
         };
-        self.op_error = None;
+        self.op_errors.remove(&participant_id);
         // Take over the read for the duration of the write.
         self.refresh_task = None;
-        self.refresh_pending = false;
-        let relist_core = core.clone();
-        self.op_task = Some(cx.spawn(async move |this, cx| {
-            let op_result = op(core).await;
-            let list = bridge(relist_core, |c| async move { c.list_global_agents().await }).await;
-            let _ = this.update(cx, |this, cx| {
-                this.op_error = crate::stores::settle_mutation(&mut this.agents, list, op_result);
-                this.op_task = None;
-                if std::mem::take(&mut this.refresh_pending) {
-                    this.refresh(cx);
-                }
-                cx.notify();
-            });
-        }));
+        let key = participant_id.clone();
+        self.op_tasks.insert(
+            participant_id,
+            cx.spawn(async move |this, cx| {
+                let op_result = op(core).await;
+                let _ = this.update(cx, |this, cx| {
+                    // Drop this op's slot *first*: whether it is the last one in
+                    // flight is what decides who owes the resolving read.
+                    this.op_tasks.remove(&key);
+                    if let Err(message) = op_result {
+                        this.op_errors.insert(key.clone(), message);
+                    }
+                    if this.op_tasks.is_empty() {
+                        this.refresh(cx);
+                    }
+                    cx.notify();
+                });
+            }),
+        );
         cx.notify();
     }
 
@@ -191,7 +257,8 @@ impl AgentsStore {
         update: ParticipantUpdate,
         cx: &mut Context<Self>,
     ) {
-        self.write_then_relist(cx, move |core| {
+        let key = participant_id.clone();
+        self.write_then_settle(key, cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
                     c.update_space_participant(participant_id, update).await
@@ -207,7 +274,8 @@ impl AgentsStore {
     /// its authorship survive; there is no un-retire here because app-core
     /// offers none.
     pub fn retire(&mut self, participant_id: String, cx: &mut Context<Self>) {
-        self.write_then_relist(cx, move |core| {
+        let key = participant_id.clone();
+        self.write_then_settle(key, cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
                     c.retire_participant(participant_id).await

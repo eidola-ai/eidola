@@ -290,7 +290,16 @@ impl Render for AgentsSettingsView {
 
         let theme = cx.theme();
         let agents = self.agents(cx);
-        let op_error = self.agents_store.read(cx).op_error().map(str::to_string);
+        // Refusals are keyed per agent and render under their own rows — except
+        // in the failed-load branch below, which owns the whole body and would
+        // otherwise swallow them.
+        let standing_errors: Vec<(GlobalAgentInfo, String)> = {
+            let store = self.agents_store.read(cx);
+            agents
+                .iter()
+                .filter_map(|a| store.op_error(&a.id).map(|e| (a.clone(), e.to_string())))
+                .collect()
+        };
         let (load_error, has_value) = {
             let cell = self.agents_store.read(cx).agents();
             (cell.error().map(|e| e.to_string()), cell.has_value())
@@ -334,8 +343,8 @@ impl Render for AgentsSettingsView {
             ));
             // A refused write and a failed re-list are two truths that can hold
             // at once; this branch owns the body, so it carries both.
-            if let Some(err) = op_error {
-                col = col.child(self.render_op_error(&err, cx));
+            for (agent, err) in &standing_errors {
+                col = col.child(self.render_op_error(agent, err, cx));
             }
             return col;
         }
@@ -364,10 +373,6 @@ impl Render for AgentsSettingsView {
 
         for agent in &agents {
             col = col.child(self.render_row(agent, cx));
-        }
-
-        if let Some(err) = op_error {
-            col = col.child(self.render_op_error(&err, cx));
         }
 
         // A refresh failure over rows we still hold: keep them, say so quietly.
@@ -409,13 +414,69 @@ impl AgentsSettingsView {
         {
             self.retiring = None;
         }
+        // A refusal about an agent the roster no longer carries has no row to
+        // render under, and nothing left to say — the agent is gone. The store
+        // is told here rather than deciding for itself, because only a listing
+        // that has answered can say a row is absent.
+        let present_ids: Vec<String> = list.iter().map(|a| a.id.clone()).collect();
+        self.agents_store
+            .update(cx, |s, _| s.forget_op_errors_absent_from(&present_ids));
     }
 
-    fn render_op_error(&self, err: &str, cx: &Context<Self>) -> impl IntoElement {
-        div()
-            .id("agents-error")
-            .probe("settings/agents/error", gpui::Role::Alert, err.to_string())
-            .child(error_banner(err, cx))
+    /// A refused write, rendered **under the row it was about**.
+    ///
+    /// The store keys refusals per agent, so the surface has to as well: two can
+    /// stand at once, and a single store-wide band could not tell the reader
+    /// which of their two actions was refused — nor could it show the second
+    /// without discarding the first. The row is the context, so the band needs
+    /// no subject in its visible text; its **accessible name carries the name**,
+    /// because a screen reader meets the alert without the row above it. Its
+    /// probes are keyed for the same reason element ids must be unique per
+    /// painted element.
+    ///
+    /// Dismissible: nothing else clears a refusal until the next write to that
+    /// same agent, so the × is how a reader acknowledges one — it never implies
+    /// the write succeeded.
+    fn render_op_error(
+        &self,
+        agent: &GlobalAgentInfo,
+        err: &str,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let id = agent.id.clone();
+        let dismiss_id = agent.id.clone();
+        let subject = agent.label.clone();
+        h_flex()
+            .id(SharedString::from(format!("agents-error-{id}")))
+            .probe(
+                SharedString::from(format!("settings/agents/{id}/error")),
+                gpui::Role::Alert,
+                SharedString::from(format!("{subject}: {err}")),
+            )
+            .w_full()
+            .gap_2()
+            .items_start()
+            .justify_between()
+            .child(div().flex_1().min_w_0().child(error_banner(err, cx)))
+            .child(
+                div()
+                    .id(SharedString::from(format!("agents-error-dismiss-{id}")))
+                    .probe(
+                        SharedString::from(format!("settings/agents/{id}/error/dismiss")),
+                        gpui::Role::Button,
+                        SharedString::from(format!("Dismiss the message about {subject}")),
+                    )
+                    .cursor_pointer()
+                    .text_color(theme.muted_foreground)
+                    .hover(|s| s.text_color(theme.foreground))
+                    .child("×")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let id = dismiss_id.clone();
+                        this.agents_store
+                            .update(cx, |s, cx| s.clear_op_error(&id, cx));
+                    })),
+            )
     }
 
     /// One agent: the resting row, plus whichever of its two forms is open.
@@ -485,6 +546,15 @@ impl AgentsSettingsView {
         }
         if retiring {
             wrap = wrap.child(self.render_retire_confirm(agent, cx));
+        }
+        // This agent's own refused write, under this agent's row.
+        if let Some(err) = self
+            .agents_store
+            .read(cx)
+            .op_error(&agent.id)
+            .map(str::to_string)
+        {
+            wrap = wrap.child(self.render_op_error(agent, &err, cx));
         }
         wrap
     }
