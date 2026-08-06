@@ -7029,7 +7029,10 @@ fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
         label.update(cx, |s, cx| s.set_value("Reviewer", window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.inspector_save_add_participant(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_add_participant(window, cx));
+    })
+    .unwrap();
     wait_until(cx, "participant added", |cx| {
         participant_labels(&stores, &space, cx).contains(&"Reviewer".to_string())
     });
@@ -7050,7 +7053,12 @@ fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
     );
 
     // Remove it, from its own disclosure.
-    view.update(cx, |v, cx| v.inspector_remove_participant(&reviewer.id, cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_remove_participant(&reviewer.id, window, cx)
+        });
+    })
+    .unwrap();
     wait_until(cx, "participant removed", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
     });
@@ -7091,7 +7099,10 @@ fn inspector_participant_system_prompt_round_trips(cx: &mut TestAppContext) {
         });
     })
     .unwrap();
-    view.update(cx, |v, cx| v.inspector_save_participant_edit(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
+    })
+    .unwrap();
     wait_until(cx, "system prompt persisted", |cx| {
         stores.participants.read_with(cx, |s, _| {
             s.list(&space)
@@ -7150,7 +7161,10 @@ fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
         label.update(cx, |s, cx| s.set_value("Me", window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.inspector_save_participant_edit(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
+    })
+    .unwrap();
     wait_until(cx, "override applied", |cx| {
         stores.participants.read_with(cx, |s, _| {
             s.list(&space)
@@ -7187,7 +7201,10 @@ fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
         label.update(cx, |s, cx| s.set_value("Myself", window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.inspector_save_participant_edit(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
+    })
+    .unwrap();
     wait_until(cx, "edit-everywhere applied", |cx| {
         stores.participants.read_with(cx, |s, _| {
             s.list(&space)
@@ -7257,7 +7274,10 @@ fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
     );
 
     view.update(cx, |v, cx| v.inspector_begin_promote(cx));
-    view.update(cx, |v, cx| v.inspector_confirm_promote(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_confirm_promote(window, cx));
+    })
+    .unwrap();
     // What the editor was editing has changed shape, so it closes.
     assert!(
         view.read_with(cx, |v, _| v.inspector_editing_participant().is_none()),
@@ -7352,7 +7372,10 @@ fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAp
 
     // Share, without touching Save first.
     view.update(cx, |v, cx| v.inspector_begin_promote(cx));
-    view.update(cx, |v, cx| v.inspector_confirm_promote(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_confirm_promote(window, cx));
+    })
+    .unwrap();
 
     wait_until(cx, "the share lands", |cx| {
         stores.participants.read_with(cx, |s, _| {
@@ -7398,6 +7421,80 @@ fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAp
             .read_with(cx, |s, _| s.op_error(&space).map(str::to_string))
             .is_none(),
         "the share was accepted"
+    );
+
+    drain_runtime(&core);
+}
+
+/// The inspector's half of the handback rule (Codex review, PR #279): the
+/// roster-driven retire has always restored the keyboard, but the verbs a reader
+/// actually presses — Cancel, Save, and the ones that close a form on the way to
+/// doing something else — dropped their focused fields and left the window
+/// holding a dead handle.
+#[gpui::test]
+fn inspector_hands_the_keyboard_back_when_a_form_closes(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+    let agent = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .id
+            .clone()
+    });
+
+    let view_holds_the_keyboard = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.read(cx).focus_handle().is_focused(window)
+        })
+        .unwrap()
+    };
+    // Opening a disclosure focuses its name field (the reveal-focuses rule), so
+    // every case below starts with the form holding the keyboard.
+    let open_the_disclosure = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.inspector_toggle_participant(&agent, window, cx)
+            });
+        })
+        .unwrap();
+        assert!(!view_holds_the_keyboard(cx), "the name field has it");
+    };
+
+    open_the_disclosure(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_participant_edit(window, cx));
+    })
+    .unwrap();
+    assert!(view_holds_the_keyboard(cx), "Cancel hands it back");
+
+    open_the_disclosure(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
+    })
+    .unwrap();
+    assert!(view_holds_the_keyboard(cx), "Save hands it back");
+
+    // The add form is the same shape, and its Cancel is the same door.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_add_participant(window, cx));
+    })
+    .unwrap();
+    assert!(
+        !view_holds_the_keyboard(cx),
+        "the add form's name field has it"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_add_participant(window, cx));
+    })
+    .unwrap();
+    assert!(
+        view_holds_the_keyboard(cx),
+        "the add form hands it back too"
     );
 
     drain_runtime(&core);
@@ -7482,7 +7579,10 @@ fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
     // database, not the cached roster: the claim is about what was durably
     // published, and `drain_runtime` is what makes "no write was issued" and "a
     // write landed" distinguishable in one bounded step.
-    view.update(cx, |v, cx| v.inspector_save_participant_edit(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
+    })
+    .unwrap();
     cx.run_until_parked();
     drain_runtime(&core);
     cx.run_until_parked();
@@ -7654,7 +7754,10 @@ fn agents_pane_lists_edits_and_opens_the_notebook(cx: &mut TestAppContext) {
         label.update(cx, |s, cx| s.set_value("Ada", window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.save_edit(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.save_edit(window, cx));
+    })
+    .unwrap();
     wait_until(cx, "the rename lands", |cx| {
         stores
             .agents
@@ -7680,6 +7783,97 @@ fn agents_pane_lists_edits_and_opens_the_notebook(cx: &mut TestAppContext) {
         view.read_with(cx, |v, _| v.notebooks_opened_for_test()),
         1,
         "the notebook opens as a space window"
+    );
+
+    drain_runtime(&core);
+}
+
+/// **A form that closes hands the keyboard back** (Codex review, PR #279).
+///
+/// The editor's fields are focusable elements owned by the draft, and every way
+/// the editor closes — Cancel, Save, arming Retire, or a roster refresh that
+/// drops the agent — drops them. Whatever the window was focused on is then a
+/// handle to something nobody paints: no keystroke reaches anything, and Tab
+/// restarts from the window root instead of resuming beside the row the reader
+/// was working on. The `held` observation has to be taken **before** the drop,
+/// since a dead input's handle is gone with it.
+#[gpui::test]
+fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    let agent = share_the_seeded_agent(cx, &stores, &space);
+
+    let pane_holds_the_keyboard = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.read(cx).focus_handle().is_focused(window)
+        })
+        .unwrap()
+    };
+    let open_and_focus_the_charter = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.toggle_edit(&agent, window, cx));
+        })
+        .unwrap();
+        let prompt = view
+            .read_with(cx, |v, _| v.editing_prompt_state())
+            .expect("the editor is open");
+        cx.update_window(window, |_, window, cx| {
+            prompt.update(cx, |s, cx| s.focus(window, cx));
+        })
+        .unwrap();
+        assert!(
+            !pane_holds_the_keyboard(cx),
+            "the charter holds the keyboard while the editor is open"
+        );
+    };
+
+    // Cancel.
+    open_and_focus_the_charter(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_edit(window, cx));
+    })
+    .unwrap();
+    assert!(pane_holds_the_keyboard(cx), "Cancel hands it back");
+
+    // Save.
+    open_and_focus_the_charter(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.save_edit(window, cx));
+    })
+    .unwrap();
+    assert!(pane_holds_the_keyboard(cx), "Save hands it back");
+
+    // Arming a retirement, which replaces the editor.
+    open_and_focus_the_charter(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent, window, cx));
+    })
+    .unwrap();
+    assert!(pane_holds_the_keyboard(cx), "arming Retire hands it back");
+    view.update(cx, |v, cx| v.cancel_retire(cx));
+
+    // And the unmount no verb pressed: the agent leaves the roster under an
+    // open editor, and `sync_open_forms` retires it at the head of `render`.
+    open_and_focus_the_charter(cx);
+    let handle = stores.app_core().expect("a real core");
+    handle
+        .runtime()
+        .block_on(handle.retire_participant(agent.clone()))
+        .expect("the other window's retirement");
+    stores.agents.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the roster drops it", |cx| {
+        stores.agents.read_with(cx, |s, _| s.list().is_empty())
+    });
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.editing_agent().is_none()),
+        "the editor went with its row"
+    );
+    assert!(
+        pane_holds_the_keyboard(cx),
+        "and so did the keyboard it was holding"
     );
 
     drain_runtime(&core);
@@ -7713,7 +7907,10 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
         label.update(cx, |s, cx| s.set_value("Renamed in passing", window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.arm_retire(&agent, cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent, window, cx));
+    })
+    .unwrap();
     assert!(
         view.read_with(cx, |v, _| v.editing_agent().is_none()),
         "arming the retirement closes the editor it replaces"
@@ -7729,7 +7926,10 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
     );
 
     // Armed, then stood down — nothing is written.
-    view.update(cx, |v, cx| v.arm_retire(&agent, cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent, window, cx));
+    })
+    .unwrap();
     assert_eq!(
         view.read_with(cx, |v, _| v.retiring_agent().map(str::to_string)),
         Some(agent.clone())
@@ -7743,7 +7943,10 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
         "declining the confirmation retires nothing"
     );
 
-    view.update(cx, |v, cx| v.arm_retire(&agent, cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent, window, cx));
+    })
+    .unwrap();
     view.update(cx, |v, cx| v.confirm_retire(cx));
     wait_until(cx, "the retirement lands", |cx| {
         stores.agents.read_with(cx, |s, _| s.list().is_empty())
@@ -12254,7 +12457,7 @@ fn space_inspector_a_form_that_leaves_takes_its_dropdown_with_it(cx: &mut TestAp
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
             v.inspector_begin_template(window, cx);
-            v.inspector_cancel_template(cx);
+            v.inspector_cancel_template(window, cx);
         })
     })
     .unwrap();
@@ -12285,7 +12488,12 @@ fn space_inspector_removing_a_participant_takes_its_dropdown_with_it(cx: &mut Te
     draw_window(cx, window);
     assert!(view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()));
 
-    view.update(cx, |v, cx| v.inspector_remove_participant("agent-1", cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_remove_participant("agent-1", window, cx)
+        });
+    })
+    .unwrap();
     draw_window(cx, window);
 
     assert!(

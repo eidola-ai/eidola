@@ -3008,7 +3008,10 @@ fn agents_pane_probes_cover_rows_editor_and_retire(cx: &mut TestAppContext) {
     // A refused write stands **under its own row**, keyed like the store's slot,
     // so two of them can be told apart — and its accessible name carries the
     // agent's, which the row above it cannot supply to a screen reader.
-    view.update(cx, |v, cx| v.cancel_edit(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_edit(window, cx));
+    })
+    .unwrap();
     let refusal = "Couldn't save: notify policy must be explicit, human or all";
     stores
         .agents
@@ -3033,7 +3036,10 @@ fn agents_pane_probes_cover_rows_editor_and_retire(cx: &mut TestAppContext) {
     );
 
     // The retire confirmation — its note is a readable node, not only pixels.
-    view.update(cx, |v, cx| v.arm_retire("agent-ada", cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire("agent-ada", window, cx));
+    })
+    .unwrap();
     let names = fresh_names(cx, window);
     for expected in [
         "settings/agents/agent-ada/retire/note",

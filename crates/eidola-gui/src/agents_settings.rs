@@ -27,9 +27,9 @@
 
 use eidola_app_core::{GlobalAgentInfo, ParticipantUpdate};
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
-    prelude::FluentBuilder,
+    AppContext, Context, Entity, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
+    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Window, div, prelude::FluentBuilder,
 };
 use gpui_component::{
     ActiveTheme, StyledExt as _, h_flex,
@@ -77,6 +77,10 @@ pub struct AgentsSettingsView {
     retiring: Option<String>,
     /// The open dropdown's own scroll (reset to the top on each open).
     picker_scroll: ScrollHandle,
+    /// Where the keyboard goes when an editor holding it closes — the pane's
+    /// own root, tracked on the element below, so Tab resumes from the roster
+    /// rather than from the window.
+    focus_handle: FocusHandle,
     /// How many notebook windows this pane has asked for — the behavior tests'
     /// seam, since the open is deferred and stub tests have no window to
     /// inspect (the Library's `open_space_requests` counter, same reason).
@@ -104,6 +108,7 @@ impl AgentsSettingsView {
             draft: None,
             retiring: None,
             picker_scroll: ScrollHandle::new(),
+            focus_handle: cx.focus_handle(),
             notebooks_opened: 0,
             _subscriptions: subscriptions,
         }
@@ -114,6 +119,11 @@ impl AgentsSettingsView {
     }
 
     // -- Test seams --------------------------------------------------------
+
+    /// The pane's own focus target — what an editor hands the keyboard back to.
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 
     #[doc(hidden)]
     pub fn editing_agent(&self) -> Option<&str> {
@@ -155,7 +165,7 @@ impl AgentsSettingsView {
         cx: &mut Context<Self>,
     ) {
         if self.editing_agent() == Some(participant_id) {
-            self.cancel_edit(cx);
+            self.cancel_edit(window, cx);
             return;
         }
         let Some(agent) = self.agents(cx).into_iter().find(|a| a.id == participant_id) else {
@@ -182,8 +192,32 @@ impl AgentsSettingsView {
         cx.notify();
     }
 
-    pub fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+    /// Hand the keyboard back to the pane's root when a form that **was**
+    /// holding it has gone and left nothing focused.
+    ///
+    /// `held` is an observation taken *before* the form was dropped, and it has
+    /// to be: the question is asked of the form's own `InputState`s, which die
+    /// with it. Restoring only from a lender still holding it is
+    /// `set_inspector_open`'s rule — a form that never had the keyboard must not
+    /// take it from whatever does.
+    fn hand_back_focus(&mut self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if held && !self.draft_field_focused(window, cx) {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
+    /// Whether the open editor's own fields hold this window's focus.
+    fn draft_field_focused(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.draft.as_ref().is_some_and(|d| {
+            d.label.read(cx).focus_handle(cx).is_focused(window)
+                || d.system_prompt.read(cx).focus_handle(cx).is_focused(window)
+        })
+    }
+
+    pub fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.draft_field_focused(window, cx);
         self.draft = None;
+        self.hand_back_focus(held, window, cx);
         cx.notify();
     }
 
@@ -215,7 +249,8 @@ impl AgentsSettingsView {
 
     /// Commit the open editor — an **edit everywhere**: this is the agent's own
     /// config, which every space that has not overridden the field follows.
-    pub fn save_edit(&mut self, cx: &mut Context<Self>) {
+    pub fn save_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.draft_field_focused(window, cx);
         let Some(draft) = self.draft.take() else {
             return;
         };
@@ -235,14 +270,22 @@ impl AgentsSettingsView {
         };
         self.agents_store
             .update(cx, |s, cx| s.update_agent(draft.participant_id, update, cx));
+        self.hand_back_focus(held, window, cx);
         cx.notify();
     }
 
     // -- Retirement --------------------------------------------------------
 
-    pub fn arm_retire(&mut self, participant_id: &str, cx: &mut Context<Self>) {
+    pub fn arm_retire(
+        &mut self,
+        participant_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let held = self.draft_field_focused(window, cx);
         self.draft = None;
         self.retiring = Some(participant_id.to_string());
+        self.hand_back_focus(held, window, cx);
         cx.notify();
     }
 
@@ -280,13 +323,13 @@ impl AgentsSettingsView {
 }
 
 impl Render for AgentsSettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The roster can move under an open editor or an armed retirement
         // (another window shares or retires an agent; a bus refresh lands), and
         // neither may go on describing a row that has left. Reconciled at the
         // head of `render` for the same reason the inspector's editor is: the
         // unmount is not a verb anyone pressed.
-        self.sync_open_forms(cx);
+        self.sync_open_forms(window, cx);
 
         let theme = cx.theme();
         let agents = self.agents(cx);
@@ -307,6 +350,7 @@ impl Render for AgentsSettingsView {
 
         let mut col = v_flex()
             .id("agents-pane")
+            .track_focus(&self.focus_handle)
             .px_6()
             .py_5()
             .gap_3()
@@ -409,26 +453,37 @@ impl AgentsSettingsView {
     /// answering to it. Nothing shape-like is cached either: `AgentDraft` holds
     /// values, and the row's one conditional affordance (the Notebook door) is
     /// re-derived from the live row every frame rather than snapshotted.
-    fn sync_open_forms(&mut self, cx: &mut Context<Self>) {
-        let Some(list) = self.agents_store.read(cx).agents().value() else {
+    fn sync_open_forms(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The roster is read out before anything is retired, so the store's
+        // borrow ends here rather than straddling the focus handback below.
+        let Some(present_ids) = self
+            .agents_store
+            .read(cx)
+            .agents()
+            .value()
+            .map(|list| list.iter().map(|a| a.id.clone()).collect::<Vec<String>>())
+        else {
             return;
         };
-        let present = |id: &str| list.iter().any(|a| a.id == id);
-        if let Some(d) = self.draft.as_ref()
-            && !present(&d.participant_id)
+        let present = |id: &str| present_ids.iter().any(|p| p == id);
+        if self
+            .draft
+            .as_ref()
+            .is_some_and(|d| !present(&d.participant_id))
         {
+            // The unmount no verb pressed still owes the keyboard back — this
+            // is the path the rule was written for.
+            let held = self.draft_field_focused(window, cx);
             self.draft = None;
+            self.hand_back_focus(held, window, cx);
         }
-        if let Some(id) = self.retiring.as_ref()
-            && !present(id)
-        {
+        if self.retiring.as_ref().is_some_and(|id| !present(id)) {
             self.retiring = None;
         }
         // A refusal about an agent the roster no longer carries has no row to
         // render under, and nothing left to say — the agent is gone. The store
         // is told here rather than deciding for itself, because only a listing
         // that has answered can say a row is absent.
-        let present_ids: Vec<String> = list.iter().map(|a| a.id.clone()).collect();
         self.agents_store
             .update(cx, |s, _| s.forget_op_errors_absent_from(&present_ids));
     }
@@ -622,7 +677,7 @@ impl AgentsSettingsView {
                 format!("Retire {subject_retire}"),
                 false,
                 cx,
-                cx.listener(move |this, _, _, cx| this.arm_retire(&id_retire, cx)),
+                cx.listener(move |this, _, window, cx| this.arm_retire(&id_retire, window, cx)),
             ))
     }
 
@@ -692,7 +747,7 @@ impl AgentsSettingsView {
                         "Cancel",
                         false,
                         cx,
-                        cx.listener(|this, _, _, cx| this.cancel_edit(cx)),
+                        cx.listener(|this, _, window, cx| this.cancel_edit(window, cx)),
                     ))
                     .child(ghost_button_labeled(
                         "agent-editor-save".into(),
@@ -701,7 +756,7 @@ impl AgentsSettingsView {
                         format!("Save {}", agent.label),
                         true,
                         cx,
-                        cx.listener(|this, _, _, cx| this.save_edit(cx)),
+                        cx.listener(|this, _, window, cx| this.save_edit(window, cx)),
                     )),
             )
             .into_any_element()
