@@ -24,6 +24,7 @@ use eidola_app_core::{
 use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
 use eidola_gui::actions::{PostOnly, Send};
+use eidola_gui::agents_settings::AgentsSettingsView;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
 use eidola_gui::participants::EditMode;
@@ -933,6 +934,7 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
                 SettingsPane::General,
                 SettingsPane::Backends,
                 SettingsPane::Templates,
+                SettingsPane::Agents,
                 SettingsPane::Account,
                 SettingsPane::Wallet,
             ],
@@ -955,6 +957,7 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
                 SettingsPane::General,
                 SettingsPane::Backends,
                 SettingsPane::Templates,
+                SettingsPane::Agents,
             ],
             "eidola disabled hides Account and Wallet"
         );
@@ -7026,7 +7029,10 @@ fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
         label.update(cx, |s, cx| s.set_value("Reviewer", window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.inspector_save_add_participant(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_add_participant(window, cx));
+    })
+    .unwrap();
     wait_until(cx, "participant added", |cx| {
         participant_labels(&stores, &space, cx).contains(&"Reviewer".to_string())
     });
@@ -7047,7 +7053,12 @@ fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
     );
 
     // Remove it, from its own disclosure.
-    view.update(cx, |v, cx| v.inspector_remove_participant(&reviewer.id, cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_remove_participant(&reviewer.id, window, cx)
+        });
+    })
+    .unwrap();
     wait_until(cx, "participant removed", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
     });
@@ -7088,7 +7099,10 @@ fn inspector_participant_system_prompt_round_trips(cx: &mut TestAppContext) {
         });
     })
     .unwrap();
-    view.update(cx, |v, cx| v.inspector_save_participant_edit(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
+    })
+    .unwrap();
     wait_until(cx, "system prompt persisted", |cx| {
         stores.participants.read_with(cx, |s, _| {
             s.list(&space)
@@ -7147,7 +7161,10 @@ fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
         label.update(cx, |s, cx| s.set_value("Me", window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.inspector_save_participant_edit(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
+    })
+    .unwrap();
     wait_until(cx, "override applied", |cx| {
         stores.participants.read_with(cx, |s, _| {
             s.list(&space)
@@ -7184,7 +7201,10 @@ fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
         label.update(cx, |s, cx| s.set_value("Myself", window, cx));
     })
     .unwrap();
-    view.update(cx, |v, cx| v.inspector_save_participant_edit(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
+    })
+    .unwrap();
     wait_until(cx, "edit-everywhere applied", |cx| {
         stores.participants.read_with(cx, |s, _| {
             s.list(&space)
@@ -7197,6 +7217,1024 @@ fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
     });
 
     drain_runtime(&core);
+}
+
+/// The **promote affordance** (task 36): "Share this agent…" on a space-owned
+/// agent's disclosure turns it into a shared identity *in place*.
+///
+/// Two things are asserted because both are the feature: the verb asks first
+/// (sharing is one-way — "Not now" leaves the roster exactly as it was), and the
+/// share itself moves ownership without moving configuration. The row comes back
+/// **referenced** with the same id and the same effective persona — which is
+/// also what makes the "shared" tag and the override fork appear with no view
+/// code at all, since both are read off the store's own re-list.
+#[gpui::test]
+fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    let before = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .clone()
+    });
+    assert_eq!(
+        before.source, "owned",
+        "the seeded agent starts space-owned"
+    );
+    let agent = before.id.clone();
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx)
+        });
+    })
+    .unwrap();
+
+    // The confirmation is armed, then stood down — nothing is written.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
+    assert!(view.read_with(cx, |v, _| v.inspector_promote_confirming()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_promote(window, cx));
+    })
+    .unwrap();
+    assert!(!view.read_with(cx, |v, _| v.inspector_promote_confirming()));
+    cx.run_until_parked();
+    assert_eq!(
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .find(|p| p.id == agent)
+                .map(|p| p.source.clone())
+        }),
+        Some("owned".to_string()),
+        "declining the confirmation shares nothing"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_confirm_promote(window, cx));
+    })
+    .unwrap();
+    // What the editor was editing has changed shape, so it closes.
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_editing_participant().is_none()),
+        "the disclosure closes on a share"
+    );
+
+    wait_until(cx, "the share lands", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent && p.source == "referenced")
+        })
+    });
+    let after = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.id == agent)
+            .expect("the shared agent is still a member")
+            .clone()
+    });
+    assert_eq!(after.scope, "global");
+    assert_eq!(after.label, before.label);
+    assert_eq!(after.model_ref, before.model_ref);
+    assert_eq!(after.system_prompt, before.system_prompt);
+    assert_eq!(after.notify_policy, before.notify_policy);
+    assert!(
+        after.reference.is_some(),
+        "a referenced global carries the override fork's detail"
+    );
+    assert!(
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_errors_for(&space).is_empty()),
+        "the share was accepted"
+    );
+
+    drain_runtime(&core);
+}
+
+/// **The confirmation is about the persona on screen.** "Share this agent…" is
+/// pressed from inside the open editor, whose fields stay visible behind the
+/// confirmation — so "keeps this space's persona exactly as it is" is read
+/// against the values the reader is looking at, which are the ones they just
+/// typed. Sharing therefore saves the draft and *then* promotes; discarding it
+/// would make the reassurance false about everything the reader could see
+/// (Codex review, PR #279).
+#[gpui::test]
+fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    let before = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .clone()
+    });
+    let agent = before.id.clone();
+    assert_ne!(
+        before.notify_policy, "explicit",
+        "the notify change below has to be a change"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx)
+        });
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .expect("the disclosure is the editor");
+    let prompt = view
+        .read_with(cx, |v, _| v.inspector_editing_prompt_state())
+        .expect("the disclosure is the editor");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Cartographer", window, cx));
+        prompt.update(cx, |s, cx| {
+            s.set_value("Draw the map before arguing about it.", window, cx)
+        });
+    })
+    .unwrap();
+    view.update(cx, |v, cx| {
+        v.inspector_select_participant_model("gemma4-31b@eidola", cx);
+        v.inspector_set_edit_notify("explicit", cx);
+    });
+
+    // Share, without touching Save first.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_confirm_promote(window, cx));
+    })
+    .unwrap();
+
+    wait_until(cx, "the share lands", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent && p.source == "referenced")
+        })
+    });
+    let after = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.id == agent)
+            .expect("the shared agent is still a member")
+            .clone()
+    });
+    assert_eq!(after.scope, "global");
+    assert_eq!(
+        after.label, "Cartographer",
+        "the name on screen is the name that was shared"
+    );
+    assert_eq!(
+        after.system_prompt.as_deref(),
+        Some("Draw the map before arguing about it."),
+        "the charter on screen is the charter that was shared"
+    );
+    assert_eq!(after.model_ref.as_deref(), Some("gemma4-31b@eidola"));
+    assert_eq!(after.notify_policy, "explicit");
+    // The membership keeps NULL overrides, so the persona above is the shared
+    // agent's own — not this space papering over a stale one.
+    let reference = after.reference.expect("a referenced global carries detail");
+    assert_eq!(reference.base_label, "Cartographer");
+    assert_eq!(
+        reference.base_system_prompt.as_deref(),
+        Some("Draw the map before arguing about it.")
+    );
+    assert!(
+        reference.override_label.is_none() && reference.override_system_prompt.is_none(),
+        "promotion writes no per-space override"
+    );
+    assert!(
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_errors_for(&space).is_empty()),
+        "the share was accepted"
+    );
+
+    drain_runtime(&core);
+}
+
+/// The inspector's half of the handback rule (Codex review, PR #279): the
+/// roster-driven retire has always restored the keyboard, but the verbs a reader
+/// actually presses — Cancel, Save, and the ones that close a form on the way to
+/// doing something else — dropped their focused fields and left the window
+/// holding a dead handle.
+#[gpui::test]
+fn inspector_hands_the_keyboard_back_when_a_form_closes(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+    let agent = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .id
+            .clone()
+    });
+
+    let view_holds_the_keyboard = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.read(cx).focus_handle().is_focused(window)
+        })
+        .unwrap()
+    };
+    // Opening a disclosure focuses its name field (the reveal-focuses rule), so
+    // every case below starts with the form holding the keyboard.
+    let open_the_disclosure = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.inspector_toggle_participant(&agent, window, cx)
+            });
+        })
+        .unwrap();
+        assert!(!view_holds_the_keyboard(cx), "the name field has it");
+    };
+
+    open_the_disclosure(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_participant_edit(window, cx));
+    })
+    .unwrap();
+    assert!(view_holds_the_keyboard(cx), "Cancel hands it back");
+
+    // The same containment question here: focus inside the disclosure that is
+    // not one of its inputs still owes the keyboard back.
+    open_the_disclosure(cx);
+    let subtree = view
+        .read_with(cx, |v, _| v.inspector_editing_focus_handle())
+        .expect("the disclosure is open");
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&subtree, cx);
+    })
+    .unwrap();
+    assert!(!view_holds_the_keyboard(cx), "the form subtree holds it");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_participant_edit(window, cx));
+    })
+    .unwrap();
+    assert!(
+        view_holds_the_keyboard(cx),
+        "containment, not an enumeration of inputs"
+    );
+
+    open_the_disclosure(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
+    })
+    .unwrap();
+    assert!(view_holds_the_keyboard(cx), "Save hands it back");
+
+    // **The share confirmation's buttons are tab stops too**, and arming or
+    // standing down unmounts the one that was pressed while the form itself
+    // survives — so the keyboard goes back *to the form*, where the reader
+    // still is (Codex review, PR #279).
+    open_the_disclosure(cx);
+    let form = view
+        .read_with(cx, |v, _| v.inspector_editing_focus_handle())
+        .expect("the disclosure is open");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _cx| form.is_focused(window))
+            .unwrap(),
+        "arming the share leaves the keyboard on the form it replaced a button in"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_promote(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _cx| form.is_focused(window))
+            .unwrap(),
+        "and so does standing it down"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_participant_edit(window, cx));
+    })
+    .unwrap();
+
+    // The inspector's own sync path: a row that leaves the roster takes the
+    // whole editor — **including an armed share confirmation** — and the
+    // round-5 handback fires for it, because the question is containment of the
+    // form and the confirm lives inside it (Codex review, PR #279 asked; this
+    // is the answer, pinned).
+    open_the_disclosure(cx);
+    let form = view
+        .read_with(cx, |v, _| v.inspector_editing_focus_handle())
+        .expect("the disclosure is open");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+        window.focus(&form, cx);
+    })
+    .unwrap();
+    assert!(!view_holds_the_keyboard(cx), "the form holds the keyboard");
+    stores
+        .participants
+        .update(cx, |s, cx| s.remove(space.clone(), agent.clone(), cx));
+    wait_until(cx, "the row leaves the roster", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| !s.list(&space).iter().any(|p| p.id == agent))
+    });
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_editing_participant().is_none()),
+        "the editor went with its row"
+    );
+    assert!(
+        !view.read_with(cx, |v, _| v.inspector_promote_confirming()),
+        "and the armed confirmation with it"
+    );
+    assert!(
+        view_holds_the_keyboard(cx),
+        "the roster-driven unmount hands the keyboard back too"
+    );
+
+    // The add form is the same shape, and its Cancel is the same door.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_add_participant(window, cx));
+    })
+    .unwrap();
+    assert!(
+        !view_holds_the_keyboard(cx),
+        "the add form's name field has it"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_add_participant(window, cx));
+    })
+    .unwrap();
+    assert!(
+        view_holds_the_keyboard(cx),
+        "the add form hands it back too"
+    );
+
+    drain_runtime(&core);
+}
+
+/// **An open editor is valid only while its row still answers to the shape it
+/// was seeded from** (Codex review, PR #279).
+///
+/// Promotion keeps the participant's id, so the roster's re-list carries the
+/// same row — with `source` flipped to `referenced`. An editor seeded on the
+/// *owned* shape then goes on painting the owned form: no Everyone/This-space
+/// fork, a live "Share this agent…" over an agent that already is one, and — the
+/// harm — a **Save** that routes to `update_everywhere`, publishing the draft to
+/// every space the shared agent joins without ever showing the reader the choice
+/// they were entitled to make.
+#[gpui::test]
+fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
+    cx: &mut TestAppContext,
+) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    let before = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .clone()
+    });
+    let agent = before.id.clone();
+    assert_eq!(before.source, "owned");
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx)
+        });
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .expect("the disclosure is the editor");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| {
+            s.set_value("Published to every space", window, cx)
+        });
+    })
+    .unwrap();
+    // With the share armed, too: an irreversible verb aimed at a row that has
+    // since become something else must not survive either.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
+
+    // Another window shares the same agent. Its id does not move — only what it
+    // *is* — so the roster-leave rule alone sees nothing.
+    core.runtime()
+        .block_on(core.promote_participant(agent.clone(), None))
+        .expect("the other window's share");
+    stores
+        .participants
+        .update(cx, |s, cx| s.refresh(space.clone(), cx));
+    wait_until(cx, "the roster re-lists it as shared", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent && p.source == "referenced")
+        })
+    });
+    draw_window(cx, window);
+
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_editing_participant().is_none()),
+        "an editor seeded on an owned agent must not go on describing a shared one"
+    );
+    assert!(
+        !view.read_with(cx, |v, _| v.inspector_promote_confirming()),
+        "the armed share dies with the editor that owned it"
+    );
+
+    // The verb the stale editor was still offering writes nothing now. Read the
+    // database, not the cached roster: the claim is about what was durably
+    // published, and `drain_runtime` is what makes "no write was issued" and "a
+    // write landed" distinguishable in one bounded step.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    drain_runtime(&core);
+    cx.run_until_parked();
+    let durable = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.id == agent)
+        .expect("still a member");
+    assert_eq!(
+        durable.label, before.label,
+        "the draft was never published to every space that follows the shared row"
+    );
+
+    // Re-opening seeds the editor the row now deserves: the fork, in its safe
+    // mode, with nothing armed.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx)
+        });
+    })
+    .unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.inspector_editing_mode()),
+        Some(EditMode::OverrideHere),
+        "a referenced global opens in this-space-only"
+    );
+
+    drain_runtime(&core);
+}
+
+/// A shared agent's **notebook** is a real space, and the Library is the list of
+/// the human's conversations — so promotion must not put a new row in it.
+/// `AppCore::list_spaces` excludes notebooks unconditionally; this is the GUI's
+/// end of that promise, read where a person would read it.
+#[gpui::test]
+fn a_shared_agents_notebook_stays_out_of_the_library(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (_window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+    stores
+        .participants
+        .update(cx, |s, cx| s.ensure(space.clone(), cx));
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+    wait_until(cx, "the library lists the space", |cx| {
+        stores.spaces.read_with(cx, |s, _| s.list().len() == 1)
+    });
+
+    let agent = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .id
+            .clone()
+    });
+    stores.participants.update(cx, |s, cx| {
+        s.promote(space.clone(), agent.clone(), None, cx)
+    });
+    wait_until(cx, "the share lands", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent && p.source == "referenced")
+        })
+    });
+
+    // Re-list from the database, not from the cached index: promotion emits
+    // `Change::Participants` only (the Library provably didn't change), so this
+    // asks the question the exclusion is the answer to.
+    stores.spaces.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the library re-lists", |cx| {
+        stores
+            .spaces
+            .read_with(cx, |s, _| !s.index().is_loading() && s.list().len() == 1)
+    });
+    assert_eq!(
+        stores.spaces.read_with(cx, |s, _| s
+            .list()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>()),
+        vec![space],
+        "the notebook created by the share is not a conversation"
+    );
+
+    drain_runtime(&core);
+}
+
+/// Promote the seeded agent and hand back its id — the precondition of every
+/// Agents-pane test, since an agent reaches the library only by being shared.
+fn share_the_seeded_agent(cx: &mut TestAppContext, stores: &Stores, space: &str) -> String {
+    stores
+        .participants
+        .update(cx, |s, cx| s.ensure(space.to_string(), cx));
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(stores, space, cx).len() == 2
+    });
+    let agent = stores.participants.read_with(cx, |s, _| {
+        s.list(space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .id
+            .clone()
+    });
+    stores.participants.update(cx, |s, cx| {
+        s.promote(space.to_string(), agent.clone(), None, cx)
+    });
+    // Behavior tests run bus-less (`Stores::for_test` installs no bridge), so
+    // the library is re-listed here the way `Change::Participants` does it in
+    // the app — the dispatch itself is pinned by
+    // `a_participants_change_reaches_the_agent_library` (`tests/stores.rs`).
+    wait_until(cx, "the promotion lands", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(space)
+                .iter()
+                .any(|p| p.id == agent && p.source == "referenced")
+        })
+    });
+    stores.agents.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the share lands", |cx| {
+        stores
+            .agents
+            .read_with(cx, |s, _| s.list().iter().any(|a| a.id == agent))
+    });
+    agent
+}
+
+/// The **Agents pane** end to end (task 36): a shared agent appears in the
+/// library with its notebook, its editor writes the agent's *own* config (the
+/// edit-everywhere half, which the space it came from then follows), and its
+/// notebook opens as an ordinary space window.
+#[gpui::test]
+fn agents_pane_lists_edits_and_opens_the_notebook(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    // Nothing is shared yet, so the library is empty — the pane's own store is
+    // what says so (the seeded human and Eidola are globals it must not list).
+    wait_until(cx, "the empty library answers", |cx| {
+        stores
+            .agents
+            .read_with(cx, |s, _| s.agents().has_value() && s.list().is_empty())
+    });
+
+    let agent = share_the_seeded_agent(cx, &stores, &space);
+    let listed = stores.agents.read_with(cx, |s, _| s.list()[0].clone());
+    assert_eq!(listed.id, agent);
+    let notebook = listed
+        .notebook_space_id
+        .clone()
+        .expect("promotion created a notebook, and the roster carries its id");
+
+    // Edit everywhere: the name written here is the agent's own.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_edit(&agent, window, cx));
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.editing_label_state())
+        .expect("the row's editor is open");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Ada", window, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.save_edit(window, cx));
+    })
+    .unwrap();
+    wait_until(cx, "the rename lands", |cx| {
+        stores
+            .agents
+            .read_with(cx, |s, _| s.list().iter().any(|a| a.label == "Ada"))
+    });
+    // …and the space it came from reads the new name, because its membership
+    // overrides nothing.
+    stores
+        .participants
+        .update(cx, |s, cx| s.refresh(space.clone(), cx));
+    wait_until(cx, "the space follows", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent && p.label == "Ada")
+        })
+    });
+
+    // The notebook door: a real space, through the ordinary window path.
+    view.update(cx, |v, cx| v.open_notebook(notebook, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.notebooks_opened_for_test()),
+        1,
+        "the notebook opens as a space window"
+    );
+
+    drain_runtime(&core);
+}
+
+/// **A form that closes hands the keyboard back** (Codex review, PR #279).
+///
+/// The editor's fields are focusable elements owned by the draft, and every way
+/// the editor closes — Cancel, Save, arming Retire, or a roster refresh that
+/// drops the agent — drops them. Whatever the window was focused on is then a
+/// handle to something nobody paints: no keystroke reaches anything, and Tab
+/// restarts from the window root instead of resuming beside the row the reader
+/// was working on. The `held` observation has to be taken **before** the drop,
+/// since a dead input's handle is gone with it.
+#[gpui::test]
+fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    let agent = share_the_seeded_agent(cx, &stores, &space);
+
+    let pane_holds_the_keyboard = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.read(cx).focus_handle().is_focused(window)
+        })
+        .unwrap()
+    };
+    let open_and_focus_the_charter = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.toggle_edit(&agent, window, cx));
+        })
+        .unwrap();
+        let prompt = view
+            .read_with(cx, |v, _| v.editing_prompt_state())
+            .expect("the editor is open");
+        cx.update_window(window, |_, window, cx| {
+            prompt.update(cx, |s, cx| s.focus(window, cx));
+        })
+        .unwrap();
+        assert!(
+            !pane_holds_the_keyboard(cx),
+            "the charter holds the keyboard while the editor is open"
+        );
+    };
+
+    // **Focus inside the editor that is not one of its two inputs.** The editor
+    // is a subtree — verbs, chips, a model dropdown — and a handback gated on an
+    // enumeration of its text fields answers "not held" for everything else in
+    // it, dropping the keyboard on the floor for exactly the controls a future
+    // edit adds (Codex review, PR #279).
+    open_and_focus_the_charter(cx);
+    let subtree = view
+        .read_with(cx, |v, _| v.editing_focus_handle())
+        .expect("the editor is open");
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&subtree, cx);
+    })
+    .unwrap();
+    assert!(
+        !pane_holds_the_keyboard(cx),
+        "the editor subtree holds the keyboard, not the pane"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_edit(window, cx));
+    })
+    .unwrap();
+    assert!(
+        pane_holds_the_keyboard(cx),
+        "containment, not an enumeration of inputs, is what the handback asks"
+    );
+
+    // Cancel.
+    open_and_focus_the_charter(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_edit(window, cx));
+    })
+    .unwrap();
+    assert!(pane_holds_the_keyboard(cx), "Cancel hands it back");
+
+    // Save.
+    open_and_focus_the_charter(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.save_edit(window, cx));
+    })
+    .unwrap();
+    assert!(pane_holds_the_keyboard(cx), "Save hands it back");
+
+    // **The confirmation's own buttons are tab stops** (`probe(Role::Button)`
+    // derives `focusable()` + `tab_index(0)`), so Keep and Retire unmount a
+    // focused control just as an editor's fields do — and owe the keyboard back
+    // the same way (Codex review, PR #279).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent, window, cx));
+    })
+    .unwrap();
+    let confirm = view.read_with(cx, |v, _| v.retire_focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&confirm, cx);
+    })
+    .unwrap();
+    assert!(
+        !pane_holds_the_keyboard(cx),
+        "the confirmation holds the keyboard"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_retire(window, cx));
+    })
+    .unwrap();
+    assert!(pane_holds_the_keyboard(cx), "Keep hands it back");
+
+    // Arming a retirement, which replaces the editor.
+    open_and_focus_the_charter(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent, window, cx));
+    })
+    .unwrap();
+    assert!(pane_holds_the_keyboard(cx), "arming Retire hands it back");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_retire(window, cx));
+    })
+    .unwrap();
+
+    // The same unmount, over an armed **confirmation** rather than an editor:
+    // its Keep/Retire are tab stops too, and a roster refresh that drops the
+    // agent takes them away without anyone pressing anything. A second shared
+    // agent, so the roster still has a row for the editor case below.
+    let core_handle = stores.app_core().expect("a real core");
+    let space_b = core_handle
+        .runtime()
+        .block_on(core_handle.create_space(Some("B".into())))
+        .expect("a space")
+        .id;
+    let agent_b = core_handle
+        .runtime()
+        .block_on(core_handle.list_space_participants(space_b.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the seeded agent")
+        .id;
+    core_handle
+        .runtime()
+        .block_on(core_handle.promote_participant(agent_b.clone(), None))
+        .expect("share the second agent");
+    stores.agents.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the library lists both", |cx| {
+        stores.agents.read_with(cx, |s, _| s.list().len() == 2)
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent_b, window, cx));
+    })
+    .unwrap();
+    let confirm_focus = view.read_with(cx, |v, _| v.retire_focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&confirm_focus, cx);
+    })
+    .unwrap();
+    assert!(!pane_holds_the_keyboard(cx), "the confirmation holds it");
+    core_handle
+        .runtime()
+        .block_on(core_handle.retire_participant(agent_b.clone()))
+        .expect("the other window's retirement");
+    stores.agents.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the roster drops it", |cx| {
+        stores.agents.read_with(cx, |s, _| s.list().len() == 1)
+    });
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.retiring_agent().is_none()),
+        "the confirmation went with its row"
+    );
+    assert!(
+        pane_holds_the_keyboard(cx),
+        "and so did the keyboard it was holding"
+    );
+
+    // And the unmount no verb pressed: the agent leaves the roster under an
+    // open editor, and `sync_open_forms` retires it at the head of `render`.
+    open_and_focus_the_charter(cx);
+    let handle = stores.app_core().expect("a real core");
+    handle
+        .runtime()
+        .block_on(handle.retire_participant(agent.clone()))
+        .expect("the other window's retirement");
+    stores.agents.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the roster drops it", |cx| {
+        stores.agents.read_with(cx, |s, _| s.list().is_empty())
+    });
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.editing_agent().is_none()),
+        "the editor went with its row"
+    );
+    assert!(
+        pane_holds_the_keyboard(cx),
+        "and so did the keyboard it was holding"
+    );
+
+    drain_runtime(&core);
+}
+
+/// **Retirement** asks first, then takes the agent out of the library and
+/// archives its notebook — and is not an unshare: the participant survives, so
+/// the space it worked in still resolves it.
+#[gpui::test]
+fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    let agent = share_the_seeded_agent(cx, &stores, &space);
+
+    // Armed from over an open editor, the retirement takes that editor with it —
+    // and unlike the share, discarding the draft is the honest reading: the
+    // confirmation *replaces* the editor on screen rather than standing under
+    // its still-visible fields, it promises nothing about configuration, and a
+    // config edit to an agent leaving the library is a value nothing will read
+    // again.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_edit(&agent, window, cx));
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.editing_label_state())
+        .expect("the row's editor is open");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Renamed in passing", window, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent, window, cx));
+    })
+    .unwrap();
+    assert!(
+        view.read_with(cx, |v, _| v.editing_agent().is_none()),
+        "arming the retirement closes the editor it replaces"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_retire(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        stores.agents.read_with(cx, |s, _| s
+            .list()
+            .iter()
+            .all(|a| a.label != "Renamed in passing")),
+        "the draft the retirement discarded was never written"
+    );
+
+    // Armed, then stood down — nothing is written.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent, window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.retiring_agent().map(str::to_string)),
+        Some(agent.clone())
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_retire(window, cx));
+    })
+    .unwrap();
+    assert!(view.read_with(cx, |v, _| v.retiring_agent().is_none()));
+    cx.run_until_parked();
+    assert_eq!(
+        stores.agents.read_with(cx, |s, _| s.list().len()),
+        1,
+        "declining the confirmation retires nothing"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire(&agent, window, cx));
+    })
+    .unwrap();
+    // The confirmation's Retire is a real tab stop, and pressing it unmounts
+    // the button — so it owes the keyboard back like every other closing path
+    // (Codex review, PR #279).
+    let confirm = view.read_with(cx, |v, _| v.retire_focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&confirm, cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.confirm_retire(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, cx| {
+            view.read(cx).focus_handle().is_focused(window)
+        })
+        .unwrap(),
+        "Retire hands the keyboard back to the pane"
+    );
+    wait_until(cx, "the retirement lands", |cx| {
+        stores.agents.read_with(cx, |s, _| s.list().is_empty())
+    });
+    assert!(
+        stores
+            .agents
+            .read_with(cx, |s, _| s.op_error(&agent).map(str::to_string))
+            .is_none(),
+        "the retirement was accepted"
+    );
+    // The notebook went with it (archived in the same transaction).
+    let core_handle = stores.app_core().expect("a real core");
+    assert!(
+        core_handle
+            .runtime()
+            .block_on(core_handle.list_global_agents())
+            .expect("library")
+            .is_empty()
+    );
+    // Not an unshare: the space still has the agent as a referenced member.
+    stores
+        .participants
+        .update(cx, |s, cx| s.refresh(space.clone(), cx));
+    cx.run_until_parked();
+
+    drain_runtime(&core);
+}
+
+/// A failed *initial* read must not read as an empty library, and a refused
+/// write must say so — the two honest-state rules, over this pane's cell.
+#[gpui::test]
+fn agents_pane_failed_load_and_refused_write_are_visible(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.agents = Some(Vec::new());
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    let _ = view;
+
+    stores.agents.read_with(cx, |s, _| {
+        assert!(s.agents().has_value(), "an empty library has answered");
+        assert!(s.list().is_empty());
+    });
+
+    stores
+        .agents
+        .update(cx, |s, _| s.set_failed_for_test("boom"));
+    stores.agents.read_with(cx, |s, _| {
+        assert!(
+            !s.agents().has_value(),
+            "a failed initial read holds nothing"
+        );
+        assert!(s.agents().error().is_some());
+    });
 }
 
 #[gpui::test]
@@ -7426,6 +8464,7 @@ fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &m
                 label: Some("Myself".into()),
                 ..Default::default()
             },
+            eidola_app_core::ExpectedScope::Any,
             cx,
         );
     });
@@ -7614,10 +8653,13 @@ fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
     wait_until(cx, "A op_error", |cx| {
         stores
             .participants
-            .read_with(cx, |s, _| s.op_error(&space_a).is_some())
+            .read_with(cx, |s, _| !s.op_errors_for(&space_a).is_empty())
     });
     stores.participants.read_with(cx, |s, _| {
-        assert!(s.op_error(&space_b).is_none(), "B must not see A's error");
+        assert!(
+            s.op_errors_for(&space_b).is_empty(),
+            "B must not see A's error"
+        );
     });
 
     let b = space_b.clone();
@@ -7627,11 +8669,11 @@ fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
     wait_until(cx, "B op_error", |cx| {
         stores
             .participants
-            .read_with(cx, |s, _| s.op_error(&space_b).is_some())
+            .read_with(cx, |s, _| !s.op_errors_for(&space_b).is_empty())
     });
     stores.participants.read_with(cx, |s, _| {
         assert!(
-            s.op_error(&space_a).is_some(),
+            !s.op_errors_for(&space_a).is_empty(),
             "starting B's op must not clear A's error (per-space keying)"
         );
     });
@@ -11364,6 +12406,7 @@ fn space_inspector_shows_the_settings_the_store_holds(cx: &mut TestAppContext) {
         eidola_app_core::SpaceSettings {
             cascade_limit: 6,
             router_model: Some("gemma4-31b@eidola".into()),
+            ..Default::default()
         },
     );
     let (window, view) = open_space(cx, &stores, Some("s1".into()));
@@ -11650,7 +12693,7 @@ fn space_inspector_a_form_that_leaves_takes_its_dropdown_with_it(cx: &mut TestAp
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
             v.inspector_begin_template(window, cx);
-            v.inspector_cancel_template(cx);
+            v.inspector_cancel_template(window, cx);
         })
     })
     .unwrap();
@@ -11681,7 +12724,12 @@ fn space_inspector_removing_a_participant_takes_its_dropdown_with_it(cx: &mut Te
     draw_window(cx, window);
     assert!(view.read_with(cx, |v, _| v.inspector_participant_picker_open_for_test()));
 
-    view.update(cx, |v, cx| v.inspector_remove_participant("agent-1", cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_remove_participant("agent-1", window, cx)
+        });
+    })
+    .unwrap();
     draw_window(cx, window);
 
     assert!(

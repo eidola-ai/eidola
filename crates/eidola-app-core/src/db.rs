@@ -1496,43 +1496,79 @@ pub async fn get_participant(
 /// notify_policy, role). Editing a global edits it everywhere; editing an owned
 /// row edits that space/template only. Each `Some` replaces; the inner `Option`
 /// clears/sets the two nullable columns.
+///
+/// **Liveness rides the `WHERE`, so retirement wins terminally** (Codex review,
+/// PR #279). Save and Retire are independent operations in independent slots,
+/// and a `bridge`d core call runs to completion even after its gpui task is
+/// replaced — so a Save started in another window can commit *after* a
+/// retirement. Updating by `id` alone let that stale write rename a retired
+/// participant, and since the trail renders an author's byline by joining this
+/// row, the record retirement promises to leave alone changed silently
+/// underneath it. Asking `removed_at` here rather than in a caller's earlier
+/// read is what makes the answer terminal: no interleaving can put a live read
+/// in front of a write that lands after the retirement.
+///
+/// `false` therefore means "nothing to set, or nothing live to set it on"; the
+/// caller distinguishes them (the read only *explains* a write that struck
+/// nothing — it never decides one).
 pub async fn update_participant_config(
     conn: &Connection,
     id: &str,
-    label: Option<&str>,
-    model_ref: Option<Option<&str>>,
-    system_prompt: Option<Option<&str>>,
-    notify_policy: Option<&str>,
-    role: Option<&str>,
+    write: &PersonaWrite,
 ) -> Result<bool, AppError> {
     let mut sets: Vec<String> = Vec::new();
     let mut params: Vec<Value> = vec![Value::Text(id.to_string())];
-    if let Some(l) = label {
-        params.push(Value::Text(l.to_string()));
+    if let Some(l) = &write.label {
+        params.push(Value::Text(l.clone()));
         sets.push(format!("label = ?{}", params.len()));
     }
-    if let Some(m) = model_ref {
-        params.push(opt_str(m));
+    if let Some(m) = &write.model_ref {
+        params.push(opt_str(m.as_deref()));
         sets.push(format!("model_ref = ?{}", params.len()));
     }
-    if let Some(s) = system_prompt {
-        params.push(opt_str(s));
+    if let Some(s) = &write.system_prompt {
+        params.push(opt_str(s.as_deref()));
         sets.push(format!("system_prompt = ?{}", params.len()));
     }
-    if let Some(n) = notify_policy {
-        params.push(Value::Text(n.to_string()));
+    if let Some(n) = &write.notify_policy {
+        params.push(Value::Text(n.clone()));
         sets.push(format!("notify_policy = ?{}", params.len()));
     }
-    if let Some(r) = role {
-        params.push(Value::Text(r.to_string()));
+    if let Some(r) = &write.role {
+        params.push(Value::Text(r.clone()));
         sets.push(format!("role = ?{}", params.len()));
     }
     if sets.is_empty() {
         return Ok(false);
     }
-    let sql = format!("UPDATE participant SET {} WHERE id = ?1", sets.join(", "));
+    // Liveness, plus whatever the caller believed it was editing.
+    let mut premise = String::from(" AND removed_at IS NULL");
+    match &write.premise {
+        ScopePremise::Any => {}
+        ScopePremise::Global => premise.push_str(" AND scope = 'global'"),
+        ScopePremise::SpaceOwned { space_id } => {
+            params.push(Value::Text(space_id.clone()));
+            premise.push_str(&format!(
+                " AND scope = 'space' AND owner_space_id = ?{}",
+                params.len()
+            ));
+        }
+    }
+    let sql = format!(
+        "UPDATE participant SET {} WHERE id = ?1{premise}",
+        sets.join(", ")
+    );
     let n = conn.execute(&sql, params).await.map_err(AppError::db)?;
     Ok(n > 0)
+}
+
+/// Whether a participant row exists and has not been retired/removed — the
+/// liveness question a write asks **inside its own transaction** when it cannot
+/// carry the predicate in its statement (see `memory::Inner::remember`).
+pub async fn participant_is_live(conn: &Connection, id: &str) -> Result<bool, AppError> {
+    Ok(get_participant(conn, id)
+        .await?
+        .is_some_and(|p| p.removed_at.is_none()))
 }
 
 /// Soft-remove a participant row (global: library soft-remove; owned:
@@ -1622,48 +1658,104 @@ pub async fn delete_template_owned_participants(
 
 // --- promotion (task 36): space-owned agent → global identity --------------
 
+/// A **validated** persona to write onto a participant's own config columns —
+/// the resolved form of a `ParticipantUpdate` (label trimmed and checked,
+/// notify policy checked, the two nullable columns already reduced to
+/// set-or-clear). Produced once in `lib.rs` so an ordinary edit and a promotion
+/// that carries one cannot drift on what an update *means*.
+#[derive(Clone, Debug, Default)]
+pub struct PersonaWrite {
+    pub label: Option<String>,
+    pub model_ref: Option<Option<String>>,
+    pub system_prompt: Option<Option<String>>,
+    pub notify_policy: Option<String>,
+    /// The participant's `role` column — only the seeding paths set it.
+    pub role: Option<String>,
+    /// **What the caller believed it was editing.** Liveness is not the whole
+    /// premise of a config write: an editor opened on a *space-owned* row was
+    /// composed against a persona that promotion moves out from under it, and a
+    /// write that carries only `removed_at IS NULL` will happily republish the
+    /// old values to every space the agent has since joined. Carried into the
+    /// statement, the premise makes that stale write strike nothing (Codex
+    /// review, PR #279).
+    pub premise: ScopePremise,
+}
+
+/// The scope a config write was composed against.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ScopePremise {
+    /// No premise — the write is about a row by id alone.
+    #[default]
+    Any,
+    /// This space's own row (the inspector's owned-agent editor).
+    SpaceOwned { space_id: String },
+    /// A shared identity (the Agents pane; the inspector's "Everyone" mode).
+    Global,
+}
+
+impl PersonaWrite {
+    /// Whether it would write nothing at all (every column left alone).
+    pub fn is_empty(&self) -> bool {
+        self.label.is_none()
+            && self.model_ref.is_none()
+            && self.system_prompt.is_none()
+            && self.notify_policy.is_none()
+    }
+
+    /// Apply it, reporting whether any row changed. Every caller writes through
+    /// here, so "a persona write" is one statement builder
+    /// ([`update_participant_config`]) with one set of semantics.
+    pub async fn apply(&self, conn: &Connection, participant_id: &str) -> Result<bool, AppError> {
+        update_participant_config(conn, participant_id, self).await
+    }
+}
+
+/// What [`promote_participant_tx`] writes — one struct rather than eight
+/// positional arguments.
+pub struct Promotion<'a> {
+    pub participant_id: &'a str,
+    pub home_space_id: &'a str,
+    pub role: &'a str,
+    pub notebook_space_id: &'a str,
+    pub notebook_title: &'a str,
+    /// A persona to adopt **in the promoting transaction**, if the caller is
+    /// carrying one (the GUI's "Share this agent…" promotes what its editor is
+    /// showing). Inside the same transaction *and behind the same guard*, so a
+    /// promotion that loses a race takes the persona write back with it.
+    pub persona: Option<&'a PersonaWrite>,
+    pub now: i64,
+}
+
 /// Promote a space-owned agent to a **global** identity, in place and in one
 /// transaction. Same row, same id — so authorship, provenance and memory
 /// continuity are structural rather than stitched. Copy-projection was
 /// rejected: it fragments past posts, memory blocks and reference edges across
 /// two identities, which is the opposite of what promotion exists to create.
 ///
-/// Three writes, all or nothing:
+/// Four writes, all or nothing:
 ///
 /// 1. `owner_space_id → NULL`, `scope → 'global'` on the participant row. The
 ///    pinned `participant_scope` echo on every past `action` and every
 ///    `memory_block` follows via `ON UPDATE CASCADE` — see the schema comments
 ///    there and `turso_enforcement_smoke` case (e).
-/// 2. A `space_participant` reference row for the **former owner space**, with
+/// 2. The optional [`Promotion::persona`], onto the row that statement just
+///    proved was still ours to promote.
+/// 3. A `space_participant` reference row for the **former owner space**, with
 ///    NULL overrides. Ownership no longer implies membership, and NULL
 ///    overrides mean the effective config (`COALESCE(override, config)`) is
 ///    byte-identical to what it was: the space's persona is preserved exactly.
-/// 3. The agent's private **notebook space** (`space.notebook_participant_id`),
+/// 4. The agent's private **notebook space** (`space.notebook_participant_id`),
 ///    referenced into by the agent itself, hidden from the Library listing.
 ///
 /// The caller has already validated *what* may be promoted (kind, scope, the
-/// shared "You", removal); this is the mechanics.
+/// shared "You", removal) and what the persona may say; this is the mechanics —
+/// **plus the one check that cannot be done ahead of the transaction**, below.
 pub async fn promote_participant_tx(
     conn: &Connection,
-    participant_id: &str,
-    home_space_id: &str,
-    role: &str,
-    notebook_space_id: &str,
-    notebook_title: &str,
-    now: i64,
+    promotion: &Promotion<'_>,
 ) -> Result<(), AppError> {
     conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
-    match promote_participant_tx_body(
-        conn,
-        participant_id,
-        home_space_id,
-        role,
-        notebook_space_id,
-        notebook_title,
-        now,
-    )
-    .await
-    {
+    match promote_participant_tx_body(conn, promotion).await {
         Ok(()) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
             Ok(())
@@ -1678,32 +1770,61 @@ pub async fn promote_participant_tx(
 
 async fn promote_participant_tx_body(
     conn: &Connection,
-    participant_id: &str,
-    home_space_id: &str,
-    role: &str,
-    notebook_space_id: &str,
-    notebook_title: &str,
-    now: i64,
+    promotion: &Promotion<'_>,
 ) -> Result<(), AppError> {
+    let participant_id = promotion.participant_id;
     // Both key columns move in one statement: the three-way scope/owner CHECK
     // must hold at statement end, and the cascade fires off the (id, scope)
     // parent key.
+    //
+    // **This statement is the transaction's own gate**, not a repeat of the
+    // caller's. The caller read the row a moment ago; another window sharing or
+    // removing the same agent in between is what the predicate catches, and
+    // catching it *here* is what lets everything after it — the persona above
+    // all — roll back as one. `removed_at` rides the same predicate for the
+    // same reason.
     let n = conn
         .execute(
             "UPDATE participant SET scope = 'global', owner_space_id = NULL \
-             WHERE id = ?1 AND scope = 'space'",
+             WHERE id = ?1 AND scope = 'space' AND removed_at IS NULL",
             (Value::Text(participant_id.to_string()),),
         )
         .await
         .map_err(AppError::db)?;
     if n == 0 {
         return Err(AppError::Database {
-            message: format!("participant {participant_id} was not a space-owned row to promote"),
+            message: format!(
+                "participant {participant_id} was no longer a live space-owned row to promote"
+            ),
         });
     }
-    insert_space_participant(conn, home_space_id, participant_id, role, now).await?;
-    insert_notebook_space(conn, notebook_space_id, participant_id, notebook_title, now).await?;
-    insert_space_participant(conn, notebook_space_id, participant_id, "owner", now).await?;
+    if let Some(persona) = promotion.persona {
+        persona.apply(conn, participant_id).await?;
+    }
+    insert_space_participant(
+        conn,
+        promotion.home_space_id,
+        participant_id,
+        promotion.role,
+        promotion.now,
+    )
+    .await?;
+    insert_notebook_space(
+        conn,
+        promotion.notebook_space_id,
+        participant_id,
+        promotion.notebook_title,
+        promotion.now,
+    )
+    .await?;
+    insert_space_participant(
+        conn,
+        promotion.notebook_space_id,
+        participant_id,
+        "owner",
+        promotion.now,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1754,11 +1875,131 @@ pub async fn notebook_space_for(
     }
 }
 
+/// One row of the **global agent library** — a shared identity plus the door to
+/// its notebook (see [`list_global_agents`]).
+#[derive(Clone, Debug)]
+pub struct GlobalAgentRow {
+    pub id: String,
+    pub label: String,
+    pub model_ref: Option<String>,
+    pub system_prompt: Option<String>,
+    pub notify_policy: String,
+    /// The agent's private notebook space, `None` for a global agent that has
+    /// none. Only promotion creates one, and it does so in the same
+    /// transaction as the scope flip — so a `None` here is a row from some
+    /// future path that mints globals another way, never a half-promoted one.
+    pub notebook_space_id: Option<String>,
+}
+
+/// The live **global agents** — the shared agent library (task 36).
+///
+/// `kind = 'agent'` is what keeps the two seeded non-agent globals out: the
+/// shared human ("You") and Eidola-the-system are global rows too, and neither
+/// is a colleague anyone manages. The notebook is **joined here rather than
+/// looked up per row**, because the only consumer is a roster that offers the
+/// notebook door on every line.
+///
+/// Ordered by the label the reader sees (id breaking ties), so the management
+/// surface and any future listing agree on an order a person can predict.
+pub async fn list_global_agents(conn: &Connection) -> Result<Vec<GlobalAgentRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.id, p.label, p.model_ref, p.system_prompt, p.notify_policy, s.id \
+             FROM participant p \
+             LEFT JOIN space s ON s.notebook_participant_id = p.id \
+             WHERE p.scope = 'global' AND p.kind = 'agent' AND p.removed_at IS NULL \
+             ORDER BY p.label, p.id",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(GlobalAgentRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            label: row.get::<String>(1).map_err(AppError::db)?,
+            model_ref: row.get::<Option<String>>(2).map_err(AppError::db)?,
+            system_prompt: row.get::<Option<String>>(3).map_err(AppError::db)?,
+            notify_policy: row.get::<String>(4).map_err(AppError::db)?,
+            notebook_space_id: row.get::<Option<String>>(5).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Retire a global agent: the soft-remove **and** its notebook's archival, in
+/// one transaction (task 36 — "archival tied to retirement").
+///
+/// The two belong together because the notebook exists only for the agent: a
+/// retired agent whose notebook stayed open would leave a live space nobody
+/// owns, and an archived notebook beside a live agent would take away the
+/// residence its next `core` memory block needs. Answers `false` when the row
+/// was already retired — the caller decides whether that is a refusal.
+///
+/// The participant row itself always survives (soft-remove), so every
+/// `action.participant_id` in the trail stays resolvable; retirement is about
+/// the *library*, never the history.
+pub async fn retire_participant_tx(
+    conn: &Connection,
+    participant_id: &str,
+    now: i64,
+) -> Result<bool, AppError> {
+    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    match retire_participant_tx_body(conn, participant_id, now).await {
+        Ok(retired) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(retired)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn retire_participant_tx_body(
+    conn: &Connection,
+    participant_id: &str,
+    now: i64,
+) -> Result<bool, AppError> {
+    if !soft_remove_participant(conn, participant_id, now).await? {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE space SET archived_at = ?2 \
+         WHERE notebook_participant_id = ?1 AND archived_at IS NULL",
+        (Value::Text(participant_id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to archive the retired agent's notebook: {e}"),
+    })?;
+    Ok(true)
+}
+
 /// Whether a participant is a member of one space — **owned row ∪ live
-/// reference row**, the same membership definition [`participant_spaces`] and
-/// [`space_participants`] read from their two sides, asked of a single space.
-/// This is the cross-space ACL (task 37): reference *creation* and reference
-/// *following* both gate on it.
+/// reference row, and in both cases a live participant**: the same membership
+/// definition [`participant_spaces`] and [`space_participants`] read from their
+/// two sides, asked of a single space. This is the cross-space ACL (task 37):
+/// reference *creation* and reference *following* both gate on it.
+///
+/// **Membership means live membership.** Retirement soft-removes the
+/// participant and deliberately leaves its `space_participant` rows standing —
+/// the trail still records where the agent worked — so a question that asked
+/// only about the row went on answering "member" for an agent the human had
+/// just taken out of service. A turn binds its tools to the responding
+/// participant when it starts, so a retirement landing between two rounds left
+/// a live `read_post` holding a retired id, still opening the conversations it
+/// had belonged to (Codex review, PR #279). What ends availability is therefore
+/// the *question*, asked here at the boundary rather than by sweeping `left_at`
+/// onto every membership row: one rule that covers any future
+/// availability-ending state, that leaves the historical record undisturbed,
+/// and that no racing grant can slip past (`add_global_participant` refuses a
+/// retired participant, and a row created anyway would still not answer here).
+/// `space_participants` already read membership this way; these two had drifted
+/// from the definition their own docs claimed. Rendering paths are untouched on
+/// purpose — "who wrote this post" must keep naming retired authors.
 ///
 /// Deliberately **not** filtered on `space.archived_at`: archiving is a Library
 /// visibility choice, not a departure. A member of an archived space is still a
@@ -1777,7 +2018,9 @@ pub async fn is_space_member(
                  WHERE p.id = ?2 AND p.owner_space_id = ?1 AND p.removed_at IS NULL \
              ) OR EXISTS ( \
                  SELECT 1 FROM space_participant r \
-                 WHERE r.participant_id = ?2 AND r.space_id = ?1 AND r.left_at IS NULL \
+                 JOIN participant p ON p.id = r.participant_id \
+                 WHERE r.participant_id = ?2 AND r.space_id = ?1 \
+                   AND r.left_at IS NULL AND p.removed_at IS NULL \
              )",
         )
         .await
@@ -1887,10 +2130,12 @@ pub async fn referenced_post(
     }))
 }
 
-/// Every space a participant is a member of — **owned rows ∪ live references**,
-/// the same membership definition [`space_participants`] reads from the other
-/// side. This is the boundary for everything cross-space: task 36's
-/// `list_my_spaces` reaches exactly these and nothing else.
+/// Every space a participant is a member of — **owned rows ∪ live references,
+/// and in both cases a live participant** ([`is_space_member`] states why
+/// retirement has to be visible here). The same membership definition
+/// [`space_participants`] reads from the other side. This is the boundary for
+/// everything cross-space: task 36's `list_my_spaces` reaches exactly these and
+/// nothing else.
 ///
 /// Rows carry the same activity signals as [`list_spaces`], and notebooks are
 /// **included** — an agent's own notebook is one of its spaces.
@@ -1917,7 +2162,9 @@ pub async fn participant_spaces(
                ) \
                OR EXISTS ( \
                    SELECT 1 FROM space_participant r \
-                   WHERE r.participant_id = ?1 AND r.space_id = s.id AND r.left_at IS NULL \
+                   JOIN participant p ON p.id = r.participant_id \
+                   WHERE r.participant_id = ?1 AND r.space_id = s.id \
+                     AND r.left_at IS NULL AND p.removed_at IS NULL \
                ) \
            ) \
          GROUP BY s.id, s.title, s.created_at, s.archived_at \
@@ -1984,27 +2231,36 @@ pub async fn ensure_space_participant(
     participant_id: &str,
     role: &str,
     joined_at: i64,
-) -> Result<(), AppError> {
-    insert_participant_ref(
-        conn,
-        "space_participant",
-        "space_id",
-        space_id,
-        participant_id,
-        role,
-        joined_at,
-        &ParticipantRefRow {
-            participant_id: participant_id.to_string(),
-            role: role.to_string(),
-            joined_at,
-            override_label: None,
-            override_model_ref: None,
-            override_system_prompt: None,
-            override_notify_policy: None,
-        },
-        true,
-    )
-    .await
+) -> Result<bool, AppError> {
+    // **Liveness rides the insert.** The caller reads the participant first for
+    // its typed refusals, but a read cannot answer for a write that lands after
+    // it: a retirement committing in between left a durable membership joined
+    // *after* retirement, plus an invalidation and an `Internal` error where a
+    // refusal belonged (Codex review, PR #279). `INSERT … SELECT … WHERE EXISTS`
+    // makes the premise part of the statement, so a lost race writes nothing.
+    // `OR IGNORE` keeps the join idempotent, as it has always been.
+    let n = conn
+        .execute(
+            "INSERT OR IGNORE INTO space_participant \
+             (space_id, participant_id, participant_scope, role, joined_at, \
+              override_label, override_model_ref, override_system_prompt, \
+              override_notify_policy) \
+             SELECT ?1, ?2, 'global', ?3, ?4, NULL, NULL, NULL, NULL \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM participant WHERE id = ?2 AND removed_at IS NULL \
+             )",
+            (
+                Value::Text(space_id.to_string()),
+                Value::Text(participant_id.to_string()),
+                Value::Text(role.to_string()),
+                Value::Integer(joined_at),
+            ),
+        )
+        .await
+        .map_err(|e| AppError::Database {
+            message: format!("failed to insert space_participant: {e}"),
+        })?;
+    Ok(n > 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2048,6 +2304,14 @@ async fn insert_participant_ref(
 
 /// Update a space membership's overrides (each `Some` replaces; inner `Option`
 /// clears/sets). Only meaningful for referenced globals ("override here").
+///
+/// Same rule as [`update_participant_config`], at the membership level: the
+/// write lands only on a **live membership of a live participant** — the
+/// definition [`is_space_member`] reads, now asked of a write. A stale
+/// "override here" arriving after the member left (or after the agent was
+/// retired) is refused rather than parked in columns nothing reads, which is
+/// what keeps "your write was refused" from meaning "your write is waiting to
+/// reappear".
 pub async fn update_space_participant_override(
     conn: &Connection,
     space_id: &str,
@@ -2077,7 +2341,11 @@ pub async fn update_space_participant_override(
         return Ok(false);
     }
     let sql = format!(
-        "UPDATE space_participant SET {} WHERE space_id = ?1 AND participant_id = ?2",
+        "UPDATE space_participant SET {} \
+         WHERE space_id = ?1 AND participant_id = ?2 AND left_at IS NULL \
+           AND EXISTS ( \
+               SELECT 1 FROM participant p WHERE p.id = ?2 AND p.removed_at IS NULL \
+           )",
         sets.join(", ")
     );
     let n = conn.execute(&sql, params).await.map_err(AppError::db)?;
@@ -2105,8 +2373,143 @@ pub async fn insert_template_participant(
     .await
 }
 
+/// What [`remove_space_participant_tx`] did — decided by the write, not by the
+/// caller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpaceRemoval {
+    /// The participant was still this space's own, so its row was deactivated.
+    SoftRemoved,
+    /// It was a referenced global (shared, or shared *just now*), so it left the
+    /// space and the row stands.
+    Left,
+    /// Nothing live to end — already removed, already left, or never a member.
+    NothingToDo,
+    /// The participant owns this space as its **notebook**, and that membership
+    /// is structural: the notebook exists only for it, and is the residence of
+    /// the `core` memory it writes. Refused rather than obeyed, because nothing
+    /// can grant a notebook membership back.
+    RefusedNotebookOwner,
+}
+
+/// Take a participant out of one space, **deciding at the write** whether that
+/// means deactivating this space's own row or ending a membership.
+///
+/// The two are not interchangeable: a soft-remove retires the participant
+/// everywhere (it is what the library's Retire does), while a leave ends one
+/// membership. Choosing between them from a `get_participant` read taken a
+/// moment earlier is a read-then-write window, and promotion is exactly what
+/// walks through it: another window flips the row to `global` in between, and
+/// the removal — still believing it holds a space-owned agent — sets
+/// `removed_at` on a freshly *shared* agent, retiring it from the library the
+/// instant it arrived and orphaning the notebook promotion had just created
+/// (retirement archives it; this write knows nothing about it). Both callers
+/// then report success (Codex review, PR #279).
+///
+/// So the ownership test rides **in the soft-remove's own `WHERE`**: it strikes
+/// only a row that is still `scope = 'space'`, still owned by *this* space, and
+/// still live. Zero rows means the premise no longer holds, and the fallback is
+/// the honest one — end the membership, which after a promotion is precisely the
+/// reference row promotion left behind. The mirror guard is on the other side
+/// (`promote_participant_tx` requires `scope = 'space' AND removed_at IS NULL`),
+/// so whichever transaction commits first, the loser refuses cleanly rather than
+/// writing through a premise that has expired.
+pub async fn remove_space_participant_tx(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    now: i64,
+) -> Result<SpaceRemoval, AppError> {
+    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    match remove_space_participant_tx_body(conn, space_id, participant_id, now).await {
+        Ok(outcome) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(outcome)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn remove_space_participant_tx_body(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    now: i64,
+) -> Result<SpaceRemoval, AppError> {
+    let struck = conn
+        .execute(
+            "UPDATE participant SET removed_at = ?3 \
+             WHERE id = ?1 AND removed_at IS NULL \
+               AND scope = 'space' AND owner_space_id = ?2",
+            (
+                Value::Text(participant_id.to_string()),
+                Value::Text(space_id.to_string()),
+                Value::Integer(now),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    if struck > 0 {
+        return Ok(SpaceRemoval::SoftRemoved);
+    }
+    // The notebook owner's membership is guarded **in the leave's own `WHERE`**,
+    // for the reason the soft-remove is guarded above: a promotion mints the
+    // notebook and its membership in one transaction, so a removal that read the
+    // space a moment earlier saw an ordinary conversation. The read below only
+    // *explains* a write that struck nothing — it never decides one.
+    let left = conn
+        .execute(
+            "UPDATE space_participant SET left_at = ?3 \
+             WHERE space_id = ?1 AND participant_id = ?2 AND left_at IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM space s \
+                   WHERE s.id = ?1 AND s.notebook_participant_id = ?2 \
+               )",
+            (
+                Value::Text(space_id.to_string()),
+                Value::Text(participant_id.to_string()),
+                Value::Integer(now),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    if left > 0 {
+        return Ok(SpaceRemoval::Left);
+    }
+    match notebook_participant_of(conn, space_id).await?.as_deref() == Some(participant_id) {
+        true => Ok(SpaceRemoval::RefusedNotebookOwner),
+        false => Ok(SpaceRemoval::NothingToDo),
+    }
+}
+
+/// The participant a space is the **notebook** of, if it is one — the reverse of
+/// [`notebook_space_for`]. Read by the removal guard above, and surfaced to the
+/// GUI (via `SpaceSettings`) so the roster can withhold a Remove that could only
+/// be refused.
+pub async fn notebook_participant_of(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT notebook_participant_id FROM space WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(space_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(row.get::<Option<String>>(0).map_err(AppError::db)?),
+    }
+}
+
 /// End a space membership (reference) — set `left_at`. For a referenced global;
-/// owned participants are removed via [`soft_remove_participant`].
+/// owned participants are removed via [`soft_remove_participant`]. Callers
+/// choosing *between* the two must go through [`remove_space_participant_tx`],
+/// which decides at the write.
 pub async fn leave_space_participant(
     conn: &Connection,
     space_id: &str,
@@ -4121,6 +4524,23 @@ pub async fn first_user_text(
     match rows.next().await.map_err(AppError::db)? {
         None => Ok(None),
         Some(row) => Ok(row.get::<Option<String>>(0).map_err(AppError::db)?),
+    }
+}
+
+/// Whether a space is archived. Answers `false` for a space that does not
+/// exist — the question is "is this one hidden", not "does this one exist".
+pub async fn space_is_archived(conn: &Connection, space_id: &str) -> Result<bool, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT archived_at IS NOT NULL FROM space WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(false),
+        Some(row) => Ok(row.get::<i64>(0).map_err(AppError::db)? != 0),
     }
 }
 
@@ -6470,11 +6890,13 @@ mod tests {
         update_participant_config(
             &conn,
             &agent.participant_id,
-            Some("Justin"),
-            Some(Some("kimi-k2-6")),
-            Some(Some("Be terse.")),
-            Some("all"),
-            None,
+            &PersonaWrite {
+                label: Some("Justin".into()),
+                model_ref: Some(Some("kimi-k2-6".into())),
+                system_prompt: Some(Some("Be terse.".into())),
+                notify_policy: Some("all".into()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -6800,5 +7222,199 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// **The removal's decision belongs to its write** (Codex review, PR #279).
+    ///
+    /// `remove_space_participant` used to read the participant, see a
+    /// space-owned row, and *then* soft-remove it. Between those two steps
+    /// another window's promotion can commit — and the interleave is played out
+    /// literally below, with the same two primitives the old code used. The
+    /// stale soft-remove lands on the now-**global** row: the agent is retired
+    /// from the library the instant it was shared, its brand-new notebook is
+    /// left unarchived (only retirement archives it), and neither caller saw an
+    /// error. Promotion is one-way, so there is no way back.
+    ///
+    /// The cure is not a fresher read but no read at all: the ownership test
+    /// rides in the soft-remove's own `WHERE`, so after the same interleave the
+    /// new door strikes nothing and ends the membership instead — leaving the
+    /// shared agent alive with the reference row promotion created marked
+    /// `left_at`.
+    #[tokio::test]
+    async fn a_removal_decided_before_a_promotion_cannot_retire_the_shared_agent() {
+        async fn fixture(conn: &Connection, space: &str, agent: &str) {
+            insert_space(conn, space, Some("Home"), "unlinked", 1)
+                .await
+                .unwrap();
+            insert_participant(
+                conn,
+                agent,
+                "space",
+                Some(space),
+                None,
+                "agent",
+                "Cartographer",
+                None,
+                None,
+                "explicit",
+                "member",
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        async fn promote(conn: &Connection, space: &str, agent: &str, notebook: &str) {
+            promote_participant_tx(
+                conn,
+                &Promotion {
+                    participant_id: agent,
+                    home_space_id: space,
+                    role: "member",
+                    notebook_space_id: notebook,
+                    notebook_title: "Cartographer — notebook",
+                    persona: None,
+                    now: 2,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+
+        // --- the old shape, played out ------------------------------------
+        fixture(&conn, "s-old", "p-old").await;
+        let read = get_participant(&conn, "p-old").await.unwrap().unwrap();
+        assert_eq!(read.scope, "space", "the read that decided");
+        promote(&conn, "s-old", "p-old", "nb-old").await;
+        // ...and the write it decided on, arriving after the share landed.
+        assert!(
+            soft_remove_participant(&conn, "p-old", 3).await.unwrap(),
+            "the unguarded soft-remove reports success"
+        );
+        let wrecked = get_participant(&conn, "p-old").await.unwrap().unwrap();
+        assert_eq!(wrecked.scope, "global");
+        assert!(
+            wrecked.removed_at.is_some(),
+            "the shared agent was retired by a removal aimed at a space-owned one"
+        );
+        assert!(
+            !space_is_archived(&conn, "nb-old").await.unwrap(),
+            "and its notebook was orphaned — nothing archived it"
+        );
+
+        // --- the same interleave, through the door that decides at the write
+        fixture(&conn, "s-new", "p-new").await;
+        let read = get_participant(&conn, "p-new").await.unwrap().unwrap();
+        assert_eq!(read.scope, "space");
+        promote(&conn, "s-new", "p-new", "nb-new").await;
+        assert_eq!(
+            remove_space_participant_tx(&conn, "s-new", "p-new", 3)
+                .await
+                .unwrap(),
+            SpaceRemoval::Left,
+            "the premise expired, so the removal ends the membership instead"
+        );
+        let survivor = get_participant(&conn, "p-new").await.unwrap().unwrap();
+        assert_eq!(survivor.scope, "global");
+        assert!(
+            survivor.removed_at.is_none(),
+            "the shared agent survives its home space's removal"
+        );
+        assert!(
+            space_participants(&conn, "s-new")
+                .await
+                .unwrap()
+                .iter()
+                .all(|p| p.participant_id != "p-new"),
+            "and it is no longer a member of the space it left"
+        );
+
+        // The ordinary case still soft-removes: a row this space really owns.
+        fixture(&conn, "s-owned", "p-owned").await;
+        assert_eq!(
+            remove_space_participant_tx(&conn, "s-owned", "p-owned", 3)
+                .await
+                .unwrap(),
+            SpaceRemoval::SoftRemoved
+        );
+        assert!(
+            get_participant(&conn, "p-owned")
+                .await
+                .unwrap()
+                .unwrap()
+                .removed_at
+                .is_some()
+        );
+        // And a second removal has nothing left to end.
+        assert_eq!(
+            remove_space_participant_tx(&conn, "s-owned", "p-owned", 4)
+                .await
+                .unwrap(),
+            SpaceRemoval::NothingToDo
+        );
+    }
+
+    /// **A join decides at its write** (Codex review, PR #279). The caller reads
+    /// the participant first — for its typed refusals — but a read cannot answer
+    /// for a write that lands after it: a retirement committing in between left
+    /// a durable membership row joined *after* retirement. The old shape's two
+    /// halves are played out around a retirement below, then the same interleave
+    /// goes through the guarded insert.
+    #[tokio::test]
+    async fn a_join_decided_before_a_retirement_inserts_no_membership() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        insert_space(&conn, "s", Some("Home"), "unlinked", 1)
+            .await
+            .unwrap();
+        insert_participant(
+            &conn, "g", "global", None, None, "agent", "Ada", None, None, "explicit", "member",
+            None, 1,
+        )
+        .await
+        .unwrap();
+
+        // The read that decided: live and global.
+        let read = get_participant(&conn, "g").await.unwrap().unwrap();
+        assert!(read.removed_at.is_none());
+        // ...the retirement...
+        assert!(soft_remove_participant(&conn, "g", 2).await.unwrap());
+        // ...and the write it decided on, now guarded.
+        assert!(
+            !ensure_space_participant(&conn, "s", "g", "member", 3)
+                .await
+                .unwrap(),
+            "the premise expired, so the insert strikes nothing"
+        );
+        assert!(
+            space_participants(&conn, "s")
+                .await
+                .unwrap()
+                .iter()
+                .all(|m| m.participant_id != "g"),
+            "and no membership row was left behind"
+        );
+
+        // The ordinary case still joins, and stays idempotent.
+        insert_participant(
+            &conn, "h", "global", None, None, "agent", "Bo", None, None, "explicit", "member",
+            None, 1,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ensure_space_participant(&conn, "s", "h", "member", 3)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !ensure_space_participant(&conn, "s", "h", "member", 4)
+                .await
+                .unwrap(),
+            "re-adding an existing member changes nothing"
+        );
     }
 }

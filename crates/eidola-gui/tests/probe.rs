@@ -17,6 +17,7 @@ use eidola_app_core::{
 use eidola_app_core::{
     ParticipantInfo, ParticipantReference, SpaceTemplateInfo, TemplateParticipantInfo,
 };
+use eidola_gui::agents_settings::AgentsSettingsView;
 use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
@@ -2659,6 +2660,47 @@ fn open_participants_inspector(
     open_participants_inspector_with(cx, stores)
 }
 
+/// **A notebook's owner carries no Remove** (task 36; Codex review, PR #279).
+///
+/// A notebook is a real space, so opening one renders its owner as an ordinary
+/// referenced participant. Its membership is structural, though — the space
+/// exists only for that agent and is where its `core` memory lives — so
+/// app-core refuses to end it, and an affordance that could only be refused has
+/// no business on the row. The space's own settings are what say which
+/// participant that is.
+#[gpui::test]
+fn space_inspector_a_notebooks_owner_is_not_removable(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some(probe_participants());
+        s.space_settings = Some((
+            "demo".into(),
+            eidola_app_core::SpaceSettings {
+                notebook_participant_id: Some("agent-1".into()),
+                ..Default::default()
+            },
+        ));
+    });
+    let (window, view) = open_participants_inspector_with(cx, stores);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx)
+        });
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/inspector/participants/editor/save".to_string()),
+        "the row is still an editor: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/inspector/participants/agent-1/remove".to_string()),
+        "a notebook's owner must not be offered removal from its own notebook: {names:?}"
+    );
+}
+
 fn participants_inspector_stores(cx: &mut TestAppContext) -> Stores {
     stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
@@ -2740,6 +2782,12 @@ fn space_inspector_participants_probes_cover_rows_editor_and_add(cx: &mut TestAp
     );
     // The human editor shows only the mode toggle + name (no model/prompt).
     assert!(!names.contains(&"space/inspector/participants/editor/model".to_string()));
+    // Nothing offers to share what is already shared — promotion is one-way, so
+    // no surface here may imply its inverse either.
+    assert!(
+        !names.contains(&format!("space/inspector/participants/{you}/share")),
+        "a referenced global carries no share verb: {names:?}"
+    );
 
     // An agent's disclosure adds the model field, the prompt and notify chips.
     cx.update_window(window, |_, window, cx| {
@@ -2754,12 +2802,40 @@ fn space_inspector_participants_probes_cover_rows_editor_and_add(cx: &mut TestAp
         "space/inspector/participants/editor/system-prompt",
         "space/inspector/participants/editor/notify/human",
         "space/inspector/participants/agent-1/remove",
+        // A space-owned agent is the one that can be shared (task 36).
+        "space/inspector/participants/agent-1/share",
     ] {
         assert!(
             names.contains(&expected.to_string()),
             "agent editor probe {expected:?} missing: {names:?}"
         );
     }
+
+    // The share asks first — the verb is replaced by its confirmation, which
+    // carries the reassurance as a readable node rather than only as pixels.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_promote(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "space/inspector/participants/agent-1/share/note",
+        "space/inspector/participants/agent-1/share/confirm",
+        "space/inspector/participants/agent-1/share/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "share-confirm probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"space/inspector/participants/agent-1/share".to_string()),
+        "the armed confirmation replaces the verb: {names:?}"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_promote(window, cx));
+    })
+    .unwrap();
 
     // The add form.
     cx.update_window(window, |_, window, cx| {
@@ -2891,6 +2967,200 @@ fn templates_pane_probes_cover_rows_and_editor(cx: &mut TestAppContext) {
             "template editor probe {expected:?} missing: {names:?}"
         );
     }
+
+    probe::set_probes_enabled(false);
+}
+
+fn probe_agents() -> Vec<eidola_app_core::GlobalAgentInfo> {
+    vec![
+        eidola_app_core::GlobalAgentInfo {
+            id: "agent-ada".into(),
+            label: "Ada".into(),
+            model_ref: Some("gemma4-31b".into()),
+            system_prompt: Some("Be concise.".into()),
+            notify_policy: "human".into(),
+            notebook_space_id: Some("nb-ada".into()),
+        },
+        // A shared agent with no notebook is representable (only promotion
+        // makes one), and the row must simply not offer the door.
+        eidola_app_core::GlobalAgentInfo {
+            id: "agent-bo".into(),
+            label: "Bo".into(),
+            model_ref: None,
+            system_prompt: None,
+            notify_policy: "explicit".into(),
+            notebook_space_id: None,
+        },
+    ]
+}
+
+#[gpui::test]
+fn agents_pane_probes_cover_rows_editor_and_retire(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.agents = Some(probe_agents());
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+
+    // A resting row: its content is what it answers with and when.
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "settings/agents/agent-ada",
+        gpui::Role::ListItem,
+        "Ada",
+        "gemma4-31b · Eidola · responds to people",
+    );
+    let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+    for expected in [
+        "settings/agents/agent-ada/notebook",
+        "settings/agents/agent-ada/edit",
+        "settings/agents/agent-ada/retire",
+        "settings/agents/agent-bo/edit",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "agent row probe {expected:?} missing: {names:?}"
+        );
+    }
+    // No notebook, no door.
+    assert!(
+        !names.contains(&"settings/agents/agent-bo/notebook".to_string()),
+        "an agent without a notebook offers no notebook verb: {names:?}"
+    );
+
+    // The editor.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_edit("agent-ada", window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/agents/editor/name",
+        "settings/agents/editor/model",
+        "settings/agents/editor/system-prompt",
+        "settings/agents/editor/notify/human",
+        "settings/agents/editor/save",
+        "settings/agents/editor/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "agent editor probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    // A refused write stands **under its own row**, keyed like the store's slot,
+    // so two of them can be told apart — and its accessible name carries the
+    // agent's, which the row above it cannot supply to a screen reader.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_edit(window, cx));
+    })
+    .unwrap();
+    let refusal = "Couldn't save: notify policy must be explicit, human or all";
+    stores
+        .agents
+        .update(cx, |s, _| s.set_op_error_for_test("agent-ada", refusal));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/agents/agent-ada/error",
+        gpui::Role::Alert,
+        &format!("Ada: {refusal}"),
+    );
+    assert_probe(
+        &entries,
+        "settings/agents/agent-ada/error/dismiss",
+        gpui::Role::Button,
+        "Dismiss the message about Ada",
+    );
+    let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+    assert!(
+        !names.contains(&"settings/agents/agent-bo/error".to_string()),
+        "another agent's row carries no band: {names:?}"
+    );
+
+    // The retire confirmation — its note is a readable node, not only pixels.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.arm_retire("agent-ada", window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/agents/agent-ada/retire/note",
+        "settings/agents/agent-ada/retire/confirm",
+        "settings/agents/agent-ada/retire/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "retire-confirm probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+/// The third state the other two are measured against: a cell that **has not
+/// answered**. `Loadable`'s rule is that it says nothing — so rendering the
+/// "share one from a space" invitation over it tells a cold-opening reader their
+/// shared agents are gone (Codex review, PR #279).
+#[gpui::test]
+fn agents_pane_unread_library_is_not_an_empty_one(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        // No fixture: the stub store stays `NotLoaded` and never answers.
+        s.agents = None;
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/agents/loading".to_string()),
+        "an unread library says it is unread: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/agents/empty".to_string()),
+        "and must not read as an empty one: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// An empty library says so, and a failed *initial* read says something else —
+/// "Failed is not empty", over the pane that would otherwise invite the reader
+/// to share an agent they may already have.
+#[gpui::test]
+fn agents_pane_failed_load_shows_retry_not_an_empty_library(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.agents = Some(Vec::new());
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/agents/empty".to_string()),
+        "an empty library names its door: {names:?}"
+    );
+
+    stores
+        .agents
+        .update(cx, |s, _| s.set_failed_for_test("boom"));
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/agents/retry".to_string()),
+        "a failed load must offer Retry: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/agents/empty".to_string()),
+        "a failed load must not read as an empty library: {names:?}"
+    );
 
     probe::set_probes_enabled(false);
 }
@@ -4389,6 +4659,7 @@ fn space_inspector_router_cost_note_is_exactly_remote_conditional(cx: &mut TestA
         eidola_app_core::SpaceSettings {
             cascade_limit: 4,
             router_model: Some("tiny@local".into()),
+            ..Default::default()
         },
     );
     let entries = fresh_entries(cx, window);
@@ -4405,6 +4676,7 @@ fn space_inspector_router_cost_note_is_exactly_remote_conditional(cx: &mut TestA
         eidola_app_core::SpaceSettings {
             cascade_limit: 4,
             router_model: Some("gemma4-31b@eidola".into()),
+            ..Default::default()
         },
     );
     let entries = fresh_entries(cx, window);

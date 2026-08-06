@@ -684,6 +684,7 @@ fn a_refresh_landing_mid_write_keeps_the_participants_ops_error(cx: &mut TestApp
                 label: Some("You\nand me".into()),
                 ..Default::default()
             },
+            eidola_app_core::ExpectedScope::Any,
             cx,
         );
     });
@@ -692,7 +693,7 @@ fn a_refresh_landing_mid_write_keeps_the_participants_ops_error(cx: &mut TestApp
     wait_until(cx, "the refusal surfaces", |cx| {
         stores
             .participants
-            .read_with(cx, |s, _| s.op_error(&space).is_some())
+            .read_with(cx, |s, _| !s.op_errors_for(&space).is_empty())
     });
     stores.participants.read_with(cx, |s, _| {
         assert!(
@@ -1231,4 +1232,507 @@ fn a_batch_of_renames_lands_on_a_listing_read_after_all_of_them(cx: &mut TestApp
             }
         }
     }
+}
+
+/// `Change::Participants` fans out to **three** stores, and the agent library
+/// is the third (task 36): a promotion or retirement changes what the library
+/// lists, and an "edit everywhere" changes what a row says. Neither store polls;
+/// the dispatcher is what makes one signal answer for two domains.
+#[gpui::test]
+fn a_participants_change_reaches_the_agent_library(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    stores
+        .agents
+        .read_with(cx, |a, _| assert!(!a.agents().is_loading()));
+
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+    stores.agents.read_with(cx, |a, _| {
+        assert!(
+            a.agents().is_loading(),
+            "a Change::Participants must drive AgentsStore::refresh"
+        );
+    });
+
+    // A templates change is not one of its signals — the library holds no
+    // template rows.
+    let (other, _dir2) = backed_stores(cx);
+    cx.update(|cx| stores::dispatch_change_for_test(&other, Some(Change::Templates), cx));
+    other.agents.read_with(cx, |a, _| {
+        assert!(
+            !a.agents().is_loading(),
+            "a Change::Templates must not touch the agent library"
+        );
+    });
+}
+
+/// Promote each space's seeded agent and hand back the two participant ids —
+/// the only way an agent reaches the library.
+fn two_shared_agents(cx: &mut TestAppContext, stores: &Stores) -> (String, String) {
+    let core = stores.app_core().expect("backed stores carry a core");
+    let mut ids = Vec::new();
+    for title in ["A", "B"] {
+        let space = core
+            .runtime()
+            .block_on(core.create_space(Some(title.into())))
+            .expect("create space")
+            .id;
+        let agent = core
+            .runtime()
+            .block_on(core.list_space_participants(space))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .id;
+        core.runtime()
+            .block_on(core.promote_participant(agent.clone(), None))
+            .expect("promotion");
+        ids.push(agent);
+    }
+    stores.agents.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the library lists both", |cx| {
+        stores.agents.read_with(cx, |s, _| s.list().len() == 2)
+    });
+    (ids[0].clone(), ids[1].clone())
+}
+
+/// **Two writes on two agents both land** (Codex review, PR #279). The Agents
+/// pane offers Edit and Retire on every row at once, so editing one agent and
+/// retiring another are independent operations a reader can start a moment
+/// apart. With one store-wide slot the second replaced the first: unpolled, the
+/// first write simply never happened; polled, it ran core-side while its
+/// refusal and its re-list were discarded. Keyed slots are what make them
+/// independent — and the resolving read is taken once the **last** one settles.
+#[gpui::test]
+fn two_writes_on_two_agents_both_land(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let (a, b) = two_shared_agents(cx, &stores);
+
+    // Both issued before either future is polled — the narrowest interleaving.
+    stores.agents.update(cx, |s, cx| {
+        s.update_agent(
+            a.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("Ada".into()),
+                ..Default::default()
+            },
+            cx,
+        );
+        s.retire(b.clone(), cx);
+    });
+
+    let durable = |_cx: &mut TestAppContext| {
+        core.runtime()
+            .block_on(core.list_global_agents())
+            .expect("library")
+    };
+    wait_until(cx, "both writes land durably", |cx| {
+        let rows = durable(cx);
+        rows.len() == 1 && rows[0].label == "Ada"
+    });
+    // And the roster the pane reads agrees — the batch-end read was taken after
+    // the last write, so it carries both.
+    wait_until(cx, "the roster resolves on a read after both", |cx| {
+        stores
+            .agents
+            .read_with(cx, |s, _| s.list().len() == 1 && s.list()[0].label == "Ada")
+    });
+    stores.agents.read_with(cx, |s, _| {
+        assert!(s.op_error(&a).is_none(), "the edit was accepted");
+        assert!(s.op_error(&b).is_none(), "the retirement was accepted");
+    });
+}
+
+/// The refusal half: two refused writes each keep their own report. One
+/// store-wide slot could hold only the last, and the pane renders a band **per
+/// row** — a lost refusal there is an edit that silently did nothing under the
+/// row the reader was looking at.
+#[gpui::test]
+fn two_refused_agent_writes_each_keep_their_own_refusal(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let (a, b) = two_shared_agents(cx, &stores);
+
+    // An invalid notify policy is refused before any write (zero trace).
+    let refused = |label: &str| eidola_app_core::ParticipantUpdate {
+        label: Some(label.into()),
+        notify_policy: Some("sometimes".into()),
+        ..Default::default()
+    };
+    stores.agents.update(cx, |s, cx| {
+        s.update_agent(a.clone(), refused("Ada"), cx);
+        s.update_agent(b.clone(), refused("Bo"), cx);
+    });
+
+    wait_until(cx, "both refusals stand", |cx| {
+        stores.agents.read_with(cx, |s, _| {
+            s.op_error(&a).is_some() && s.op_error(&b).is_some()
+        })
+    });
+    // Each × acknowledges its own, and leaves the other standing.
+    stores.agents.update(cx, |s, cx| s.clear_op_error(&a, cx));
+    stores.agents.read_with(cx, |s, _| {
+        assert!(s.op_error(&a).is_none());
+        assert!(
+            s.op_error(&b).is_some(),
+            "dismissing one refusal must not discard the other"
+        );
+    });
+    // Neither refusal wrote anything: both agents are still there, unrenamed.
+    stores.agents.read_with(cx, |s, _| {
+        assert_eq!(s.list().len(), 2);
+        assert!(!s.list().iter().any(|x| x.label == "Ada" || x.label == "Bo"));
+    });
+}
+
+/// **One `bridge` closure is not one transaction** (Codex review, PR #279).
+///
+/// The share's two core calls travel together so no gpui-side refresh can land
+/// between them — but their *database* writes are still two, and two windows
+/// share one `AppCore`. Let another window promote (or a Settings retire remove)
+/// the same agent after the editor took its snapshot, and the persona write
+/// lands on a row the promotion then refuses: the reader is told sharing failed
+/// while their draft was persisted — across **every** space, since the row they
+/// wrote to is now a global one. The cure is that the persona travels *into*
+/// `AppCore::promote_participant`, which applies it inside the promoting
+/// transaction, behind the same `scope = 'space'` guard — so a lost race rolls
+/// the persona back with it and the refusal leaves zero trace.
+#[gpui::test]
+fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent")
+        .id;
+
+    // The other window shares it first. The editor open here still believes it
+    // is looking at a space-owned agent — that snapshot is what makes the draft
+    // stale, and nothing about the two-call shape can notice.
+    core.runtime()
+        .block_on(core.promote_participant(agent.clone(), None))
+        .expect("the other window's share");
+    let before = core
+        .runtime()
+        .block_on(core.list_global_agents())
+        .expect("library")
+        .into_iter()
+        .find(|a| a.id == agent)
+        .expect("the shared agent");
+
+    stores.participants.update(cx, |s, cx| {
+        s.promote(
+            space.clone(),
+            agent.clone(),
+            Some(eidola_app_core::ParticipantUpdate {
+                label: Some("Cartographer".into()),
+                system_prompt: Some(Some("Draw the map before arguing about it.".into())),
+                ..Default::default()
+            }),
+            cx,
+        )
+    });
+    wait_until(cx, "the share is refused", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| !s.op_errors_for(&space).is_empty())
+    });
+
+    let after = core
+        .runtime()
+        .block_on(core.list_global_agents())
+        .expect("library")
+        .into_iter()
+        .find(|a| a.id == agent)
+        .expect("the shared agent is still there");
+    assert_eq!(
+        after.label, before.label,
+        "a refused share must not rename the agent it failed to share"
+    );
+    assert_eq!(
+        after.system_prompt, before.system_prompt,
+        "nor rewrite its charter — across every space that follows the shared row"
+    );
+}
+
+/// **Two writes on two participants of one space both land** (Codex review, PR
+/// #279). The inspector offers a verb on every roster row at once — share this
+/// agent, remove that one — so two mutations a moment apart are independent.
+/// `ParticipantsStore` keyed its mutation slot by **space** alone, so the second
+/// replaced the first: unpolled, the first write simply never ran; polled, its
+/// refusal and its re-list were discarded. Keyed by `(space, participant)` they
+/// are independent, and the resolving read is taken once that space's last write
+/// settles.
+#[gpui::test]
+fn two_writes_on_two_participants_of_one_space_both_land(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let seeded = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent")
+        .id;
+    let second = core
+        .runtime()
+        .block_on(core.add_space_participant(
+            space.clone(),
+            eidola_app_core::NewParticipant {
+                label: "Bo".into(),
+                model_ref: None,
+                system_prompt: None,
+                notify_policy: "explicit".into(),
+            },
+        ))
+        .expect("a second agent")
+        .id;
+
+    // Both issued before either future is polled — the narrowest interleaving.
+    stores.participants.update(cx, |s, cx| {
+        s.promote(space.clone(), seeded.clone(), None, cx);
+        s.remove(space.clone(), second.clone(), cx);
+    });
+
+    wait_until(cx, "both writes land durably", |_cx| {
+        let rows = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .expect("participants");
+        rows.iter()
+            .any(|p| p.id == seeded && p.source == "referenced")
+            && !rows.iter().any(|p| p.id == second)
+    });
+    // And the roster the panel reads agrees — the batch-end read was taken after
+    // the last of them, so it carries both.
+    wait_until(cx, "the roster resolves on a read after both", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            let rows = s.list(&space);
+            rows.iter()
+                .any(|p| p.id == seeded && p.source == "referenced")
+                && !rows.iter().any(|p| p.id == second)
+        })
+    });
+    assert!(
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_errors_for(&space).is_empty()),
+        "both writes were accepted"
+    );
+}
+
+/// The refusal half: two refused writes in one space each keep their own report.
+/// The inspector renders **one band per space** by design (the panel is 320px),
+/// so the store keeps every standing refusal and the band lists them, each named
+/// — where a single slot could only have shown the last, and the reader would
+/// never learn their other action was refused too.
+#[gpui::test]
+fn two_refused_participant_writes_each_keep_their_own_refusal(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let rows = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants");
+    let agent = rows
+        .iter()
+        .find(|p| p.kind == "agent")
+        .expect("the seeded agent")
+        .id
+        .clone();
+    let human = rows
+        .iter()
+        .find(|p| p.kind == "human")
+        .expect("the shared You")
+        .id
+        .clone();
+
+    // Two refusals app-core decides for itself: a blank label, and removing the
+    // shared human.
+    stores.participants.update(cx, |s, cx| {
+        s.update_everywhere(
+            space.clone(),
+            agent.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("   ".into()),
+                ..Default::default()
+            },
+            eidola_app_core::ExpectedScope::Any,
+            cx,
+        );
+        s.remove(space.clone(), human.clone(), cx);
+    });
+
+    wait_until(cx, "both refusals stand", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_errors_for(&space).len() == 2)
+    });
+    stores.participants.read_with(cx, |s, _| {
+        let subjects: Vec<String> = s
+            .op_errors_for(&space)
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect();
+        assert!(
+            subjects.contains(&agent),
+            "the edit's refusal: {subjects:?}"
+        );
+        assert!(
+            subjects.contains(&human),
+            "the removal's refusal: {subjects:?}"
+        );
+    });
+}
+
+/// **A Save carries the premise it was composed under** (Codex review, PR #279).
+///
+/// Save and Share are the same control on one row, so the second replaces the
+/// first's slot — sanctioned last-wins. But a replaced write's *core* call keeps
+/// running, and the two writes do not share a premise: the Save was composed
+/// against a **space-owned** row, and if the promotion commits first the stale
+/// Save lands on a row that is now **global**, republishing the old persona to
+/// every space the agent joins. Liveness alone cannot see that; the premise has
+/// to ride the write.
+#[gpui::test]
+fn a_stale_owned_save_refuses_once_the_row_is_shared(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space = core
+        .runtime()
+        .block_on(core.create_space(Some("A".into())))
+        .expect("create space")
+        .id;
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the seeded agent")
+        .id;
+    let before = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.id == agent)
+        .expect("the agent")
+        .label;
+
+    // The other window's Share lands first.
+    core.runtime()
+        .block_on(core.promote_participant(agent.clone(), None))
+        .expect("the share");
+
+    // The Save that was already in flight, composed against the owned row.
+    stores.participants.update(cx, |s, cx| {
+        s.update_everywhere(
+            space.clone(),
+            agent.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("Stale name from the owned editor".into()),
+                ..Default::default()
+            },
+            eidola_app_core::ExpectedScope::SpaceOwned {
+                space_id: space.clone(),
+            },
+            cx,
+        )
+    });
+    wait_until(cx, "the stale save is refused", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| !s.op_errors_for(&space).is_empty())
+    });
+    let after = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.id == agent)
+        .expect("the agent");
+    assert_eq!(
+        after.label, before,
+        "a save composed against an owned row must not rewrite the shared identity"
+    );
+    assert_eq!(after.scope, "global");
+}
+
+/// **Two writes on one control are sequenced, not raced** (Codex review, PR
+/// #279). Replace-cancel was documented as "last-wins", but it only dropped the
+/// *gpui* half: `bridge` leaves the core write running, so the superseded write
+/// could reach the database after its successor — last-wins reversed — or, when
+/// the successor arrived before the first was ever polled, vanish entirely.
+///
+/// The successor now takes ownership of its predecessor's task and awaits it, so
+/// it starts strictly after that write's round trip. Both land, in order: the
+/// first's charter survives (it ran), and the second's name is what stands (it
+/// ran last).
+#[gpui::test]
+fn two_saves_on_one_agent_are_sequenced(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let (agent, _b) = two_shared_agents(cx, &stores);
+
+    stores.agents.update(cx, |s, cx| {
+        s.update_agent(
+            agent.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("First".into()),
+                system_prompt: Some(Some("Written by the first save.".into())),
+                ..Default::default()
+            },
+            cx,
+        );
+        s.update_agent(
+            agent.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: Some("Second".into()),
+                ..Default::default()
+            },
+            cx,
+        );
+    });
+
+    wait_until(cx, "both saves land in order", |_cx| {
+        core.runtime()
+            .block_on(core.list_global_agents())
+            .expect("library")
+            .iter()
+            .any(|a| a.id == agent && a.label == "Second")
+    });
+    let row = core
+        .runtime()
+        .block_on(core.list_global_agents())
+        .expect("library")
+        .into_iter()
+        .find(|a| a.id == agent)
+        .expect("the agent");
+    assert_eq!(
+        row.system_prompt.as_deref(),
+        Some("Written by the first save."),
+        "the superseded save still ran — its charter is the proof"
+    );
+    assert_eq!(row.label, "Second", "and the later save is what stands");
 }

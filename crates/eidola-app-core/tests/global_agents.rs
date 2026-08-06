@@ -110,7 +110,7 @@ fn blocks(core: &AppCore, participant: &str) -> Vec<eidola_app_core::memory::Mem
 
 fn promote(core: &AppCore, participant: &str) -> eidola_app_core::PromotionOutcome {
     core.runtime()
-        .block_on(core.promote_participant(participant.to_string()))
+        .block_on(core.promote_participant(participant.to_string(), None))
         .expect("promotion")
 }
 
@@ -569,7 +569,7 @@ fn promotion_is_one_way_and_refuses_everything_else() {
 
         let refuse = |participant: &str| -> String {
             core.runtime()
-                .block_on(core.promote_participant(participant.to_string()))
+                .block_on(core.promote_participant(participant.to_string(), None))
                 .expect_err("must be refused")
                 .to_string()
         };
@@ -756,7 +756,7 @@ impl eidola_app_core::tools::Tool for PromoteMidTurn {
                 .unwrap()
                 .clone()
                 .expect("participant id set");
-            core.promote_participant(id).await.map_err(|e| {
+            core.promote_participant(id, None).await.map_err(|e| {
                 eidola_app_core::tools::ToolError::new(format!("promote failed: {e}"))
             })?;
             Ok("promoted".to_string())
@@ -903,6 +903,642 @@ fn a_promotion_mid_turn_does_not_strand_a_memory_write() {
             actions(&core, &notebook)
                 .iter()
                 .any(|a| a.action_type == "memory" && a.participant_scope == "global")
+        );
+    });
+}
+
+/// The **agent library** the management surface reads: every live global agent
+/// with its config and its notebook, and nothing that is not a colleague.
+#[test]
+fn the_agent_library_lists_shared_agents_with_their_notebooks() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+
+        // Nothing has been promoted, so the library is empty — even though the
+        // shared human and Eidola-the-system are global rows from the first
+        // boot. A global that is not an agent is not a colleague.
+        assert!(
+            core.runtime()
+                .block_on(core.list_global_agents())
+                .expect("library")
+                .is_empty(),
+            "an install that promoted nothing has no shared agents"
+        );
+
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        let outcome = promote(&core, &agent);
+
+        let library = core
+            .runtime()
+            .block_on(core.list_global_agents())
+            .expect("library");
+        assert_eq!(library.len(), 1, "{library:#?}");
+        let listed = &library[0];
+        assert_eq!(listed.id, agent);
+        assert_eq!(
+            listed.notebook_space_id.as_deref(),
+            Some(outcome.notebook_space_id.as_str())
+        );
+        // The config is the agent's own — the same row the space renders.
+        let in_space = member(&core, &space, &agent).expect("still a member");
+        assert_eq!(listed.label, in_space.label);
+        assert_eq!(listed.model_ref, in_space.model_ref);
+        assert_eq!(listed.system_prompt, in_space.system_prompt);
+        assert_eq!(listed.notify_policy, in_space.notify_policy);
+
+        // An "edit everywhere" is what the library edits, and it shows here.
+        core.runtime()
+            .block_on(core.update_space_participant(
+                agent.clone(),
+                eidola_app_core::ParticipantUpdate {
+                    label: Some("Ada".into()),
+                    ..Default::default()
+                },
+                eidola_app_core::ExpectedScope::Any,
+            ))
+            .expect("edit everywhere");
+        assert_eq!(
+            core.runtime()
+                .block_on(core.list_global_agents())
+                .expect("library")[0]
+                .label,
+            "Ada"
+        );
+    });
+}
+
+/// **Retirement** — the counterpart to promotion, and deliberately not its
+/// inverse: the agent leaves the library and its notebook is archived in the
+/// same transaction, while the row, its id, its scope and its trail all stand.
+#[test]
+fn retiring_a_shared_agent_archives_its_notebook_and_keeps_its_trail() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        let notebook = promote(&core, &agent).notebook_space_id;
+        let before = actions(&core, &space).len();
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.retire_participant(agent.clone()))
+            .expect("retire");
+        let emitted = drain(&mut rx);
+        assert!(
+            emitted.contains(&Change::Participants),
+            "retirement emits Participants: {emitted:?}"
+        );
+        assert!(
+            !emitted.contains(&Change::SpaceIndex),
+            "the archived space is a notebook, which the Library never listed: {emitted:?}"
+        );
+
+        // Gone from the library…
+        assert!(
+            core.runtime()
+                .block_on(core.list_global_agents())
+                .expect("library")
+                .is_empty()
+        );
+        // …its notebook archived in the same breath…
+        assert!(
+            core.runtime()
+                .block_on(core.test_space_archived(notebook.clone()))
+                .expect("notebook row"),
+            "the notebook is archived with its agent"
+        );
+        // …and the trail is untouched: the actions it authored are still there.
+        assert_eq!(actions(&core, &space).len(), before);
+        assert!(
+            actions(&core, &space)
+                .iter()
+                .any(|a| a.participant_id == agent),
+            "a retired agent's authorship still resolves"
+        );
+    });
+}
+
+/// Retirement is refusal-first, and every refusal writes nothing.
+#[test]
+fn retirement_refuses_everything_that_is_not_a_shared_agent() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+
+        let refuse = |participant: &str| -> String {
+            core.runtime()
+                .block_on(core.retire_participant(participant.to_string()))
+                .expect_err("must be refused")
+                .to_string()
+        };
+
+        // A space-owned agent is removed from its space, not retired.
+        assert!(refuse(&agent).contains("one space"), "{}", refuse(&agent));
+        // The shared human.
+        assert!(
+            refuse(eidola_app_core::db::HUMAN_PARTICIPANT_ID).contains("yourself"),
+            "{}",
+            refuse(eidola_app_core::db::HUMAN_PARTICIPANT_ID)
+        );
+        // Eidola-the-system is a global row, but not a colleague.
+        assert!(
+            refuse(eidola_app_core::db::SYSTEM_PARTICIPANT_ID).contains("shared agent"),
+            "{}",
+            refuse(eidola_app_core::db::SYSTEM_PARTICIPANT_ID)
+        );
+        // Unknown.
+        assert!(
+            refuse("00000000-0000-7000-8000-0000000000ff").contains("not found"),
+            "{}",
+            refuse("00000000-0000-7000-8000-0000000000ff")
+        );
+
+        // Nothing above wrote: the agent is still space-owned and still a
+        // member. Then a real retirement, and the second one is refused too.
+        assert_eq!(
+            member(&core, &space, &agent).expect("member").scope,
+            "space"
+        );
+        let notebook = promote(&core, &agent).notebook_space_id;
+        core.runtime()
+            .block_on(core.retire_participant(agent.clone()))
+            .expect("retire");
+        assert!(
+            refuse(&agent).contains("already been retired"),
+            "{}",
+            refuse(&agent)
+        );
+        // The double refusal changed nothing about the notebook either.
+        assert!(
+            core.runtime()
+                .block_on(core.test_space_archived(notebook))
+                .expect("notebook row")
+        );
+    });
+}
+
+/// **A persona travels *into* the promoting transaction** (Codex review, PR
+/// #279) — the write a surface would otherwise do just before promoting.
+///
+/// The GUI's "Share this agent…" is pressed from inside an open editor whose
+/// fields stay on screen behind the confirmation, so what it shares is what the
+/// reader is looking at. Done as an edit followed by a promotion that is two
+/// transactions, and the gap between them is reachable: two windows share one
+/// `AppCore`, so the agent can be shared or removed in between — after which the
+/// edit commits (on a row that is by then **global**, and therefore in every
+/// space that follows it) while the promotion is refused. The reader is told
+/// nothing happened; their draft went everywhere.
+///
+/// Carried here, the persona is validated before the transaction opens and
+/// applied inside it, so both halves of a refusal — the ones decided up front,
+/// and the raced one the transaction's own guard catches — leave zero trace.
+#[test]
+fn a_persona_travels_into_the_promoting_transaction() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        let before = member(&core, &space, &agent).expect("member");
+
+        let outcome = core
+            .runtime()
+            .block_on(core.promote_participant(
+                agent.clone(),
+                Some(eidola_app_core::ParticipantUpdate {
+                    label: Some("Cartographer".into()),
+                    system_prompt: Some(Some("Draw the map before arguing about it.".into())),
+                    notify_policy: Some("all".into()),
+                    ..Default::default()
+                }),
+            ))
+            .expect("promotion carrying a persona");
+
+        // The shared row is the persona that was handed in — and the home
+        // space's membership still has NULL overrides, so what the space sees is
+        // that same row rather than a stale copy pinned over it.
+        let after = member(&core, &space, &agent).expect("still a member");
+        assert_eq!(after.scope, "global");
+        assert_eq!(after.source, "referenced");
+        assert_eq!(after.label, "Cartographer");
+        assert_eq!(
+            after.system_prompt.as_deref(),
+            Some("Draw the map before arguing about it.")
+        );
+        assert_eq!(after.notify_policy, "all");
+        assert_eq!(
+            after.model_ref, before.model_ref,
+            "a field the persona left alone is untouched"
+        );
+        let reference = after.reference.expect("a referenced global carries detail");
+        assert_eq!(reference.base_label, "Cartographer");
+        assert!(
+            reference.override_label.is_none()
+                && reference.override_system_prompt.is_none()
+                && reference.override_notify_policy.is_none(),
+            "promotion writes no per-space override"
+        );
+        let library = core
+            .runtime()
+            .block_on(core.list_global_agents())
+            .expect("library");
+        assert_eq!(library.len(), 1);
+        assert_eq!(library[0].label, "Cartographer");
+        // The notebook is named for the agent being shared, which is the name
+        // that came with the promotion — not the one still in the row.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.test_space_title(outcome.notebook_space_id))
+                .expect("notebook row"),
+            Some("Cartographer — notebook".to_string())
+        );
+
+        // A refusal decided up front — the persona's own validation, which runs
+        // before the row is even read.
+        let space_b = core
+            .runtime()
+            .block_on(core.create_space(Some("B".into())))
+            .expect("create space")
+            .id;
+        let agent_b = core
+            .runtime()
+            .block_on(core.list_space_participants(space_b.clone()))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template's agent")
+            .id;
+        let before_b = member(&core, &space_b, &agent_b).expect("member");
+        let err = core
+            .runtime()
+            .block_on(core.promote_participant(
+                agent_b.clone(),
+                Some(eidola_app_core::ParticipantUpdate {
+                    label: Some("   ".into()),
+                    system_prompt: Some(Some("Never written.".into())),
+                    ..Default::default()
+                }),
+            ))
+            .expect_err("a blank name is refused");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+        let still = member(&core, &space_b, &agent_b).expect("member");
+        assert_eq!(still.label, before_b.label, "the refusal wrote nothing");
+        assert_eq!(still.system_prompt, before_b.system_prompt);
+        assert_eq!(still.scope, "space", "and shared nothing");
+
+        // And the refusal the *race* produces: the other window shared this
+        // agent first, so the promotion is refused — with the persona still
+        // unwritten, where a separate edit before it would already have
+        // published it to every space that follows the now-global row.
+        let err = core
+            .runtime()
+            .block_on(core.promote_participant(
+                agent.clone(),
+                Some(eidola_app_core::ParticipantUpdate {
+                    label: Some("Renamed by a lost race".into()),
+                    ..Default::default()
+                }),
+            ))
+            .expect_err("already shared");
+        assert!(err.to_string().contains("already a shared agent"), "{err}");
+        assert_eq!(
+            member(&core, &space, &agent).expect("member").label,
+            "Cartographer",
+            "a refused share must not rename the agent it failed to share"
+        );
+    });
+}
+
+/// **A space's removal is not the library's.** Once an agent is shared, taking
+/// it out of a conversation ends that membership and nothing else — the row, its
+/// library seat and its notebook all stand, because retirement is a different
+/// verb with a different door. The distinction is decided at the write
+/// (`db::remove_space_participant_tx`), which is what keeps it true even when
+/// the share landed a moment before the removal (Codex review, PR #279).
+#[test]
+fn removing_a_shared_agent_from_a_space_is_a_leave_not_a_retirement() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        let notebook = promote(&core, &agent).notebook_space_id;
+
+        assert!(
+            core.runtime()
+                .block_on(core.remove_space_participant(space.clone(), agent.clone()))
+                .expect("removal"),
+            "the membership ended"
+        );
+        assert!(
+            member(&core, &space, &agent).is_none(),
+            "it is no longer in the conversation"
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.list_global_agents())
+                .expect("library")
+                .iter()
+                .any(|a| a.id == agent),
+            "but it is still a shared agent"
+        );
+        assert!(
+            !core
+                .runtime()
+                .block_on(core.test_space_archived(notebook))
+                .expect("notebook row"),
+            "and its notebook stands — only retirement archives one"
+        );
+    });
+}
+
+/// The discovery half of the same rule (Codex review, PR #279): `list_my_spaces`
+/// is bounded by membership, so a retirement landing mid-turn must empty it. The
+/// tool is bound to the responding participant when the turn starts, and the
+/// `space_participant` rows retirement leaves standing are the trail, not a
+/// licence — so the *question* is what has to require a live participant.
+#[test]
+fn a_retired_agent_discovers_no_spaces_mid_turn() {
+    run(|| {
+        let script = tool_script();
+        let (_mock, core, _dir) = setup(script.clone());
+        let core = std::sync::Arc::new(core);
+
+        let space_a = turn(&core, "First conversation.", None).space_id;
+        let agent = agent_id(&core, &space_a);
+        promote(&core, &agent);
+        let space_b = core
+            .runtime()
+            .block_on(core.create_space(Some("Second".into())))
+            .expect("a space")
+            .id;
+        core.runtime()
+            .block_on(core.add_global_participant(space_b.clone(), agent.clone()))
+            .expect("joins");
+
+        core.register_tool(std::sync::Arc::new(RetireMidTurn {
+            core: std::sync::Arc::downgrade(&core),
+            participant: agent.clone(),
+        }))
+        .expect("register");
+
+        // Round 1 retires it; round 2 asks where it works.
+        *script.lock().unwrap() = vec![
+            ("retire_now".into(), "{}".into()),
+            (LIST_MY_SPACES_TOOL_NAME.into(), "{}".into()),
+        ];
+        turn(
+            &core,
+            "Retire yourself, then list your spaces.",
+            Some(space_b.clone()),
+        );
+
+        let bodies = _mock.chat_bodies();
+        let followup = bodies.last().expect("a follow-up round");
+        let result = flat_messages(followup)
+            .into_iter()
+            .rfind(|(role, _)| role == "tool")
+            .expect("a tool result")
+            .1;
+        assert_eq!(
+            result, "You are not a member of any space.",
+            "a retired agent's memberships are no longer memberships"
+        );
+    });
+}
+
+/// A tool that retires the responding agent from inside its own turn — the
+/// interleave the availability rule is about, made deterministic (the
+/// `PromoteMidTurn` idiom above).
+struct RetireMidTurn {
+    core: std::sync::Weak<AppCore>,
+    participant: String,
+}
+
+impl eidola_app_core::tools::Tool for RetireMidTurn {
+    fn name(&self) -> &str {
+        "retire_now"
+    }
+    fn description(&self) -> &str {
+        "Retire this agent, right now."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}, "required": []})
+    }
+    fn call<'a>(&'a self, _a: serde_json::Value) -> eidola_app_core::tools::ToolFuture<'a> {
+        Box::pin(async move {
+            let core = self.core.upgrade().expect("core outlives the turn");
+            core.retire_participant(self.participant.clone())
+                .await
+                .map_err(|e| {
+                    eidola_app_core::tools::ToolError::new(format!("retire failed: {e}"))
+                })?;
+            Ok("retired".to_string())
+        })
+    }
+}
+
+/// **A notebook's owner cannot be removed from it** (Codex review, PR #279).
+///
+/// The notebook is a real space, so opening it from Settings renders its owner
+/// as an ordinary referenced participant — with the inspector's Remove beside
+/// it. That removal would set `left_at` on the one membership that is
+/// structural: the agent would still be live, but unable to answer in or
+/// discover the space that is the designated residence of its core memory, and
+/// nothing in the GUI can grant a membership back to a notebook.
+#[test]
+fn a_notebook_owner_cannot_be_removed_from_its_own_notebook() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        let notebook = promote(&core, &agent).notebook_space_id;
+
+        let err = core
+            .runtime()
+            .block_on(core.remove_space_participant(notebook.clone(), agent.clone()))
+            .expect_err("the notebook's owner is not removable");
+        assert!(
+            err.to_string().contains("notebook"),
+            "the refusal says why: {err}"
+        );
+        assert!(
+            member(&core, &notebook, &agent).is_some(),
+            "it is still a member of its own notebook"
+        );
+        // And the ordinary case is untouched: it can still be taken out of a
+        // conversation it merely works in.
+        assert!(
+            core.runtime()
+                .block_on(core.remove_space_participant(space.clone(), agent.clone()))
+                .expect("an ordinary removal"),
+            "leaving a conversation still works"
+        );
+        assert!(member(&core, &space, &agent).is_none());
+        assert!(
+            member(&core, &notebook, &agent).is_some(),
+            "and its notebook membership is untouched by that"
+        );
+    });
+}
+
+/// The byline a reader sees on the agent's own post in `space`.
+fn agent_byline(core: &AppCore, space: &str) -> String {
+    core.runtime()
+        .block_on(core.get_space_tree(space.to_string()))
+        .expect("tree")
+        .into_iter()
+        .find(|n| n.action_type == "inference")
+        .expect("the agent answered once")
+        .participant
+        .label
+}
+
+/// **Retirement wins terminally** (Codex review, PR #279).
+///
+/// Save and Retire are independent operations in independent slots, so a Save
+/// running in another window can still be in flight when a retirement commits —
+/// and a `bridge`d core call runs to completion even after its gpui task is
+/// replaced. The config write updated by `id` alone, so the stale Save landed
+/// *after* retirement and renamed the retired participant. The trail renders an
+/// author's label by joining the participant row, so the record the retirement
+/// promised to leave alone changed silently underneath it.
+#[test]
+fn a_save_that_lands_after_retirement_is_refused() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        promote(&core, &agent);
+        let before = agent_byline(&core, &space);
+
+        core.runtime()
+            .block_on(core.retire_participant(agent.clone()))
+            .expect("retirement");
+
+        // The stale Save, arriving after the retirement committed.
+        let err = core
+            .runtime()
+            .block_on(core.update_space_participant(
+                agent.clone(),
+                eidola_app_core::ParticipantUpdate {
+                    label: Some("Renamed after retirement".into()),
+                    ..Default::default()
+                },
+                eidola_app_core::ExpectedScope::Any,
+            ))
+            .expect_err("a retired participant takes no more configuration");
+        assert!(err.to_string().contains("retired"), "{err}");
+        assert_eq!(
+            agent_byline(&core, &space),
+            before,
+            "the trail retirement promised to leave alone is unchanged"
+        );
+
+        // The membership-level door answers the same way: an "override here"
+        // for a participant that is no longer part of the space is refused
+        // rather than parked in columns nothing reads.
+        let err = core
+            .runtime()
+            .block_on(core.set_space_participant_override(
+                space.clone(),
+                agent.clone(),
+                eidola_app_core::ParticipantOverride {
+                    label: Some(Some("Renamed here instead".into())),
+                    ..Default::default()
+                },
+            ))
+            .expect_err("a retired participant is no longer a member either");
+        assert!(err.to_string().contains("no longer part"), "{err}");
+        assert_eq!(agent_byline(&core, &space), before);
+    });
+}
+
+/// **A retired agent writes no memory** (Codex review, PR #279). `remember` read
+/// the owner's *scope* but never its liveness, so a retirement landing mid-turn
+/// left a later round free to mutate durable memory inside a notebook that had
+/// just been archived.
+#[test]
+fn a_retired_agent_cannot_remember_mid_turn() {
+    run(|| {
+        let script = tool_script();
+        let (_mock, core, _dir) = setup(script.clone());
+        let core = std::sync::Arc::new(core);
+        core.set_memory_enabled(true);
+
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        promote(&core, &agent);
+        let before = blocks(&core, &agent).len();
+
+        core.register_tool(std::sync::Arc::new(RetireMidTurn {
+            core: std::sync::Arc::downgrade(&core),
+            participant: agent.clone(),
+        }))
+        .expect("register");
+
+        // Round 1 retires it; round 2 — same turn, same bound participant —
+        // tries to write memory.
+        *script.lock().unwrap() = vec![
+            ("retire_now".into(), "{}".into()),
+            (
+                "remember".into(),
+                serde_json::json!({
+                    "block": "after the end",
+                    "text": "Written after I was retired.",
+                    "scope": "core",
+                })
+                .to_string(),
+            ),
+        ];
+        turn(
+            &core,
+            "Retire yourself, then remember something.",
+            Some(space),
+        );
+
+        assert_eq!(
+            blocks(&core, &agent).len(),
+            before,
+            "a retired agent's memory is closed"
+        );
+    });
+}
+
+/// **A join that loses a race to a retirement writes nothing** (Codex review, PR
+/// #279). `add_global_participant` read the participant as live and *then*
+/// inserted the reference, so a retirement committing in between left a durable
+/// membership row joined after retirement, a spurious invalidation, and an
+/// `Internal` error where a typed refusal belonged.
+#[test]
+fn a_join_refused_by_retirement_leaves_no_membership() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        promote(&core, &agent);
+        let other = core
+            .runtime()
+            .block_on(core.create_space(Some("Elsewhere".into())))
+            .expect("a space")
+            .id;
+        core.runtime()
+            .block_on(core.retire_participant(agent.clone()))
+            .expect("retirement");
+
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.add_global_participant(other.clone(), agent.clone()))
+            .expect_err("a retired agent cannot join");
+        assert!(
+            !matches!(err, eidola_app_core::error::AppError::Internal { .. }),
+            "the refusal is typed, not an internal error: {err}"
+        );
+        assert!(drain(&mut rx).is_empty(), "a refusal emits nothing");
+        assert!(
+            member(&core, &other, &agent).is_none(),
+            "and leaves no membership behind"
         );
     });
 }

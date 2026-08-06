@@ -4,6 +4,7 @@
 pub mod about;
 pub mod account;
 pub mod actions;
+pub mod agents_settings;
 pub mod backends_settings;
 pub mod bridge;
 pub mod chrome;

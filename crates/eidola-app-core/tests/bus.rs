@@ -156,6 +156,21 @@
 //! (`promotion_is_in_place_and_the_scope_echo_cascades` pins the emission set;
 //! `promotion_is_one_way_and_refuses_everything_else` pins the refusals).
 //!
+//! **Retirement** (`retire_participant`) is the library's other exit point and
+//! the counterpart to promotion — deliberately **not** its inverse: the row
+//! keeps its id and its scope, the trail still resolves it, and its memory is
+//! untouched; what ends is its availability. One transaction — the
+//! `participant.removed_at` soft-remove **and** its notebook's archival ("the
+//! notebook is archived with its agent") — emitting **`Change::Participants`
+//! only**. Not `SpaceIndex`, by the same argument promotion makes and for the
+//! same reason `archive_space` *does* emit it: the rule is "did the Library
+//! listing change", and a notebook was never in it. `list_global_agents` is a
+//! pure read and emits nothing. Refusals (unknown, already retired, the shared
+//! human, a space-owned participant, a non-agent) are decided before any write.
+//! Covered by `promote_and_retire_emit_participants_only` below and
+//! `global_agents.rs`'s `retiring_a_shared_agent_archives_its_notebook_and_keeps_its_trail`
+//! / `retirement_refuses_everything_that_is_not_a_shared_agent`.
+//!
 //! **Orchestration (Participants v1, wave 2).** `submit` = `post` +
 //! `plan_notifications`; `plan_notifications` is a **pure read** (participant +
 //! cascade-depth SELECTs) — **it commits nothing and emits nothing**, so
@@ -1454,6 +1469,7 @@ fn add_update_remove_participant_emit_participants() {
                     label: Some("Justin 2".into()),
                     ..Default::default()
                 },
+                eidola_app_core::ExpectedScope::Any,
             ))
             .unwrap();
         assert!(
@@ -1470,6 +1486,7 @@ fn add_update_remove_participant_emit_participants() {
                         notify_policy: Some("sometimes".into()),
                         ..Default::default()
                     },
+                    eidola_app_core::ExpectedScope::Any,
                 ))
                 .is_err()
         );
@@ -1496,6 +1513,106 @@ fn add_update_remove_participant_emit_participants() {
                 )
                 .is_err()
         );
+    });
+}
+
+/// The two library exit points of task 36 — promotion and retirement — each
+/// emit **`Participants` and nothing else**, though both write a `space` row.
+/// The space in question is a notebook, which `list_spaces` excludes
+/// unconditionally, so a `SpaceIndex` would invalidate a store with nothing new
+/// to read. (`archive_space` emits `SpaceIndex` for exactly the opposite
+/// reason: the space it archives is one the Library lists.)
+#[test]
+fn promote_and_retire_emit_participants_only() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let space = core.runtime().block_on(core.create_space(None)).unwrap();
+        let agent = core
+            .runtime()
+            .block_on(core.list_space_participants(space.id.clone()))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template's agent")
+            .id;
+
+        let mut rx = core.subscribe_changes();
+        let outcome = core
+            .runtime()
+            .block_on(core.promote_participant(agent.clone(), None))
+            .expect("promotion");
+        let emitted = drain(&mut rx);
+        assert!(
+            emitted.contains(&Change::Participants),
+            "promotion emits Participants: {emitted:?}"
+        );
+        assert!(
+            !emitted.contains(&Change::SpaceIndex),
+            "the notebook it created is not a Library entry: {emitted:?}"
+        );
+
+        // A promotion **carrying a persona** is still one transaction and one
+        // signal. That the persona used to be a separate `update_space_participant`
+        // — a second write, a second emission, and a second chance to commit
+        // half of what the reader asked for — is exactly what moving it inside
+        // this call retired (Codex review, PR #279).
+        let space_b = core.runtime().block_on(core.create_space(None)).unwrap();
+        let agent_b = core
+            .runtime()
+            .block_on(core.list_space_participants(space_b.id.clone()))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template's agent")
+            .id;
+        let _ = drain(&mut rx);
+        core.runtime()
+            .block_on(core.promote_participant(
+                agent_b,
+                Some(eidola_app_core::ParticipantUpdate {
+                    label: Some("Cartographer".into()),
+                    ..Default::default()
+                }),
+            ))
+            .expect("promotion carrying a persona");
+        let emitted = drain(&mut rx);
+        assert_eq!(
+            emitted,
+            vec![Change::Participants],
+            "a persona-carrying promotion is one signal, not two: {emitted:?}"
+        );
+
+        core.runtime()
+            .block_on(core.retire_participant(agent.clone()))
+            .expect("retirement");
+        let emitted = drain(&mut rx);
+        assert!(
+            emitted.contains(&Change::Participants),
+            "retirement emits Participants: {emitted:?}"
+        );
+        assert!(
+            !emitted.contains(&Change::SpaceIndex),
+            "the notebook it archived was never listed: {emitted:?}"
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.test_space_archived(outcome.notebook_space_id))
+                .expect("notebook row"),
+            "retirement archived the notebook in the same transaction"
+        );
+
+        // Every refusal is decided before any write, and emits nothing.
+        assert!(
+            core.runtime()
+                .block_on(core.retire_participant(agent.clone()))
+                .is_err()
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.promote_participant(agent, None))
+                .is_err()
+        );
+        assert!(drain(&mut rx).is_empty(), "refusals must not emit");
     });
 }
 
@@ -1559,6 +1676,7 @@ fn participant_labels_reject_control_characters() {
                             label: Some(label.into()),
                             ..Default::default()
                         },
+                        eidola_app_core::ExpectedScope::Any,
                     ))
                     .is_err(),
                 "update_space_participant must reject {label:?}"
@@ -1643,6 +1761,7 @@ fn participant_labels_reject_control_characters() {
                     label: Some("Ada Lovelace".into()),
                     ..Default::default()
                 },
+                eidola_app_core::ExpectedScope::Any,
             ))
             .unwrap();
     });

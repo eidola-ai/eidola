@@ -33,9 +33,8 @@ use eidola_app_core::{
     NewParticipant, ParticipantInfo, ParticipantOverride, ParticipantReference, ParticipantUpdate,
 };
 use gpui::{
-    AnyElement, AppContext, Context, Entity, Focusable as _, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder as _, px,
+    AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme, StyledExt as _, h_flex,
@@ -59,6 +58,10 @@ const PROMPT_PLACEHOLDER: &str = "A short instruction for how this participant b
 /// inputs plus the working model/notify/mode, and (for a referenced global) the
 /// reference detail the two modes seed from.
 pub(crate) struct ParticipantEdit {
+    /// The form subtree's focus handle — the handback asks **containment**, not
+    /// an enumeration of this form's inputs (see
+    /// [`SpaceView::inspector_participant_field_focused`]).
+    focus: gpui::FocusHandle,
     pub(crate) participant_id: String,
     kind: String,
     is_referenced: bool,
@@ -69,10 +72,43 @@ pub(crate) struct ParticipantEdit {
     model_ref: Option<String>,
     notify_policy: String,
     mode: EditMode,
+    /// Whether "Share this agent…" has been pressed and the editor is showing
+    /// its confirmation. It lives **inside the editor** rather than beside it
+    /// because sharing is one-way: a flag with its own lifetime would have to be
+    /// cleared at every transition that closes this editor (the roster dropping
+    /// the row, Remove, the add form, another disclosure), and the one that
+    /// forgot would leave an armed irreversible verb over a different
+    /// participant. Owned by the thing it describes, it cannot outlive it.
+    promote_confirm: bool,
+}
+
+impl ParticipantEdit {
+    /// The visible fields as an **"edit everywhere"** update — the participant's
+    /// own config.
+    ///
+    /// Shared by the two verbs that write it: Save (for an owned participant, or
+    /// a referenced global in Everyone mode) and Share, which saves the draft
+    /// before promoting. One reading of "what the fields mean" for both, so the
+    /// share can never write a different persona than the save beside it would.
+    fn as_everywhere_update(&self, cx: &gpui::App) -> ParticipantUpdate {
+        let label = self.label.read(cx).value().trim().to_string();
+        let system_prompt = self.system_prompt.read(cx).value().trim().to_string();
+        let mut update = ParticipantUpdate {
+            label: Some(label),
+            notify_policy: Some(self.notify_policy.clone()),
+            ..Default::default()
+        };
+        if self.kind == "agent" {
+            update.model_ref = Some(self.model_ref.clone().filter(|s| !s.is_empty()));
+            update.system_prompt = Some((!system_prompt.is_empty()).then_some(system_prompt));
+        }
+        update
+    }
 }
 
 /// The open add-a-participant form (agents only).
 pub(crate) struct ParticipantAdd {
+    focus: gpui::FocusHandle,
     label: Entity<InputState>,
     system_prompt: Entity<InputState>,
     model_ref: Option<String>,
@@ -81,6 +117,7 @@ pub(crate) struct ParticipantAdd {
 
 /// The open "Save these participants as a template…" form.
 pub(crate) struct TemplateForm {
+    focus: gpui::FocusHandle,
     title: Entity<InputState>,
 }
 
@@ -99,6 +136,25 @@ impl SpaceView {
         self.space.read(cx).id().map(str::to_string)
     }
 
+    /// Whether this space is `participant_id`'s own notebook — the one
+    /// membership no roster may offer to end.
+    fn inspector_participant_owns_this_notebook(
+        &self,
+        participant_id: &str,
+        cx: &gpui::App,
+    ) -> bool {
+        let Some(space_id) = self.space_id(cx) else {
+            return false;
+        };
+        self.stores
+            .space_settings
+            .read(cx)
+            .settings(&space_id)
+            .value()
+            .and_then(|s| s.notebook_participant_id.as_deref())
+            == Some(participant_id)
+    }
+
     /// This space's membership as the store holds it.
     fn inspector_participants(&self, cx: &gpui::App) -> Vec<ParticipantInfo> {
         match self.space_id(cx) {
@@ -110,24 +166,33 @@ impl SpaceView {
     /// Whether any of the section's text fields holds the window's focus — read
     /// by [`SpaceView::inspector_field_focused`], which gates type-to-compose
     /// and the close-time focus handoff.
+    /// Whether the keyboard is anywhere **inside** one of this section's three
+    /// forms.
+    ///
+    /// **Containment, not an enumeration of inputs.** A form is a subtree — its
+    /// fields, its mode chips, its verbs, its model dropdown — and a predicate
+    /// that lists the text inputs answers "not held" for everything else in it.
+    /// Since this is what the focus handback consults (`hand_back_inspector_focus`),
+    /// an enumerated answer drops the keyboard on the floor for exactly the
+    /// controls a future edit adds, and re-breaks each time (Codex review, PR
+    /// #279). `contains_focused` is the idiom the Library's reveal already uses.
     pub(crate) fn inspector_participant_field_focused(
         &self,
         window: &Window,
         cx: &gpui::App,
     ) -> bool {
-        let focused =
-            |state: &Entity<InputState>| state.read(cx).focus_handle(cx).is_focused(window);
+        let holds = |focus: &gpui::FocusHandle| focus.contains_focused(window, cx);
         self.inspector_participant_edit
             .as_ref()
-            .is_some_and(|e| focused(&e.label) || focused(&e.system_prompt))
+            .is_some_and(|e| holds(&e.focus))
             || self
                 .inspector_participant_add
                 .as_ref()
-                .is_some_and(|a| focused(&a.label) || focused(&a.system_prompt))
+                .is_some_and(|a| holds(&a.focus))
             || self
                 .inspector_template_form
                 .as_ref()
-                .is_some_and(|t| focused(&t.title))
+                .is_some_and(|t| holds(&t.focus))
     }
 
     // -- Test seams --------------------------------------------------------
@@ -143,6 +208,14 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn inspector_editing_mode(&self) -> Option<EditMode> {
         self.inspector_participant_edit.as_ref().map(|e| e.mode)
+    }
+
+    /// The open disclosure's subtree focus handle (tests).
+    #[doc(hidden)]
+    pub fn inspector_editing_focus_handle(&self) -> Option<gpui::FocusHandle> {
+        self.inspector_participant_edit
+            .as_ref()
+            .map(|e| e.focus.clone())
     }
 
     #[doc(hidden)]
@@ -216,7 +289,7 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         if self.inspector_editing_participant() == Some(participant_id) {
-            self.inspector_cancel_participant_edit(cx);
+            self.inspector_cancel_participant_edit(window, cx);
             return;
         }
         let Some(p) = self
@@ -240,6 +313,7 @@ impl SpaceView {
                 .default_value(p.system_prompt.clone().unwrap_or_default())
         });
         self.inspector_participant_edit = Some(ParticipantEdit {
+            focus: cx.focus_handle(),
             participant_id: p.id.clone(),
             kind: p.kind.clone(),
             is_referenced,
@@ -253,6 +327,7 @@ impl SpaceView {
             } else {
                 EditMode::Everywhere
             },
+            promote_confirm: false,
         });
         cx.notify();
     }
@@ -331,18 +406,46 @@ impl SpaceView {
         }
     }
 
-    pub fn inspector_cancel_participant_edit(&mut self, cx: &mut Context<Self>) {
+    /// Hand the keyboard back to the view root when a form that **was** holding
+    /// it has gone and left nothing focused.
+    ///
+    /// `held` is an observation taken *before* the form was dropped, and it has
+    /// to be: the question is asked of the form's own `InputState`s, which die
+    /// with it. Every path that closes one of this section's three forms goes
+    /// through here — the verbs a reader presses as well as the roster-driven
+    /// retire, which is where the rule started (Codex review, PR #279). And the
+    /// restore is `set_inspector_open`'s: only from a lender still holding it,
+    /// so a form that never had the keyboard cannot take it from whatever does.
+    pub(crate) fn hand_back_inspector_focus(
+        &mut self,
+        held: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if held && !self.inspector_field_focused(window, cx) {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
+    pub fn inspector_cancel_participant_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let held = self.inspector_field_focused(window, cx);
         self.inspector_participant_edit = None;
         self.inspector_participant_picker = None;
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
     /// Commit the open editor — "edit everywhere" or "override here" per its
     /// mode; an owned participant is always an edit of its own config.
-    pub fn inspector_save_participant_edit(&mut self, cx: &mut Context<Self>) {
+    pub fn inspector_save_participant_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
+        let held = self.inspector_field_focused(window, cx);
         let Some(edit) = self.inspector_participant_edit.take() else {
             return;
         };
@@ -369,24 +472,127 @@ impl SpaceView {
                 .participants
                 .update(cx, |s, cx| s.set_override(space_id, pid, ov, cx));
         } else {
-            let mut update = ParticipantUpdate {
-                label: Some(label),
-                notify_policy: Some(edit.notify_policy.clone()),
-                ..Default::default()
+            let update = edit.as_everywhere_update(cx);
+            // The premise the editor was seeded on: an owned row belongs to this
+            // space, a referenced one is a shared identity. Either can move
+            // under an open editor (promotion), and the write is where that is
+            // caught.
+            let expected = match edit.is_referenced {
+                true => eidola_app_core::ExpectedScope::Global,
+                false => eidola_app_core::ExpectedScope::SpaceOwned {
+                    space_id: space_id.clone(),
+                },
             };
-            if is_agent {
-                update.model_ref = Some(edit.model_ref.clone().filter(|s| !s.is_empty()));
-                update.system_prompt = Some((!system_prompt.is_empty()).then_some(system_prompt));
-            }
-            self.stores
-                .participants
-                .update(cx, |s, cx| s.update_everywhere(space_id, pid, update, cx));
+            self.stores.participants.update(cx, |s, cx| {
+                s.update_everywhere(space_id, pid, update, expected, cx)
+            });
         }
         self.inspector_participant_picker = None;
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
-    pub fn inspector_remove_participant(&mut self, participant_id: &str, cx: &mut Context<Self>) {
+    // -- Sharing (task 36's in-place promotion) ----------------------------
+
+    /// Arm the "Share this agent…" confirmation on the open disclosure.
+    ///
+    /// Sharing is **one-way** (app-core has no demotion — it would strand
+    /// memberships and memory), so it asks first. The confirmation is also where
+    /// the reassurance is spoken: promotion moves the row's ownership, never its
+    /// configuration, so the agent answers in this space exactly as it does now.
+    /// Arm or stand down the share confirmation.
+    ///
+    /// **Either direction unmounts the control that was pressed** — arming
+    /// replaces "Share this agent…" with the confirmation, standing down does
+    /// the reverse — and these are real tab stops (`probe(Role::Button)` derives
+    /// `focusable()` + `tab_index(0)`), so a keyboard reader is left holding a
+    /// handle to something nobody paints. The form itself survives, so the
+    /// keyboard goes **to the form**, not out to the view root: the reader is
+    /// still editing this participant (Codex review, PR #279).
+    fn set_inspector_promote_confirm(
+        &mut self,
+        armed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(edit) = self.inspector_participant_edit.as_mut() else {
+            return;
+        };
+        edit.promote_confirm = armed;
+        let form = edit.focus.clone();
+        if form.contains_focused(window, cx) {
+            window.focus(&form, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn inspector_begin_promote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_inspector_promote_confirm(true, window, cx);
+    }
+
+    pub fn inspector_cancel_promote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_inspector_promote_confirm(false, window, cx);
+    }
+
+    /// Confirm the share: `ParticipantsStore::promote` — the open editor's
+    /// fields saved, then `AppCore::promote_participant`, in one store op.
+    ///
+    /// **The draft is what is being shared.** The confirmation renders *inside*
+    /// the editor, with name, model, charter and notify policy still on screen
+    /// above it, and it promises the agent "keeps this space's persona exactly as
+    /// it is" — a sentence a reader can only read against those visible values.
+    /// Consuming the draft and promoting the stored row would make it false about
+    /// everything they had just typed (Codex review, PR #279). The participant is
+    /// space-**owned** at this moment (that is what `can_share` means), so the
+    /// save is an ordinary edit of its own config, and promotion's byte-for-byte
+    /// guarantee then applies to the values just written. Both core calls travel
+    /// in one `bridge` closure — see [`crate::stores::ParticipantsStore::promote`].
+    ///
+    /// A blank name is refused **before** the first write, the way the add form
+    /// refuses one: app-core would reject it anyway, and returning the draft
+    /// keeps the rest of the reader's typing (with the confirmation still armed,
+    /// over the empty field that is the reason).
+    ///
+    /// The editor closes, because what it was editing has changed shape: the row
+    /// comes back from the re-list as a **referenced global**, whose editor
+    /// carries the everywhere-vs-here fork this one was seeded without. Nothing
+    /// else is view work — the roster's "shared" tag falls out of the same
+    /// re-list.
+    pub fn inspector_confirm_promote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(space_id) = self.space_id(cx) else {
+            return;
+        };
+        let held = self.inspector_field_focused(window, cx);
+        let Some(edit) = self.inspector_participant_edit.take() else {
+            return;
+        };
+        let update = edit.as_everywhere_update(cx);
+        if update.label.as_deref().is_some_and(str::is_empty) {
+            self.inspector_participant_edit = Some(edit);
+            return;
+        }
+        self.inspector_participant_picker = None;
+        self.stores.participants.update(cx, |s, cx| {
+            s.promote(space_id, edit.participant_id, Some(update), cx)
+        });
+        self.hand_back_inspector_focus(held, window, cx);
+        cx.notify();
+    }
+
+    /// Whether the open disclosure is showing its share confirmation (tests).
+    #[doc(hidden)]
+    pub fn inspector_promote_confirming(&self) -> bool {
+        self.inspector_participant_edit
+            .as_ref()
+            .is_some_and(|e| e.promote_confirm)
+    }
+
+    pub fn inspector_remove_participant(
+        &mut self,
+        participant_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
@@ -395,7 +601,9 @@ impl SpaceView {
             .participants
             .update(cx, |s, cx| s.remove(space_id, pid, cx));
         if self.inspector_editing_participant() == Some(participant_id) {
+            let held = self.inspector_field_focused(window, cx);
             self.inspector_participant_edit = None;
+            self.hand_back_inspector_focus(held, window, cx);
         }
         cx.notify();
     }
@@ -418,6 +626,7 @@ impl SpaceView {
                 .default_value(DEFAULT_AGENT_SYSTEM_PROMPT)
         });
         self.inspector_participant_add = Some(ParticipantAdd {
+            focus: cx.focus_handle(),
             label,
             system_prompt,
             model_ref: Some(self.stores.config.read(cx).default_model()),
@@ -433,16 +642,23 @@ impl SpaceView {
         }
     }
 
-    pub fn inspector_cancel_add_participant(&mut self, cx: &mut Context<Self>) {
+    pub fn inspector_cancel_add_participant(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let held = self.inspector_field_focused(window, cx);
         self.inspector_participant_add = None;
         self.inspector_participant_picker = None;
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
-    pub fn inspector_save_add_participant(&mut self, cx: &mut Context<Self>) {
+    pub fn inspector_save_add_participant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
+        let held = self.inspector_field_focused(window, cx);
         let Some(add) = self.inspector_participant_add.take() else {
             return;
         };
@@ -464,6 +680,7 @@ impl SpaceView {
             .participants
             .update(cx, |s, cx| s.add(space_id, participant, cx));
         self.inspector_participant_picker = None;
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
@@ -478,19 +695,25 @@ impl SpaceView {
             .unwrap_or_else(|| "My template".to_string());
         let title = cx.new(|cx| InputState::new(window, cx).default_value(&default_title));
         title.update(cx, |s, cx| s.focus(window, cx));
-        self.inspector_template_form = Some(TemplateForm { title });
+        self.inspector_template_form = Some(TemplateForm {
+            focus: cx.focus_handle(),
+            title,
+        });
         cx.notify();
     }
 
-    pub fn inspector_cancel_template(&mut self, cx: &mut Context<Self>) {
+    pub fn inspector_cancel_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.inspector_field_focused(window, cx);
         self.inspector_template_form = None;
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
-    pub fn inspector_save_template(&mut self, cx: &mut Context<Self>) {
+    pub fn inspector_save_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
+        let held = self.inspector_field_focused(window, cx);
         let Some(form) = self.inspector_template_form.take() else {
             return;
         };
@@ -502,6 +725,7 @@ impl SpaceView {
         self.stores
             .templates
             .update(cx, |s, cx| s.create_from_space(space_id, title, cx));
+        self.hand_back_inspector_focus(held, window, cx);
         cx.notify();
     }
 
@@ -539,16 +763,43 @@ impl SpaceView {
         mounted.then_some(target)
     }
 
-    /// Retire an open disclosure whose participant has **left the roster** —
-    /// another window removed it, and the store's re-list is the only news this
-    /// view gets. Nothing paints the editor once its row is gone, so every
-    /// window-local thing hanging off it becomes a claim about a surface that is
-    /// not there: its dropdown (above), and — worse — the field focus, which
-    /// would go on reporting through `inspector_field_focused` that a **dead**
-    /// input holds the keyboard, leaving type-to-compose inert until a click
-    /// revived it. That is the unmount no verb can clean up after, which is why
-    /// it is reconciled at the head of `render` instead: the roster is what
-    /// decides whether the editor paints, so the roster is what has to retire it.
+    /// Retire an open disclosure whose participant **no longer answers to the
+    /// shape it was seeded from** — the roster is what decides whether the
+    /// editor paints, so the roster is what has to retire it. Two ways a row
+    /// stops answering, and the same reconcile covers both:
+    ///
+    /// * **It left.** Another window removed it, and the store's re-list is the
+    ///   only news this view gets. Nothing paints the editor once its row is
+    ///   gone, so every window-local thing hanging off it becomes a claim about
+    ///   a surface that is not there: its dropdown (above), and — worse — the
+    ///   field focus, which would go on reporting through
+    ///   `inspector_field_focused` that a **dead** input holds the keyboard,
+    ///   leaving type-to-compose inert until a click revived it.
+    /// * **It became something else.** Promotion keeps the participant's id, so
+    ///   the re-list carries the same row with `source` flipped to
+    ///   `referenced` — invisible to an id check, and the editor is seeded on
+    ///   exactly that distinction. Left standing it paints the *owned* form over
+    ///   a shared agent: no Everyone/This-space fork, a live "Share this agent…"
+    ///   over something that already is one, and a **Save** routed to
+    ///   `update_everywhere` — publishing the draft to every space the agent
+    ///   joins without the reader ever being shown the choice (Codex review, PR
+    ///   #279).
+    ///
+    /// **Retire rather than re-seed**, because the fork is a decision only the
+    /// reader can make: adopting a mode for them would silently retarget the
+    /// values on screen to a different destination, which is the very thing
+    /// [`Self::inspector_set_edit_mode`] re-seeds to prevent. Re-opening the row
+    /// gives the referenced editor, its chips, and its safe default. This is the
+    /// same rule [`Self::inspector_confirm_promote`] already applies when *this*
+    /// window does the promoting ("what it was editing has changed shape"); all
+    /// that is new is that another window's promotion arrives as a re-list
+    /// rather than as a verb, and a re-list is not a thing anyone can clean up
+    /// after by hand. The armed share confirmation needs no separate handling —
+    /// it lives **inside** `ParticipantEdit`, so it cannot outlive it.
+    ///
+    /// The mirror case cannot arise: promotion is one-way (app-core offers no
+    /// demotion), so a `referenced` row never becomes `owned` under an open
+    /// editor. `scope` moves with `source` and adds nothing to ask about.
     ///
     /// **Focus comes back from a panel that is holding it** — `set_inspector_open`'s
     /// rule, restored only to a lender who still has nothing.
@@ -557,34 +808,35 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pid) = self
+        let Some((pid, was_referenced)) = self
             .inspector_participant_edit
             .as_ref()
-            .map(|e| e.participant_id.clone())
+            .map(|e| (e.participant_id.clone(), e.is_referenced))
         else {
             return;
         };
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
-        // Only a listing that has answered can say a row is gone: a first load
-        // in flight, or a failed one with nothing prior, knows nothing.
-        let gone = {
+        // Only a listing that has answered can say anything about a row: a first
+        // load in flight, or a failed one with nothing prior, knows nothing.
+        let stale = {
             let store = self.stores.participants.read(cx);
             match store.participants(&space_id).value() {
-                Some(list) => !list.iter().any(|p| p.id == pid),
+                Some(list) => match list.iter().find(|p| p.id == pid) {
+                    None => true,
+                    Some(p) => (p.source == "referenced") != was_referenced,
+                },
                 None => false,
             }
         };
-        if !gone {
+        if !stale {
             return;
         }
         let held = self.inspector_field_focused(window, cx);
         self.inspector_participant_edit = None;
         self.inspector_participant_picker = None;
-        if held && !self.inspector_field_focused(window, cx) {
-            window.focus(&self.focus_handle, cx);
-        }
+        self.hand_back_inspector_focus(held, window, cx);
     }
 
     pub(crate) fn inspector_toggle_participant_picker(
@@ -685,12 +937,7 @@ impl SpaceView {
                 cell.is_loading(),
             )
         };
-        let op_error = self
-            .stores
-            .participants
-            .read(cx)
-            .op_error(&space_id)
-            .map(str::to_string);
+        let op_errors = self.stores.participants.read(cx).op_errors_for(&space_id);
 
         let mut col = v_flex()
             .w_full()
@@ -721,8 +968,9 @@ impl SpaceView {
             // A refused write and a failed re-list can stand at once (see
             // `stores::settle_mutation`); this branch owns the section, so it
             // carries the write's refusal rather than swallowing it.
-            if let Some(err) = op_error {
-                col = col.child(self.render_inspector_participants_error(&err, &space_id, cx));
+            if !op_errors.is_empty() {
+                col =
+                    col.child(self.render_inspector_participants_error(&op_errors, &space_id, cx));
             }
             return Some(col.into_any_element());
         }
@@ -788,8 +1036,8 @@ impl SpaceView {
                 ),
             };
 
-        if let Some(err) = op_error {
-            col = col.child(self.render_inspector_participants_error(&err, &space_id, cx));
+        if !op_errors.is_empty() {
+            col = col.child(self.render_inspector_participants_error(&op_errors, &space_id, cx));
         }
 
         // A failed *refresh* over rows we still hold: keep them, and say the
@@ -923,11 +1171,25 @@ impl SpaceView {
             return div().into_any_element();
         };
         let is_agent = edit.kind == "agent";
-        let can_remove = p.id != eidola_app_core::HUMAN_PARTICIPANT_ID;
+        // Two members are never removable: the shared "You", and — when this
+        // space is an agent's **notebook** — that agent. The notebook exists
+        // only for it and is where its `core` memory lives, so the membership is
+        // structural and app-core refuses to end it. Withholding the affordance
+        // is the courtesy; the refusal is the guarantee (task 36; Codex review,
+        // PR #279). Until the space's settings have landed the space cannot be
+        // known to be a notebook, and Remove is offered as it is anywhere else —
+        // the honest degradation, since pressing it is refused rather than
+        // obeyed.
+        let can_remove = p.id != eidola_app_core::HUMAN_PARTICIPANT_ID
+            && !self.inspector_participant_owns_this_notebook(&p.id, cx);
         let remove_id = p.id.clone();
         let subject = p.label.clone();
+        // Only a **space-owned** agent can be shared: a referenced global
+        // already is one, and promotion is one-way, so there is deliberately
+        // nothing here that reads as "unshare".
+        let can_share = is_agent && !edit.is_referenced;
 
-        let mut card = v_flex().w_full().pb_3().gap_2();
+        let mut card = v_flex().track_focus(&edit.focus).w_full().pb_3().gap_2();
 
         if edit.is_referenced {
             let mode = edit.mode;
@@ -1005,6 +1267,28 @@ impl SpaceView {
                 .child(self.render_inspector_notify(&edit.notify_policy, "editor", true, cx));
         }
 
+        // Sharing gets its own line rather than a fourth seat in the verb row:
+        // the panel is 320px, and a row of four verbs pushed Save off the edge.
+        // It is also not a peer of Cancel/Save — those settle this edit, while
+        // this one changes what the participant *is*.
+        if can_share {
+            card = card.child(match edit.promote_confirm {
+                true => self.render_inspector_share_confirm(p, cx),
+                false => h_flex()
+                    .w_full()
+                    .child(ghost_button_labeled(
+                        "space-inspector-p-share".into(),
+                        SharedString::from(format!("space/inspector/participants/{}/share", p.id)),
+                        "Share this agent…",
+                        format!("Share {subject} across spaces"),
+                        false,
+                        cx,
+                        cx.listener(|this, _, window, cx| this.inspector_begin_promote(window, cx)),
+                    ))
+                    .into_any_element(),
+            });
+        }
+
         card.child(
             h_flex()
                 .w_full()
@@ -1021,8 +1305,8 @@ impl SpaceView {
                         format!("Remove {subject}"),
                         false,
                         cx,
-                        cx.listener(move |this, _, _, cx| {
-                            this.inspector_remove_participant(&remove_id, cx)
+                        cx.listener(move |this, _, window, cx| {
+                            this.inspector_remove_participant(&remove_id, window, cx)
                         }),
                     ))
                 }))
@@ -1035,8 +1319,8 @@ impl SpaceView {
                             "Cancel",
                             false,
                             cx,
-                            cx.listener(|this, _, _, cx| {
-                                this.inspector_cancel_participant_edit(cx)
+                            cx.listener(|this, _, window, cx| {
+                                this.inspector_cancel_participant_edit(window, cx)
                             }),
                         ))
                         .child(ghost_button(
@@ -1045,11 +1329,93 @@ impl SpaceView {
                             "Save",
                             true,
                             cx,
-                            cx.listener(|this, _, _, cx| this.inspector_save_participant_edit(cx)),
+                            cx.listener(|this, _, window, cx| {
+                                this.inspector_save_participant_edit(window, cx)
+                            }),
                         )),
                 ),
         )
         .into_any_element()
+    }
+
+    /// The share confirmation — what "Share this agent…" reveals in place.
+    ///
+    /// It says the two things a reader needs before an irreversible verb: that
+    /// **nothing about this space changes** (promotion moves the row's
+    /// ownership, not its configuration — the space keeps the agent as a member
+    /// with empty overrides, so its persona here is preserved byte for byte),
+    /// and that it **cannot be undone** (there is no demotion; retirement is the
+    /// soft-remove).
+    fn render_inspector_share_confirm(
+        &self,
+        p: &ParticipantInfo,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let name = p.label.clone();
+        let reassurance = format!(
+            "{name} keeps this space's persona exactly as it is, and can then join other spaces. \
+             You'll manage it in Settings → Agents. Sharing can't be undone."
+        );
+        v_flex()
+            .id("space-inspector-p-share-confirm")
+            .w_full()
+            .p_2()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary.opacity(0.3))
+            .child(
+                div()
+                    .id("space-inspector-p-share-note")
+                    .probe(
+                        SharedString::from(format!(
+                            "space/inspector/participants/{}/share/note",
+                            p.id
+                        )),
+                        gpui::Role::Label,
+                        SharedString::from(reassurance.clone()),
+                    )
+                    .text_xs()
+                    .text_color(muted)
+                    .child(SharedString::from(reassurance)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_end()
+                    .child(ghost_button_labeled(
+                        "space-inspector-p-share-cancel".into(),
+                        SharedString::from(format!(
+                            "space/inspector/participants/{}/share/cancel",
+                            p.id
+                        )),
+                        "Not now",
+                        format!("Keep {name} in this space"),
+                        false,
+                        cx,
+                        cx.listener(|this, _, window, cx| {
+                            this.inspector_cancel_promote(window, cx)
+                        }),
+                    ))
+                    .child(ghost_button_labeled(
+                        "space-inspector-p-share-confirm-button".into(),
+                        SharedString::from(format!(
+                            "space/inspector/participants/{}/share/confirm",
+                            p.id
+                        )),
+                        "Share",
+                        format!("Share {name} across spaces"),
+                        true,
+                        cx,
+                        cx.listener(|this, _, window, cx| {
+                            this.inspector_confirm_promote(window, cx)
+                        }),
+                    )),
+            )
+            .into_any_element()
     }
 
     fn render_inspector_add_form(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1059,6 +1425,7 @@ impl SpaceView {
         };
         v_flex()
             .id("space-inspector-participants-add-form")
+            .track_focus(&add.focus)
             .w_full()
             .p_2()
             .gap_2()
@@ -1106,7 +1473,9 @@ impl SpaceView {
                         "Cancel",
                         false,
                         cx,
-                        cx.listener(|this, _, _, cx| this.inspector_cancel_add_participant(cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.inspector_cancel_add_participant(window, cx)
+                        }),
                     ))
                     .child(ghost_button(
                         "space-inspector-add-submit".into(),
@@ -1114,7 +1483,9 @@ impl SpaceView {
                         "Add",
                         true,
                         cx,
-                        cx.listener(|this, _, _, cx| this.inspector_save_add_participant(cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.inspector_save_add_participant(window, cx)
+                        }),
                     )),
             )
             .into_any_element()
@@ -1127,6 +1498,7 @@ impl SpaceView {
         };
         v_flex()
             .id("space-inspector-template-form")
+            .track_focus(&form.focus)
             .w_full()
             .p_2()
             .gap_2()
@@ -1155,7 +1527,9 @@ impl SpaceView {
                         "Cancel",
                         false,
                         cx,
-                        cx.listener(|this, _, _, cx| this.inspector_cancel_template(cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.inspector_cancel_template(window, cx)
+                        }),
                     ))
                     .child(ghost_button(
                         "space-inspector-template-save".into(),
@@ -1163,7 +1537,7 @@ impl SpaceView {
                         "Save template",
                         true,
                         cx,
-                        cx.listener(|this, _, _, cx| this.inspector_save_template(cx)),
+                        cx.listener(|this, _, window, cx| this.inspector_save_template(window, cx)),
                     )),
             )
             .into_any_element()
@@ -1224,29 +1598,59 @@ impl SpaceView {
         row.into_any_element()
     }
 
-    /// The membership's write-refusal band. Dismissible for the same reason the
-    /// panel's other two are: nothing else clears a refusal until the next write
-    /// to the same control, so an unacknowledged one stands indefinitely.
+    /// The membership's write-refusal band — **one per space, listing every
+    /// refusal that stands**.
+    ///
+    /// The store keys refusals per `(space, participant)`, so two independent
+    /// writes can both be refused; a band that showed one would be the very
+    /// defect keyed reports exist to prevent. But a band under each disclosure
+    /// row is not available here the way it is in the Agents pane — this roster
+    /// is a compact list of closed rows in a 320px panel — so the one band lists
+    /// them, each line **naming its subject**, since the band no longer sits
+    /// under the row it is about. A subject the roster cannot name (a refused
+    /// *add* has no row yet) speaks for itself and the line stands bare.
+    ///
+    /// Dismissible for the same reason the panel's other two are: nothing else
+    /// clears a refusal until the next write to that same row, so an
+    /// unacknowledged one stands indefinitely. The × acknowledges what the band
+    /// shows — all of it, matching the one band it dismisses — and never implies
+    /// a write succeeded.
     fn render_inspector_participants_error(
         &self,
-        err: &str,
+        errors: &[(String, String)],
         space_id: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
         let id = space_id.to_string();
+        // Name each subject from the roster the reader is looking at; a refused
+        // *add* has no row yet, so its message stands bare.
+        let roster = self.inspector_participants(cx);
+        let lines: Vec<String> = errors
+            .iter()
+            .map(
+                |(pid, message)| match roster.iter().find(|p| &p.id == pid) {
+                    Some(p) => format!("{}: {message}", p.label),
+                    None => message.clone(),
+                },
+            )
+            .collect();
+        let mut column = v_flex().flex_1().min_w_0().gap_1();
+        for line in &lines {
+            column = column.child(error_banner(line, cx));
+        }
         h_flex()
             .id("space-inspector-participants-error")
             .probe(
                 "space/inspector/participants/error",
                 gpui::Role::Alert,
-                err.to_string(),
+                lines.join(" · "),
             )
             .w_full()
             .gap_2()
             .items_start()
             .justify_between()
-            .child(div().flex_1().min_w_0().child(error_banner(err, cx)))
+            .child(column)
             .child(
                 div()
                     .id("space-inspector-participants-error-dismiss")

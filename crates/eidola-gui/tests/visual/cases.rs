@@ -83,6 +83,7 @@ fn register_space(s: &mut Snapshots) {
                     eidola_app_core::SpaceSettings {
                         cascade_limit: 4,
                         router_model: Some("gemma4-31b@eidola".into()),
+                        ..Default::default()
                     },
                 ));
             });
@@ -117,6 +118,7 @@ fn register_space(s: &mut Snapshots) {
                     eidola_app_core::SpaceSettings {
                         cascade_limit: 4,
                         router_model: None,
+                        ..Default::default()
                     },
                 ));
             });
