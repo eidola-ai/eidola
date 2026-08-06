@@ -1,5 +1,5 @@
 //! Settings window — a calm two-pane surface. A narrow nav list (General ·
-//! Backends · Account · Wallet) sits on a `theme.sidebar` band down the left
+//! Backends · Templates · Agents · Account · Wallet) sits on a `theme.sidebar` band down the left
 //! edge; the selected pane renders in the content column. No primary-button
 //! tab strip, no boxes-in-boxes: the nav is quiet text, the content is
 //! hairline rows.
@@ -25,6 +25,7 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 use crate::account::AccountView;
 use crate::actions::CloseWindow;
+use crate::agents_settings::AgentsSettingsView;
 use crate::backends_settings::BackendsSettingsView;
 use crate::focus::TabRegion as _;
 use crate::general::GeneralView;
@@ -46,6 +47,7 @@ pub enum SettingsPane {
     General,
     Backends,
     Templates,
+    Agents,
     Account,
     Wallet,
 }
@@ -56,6 +58,7 @@ impl SettingsPane {
             SettingsPane::General => "General",
             SettingsPane::Backends => "Backends",
             SettingsPane::Templates => "Templates",
+            SettingsPane::Agents => "Agents",
             SettingsPane::Account => "Account",
             SettingsPane::Wallet => "Wallet",
         }
@@ -73,6 +76,7 @@ pub struct SettingsView {
     general: Entity<GeneralView>,
     backends: Entity<BackendsSettingsView>,
     templates: Entity<TemplatesSettingsView>,
+    agents: Entity<AgentsSettingsView>,
     account: Entity<AccountView>,
     wallet: Entity<WalletView>,
     /// The backend registry — read to gate the Account/Wallet nav items on
@@ -95,6 +99,7 @@ impl SettingsView {
         let general = cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx));
         let backends = cx.new(|cx| BackendsSettingsView::new(stores.clone(), window, cx));
         let templates = cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx));
+        let agents = cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx));
         let account = cx.new(|cx| AccountView::new(stores.clone(), window, cx));
         let wallet = cx.new(|cx| WalletView::new(stores.clone(), window, cx));
         let backends_store = stores.backends.clone();
@@ -116,6 +121,7 @@ impl SettingsView {
             general,
             backends,
             templates,
+            agents,
             account,
             wallet,
             backends_store,
@@ -151,6 +157,7 @@ impl SettingsView {
             SettingsPane::General,
             SettingsPane::Backends,
             SettingsPane::Templates,
+            SettingsPane::Agents,
         ];
         if self.eidola_enabled(cx) {
             panes.push(SettingsPane::Account);
@@ -202,6 +209,12 @@ impl SettingsView {
         self.templates.clone()
     }
 
+    /// The Agents pane entity — exposed for behavior tests asserting the
+    /// shared-agent edit / retire / notebook flows.
+    pub fn agents_pane(&self) -> Entity<AgentsSettingsView> {
+        self.agents.clone()
+    }
+
     fn nav_item(
         &self,
         pane: SettingsPane,
@@ -250,6 +263,7 @@ impl Render for SettingsView {
             SettingsPane::General => self.general.clone().into_any_element(),
             SettingsPane::Backends => self.backends.clone().into_any_element(),
             SettingsPane::Templates => self.templates.clone().into_any_element(),
+            SettingsPane::Agents => self.agents.clone().into_any_element(),
             SettingsPane::Account => self.account.clone().into_any_element(),
             SettingsPane::Wallet => self.wallet.clone().into_any_element(),
         };

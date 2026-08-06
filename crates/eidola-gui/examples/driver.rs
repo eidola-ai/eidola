@@ -543,6 +543,31 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_inspector_share_agent",
+                description: "Space view: the inspector's Participants section with a space-owned agent's disclosure open and its share confirmation armed — the one-way promote affordance (task 36)",
+                default_size: size(px(1040.), px(760.)),
+                build: |window, cx| {
+                    let stores = inspector_stores(cx, None);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
+                    view.update(cx, |v, cx| {
+                        v.set_inspector_open_for_test(true, window, cx);
+                        v.inspector_toggle_participant("agent-assistant", window, cx);
+                        v.inspector_begin_promote(window, cx);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_traces",
                 description: "Space view: trace disclosures — an answered turn's tool rounds under its reply, and three declines stacked in the gap under the post they answered (two agents, one of them asked twice)",
                 default_size: size(px(860.), px(760.)),
@@ -620,6 +645,32 @@ mod driver {
                     let stores = ready_stores(cx);
                     let view = cx.new(|cx| SettingsView::new(stores, window, cx));
                     view.update(cx, |v, cx| v.select(SettingsPane::Templates, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "settings_agents",
+                description: "Settings → Agents pane: the shared agent library (task 36) — each row with its notebook, edit and retire verbs",
+                default_size: size(px(620.), px(520.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| v.select(SettingsPane::Agents, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "settings_agents_retire",
+                description: "Settings → Agents pane with a retirement armed — the confirmation that says the notebook goes too",
+                default_size: size(px(620.), px(520.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| {
+                        v.select(SettingsPane::Agents, cx);
+                        v.agents_pane()
+                            .update(cx, |p, cx| p.arm_retire("agent-ada", window, cx));
+                    });
                     root(view, window, cx)
                 },
             },
@@ -732,6 +783,7 @@ mod driver {
                 eidola_app_core::SpaceSettings {
                     cascade_limit: 4,
                     router_model: router,
+                    ..Default::default()
                 },
             ));
         })
@@ -750,7 +802,33 @@ mod driver {
             s.local_models = Some(local_models_state());
             s.participants = Some(participants_fixture());
             s.templates = templates_fixture();
+            s.agents = Some(agents_fixture());
         })
+    }
+
+    /// The shared agent library (Settings → Agents): two promoted agents, each
+    /// with the notebook a promotion creates.
+    fn agents_fixture() -> Vec<eidola_app_core::GlobalAgentInfo> {
+        vec![
+            eidola_app_core::GlobalAgentInfo {
+                id: "agent-ada".into(),
+                label: "Ada".into(),
+                model_ref: Some("gemma4-31b".into()),
+                system_prompt: Some(
+                    "Answer plainly, cite what you rely on, and say when you are unsure.".into(),
+                ),
+                notify_policy: "human".into(),
+                notebook_space_id: Some("nb-ada".into()),
+            },
+            eidola_app_core::GlobalAgentInfo {
+                id: "agent-critic".into(),
+                label: "Critic".into(),
+                model_ref: Some("qwen3-8b@my-vllm".into()),
+                system_prompt: Some("Look for the weakest step in an argument.".into()),
+                notify_policy: "explicit".into(),
+                notebook_space_id: Some("nb-critic".into()),
+            },
+        ]
     }
 
     /// Participants fixture for the Participants view: the referenced global
