@@ -404,25 +404,21 @@ fn an_agent_follows_a_quote_only_once_it_is_granted_membership() {
         }
 
         // --- granted ---------------------------------------------------
-        // Ordinary membership, which for a space-owned agent means promotion
-        // first: anything cross-space implies a shared identity (task 36). Both
-        // halves travel in **one** call — "Share this agent and add it to *A*
-        // as an observer" — so the irreversible half can never land alone.
-        let outcome = core
+        // Through the door the reader actually presses (the inspector's "Invite
+        // an agent…"): ordinary membership, which for a space-owned agent means
+        // promotion first — anything cross-space implies a shared identity
+        // (task 36). Both halves travel in **one** transaction, which also
+        // decides *whether* the sharing half is needed at all, so the
+        // irreversible one can never land alone or be asked for twice.
+        let member = core
             .runtime()
-            .block_on(core.promote_participant(
+            .block_on(core.grant_space_membership(
+                s.source_space.clone(),
                 s.agent.clone(),
-                None,
-                Some(eidola_app_core::SpaceGrant {
-                    space_id: s.source_space.clone(),
-                    role: eidola_app_core::MembershipRole::Observer,
-                }),
+                eidola_app_core::MembershipRole::Observer,
             ))
             .expect("share and grant");
-        assert_eq!(
-            outcome.granted_space_id.as_deref(),
-            Some(s.source_space.as_str())
-        );
+        assert_eq!(member.scope, "global", "shared on its way in");
         let granted = core
             .runtime()
             .block_on(core.list_space_participants(s.source_space.clone()))
@@ -961,6 +957,139 @@ fn a_grant_naming_the_home_space_is_satisfied_by_the_promotion() {
             .find(|p| p.id == agent)
             .expect("still a member of its home space");
         assert_eq!(member.source, "referenced");
+    });
+}
+
+/// **The grant decides at the write, not from the picker's snapshot.** The
+/// invite form captures whether a candidate is shared when its list lands; a
+/// promotion from another window between that read and the confirmation makes
+/// the snapshot a lie, and a grant that branches on it asks for a promotion
+/// that can only be refused ("already a shared agent") — for a membership that
+/// could simply have been added. When the competing promotion granted this very
+/// space, the reader is told the operation failed about a state that already
+/// holds (Codex review, PR #280).
+#[test]
+fn a_grant_decides_from_the_row_it_finds_not_from_the_pickers_snapshot() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let home = turn(&core, "Hello there.", None).space_id;
+        let agent = agent_id(&core, &home);
+        let elsewhere = core
+            .runtime()
+            .block_on(core.create_space(Some("Elsewhere".into())))
+            .expect("a space")
+            .id;
+
+        // The picker read it as space-owned…
+        let candidate = core
+            .runtime()
+            .block_on(core.list_grantable_agents(
+                elsewhere.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            ))
+            .expect("candidates")
+            .into_iter()
+            .find(|c| c.id == agent)
+            .expect("offered here");
+        assert!(!candidate.shared, "the snapshot the form would hold");
+
+        // …and another window shared it before the reader confirmed.
+        core.runtime()
+            .block_on(core.promote_participant(agent.clone(), None, None))
+            .expect("the competing promotion");
+
+        let member = core
+            .runtime()
+            .block_on(core.grant_space_membership(
+                elsewhere.clone(),
+                agent.clone(),
+                eidola_app_core::MembershipRole::Observer,
+            ))
+            .expect("the grant lands on the row it finds");
+        assert_eq!(member.id, agent);
+        assert_eq!(member.role, "observer");
+        assert_eq!(
+            member.scope, "global",
+            "already shared — the grant added the membership and nothing else"
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.list_space_participants(elsewhere.clone()))
+                .expect("participants")
+                .iter()
+                .any(|p| p.id == agent),
+            "a member here now"
+        );
+
+        // And the sharper half: the competing promotion granted **this** space
+        // too, so there is nothing left to do — satisfied, not refused (the
+        // rule `a_grant_naming_the_home_space_is_satisfied_by_the_promotion`
+        // already applies inside the promotion).
+        let other = turn(&core, "Another conversation.", None).space_id;
+        let second = agent_id(&core, &other);
+        let third = core
+            .runtime()
+            .block_on(core.create_space(Some("Third".into())))
+            .expect("a space")
+            .id;
+        core.runtime()
+            .block_on(core.promote_participant(
+                second.clone(),
+                None,
+                Some(eidola_app_core::SpaceGrant {
+                    space_id: third.clone(),
+                    role: eidola_app_core::MembershipRole::Observer,
+                }),
+            ))
+            .expect("the competing promotion granted the same destination");
+        let mut rx = core.subscribe_changes();
+        let already = core
+            .runtime()
+            .block_on(core.grant_space_membership(
+                third.clone(),
+                second.clone(),
+                eidola_app_core::MembershipRole::Observer,
+            ))
+            .expect("a membership that already holds is satisfied, not refused");
+        assert_eq!(already.id, second);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "nothing was written, so nothing was announced"
+        );
+
+        // A space-owned candidate still travels as one transaction: the
+        // promotion and the membership, or neither.
+        let fourth = turn(&core, "A fourth conversation.", None).space_id;
+        let owned = agent_id(&core, &fourth);
+        let member = core
+            .runtime()
+            .block_on(core.grant_space_membership(
+                elsewhere.clone(),
+                owned.clone(),
+                eidola_app_core::MembershipRole::Observer,
+            ))
+            .expect("a space-owned agent is shared on its way in");
+        assert_eq!(member.scope, "global", "shared by the grant itself");
+        assert_eq!(member.role, "observer");
+        assert!(
+            core.runtime()
+                .block_on(core.list_global_agents())
+                .expect("the library")
+                .iter()
+                .any(|a| a.id == owned),
+            "and it is in the shared library now"
+        );
+
+        // The refusals that were never about the snapshot are unchanged.
+        let err = core
+            .runtime()
+            .block_on(core.grant_space_membership(
+                "no-such-space".into(),
+                agent.clone(),
+                eidola_app_core::MembershipRole::Observer,
+            ))
+            .expect_err("an unknown space is refused");
+        assert!(err.to_string().contains("space not found"), "{err}");
     });
 }
 

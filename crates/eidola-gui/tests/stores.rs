@@ -1464,6 +1464,57 @@ fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
     );
 }
 
+/// **A grant decides at the write, not from the picker's snapshot** (Codex
+/// review, PR #280). The invite form records whether a candidate was shared
+/// when its listing landed; another window sharing it before the reader
+/// confirms made that snapshot a lie, and a store that branched on it asked for
+/// a promotion of an already-global row — refused, for a membership app-core
+/// would have added without complaint. The store now names the *outcome* it
+/// wants and lets one transaction decide the verb.
+#[gpui::test]
+fn a_grant_that_loses_the_race_to_a_promotion_still_adds_the_membership(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let home = core
+        .runtime()
+        .block_on(core.create_space(Some("Home".into())))
+        .expect("create space")
+        .id;
+    let here = core
+        .runtime()
+        .block_on(core.create_space(Some("Here".into())))
+        .expect("create space")
+        .id;
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(home.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent")
+        .id;
+
+    // The form listed it as space-owned; another window shares it meanwhile.
+    core.runtime()
+        .block_on(core.promote_participant(agent.clone(), None, None))
+        .expect("the other window's share");
+
+    stores.participants.update(cx, |s, cx| {
+        s.grant_membership(here.clone(), agent.clone(), cx)
+    });
+    wait_until(cx, "the grant lands", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.list(&here).iter().any(|p| p.id == agent))
+    });
+    assert!(
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_errors_for(&here).is_empty()),
+        "a grant onto a row someone else shared first is not a refusal"
+    );
+}
+
 /// **Two writes on two participants of one space both land** (Codex review, PR
 /// #279). The inspector offers a verb on every roster row at once — share this
 /// agent, remove that one — so two mutations a moment apart are independent.

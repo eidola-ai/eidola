@@ -896,20 +896,26 @@ impl SpaceView {
     }
 
     /// Grant the armed candidate membership of this space, as an observer.
+    ///
+    /// The candidate's `shared` flag is what the **sentence** was written from,
+    /// never what the write branches on: whether the row still needs sharing is
+    /// decided inside the grant's own transaction (see
+    /// `ParticipantsStore::grant_membership`), because another window can share
+    /// it between this form's listing and this press.
     pub fn inspector_confirm_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(space_id) = self.space_id(cx) else {
             return;
         };
-        let Some((participant_id, _, shared, _)) = self
+        let Some((participant_id, _, _, _)) = self
             .inspector_invite
             .as_ref()
             .and_then(|f| f.confirming.clone())
         else {
             return;
         };
-        self.stores.participants.update(cx, |s, cx| {
-            s.grant_membership(space_id, participant_id, shared, cx)
-        });
+        self.stores
+            .participants
+            .update(cx, |s, cx| s.grant_membership(space_id, participant_id, cx));
         self.inspector_cancel_invite(window, cx);
     }
 

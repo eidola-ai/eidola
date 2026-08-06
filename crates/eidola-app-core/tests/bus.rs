@@ -151,7 +151,17 @@
 //! **revive** of one that had left (the join is an insert-or-revive upsert,
 //! task 37 / Codex review PR #280). Re-adding a member that is already live
 //! writes nothing and emits nothing, which is what its idempotence has always
-//! meant; the older wording here claimed the opposite and was never true. Memory is
+//! meant; the older wording here claimed the opposite and was never true.
+//! **`grant_space_membership`** (task 37's grant door: give an agent membership
+//! of a space, sharing it first iff the row is still space-owned) is a third
+//! exit point onto the same variant, and the same rule — the promotion branch
+//! emits what `promote_participant` would, the join branch what
+//! `add_global_participant` would, and a membership that **already held**
+//! writes nothing and emits nothing (Codex review, PR #280). It never emits
+//! `SpaceIndex` for the same reason promotion does not: the one space its
+//! promoting branch creates is a notebook. Covered by
+//! `a_grant_decides_from_the_row_it_finds_not_from_the_pickers_snapshot`
+//! (`cross_space_references.rs`), which pins the silent-satisfaction arm. Memory is
 //! untouched by promotion — no block moves, so nothing memory-shaped emits.
 //! Both are refusal-first: every typed error (already global, template-scoped,
 //! the shared human, unknown, retired, not-a-global) is decided before any
