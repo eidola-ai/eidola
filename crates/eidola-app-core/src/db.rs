@@ -1622,48 +1622,83 @@ pub async fn delete_template_owned_participants(
 
 // --- promotion (task 36): space-owned agent → global identity --------------
 
+/// A **validated** persona to write onto a participant's own config columns —
+/// the resolved form of a `ParticipantUpdate` (label trimmed and checked,
+/// notify policy checked, the two nullable columns already reduced to
+/// set-or-clear). Produced once in `lib.rs` so an ordinary edit and a promotion
+/// that carries one cannot drift on what an update *means*.
+#[derive(Clone, Debug, Default)]
+pub struct PersonaWrite {
+    pub label: Option<String>,
+    pub model_ref: Option<Option<String>>,
+    pub system_prompt: Option<Option<String>>,
+    pub notify_policy: Option<String>,
+}
+
+impl PersonaWrite {
+    /// Apply it, reporting whether any row changed. Every caller writes through
+    /// here, so "a persona write" is one statement builder
+    /// ([`update_participant_config`]) with one set of semantics.
+    pub async fn apply(&self, conn: &Connection, participant_id: &str) -> Result<bool, AppError> {
+        update_participant_config(
+            conn,
+            participant_id,
+            self.label.as_deref(),
+            self.model_ref.as_ref().map(|inner| inner.as_deref()),
+            self.system_prompt.as_ref().map(|inner| inner.as_deref()),
+            self.notify_policy.as_deref(),
+            None,
+        )
+        .await
+    }
+}
+
+/// What [`promote_participant_tx`] writes — one struct rather than eight
+/// positional arguments.
+pub struct Promotion<'a> {
+    pub participant_id: &'a str,
+    pub home_space_id: &'a str,
+    pub role: &'a str,
+    pub notebook_space_id: &'a str,
+    pub notebook_title: &'a str,
+    /// A persona to adopt **in the promoting transaction**, if the caller is
+    /// carrying one (the GUI's "Share this agent…" promotes what its editor is
+    /// showing). Inside the same transaction *and behind the same guard*, so a
+    /// promotion that loses a race takes the persona write back with it.
+    pub persona: Option<&'a PersonaWrite>,
+    pub now: i64,
+}
+
 /// Promote a space-owned agent to a **global** identity, in place and in one
 /// transaction. Same row, same id — so authorship, provenance and memory
 /// continuity are structural rather than stitched. Copy-projection was
 /// rejected: it fragments past posts, memory blocks and reference edges across
 /// two identities, which is the opposite of what promotion exists to create.
 ///
-/// Three writes, all or nothing:
+/// Four writes, all or nothing:
 ///
 /// 1. `owner_space_id → NULL`, `scope → 'global'` on the participant row. The
 ///    pinned `participant_scope` echo on every past `action` and every
 ///    `memory_block` follows via `ON UPDATE CASCADE` — see the schema comments
 ///    there and `turso_enforcement_smoke` case (e).
-/// 2. A `space_participant` reference row for the **former owner space**, with
+/// 2. The optional [`Promotion::persona`], onto the row that statement just
+///    proved was still ours to promote.
+/// 3. A `space_participant` reference row for the **former owner space**, with
 ///    NULL overrides. Ownership no longer implies membership, and NULL
 ///    overrides mean the effective config (`COALESCE(override, config)`) is
 ///    byte-identical to what it was: the space's persona is preserved exactly.
-/// 3. The agent's private **notebook space** (`space.notebook_participant_id`),
+/// 4. The agent's private **notebook space** (`space.notebook_participant_id`),
 ///    referenced into by the agent itself, hidden from the Library listing.
 ///
 /// The caller has already validated *what* may be promoted (kind, scope, the
-/// shared "You", removal); this is the mechanics.
+/// shared "You", removal) and what the persona may say; this is the mechanics —
+/// **plus the one check that cannot be done ahead of the transaction**, below.
 pub async fn promote_participant_tx(
     conn: &Connection,
-    participant_id: &str,
-    home_space_id: &str,
-    role: &str,
-    notebook_space_id: &str,
-    notebook_title: &str,
-    now: i64,
+    promotion: &Promotion<'_>,
 ) -> Result<(), AppError> {
     conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
-    match promote_participant_tx_body(
-        conn,
-        participant_id,
-        home_space_id,
-        role,
-        notebook_space_id,
-        notebook_title,
-        now,
-    )
-    .await
-    {
+    match promote_participant_tx_body(conn, promotion).await {
         Ok(()) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
             Ok(())
@@ -1678,32 +1713,61 @@ pub async fn promote_participant_tx(
 
 async fn promote_participant_tx_body(
     conn: &Connection,
-    participant_id: &str,
-    home_space_id: &str,
-    role: &str,
-    notebook_space_id: &str,
-    notebook_title: &str,
-    now: i64,
+    promotion: &Promotion<'_>,
 ) -> Result<(), AppError> {
+    let participant_id = promotion.participant_id;
     // Both key columns move in one statement: the three-way scope/owner CHECK
     // must hold at statement end, and the cascade fires off the (id, scope)
     // parent key.
+    //
+    // **This statement is the transaction's own gate**, not a repeat of the
+    // caller's. The caller read the row a moment ago; another window sharing or
+    // removing the same agent in between is what the predicate catches, and
+    // catching it *here* is what lets everything after it — the persona above
+    // all — roll back as one. `removed_at` rides the same predicate for the
+    // same reason.
     let n = conn
         .execute(
             "UPDATE participant SET scope = 'global', owner_space_id = NULL \
-             WHERE id = ?1 AND scope = 'space'",
+             WHERE id = ?1 AND scope = 'space' AND removed_at IS NULL",
             (Value::Text(participant_id.to_string()),),
         )
         .await
         .map_err(AppError::db)?;
     if n == 0 {
         return Err(AppError::Database {
-            message: format!("participant {participant_id} was not a space-owned row to promote"),
+            message: format!(
+                "participant {participant_id} was no longer a live space-owned row to promote"
+            ),
         });
     }
-    insert_space_participant(conn, home_space_id, participant_id, role, now).await?;
-    insert_notebook_space(conn, notebook_space_id, participant_id, notebook_title, now).await?;
-    insert_space_participant(conn, notebook_space_id, participant_id, "owner", now).await?;
+    if let Some(persona) = promotion.persona {
+        persona.apply(conn, participant_id).await?;
+    }
+    insert_space_participant(
+        conn,
+        promotion.home_space_id,
+        participant_id,
+        promotion.role,
+        promotion.now,
+    )
+    .await?;
+    insert_notebook_space(
+        conn,
+        promotion.notebook_space_id,
+        participant_id,
+        promotion.notebook_title,
+        promotion.now,
+    )
+    .await?;
+    insert_space_participant(
+        conn,
+        promotion.notebook_space_id,
+        participant_id,
+        "owner",
+        promotion.now,
+    )
+    .await?;
     Ok(())
 }
 
