@@ -54,6 +54,15 @@ use super::SpaceView;
 /// a choice rather than a missing value.
 const PROMPT_PLACEHOLDER: &str = "A short instruction for how this participant behaves.";
 
+/// Row height for the virtualized invite-candidate list. One line by
+/// construction (a name, and where a space-owned agent works today), so
+/// `uniform_list`'s single-measure layout holds.
+const INVITE_ROW_H: gpui::Pixels = gpui::px(22.);
+
+/// The candidate list stops growing here — a form inside a 320px panel, not a
+/// page. Below it the list is exactly as tall as its rows.
+const INVITE_LIST_MAX_H: gpui::Pixels = gpui::px(180.);
+
 /// The open editor for one participant — the row's disclosure. Holds the field
 /// inputs plus the working model/notify/mode, and (for a referenced global) the
 /// reference detail the two modes seed from.
@@ -1824,7 +1833,6 @@ impl SpaceView {
             return div().into_any_element();
         };
         let muted = theme.muted_foreground;
-        let fg = theme.foreground;
         let mut col = v_flex()
             .id("space-inspector-invite-form")
             .track_focus(&form.focus)
@@ -1913,37 +1921,49 @@ impl SpaceView {
                 col = col.child(div().text_xs().text_color(muted).child(line));
             }
             Some(candidates) => {
-                for (i, candidate) in candidates.iter().enumerate() {
-                    let line = match (&candidate.home_space_title, candidate.shared) {
-                        (_, true) => SharedString::from(candidate.label.clone()),
-                        (Some(home), false) => {
-                            SharedString::from(format!("{} — from {home}", candidate.label))
-                        }
-                        (None, false) => SharedString::from(candidate.label.clone()),
-                    };
-                    let id = candidate.id.clone();
-                    col = col.child(
-                        div()
-                            .id(SharedString::from(format!("space-inspector-invite-{i}")))
-                            .probe(
-                                format!("space/inspector/participants/invite/{i}"),
-                                gpui::Role::Button,
-                                line.clone(),
-                            )
-                            .w_full()
-                            .px_1()
-                            .py_0p5()
-                            .rounded_sm()
-                            .text_xs()
-                            .truncate()
-                            .cursor_pointer()
-                            .hover(move |s| s.bg(theme.muted).text_color(fg))
-                            .child(line)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.inspector_arm_invite(&id, window, cx)
-                            })),
-                    );
-                }
+                // **Bounded and virtualized**, the destination picker's shape
+                // (Codex review, PR #280). The size argument is the same one:
+                // the candidates are every live agent the viewer could add, and
+                // a seeded space owns an agent — so this list grows with the
+                // reader's *conversations*, not with a curated roster. The
+                // panel around it is itself an `overflow_y_scroll`, which the
+                // virtualized-list doctrine warns about, but the warning's
+                // mechanism is `ListSizingBehavior::Auto` collapsing with no
+                // parent height to fill: the height here is **explicit**
+                // (`count × ROW_H`, capped), so nothing collapses, and a
+                // bounded inner scroller inside this panel is what its model
+                // dropdown already is.
+                let count = candidates.len();
+                let shown = px((count as f32 * INVITE_ROW_H.to_f64() as f32)
+                    .min(INVITE_LIST_MAX_H.to_f64() as f32));
+                let list = gpui::uniform_list(
+                    "space-inspector-invite-list",
+                    count,
+                    cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                        this.render_invite_candidate_rows(range, cx)
+                    }),
+                )
+                .h(shown)
+                .w_full()
+                .track_scroll(&self.inspector_invite_scroll);
+                col = col.child(
+                    div()
+                        .id("space-inspector-invite-list-wrap")
+                        // `uniform_list` carries no role (the Library's rule),
+                        // so the `List` parent goes on the wrapper.
+                        .probe(
+                            "space/inspector/participants/invite/list",
+                            gpui::Role::List,
+                            "Agents you can invite",
+                        )
+                        .relative()
+                        .w_full()
+                        .child(list)
+                        .child(crate::scrollbar::vertical_floating(
+                            "invite-candidates-scrollbar",
+                            &self.inspector_invite_scroll,
+                        )),
+                );
             }
         }
         // The way out is offered in **every** state — empty and failed
@@ -1958,6 +1978,74 @@ impl SpaceView {
             cx.listener(|this, _, window, cx| this.inspector_cancel_invite(window, cx)),
         )));
         col.into_any_element()
+    }
+
+    /// The invite form's dumb indexer: exactly the candidate rows
+    /// `uniform_list` asks for.
+    ///
+    /// The candidates are already a materialized `Vec` on the form (a fetch
+    /// result, not a store listing), so the range is a slice — no scan, and
+    /// only the visible rows' strings are built.
+    fn render_invite_candidate_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let (muted, fg) = {
+            let theme = cx.theme();
+            (theme.muted, theme.foreground)
+        };
+        let Some(form) = self.inspector_invite.as_ref() else {
+            return Vec::new();
+        };
+        let Some(candidates) = form.candidates.as_ref() else {
+            return Vec::new();
+        };
+        let total = candidates.len();
+        let visible: Vec<(usize, String, SharedString)> = candidates
+            .get(range.clone())
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(offset, c)| {
+                let line = match (&c.home_space_title, c.shared) {
+                    (_, true) => SharedString::from(c.label.clone()),
+                    (Some(home), false) => SharedString::from(format!("{} — from {home}", c.label)),
+                    (None, false) => SharedString::from(c.label.clone()),
+                };
+                (range.start + offset, c.id.clone(), line)
+            })
+            .collect();
+        visible
+            .into_iter()
+            .map(|(i, id, line)| {
+                div()
+                    .id(SharedString::from(format!("space-inspector-invite-{i}")))
+                    .probe(
+                        format!("space/inspector/participants/invite/{i}"),
+                        gpui::Role::Button,
+                        line.clone(),
+                    )
+                    // Set position on a virtualized row (the a11y rule).
+                    .aria_position_in_set(i + 1)
+                    .aria_size_of_set(total)
+                    .w_full()
+                    .h(INVITE_ROW_H)
+                    .flex()
+                    .items_center()
+                    .px_1()
+                    .rounded_sm()
+                    .text_xs()
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(muted).text_color(fg))
+                    .child(line)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.inspector_arm_invite(&id, window, cx)
+                    }))
+                    .into_any_element()
+            })
+            .collect()
     }
 
     fn render_inspector_template_form(&self, cx: &mut Context<Self>) -> AnyElement {

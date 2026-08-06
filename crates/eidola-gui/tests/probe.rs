@@ -5237,6 +5237,65 @@ fn space_probes_record_the_quote_destination_and_denied_follow(cx: &mut TestAppC
     probe::set_probes_enabled(false);
 }
 
+/// **The candidate list is bounded and virtualized.** The picker offers every
+/// live agent the reader could add, and a seeded space owns an agent — so this
+/// list grows with their *conversations*, exactly as the Library does (Codex
+/// review, PR #280). The panel around it scrolls, which the virtualized-list
+/// doctrine warns about; the warning's mechanism is `Auto` sizing collapsing
+/// with no parent height to fill, and this list's height is explicit, so the
+/// question is settled here rather than argued: the rows paint, and only the
+/// visible ones do.
+#[gpui::test]
+fn space_inspector_invite_list_is_bounded(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let (window, view) = open_participants_inspector(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+        view.update(cx, |v, cx| {
+            v.seed_invite_candidates_for_test(
+                (0..60)
+                    .map(|i| eidola_app_core::GrantableAgent {
+                        id: format!("agent-{i}"),
+                        label: format!("Agent {i}"),
+                        shared: true,
+                        home_space_title: None,
+                    })
+                    .collect(),
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    let entries = fresh_entries(cx, window);
+    let rows = entries
+        .iter()
+        .filter(|(n, _)| {
+            n.starts_with("space/inspector/participants/invite/")
+                && n.rsplit('/')
+                    .next()
+                    .is_some_and(|t| t.parse::<u32>().is_ok())
+        })
+        .count();
+    assert!(
+        rows > 0,
+        "the list renders inside the panel's own scroller — it does not collapse: {:?}",
+        entries.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    assert!(
+        rows <= 14,
+        "…and only its visible window, never all 60 candidates: {rows}"
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/participants/invite/list",
+        gpui::Role::List,
+        "Agents you can invite",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 /// The grant door (task 37): "Invite an agent…" beside Add, and the form it
 /// opens — whose exit is probed in every state, including the one where the
 /// stub has no backend to list candidates from.

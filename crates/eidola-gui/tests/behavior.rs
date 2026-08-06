@@ -13597,6 +13597,71 @@ fn space_a_quote_into_an_unloaded_conversation_waits_for_its_tail(cx: &mut TestA
 }
 
 #[gpui::test]
+fn space_quote_destination_frame_work_is_constant_in_library_size(cx: &mut TestAppContext) {
+    // Virtualizing the *elements* and then materializing the whole display
+    // model to slice it is half the move: the indexer cloned an id and a label
+    // for every conversation the reader has ever had, and the render built the
+    // same vector again to ask its length (Codex review, PR #280). The range
+    // now goes on before anything is cloned, and the count is a count — so a
+    // frame's allocations are O(visible) and only a pointer scan is O(loaded).
+    let small: Vec<_> = (0..40)
+        .map(|i| {
+            stub_space(
+                &format!("s{i}"),
+                Some(&format!("Conversation {i}")),
+                None,
+                i as i64,
+            )
+        })
+        .collect();
+    let large: Vec<_> = (0..2000)
+        .map(|i| {
+            stub_space(
+                &format!("s{i}"),
+                Some(&format!("Conversation {i}")),
+                None,
+                i as i64,
+            )
+        })
+        .collect();
+    let visible = 0..10usize;
+
+    let run = |rows: Vec<eidola_app_core::SpaceInfo>, cx: &mut TestAppContext| {
+        let stores = stub_stores(cx, |s| {
+            s.config_state = Some(config_state(true));
+            s.spaces = rows;
+        });
+        let (window, view) = open_space(cx, &stores, Some("s0".into()));
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |v, cx| {
+                v.quote_destination_frame_work_for_test(visible.clone(), cx)
+            })
+        })
+        .unwrap()
+    };
+
+    let small_built = run(small, cx);
+    let large_built = run(large, cx);
+
+    assert_eq!(small_built, 10, "the visible window is what gets built");
+    assert_eq!(
+        large_built, 10,
+        "…and it does not grow with the Library — 2000 conversations, ten rows"
+    );
+    // **What this test does *not* claim.** The remaining half of the finding —
+    // that the ids and labels are cloned only for the visible range — is not
+    // gated here, deliberately. Both shapes walk the index (the total that
+    // `aria_size_of_set` needs is a count over it), so only the allocations
+    // differ, and wall-clock separates them by ~3.5× at any fixture size: a
+    // ratio gate at that margin passed a materialize-then-slice regression on
+    // a second run, which is worse than no gate at all. The locality is held
+    // by construction instead — the range goes on the iterator *before* the
+    // `map` that clones, and the count returns `usize` so there is no vector
+    // to materialize — and a gate for it would want allocation counting the
+    // crate does not have. What is pinned here is the half that paints.
+}
+
+#[gpui::test]
 fn space_a_quote_lands_in_a_conversation_whose_refresh_failed(cx: &mut TestAppContext) {
     // The other side of the wait: `Failed { prior: Some(..) }` is a *refresh*
     // that failed over posts we still hold, and those posts are what the reader

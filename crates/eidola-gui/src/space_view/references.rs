@@ -1013,9 +1013,9 @@ impl SpaceView {
             let cell = self.stores.spaces.read(cx).index();
             (cell.error().map(|e| e.to_string()), cell.has_value())
         };
-        let destinations = self.quote_destinations(here.as_deref(), cx);
+        let destinations = self.quote_destination_count(here.as_deref(), cx);
 
-        if destinations.is_empty() {
+        if destinations == 0 {
             let (line, retry) = match (&load_error, has_listing) {
                 // A failed *initial* read: say so, and offer the door back. The
                 // quiet retry line rather than the full `load_error_panel` — a
@@ -1064,13 +1064,11 @@ impl SpaceView {
         // window. The height is exact rather than flex-derived — the rows are
         // one line by construction, so the list is `count × ROW_H` capped at
         // `MAX_H`, and `uniform_list` scrolls inside it.
-        let shown = px(
-            (destinations.len() as f32 * DESTINATION_ROW_H.to_f64() as f32)
-                .min(DESTINATION_LIST_MAX_H.to_f64() as f32),
-        );
+        let shown = px((destinations as f32 * DESTINATION_ROW_H.to_f64() as f32)
+            .min(DESTINATION_LIST_MAX_H.to_f64() as f32));
         let list = gpui::uniform_list(
             "space-quote-destination-list",
-            destinations.len(),
+            destinations,
             cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
                 this.render_quote_destination_rows(range, cx)
             }),
@@ -1124,14 +1122,32 @@ impl SpaceView {
         let theme = cx.theme();
         let muted = theme.muted;
         let here = self.space.read(cx).id().map(str::to_string);
-        let destinations = self.quote_destinations(here.as_deref(), cx);
-        let total = destinations.len();
-        destinations
+        // **The range is applied before anything is cloned.** A dumb indexer
+        // that materializes the whole display model and then slices it has
+        // virtualized the *elements* and left the rest O(loaded) — half the
+        // move (Codex review, PR #280). The scan itself is over `SpaceInfo`
+        // references (a filter cannot be a `get(range)` the way the Library's
+        // unfiltered listing can); what stops at the visible window is every
+        // allocation: the id, the label, and the row.
+        let (total, visible) = {
+            let store = self.stores.spaces.read(cx);
+            let rows = store
+                .list()
+                .iter()
+                .filter(|s| here.as_deref() != Some(s.id.as_str()));
+            let visible: Vec<(String, SharedString)> = rows
+                .clone()
+                .skip(range.start)
+                .take(range.len())
+                .map(|s| (s.id.clone(), space_label(s)))
+                .collect();
+            (rows.count(), visible)
+        };
+        visible
             .into_iter()
             .enumerate()
-            .skip(range.start)
-            .take(range.len())
-            .map(|(i, (id, label))| {
+            .map(|(offset, (id, label))| {
+                let i = range.start + offset;
                 let for_arm = label.clone();
                 div()
                     .id(SharedString::from(format!("space-quote-destination-{i}")))
@@ -1164,22 +1180,34 @@ impl SpaceView {
             .collect()
     }
 
-    /// The conversations this space may be quoted into: the Library index less
-    /// this one. One reading, shared by the render (which needs the count and
-    /// the empty-state question) and the indexer (which needs the rows).
-    fn quote_destinations(
-        &self,
-        here: Option<&str>,
-        cx: &gpui::App,
-    ) -> Vec<(String, SharedString)> {
+    /// How many conversations this space may be quoted into: the Library index
+    /// less this one. A **count**, not a listing — the render needs the number
+    /// (for the list's height and the empty-state question) and nothing else,
+    /// and materializing a vector to ask its length is the same defect the
+    /// indexer above cures.
+    fn quote_destination_count(&self, here: Option<&str>, cx: &gpui::App) -> usize {
         self.stores
             .spaces
             .read(cx)
             .list()
             .iter()
             .filter(|s| here != Some(s.id.as_str()))
-            .map(|s| (s.id.clone(), space_label(s)))
-            .collect()
+            .count()
+    }
+
+    /// Test seam: run one frame's worth of the destination picker's work — the
+    /// count the render asks for plus the rows the list asks for — and answer
+    /// how many rows were built. What a frame pays for, callable without a
+    /// painted popover.
+    #[doc(hidden)]
+    pub fn quote_destination_frame_work_for_test(
+        &mut self,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let here = self.space.read(cx).id().map(str::to_string);
+        let _ = self.quote_destination_count(here.as_deref(), cx);
+        self.render_quote_destination_rows(range, cx).len()
     }
 
     /// The picker's quiet retry line — the Library's "couldn't refresh" strip,
