@@ -128,7 +128,7 @@ These invariants describe what you get when you install and run an attested, **g
 
 **8.8.** Eidola does not promise that confidential-compute hardware vendors (AMD, Intel, NVIDIA) cannot issue fraudulent attestations. That is residual trust we currently accept; see [gaps.md](gaps.md#trust-in-confidential-compute-vendors).
 
-**8.9.** Eidola does not promise that the code performing inference has been reviewed, reproduced, or measurement-pinned by Eidola. Inference runs at a separate upstream provider (currently Tinfoil) whose router forwards to per-model enclaves trusted at the provider's own latest-signed-release bar. Eidola verifies per-handshake that the upstream it connects to is genuine confidential-compute hardware running a Sigstore-signed release of the expected repository, but does not itself re-derive or pin the downstream inference code. The long-term mitigations — self-hosting inference, or the provider adopting static-pinned upstreams — are named in [gaps.md § Inference upstream](gaps.md#inference-upstream).
+**8.9.** Eidola does not promise that the code performing inference has been reviewed, reproduced, or measurement-pinned by Eidola. Inference runs at a separate upstream provider (Tinfoil) whose router forwards to per-model enclaves trusted at the provider's own latest-signed-release bar. Eidola verifies per-handshake that the upstream it connects to is genuine confidential-compute hardware running a Sigstore-signed release of the expected repository, but does not itself re-derive or pin the downstream inference code. The long-term mitigations — self-hosting inference, or the provider adopting static-pinned upstreams — are named in [gaps.md § Inference upstream](gaps.md#inference-upstream).
 
 ---
 

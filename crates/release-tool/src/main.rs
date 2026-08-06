@@ -1,4 +1,4 @@
-//! Release engineer's tool. Two subcommands, run in order on a tag that has
+//! release officer's tool. Two subcommands, run in order on a tag that has
 //! already been pushed and built by CI:
 //!
 //! 1. `release-tool verify <tag>` — fetches the CI-built
@@ -46,7 +46,7 @@ mod verify;
 #[derive(Parser)]
 #[command(
     name = "release-tool",
-    about = "Eidola release engineer's verify + attest workflow",
+    about = "Eidola release officer's verify + attest workflow",
     version
 )]
 struct Cli {
