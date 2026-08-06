@@ -110,7 +110,7 @@ fn blocks(core: &AppCore, participant: &str) -> Vec<eidola_app_core::memory::Mem
 
 fn promote(core: &AppCore, participant: &str) -> eidola_app_core::PromotionOutcome {
     core.runtime()
-        .block_on(core.promote_participant(participant.to_string(), None))
+        .block_on(core.promote_participant(participant.to_string(), None, None))
         .expect("promotion")
 }
 
@@ -299,7 +299,7 @@ fn turns_in_two_spaces_resolve_the_same_participant() {
             .expect("a second space")
             .id;
         core.runtime()
-            .block_on(core.add_global_participant(space_b.clone(), agent.clone()))
+            .block_on(core.add_global_participant(space_b.clone(), agent.clone(), None))
             .expect("the shared agent joins");
         turn(&core, "Second conversation.", Some(space_b.clone()));
 
@@ -354,7 +354,7 @@ fn a_promoted_agents_core_memory_loads_in_another_space() {
             .expect("a second space")
             .id;
         core.runtime()
-            .block_on(core.add_global_participant(space_b.clone(), agent.clone()))
+            .block_on(core.add_global_participant(space_b.clone(), agent.clone(), None))
             .expect("the shared agent joins");
 
         // Residence did not move — both blocks still live in space A.
@@ -481,7 +481,7 @@ fn list_my_spaces_reports_membership_and_nothing_else() {
             .expect("a space")
             .id;
         core.runtime()
-            .block_on(core.add_global_participant(space_b.clone(), agent.clone()))
+            .block_on(core.add_global_participant(space_b.clone(), agent.clone(), None))
             .expect("joins");
 
         *script.lock().unwrap() = vec![(LIST_MY_SPACES_TOOL_NAME.into(), "{}".into())];
@@ -569,7 +569,7 @@ fn promotion_is_one_way_and_refuses_everything_else() {
 
         let refuse = |participant: &str| -> String {
             core.runtime()
-                .block_on(core.promote_participant(participant.to_string(), None))
+                .block_on(core.promote_participant(participant.to_string(), None, None))
                 .expect_err("must be refused")
                 .to_string()
         };
@@ -648,7 +648,7 @@ fn only_a_global_can_join_another_space_and_joining_is_idempotent() {
 
         let err = core
             .runtime()
-            .block_on(core.add_global_participant(space_b.clone(), agent.clone()))
+            .block_on(core.add_global_participant(space_b.clone(), agent.clone(), None))
             .expect_err("a space-owned agent cannot be in two places")
             .to_string();
         assert!(err.contains("share it first"), "{err}");
@@ -657,7 +657,7 @@ fn only_a_global_can_join_another_space_and_joining_is_idempotent() {
         promote(&core, &agent);
         for _ in 0..2 {
             core.runtime()
-                .block_on(core.add_global_participant(space_b.clone(), agent.clone()))
+                .block_on(core.add_global_participant(space_b.clone(), agent.clone(), None))
                 .expect("joining is idempotent");
         }
         assert_eq!(
@@ -756,9 +756,11 @@ impl eidola_app_core::tools::Tool for PromoteMidTurn {
                 .unwrap()
                 .clone()
                 .expect("participant id set");
-            core.promote_participant(id, None).await.map_err(|e| {
-                eidola_app_core::tools::ToolError::new(format!("promote failed: {e}"))
-            })?;
+            core.promote_participant(id, None, None)
+                .await
+                .map_err(|e| {
+                    eidola_app_core::tools::ToolError::new(format!("promote failed: {e}"))
+                })?;
             Ok("promoted".to_string())
         })
     }
@@ -1112,6 +1114,7 @@ fn a_persona_travels_into_the_promoting_transaction() {
                     notify_policy: Some("all".into()),
                     ..Default::default()
                 }),
+                None,
             ))
             .expect("promotion carrying a persona");
 
@@ -1179,6 +1182,7 @@ fn a_persona_travels_into_the_promoting_transaction() {
                     system_prompt: Some(Some("Never written.".into())),
                     ..Default::default()
                 }),
+                None,
             ))
             .expect_err("a blank name is refused");
         assert!(err.to_string().contains("must not be empty"), "{err}");
@@ -1199,6 +1203,7 @@ fn a_persona_travels_into_the_promoting_transaction() {
                     label: Some("Renamed by a lost race".into()),
                     ..Default::default()
                 }),
+                None,
             ))
             .expect_err("already shared");
         assert!(err.to_string().contains("already a shared agent"), "{err}");
@@ -1273,7 +1278,7 @@ fn a_retired_agent_discovers_no_spaces_mid_turn() {
             .expect("a space")
             .id;
         core.runtime()
-            .block_on(core.add_global_participant(space_b.clone(), agent.clone()))
+            .block_on(core.add_global_participant(space_b.clone(), agent.clone(), None))
             .expect("joins");
 
         core.register_tool(std::sync::Arc::new(RetireMidTurn {
@@ -1529,7 +1534,7 @@ fn a_join_refused_by_retirement_leaves_no_membership() {
         let mut rx = core.subscribe_changes();
         let err = core
             .runtime()
-            .block_on(core.add_global_participant(other.clone(), agent.clone()))
+            .block_on(core.add_global_participant(other.clone(), agent.clone(), None))
             .expect_err("a retired agent cannot join");
         assert!(
             !matches!(err, eidola_app_core::error::AppError::Internal { .. }),

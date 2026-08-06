@@ -7653,7 +7653,7 @@ fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
     // Another window shares the same agent. Its id does not move — only what it
     // *is* — so the roster-leave rule alone sees nothing.
     core.runtime()
-        .block_on(core.promote_participant(agent.clone(), None))
+        .block_on(core.promote_participant(agent.clone(), None, None))
         .expect("the other window's share");
     stores
         .participants
@@ -8027,7 +8027,7 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
         .id;
     core_handle
         .runtime()
-        .block_on(core_handle.promote_participant(agent_b.clone(), None))
+        .block_on(core_handle.promote_participant(agent_b.clone(), None, None))
         .expect("share the second agent");
     stores.agents.update(cx, |s, cx| s.refresh(cx));
     wait_until(cx, "the library lists both", |cx| {

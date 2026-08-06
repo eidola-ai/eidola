@@ -1710,7 +1710,21 @@ impl PersonaWrite {
     }
 }
 
-/// What [`promote_participant_tx`] writes — one struct rather than eight
+/// A membership to write **inside** another transaction — task 37's grant.
+///
+/// The blocked-follow → grant → retry loop's middle step is ordinary
+/// membership, and for a space-owned agent it can only follow a promotion. Two
+/// calls would be two transactions: the promotion could land and the grant be
+/// refused, leaving an agent shared (irreversibly — promotion is one-way) for a
+/// grant the reader asked for and did not get. So the grant travels *with* the
+/// promotion, as an argument, exactly as the persona does.
+#[derive(Clone, Debug)]
+pub struct MembershipGrant<'a> {
+    pub space_id: &'a str,
+    pub role: &'a str,
+}
+
+/// What [`promote_participant_tx`] writes — one struct rather than nine
 /// positional arguments.
 pub struct Promotion<'a> {
     pub participant_id: &'a str,
@@ -1718,6 +1732,11 @@ pub struct Promotion<'a> {
     pub role: &'a str,
     pub notebook_space_id: &'a str,
     pub notebook_title: &'a str,
+    /// A membership in **another** space to grant in the same transaction (task
+    /// 37's "Share this agent and add it to *A* as an observer"). The caller has
+    /// already established that the space exists and is not the home space (a
+    /// second insert on the same PK would fail the whole transaction).
+    pub grant: Option<MembershipGrant<'a>>,
     /// A persona to adopt **in the promoting transaction**, if the caller is
     /// carrying one (the GUI's "Share this agent…" promotes what its editor is
     /// showing). Inside the same transaction *and behind the same guard*, so a
@@ -1825,6 +1844,19 @@ async fn promote_participant_tx_body(
         promotion.now,
     )
     .await?;
+    // Task 37's grant. Inside the transaction the scope flip has just proved
+    // this row live and space-owned, so the membership cannot be joined onto a
+    // retired agent and a refusal anywhere above takes the grant back with it.
+    if let Some(grant) = &promotion.grant {
+        insert_space_participant(
+            conn,
+            grant.space_id,
+            participant_id,
+            grant.role,
+            promotion.now,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -1922,6 +1954,98 @@ pub async fn list_global_agents(conn: &Connection) -> Result<Vec<GlobalAgentRow>
             system_prompt: row.get::<Option<String>>(3).map_err(AppError::db)?,
             notify_policy: row.get::<String>(4).map_err(AppError::db)?,
             notebook_space_id: row.get::<Option<String>>(5).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// One candidate for task 37's grant — an agent a reader could give membership
+/// of a space (see [`list_grantable_agents`]).
+#[derive(Clone, Debug)]
+pub struct GrantableAgentRow {
+    pub id: String,
+    pub label: String,
+    /// Already a shared identity, so the grant is plain membership. `false` is
+    /// a space-owned agent, whose grant is promotion + membership in one
+    /// transaction ([`promote_participant_tx`] carrying a [`MembershipGrant`]).
+    pub shared: bool,
+    /// The title of the space that owns it (`None` when shared, or when its
+    /// home space is untitled) — what names the agent to a reader who knows it
+    /// from somewhere else.
+    pub home_space_title: Option<String>,
+}
+
+/// The agents that could be granted membership of `space_id`, as the viewer
+/// may see them (task 37's grant picker).
+///
+/// Three exclusions, each a rule rather than a nicety:
+///
+/// - **Already a member** — of either kind (a space's own agent, or a global
+///   already referenced in). Offering a grant that would change nothing is the
+///   fake affordance the honest-states rule exists to prevent.
+/// - **Not an agent, or retired** — the shared human and Eidola-the-system are
+///   globals nobody grants, and a retired agent cannot rejoin a space
+///   (`add_global_participant` refuses one; the picker must not offer it).
+/// - **Owned by a space the viewer does not take part in** — the listing is a
+///   read like any other, so it obeys the same ACL: without this it would
+///   announce the existence of agents (and, through `home_space_title`, of
+///   conversations) in spaces the viewer has no part in, which is exactly the
+///   leak rule 4 exists to close. A global has no home space to leak, so it is
+///   listed unconditionally.
+///
+/// Ordered by label, the name the reader sees.
+pub async fn list_grantable_agents(
+    conn: &Connection,
+    space_id: &str,
+    viewer_participant_id: &str,
+) -> Result<Vec<GrantableAgentRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.id, p.label, p.scope = 'global', s.title \
+             FROM participant p \
+             LEFT JOIN space s ON s.id = p.owner_space_id \
+             WHERE p.kind = 'agent' AND p.removed_at IS NULL \
+               AND p.scope IN ('global', 'space') \
+               AND COALESCE(p.owner_space_id, '') <> ?1 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM space_participant r \
+                   WHERE r.participant_id = p.id AND r.space_id = ?1 \
+                     AND r.left_at IS NULL \
+               ) \
+               AND ( \
+                   p.scope = 'global' \
+                   OR EXISTS ( \
+                       SELECT 1 FROM participant v \
+                       WHERE v.id = ?2 AND v.owner_space_id = p.owner_space_id \
+                         AND v.removed_at IS NULL \
+                   ) \
+                   OR EXISTS ( \
+                       SELECT 1 FROM space_participant vr \
+                       JOIN participant v ON v.id = vr.participant_id \
+                       WHERE vr.participant_id = ?2 \
+                         AND vr.space_id = p.owner_space_id \
+                         AND vr.left_at IS NULL AND v.removed_at IS NULL \
+                   ) \
+               ) \
+             ORDER BY p.label, p.id",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(space_id.to_string()),
+            Value::Text(viewer_participant_id.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        let shared = row.get::<i64>(2).map_err(AppError::db)? != 0;
+        out.push(GrantableAgentRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            label: row.get::<String>(1).map_err(AppError::db)?,
+            shared,
+            home_space_title: row.get::<Option<String>>(3).map_err(AppError::db)?,
         });
     }
     Ok(out)
@@ -7274,6 +7398,7 @@ mod tests {
                     notebook_space_id: notebook,
                     notebook_title: "Cartographer — notebook",
                     persona: None,
+                    grant: None,
                     now: 2,
                 },
             )

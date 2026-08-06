@@ -418,7 +418,7 @@ impl ParticipantsStore {
         self.write_then_settle(space_id, key, cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
-                    c.promote_participant(participant_id, persona).await
+                    c.promote_participant(participant_id, persona, None).await
                 })
                 .await
                 .map(|_| ())
