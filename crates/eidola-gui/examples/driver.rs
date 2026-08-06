@@ -762,7 +762,7 @@ mod driver {
                         v.set_inspector_open_for_test(true, window, cx);
                         v.inspector_begin_invite(window, cx);
                         v.seed_invite_candidates_for_test(fixtures::grantable_agents(), cx);
-                        v.inspector_arm_invite("agent-mara", cx);
+                        v.inspector_arm_invite("agent-mara", window, cx);
                     });
                     root(view, window, cx)
                 },

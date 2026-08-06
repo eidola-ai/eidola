@@ -13344,9 +13344,9 @@ fn space_quoting_elsewhere_names_who_will_see_the_passage(cx: &mut TestAppContex
         );
     });
 
-    cx.update_window(window, |_, _, cx| {
+    cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.arm_quote_destination_for_test("other", "Tides", cx)
+            v.arm_quote_destination_for_test("other", "Tides", window, cx)
         });
     })
     .unwrap();
@@ -13408,11 +13408,73 @@ fn space_quoting_elsewhere_names_who_will_see_the_passage(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn space_a_quote_into_an_open_conversation_lands_in_the_window_it_raises(cx: &mut TestAppContext) {
+    // The destination is **already open**. The passage must land in that
+    // window, and no second window may open onto the same conversation: the
+    // one-shot mailbox is drained by whichever view draws first, so opening a
+    // duplicate is a coin flip between showing the reader their quote and
+    // showing them a fresh, empty composer with the quote in the window behind
+    // it (Codex review, PR #280). The invariant: the window presented is the
+    // window holding the quote.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (_dest_window, dest_view) = open_space(cx, &stores, Some("other".into()));
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let windows_before = cx.update(|cx| cx.windows().len());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+        view.update(cx, |v, cx| {
+            v.arm_quote_destination_for_test("other", "Tides", window, cx)
+        });
+        view.update(cx, |v, cx| v.confirm_quote_destination_for_test(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        windows_before,
+        "the conversation was already open — raising it, not opening a duplicate"
+    );
+    dest_view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "the window the reader is shown is the one holding the passage"
+        );
+    });
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.active_draft_references_for_test().is_empty(),
+            "and nothing was attached here"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_a_quote_from_another_window_lands_in_this_ones_draft(cx: &mut TestAppContext) {
     // The receiving half. A draft is window-local, so the shared `Space`
-    // entity is the courier: the first window to render this space takes the
-    // offer and attaches it exactly as `Edit > Quote` would — ordinal 1, a
-    // footnote row, a marker in the body, and nothing durable until it posts.
+    // entity is the courier: the window the offer names takes it and attaches
+    // it exactly as `Edit > Quote` would — ordinal 1, a footnote row, a marker
+    // in the body, and nothing durable until it posts.
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, Some("dest".into()));
     seed_quotable_space(
@@ -13441,6 +13503,9 @@ fn space_a_quote_from_another_window_lands_in_this_ones_draft(cx: &mut TestAppCo
                     byline: "You".into(),
                     snippet: "quick brown".into(),
                 },
+                // Unaddressed: the sender found no window on this space and
+                // opened one, so the next view to draw it takes the offer.
+                None,
                 cx,
             );
         });
@@ -13557,8 +13622,8 @@ fn inspector_inviting_an_agent_from_another_space_shares_it_and_adds_it_here(
         })
     });
 
-    cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.inspector_arm_invite(&visitor.id, cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_arm_invite(&visitor.id, window, cx));
     })
     .unwrap();
     let statement = view
@@ -13617,6 +13682,141 @@ fn inspector_inviting_an_agent_from_another_space_shares_it_and_adds_it_here(
         })
     });
     drain_runtime(&core);
+}
+
+#[gpui::test]
+fn inspector_the_invite_form_takes_the_keyboard_its_door_had(cx: &mut TestAppContext) {
+    // The mount side of the handback rule. Opening the form **replaces** the
+    // "Invite an agent…" door, and arming a candidate replaces the rows inside
+    // the form — both are real tab stops (`probe(Role::Button)` derives
+    // `focusable()` + `tab_index(0)`), so a transition that mounts a surface
+    // and focuses nothing leaves the window on a dead handle: keystrokes reach
+    // nothing and Tab restarts from the window root (Codex review, PR #280).
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let elsewhere = core
+        .runtime()
+        .block_on(core.create_space(Some("Tides".into())))
+        .expect("a second conversation")
+        .id;
+    let visitor = core
+        .runtime()
+        .block_on(core.list_space_participants(elsewhere.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the template seeds an agent there too");
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    // Opening it: a reveal focuses what it revealed — the rule the disclosure,
+    // Add and the template form already follow. This form has no text field,
+    // so the keyboard goes to the form itself.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+    })
+    .unwrap();
+    let form = view
+        .read_with(cx, |v, _| v.inspector_invite_focus_handle())
+        .expect("the form is open");
+    assert!(
+        cx.update_window(window, |_, window, _| form.is_focused(window))
+            .unwrap(),
+        "the form the door became holds the keyboard"
+    );
+
+    wait_until(cx, "the candidates land", |cx| {
+        view.read_with(cx, |v, _| {
+            v.inspector_invite_for_test()
+                .is_some_and(|(labels, _)| !labels.is_empty())
+        })
+    });
+    draw_window(cx, window);
+
+    // Tab onto a candidate row, then arm it: the row unmounts with the list it
+    // was in, and the form survives, so the keyboard stays on the form — the
+    // rule the share confirmation already applies to its own verbs.
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, cx| {
+            form.contains_focused(window, cx) && !form.is_focused(window)
+        })
+        .unwrap(),
+        "Tab from the form lands on a control inside it"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_arm_invite(&visitor.id, window, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(
+        cx.update_window(window, |_, window, cx| form.contains_focused(window, cx))
+            .unwrap(),
+        "arming the grant leaves the keyboard on the form it replaced a row in"
+    );
+    drain_runtime(&core);
+}
+
+#[gpui::test]
+fn space_arming_a_quote_destination_keeps_the_keyboard_on_the_picker(cx: &mut TestAppContext) {
+    // The same rule, one surface over: choosing a destination replaces the list
+    // of conversations with the visibility statement and its two verbs, so the
+    // row that was pressed unmounts. The picker survives it and keeps the
+    // keyboard (Codex review, PR #280) — and only if the picker was the one
+    // holding it, so a pointer press from the page takes nothing.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    let picker = view
+        .read_with(cx, |v, _| v.quote_destination_focus_handle())
+        .expect("the picker is open");
+
+    // A reader who tabbed into the picker is on one of its rows.
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&picker, cx);
+        window.focus_next(cx);
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, cx| {
+            picker.contains_focused(window, cx) && !picker.is_focused(window)
+        })
+        .unwrap(),
+        "Tab from the picker lands on a destination row"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.arm_quote_destination_for_test("other", "Tides", window, cx)
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(
+        cx.update_window(window, |_, window, cx| picker.contains_focused(window, cx))
+            .unwrap(),
+        "the statement's verbs are where the keyboard is, not a row nobody paints"
+    );
 }
 
 #[gpui::test]

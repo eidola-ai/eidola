@@ -769,13 +769,26 @@ impl SpaceView {
     /// Open the invite form and start its read. The candidates come from
     /// app-core's viewer-scoped listing, so this surface can only ever offer
     /// agents this reader already knows about.
+    ///
+    /// **The reveal focuses what it revealed** — the Settings idiom every other
+    /// form in this section follows (the disclosure, Add and the template form
+    /// each focus their first field). It is the mount-side half of the handback
+    /// rule, and it is owed here for the same reason: the form *replaces* the
+    /// "Invite an agent…" door, which is a real tab stop (`probe(Role::Button)`
+    /// derives `focusable()` + `tab_index(0)`), so opening it otherwise leaves
+    /// the window holding a handle to something nobody paints — keystrokes
+    /// reach nothing and Tab restarts from the window root (Codex review, PR
+    /// #280). This form has no text field to focus, so the keyboard goes to the
+    /// form itself, which is what `contains_focused` asks about anyway.
     pub fn inspector_begin_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.inspector_participant_edit = None;
         self.inspector_participant_add = None;
         self.inspector_template_form = None;
         self.inspector_participant_picker = None;
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
         self.inspector_invite = Some(InviteForm {
-            focus: cx.focus_handle(),
+            focus,
             candidates: None,
             error: None,
             confirming: None,
@@ -812,7 +825,19 @@ impl SpaceView {
     }
 
     /// Arm the confirmation for one candidate — where the consequence is said.
-    pub fn inspector_arm_invite(&mut self, participant_id: &str, cx: &mut Context<Self>) {
+    ///
+    /// The candidate rows are tab stops, and the confirmation **replaces** them
+    /// inside the same form, so the pressed row unmounts: the keyboard goes to
+    /// the form, exactly as it does when the share confirmation replaces a
+    /// verb ([`Self::set_inspector_promote_confirm`]) — and, as there, only
+    /// from a form that was holding it, so a pointer press from elsewhere in
+    /// the window takes nothing.
+    pub fn inspector_arm_invite(
+        &mut self,
+        participant_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(form) = self.inspector_invite.as_mut() else {
             return;
         };
@@ -829,7 +854,17 @@ impl SpaceView {
             candidate.shared,
             candidate.home_space_title.clone().map(SharedString::from),
         ));
+        let focus = form.focus.clone();
+        if focus.contains_focused(window, cx) {
+            window.focus(&focus, cx);
+        }
         cx.notify();
+    }
+
+    /// The invite form's subtree focus handle (tests).
+    #[doc(hidden)]
+    pub fn inspector_invite_focus_handle(&self) -> Option<gpui::FocusHandle> {
+        self.inspector_invite.as_ref().map(|f| f.focus.clone())
     }
 
     pub fn inspector_cancel_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1854,8 +1889,8 @@ impl SpaceView {
                             .cursor_pointer()
                             .hover(move |s| s.bg(theme.muted).text_color(fg))
                             .child(line)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.inspector_arm_invite(&id, cx)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.inspector_arm_invite(&id, window, cx)
                             })),
                     );
                 }

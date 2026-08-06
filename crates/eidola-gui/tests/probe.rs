@@ -4996,9 +4996,9 @@ fn space_probes_record_the_quote_destination_and_denied_follow(cx: &mut TestAppC
     // Arming one grows the statement — carried as the node's **value**, the
     // channel a screen reader reads, because it is the content of the surface
     // rather than its name.
-    cx.update_window(window, |_, _, cx| {
+    cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.arm_quote_destination_for_test("other", "Tides", cx)
+            v.arm_quote_destination_for_test("other", "Tides", window, cx)
         });
     })
     .unwrap();
