@@ -414,6 +414,28 @@ pub struct Space {
     /// so a reload — or the other window on the same space — can't collapse one
     /// under the reader.
     traces_expanded: std::collections::HashSet<String>,
+    /// A quote handed to this space from **another window** — task 37's
+    /// cross-space quote creation, in flight.
+    ///
+    /// A draft is window-local by design (STATE.md: two windows on one space
+    /// are two cursors), so a quote made in space A's window cannot be written
+    /// into space B's composer directly: the two windows share nothing but this
+    /// entity. So the entity is the courier — a **one-shot mailbox**, not
+    /// state: the first `SpaceView` to render on this space takes it and
+    /// attaches it to its draft, and nothing durable happens until that draft
+    /// is posted (accept-before-consume, exactly as an in-space quote).
+    offered_quote: Option<OfferedQuote>,
+}
+
+/// A quote travelling between windows (see [`Space::offer_quote`]): the write
+/// spec app-core validates, plus the two strings the receiving draft's footnote
+/// row needs. It carries **no** node or space of the source window — the
+/// reference names a concrete generation and nothing else survives the trip.
+#[derive(Clone, Debug)]
+pub struct OfferedQuote {
+    pub spec: eidola_app_core::ReferenceSpec,
+    pub byline: gpui::SharedString,
+    pub snippet: gpui::SharedString,
 }
 
 impl EventEmitter<SpaceEvent> for Space {}
@@ -441,6 +463,7 @@ impl Space {
             traces: Loadable::NotLoaded,
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
+            offered_quote: None,
         }
     }
 
@@ -467,6 +490,7 @@ impl Space {
             traces: Loadable::NotLoaded,
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
+            offered_quote: None,
         };
         space.load_transcript(cx);
         space
@@ -494,6 +518,7 @@ impl Space {
             traces: Loadable::NotLoaded,
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
+            offered_quote: None,
         }
     }
 
@@ -517,6 +542,32 @@ impl Space {
     /// The in-flight streaming turns, in start (`seq`) order.
     pub fn streams(&self) -> &[StreamingTurn] {
         &self.streams
+    }
+
+    // -- Cross-space quote handoff -----------------------------------------
+
+    /// Hand this space a quote made in another window (task 37's creation UI).
+    ///
+    /// It is deliberately **not** merged with anything: a second offer replaces
+    /// the first, because an undelivered offer means no window has drawn this
+    /// space yet and the newer one is what the reader just asked for. Nothing
+    /// durable happens here — the receiving view attaches it to a draft, and the
+    /// draft is what a post consumes.
+    pub fn offer_quote(&mut self, quote: OfferedQuote, cx: &mut Context<Self>) {
+        self.offered_quote = Some(quote);
+        cx.notify();
+    }
+
+    /// Take the pending offer, if any — a one-shot: whichever `SpaceView`
+    /// renders first attaches it to its own draft, and two windows never both
+    /// receive it (a quote pasted twice would be two references to write).
+    pub fn take_offered_quote(&mut self) -> Option<OfferedQuote> {
+        self.offered_quote.take()
+    }
+
+    /// Whether an offer is waiting (the `&self` render path's question).
+    pub fn has_offered_quote(&self) -> bool {
+        self.offered_quote.is_some()
     }
 
     // -- Incoming references (source highlights) ---------------------------

@@ -610,8 +610,8 @@ impl ChromeRoot {
     fn render_menu_panel(&self, _window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         use crate::actions::{
             About, ActualSize, CheckForUpdates, NewSpace, NewSpaceFromTemplate, OpenLibrary,
-            OpenRecord, OpenSettings, Quit, Quote, QuoteInReply, ToggleInspector, ZoomIn, ZoomOut,
-            primary_alt_chord, primary_chord, primary_shift_chord,
+            OpenRecord, OpenSettings, Quit, Quote, QuoteElsewhere, QuoteInReply, ToggleInspector,
+            ZoomIn, ZoomOut, primary_alt_chord, primary_chord, primary_shift_chord,
         };
         let theme = cx.theme();
 
@@ -701,6 +701,13 @@ impl ChromeRoot {
                 "Quote in Reply",
                 None,
                 |w, cx| w.dispatch_action(Box::new(QuoteInReply), cx),
+                cx,
+            ))
+            .child(menu_item(
+                "quote-elsewhere",
+                "Quote in Another Conversation…",
+                None,
+                |w, cx| w.dispatch_action(Box::new(QuoteElsewhere), cx),
                 cx,
             ))
             .child(separator())

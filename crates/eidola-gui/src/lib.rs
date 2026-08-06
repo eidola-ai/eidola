@@ -45,7 +45,8 @@ use crate::about::AboutView;
 use crate::actions::{
     About, ActualSize, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize,
     NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenRecord, OpenSettings, Quit, QuitApp, Quote,
-    QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn, ZoomOut,
+    QuoteElsewhere, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn,
+    ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::lifecycle::LaunchOptions;
@@ -375,6 +376,7 @@ fn install_menus(cx: &mut App) {
                 // exists, so macOS greys them the rest of the time.
                 MenuItem::action("Quote", Quote),
                 MenuItem::action("Quote in Reply", QuoteInReply),
+                MenuItem::action("Quote in Another Conversation…", QuoteElsewhere),
             ],
             disabled: false,
         },

@@ -4951,3 +4951,114 @@ fn space_inspector_shows_a_title_refusal_beside_a_standing_settings_one(cx: &mut
 
     probe::set_probes_enabled(false);
 }
+
+/// The cross-space creation UI and the denied-follow notice (task 37): the
+/// destination picker's rows, the statement the reader must be shown, its two
+/// verbs, and the notice's own dismiss — every one a driver target and an
+/// AccessKit node.
+#[gpui::test]
+fn space_probes_record_the_quote_destination_and_denied_follow(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.spaces = vec![
+            space_info("s", Some("Here")),
+            space_info("other", Some("Tides")),
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut post = probe_post("a1", "the quick brown fox");
+    post.blocks[0].id = "b1".into();
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+    draw(cx, window);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/quote-destination".to_string())
+            && names.contains(&"space/quote-destination/0".to_string()),
+        "the destination picker and its rows are probed: {names:?}"
+    );
+
+    // Arming one grows the statement — carried as the node's **value**, the
+    // channel a screen reader reads, because it is the content of the surface
+    // rather than its name.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.arm_quote_destination_for_test("other", "Tides", cx)
+        });
+    })
+    .unwrap();
+    draw(cx, window);
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let note = entries
+        .iter()
+        .find(|(n, _)| n == "space/quote-destination/note")
+        .expect("the visibility statement is probed");
+    assert!(
+        note.1
+            .value
+            .as_ref()
+            .is_some_and(|v| v.contains("visible to everyone in Tides")),
+        "the statement names the destination: {:?}",
+        note.1.value
+    );
+    let names: Vec<String> = entries.iter().map(|(n, _)| n.to_string()).collect();
+    assert!(
+        names.contains(&"space/quote-destination/confirm".to_string())
+            && names.contains(&"space/quote-destination/cancel".to_string()),
+        "both verbs are probed: {names:?}"
+    );
+
+    // The denied follow's quiet notice: an Alert carrying its sentence, plus a
+    // dismiss.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.close_quote_destination(cx);
+            v.report_navigation_failure_for_test(
+                eidola_app_core::error::AppError::NotAParticipant {
+                    participant_id: "p1".into(),
+                    action_id: "a-private".into(),
+                },
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    draw(cx, window);
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let notice = entries
+        .iter()
+        .find(|(n, _)| n == "space/reference-notice")
+        .expect("the denial notice is probed");
+    assert_eq!(notice.1.role, gpui::Role::Alert);
+    let said = notice.1.value.clone().unwrap_or_default();
+    assert!(
+        said.contains("don't take part in"),
+        "the sentence rides as the value: {said}"
+    );
+    assert!(
+        !said.contains("a-private") && !said.contains("p1"),
+        "and it names nothing about the refused conversation: {said}"
+    );
+    let names: Vec<String> = entries.iter().map(|(n, _)| n.to_string()).collect();
+    assert!(
+        names.contains(&"space/reference-notice/dismiss".to_string()),
+        "the notice is dismissible: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}

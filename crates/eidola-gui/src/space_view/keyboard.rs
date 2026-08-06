@@ -374,6 +374,11 @@ impl SpaceView {
         self.context_menu.is_some()
             || self.band_menu.is_some()
             || self.highlight_picker.is_some()
+            // The quote-destination picker is one too, and for the sharper
+            // version of the same reason: it holds a passage on its way into
+            // another conversation, and a printable behind it would start a
+            // draft here instead.
+            || self.quote_destination.is_some()
             // The inspector's router dropdown is one too: it is a choice
             // hovering over the panel, and a printable behind it would start a
             // draft the reader cannot see.
