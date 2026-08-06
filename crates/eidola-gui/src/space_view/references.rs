@@ -788,6 +788,32 @@ impl SpaceView {
         if !self.space.read(cx).has_offered_quote_for(here) {
             return;
         }
+        // **Wait for the tail this belongs to.** Quoting into a conversation
+        // that was not already open lands in a window whose first frames run
+        // before its transcript has answered, and `sync_tail_drafts` mints no
+        // composer in that state — so taking the offer there made
+        // `draft_for_quote` pick a parent from a tree with no posts in it: a
+        // *root* draft, attached to nothing on screen, submitting with no
+        // `reply_to` and persisted under whatever the tail turned out to be
+        // (Codex review, PR #280). The mailbox already survives frames, so the
+        // offer simply stays in it — no second pending mechanism — and is taken
+        // on the first frame there is somewhere for it to land.
+        //
+        // The same predicate `sync_tail_drafts` gates on, deliberately without
+        // its *streaming* half: a streaming space has a loaded tree, so
+        // `draft_for_quote`'s fallback picks the branch's last real post — a
+        // parent that exists — where waiting would leave the reader looking at
+        // the window they were just shown with an empty composer.
+        //
+        // Rethreading cannot cure this after the fact (the doctrine's usual
+        // move): `rethread_drafts` forwards a draft through the *identity* its
+        // parent named, and a root draft names nothing — "root because this
+        // space is empty" and "root because we had not read it yet" are the
+        // same value. A draft minted against an unloaded tree is a guess; the
+        // doctrine's drafts attach to what exists.
+        if !self.space.read(cx).transcript_loaded() {
+            return;
+        }
         let Some(offer) = self
             .space
             .update(cx, |space, _| space.take_offered_quote(here))
