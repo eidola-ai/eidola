@@ -543,6 +543,31 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_inspector_share_agent",
+                description: "Space view: the inspector's Participants section with a space-owned agent's disclosure open and its share confirmation armed — the one-way promote affordance (task 36)",
+                default_size: size(px(1040.), px(760.)),
+                build: |window, cx| {
+                    let stores = inspector_stores(cx, None);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
+                    view.update(cx, |v, cx| {
+                        v.set_inspector_open_for_test(true, window, cx);
+                        v.inspector_toggle_participant("agent-assistant", window, cx);
+                        v.inspector_begin_promote(cx);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_traces",
                 description: "Space view: trace disclosures — an answered turn's tool rounds under its reply, and three declines stacked in the gap under the post they answered (two agents, one of them asked twice)",
                 default_size: size(px(860.), px(760.)),

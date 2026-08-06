@@ -7199,6 +7199,163 @@ fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
     drain_runtime(&core);
 }
 
+/// The **promote affordance** (task 36): "Share this agent…" on a space-owned
+/// agent's disclosure turns it into a shared identity *in place*.
+///
+/// Two things are asserted because both are the feature: the verb asks first
+/// (sharing is one-way — "Not now" leaves the roster exactly as it was), and the
+/// share itself moves ownership without moving configuration. The row comes back
+/// **referenced** with the same id and the same effective persona — which is
+/// also what makes the "shared" tag and the override fork appear with no view
+/// code at all, since both are read off the store's own re-list.
+#[gpui::test]
+fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    let before = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .clone()
+    });
+    assert_eq!(
+        before.source, "owned",
+        "the seeded agent starts space-owned"
+    );
+    let agent = before.id.clone();
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx)
+        });
+    })
+    .unwrap();
+
+    // The confirmation is armed, then stood down — nothing is written.
+    view.update(cx, |v, cx| v.inspector_begin_promote(cx));
+    assert!(view.read_with(cx, |v, _| v.inspector_promote_confirming()));
+    view.update(cx, |v, cx| v.inspector_cancel_promote(cx));
+    assert!(!view.read_with(cx, |v, _| v.inspector_promote_confirming()));
+    cx.run_until_parked();
+    assert_eq!(
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .find(|p| p.id == agent)
+                .map(|p| p.source.clone())
+        }),
+        Some("owned".to_string()),
+        "declining the confirmation shares nothing"
+    );
+
+    view.update(cx, |v, cx| v.inspector_begin_promote(cx));
+    view.update(cx, |v, cx| v.inspector_confirm_promote(cx));
+    // What the editor was editing has changed shape, so it closes.
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_editing_participant().is_none()),
+        "the disclosure closes on a share"
+    );
+
+    wait_until(cx, "the share lands", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent && p.source == "referenced")
+        })
+    });
+    let after = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.id == agent)
+            .expect("the shared agent is still a member")
+            .clone()
+    });
+    assert_eq!(after.scope, "global");
+    assert_eq!(after.label, before.label);
+    assert_eq!(after.model_ref, before.model_ref);
+    assert_eq!(after.system_prompt, before.system_prompt);
+    assert_eq!(after.notify_policy, before.notify_policy);
+    assert!(
+        after.reference.is_some(),
+        "a referenced global carries the override fork's detail"
+    );
+    assert!(
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_error(&space).map(str::to_string))
+            .is_none(),
+        "the share was accepted"
+    );
+
+    drain_runtime(&core);
+}
+
+/// A shared agent's **notebook** is a real space, and the Library is the list of
+/// the human's conversations — so promotion must not put a new row in it.
+/// `AppCore::list_spaces` excludes notebooks unconditionally; this is the GUI's
+/// end of that promise, read where a person would read it.
+#[gpui::test]
+fn a_shared_agents_notebook_stays_out_of_the_library(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (_window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+    stores
+        .participants
+        .update(cx, |s, cx| s.ensure(space.clone(), cx));
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+    wait_until(cx, "the library lists the space", |cx| {
+        stores.spaces.read_with(cx, |s, _| s.list().len() == 1)
+    });
+
+    let agent = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .id
+            .clone()
+    });
+    stores
+        .participants
+        .update(cx, |s, cx| s.promote(space.clone(), agent.clone(), cx));
+    wait_until(cx, "the share lands", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent && p.source == "referenced")
+        })
+    });
+
+    // Re-list from the database, not from the cached index: promotion emits
+    // `Change::Participants` only (the Library provably didn't change), so this
+    // asks the question the exclusion is the answer to.
+    stores.spaces.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the library re-lists", |cx| {
+        stores
+            .spaces
+            .read_with(cx, |s, _| !s.index().is_loading() && s.list().len() == 1)
+    });
+    assert_eq!(
+        stores.spaces.read_with(cx, |s, _| s
+            .list()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>()),
+        vec![space],
+        "the notebook created by the share is not a conversation"
+    );
+
+    drain_runtime(&core);
+}
+
 #[gpui::test]
 fn templates_pane_crud_and_set_default(cx: &mut TestAppContext) {
     let (stores, core, _dir, _space) = participants_scene(cx);

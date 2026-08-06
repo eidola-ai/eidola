@@ -2740,6 +2740,12 @@ fn space_inspector_participants_probes_cover_rows_editor_and_add(cx: &mut TestAp
     );
     // The human editor shows only the mode toggle + name (no model/prompt).
     assert!(!names.contains(&"space/inspector/participants/editor/model".to_string()));
+    // Nothing offers to share what is already shared — promotion is one-way, so
+    // no surface here may imply its inverse either.
+    assert!(
+        !names.contains(&format!("space/inspector/participants/{you}/share")),
+        "a referenced global carries no share verb: {names:?}"
+    );
 
     // An agent's disclosure adds the model field, the prompt and notify chips.
     cx.update_window(window, |_, window, cx| {
@@ -2754,12 +2760,34 @@ fn space_inspector_participants_probes_cover_rows_editor_and_add(cx: &mut TestAp
         "space/inspector/participants/editor/system-prompt",
         "space/inspector/participants/editor/notify/human",
         "space/inspector/participants/agent-1/remove",
+        // A space-owned agent is the one that can be shared (task 36).
+        "space/inspector/participants/agent-1/share",
     ] {
         assert!(
             names.contains(&expected.to_string()),
             "agent editor probe {expected:?} missing: {names:?}"
         );
     }
+
+    // The share asks first — the verb is replaced by its confirmation, which
+    // carries the reassurance as a readable node rather than only as pixels.
+    view.update(cx, |v, cx| v.inspector_begin_promote(cx));
+    let names = fresh_names(cx, window);
+    for expected in [
+        "space/inspector/participants/agent-1/share/note",
+        "space/inspector/participants/agent-1/share/confirm",
+        "space/inspector/participants/agent-1/share/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "share-confirm probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"space/inspector/participants/agent-1/share".to_string()),
+        "the armed confirmation replaces the verb: {names:?}"
+    );
+    view.update(cx, |v, cx| v.inspector_cancel_promote(cx));
 
     // The add form.
     cx.update_window(window, |_, window, cx| {

@@ -69,6 +69,14 @@ pub(crate) struct ParticipantEdit {
     model_ref: Option<String>,
     notify_policy: String,
     mode: EditMode,
+    /// Whether "Share this agent…" has been pressed and the editor is showing
+    /// its confirmation. It lives **inside the editor** rather than beside it
+    /// because sharing is one-way: a flag with its own lifetime would have to be
+    /// cleared at every transition that closes this editor (the roster dropping
+    /// the row, Remove, the add form, another disclosure), and the one that
+    /// forgot would leave an armed irreversible verb over a different
+    /// participant. Owned by the thing it describes, it cannot outlive it.
+    promote_confirm: bool,
 }
 
 /// The open add-a-participant form (agents only).
@@ -253,6 +261,7 @@ impl SpaceView {
             } else {
                 EditMode::Everywhere
             },
+            promote_confirm: false,
         });
         cx.notify();
     }
@@ -384,6 +393,57 @@ impl SpaceView {
         }
         self.inspector_participant_picker = None;
         cx.notify();
+    }
+
+    // -- Sharing (task 36's in-place promotion) ----------------------------
+
+    /// Arm the "Share this agent…" confirmation on the open disclosure.
+    ///
+    /// Sharing is **one-way** (app-core has no demotion — it would strand
+    /// memberships and memory), so it asks first. The confirmation is also where
+    /// the reassurance is spoken: promotion moves the row's ownership, never its
+    /// configuration, so the agent answers in this space exactly as it does now.
+    pub fn inspector_begin_promote(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = self.inspector_participant_edit.as_mut() {
+            edit.promote_confirm = true;
+            cx.notify();
+        }
+    }
+
+    pub fn inspector_cancel_promote(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = self.inspector_participant_edit.as_mut() {
+            edit.promote_confirm = false;
+            cx.notify();
+        }
+    }
+
+    /// Confirm the share: `ParticipantsStore::promote` → `AppCore::promote_participant`.
+    ///
+    /// The editor closes, because what it was editing has changed shape: the row
+    /// comes back from the re-list as a **referenced global**, whose editor
+    /// carries the everywhere-vs-here fork this one was seeded without. Nothing
+    /// else is view work — the roster's "shared" tag falls out of the same
+    /// re-list.
+    pub fn inspector_confirm_promote(&mut self, cx: &mut Context<Self>) {
+        let Some(space_id) = self.space_id(cx) else {
+            return;
+        };
+        let Some(edit) = self.inspector_participant_edit.take() else {
+            return;
+        };
+        self.inspector_participant_picker = None;
+        self.stores
+            .participants
+            .update(cx, |s, cx| s.promote(space_id, edit.participant_id, cx));
+        cx.notify();
+    }
+
+    /// Whether the open disclosure is showing its share confirmation (tests).
+    #[doc(hidden)]
+    pub fn inspector_promote_confirming(&self) -> bool {
+        self.inspector_participant_edit
+            .as_ref()
+            .is_some_and(|e| e.promote_confirm)
     }
 
     pub fn inspector_remove_participant(&mut self, participant_id: &str, cx: &mut Context<Self>) {
@@ -926,6 +986,10 @@ impl SpaceView {
         let can_remove = p.id != eidola_app_core::HUMAN_PARTICIPANT_ID;
         let remove_id = p.id.clone();
         let subject = p.label.clone();
+        // Only a **space-owned** agent can be shared: a referenced global
+        // already is one, and promotion is one-way, so there is deliberately
+        // nothing here that reads as "unshare".
+        let can_share = is_agent && !edit.is_referenced;
 
         let mut card = v_flex().w_full().pb_3().gap_2();
 
@@ -1005,6 +1069,28 @@ impl SpaceView {
                 .child(self.render_inspector_notify(&edit.notify_policy, "editor", true, cx));
         }
 
+        // Sharing gets its own line rather than a fourth seat in the verb row:
+        // the panel is 320px, and a row of four verbs pushed Save off the edge.
+        // It is also not a peer of Cancel/Save — those settle this edit, while
+        // this one changes what the participant *is*.
+        if can_share {
+            card = card.child(match edit.promote_confirm {
+                true => self.render_inspector_share_confirm(p, cx),
+                false => h_flex()
+                    .w_full()
+                    .child(ghost_button_labeled(
+                        "space-inspector-p-share".into(),
+                        SharedString::from(format!("space/inspector/participants/{}/share", p.id)),
+                        "Share this agent…",
+                        format!("Share {subject} across spaces"),
+                        false,
+                        cx,
+                        cx.listener(|this, _, _, cx| this.inspector_begin_promote(cx)),
+                    ))
+                    .into_any_element(),
+            });
+        }
+
         card.child(
             h_flex()
                 .w_full()
@@ -1050,6 +1136,82 @@ impl SpaceView {
                 ),
         )
         .into_any_element()
+    }
+
+    /// The share confirmation — what "Share this agent…" reveals in place.
+    ///
+    /// It says the two things a reader needs before an irreversible verb: that
+    /// **nothing about this space changes** (promotion moves the row's
+    /// ownership, not its configuration — the space keeps the agent as a member
+    /// with empty overrides, so its persona here is preserved byte for byte),
+    /// and that it **cannot be undone** (there is no demotion; retirement is the
+    /// soft-remove).
+    fn render_inspector_share_confirm(
+        &self,
+        p: &ParticipantInfo,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let name = p.label.clone();
+        let reassurance = format!(
+            "{name} keeps this space's persona exactly as it is, and can then join other spaces. \
+             Sharing can't be undone."
+        );
+        v_flex()
+            .id("space-inspector-p-share-confirm")
+            .w_full()
+            .p_2()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary.opacity(0.3))
+            .child(
+                div()
+                    .id("space-inspector-p-share-note")
+                    .probe(
+                        SharedString::from(format!(
+                            "space/inspector/participants/{}/share/note",
+                            p.id
+                        )),
+                        gpui::Role::Label,
+                        SharedString::from(reassurance.clone()),
+                    )
+                    .text_xs()
+                    .text_color(muted)
+                    .child(SharedString::from(reassurance)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_end()
+                    .child(ghost_button_labeled(
+                        "space-inspector-p-share-cancel".into(),
+                        SharedString::from(format!(
+                            "space/inspector/participants/{}/share/cancel",
+                            p.id
+                        )),
+                        "Not now",
+                        format!("Keep {name} in this space"),
+                        false,
+                        cx,
+                        cx.listener(|this, _, _, cx| this.inspector_cancel_promote(cx)),
+                    ))
+                    .child(ghost_button_labeled(
+                        "space-inspector-p-share-confirm-button".into(),
+                        SharedString::from(format!(
+                            "space/inspector/participants/{}/share/confirm",
+                            p.id
+                        )),
+                        "Share",
+                        format!("Share {name} across spaces"),
+                        true,
+                        cx,
+                        cx.listener(|this, _, _, cx| this.inspector_confirm_promote(cx)),
+                    )),
+            )
+            .into_any_element()
     }
 
     fn render_inspector_add_form(&self, cx: &mut Context<Self>) -> AnyElement {
