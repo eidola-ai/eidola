@@ -1208,3 +1208,45 @@ fn a_persona_travels_into_the_promoting_transaction() {
         );
     });
 }
+
+/// **A space's removal is not the library's.** Once an agent is shared, taking
+/// it out of a conversation ends that membership and nothing else — the row, its
+/// library seat and its notebook all stand, because retirement is a different
+/// verb with a different door. The distinction is decided at the write
+/// (`db::remove_space_participant_tx`), which is what keeps it true even when
+/// the share landed a moment before the removal (Codex review, PR #279).
+#[test]
+fn removing_a_shared_agent_from_a_space_is_a_leave_not_a_retirement() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let space = turn(&core, "Hello.", None).space_id;
+        let agent = agent_id(&core, &space);
+        let notebook = promote(&core, &agent).notebook_space_id;
+
+        assert!(
+            core.runtime()
+                .block_on(core.remove_space_participant(space.clone(), agent.clone()))
+                .expect("removal"),
+            "the membership ended"
+        );
+        assert!(
+            member(&core, &space, &agent).is_none(),
+            "it is no longer in the conversation"
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.list_global_agents())
+                .expect("library")
+                .iter()
+                .any(|a| a.id == agent),
+            "but it is still a shared agent"
+        );
+        assert!(
+            !core
+                .runtime()
+                .block_on(core.test_space_archived(notebook))
+                .expect("notebook row"),
+            "and its notebook stands — only retirement archives one"
+        );
+    });
+}
