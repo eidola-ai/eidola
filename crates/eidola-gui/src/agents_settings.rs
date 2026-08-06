@@ -27,9 +27,9 @@
 
 use eidola_app_core::{GlobalAgentInfo, ParticipantUpdate};
 use gpui::{
-    AppContext, Context, Entity, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
-    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, div, prelude::FluentBuilder,
+    AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    div, prelude::FluentBuilder,
 };
 use gpui_component::{
     ActiveTheme, StyledExt as _, h_flex,
@@ -60,6 +60,13 @@ struct AgentDraft {
     system_prompt: Entity<InputState>,
     model_ref: Option<String>,
     notify_policy: String,
+    /// The editor subtree's own focus handle — what the handback question is
+    /// asked of. **Containment, not an enumeration of fields**: the editor holds
+    /// more than its two inputs, and a predicate that lists them answers "not
+    /// held" for anything else focused inside it, so the keyboard is dropped on
+    /// the floor by exactly the controls a future edit adds (Codex review, PR
+    /// #279).
+    focus: gpui::FocusHandle,
     /// Whether the model dropdown is open. It is painted **inside this draft**,
     /// so it dies with the draft — the inspector's derive-don't-clear rule, made
     /// structural by ownership rather than by a reader.
@@ -135,6 +142,13 @@ impl AgentsSettingsView {
         self.retiring.as_deref()
     }
 
+    /// The open editor's subtree focus handle (tests: focus something inside
+    /// the editor that is not one of its two inputs).
+    #[doc(hidden)]
+    pub fn editing_focus_handle(&self) -> Option<FocusHandle> {
+        self.draft.as_ref().map(|d| d.focus.clone())
+    }
+
     #[doc(hidden)]
     pub fn editing_label_state(&self) -> Option<Entity<InputState>> {
         self.draft.as_ref().map(|d| d.label.clone())
@@ -185,6 +199,7 @@ impl AgentsSettingsView {
             participant_id: agent.id.clone(),
             label,
             system_prompt,
+            focus: cx.focus_handle(),
             model_ref: agent.model_ref.clone(),
             notify_policy: agent.notify_policy.clone(),
             picker_open: false,
@@ -206,12 +221,14 @@ impl AgentsSettingsView {
         }
     }
 
-    /// Whether the open editor's own fields hold this window's focus.
+    /// Whether the keyboard is anywhere **inside** the open editor — the
+    /// question the handback has to ask, since the editor is a subtree and not a
+    /// list of two inputs (`contains_focused` is the same idiom the Library's
+    /// reveal uses).
     fn draft_field_focused(&self, window: &Window, cx: &gpui::App) -> bool {
-        self.draft.as_ref().is_some_and(|d| {
-            d.label.read(cx).focus_handle(cx).is_focused(window)
-                || d.system_prompt.read(cx).focus_handle(cx).is_focused(window)
-        })
+        self.draft
+            .as_ref()
+            .is_some_and(|d| d.focus.contains_focused(window, cx))
     }
 
     pub fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -688,6 +705,7 @@ impl AgentsSettingsView {
         };
         v_flex()
             .id("agent-editor")
+            .track_focus(&draft.focus)
             .w_full()
             .p_3()
             .gap_2()
