@@ -649,6 +649,32 @@ mod driver {
                 },
             },
             Scene {
+                name: "settings_agents",
+                description: "Settings → Agents pane: the shared agent library (task 36) — each row with its notebook, edit and retire verbs",
+                default_size: size(px(620.), px(520.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| v.select(SettingsPane::Agents, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "settings_agents_retire",
+                description: "Settings → Agents pane with a retirement armed — the confirmation that says the notebook goes too",
+                default_size: size(px(620.), px(520.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| {
+                        v.select(SettingsPane::Agents, cx);
+                        v.agents_pane()
+                            .update(cx, |p, cx| p.arm_retire("agent-ada", cx));
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "library",
                 description: "Library window with six spaces (hover/rename/archive)",
                 default_size: size(px(520.), px(620.)),
@@ -775,7 +801,33 @@ mod driver {
             s.local_models = Some(local_models_state());
             s.participants = Some(participants_fixture());
             s.templates = templates_fixture();
+            s.agents = Some(agents_fixture());
         })
+    }
+
+    /// The shared agent library (Settings → Agents): two promoted agents, each
+    /// with the notebook a promotion creates.
+    fn agents_fixture() -> Vec<eidola_app_core::GlobalAgentInfo> {
+        vec![
+            eidola_app_core::GlobalAgentInfo {
+                id: "agent-ada".into(),
+                label: "Ada".into(),
+                model_ref: Some("gemma4-31b".into()),
+                system_prompt: Some(
+                    "Answer plainly, cite what you rely on, and say when you are unsure.".into(),
+                ),
+                notify_policy: "human".into(),
+                notebook_space_id: Some("nb-ada".into()),
+            },
+            eidola_app_core::GlobalAgentInfo {
+                id: "agent-critic".into(),
+                label: "Critic".into(),
+                model_ref: Some("qwen3-8b@my-vllm".into()),
+                system_prompt: Some("Look for the weakest step in an argument.".into()),
+                notify_policy: "explicit".into(),
+                notebook_space_id: Some("nb-critic".into()),
+            },
+        ]
     }
 
     /// Participants fixture for the Participants view: the referenced global
