@@ -7310,8 +7310,7 @@ fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
     assert!(
         stores
             .participants
-            .read_with(cx, |s, _| s.op_error(&space).map(str::to_string))
-            .is_none(),
+            .read_with(cx, |s, _| s.op_errors_for(&space).is_empty()),
         "the share was accepted"
     );
 
@@ -7418,8 +7417,7 @@ fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAp
     assert!(
         stores
             .participants
-            .read_with(cx, |s, _| s.op_error(&space).map(str::to_string))
-            .is_none(),
+            .read_with(cx, |s, _| s.op_errors_for(&space).is_empty()),
         "the share was accepted"
     );
 
@@ -8421,10 +8419,13 @@ fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
     wait_until(cx, "A op_error", |cx| {
         stores
             .participants
-            .read_with(cx, |s, _| s.op_error(&space_a).is_some())
+            .read_with(cx, |s, _| !s.op_errors_for(&space_a).is_empty())
     });
     stores.participants.read_with(cx, |s, _| {
-        assert!(s.op_error(&space_b).is_none(), "B must not see A's error");
+        assert!(
+            s.op_errors_for(&space_b).is_empty(),
+            "B must not see A's error"
+        );
     });
 
     let b = space_b.clone();
@@ -8434,11 +8435,11 @@ fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
     wait_until(cx, "B op_error", |cx| {
         stores
             .participants
-            .read_with(cx, |s, _| s.op_error(&space_b).is_some())
+            .read_with(cx, |s, _| !s.op_errors_for(&space_b).is_empty())
     });
     stores.participants.read_with(cx, |s, _| {
         assert!(
-            s.op_error(&space_a).is_some(),
+            !s.op_errors_for(&space_a).is_empty(),
             "starting B's op must not clear A's error (per-space keying)"
         );
     });

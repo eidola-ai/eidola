@@ -880,12 +880,7 @@ impl SpaceView {
                 cell.is_loading(),
             )
         };
-        let op_error = self
-            .stores
-            .participants
-            .read(cx)
-            .op_error(&space_id)
-            .map(str::to_string);
+        let op_errors = self.stores.participants.read(cx).op_errors_for(&space_id);
 
         let mut col = v_flex()
             .w_full()
@@ -916,8 +911,9 @@ impl SpaceView {
             // A refused write and a failed re-list can stand at once (see
             // `stores::settle_mutation`); this branch owns the section, so it
             // carries the write's refusal rather than swallowing it.
-            if let Some(err) = op_error {
-                col = col.child(self.render_inspector_participants_error(&err, &space_id, cx));
+            if !op_errors.is_empty() {
+                col =
+                    col.child(self.render_inspector_participants_error(&op_errors, &space_id, cx));
             }
             return Some(col.into_any_element());
         }
@@ -983,8 +979,8 @@ impl SpaceView {
                 ),
             };
 
-        if let Some(err) = op_error {
-            col = col.child(self.render_inspector_participants_error(&err, &space_id, cx));
+        if !op_errors.is_empty() {
+            col = col.child(self.render_inspector_participants_error(&op_errors, &space_id, cx));
         }
 
         // A failed *refresh* over rows we still hold: keep them, and say the
@@ -1541,29 +1537,59 @@ impl SpaceView {
         row.into_any_element()
     }
 
-    /// The membership's write-refusal band. Dismissible for the same reason the
-    /// panel's other two are: nothing else clears a refusal until the next write
-    /// to the same control, so an unacknowledged one stands indefinitely.
+    /// The membership's write-refusal band — **one per space, listing every
+    /// refusal that stands**.
+    ///
+    /// The store keys refusals per `(space, participant)`, so two independent
+    /// writes can both be refused; a band that showed one would be the very
+    /// defect keyed reports exist to prevent. But a band under each disclosure
+    /// row is not available here the way it is in the Agents pane — this roster
+    /// is a compact list of closed rows in a 320px panel — so the one band lists
+    /// them, each line **naming its subject**, since the band no longer sits
+    /// under the row it is about. A subject the roster cannot name (a refused
+    /// *add* has no row yet) speaks for itself and the line stands bare.
+    ///
+    /// Dismissible for the same reason the panel's other two are: nothing else
+    /// clears a refusal until the next write to that same row, so an
+    /// unacknowledged one stands indefinitely. The × acknowledges what the band
+    /// shows — all of it, matching the one band it dismisses — and never implies
+    /// a write succeeded.
     fn render_inspector_participants_error(
         &self,
-        err: &str,
+        errors: &[(String, String)],
         space_id: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
         let id = space_id.to_string();
+        // Name each subject from the roster the reader is looking at; a refused
+        // *add* has no row yet, so its message stands bare.
+        let roster = self.inspector_participants(cx);
+        let lines: Vec<String> = errors
+            .iter()
+            .map(
+                |(pid, message)| match roster.iter().find(|p| &p.id == pid) {
+                    Some(p) => format!("{}: {message}", p.label),
+                    None => message.clone(),
+                },
+            )
+            .collect();
+        let mut column = v_flex().flex_1().min_w_0().gap_1();
+        for line in &lines {
+            column = column.child(error_banner(line, cx));
+        }
         h_flex()
             .id("space-inspector-participants-error")
             .probe(
                 "space/inspector/participants/error",
                 gpui::Role::Alert,
-                err.to_string(),
+                lines.join(" · "),
             )
             .w_full()
             .gap_2()
             .items_start()
             .justify_between()
-            .child(div().flex_1().min_w_0().child(error_banner(err, cx)))
+            .child(column)
             .child(
                 div()
                     .id("space-inspector-participants-error-dismiss")
