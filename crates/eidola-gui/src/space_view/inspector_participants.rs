@@ -165,6 +165,16 @@ Sharing can't be undone."
 /// change.
 pub(crate) struct InviteForm {
     pub(crate) focus: gpui::FocusHandle,
+    /// **The candidate list's single tab stop** — a virtualized list has one
+    /// (the Library's rule): `uniform_list` materializes only the visible
+    /// window, so a tab stop per row is a tab order that does not contain the
+    /// candidates nobody has scrolled to (Codex review, PR #280). Tracked on
+    /// the element carrying the `List` role.
+    pub(crate) list_focus: gpui::FocusHandle,
+    /// The roving cursor over the candidates, read through
+    /// [`SpaceView::invite_cursor`] — the listing can be replaced under it by
+    /// the form's own read landing.
+    pub(crate) cursor: usize,
     /// `None` while the read is in flight — the form says "Loading…" rather
     /// than reading as an empty library.
     pub(crate) candidates: Option<Vec<eidola_app_core::GrantableAgent>>,
@@ -818,6 +828,11 @@ impl SpaceView {
         window.focus(&focus, cx);
         self.inspector_invite = Some(InviteForm {
             focus,
+            list_focus: cx
+                .focus_handle()
+                .tab_index(crate::focus::region::MAIN)
+                .tab_stop(true),
+            cursor: 0,
             candidates: None,
             error: None,
             confirming: None,
@@ -1939,8 +1954,8 @@ impl SpaceView {
                 let list = gpui::uniform_list(
                     "space-inspector-invite-list",
                     count,
-                    cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                        this.render_invite_candidate_rows(range, cx)
+                    cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                        this.render_invite_candidate_rows(range, window, cx)
                     }),
                 )
                 .h(shown)
@@ -1956,6 +1971,14 @@ impl SpaceView {
                             gpui::Role::List,
                             "Agents you can invite",
                         )
+                        // The single tab stop, on the element carrying the
+                        // role, with the roving key map riding it.
+                        .track_focus(&form.list_focus)
+                        .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                            if this.handle_invite_key(ev, window, cx) {
+                                cx.stop_propagation();
+                            }
+                        }))
                         .relative()
                         .w_full()
                         .child(list)
@@ -1980,6 +2003,91 @@ impl SpaceView {
         col.into_any_element()
     }
 
+    /// The **effective** cursor over the invite candidates: clamped into the
+    /// listing the form currently holds, and `None` while there is nothing to
+    /// point at (a read in flight, an empty answer). Derived on read — the
+    /// Library's rule, because the form's own fetch can replace the listing
+    /// under the cursor.
+    fn invite_cursor(&self) -> Option<usize> {
+        let form = self.inspector_invite.as_ref()?;
+        form.candidates
+            .as_ref()?
+            .len()
+            .checked_sub(1)
+            .map(|last| form.cursor.min(last))
+    }
+
+    /// The candidate list's roving-focus key map: ↑/↓ move the cursor,
+    /// Home/End take its ends, Enter arms the candidate it sits on.
+    ///
+    /// **Escape is not among them, deliberately.** This form's way out is its
+    /// Cancel (offered in every state), and the panel's Escape rungs belong to
+    /// its dropdowns; a cursor that consumed Escape would put a rung in front
+    /// of both. Five keys, everything else propagates.
+    fn handle_invite_key(
+        &mut self,
+        ev: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(form) = self.inspector_invite.as_ref() else {
+            return false;
+        };
+        // The **list** holding focus, not containing it: once Tab has moved on
+        // to Cancel, that verb owns the keyboard.
+        if !form.list_focus.is_focused(window) || ev.keystroke.modifiers.modified() {
+            return false;
+        }
+        let count = form.candidates.as_ref().map(|c| c.len()).unwrap_or(0);
+        let (Some(last), Some(cursor)) = (count.checked_sub(1), self.invite_cursor()) else {
+            return false;
+        };
+        let target = match ev.keystroke.key.as_str() {
+            "up" => cursor.saturating_sub(1),
+            "down" => (cursor + 1).min(last),
+            "home" => 0,
+            "end" => last,
+            "enter" => {
+                let picked = self
+                    .inspector_invite
+                    .as_ref()
+                    .and_then(|f| f.candidates.as_ref())
+                    .and_then(|c| c.get(cursor))
+                    .map(|c| c.id.clone());
+                if let Some(id) = picked {
+                    self.inspector_arm_invite(&id, window, cx);
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        self.move_invite_cursor(target, cx);
+        true
+    }
+
+    /// Move the cursor and scroll it into view — the scroll is what makes one
+    /// tab stop equivalent to a per-row one.
+    fn move_invite_cursor(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(form) = self.inspector_invite.as_mut() {
+            form.cursor = idx;
+        }
+        self.inspector_invite_scroll
+            .scroll_to_item(idx, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Test seam: where the invite list's roving cursor effectively sits.
+    #[doc(hidden)]
+    pub fn invite_cursor_for_test(&self) -> Option<usize> {
+        self.invite_cursor()
+    }
+
+    /// Test seam: the candidate list's own focus handle (its single tab stop).
+    #[doc(hidden)]
+    pub fn invite_list_focus_handle(&self) -> Option<gpui::FocusHandle> {
+        self.inspector_invite.as_ref().map(|f| f.list_focus.clone())
+    }
+
     /// The invite form's dumb indexer: exactly the candidate rows
     /// `uniform_list` asks for.
     ///
@@ -1989,6 +2097,7 @@ impl SpaceView {
     fn render_invite_candidate_rows(
         &mut self,
         range: std::ops::Range<usize>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let (muted, fg) = {
@@ -2016,19 +2125,25 @@ impl SpaceView {
                 (range.start + offset, c.id.clone(), line)
             })
             .collect();
+        let cursor = self.invite_cursor();
+        let on_cursor = |i: usize| cursor == Some(i);
+        let keyboard = window.last_input_was_keyboard();
         visible
             .into_iter()
             .map(|(i, id, line)| {
                 div()
                     .id(SharedString::from(format!("space-inspector-invite-{i}")))
-                    .probe(
+                    // A managed descendant of the list, never a tab stop.
+                    .probe_delegating(
                         format!("space/inspector/participants/invite/{i}"),
-                        gpui::Role::Button,
+                        gpui::Role::ListItem,
                         line.clone(),
                     )
                     // Set position on a virtualized row (the a11y rule).
                     .aria_position_in_set(i + 1)
                     .aria_size_of_set(total)
+                    .aria_selected(on_cursor(i))
+                    .when(on_cursor(i), |d| d.aria_active_descendant())
                     .w_full()
                     .h(INVITE_ROW_H)
                     .flex()
@@ -2039,6 +2154,10 @@ impl SpaceView {
                     .truncate()
                     .cursor_pointer()
                     .hover(move |s| s.bg(muted).text_color(fg))
+                    .when(on_cursor(i) && keyboard, |d| {
+                        d.bg(muted)
+                            .shadow(crate::focus::ring_shadows(crate::focus::ring_colors()))
+                    })
                     .child(line)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.inspector_arm_invite(&id, window, cx)

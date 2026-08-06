@@ -5027,6 +5027,30 @@ fn space_quote_destination_list_is_bounded(cx: &mut TestAppContext) {
         gpui::Role::List,
         "Conversations",
     );
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/quote-destination/58"),
+        "the far end of the index is not materialized at rest"
+    );
+
+    // **The arc the single tab stop exists for.** The list holds the keyboard,
+    // End moves the cursor to the last destination, and `scroll_to_item`
+    // materializes it — so a row no tab order could have contained is now
+    // painted, readable, and the one Enter would arm.
+    cx.simulate_keystrokes(window, "end");
+    let entries = fresh_entries(cx, window);
+    let (_, last) = entries
+        .iter()
+        .find(|(n, _)| n == "space/quote-destination/58")
+        .expect("the cursor scrolled the last destination into being");
+    assert_eq!(last.role, gpui::Role::ListItem, "a managed descendant");
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/quote-destination/0"),
+        "…and the window moved: the first row is gone from the slice"
+    );
 
     probe::set_probes_enabled(false);
 }
@@ -5292,6 +5316,27 @@ fn space_inspector_invite_list_is_bounded(cx: &mut TestAppContext) {
         gpui::Role::List,
         "Agents you can invite",
     );
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/inspector/participants/invite/59"),
+        "the far end is not materialized at rest"
+    );
+
+    // The same arc: the list is the tab stop, End moves the cursor to the last
+    // candidate, and `scroll_to_item` materializes it.
+    let list = view
+        .read_with(cx, |v, _| v.invite_list_focus_handle())
+        .expect("the form is open");
+    cx.update_window(window, |_, window, cx| window.focus(&list, cx))
+        .unwrap();
+    cx.simulate_keystrokes(window, "end");
+    let entries = fresh_entries(cx, window);
+    let (_, last) = entries
+        .iter()
+        .find(|(n, _)| n == "space/inspector/participants/invite/59")
+        .expect("the cursor scrolled the last candidate into being");
+    assert_eq!(last.role, gpui::Role::ListItem, "a managed descendant");
 
     probe::set_probes_enabled(false);
 }

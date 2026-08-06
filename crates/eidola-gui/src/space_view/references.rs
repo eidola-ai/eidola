@@ -113,12 +113,23 @@ pub(crate) const FOLLOW_DENIED_HERE: SharedString = SharedString::new_static(
 pub(crate) struct QuoteDestination {
     pub(crate) selection: PostSelection,
     pub(crate) confirming: Option<(String, SharedString)>,
-    /// The popover subtree's focus handle. The destination rows are tab stops
-    /// and **arming replaces them** with the statement and its two verbs, so
-    /// the pressed row unmounts: without somewhere inside the surface to put
-    /// the keyboard, a reader who chose a destination from the keyboard is left
-    /// on a dead handle (the rule `set_inspector_promote_confirm` states).
+    /// The popover subtree's focus handle — what the handback asks containment
+    /// of, and where the keyboard goes when arming a destination unmounts the
+    /// row that was pressed (the rule `set_inspector_promote_confirm` states).
     pub(crate) focus: gpui::FocusHandle,
+    /// **The list's single tab stop.** A virtualized list has one (the
+    /// Library's rule): `uniform_list` materializes only the visible window, so
+    /// a tab stop per row is a tab order that does not contain the rows nobody
+    /// has scrolled to — Tab walked off the end of the slice and out of the
+    /// picker (Codex review, PR #280). Tracked on the element carrying the
+    /// `List` role, because a handle on the `uniform_list` itself would focus a
+    /// node the AccessKit tree has no entry for.
+    pub(crate) list_focus: gpui::FocusHandle,
+    /// The roving cursor: which destination the keyboard is on. Read through
+    /// [`SpaceView::quote_destination_cursor`], never directly — the Library
+    /// index moves under it (a bus re-list, another window archiving), so the
+    /// stored value is clamped at every use rather than chased at every change.
+    pub(crate) cursor: usize,
 }
 
 /// Row height for the virtualized destination list. The rows are one line by
@@ -676,11 +687,28 @@ impl SpaceView {
         // review, PR #280). The Edit-menu door owes it for the plainer reason:
         // a picker you have to hunt for with Tab is not reachable.
         let focus = cx.focus_handle();
-        window.focus(&focus, cx);
+        let list_focus = cx
+            .focus_handle()
+            .tab_index(crate::focus::region::MAIN)
+            .tab_stop(true);
+        // **The reveal focuses the list, when there is one.** The list is the
+        // surface's single tab stop, so landing there is what makes ↑/↓ work
+        // the moment the picker opens; with nothing to list (an index still
+        // loading, a failed read, a reader with one conversation) that handle
+        // is tracked on no element this frame, and focusing it would be the
+        // dead handle this whole family of fixes is about — so the popover
+        // itself takes it, and it is live either way.
+        let here = self.space.read(cx).id().map(str::to_string);
+        match self.quote_destination_count(here.as_deref(), cx) {
+            0 => window.focus(&focus, cx),
+            _ => window.focus(&list_focus, cx),
+        }
         self.quote_destination = Some(QuoteDestination {
             selection,
             confirming: None,
             focus,
+            list_focus,
+            cursor: 0,
         });
         // Ask for a fresh index as the picker opens — what `OpenLibrary` does
         // on every invocation, and the only thing that re-reads a `Failed` one
@@ -1066,11 +1094,12 @@ impl SpaceView {
         // `MAX_H`, and `uniform_list` scrolls inside it.
         let shown = px((destinations as f32 * DESTINATION_ROW_H.to_f64() as f32)
             .min(DESTINATION_LIST_MAX_H.to_f64() as f32));
+        let list_focus = dest.list_focus.clone();
         let list = gpui::uniform_list(
             "space-quote-destination-list",
             destinations,
-            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                this.render_quote_destination_rows(range, cx)
+            cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                this.render_quote_destination_rows(range, window, cx)
             }),
         )
         .h(shown)
@@ -1088,6 +1117,15 @@ impl SpaceView {
                     gpui::Role::List,
                     "Conversations",
                 )
+                // The single tab stop lives on the element carrying the role
+                // (see `QuoteDestination::list_focus`), and the roving key map
+                // rides with it.
+                .track_focus(&list_focus)
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                    if this.handle_quote_destination_key(ev, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .relative()
                 .w_full()
                 .child(list)
@@ -1105,6 +1143,100 @@ impl SpaceView {
         Some(col.into_any_element())
     }
 
+    /// The **effective** roving cursor: clamped into the current listing, and
+    /// `None` when there is nothing to point at. Derived on read, because the
+    /// Library index moves under it — the Library's own rule, for the same
+    /// reason: a cursor one past the end is a dead Enter and a ring nobody
+    /// draws.
+    fn quote_destination_cursor(&self, cx: &gpui::App) -> Option<usize> {
+        let dest = self.quote_destination.as_ref()?;
+        let here = self.space.read(cx).id().map(str::to_string);
+        self.quote_destination_count(here.as_deref(), cx)
+            .checked_sub(1)
+            .map(|last| dest.cursor.min(last))
+    }
+
+    /// The destination list's roving-focus key map: ↑/↓ move the cursor,
+    /// Home/End take its ends, Enter arms the destination it sits on. Returns
+    /// whether it consumed the press.
+    ///
+    /// **Escape is deliberately not among them.** The picker holds a passage on
+    /// its way out of this conversation, and Escape means *dismiss* — a rung of
+    /// the space root's own chain (`close_quote_destination`). A roving cursor
+    /// that consumed Escape would shadow the only way out, so this handler
+    /// answers five keys and lets everything else propagate.
+    fn handle_quote_destination_key(
+        &mut self,
+        ev: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(dest) = self.quote_destination.as_ref() else {
+            return false;
+        };
+        // Gated on the **list** holding focus, not on containing it: once Tab
+        // has moved on, whatever it reached owns the keyboard.
+        if !dest.list_focus.is_focused(window) || ev.keystroke.modifiers.modified() {
+            return false;
+        }
+        let here = self.space.read(cx).id().map(str::to_string);
+        let count = self.quote_destination_count(here.as_deref(), cx);
+        let (Some(last), Some(cursor)) = (count.checked_sub(1), self.quote_destination_cursor(cx))
+        else {
+            return false;
+        };
+        let target = match ev.keystroke.key.as_str() {
+            "up" => cursor.saturating_sub(1),
+            "down" => (cursor + 1).min(last),
+            "home" => 0,
+            "end" => last,
+            "enter" => {
+                let picked = {
+                    let store = self.stores.spaces.read(cx);
+                    store
+                        .list()
+                        .iter()
+                        .filter(|s| here.as_deref() != Some(s.id.as_str()))
+                        .nth(cursor)
+                        .map(|s| (s.id.clone(), space_label(s)))
+                };
+                if let Some((id, label)) = picked {
+                    self.arm_quote_destination(id, label, window, cx);
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        self.move_quote_destination_cursor(target, cx);
+        true
+    }
+
+    /// Move the roving cursor and scroll it into view. **The scroll is what
+    /// makes one tab stop equivalent to a per-row one**: an off-screen row is
+    /// materialized by the list before it can be read.
+    fn move_quote_destination_cursor(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(dest) = self.quote_destination.as_mut() {
+            dest.cursor = idx;
+        }
+        self.quote_destination_scroll
+            .scroll_to_item(idx, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Test seam: where the picker's roving cursor effectively sits.
+    #[doc(hidden)]
+    pub fn quote_destination_cursor_for_test(&self, cx: &gpui::App) -> Option<usize> {
+        self.quote_destination_cursor(cx)
+    }
+
+    /// Test seam: the list's own focus handle (the surface's single tab stop).
+    #[doc(hidden)]
+    pub fn quote_destination_list_focus_handle(&self) -> Option<gpui::FocusHandle> {
+        self.quote_destination
+            .as_ref()
+            .map(|d| d.list_focus.clone())
+    }
+
     /// The destination list's **dumb indexer**: exactly the rows
     /// `uniform_list` asks for, rebuilt from the store each frame.
     ///
@@ -1117,6 +1249,7 @@ impl SpaceView {
     fn render_quote_destination_rows(
         &mut self,
         range: std::ops::Range<usize>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let theme = cx.theme();
@@ -1143,6 +1276,9 @@ impl SpaceView {
                 .collect();
             (rows.count(), visible)
         };
+        let cursor = self.quote_destination_cursor(cx);
+        let on_cursor = |i: usize| cursor == Some(i);
+        let keyboard = window.last_input_was_keyboard();
         visible
             .into_iter()
             .enumerate()
@@ -1151,9 +1287,12 @@ impl SpaceView {
                 let for_arm = label.clone();
                 div()
                     .id(SharedString::from(format!("space-quote-destination-{i}")))
-                    .probe(
+                    // The list holds the keyboard and moves a cursor over its
+                    // rows, so a row is a **managed descendant**, never a tab
+                    // stop — `probe_delegating`, the Library's rule.
+                    .probe_delegating(
                         format!("space/quote-destination/{i}"),
-                        gpui::Role::Button,
+                        gpui::Role::ListItem,
                         label.clone(),
                     )
                     // **Set position on a virtualized row**: AT sees six of six
@@ -1161,6 +1300,10 @@ impl SpaceView {
                     // (there are no other kinds here).
                     .aria_position_in_set(i + 1)
                     .aria_size_of_set(total)
+                    // The a11y state is not modality-gated: the cursor is where
+                    // the keyboard is whether or not the last press was one.
+                    .aria_selected(on_cursor(i))
+                    .when(on_cursor(i), |d| d.aria_active_descendant())
                     .w_full()
                     .h(DESTINATION_ROW_H)
                     .flex()
@@ -1171,6 +1314,12 @@ impl SpaceView {
                     .truncate()
                     .cursor_pointer()
                     .hover(move |s| s.bg(muted))
+                    // The ring *is* modality-gated: a programmatic cursor must
+                    // not paint a keyboard indicator for a pointer user.
+                    .when(on_cursor(i) && keyboard, |d| {
+                        d.bg(muted)
+                            .shadow(crate::focus::ring_shadows(crate::focus::ring_colors()))
+                    })
                     .child(label)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.arm_quote_destination(id.clone(), for_arm.clone(), window, cx);
@@ -1203,11 +1352,12 @@ impl SpaceView {
     pub fn quote_destination_frame_work_for_test(
         &mut self,
         range: std::ops::Range<usize>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> usize {
         let here = self.space.read(cx).id().map(str::to_string);
         let _ = self.quote_destination_count(here.as_deref(), cx);
-        self.render_quote_destination_rows(range, cx).len()
+        self.render_quote_destination_rows(range, window, cx).len()
     }
 
     /// The picker's quiet retry line — the Library's "couldn't refresh" strip,
@@ -2001,6 +2151,8 @@ impl SpaceView {
             confirming: armed
                 .map(|(id, title)| (id.to_string(), SharedString::from(title.to_string()))),
             focus: cx.focus_handle(),
+            list_focus: cx.focus_handle(),
+            cursor: 0,
         });
         cx.notify();
     }
