@@ -738,6 +738,9 @@ pub struct SpaceView {
     pub(crate) inspector_participant_picker: Option<inspector_participants::ParticipantPicker>,
     /// That dropdown's own scroll (reset to the top on each open).
     pub(crate) inspector_participant_picker_scroll: ScrollHandle,
+    /// Scroll position of the invite form's **virtualized** candidate list —
+    /// a stored `UniformListScrollHandle` per the virtualized-list idiom.
+    pub(crate) inspector_invite_scroll: gpui::UniformListScrollHandle,
 
     /// The window title last pushed to the platform (and to the a11y root
     /// node), so an unchanged title never re-enters AppKit every frame. The
@@ -916,6 +919,7 @@ impl SpaceView {
             inspector_invite_task: None,
             inspector_participant_picker: None,
             inspector_participant_picker_scroll: ScrollHandle::new(),
+            inspector_invite_scroll: gpui::UniformListScrollHandle::new(),
             window_title: None,
         };
         this.rebuild(cx);
