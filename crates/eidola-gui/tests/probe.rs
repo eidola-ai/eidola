@@ -17,6 +17,7 @@ use eidola_app_core::{
 use eidola_app_core::{
     ParticipantInfo, ParticipantReference, SpaceTemplateInfo, TemplateParticipantInfo,
 };
+use eidola_gui::agents_settings::AgentsSettingsView;
 use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
@@ -2919,6 +2920,139 @@ fn templates_pane_probes_cover_rows_and_editor(cx: &mut TestAppContext) {
             "template editor probe {expected:?} missing: {names:?}"
         );
     }
+
+    probe::set_probes_enabled(false);
+}
+
+fn probe_agents() -> Vec<eidola_app_core::GlobalAgentInfo> {
+    vec![
+        eidola_app_core::GlobalAgentInfo {
+            id: "agent-ada".into(),
+            label: "Ada".into(),
+            model_ref: Some("gemma4-31b".into()),
+            system_prompt: Some("Be concise.".into()),
+            notify_policy: "human".into(),
+            notebook_space_id: Some("nb-ada".into()),
+        },
+        // A shared agent with no notebook is representable (only promotion
+        // makes one), and the row must simply not offer the door.
+        eidola_app_core::GlobalAgentInfo {
+            id: "agent-bo".into(),
+            label: "Bo".into(),
+            model_ref: None,
+            system_prompt: None,
+            notify_policy: "explicit".into(),
+            notebook_space_id: None,
+        },
+    ]
+}
+
+#[gpui::test]
+fn agents_pane_probes_cover_rows_editor_and_retire(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.agents = Some(probe_agents());
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+
+    // A resting row: its content is what it answers with and when.
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "settings/agents/agent-ada",
+        gpui::Role::ListItem,
+        "Ada",
+        "gemma4-31b · Eidola · responds to people",
+    );
+    let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+    for expected in [
+        "settings/agents/agent-ada/notebook",
+        "settings/agents/agent-ada/edit",
+        "settings/agents/agent-ada/retire",
+        "settings/agents/agent-bo/edit",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "agent row probe {expected:?} missing: {names:?}"
+        );
+    }
+    // No notebook, no door.
+    assert!(
+        !names.contains(&"settings/agents/agent-bo/notebook".to_string()),
+        "an agent without a notebook offers no notebook verb: {names:?}"
+    );
+
+    // The editor.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_edit("agent-ada", window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/agents/editor/name",
+        "settings/agents/editor/model",
+        "settings/agents/editor/system-prompt",
+        "settings/agents/editor/notify/human",
+        "settings/agents/editor/save",
+        "settings/agents/editor/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "agent editor probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    // The retire confirmation — its note is a readable node, not only pixels.
+    view.update(cx, |v, cx| v.arm_retire("agent-ada", cx));
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/agents/agent-ada/retire/note",
+        "settings/agents/agent-ada/retire/confirm",
+        "settings/agents/agent-ada/retire/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "retire-confirm probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+/// An empty library says so, and a failed *initial* read says something else —
+/// "Failed is not empty", over the pane that would otherwise invite the reader
+/// to share an agent they may already have.
+#[gpui::test]
+fn agents_pane_failed_load_shows_retry_not_an_empty_library(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.agents = Some(Vec::new());
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/agents/empty".to_string()),
+        "an empty library names its door: {names:?}"
+    );
+
+    stores
+        .agents
+        .update(cx, |s, _| s.set_failed_for_test("boom"));
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/agents/retry".to_string()),
+        "a failed load must offer Retry: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/agents/empty".to_string()),
+        "a failed load must not read as an empty library: {names:?}"
+    );
 
     probe::set_probes_enabled(false);
 }

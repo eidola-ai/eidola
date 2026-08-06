@@ -20,6 +20,7 @@
 //! the individual store entities pulled from it) and call store methods.
 
 pub mod account;
+pub mod agents;
 pub mod backends;
 pub mod config;
 pub mod local_models;
@@ -40,6 +41,7 @@ use eidola_app_core::changes::Change;
 use gpui::{App, AppContext, AsyncApp, Entity};
 
 pub use account::AccountStore;
+pub use agents::AgentsStore;
 pub use backends::BackendsStore;
 pub use config::ConfigStore;
 pub use local_models::LocalModelsStore;
@@ -78,6 +80,10 @@ pub struct Stores {
     /// The space-template registry (the Space Templates settings pane);
     /// refreshed on `Change::Templates`.
     pub templates: Entity<TemplatesStore>,
+    /// The shared **agent library** (the Agents settings pane, task 36) —
+    /// global agents with their notebooks; refreshed on `Change::Participants`,
+    /// the same signal `participants` answers with a per-space re-list.
+    pub agents: Entity<AgentsStore>,
     /// Per-space settings (cascade limit, router model) — the space
     /// inspector's data source; refreshed on `Change::Space`.
     pub space_settings: Entity<SpaceSettingsStore>,
@@ -143,6 +149,7 @@ impl Stores {
         let update = cx.new(|_| UpdateStore::stub(fixture.update_check, fixture.update_checking));
         let participants = cx.new(|_| ParticipantsStore::stub(fixture.participants));
         let templates = cx.new(|_| TemplatesStore::stub(fixture.templates));
+        let agents = cx.new(|_| AgentsStore::stub(fixture.agents));
         let space_settings = cx.new(|_| SpaceSettingsStore::stub(fixture.space_settings));
         let record = cx.new(|_| RecordStore::new());
         Self {
@@ -157,6 +164,7 @@ impl Stores {
             update,
             participants,
             templates,
+            agents,
             space_settings,
             record,
         }
@@ -181,6 +189,7 @@ impl Stores {
         let update = cx.new(|_| UpdateStore::new(app_core.clone()));
         let participants = cx.new(|_| ParticipantsStore::new(app_core.clone()));
         let templates = cx.new(|_| TemplatesStore::new(app_core.clone()));
+        let agents = cx.new(|_| AgentsStore::new(app_core.clone()));
         let space_settings = cx.new(|_| SpaceSettingsStore::new(app_core.clone()));
         let record = cx.new(|_| RecordStore::new());
         Self {
@@ -195,6 +204,7 @@ impl Stores {
             update,
             participants,
             templates,
+            agents,
             space_settings,
             record,
         }
@@ -238,6 +248,10 @@ pub struct StoresStub {
     pub participants: Option<(String, Vec<eidola_app_core::ParticipantInfo>)>,
     /// Fixture space templates (the Space Templates settings pane's scene).
     pub templates: Vec<eidola_app_core::SpaceTemplateInfo>,
+    /// Fixture shared agents (the Agents settings pane's scene). `None` leaves
+    /// the roster `NotLoaded`; `Some(vec![])` is an empty library that has
+    /// answered.
+    pub agents: Option<Vec<eidola_app_core::GlobalAgentInfo>>,
     /// One space's fixture settings (the space inspector's scene).
     pub space_settings: Option<(String, eidola_app_core::SpaceSettings)>,
 }
@@ -450,9 +464,14 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
         // cached template snapshot says. The store reads participant config now,
         // so it must hear about participant changes. (`Change::Config` already
         // fans out to two stores for the same kind of reason.)
+        // The **agent library** answers the same signal with its own listing:
+        // a promotion adds a row, a retirement removes one, and an "edit
+        // everywhere" moves what a row says. Two domains, one invalidation —
+        // the dispatcher fans it out rather than either store polling.
         Change::Participants => {
             stores.participants.update(cx, |s, cx| s.refresh_all(cx));
             stores.templates.update(cx, |s, cx| s.refresh(cx));
+            stores.agents.update(cx, |s, cx| s.refresh(cx));
         }
     }
 }
@@ -473,6 +492,7 @@ fn refresh_everything(stores: &Stores, cx: &mut App) {
     stores.update.update(cx, |s, cx| s.refresh(cx));
     stores.templates.update(cx, |s, cx| s.refresh(cx));
     stores.participants.update(cx, |s, cx| s.refresh_all(cx));
+    stores.agents.update(cx, |s, cx| s.refresh(cx));
     stores.space_settings.update(cx, |s, cx| s.refresh_all(cx));
     // A dropped change may have been a Record write — let open Record
     // windows mark themselves stale.

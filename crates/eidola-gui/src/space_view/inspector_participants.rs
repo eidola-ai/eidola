@@ -1156,7 +1156,7 @@ impl SpaceView {
         let name = p.label.clone();
         let reassurance = format!(
             "{name} keeps this space's persona exactly as it is, and can then join other spaces. \
-             Sharing can't be undone."
+             You'll manage it in Settings → Agents. Sharing can't be undone."
         );
         v_flex()
             .id("space-inspector-p-share-confirm")

@@ -1232,3 +1232,34 @@ fn a_batch_of_renames_lands_on_a_listing_read_after_all_of_them(cx: &mut TestApp
         }
     }
 }
+
+/// `Change::Participants` fans out to **three** stores, and the agent library
+/// is the third (task 36): a promotion or retirement changes what the library
+/// lists, and an "edit everywhere" changes what a row says. Neither store polls;
+/// the dispatcher is what makes one signal answer for two domains.
+#[gpui::test]
+fn a_participants_change_reaches_the_agent_library(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    stores
+        .agents
+        .read_with(cx, |a, _| assert!(!a.agents().is_loading()));
+
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+    stores.agents.read_with(cx, |a, _| {
+        assert!(
+            a.agents().is_loading(),
+            "a Change::Participants must drive AgentsStore::refresh"
+        );
+    });
+
+    // A templates change is not one of its signals — the library holds no
+    // template rows.
+    let (other, _dir2) = backed_stores(cx);
+    cx.update(|cx| stores::dispatch_change_for_test(&other, Some(Change::Templates), cx));
+    other.agents.read_with(cx, |a, _| {
+        assert!(
+            !a.agents().is_loading(),
+            "a Change::Templates must not touch the agent library"
+        );
+    });
+}

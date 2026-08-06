@@ -24,6 +24,7 @@ use eidola_app_core::{
 use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
 use eidola_gui::actions::{PostOnly, Send};
+use eidola_gui::agents_settings::AgentsSettingsView;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
 use eidola_gui::participants::EditMode;
@@ -933,6 +934,7 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
                 SettingsPane::General,
                 SettingsPane::Backends,
                 SettingsPane::Templates,
+                SettingsPane::Agents,
                 SettingsPane::Account,
                 SettingsPane::Wallet,
             ],
@@ -955,6 +957,7 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
                 SettingsPane::General,
                 SettingsPane::Backends,
                 SettingsPane::Templates,
+                SettingsPane::Agents,
             ],
             "eidola disabled hides Account and Wallet"
         );
@@ -7354,6 +7357,201 @@ fn a_shared_agents_notebook_stays_out_of_the_library(cx: &mut TestAppContext) {
     );
 
     drain_runtime(&core);
+}
+
+/// Promote the seeded agent and hand back its id — the precondition of every
+/// Agents-pane test, since an agent reaches the library only by being shared.
+fn share_the_seeded_agent(cx: &mut TestAppContext, stores: &Stores, space: &str) -> String {
+    stores
+        .participants
+        .update(cx, |s, cx| s.ensure(space.to_string(), cx));
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(stores, space, cx).len() == 2
+    });
+    let agent = stores.participants.read_with(cx, |s, _| {
+        s.list(space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .id
+            .clone()
+    });
+    stores
+        .participants
+        .update(cx, |s, cx| s.promote(space.to_string(), agent.clone(), cx));
+    // Behavior tests run bus-less (`Stores::for_test` installs no bridge), so
+    // the library is re-listed here the way `Change::Participants` does it in
+    // the app — the dispatch itself is pinned by
+    // `a_participants_change_reaches_the_agent_library` (`tests/stores.rs`).
+    wait_until(cx, "the promotion lands", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(space)
+                .iter()
+                .any(|p| p.id == agent && p.source == "referenced")
+        })
+    });
+    stores.agents.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the share lands", |cx| {
+        stores
+            .agents
+            .read_with(cx, |s, _| s.list().iter().any(|a| a.id == agent))
+    });
+    agent
+}
+
+/// The **Agents pane** end to end (task 36): a shared agent appears in the
+/// library with its notebook, its editor writes the agent's *own* config (the
+/// edit-everywhere half, which the space it came from then follows), and its
+/// notebook opens as an ordinary space window.
+#[gpui::test]
+fn agents_pane_lists_edits_and_opens_the_notebook(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    // Nothing is shared yet, so the library is empty — the pane's own store is
+    // what says so (the seeded human and Eidola are globals it must not list).
+    wait_until(cx, "the empty library answers", |cx| {
+        stores
+            .agents
+            .read_with(cx, |s, _| s.agents().has_value() && s.list().is_empty())
+    });
+
+    let agent = share_the_seeded_agent(cx, &stores, &space);
+    let listed = stores.agents.read_with(cx, |s, _| s.list()[0].clone());
+    assert_eq!(listed.id, agent);
+    let notebook = listed
+        .notebook_space_id
+        .clone()
+        .expect("promotion created a notebook, and the roster carries its id");
+
+    // Edit everywhere: the name written here is the agent's own.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_edit(&agent, window, cx));
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.editing_label_state())
+        .expect("the row's editor is open");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Ada", window, cx));
+    })
+    .unwrap();
+    view.update(cx, |v, cx| v.save_edit(cx));
+    wait_until(cx, "the rename lands", |cx| {
+        stores
+            .agents
+            .read_with(cx, |s, _| s.list().iter().any(|a| a.label == "Ada"))
+    });
+    // …and the space it came from reads the new name, because its membership
+    // overrides nothing.
+    stores
+        .participants
+        .update(cx, |s, cx| s.refresh(space.clone(), cx));
+    wait_until(cx, "the space follows", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent && p.label == "Ada")
+        })
+    });
+
+    // The notebook door: a real space, through the ordinary window path.
+    view.update(cx, |v, cx| v.open_notebook(notebook, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.notebooks_opened_for_test()),
+        1,
+        "the notebook opens as a space window"
+    );
+
+    drain_runtime(&core);
+}
+
+/// **Retirement** asks first, then takes the agent out of the library and
+/// archives its notebook — and is not an unshare: the participant survives, so
+/// the space it worked in still resolves it.
+#[gpui::test]
+fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    let agent = share_the_seeded_agent(cx, &stores, &space);
+
+    // Armed, then stood down — nothing is written.
+    view.update(cx, |v, cx| v.arm_retire(&agent, cx));
+    assert_eq!(
+        view.read_with(cx, |v, _| v.retiring_agent().map(str::to_string)),
+        Some(agent.clone())
+    );
+    view.update(cx, |v, cx| v.cancel_retire(cx));
+    assert!(view.read_with(cx, |v, _| v.retiring_agent().is_none()));
+    cx.run_until_parked();
+    assert_eq!(
+        stores.agents.read_with(cx, |s, _| s.list().len()),
+        1,
+        "declining the confirmation retires nothing"
+    );
+
+    view.update(cx, |v, cx| v.arm_retire(&agent, cx));
+    view.update(cx, |v, cx| v.confirm_retire(cx));
+    wait_until(cx, "the retirement lands", |cx| {
+        stores.agents.read_with(cx, |s, _| s.list().is_empty())
+    });
+    assert!(
+        stores
+            .agents
+            .read_with(cx, |s, _| s.op_error().map(str::to_string))
+            .is_none(),
+        "the retirement was accepted"
+    );
+    // The notebook went with it (archived in the same transaction).
+    let core_handle = stores.app_core().expect("a real core");
+    assert!(
+        core_handle
+            .runtime()
+            .block_on(core_handle.list_global_agents())
+            .expect("library")
+            .is_empty()
+    );
+    // Not an unshare: the space still has the agent as a referenced member.
+    stores
+        .participants
+        .update(cx, |s, cx| s.refresh(space.clone(), cx));
+    cx.run_until_parked();
+
+    drain_runtime(&core);
+}
+
+/// A failed *initial* read must not read as an empty library, and a refused
+/// write must say so — the two honest-state rules, over this pane's cell.
+#[gpui::test]
+fn agents_pane_failed_load_and_refused_write_are_visible(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.agents = Some(Vec::new());
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
+    });
+    let _ = view;
+
+    stores.agents.read_with(cx, |s, _| {
+        assert!(s.agents().has_value(), "an empty library has answered");
+        assert!(s.list().is_empty());
+    });
+
+    stores
+        .agents
+        .update(cx, |s, _| s.set_failed_for_test("boom"));
+    stores.agents.read_with(cx, |s, _| {
+        assert!(
+            !s.agents().has_value(),
+            "a failed initial read holds nothing"
+        );
+        assert!(s.agents().error().is_some());
+    });
 }
 
 #[gpui::test]
