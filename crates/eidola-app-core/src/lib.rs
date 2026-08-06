@@ -3186,25 +3186,25 @@ impl Inner {
         // insert's own `WHERE EXISTS` is what makes them terminal, since a
         // retirement can commit between a read and a write that follows it.
         let role = role.map(|r| r.as_str()).unwrap_or(row.role.as_str());
+        // The join and the read that describes it are **one transaction**, so
+        // the answer is about the commit point: a removal or retirement landing
+        // right after the write cannot turn a committed join into a failure
+        // message (Codex review, PR #280).
         let joined =
-            db::ensure_space_participant(&conn, space_id, participant_id, role, now_ms()).await?;
-        let member = db::space_participants(&conn, space_id)
-            .await?
-            .into_iter()
-            .find(|m| m.participant_id == participant_id);
-        match member {
+            db::join_space_participant_tx(&conn, space_id, participant_id, role, now_ms()).await?;
+        match joined {
             // Joined now, or already a member — either way it is one, and the
             // emission is honest (an idempotent re-join changes nothing, but
-            // `INSERT OR IGNORE` cannot tell us so without a second read).
-            Some(member) => {
-                if joined {
+            // the insert-or-revive cannot tell us so without the read beside
+            // it, which is why they share a transaction).
+            Some((changed, member)) => {
+                if changed {
                     self.bus.emit(Change::Participants);
                 }
                 Ok(ParticipantInfo::from_effective(member))
             }
-            // Nothing inserted and not a member: the premise expired between
-            // the read above and the write — a retirement won. Zero trace, and
-            // a typed refusal rather than the `Internal` this used to raise.
+            // Nothing inserted and not a member: the premise expired before the
+            // write — a retirement won. Zero trace, and a typed refusal.
             None => Err(AppError::Config {
                 message: format!("{} has been retired and cannot rejoin a space", row.label),
             }),
@@ -3279,7 +3279,7 @@ impl Inner {
         // Minted here so the transaction can be handed one: it is used only on
         // the branch that promotes, and an unused uuid costs nothing.
         let notebook_space_id = Uuid::now_v7().to_string();
-        let decision = db::grant_space_membership_tx(
+        let outcome = db::grant_space_membership_tx(
             &conn,
             space_id,
             participant_id,
@@ -3288,20 +3288,16 @@ impl Inner {
             now_ms(),
         )
         .await?;
-        if decision != db::GrantDecision::AlreadyAMember {
+        if outcome.decision != db::GrantDecision::AlreadyAMember {
             self.bus.emit(Change::Participants);
         }
-        let member = db::space_participants(&conn, space_id)
-            .await?
-            .into_iter()
-            .find(|m| m.participant_id == participant_id)
-            .ok_or_else(|| AppError::Config {
-                message: format!(
-                    "{} could not be given membership — it may have been retired",
-                    row.label
-                ),
-            })?;
-        Ok(ParticipantInfo::from_effective(member))
+        // **The result describes the commit point.** It is read inside the
+        // transaction and handed back, never re-read after it: between the
+        // commit and a second read another window can end this membership or
+        // retire the agent, and the call would then report failure for work
+        // that committed — including, for a space-owned candidate, an
+        // irreversible promotion (Codex review, PR #280).
+        Ok(ParticipantInfo::from_effective(outcome.member))
     }
 
     /// Promote a space-owned agent to a **global** identity — one colleague in
