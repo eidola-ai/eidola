@@ -533,7 +533,13 @@ impl AgentsSettingsView {
             self.hand_back_focus(held, window, cx);
         }
         if self.retiring.as_ref().is_some_and(|id| !present(id)) {
+            // The confirmation's own buttons are tab stops, so this unmount owes
+            // the keyboard back exactly as the editor's above does — and this is
+            // the path no verb pressed, which is why it is easy to forget
+            // (Codex review, PR #279).
+            let held = self.draft_field_focused(window, cx);
             self.retiring = None;
+            self.hand_back_focus(held, window, cx);
         }
         // A refusal about an agent the roster no longer carries has no row to
         // render under, and nothing left to say — the agent is gone. The store

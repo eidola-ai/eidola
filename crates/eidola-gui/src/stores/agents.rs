@@ -46,9 +46,12 @@ pub struct AgentsStore {
     /// user's other action then either disappears or, worse, reads as accepted
     /// (Codex review, PR #279; the doctrine is `crates/eidola-gui/AGENTS.md` →
     /// "Independent mutations get keyed slots"). Two writes on the **same**
-    /// agent still replace-cancel: that is one control, and last-wins is the
-    /// intended reading.
-    op_tasks: HashMap<String, Task<()>>,
+    /// agent are **chained**, not replaced — see [`Self::write_then_settle`].
+    /// The generation beside each task is what tells a settling op whether it is
+    /// still the current one.
+    op_tasks: HashMap<String, (u64, Task<()>)>,
+    /// Monotonic op counter; a task settles only while its key still names it.
+    next_op_gen: u64,
     /// The last write error **per agent** — keyed exactly as the slots are,
     /// because a per-row band reading a store-wide slot could not tell "no
     /// refusal" from "another agent's refusal replaced mine".
@@ -62,6 +65,7 @@ impl AgentsStore {
             agents: Loadable::NotLoaded,
             refresh_task: None,
             op_tasks: HashMap::new(),
+            next_op_gen: 0,
             op_errors: HashMap::new(),
         }
     }
@@ -76,6 +80,7 @@ impl AgentsStore {
             },
             refresh_task: None,
             op_tasks: HashMap::new(),
+            next_op_gen: 0,
             op_errors: HashMap::new(),
         }
     }
@@ -225,24 +230,48 @@ impl AgentsStore {
         self.op_errors.remove(&participant_id);
         // Take over the read for the duration of the write.
         self.refresh_task = None;
+        self.next_op_gen += 1;
+        let generation = self.next_op_gen;
+        // **Chained, not replaced.** Dropping the predecessor's `Task` cancels
+        // only its gpui half — `bridge` leaves the core write running — so a
+        // superseded write could still reach the database *after* its successor
+        // (last-wins reversed), or, if it had not been polled yet, never run at
+        // all. Owning it and awaiting it makes the successor start strictly
+        // after the predecessor's round trip: last-wins becomes true by
+        // sequencing rather than by hope (Codex review, PR #279).
+        let previous = self.op_tasks.remove(&participant_id).map(|(_, task)| task);
         let key = participant_id.clone();
         self.op_tasks.insert(
             participant_id,
-            cx.spawn(async move |this, cx| {
-                let op_result = op(core).await;
-                let _ = this.update(cx, |this, cx| {
-                    // Drop this op's slot *first*: whether it is the last one in
-                    // flight is what decides who owes the resolving read.
-                    this.op_tasks.remove(&key);
-                    if let Err(message) = op_result {
-                        this.op_errors.insert(key.clone(), message);
+            (
+                generation,
+                cx.spawn(async move |this, cx| {
+                    if let Some(previous) = previous {
+                        previous.await;
                     }
-                    if this.op_tasks.is_empty() {
-                        this.refresh(cx);
-                    }
-                    cx.notify();
-                });
-            }),
+                    let op_result = op(core).await;
+                    let _ = this.update(cx, |this, cx| {
+                        // **Only the current generation settles.** A superseded
+                        // op reports nothing: a newer write on the same control
+                        // has taken over, its start already cleared this key's
+                        // report, and the outcome the reader is waiting for is
+                        // the newer one's. It must not remove the slot either —
+                        // that slot is now its successor's, and dropping it
+                        // would cancel the very write it just sequenced.
+                        if this.op_tasks.get(&key).map(|(g, _)| *g) != Some(generation) {
+                            return;
+                        }
+                        this.op_tasks.remove(&key);
+                        if let Err(message) = op_result {
+                            this.op_errors.insert(key.clone(), message);
+                        }
+                        if this.op_tasks.is_empty() {
+                            this.refresh(cx);
+                        }
+                        cx.notify();
+                    });
+                }),
+            ),
         );
         cx.notify();
     }
