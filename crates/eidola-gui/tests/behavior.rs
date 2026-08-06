@@ -13887,6 +13887,144 @@ fn inspector_the_invite_form_takes_the_keyboard_its_door_had(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn space_the_quote_picker_takes_the_keyboard_and_gives_it_back(cx: &mut TestAppContext) {
+    // Both sides of the picker's own focus contract (Codex review, PR #280).
+    // **Mount:** a reveal focuses what it revealed — and the context-menu door
+    // makes it a defect rather than an inconvenience, since `run_context_item`
+    // unmounts the focused menu row *before* dispatching, leaving a keyboard
+    // reader on a dead handle while the surface they asked for stands
+    // unfocused. **Unmount:** a surface that took the keyboard owes it back;
+    // its rows and verbs are real tab stops, so dropping it while it holds the
+    // focus is the same dead handle one step later.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let root = view.read_with(cx, |v, _| v.focus_handle());
+    let open_the_picker = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+            view.update(cx, |v, cx| {
+                v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+            });
+        })
+        .unwrap();
+        view.read_with(cx, |v, _| v.quote_destination_focus_handle())
+            .expect("the picker is open")
+    };
+
+    // Opening it — from either door; both funnel through this action, which is
+    // why one focus call covers the context menu's row and the Edit menu's item.
+    let picker = open_the_picker(cx);
+    assert!(
+        cx.update_window(window, |_, window, _| picker.is_focused(window))
+            .unwrap(),
+        "the picker holds the keyboard it revealed"
+    );
+
+    // Escape: the picker goes, and the keyboard comes back to the view root —
+    // live, so the conversation's own key model answers the next press.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| assert!(v.close_quote_destination(window, cx)));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "Escape hands the keyboard back rather than leaving it on a picker nobody paints"
+    );
+
+    // "Quote there" unmounts the verb that was pressed. The passage leaves for
+    // another window; what is owed here is that this one's keyboard stays live.
+    let _picker = open_the_picker(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.arm_quote_destination_for_test("other", "Tides", window, cx)
+        });
+        view.update(cx, |v, cx| v.confirm_quote_destination_for_test(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "the quote left for another window; the keyboard stayed in this one"
+    );
+    cx.run_until_parked();
+
+    // **A reader navigating the conversation gets their place back, not the
+    // root.** `keyboard_home` gives the same answer `sync_tree_focus`'s falling
+    // edge would, so the explicit handback and the observation a frame later
+    // agree — and the level survives instead of being cleared as "the
+    // conversation lost focus".
+    {
+        let mut vcx = VisualTestContext::from_window(window, cx);
+        vcx.simulate_keystrokes("down");
+        vcx.run_until_parked();
+    }
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), None)),
+            "the reader is on the post"
+        );
+    });
+    let _picker = open_the_picker(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.close_quote_destination(window, cx));
+    })
+    .unwrap();
+    assert!(
+        !cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "not the view root — the reader had a place in the conversation"
+    );
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), None)),
+            "and their level stands"
+        );
+    });
+
+    // And the borrow rule: a picker that never held the keyboard has none to
+    // give back — a reader composing beside it keeps their caret.
+    open_space_draft(&view, window, cx, Some("a1"));
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("a draft is open");
+    let picker = open_the_picker(cx);
+    let caret = composer.read_with(cx, |e, cx| e.focus_handle(cx));
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&caret, cx);
+    })
+    .unwrap();
+    assert!(
+        !cx.update_window(window, |_, window, cx| picker.contains_focused(window, cx))
+            .unwrap(),
+        "the reader moved the keyboard out of the picker"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.close_quote_destination(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| caret.is_focused(window))
+            .unwrap(),
+        "closing a picker that was not holding the keyboard takes nothing"
+    );
+}
+
+#[gpui::test]
 fn space_arming_a_quote_destination_keeps_the_keyboard_on_the_picker(cx: &mut TestAppContext) {
     // The same rule, one surface over: choosing a destination replaces the list
     // of conversations with the visibility statement and its two verbs, so the

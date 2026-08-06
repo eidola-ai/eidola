@@ -2371,7 +2371,7 @@ impl Render for SpaceView {
                     }
                     // …and the quote-destination picker, an overlay of the
                     // same kind over the conversation itself.
-                    if this.close_quote_destination(cx) {
+                    if this.close_quote_destination(window, cx) {
                         return;
                     }
                     // …and its Participants section's model dropdown, which is
