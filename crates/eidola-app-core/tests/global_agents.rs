@@ -1250,3 +1250,89 @@ fn removing_a_shared_agent_from_a_space_is_a_leave_not_a_retirement() {
         );
     });
 }
+
+/// The discovery half of the same rule (Codex review, PR #279): `list_my_spaces`
+/// is bounded by membership, so a retirement landing mid-turn must empty it. The
+/// tool is bound to the responding participant when the turn starts, and the
+/// `space_participant` rows retirement leaves standing are the trail, not a
+/// licence — so the *question* is what has to require a live participant.
+#[test]
+fn a_retired_agent_discovers_no_spaces_mid_turn() {
+    run(|| {
+        let script = tool_script();
+        let (_mock, core, _dir) = setup(script.clone());
+        let core = std::sync::Arc::new(core);
+
+        let space_a = turn(&core, "First conversation.", None).space_id;
+        let agent = agent_id(&core, &space_a);
+        promote(&core, &agent);
+        let space_b = core
+            .runtime()
+            .block_on(core.create_space(Some("Second".into())))
+            .expect("a space")
+            .id;
+        core.runtime()
+            .block_on(core.add_global_participant(space_b.clone(), agent.clone()))
+            .expect("joins");
+
+        core.register_tool(std::sync::Arc::new(RetireMidTurn {
+            core: std::sync::Arc::downgrade(&core),
+            participant: agent.clone(),
+        }))
+        .expect("register");
+
+        // Round 1 retires it; round 2 asks where it works.
+        *script.lock().unwrap() = vec![
+            ("retire_now".into(), "{}".into()),
+            (LIST_MY_SPACES_TOOL_NAME.into(), "{}".into()),
+        ];
+        turn(
+            &core,
+            "Retire yourself, then list your spaces.",
+            Some(space_b.clone()),
+        );
+
+        let bodies = _mock.chat_bodies();
+        let followup = bodies.last().expect("a follow-up round");
+        let result = flat_messages(followup)
+            .into_iter()
+            .rfind(|(role, _)| role == "tool")
+            .expect("a tool result")
+            .1;
+        assert_eq!(
+            result, "You are not a member of any space.",
+            "a retired agent's memberships are no longer memberships"
+        );
+    });
+}
+
+/// A tool that retires the responding agent from inside its own turn — the
+/// interleave the availability rule is about, made deterministic (the
+/// `PromoteMidTurn` idiom above).
+struct RetireMidTurn {
+    core: std::sync::Weak<AppCore>,
+    participant: String,
+}
+
+impl eidola_app_core::tools::Tool for RetireMidTurn {
+    fn name(&self) -> &str {
+        "retire_now"
+    }
+    fn description(&self) -> &str {
+        "Retire this agent, right now."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}, "required": []})
+    }
+    fn call<'a>(&'a self, _a: serde_json::Value) -> eidola_app_core::tools::ToolFuture<'a> {
+        Box::pin(async move {
+            let core = self.core.upgrade().expect("core outlives the turn");
+            core.retire_participant(self.participant.clone())
+                .await
+                .map_err(|e| {
+                    eidola_app_core::tools::ToolError::new(format!("retire failed: {e}"))
+                })?;
+            Ok("retired".to_string())
+        })
+    }
+}

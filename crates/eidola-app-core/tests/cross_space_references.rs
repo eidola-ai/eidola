@@ -428,6 +428,92 @@ fn an_agent_follows_a_quote_only_once_it_is_granted_membership() {
     });
 }
 
+/// A tool that retires the responding agent from inside its own turn — the
+/// interleave the finding is about, made deterministic (the `PromoteMidTurn`
+/// idiom from `global_agents.rs`).
+struct RetireMidTurn {
+    core: std::sync::Weak<AppCore>,
+    participant: String,
+}
+
+impl eidola_app_core::tools::Tool for RetireMidTurn {
+    fn name(&self) -> &str {
+        "retire_now"
+    }
+    fn description(&self) -> &str {
+        "Retire this agent, right now."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}, "required": []})
+    }
+    fn call<'a>(&'a self, _a: serde_json::Value) -> eidola_app_core::tools::ToolFuture<'a> {
+        Box::pin(async move {
+            let core = self.core.upgrade().expect("core outlives the turn");
+            core.retire_participant(self.participant.clone())
+                .await
+                .map_err(|e| {
+                    eidola_app_core::tools::ToolError::new(format!("retire failed: {e}"))
+                })?;
+            Ok("retired".to_string())
+        })
+    }
+}
+
+/// **Retirement ends availability, including mid-turn** (Codex review, PR #279).
+///
+/// A turn binds its tools to the responding participant when it starts, so a
+/// retirement landing between two rounds leaves a live tool holding a retired
+/// agent's id. Retirement deliberately leaves the `space_participant` rows
+/// standing — the trail still records where the agent worked — so a membership
+/// question that asks only about the row goes on answering "member" for an agent
+/// the human has just taken out of service, and the next round reads its former
+/// conversations. Membership is **live** membership: a live row *and* a live
+/// participant, which is the definition `space_participants` already used.
+#[test]
+fn a_retirement_mid_turn_closes_the_passage_it_had_opened() {
+    run(|| {
+        let script = tool_script();
+        let (mock, core, _dir) = setup(script.clone());
+        let core = std::sync::Arc::new(core);
+        let s = scenario(&core);
+
+        // Promote and grant, so the follow is genuinely permitted first.
+        core.runtime()
+            .block_on(core.promote_participant(s.agent.clone(), None))
+            .expect("promotion");
+        core.runtime()
+            .block_on(core.add_global_participant(s.source_space.clone(), s.agent.clone()))
+            .expect("the grant");
+        core.register_tool(std::sync::Arc::new(RetireMidTurn {
+            core: std::sync::Arc::downgrade(&core),
+            participant: s.agent.clone(),
+        }))
+        .expect("register");
+
+        // Round 1 retires the agent; round 2 — same turn, same bound
+        // participant id — tries to follow the quote it could have followed a
+        // moment earlier.
+        *script.lock().unwrap() = vec![
+            ("retire_now".into(), "{}".into()),
+            (
+                "read_post".into(),
+                serde_json::json!({ "handle": s.quoting_handle, "quote": 1 }).to_string(),
+            ),
+        ];
+        turn(
+            &core,
+            "Retire yourself, then read that quote.",
+            Some(s.space.clone()),
+        );
+
+        assert_eq!(
+            last_tool_result(&mock),
+            FOLLOW_DENIED,
+            "a retired agent must not keep reading the spaces it belonged to"
+        );
+    });
+}
+
 /// A quote whose target is in *this* space but no longer current — the
 /// generation the reference named was edited away. References name concrete
 /// generations and are never remapped, so the honest answer is that generation,

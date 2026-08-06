@@ -1922,10 +1922,27 @@ async fn retire_participant_tx_body(
 }
 
 /// Whether a participant is a member of one space — **owned row ∪ live
-/// reference row**, the same membership definition [`participant_spaces`] and
-/// [`space_participants`] read from their two sides, asked of a single space.
-/// This is the cross-space ACL (task 37): reference *creation* and reference
-/// *following* both gate on it.
+/// reference row, and in both cases a live participant**: the same membership
+/// definition [`participant_spaces`] and [`space_participants`] read from their
+/// two sides, asked of a single space. This is the cross-space ACL (task 37):
+/// reference *creation* and reference *following* both gate on it.
+///
+/// **Membership means live membership.** Retirement soft-removes the
+/// participant and deliberately leaves its `space_participant` rows standing —
+/// the trail still records where the agent worked — so a question that asked
+/// only about the row went on answering "member" for an agent the human had
+/// just taken out of service. A turn binds its tools to the responding
+/// participant when it starts, so a retirement landing between two rounds left
+/// a live `read_post` holding a retired id, still opening the conversations it
+/// had belonged to (Codex review, PR #279). What ends availability is therefore
+/// the *question*, asked here at the boundary rather than by sweeping `left_at`
+/// onto every membership row: one rule that covers any future
+/// availability-ending state, that leaves the historical record undisturbed,
+/// and that no racing grant can slip past (`add_global_participant` refuses a
+/// retired participant, and a row created anyway would still not answer here).
+/// `space_participants` already read membership this way; these two had drifted
+/// from the definition their own docs claimed. Rendering paths are untouched on
+/// purpose — "who wrote this post" must keep naming retired authors.
 ///
 /// Deliberately **not** filtered on `space.archived_at`: archiving is a Library
 /// visibility choice, not a departure. A member of an archived space is still a
@@ -1944,7 +1961,9 @@ pub async fn is_space_member(
                  WHERE p.id = ?2 AND p.owner_space_id = ?1 AND p.removed_at IS NULL \
              ) OR EXISTS ( \
                  SELECT 1 FROM space_participant r \
-                 WHERE r.participant_id = ?2 AND r.space_id = ?1 AND r.left_at IS NULL \
+                 JOIN participant p ON p.id = r.participant_id \
+                 WHERE r.participant_id = ?2 AND r.space_id = ?1 \
+                   AND r.left_at IS NULL AND p.removed_at IS NULL \
              )",
         )
         .await
@@ -2054,10 +2073,12 @@ pub async fn referenced_post(
     }))
 }
 
-/// Every space a participant is a member of — **owned rows ∪ live references**,
-/// the same membership definition [`space_participants`] reads from the other
-/// side. This is the boundary for everything cross-space: task 36's
-/// `list_my_spaces` reaches exactly these and nothing else.
+/// Every space a participant is a member of — **owned rows ∪ live references,
+/// and in both cases a live participant** ([`is_space_member`] states why
+/// retirement has to be visible here). The same membership definition
+/// [`space_participants`] reads from the other side. This is the boundary for
+/// everything cross-space: task 36's `list_my_spaces` reaches exactly these and
+/// nothing else.
 ///
 /// Rows carry the same activity signals as [`list_spaces`], and notebooks are
 /// **included** — an agent's own notebook is one of its spaces.
@@ -2084,7 +2105,9 @@ pub async fn participant_spaces(
                ) \
                OR EXISTS ( \
                    SELECT 1 FROM space_participant r \
-                   WHERE r.participant_id = ?1 AND r.space_id = s.id AND r.left_at IS NULL \
+                   JOIN participant p ON p.id = r.participant_id \
+                   WHERE r.participant_id = ?1 AND r.space_id = s.id \
+                     AND r.left_at IS NULL AND p.removed_at IS NULL \
                ) \
            ) \
          GROUP BY s.id, s.title, s.created_at, s.archived_at \
