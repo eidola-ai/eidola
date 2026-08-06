@@ -7470,6 +7470,26 @@ fn inspector_hands_the_keyboard_back_when_a_form_closes(cx: &mut TestAppContext)
     .unwrap();
     assert!(view_holds_the_keyboard(cx), "Cancel hands it back");
 
+    // The same containment question here: focus inside the disclosure that is
+    // not one of its inputs still owes the keyboard back.
+    open_the_disclosure(cx);
+    let subtree = view
+        .read_with(cx, |v, _| v.inspector_editing_focus_handle())
+        .expect("the disclosure is open");
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&subtree, cx);
+    })
+    .unwrap();
+    assert!(!view_holds_the_keyboard(cx), "the form subtree holds it");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_participant_edit(window, cx));
+    })
+    .unwrap();
+    assert!(
+        view_holds_the_keyboard(cx),
+        "containment, not an enumeration of inputs"
+    );
+
     open_the_disclosure(cx);
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
@@ -7826,6 +7846,32 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
             "the charter holds the keyboard while the editor is open"
         );
     };
+
+    // **Focus inside the editor that is not one of its two inputs.** The editor
+    // is a subtree — verbs, chips, a model dropdown — and a handback gated on an
+    // enumeration of its text fields answers "not held" for everything else in
+    // it, dropping the keyboard on the floor for exactly the controls a future
+    // edit adds (Codex review, PR #279).
+    open_and_focus_the_charter(cx);
+    let subtree = view
+        .read_with(cx, |v, _| v.editing_focus_handle())
+        .expect("the editor is open");
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&subtree, cx);
+    })
+    .unwrap();
+    assert!(
+        !pane_holds_the_keyboard(cx),
+        "the editor subtree holds the keyboard, not the pane"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_edit(window, cx));
+    })
+    .unwrap();
+    assert!(
+        pane_holds_the_keyboard(cx),
+        "containment, not an enumeration of inputs, is what the handback asks"
+    );
 
     // Cancel.
     open_and_focus_the_charter(cx);

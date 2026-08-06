@@ -33,9 +33,8 @@ use eidola_app_core::{
     NewParticipant, ParticipantInfo, ParticipantOverride, ParticipantReference, ParticipantUpdate,
 };
 use gpui::{
-    AnyElement, AppContext, Context, Entity, Focusable as _, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder as _, px,
+    AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme, StyledExt as _, h_flex,
@@ -59,6 +58,10 @@ const PROMPT_PLACEHOLDER: &str = "A short instruction for how this participant b
 /// inputs plus the working model/notify/mode, and (for a referenced global) the
 /// reference detail the two modes seed from.
 pub(crate) struct ParticipantEdit {
+    /// The form subtree's focus handle — the handback asks **containment**, not
+    /// an enumeration of this form's inputs (see
+    /// [`SpaceView::inspector_participant_field_focused`]).
+    focus: gpui::FocusHandle,
     pub(crate) participant_id: String,
     kind: String,
     is_referenced: bool,
@@ -105,6 +108,7 @@ impl ParticipantEdit {
 
 /// The open add-a-participant form (agents only).
 pub(crate) struct ParticipantAdd {
+    focus: gpui::FocusHandle,
     label: Entity<InputState>,
     system_prompt: Entity<InputState>,
     model_ref: Option<String>,
@@ -113,6 +117,7 @@ pub(crate) struct ParticipantAdd {
 
 /// The open "Save these participants as a template…" form.
 pub(crate) struct TemplateForm {
+    focus: gpui::FocusHandle,
     title: Entity<InputState>,
 }
 
@@ -161,24 +166,33 @@ impl SpaceView {
     /// Whether any of the section's text fields holds the window's focus — read
     /// by [`SpaceView::inspector_field_focused`], which gates type-to-compose
     /// and the close-time focus handoff.
+    /// Whether the keyboard is anywhere **inside** one of this section's three
+    /// forms.
+    ///
+    /// **Containment, not an enumeration of inputs.** A form is a subtree — its
+    /// fields, its mode chips, its verbs, its model dropdown — and a predicate
+    /// that lists the text inputs answers "not held" for everything else in it.
+    /// Since this is what the focus handback consults (`hand_back_inspector_focus`),
+    /// an enumerated answer drops the keyboard on the floor for exactly the
+    /// controls a future edit adds, and re-breaks each time (Codex review, PR
+    /// #279). `contains_focused` is the idiom the Library's reveal already uses.
     pub(crate) fn inspector_participant_field_focused(
         &self,
         window: &Window,
         cx: &gpui::App,
     ) -> bool {
-        let focused =
-            |state: &Entity<InputState>| state.read(cx).focus_handle(cx).is_focused(window);
+        let holds = |focus: &gpui::FocusHandle| focus.contains_focused(window, cx);
         self.inspector_participant_edit
             .as_ref()
-            .is_some_and(|e| focused(&e.label) || focused(&e.system_prompt))
+            .is_some_and(|e| holds(&e.focus))
             || self
                 .inspector_participant_add
                 .as_ref()
-                .is_some_and(|a| focused(&a.label) || focused(&a.system_prompt))
+                .is_some_and(|a| holds(&a.focus))
             || self
                 .inspector_template_form
                 .as_ref()
-                .is_some_and(|t| focused(&t.title))
+                .is_some_and(|t| holds(&t.focus))
     }
 
     // -- Test seams --------------------------------------------------------
@@ -194,6 +208,14 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn inspector_editing_mode(&self) -> Option<EditMode> {
         self.inspector_participant_edit.as_ref().map(|e| e.mode)
+    }
+
+    /// The open disclosure's subtree focus handle (tests).
+    #[doc(hidden)]
+    pub fn inspector_editing_focus_handle(&self) -> Option<gpui::FocusHandle> {
+        self.inspector_participant_edit
+            .as_ref()
+            .map(|e| e.focus.clone())
     }
 
     #[doc(hidden)]
@@ -291,6 +313,7 @@ impl SpaceView {
                 .default_value(p.system_prompt.clone().unwrap_or_default())
         });
         self.inspector_participant_edit = Some(ParticipantEdit {
+            focus: cx.focus_handle(),
             participant_id: p.id.clone(),
             kind: p.kind.clone(),
             is_referenced,
@@ -573,6 +596,7 @@ impl SpaceView {
                 .default_value(DEFAULT_AGENT_SYSTEM_PROMPT)
         });
         self.inspector_participant_add = Some(ParticipantAdd {
+            focus: cx.focus_handle(),
             label,
             system_prompt,
             model_ref: Some(self.stores.config.read(cx).default_model()),
@@ -641,7 +665,10 @@ impl SpaceView {
             .unwrap_or_else(|| "My template".to_string());
         let title = cx.new(|cx| InputState::new(window, cx).default_value(&default_title));
         title.update(cx, |s, cx| s.focus(window, cx));
-        self.inspector_template_form = Some(TemplateForm { title });
+        self.inspector_template_form = Some(TemplateForm {
+            focus: cx.focus_handle(),
+            title,
+        });
         cx.notify();
     }
 
@@ -1132,7 +1159,7 @@ impl SpaceView {
         // nothing here that reads as "unshare".
         let can_share = is_agent && !edit.is_referenced;
 
-        let mut card = v_flex().w_full().pb_3().gap_2();
+        let mut card = v_flex().track_focus(&edit.focus).w_full().pb_3().gap_2();
 
         if edit.is_referenced {
             let mode = edit.mode;
@@ -1366,6 +1393,7 @@ impl SpaceView {
         };
         v_flex()
             .id("space-inspector-participants-add-form")
+            .track_focus(&add.focus)
             .w_full()
             .p_2()
             .gap_2()
@@ -1438,6 +1466,7 @@ impl SpaceView {
         };
         v_flex()
             .id("space-inspector-template-form")
+            .track_focus(&form.focus)
             .w_full()
             .p_2()
             .gap_2()
