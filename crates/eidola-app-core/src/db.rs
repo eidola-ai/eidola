@@ -2346,9 +2346,14 @@ pub async fn insert_space_participant(
     .await
 }
 
-/// Ensure a global is referenced into a space (idempotent — INSERT OR IGNORE on
-/// the PK). Used to guarantee "You" joins every instantiated space even if a
-/// copied template reference already added it.
+/// Ensure a global is referenced into a space — **insert or revive**, on the
+/// space's primary key. Used to guarantee "You" joins every instantiated space
+/// even if a copied template reference already added it, and to let an agent
+/// that left be invited back.
+///
+/// Answers whether the membership *changed*: a fresh join or a revived one.
+/// A membership that was already live is left exactly as it stands, which is
+/// what "idempotent" has always meant here.
 pub async fn ensure_space_participant(
     conn: &Connection,
     space_id: &str,
@@ -2356,23 +2361,48 @@ pub async fn ensure_space_participant(
     role: &str,
     joined_at: i64,
 ) -> Result<bool, AppError> {
-    // **Liveness rides the insert.** The caller reads the participant first for
+    // **Liveness rides the write.** The caller reads the participant first for
     // its typed refusals, but a read cannot answer for a write that lands after
     // it: a retirement committing in between left a durable membership joined
     // *after* retirement, plus an invalidation and an `Internal` error where a
     // refusal belonged (Codex review, PR #279). `INSERT … SELECT … WHERE EXISTS`
-    // makes the premise part of the statement, so a lost race writes nothing.
-    // `OR IGNORE` keeps the join idempotent, as it has always been.
+    // makes the premise part of the statement, so a lost race writes nothing —
+    // and it guards the revive too, since a `SELECT` that yields no row can
+    // conflict with nothing.
+    //
+    // **A departure is not an absence.** Leaving is soft (`left_at`), so the row
+    // survives on the PK and an insert-only join struck nothing: the caller's
+    // roster read then found no member and reported the *live* agent retired —
+    // a sentence about the wrong thing, and permanent, since every retry took
+    // the same path (Codex review, PR #280). The upsert revives that row and
+    // applies the role being asked for, so the offer the picker makes (an agent
+    // that left is grantable again) is the one the write honours.
+    //
+    // The `WHERE left_at IS NOT NULL` on the update is what keeps this a
+    // *revive* rather than an overwrite: a live membership is never rewritten,
+    // so the template instantiation's "You" (inserted a few lines earlier with
+    // the template's own role and overrides) survives the `ensure` that follows
+    // it, exactly as `OR IGNORE` made it.
     let n = conn
         .execute(
-            "INSERT OR IGNORE INTO space_participant \
+            "INSERT INTO space_participant \
              (space_id, participant_id, participant_scope, role, joined_at, \
               override_label, override_model_ref, override_system_prompt, \
               override_notify_policy) \
              SELECT ?1, ?2, 'global', ?3, ?4, NULL, NULL, NULL, NULL \
              WHERE EXISTS ( \
                  SELECT 1 FROM participant WHERE id = ?2 AND removed_at IS NULL \
-             )",
+             ) \
+             ON CONFLICT (space_id, participant_id) DO UPDATE SET \
+                 participant_scope = 'global', \
+                 role = excluded.role, \
+                 joined_at = excluded.joined_at, \
+                 left_at = NULL, \
+                 override_label = NULL, \
+                 override_model_ref = NULL, \
+                 override_system_prompt = NULL, \
+                 override_notify_policy = NULL \
+             WHERE space_participant.left_at IS NOT NULL",
             (
                 Value::Text(space_id.to_string()),
                 Value::Text(participant_id.to_string()),
@@ -7540,6 +7570,122 @@ mod tests {
                 .await
                 .unwrap(),
             "re-adding an existing member changes nothing"
+        );
+    }
+
+    /// **A departure is not an absence.** Leaving is soft, so the row stays on
+    /// the space's primary key; an insert-only join struck nothing and the
+    /// membership could never be given back (Codex review, PR #280). The three
+    /// things the upsert has to get right, in one place: the revive, the
+    /// premise still riding it, and the live row it must not touch.
+    #[tokio::test]
+    async fn a_membership_that_left_is_revived_and_a_live_one_is_left_alone() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        insert_space(&conn, "s", Some("Home"), "unlinked", 1)
+            .await
+            .unwrap();
+        for (id, label) in [("g", "Ada"), ("r", "Cy"), ("t", "You")] {
+            insert_participant(
+                &conn, id, "global", None, None, "agent", label, None, None, "explicit", "member",
+                None, 1,
+            )
+            .await
+            .unwrap();
+        }
+
+        // It joined, then left.
+        assert!(
+            ensure_space_participant(&conn, "s", "g", "member", 2)
+                .await
+                .unwrap()
+        );
+        assert!(leave_space_participant(&conn, "s", "g", 3).await.unwrap());
+        assert!(
+            space_participants(&conn, "s")
+                .await
+                .unwrap()
+                .iter()
+                .all(|m| m.participant_id != "g"),
+            "a member that left is not a member"
+        );
+
+        // Inviting it back revives that row — one membership, the new role.
+        assert!(
+            ensure_space_participant(&conn, "s", "g", "observer", 4)
+                .await
+                .unwrap(),
+            "the membership came back, so the write reports a change"
+        );
+        let roster = space_participants(&conn, "s").await.unwrap();
+        let back: Vec<_> = roster.iter().filter(|m| m.participant_id == "g").collect();
+        assert_eq!(back.len(), 1, "revived, not duplicated");
+        assert_eq!(back[0].role, "observer", "the requested role rides it");
+
+        // The premise rides the revive as it rides the insert: a retired
+        // participant's departed row stays departed.
+        assert!(
+            ensure_space_participant(&conn, "s", "r", "member", 5)
+                .await
+                .unwrap()
+        );
+        assert!(leave_space_participant(&conn, "s", "r", 6).await.unwrap());
+        assert!(soft_remove_participant(&conn, "r", 7).await.unwrap());
+        assert!(
+            !ensure_space_participant(&conn, "s", "r", "member", 8)
+                .await
+                .unwrap(),
+            "a retired participant cannot be revived into a space either"
+        );
+        assert!(
+            space_participants(&conn, "s")
+                .await
+                .unwrap()
+                .iter()
+                .all(|m| m.participant_id != "r")
+        );
+
+        // And a **live** membership is not rewritten — what the template
+        // instantiation's copied "You" reference depends on (it is inserted
+        // with the template's own role and overrides, and the `ensure` that
+        // follows must leave both standing).
+        insert_participant_ref(
+            &conn,
+            "space_participant",
+            "space_id",
+            "s",
+            "t",
+            "member",
+            9,
+            &ParticipantRefRow {
+                participant_id: "t".into(),
+                role: "member".into(),
+                joined_at: 9,
+                override_label: Some("Scribe".into()),
+                override_model_ref: None,
+                override_system_prompt: None,
+                override_notify_policy: None,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ensure_space_participant(&conn, "s", "t", "owner", 10)
+                .await
+                .unwrap(),
+            "a live membership is already what it is"
+        );
+        let kept = space_participants(&conn, "s")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.participant_id == "t")
+            .expect("still a member");
+        assert_eq!(kept.role, "member", "its role was not overwritten");
+        assert_eq!(
+            kept.label, "Scribe",
+            "nor were the overrides it was inserted with"
         );
     }
 }

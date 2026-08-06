@@ -964,6 +964,106 @@ fn a_grant_naming_the_home_space_is_satisfied_by_the_promotion() {
     });
 }
 
+/// An agent that **left** can be invited back — the picker offers it, so the
+/// write has to honour the offer.
+///
+/// A membership is soft-ended (`left_at`), and the row stays on the space's
+/// primary key, so an insert-only join struck nothing and the roster read that
+/// followed found no member: the reader was told the live agent "has been
+/// retired and cannot rejoin a space" — a sentence about the wrong thing, and
+/// permanent, since every retry took the same path (Codex review, PR #280).
+/// The join is insert-**or-revive**, and the requested role rides the revive.
+#[test]
+fn an_agent_that_left_can_be_invited_back() {
+    run(|| {
+        let (_mock, core, _dir) = setup(tool_script());
+        let home = turn(&core, "Hello there.", None).space_id;
+        let agent = agent_id(&core, &home);
+        let elsewhere = core
+            .runtime()
+            .block_on(core.create_space(Some("Elsewhere".into())))
+            .expect("a space")
+            .id;
+        core.runtime()
+            .block_on(core.promote_participant(
+                agent.clone(),
+                None,
+                Some(eidola_app_core::SpaceGrant {
+                    space_id: elsewhere.clone(),
+                    role: eidola_app_core::MembershipRole::Observer,
+                }),
+            ))
+            .expect("share and grant");
+        assert!(
+            core.runtime()
+                .block_on(core.remove_space_participant(elsewhere.clone(), agent.clone()))
+                .expect("the removal"),
+            "it leaves"
+        );
+
+        // The picker offers it again — a departure is not a retirement.
+        assert!(
+            core.runtime()
+                .block_on(core.list_grantable_agents(
+                    elsewhere.clone(),
+                    eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                ))
+                .expect("candidates")
+                .iter()
+                .any(|c| c.id == agent),
+            "an agent that left this space is grantable again"
+        );
+
+        let mut rx = core.subscribe_changes();
+        let member = core
+            .runtime()
+            .block_on(core.add_global_participant(
+                elsewhere.clone(),
+                agent.clone(),
+                Some(eidola_app_core::MembershipRole::Observer),
+            ))
+            .expect("the second grant lands rather than reporting a retirement");
+        assert_eq!(member.id, agent);
+        assert_eq!(
+            member.role, "observer",
+            "the requested role rides the revive"
+        );
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Change::Participants)),
+            "a membership that came back is a membership change"
+        );
+
+        let roster = core
+            .runtime()
+            .block_on(core.list_space_participants(elsewhere.clone()))
+            .expect("participants");
+        let back = roster
+            .iter()
+            .find(|p| p.id == agent)
+            .expect("a member again");
+        assert_eq!(back.role, "observer");
+        assert_eq!(back.source, "referenced");
+        assert_eq!(
+            roster.iter().filter(|p| p.id == agent).count(),
+            1,
+            "one membership, revived — not a second row"
+        );
+
+        // Idempotent as ever: adding a live member again changes nothing, and
+        // does not rewrite the membership it found.
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.add_global_participant(elsewhere.clone(), agent.clone(), None))
+            .expect("adding a member again is not an error");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "an idempotent re-add writes nothing, so it says nothing"
+        );
+    });
+}
+
 /// The picker behind the grant obeys the same ACL as everything else: it lists
 /// agents a reader could actually add here, and nothing about spaces they take
 /// no part in.
