@@ -661,6 +661,11 @@ impl SpaceView {
             confirming: None,
             focus: cx.focus_handle(),
         });
+        // Ask for a fresh index as the picker opens — what `OpenLibrary` does
+        // on every invocation, and the only thing that re-reads a `Failed` one
+        // besides a bus signal. A fresh scroll for a freshly opened list.
+        self.quote_destination_scroll = gpui::ScrollHandle::new();
+        self.stores.spaces.update(cx, |s, cx| s.refresh(cx));
         cx.notify();
     }
 
@@ -915,16 +920,78 @@ impl SpaceView {
                 .text_color(theme.muted_foreground)
                 .child("Quote into"),
         );
-        let spaces = self.stores.spaces.read(cx);
-        let mut offered = 0usize;
-        for space in spaces.list() {
-            if here.as_deref() == Some(space.id.as_str()) {
-                continue;
-            }
-            let label = space_label(space);
-            let id = space.id.clone();
-            let for_arm = label.clone();
+
+        // **The index has states, and this surface has to read all of them**
+        // (Codex review, PR #280). `list()` answers `&[]` for a failed read
+        // exactly as it does for a real empty Library — the Library window's
+        // own "Failed is not empty" rule — so collapsing them said "No other
+        // conversations yet" about a read that failed, with nothing to press:
+        // quoting elsewhere was simply dead for the session, since the index is
+        // re-read only on a bus signal or an `OpenLibrary`.
+        let (load_error, has_listing, destinations) = {
+            let store = self.stores.spaces.read(cx);
+            let cell = store.index();
+            let rows: Vec<(String, SharedString)> = store
+                .list()
+                .iter()
+                .filter(|s| here.as_deref() != Some(s.id.as_str()))
+                .map(|s| (s.id.clone(), space_label(s)))
+                .collect();
+            (cell.error().map(|e| e.to_string()), cell.has_value(), rows)
+        };
+
+        if destinations.is_empty() {
+            let (line, retry) = match (&load_error, has_listing) {
+                // A failed *initial* read: say so, and offer the door back. The
+                // quiet retry line rather than the full `load_error_panel` — a
+                // 320px popover is the Library's "couldn't refresh" idiom, not
+                // its centred panel.
+                (Some(_), false) => ("Couldn't load your conversations.", true),
+                // Nothing has answered yet. A read in flight knows nothing, and
+                // an unanswered index is not an empty one.
+                (None, false) => ("Loading…", false),
+                // Genuinely empty (or empty-but-stale, which the retry says).
+                _ => ("No other conversations yet.", load_error.is_some()),
+            };
             col = col.child(
+                div()
+                    .id("space-quote-destination-empty")
+                    // A static readout rides its own `Label` node (the a11y
+                    // rule): three states, three sentences, and which one is
+                    // showing is the whole point of Finding C.
+                    .probe_value(
+                        "space/quote-destination/empty",
+                        gpui::Role::Label,
+                        "Conversations",
+                        line,
+                    )
+                    .px_1()
+                    .py_0p5()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(line),
+            );
+            if retry {
+                col = col.child(self.quote_destination_retry(cx));
+            }
+            return Some(col.into_any_element());
+        }
+
+        // **A bounded, scrolling list** — the Library is unbounded, and an
+        // unbounded column inside a popover clipped its own overflow: every
+        // conversation past the first handful was unreachable, and each frame
+        // built a row for all of them. The model picker's shape, because a
+        // dropdown of conversations is a dropdown (Codex review, PR #280).
+        let mut menu = v_flex()
+            .id("space-quote-destination-list")
+            .w_full()
+            .max_h(px(220.))
+            .overflow_y_scroll()
+            .track_scroll(&self.quote_destination_scroll)
+            .gap_0p5();
+        for (offered, (id, label)) in destinations.into_iter().enumerate() {
+            let for_arm = label.clone();
+            menu = menu.child(
                 div()
                     .id(SharedString::from(format!(
                         "space-quote-destination-{offered}"
@@ -947,21 +1014,43 @@ impl SpaceView {
                         this.arm_quote_destination(id.clone(), for_arm.clone(), window, cx);
                     })),
             );
-            offered += 1;
         }
-        if offered == 0 {
-            // Honest empty: the Library may not have answered yet, and a reader
-            // with one conversation has nowhere else to quote into.
-            col = col.child(
-                div()
-                    .px_1()
-                    .py_0p5()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("No other conversations yet."),
-            );
+        col = col.child(div().relative().w_full().child(menu).child(
+            crate::scrollbar::vertical_floating(
+                "quote-destination-scrollbar",
+                &self.quote_destination_scroll,
+            ),
+        ));
+        // A failed *refresh* over a listing we still hold keeps the rows — they
+        // are honest as of the last read — and says the last read is no longer
+        // the last word.
+        if load_error.is_some() {
+            col = col.child(self.quote_destination_retry(cx));
         }
         Some(col.into_any_element())
+    }
+
+    /// The picker's quiet retry line — the Library's "couldn't refresh" strip,
+    /// in a popover. It is the **only** door to a fresh index from here: the
+    /// store re-reads on a bus `Change::SpaceIndex` or an `OpenLibrary`, so
+    /// without it a reader whose index failed has to know that opening the
+    /// Library is what fixes quoting elsewhere.
+    fn quote_destination_retry(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        div()
+            .id("space-quote-destination-retry")
+            .probe("space/quote-destination/retry", gpui::Role::Button, "Retry")
+            .px_1()
+            .py_0p5()
+            .text_xs()
+            .cursor_pointer()
+            .text_color(theme.muted_foreground)
+            .hover(|s| s.text_color(theme.foreground))
+            .child("Couldn't refresh — retry")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.stores.spaces.update(cx, |s, cx| s.refresh(cx));
+            }))
+            .into_any_element()
     }
 
     /// Drop a pending reference from a draft: remove the row **and** its embed
