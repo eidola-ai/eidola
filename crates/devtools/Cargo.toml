@@ -26,5 +26,5 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-rumdl = "=0.2.40"
+rumdl = "=0.2.46"
 just = "=1.57.0"
