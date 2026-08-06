@@ -3276,12 +3276,13 @@ impl Inner {
         let conn = self.db_conn().await?;
         // A space-owned participant is soft-removed (its row deactivated); a
         // referenced global leaves the space (its reference row's left_at set).
-        let removed = match db::get_participant(&conn, participant_id).await? {
-            Some(p) if p.scope == "space" && p.owner_space_id.as_deref() == Some(space_id) => {
-                db::soft_remove_participant(&conn, participant_id, now_ms()).await?
-            }
-            _ => db::leave_space_participant(&conn, space_id, participant_id, now_ms()).await?,
-        };
+        // **Which one is decided at the write, not here**: a read taken now can
+        // be overtaken by another window's promotion, and a soft-remove aimed at
+        // a row that has since become global retires a shared agent outright.
+        // See `db::remove_space_participant_tx`.
+        let removed = db::remove_space_participant_tx(&conn, space_id, participant_id, now_ms())
+            .await?
+            != db::SpaceRemoval::NothingToDo;
         if removed {
             self.bus.emit(Change::Participants);
         }

@@ -2272,8 +2272,92 @@ pub async fn insert_template_participant(
     .await
 }
 
+/// What [`remove_space_participant_tx`] did — decided by the write, not by the
+/// caller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpaceRemoval {
+    /// The participant was still this space's own, so its row was deactivated.
+    SoftRemoved,
+    /// It was a referenced global (shared, or shared *just now*), so it left the
+    /// space and the row stands.
+    Left,
+    /// Nothing live to end — already removed, already left, or never a member.
+    NothingToDo,
+}
+
+/// Take a participant out of one space, **deciding at the write** whether that
+/// means deactivating this space's own row or ending a membership.
+///
+/// The two are not interchangeable: a soft-remove retires the participant
+/// everywhere (it is what the library's Retire does), while a leave ends one
+/// membership. Choosing between them from a `get_participant` read taken a
+/// moment earlier is a read-then-write window, and promotion is exactly what
+/// walks through it: another window flips the row to `global` in between, and
+/// the removal — still believing it holds a space-owned agent — sets
+/// `removed_at` on a freshly *shared* agent, retiring it from the library the
+/// instant it arrived and orphaning the notebook promotion had just created
+/// (retirement archives it; this write knows nothing about it). Both callers
+/// then report success (Codex review, PR #279).
+///
+/// So the ownership test rides **in the soft-remove's own `WHERE`**: it strikes
+/// only a row that is still `scope = 'space'`, still owned by *this* space, and
+/// still live. Zero rows means the premise no longer holds, and the fallback is
+/// the honest one — end the membership, which after a promotion is precisely the
+/// reference row promotion left behind. The mirror guard is on the other side
+/// (`promote_participant_tx` requires `scope = 'space' AND removed_at IS NULL`),
+/// so whichever transaction commits first, the loser refuses cleanly rather than
+/// writing through a premise that has expired.
+pub async fn remove_space_participant_tx(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    now: i64,
+) -> Result<SpaceRemoval, AppError> {
+    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    match remove_space_participant_tx_body(conn, space_id, participant_id, now).await {
+        Ok(outcome) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(outcome)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn remove_space_participant_tx_body(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    now: i64,
+) -> Result<SpaceRemoval, AppError> {
+    let struck = conn
+        .execute(
+            "UPDATE participant SET removed_at = ?3 \
+             WHERE id = ?1 AND removed_at IS NULL \
+               AND scope = 'space' AND owner_space_id = ?2",
+            (
+                Value::Text(participant_id.to_string()),
+                Value::Text(space_id.to_string()),
+                Value::Integer(now),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    if struck > 0 {
+        return Ok(SpaceRemoval::SoftRemoved);
+    }
+    match leave_space_participant(conn, space_id, participant_id, now).await? {
+        true => Ok(SpaceRemoval::Left),
+        false => Ok(SpaceRemoval::NothingToDo),
+    }
+}
+
 /// End a space membership (reference) — set `left_at`. For a referenced global;
-/// owned participants are removed via [`soft_remove_participant`].
+/// owned participants are removed via [`soft_remove_participant`]. Callers
+/// choosing *between* the two must go through [`remove_space_participant_tx`],
+/// which decides at the write.
 pub async fn leave_space_participant(
     conn: &Connection,
     space_id: &str,
@@ -6984,5 +7068,138 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// **The removal's decision belongs to its write** (Codex review, PR #279).
+    ///
+    /// `remove_space_participant` used to read the participant, see a
+    /// space-owned row, and *then* soft-remove it. Between those two steps
+    /// another window's promotion can commit — and the interleave is played out
+    /// literally below, with the same two primitives the old code used. The
+    /// stale soft-remove lands on the now-**global** row: the agent is retired
+    /// from the library the instant it was shared, its brand-new notebook is
+    /// left unarchived (only retirement archives it), and neither caller saw an
+    /// error. Promotion is one-way, so there is no way back.
+    ///
+    /// The cure is not a fresher read but no read at all: the ownership test
+    /// rides in the soft-remove's own `WHERE`, so after the same interleave the
+    /// new door strikes nothing and ends the membership instead — leaving the
+    /// shared agent alive with the reference row promotion created marked
+    /// `left_at`.
+    #[tokio::test]
+    async fn a_removal_decided_before_a_promotion_cannot_retire_the_shared_agent() {
+        async fn fixture(conn: &Connection, space: &str, agent: &str) {
+            insert_space(conn, space, Some("Home"), "unlinked", 1)
+                .await
+                .unwrap();
+            insert_participant(
+                conn,
+                agent,
+                "space",
+                Some(space),
+                None,
+                "agent",
+                "Cartographer",
+                None,
+                None,
+                "explicit",
+                "member",
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        async fn promote(conn: &Connection, space: &str, agent: &str, notebook: &str) {
+            promote_participant_tx(
+                conn,
+                &Promotion {
+                    participant_id: agent,
+                    home_space_id: space,
+                    role: "member",
+                    notebook_space_id: notebook,
+                    notebook_title: "Cartographer — notebook",
+                    persona: None,
+                    now: 2,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+
+        // --- the old shape, played out ------------------------------------
+        fixture(&conn, "s-old", "p-old").await;
+        let read = get_participant(&conn, "p-old").await.unwrap().unwrap();
+        assert_eq!(read.scope, "space", "the read that decided");
+        promote(&conn, "s-old", "p-old", "nb-old").await;
+        // ...and the write it decided on, arriving after the share landed.
+        assert!(
+            soft_remove_participant(&conn, "p-old", 3).await.unwrap(),
+            "the unguarded soft-remove reports success"
+        );
+        let wrecked = get_participant(&conn, "p-old").await.unwrap().unwrap();
+        assert_eq!(wrecked.scope, "global");
+        assert!(
+            wrecked.removed_at.is_some(),
+            "the shared agent was retired by a removal aimed at a space-owned one"
+        );
+        assert!(
+            !space_is_archived(&conn, "nb-old").await.unwrap(),
+            "and its notebook was orphaned — nothing archived it"
+        );
+
+        // --- the same interleave, through the door that decides at the write
+        fixture(&conn, "s-new", "p-new").await;
+        let read = get_participant(&conn, "p-new").await.unwrap().unwrap();
+        assert_eq!(read.scope, "space");
+        promote(&conn, "s-new", "p-new", "nb-new").await;
+        assert_eq!(
+            remove_space_participant_tx(&conn, "s-new", "p-new", 3)
+                .await
+                .unwrap(),
+            SpaceRemoval::Left,
+            "the premise expired, so the removal ends the membership instead"
+        );
+        let survivor = get_participant(&conn, "p-new").await.unwrap().unwrap();
+        assert_eq!(survivor.scope, "global");
+        assert!(
+            survivor.removed_at.is_none(),
+            "the shared agent survives its home space's removal"
+        );
+        assert!(
+            space_participants(&conn, "s-new")
+                .await
+                .unwrap()
+                .iter()
+                .all(|p| p.participant_id != "p-new"),
+            "and it is no longer a member of the space it left"
+        );
+
+        // The ordinary case still soft-removes: a row this space really owns.
+        fixture(&conn, "s-owned", "p-owned").await;
+        assert_eq!(
+            remove_space_participant_tx(&conn, "s-owned", "p-owned", 3)
+                .await
+                .unwrap(),
+            SpaceRemoval::SoftRemoved
+        );
+        assert!(
+            get_participant(&conn, "p-owned")
+                .await
+                .unwrap()
+                .unwrap()
+                .removed_at
+                .is_some()
+        );
+        // And a second removal has nothing left to end.
+        assert_eq!(
+            remove_space_participant_tx(&conn, "s-owned", "p-owned", 4)
+                .await
+                .unwrap(),
+            SpaceRemoval::NothingToDo
+        );
     }
 }
