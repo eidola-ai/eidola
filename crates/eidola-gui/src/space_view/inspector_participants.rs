@@ -205,7 +205,8 @@ impl SpaceView {
             == Some(participant_id)
     }
 
-    /// Whether this space is some agent's private **notebook**.
+    /// Whether this space is some agent's private **notebook** — `None` while
+    /// the settings read has not answered.
     ///
     /// **Flagged, not decided** (task 37): whether an agent may be granted
     /// observer membership of another agent's notebook is one of the two
@@ -213,17 +214,36 @@ impl SpaceView {
     /// conservative reading and offers no *new* door here — app-core's rules
     /// are unchanged either way (`add_global_participant` has never refused a
     /// notebook), so nothing here forecloses the answer. If notebooks turn out
-    /// to be grantable, deleting this predicate's one use is the whole change.
-    fn inspector_space_is_a_notebook(&self, cx: &gpui::App) -> bool {
-        let Some(space_id) = self.space_id(cx) else {
-            return false;
-        };
-        self.stores
-            .space_settings
-            .read(cx)
-            .settings(&space_id)
-            .value()
-            .is_some_and(|s| s.notebook_participant_id.is_some())
+    /// to be grantable, deleting [`Self::inspector_offers_grant_door`]'s one
+    /// use is the whole change.
+    ///
+    /// **The three states are three answers**, because that unchanged app-core
+    /// rule is exactly what makes the unknown one dangerous: nothing refuses a
+    /// notebook grant *underneath* this decision, so a predicate that folds "no
+    /// answer yet" into "an ordinary space" offers the door in the window
+    /// before the read lands, and confirming it succeeds — a notebook's whole
+    /// history handed to an agent by a surface that had decided not to allow it
+    /// (Codex review, PR #280). A cell that has not answered knows nothing; only
+    /// a listing that answered may say anything (the status menu's rule, and
+    /// [`Self::sync_inspector_participant_edit`]'s).
+    fn inspector_space_is_a_notebook(&self, cx: &gpui::App) -> Option<bool> {
+        let space_id = self.space_id(cx)?;
+        Some(
+            self.stores
+                .space_settings
+                .read(cx)
+                .settings(&space_id)
+                .value()?
+                .notebook_participant_id
+                .is_some(),
+        )
+    }
+
+    /// Whether the roster offers the grant door: only where the settings have
+    /// **affirmed** an ordinary conversation. Unknown withholds it — the door
+    /// comes back on the frame the read answers.
+    fn inspector_offers_grant_door(&self, cx: &gpui::App) -> bool {
+        self.inspector_space_is_a_notebook(cx) == Some(false)
     }
 
     /// This space's membership as the store holds it.
@@ -893,11 +913,34 @@ impl SpaceView {
         self.inspector_cancel_invite(window, cx);
     }
 
+    /// Retire an open invite form over a space that turns out to be a
+    /// **notebook** — the door's own lifetime rule, run at the head of `render`
+    /// beside [`Self::sync_inspector_participant_edit`].
+    ///
+    /// The withheld door is a decision about *where* the grant may be made, and
+    /// a form is a door left standing: gating the render alone leaves any form
+    /// opened while the settings were still unknown mounted and confirmable
+    /// after the answer arrives, which app-core will not refuse (Codex review,
+    /// PR #280). So the same question that decides the door decides the form
+    /// for as long as it is open — "a form is valid only while what it was
+    /// opened over still answers to the same shape", where the shape here is
+    /// the space's own kind. Only an **affirmed** notebook retires it; unknown
+    /// withholds the door but disturbs nothing already open, because unknown is
+    /// not evidence either way.
+    pub(crate) fn sync_inspector_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inspector_invite.is_none() || self.inspector_space_is_a_notebook(cx) != Some(true) {
+            return;
+        }
+        // The same exit Cancel takes — the form, its read, and the keyboard it
+        // may be holding, through the one handback door.
+        self.inspector_cancel_invite(window, cx);
+    }
+
     /// Whether the roster offers the grant door here (the notebook question,
     /// asked of the surface rather than of a painted frame).
     #[doc(hidden)]
     pub fn inspector_offers_grant_door_for_test(&self, cx: &gpui::App) -> bool {
-        !self.inspector_space_is_a_notebook(cx)
+        self.inspector_offers_grant_door(cx)
     }
 
     /// Seed the invite form's candidates without a backend — the driver and
@@ -1264,13 +1307,14 @@ impl SpaceView {
 
         col = match (
             self.inspector_invite.is_some(),
-            self.inspector_space_is_a_notebook(cx),
+            self.inspector_offers_grant_door(cx),
         ) {
             (true, _) => col.child(self.render_inspector_invite_form(cx)),
-            // A notebook withholds the grant door — see
-            // `inspector_space_is_a_notebook`.
-            (false, true) => col,
-            (false, false) => col.child(
+            // A notebook withholds the grant door — and so does a settings read
+            // that has not said which this is (see
+            // `inspector_space_is_a_notebook`).
+            (false, false) => col,
+            (false, true) => col.child(
                 div()
                     .id("space-inspector-participants-invite")
                     .probe(
