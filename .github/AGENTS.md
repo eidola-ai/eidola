@@ -35,4 +35,4 @@ Runs on `v*` tags, two responsibilities: (1) generate `tinfoil-deployment.json` 
 
 - `cla.yml` verifies every PR author/committer email is covered by the current `CLA-INDIVIDUAL.md` / `CLA-CORPORATE.md` hash recorded in `CLA-SIGNERS.txt`.
 - `website.yml` — PRs touching `www/**`, `docs/**`, or `crates/eidola-www` get a validating build (the content gate; `rust-checks`' scope step deliberately ignores `www/**`); pushes to `main` build + deploy to GitHub Pages.
-- `rust-checks.yml` also runs `scripts/check-legal-doc-versions.sh` (a PR changing a legal document's bytes must increment its front-matter version by exactly 1).
+- `rust-checks.yml` also runs `scripts/check-legal-doc-versions.sh` (a PR changing a legal document's bytes must increment its front-matter version by exactly 1). Currently short-circuited: the documents are pre-publication drafts, so the acceptance-ordering contract is not yet in force — the early exit in the script says when to remove it.
