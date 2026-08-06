@@ -4952,6 +4952,157 @@ fn space_inspector_shows_a_title_refusal_beside_a_standing_settings_one(cx: &mut
     probe::set_probes_enabled(false);
 }
 
+/// **The destination list is bounded and scrolls.** The Library is unbounded,
+/// and an unbounded column inside a popover clips its own overflow: the far
+/// conversations become unreachable, and every frame builds a row for all of
+/// them (Codex review, PR #280). The model picker's shape — a capped height
+/// with its own scroller — so the popover's painted height stays a popover's
+/// however long the Library gets.
+#[gpui::test]
+fn space_quote_destination_list_is_bounded(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let many: Vec<_> = (0..60)
+        .map(|i| space_info(&format!("s{i}"), Some(&format!("Conversation {i}"))))
+        .collect();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.spaces = many;
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s0".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut post = probe_post("a1", "the quick brown fox");
+    post.blocks[0].id = "b1".into();
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+    draw(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+
+    let entries = fresh_entries(cx, window);
+    let (_, picker) = entries
+        .iter()
+        .find(|(n, _)| n == "space/quote-destination")
+        .expect("the picker painted");
+    assert!(
+        picker.bounds.size.height <= gpui::px(400.),
+        "59 destinations must not grow the popover past a popover's height: {:?}",
+        picker.bounds.size.height
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|(n, _)| n == "space/quote-destination/58"),
+        "and every destination is still a row inside the scroller"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **The index has three states, and the picker reads all of them** (Codex
+/// review, PR #280). `list()` answers `&[]` for a read that failed exactly as
+/// it does for a genuinely empty Library, so collapsing them told the reader
+/// "no other conversations" about a failure — with nothing to press, and
+/// nothing else in a space window that ever re-reads the index.
+#[gpui::test]
+fn space_quote_destination_reads_the_index_states_apart(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    // An index that has not answered: `stub` leaves an empty seed `NotLoaded`.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+    });
+    let spaces = stores.spaces.clone();
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut post = probe_post("a1", "the quick brown fox");
+    post.blocks[0].id = "b1".into();
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+    draw(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+
+    let unanswered = fresh_entries(cx, window);
+    assert_probe_value(
+        &unanswered,
+        "space/quote-destination/empty",
+        gpui::Role::Label,
+        "Conversations",
+        "Loading…",
+    );
+    assert!(
+        !unanswered
+            .iter()
+            .any(|(n, _)| n == "space/quote-destination/retry"),
+        "a read in flight is not a failure, so there is nothing to retry yet"
+    );
+
+    // A failed *initial* read: say so, and offer the door back — the only one
+    // there is, since nothing else in this window re-reads the index.
+    cx.update(|cx| {
+        spaces.update(cx, |s, cx| {
+            s.settle_for_test(None, Err("database is locked"), None, cx)
+        });
+    });
+    let failed = fresh_entries(cx, window);
+    assert_probe_value(
+        &failed,
+        "space/quote-destination/empty",
+        gpui::Role::Label,
+        "Conversations",
+        "Couldn't load your conversations.",
+    );
+    assert_probe(
+        &failed,
+        "space/quote-destination/retry",
+        gpui::Role::Button,
+        "Retry",
+    );
+
+    // And a genuinely empty Library keeps the honest sentence, with nothing to
+    // retry — a reader with one conversation has nowhere else to quote into.
+    cx.update(|cx| {
+        spaces.update(cx, |s, cx| {
+            s.settle_for_test(None, Ok(Vec::new()), None, cx)
+        });
+    });
+    let empty = fresh_entries(cx, window);
+    assert_probe_value(
+        &empty,
+        "space/quote-destination/empty",
+        gpui::Role::Label,
+        "Conversations",
+        "No other conversations yet.",
+    );
+    assert!(
+        !empty
+            .iter()
+            .any(|(n, _)| n == "space/quote-destination/retry"),
+        "nothing failed, so nothing offers a retry"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 /// The cross-space creation UI and the denied-follow notice (task 37): the
 /// destination picker's rows, the statement the reader must be shown, its two
 /// verbs, and the notice's own dismiss — every one a driver target and an

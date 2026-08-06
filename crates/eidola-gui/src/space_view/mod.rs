@@ -408,6 +408,11 @@ pub struct SpaceView {
     /// destination the visibility statement names. Window-local transient
     /// state, like the highlight picker it sits beside.
     pub(crate) quote_destination: Option<references::QuoteDestination>,
+    /// Scroll position of the destination picker's bounded list — a view field
+    /// for the same reason the participant picker's is (`ScrollHandle` is the
+    /// scroller's own state; the list is reset to the top each time the picker
+    /// opens).
+    pub(crate) quote_destination_scroll: ScrollHandle,
     /// The open right-click menu over one of the space's editors, if any —
     /// window-local transient state, like the band menu and the picker (one
     /// open at a time; see [`context_menu`]).
@@ -837,6 +842,7 @@ impl SpaceView {
             post_selection: None,
             highlight_picker: None,
             quote_destination: None,
+            quote_destination_scroll: ScrollHandle::new(),
             context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),
