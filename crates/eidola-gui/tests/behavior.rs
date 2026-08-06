@@ -13516,3 +13516,155 @@ fn space_a_denied_follow_says_so_without_naming_the_conversation(cx: &mut TestAp
         assert!(v.reference_notice_for_test().is_none(), "and it dismisses");
     });
 }
+
+#[gpui::test]
+fn inspector_inviting_an_agent_from_another_space_shares_it_and_adds_it_here(
+    cx: &mut TestAppContext,
+) {
+    // Task 37's grant, from the surface a reader would use it from: the space
+    // whose privacy the decision is about. The candidate here is a **space-
+    // owned** agent from another conversation, so the grant is a share *and* a
+    // membership — one core call, so the irreversible half can never land
+    // alone — and the sentence says both, including the part that can't be
+    // undone.
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let elsewhere = core
+        .runtime()
+        .block_on(core.create_space(Some("Tides".into())))
+        .expect("a second conversation")
+        .id;
+    let visitor = core
+        .runtime()
+        .block_on(core.list_space_participants(elsewhere.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the template seeds an agent there too");
+
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+    })
+    .unwrap();
+    wait_until(cx, "the candidates land", |cx| {
+        view.read_with(cx, |v, _| {
+            v.inspector_invite_for_test()
+                .is_some_and(|(labels, _)| !labels.is_empty())
+        })
+    });
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.inspector_arm_invite(&visitor.id, cx));
+    })
+    .unwrap();
+    let statement = view
+        .read_with(cx, |v, _| v.inspector_invite_for_test())
+        .expect("the form is open")
+        .1
+        .expect("a candidate is armed");
+    assert!(
+        statement.contains("shares it across spaces") && statement.contains("can't be undone"),
+        "an unshared agent's grant says what it costs: {statement}"
+    );
+    assert!(
+        statement.contains("read this conversation"),
+        "…and what it gives: {statement}"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_confirm_invite(window, cx));
+    })
+    .unwrap();
+    wait_until(cx, "the grant lands", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.list(&space).iter().any(|p| p.id == visitor.id))
+    });
+
+    let member = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.id == visitor.id)
+            .expect("granted")
+            .clone()
+    });
+    assert_eq!(member.scope, "global", "it had to be shared to join at all");
+    assert_eq!(member.role, "observer", "read-only is what was granted");
+    assert_eq!(
+        member.label, visitor.label,
+        "and it arrives as itself — promotion moves ownership, not configuration"
+    );
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_invite_for_test().is_none()),
+        "the form closes on the grant"
+    );
+
+    // It is no longer a candidate here (an affordance that could only be a
+    // no-op is not offered), and its own space still has it.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+    })
+    .unwrap();
+    wait_until(cx, "the second read lands", |cx| {
+        view.read_with(cx, |v, _| {
+            v.inspector_invite_for_test().is_some_and(|(l, _)| {
+                !l.iter().any(|label| label == &visitor.label) || l.is_empty()
+            })
+        })
+    });
+    drain_runtime(&core);
+}
+
+#[gpui::test]
+fn inspector_a_notebook_offers_no_grant_door(cx: &mut TestAppContext) {
+    // A notebook is an agent's private space, and whether an agent may be
+    // *granted* observer membership of another agent's notebook is a decision
+    // task 37 deliberately leaves open. Until it is made, the panel offers no
+    // new door there — app-core's rules are untouched, so nothing is
+    // foreclosed either way.
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the template seeds an agent")
+        .id;
+    let notebook = core
+        .runtime()
+        .block_on(core.promote_participant(agent.clone(), None, None))
+        .expect("promotion")
+        .notebook_space_id;
+
+    let (window, view) = open_participants_inspector(cx, &stores, &notebook);
+    wait_until(cx, "the notebook's settings land", |cx| {
+        stores.space_settings.read_with(cx, |s, _| {
+            s.settings(&notebook)
+                .value()
+                .is_some_and(|s| s.notebook_participant_id.is_some())
+        })
+    });
+    assert!(
+        !view.read_with(cx, |v, cx| v.inspector_offers_grant_door_for_test(cx)),
+        "a notebook withholds the grant door"
+    );
+
+    // An ordinary conversation still offers it.
+    let (_w2, view2) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "the space's settings land", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).value().is_some())
+    });
+    assert!(
+        view2.read_with(cx, |v, cx| v.inspector_offers_grant_door_for_test(cx)),
+        "an ordinary conversation offers the grant"
+    );
+    let _ = window;
+    drain_runtime(&core);
+}

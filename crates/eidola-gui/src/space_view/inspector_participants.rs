@@ -115,6 +115,56 @@ pub(crate) struct ParticipantAdd {
     notify_policy: String,
 }
 
+/// **The sentence a grant has to say** (task 37), for each of the two shapes a
+/// candidate comes in.
+///
+/// A shared agent joins by ordinary membership, and what the reader needs to
+/// know is what membership *is* here: it can read this conversation. A
+/// **space-owned** one cannot join at all without being shared first, so the
+/// sentence says that too — including the part that cannot be taken back, and
+/// the reassurance promotion actually earns (its persona where it works today
+/// is preserved byte-for-byte, because promotion moves ownership, not config).
+pub(crate) fn grant_statement(
+    label: &str,
+    shared: bool,
+    home_space_title: Option<&str>,
+) -> SharedString {
+    if shared {
+        return SharedString::from(format!(
+            "{label} will be able to read this conversation, including everything already in it."
+        ));
+    }
+    let home = match home_space_title {
+        Some(home) => format!(" It keeps its persona in {home} exactly as it is."),
+        None => String::new(),
+    };
+    SharedString::from(format!(
+        "{label} works in one conversation today, so adding it here shares it across spaces.\
+{home} It will be able to read this conversation, including everything already in it. \
+Sharing can't be undone."
+    ))
+}
+
+/// The open **"Invite an agent…"** form (task 37's grant): the candidates this
+/// space could give membership to, and — once one is chosen — the sentence that
+/// says what granting it means.
+///
+/// Its data is a **view-owned read**, not a store cell: the list is a transient
+/// picker's material, only ever looked at while this form is open, and killing
+/// its fetch when the window closes strands nothing (STATE.md's owner = blast
+/// radius). The *write* it leads to is the store's, like every other membership
+/// change.
+pub(crate) struct InviteForm {
+    pub(crate) focus: gpui::FocusHandle,
+    /// `None` while the read is in flight — the form says "Loading…" rather
+    /// than reading as an empty library.
+    pub(crate) candidates: Option<Vec<eidola_app_core::GrantableAgent>>,
+    /// A failed read, said out loud rather than shown as "nobody to invite".
+    pub(crate) error: Option<SharedString>,
+    /// The chosen candidate: `(id, label, shared, home space title)`.
+    pub(crate) confirming: Option<(String, SharedString, bool, Option<SharedString>)>,
+}
+
 /// The open "Save these participants as a template…" form.
 pub(crate) struct TemplateForm {
     focus: gpui::FocusHandle,
@@ -155,6 +205,27 @@ impl SpaceView {
             == Some(participant_id)
     }
 
+    /// Whether this space is some agent's private **notebook**.
+    ///
+    /// **Flagged, not decided** (task 37): whether an agent may be granted
+    /// observer membership of another agent's notebook is one of the two
+    /// questions the spec leaves to Mike, so this surface takes the
+    /// conservative reading and offers no *new* door here — app-core's rules
+    /// are unchanged either way (`add_global_participant` has never refused a
+    /// notebook), so nothing here forecloses the answer. If notebooks turn out
+    /// to be grantable, deleting this predicate's one use is the whole change.
+    fn inspector_space_is_a_notebook(&self, cx: &gpui::App) -> bool {
+        let Some(space_id) = self.space_id(cx) else {
+            return false;
+        };
+        self.stores
+            .space_settings
+            .read(cx)
+            .settings(&space_id)
+            .value()
+            .is_some_and(|s| s.notebook_participant_id.is_some())
+    }
+
     /// This space's membership as the store holds it.
     fn inspector_participants(&self, cx: &gpui::App) -> Vec<ParticipantInfo> {
         match self.space_id(cx) {
@@ -193,6 +264,13 @@ impl SpaceView {
                 .inspector_template_form
                 .as_ref()
                 .is_some_and(|t| holds(&t.focus))
+            // The invite form is the section's fourth, and it is a form in
+            // exactly this sense: its rows and verbs are tab stops, so a
+            // keystroke inside it is a keystroke inside the panel.
+            || self
+                .inspector_invite
+                .as_ref()
+                .is_some_and(|i| holds(&i.focus))
     }
 
     // -- Test seams --------------------------------------------------------
@@ -301,6 +379,7 @@ impl SpaceView {
         };
         self.inspector_participant_add = None;
         self.inspector_template_form = None;
+        self.inspector_invite = None;
         self.inspector_participant_picker = None;
         let is_referenced = p.source == "referenced";
         let label = cx.new(|cx| InputState::new(window, cx).default_value(&p.label));
@@ -613,6 +692,7 @@ impl SpaceView {
     pub fn inspector_begin_add_participant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.inspector_participant_edit = None;
         self.inspector_template_form = None;
+        self.inspector_invite = None;
         self.inspector_participant_picker = None;
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("Participant name"));
         label.update(cx, |s, cx| s.focus(window, cx));
@@ -684,11 +764,144 @@ impl SpaceView {
         cx.notify();
     }
 
+    // -- Inviting an agent (task 37's grant) -------------------------------
+
+    /// Open the invite form and start its read. The candidates come from
+    /// app-core's viewer-scoped listing, so this surface can only ever offer
+    /// agents this reader already knows about.
+    pub fn inspector_begin_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.inspector_participant_edit = None;
+        self.inspector_participant_add = None;
+        self.inspector_template_form = None;
+        self.inspector_participant_picker = None;
+        self.inspector_invite = Some(InviteForm {
+            focus: cx.focus_handle(),
+            candidates: None,
+            error: None,
+            confirming: None,
+        });
+        let (Some(space_id), Some(core)) = (self.space_id(cx), self.stores.app_core()) else {
+            // No backend (stub mode) or no space yet: the form stands empty and
+            // honest rather than spinning forever.
+            if let Some(form) = self.inspector_invite.as_mut() {
+                form.candidates = Some(Vec::new());
+            }
+            cx.notify();
+            return;
+        };
+        let rx = crate::bridge::list_grantable_agents(core, space_id);
+        self.inspector_invite_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = rx.await;
+            this.update(cx, |this, cx| {
+                if let Some(form) = this.inspector_invite.as_mut() {
+                    match result {
+                        Ok(Ok(candidates)) => form.candidates = Some(candidates),
+                        Ok(Err(err)) => {
+                            form.candidates = Some(Vec::new());
+                            form.error = Some(SharedString::from(err.to_string()));
+                        }
+                        // A dropped receiver is a closing window; say nothing.
+                        Err(_) => {}
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Arm the confirmation for one candidate — where the consequence is said.
+    pub fn inspector_arm_invite(&mut self, participant_id: &str, cx: &mut Context<Self>) {
+        let Some(form) = self.inspector_invite.as_mut() else {
+            return;
+        };
+        let Some(candidate) = form
+            .candidates
+            .as_ref()
+            .and_then(|c| c.iter().find(|c| c.id == participant_id))
+        else {
+            return;
+        };
+        form.confirming = Some((
+            candidate.id.clone(),
+            SharedString::from(candidate.label.clone()),
+            candidate.shared,
+            candidate.home_space_title.clone().map(SharedString::from),
+        ));
+        cx.notify();
+    }
+
+    pub fn inspector_cancel_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.inspector_field_focused(window, cx);
+        self.inspector_invite = None;
+        self.inspector_invite_task = None;
+        self.hand_back_inspector_focus(held, window, cx);
+        cx.notify();
+    }
+
+    /// Grant the armed candidate membership of this space, as an observer.
+    pub fn inspector_confirm_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(space_id) = self.space_id(cx) else {
+            return;
+        };
+        let Some((participant_id, _, shared, _)) = self
+            .inspector_invite
+            .as_ref()
+            .and_then(|f| f.confirming.clone())
+        else {
+            return;
+        };
+        self.stores.participants.update(cx, |s, cx| {
+            s.grant_membership(space_id, participant_id, shared, cx)
+        });
+        self.inspector_cancel_invite(window, cx);
+    }
+
+    /// Whether the roster offers the grant door here (the notebook question,
+    /// asked of the surface rather than of a painted frame).
+    #[doc(hidden)]
+    pub fn inspector_offers_grant_door_for_test(&self, cx: &gpui::App) -> bool {
+        !self.inspector_space_is_a_notebook(cx)
+    }
+
+    /// Seed the invite form's candidates without a backend — the driver and
+    /// the visual harness run on stub stores, where there is nothing to list.
+    #[doc(hidden)]
+    pub fn seed_invite_candidates_for_test(
+        &mut self,
+        candidates: Vec<eidola_app_core::GrantableAgent>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(form) = self.inspector_invite.as_mut() {
+            form.candidates = Some(candidates);
+        }
+        cx.notify();
+    }
+
+    /// What the invite form is showing (behavior tests read the transition
+    /// here rather than through the painted panel): the candidate labels, and
+    /// the sentence an armed candidate is showing.
+    #[doc(hidden)]
+    pub fn inspector_invite_for_test(&self) -> Option<(Vec<String>, Option<SharedString>)> {
+        let form = self.inspector_invite.as_ref()?;
+        Some((
+            form.candidates
+                .as_ref()
+                .map(|c| c.iter().map(|c| c.label.clone()).collect())
+                .unwrap_or_default(),
+            form.confirming
+                .as_ref()
+                .map(|(_, label, shared, home)| grant_statement(label, *shared, home.as_deref())),
+        ))
+    }
+
     // -- Save as template --------------------------------------------------
 
     pub fn inspector_begin_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.inspector_participant_edit = None;
         self.inspector_participant_add = None;
+        self.inspector_invite = None;
         let default_title = self
             .space_title(cx)
             .map(|t| t.to_string())
@@ -1011,6 +1224,33 @@ impl SpaceView {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.inspector_begin_add_participant(window, cx)
                     })),
+            ),
+        };
+
+        col = match (
+            self.inspector_invite.is_some(),
+            self.inspector_space_is_a_notebook(cx),
+        ) {
+            (true, _) => col.child(self.render_inspector_invite_form(cx)),
+            // A notebook withholds the grant door — see
+            // `inspector_space_is_a_notebook`.
+            (false, true) => col,
+            (false, false) => col.child(
+                div()
+                    .id("space-inspector-participants-invite")
+                    .probe(
+                        "space/inspector/participants/invite",
+                        gpui::Role::Button,
+                        "Invite an agent",
+                    )
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(link)
+                    .hover(move |s| s.text_color(fg))
+                    .child("Invite an agent…")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.inspector_begin_invite(window, cx)),
+                    ),
             ),
         };
 
@@ -1489,6 +1729,150 @@ impl SpaceView {
                     )),
             )
             .into_any_element()
+    }
+
+    /// The invite form: who could join, and — once one is chosen — what
+    /// letting them in means.
+    fn render_inspector_invite_form(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let Some(form) = self.inspector_invite.as_ref() else {
+            return div().into_any_element();
+        };
+        let muted = theme.muted_foreground;
+        let fg = theme.foreground;
+        let mut col = v_flex()
+            .id("space-inspector-invite-form")
+            .track_focus(&form.focus)
+            .probe(
+                "space/inspector/participants/invite/form",
+                gpui::Role::Group,
+                "Invite an agent",
+            )
+            .w_full()
+            .p_2()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary.opacity(0.3));
+
+        if let Some((id, label, shared, home)) = form.confirming.clone() {
+            let statement = grant_statement(&label, shared, home.as_deref());
+            let verb = if shared {
+                "Add as observer"
+            } else {
+                "Share and add"
+            };
+            let _ = id;
+            return col
+                .child(
+                    div()
+                        .id("space-inspector-invite-note")
+                        .probe_value(
+                            "space/inspector/participants/invite/note",
+                            gpui::Role::Label,
+                            "What this grant does",
+                            statement.clone(),
+                        )
+                        .text_xs()
+                        .text_color(muted)
+                        .child(statement),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(ghost_button(
+                            "space-inspector-invite-cancel".into(),
+                            "space/inspector/participants/invite/cancel".into(),
+                            "Not now",
+                            false,
+                            cx,
+                            cx.listener(|this, _, window, cx| {
+                                this.inspector_cancel_invite(window, cx)
+                            }),
+                        ))
+                        .child(ghost_button(
+                            "space-inspector-invite-confirm".into(),
+                            "space/inspector/participants/invite/confirm".into(),
+                            verb,
+                            true,
+                            cx,
+                            cx.listener(|this, _, window, cx| {
+                                this.inspector_confirm_invite(window, cx)
+                            }),
+                        )),
+                )
+                .into_any_element();
+        }
+
+        col = col.child(field_label("Invite an agent", cx));
+        match form.candidates.as_ref() {
+            // A read in flight knows nothing — and an unanswered list is not an
+            // empty one (the Agents pane's rule).
+            None => {
+                col = col.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted.opacity(0.8))
+                        .child("Loading…"),
+                );
+            }
+            Some(candidates) if candidates.is_empty() => {
+                let line = match &form.error {
+                    Some(err) => err.clone(),
+                    None => {
+                        SharedString::from("Every agent you could invite already takes part here.")
+                    }
+                };
+                col = col.child(div().text_xs().text_color(muted).child(line));
+            }
+            Some(candidates) => {
+                for (i, candidate) in candidates.iter().enumerate() {
+                    let line = match (&candidate.home_space_title, candidate.shared) {
+                        (_, true) => SharedString::from(candidate.label.clone()),
+                        (Some(home), false) => {
+                            SharedString::from(format!("{} — from {home}", candidate.label))
+                        }
+                        (None, false) => SharedString::from(candidate.label.clone()),
+                    };
+                    let id = candidate.id.clone();
+                    col = col.child(
+                        div()
+                            .id(SharedString::from(format!("space-inspector-invite-{i}")))
+                            .probe(
+                                format!("space/inspector/participants/invite/{i}"),
+                                gpui::Role::Button,
+                                line.clone(),
+                            )
+                            .w_full()
+                            .px_1()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .truncate()
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(theme.muted).text_color(fg))
+                            .child(line)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.inspector_arm_invite(&id, cx)
+                            })),
+                    );
+                }
+            }
+        }
+        // The way out is offered in **every** state — empty and failed
+        // included: a form whose only exit is a successful listing is a dead
+        // end in exactly the state a reader most needs to leave it.
+        col = col.child(h_flex().justify_end().child(ghost_button(
+            "space-inspector-invite-close".into(),
+            "space/inspector/participants/invite/cancel".into(),
+            "Cancel",
+            false,
+            cx,
+            cx.listener(|this, _, window, cx| this.inspector_cancel_invite(window, cx)),
+        )));
+        col.into_any_element()
     }
 
     fn render_inspector_template_form(&self, cx: &mut Context<Self>) -> AnyElement {
