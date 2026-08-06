@@ -295,6 +295,31 @@ impl ParticipantsStore {
         });
     }
 
+    /// **Share** a space-owned agent across spaces — task 36's in-place
+    /// promotion (`scope: 'space' → 'global'` on the same row).
+    ///
+    /// It rides the same `write; re-list` shape as every other mutation here,
+    /// and that is the whole GUI story: the participant keeps its id, the space
+    /// keeps it as a member with NULL overrides, and the re-list comes back with
+    /// `source == "referenced"` — so the row's **"shared"** tag and the editor's
+    /// override fork appear by themselves, with nothing view-side to update.
+    ///
+    /// **One-way**: app-core offers no demotion (it would strand memberships and
+    /// memory), so there is no unshare here either — retirement is the
+    /// soft-remove.
+    pub fn promote(&mut self, space_id: String, participant_id: String, cx: &mut Context<Self>) {
+        self.write_then_relist(space_id, cx, move |core| {
+            Box::pin(async move {
+                bridge(core, move |c| async move {
+                    c.promote_participant(participant_id).await
+                })
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            })
+        });
+    }
+
     /// Remove an agent participant from a space (the shared human can't be).
     pub fn remove(&mut self, space_id: String, participant_id: String, cx: &mut Context<Self>) {
         let s = space_id.clone();
