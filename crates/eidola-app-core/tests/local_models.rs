@@ -180,6 +180,53 @@ fn failed_download_surfaces_error_and_cleans_up() {
     });
 }
 
+/// A failed download leaves a row standing for an error, not for a file:
+/// the listing must keep it (the error is the point) while the *selectable*
+/// surface must not offer an id whose only possible outcome is a load
+/// failure. Its status is `Available` — the same status a scanned idle file
+/// carries — so `on_disk` is what has to be read.
+#[test]
+fn a_failed_download_is_listed_but_never_selectable() {
+    run(|| {
+        let (core, _dir) = bare_core();
+
+        let mock = core.runtime().block_on(async {
+            let mock = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(500))
+                .mount(&mock)
+                .await;
+            mock
+        });
+
+        core.runtime()
+            .block_on(core.download_local_model(format!("{}/ghost.gguf", mock.uri())))
+            .expect("download starts");
+
+        let state = wait_for_state(&core, |s| {
+            s.models
+                .iter()
+                .any(|m| m.slug == "ghost" && m.last_error.is_some())
+        });
+        let row = state.models.iter().find(|m| m.slug == "ghost").unwrap();
+        assert!(!row.on_disk, "nothing was ever written for this row");
+        assert_eq!(
+            row.status,
+            LocalModelStatus::Available,
+            "status alone would read as a usable file"
+        );
+
+        let offered = core
+            .runtime()
+            .block_on(core.backend_models("local".into()))
+            .expect("local backend lists");
+        assert!(
+            !offered.iter().any(|m| m.id == "ghost@local"),
+            "a row with no file behind it must not be offered: {offered:?}"
+        );
+    });
+}
+
 #[test]
 fn download_rejects_bad_urls_and_duplicates() {
     run(|| {

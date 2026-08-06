@@ -926,6 +926,7 @@ mod driver {
                         total: Some(6_975_877_728),
                     },
                     last_error: None,
+                    on_disk: false,
                 },
                 LocalModelInfo {
                     id: "gemma-4-E2B_q4_0-it@local".into(),
@@ -940,6 +941,7 @@ mod driver {
                         pinned: false,
                     },
                     last_error: None,
+                    on_disk: true,
                 },
                 LocalModelInfo {
                     id: "gemma-4-E4B_q4_0-it@local".into(),
@@ -950,6 +952,7 @@ mod driver {
                     source_url: None,
                     status: LocalModelStatus::Available,
                     last_error: None,
+                    on_disk: true,
                 },
             ],
         }

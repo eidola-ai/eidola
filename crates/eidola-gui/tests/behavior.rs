@@ -1230,6 +1230,7 @@ fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext
                     pinned: false,
                 },
                 last_error: None,
+                on_disk: true,
             }],
         });
     });
@@ -1296,6 +1297,7 @@ fn space_model_display_splits_name_and_backend(cx: &mut TestAppContext) {
                 source_url: None,
                 status: eidola_app_core::LocalModelStatus::Available,
                 last_error: None,
+                on_disk: true,
             }],
         });
     });
@@ -1326,6 +1328,90 @@ fn space_model_display_splits_name_and_backend(cx: &mut TestAppContext) {
     });
 }
 
+/// The picker offers files, and a snapshot row is not always one: a failed
+/// download leaves a row carrying only its error, and a mid-download row's
+/// bytes are still in a `.part`. Both belong in Settings (that is where the
+/// error and the progress are read) and neither can be picked.
+#[gpui::test]
+fn model_picker_offers_only_rows_with_a_file_behind_them(cx: &mut TestAppContext) {
+    let row = |id: &str, status, on_disk| eidola_app_core::LocalModelInfo {
+        id: id.into(),
+        slug: id.split('@').next().unwrap().into(),
+        display_name: id.into(),
+        file_name: format!("{}.gguf", id.split('@').next().unwrap()),
+        size_bytes: None,
+        source_url: None,
+        status,
+        last_error: None,
+        on_disk,
+    };
+    let stores = stub_stores(cx, |s| {
+        s.local_models = Some(eidola_app_core::LocalModelsState {
+            engine_path: None,
+            models: vec![
+                row(
+                    "here@local",
+                    eidola_app_core::LocalModelStatus::Available,
+                    true,
+                ),
+                // The failed re-download of a slug whose file went away.
+                row(
+                    "gone@local",
+                    eidola_app_core::LocalModelStatus::Available,
+                    false,
+                ),
+                row(
+                    "coming@local",
+                    eidola_app_core::LocalModelStatus::Downloading {
+                        received: 1,
+                        total: None,
+                    },
+                    false,
+                ),
+            ],
+            external: vec![eidola_app_core::ExternalEngineBackend {
+                backend_id: "mine".into(),
+                display_name: "Mine".into(),
+                enabled: true,
+                models_dir: "/models".into(),
+                engine_path: None,
+                auto_start: false,
+                models: vec![
+                    row(
+                        "there@mine",
+                        eidola_app_core::LocalModelStatus::Available,
+                        true,
+                    ),
+                    row(
+                        "ghost@mine",
+                        eidola_app_core::LocalModelStatus::Available,
+                        false,
+                    ),
+                ],
+            }],
+        });
+    });
+    stores.local_models.read_with(cx, |s, _| {
+        assert_eq!(
+            s.selectable_models()
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["here@local"]
+        );
+        assert_eq!(
+            s.external_selectable_models("mine")
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["there@mine"]
+        );
+        // Settings still shows every row — the error and the progress live there.
+        assert_eq!(s.models().len(), 3);
+        assert_eq!(s.external_models("mine").len(), 2);
+    });
+}
+
 #[gpui::test]
 fn local_models_store_pin_op_is_stub_safe(cx: &mut TestAppContext) {
     // The pin/unpin op follows the standard thin-initiating-call shape:
@@ -1348,6 +1434,7 @@ fn local_models_store_pin_op_is_stub_safe(cx: &mut TestAppContext) {
                     pinned: false,
                 },
                 last_error: None,
+                on_disk: true,
             }],
         });
     });

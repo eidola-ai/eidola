@@ -81,12 +81,17 @@ impl LocalModelsStore {
 
     /// The managed store's *selectable* models — everything on disk
     /// (loaded, warming, or not-yet-loaded; a request loads on demand).
-    /// Mid-download models are excluded (no file to serve yet). The "On
-    /// this device" group of the model picker.
+    /// The "On this device" group of the model picker.
+    ///
+    /// `on_disk` is the whole test: a row is not always a file. One still
+    /// downloading has only a `.part`, and a failed download leaves a row
+    /// carrying nothing but its error — picking either could only fail at
+    /// load time. Both stay in [`Self::models`], where Settings shows the
+    /// progress or the error.
     pub fn selectable_models(&self) -> Vec<LocalModelInfo> {
         self.models()
             .iter()
-            .filter(|m| !matches!(m.status, LocalModelStatus::Downloading { .. }))
+            .filter(|m| m.on_disk)
             .cloned()
             .collect()
     }
@@ -118,13 +123,13 @@ impl LocalModelsStore {
             .collect()
     }
 
-    /// One llamacpp backend's *selectable* models — everything scanned
-    /// except mid-download (a request loads on demand); its group in the
-    /// model picker.
+    /// One llamacpp backend's *selectable* models — everything the scan
+    /// actually found (a request loads on demand); its group in the model
+    /// picker. Same `on_disk` test as [`Self::selectable_models`].
     pub fn external_selectable_models(&self, backend_id: &str) -> Vec<LocalModelInfo> {
         self.external_models(backend_id)
             .into_iter()
-            .filter(|m| !matches!(m.status, LocalModelStatus::Downloading { .. }))
+            .filter(|m| m.on_disk)
             .collect()
     }
 

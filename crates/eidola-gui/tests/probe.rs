@@ -1180,6 +1180,7 @@ fn space_streaming_turn_reads_loading_model_while_its_engine_warms(cx: &mut Test
             source_url: None,
             status,
             last_error: None,
+            on_disk: true,
         }],
     };
     let scene = |cx: &mut TestAppContext, status: eidola_app_core::LocalModelStatus| {
@@ -2123,6 +2124,7 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
                 source_url: None,
                 status: LocalModelStatus::Available,
                 last_error: None,
+                on_disk: true,
             }],
         }],
         models: vec![
@@ -2135,6 +2137,7 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
                 source_url: None,
                 status: LocalModelStatus::Available,
                 last_error: None,
+                on_disk: true,
             },
             LocalModelInfo {
                 id: "tiny-b@local".into(),
@@ -2149,6 +2152,7 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
                     pinned: false,
                 },
                 last_error: None,
+                on_disk: true,
             },
         ],
     }
@@ -2287,6 +2291,50 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
     assert!(
         !names.contains(&"settings/backends/my-box/model/0/delete".to_string()),
         "a llamacpp backend's files are the user's: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// A catalog entry whose download failed leaves a row named exactly like the
+/// entry, with no file behind it. "Installed" *replaces* the Download verb,
+/// so reading that row as installed would take away the retry the row's own
+/// error line is asking for.
+#[gpui::test]
+fn a_failed_catalog_download_still_affords_downloading(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::{BackendsSettingsView, BackendsTab};
+
+    let _guard = probes_on();
+
+    let entry = &eidola_app_core::LOCAL_MODEL_CATALOG[0];
+    let mut state = local_models_fixture();
+    state.models = vec![eidola_app_core::LocalModelInfo {
+        id: format!("{}@local", entry.id),
+        slug: entry.id.into(),
+        display_name: entry.display_name.into(),
+        file_name: entry.file_name.into(),
+        size_bytes: None,
+        source_url: None,
+        status: eidola_app_core::LocalModelStatus::Available,
+        last_error: Some("connection reset".into()),
+        on_disk: false,
+    }];
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.backends = backends_fixture();
+        s.local_models = Some(state);
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| v.select_tab(BackendsTab::Local, cx));
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/backends/local/catalog/0/download".to_string()),
+        "a row with no file behind it must keep its Download verb: {names:?}"
     );
 
     probe::set_probes_enabled(false);
@@ -3050,6 +3098,7 @@ fn same_name_on_two_backends() -> eidola_app_core::LocalModelsState {
         source_url: None,
         status: LocalModelStatus::Available,
         last_error: None,
+        on_disk: true,
     };
     LocalModelsState {
         engine_path: Some("/opt/homebrew/bin/llama-server".into()),

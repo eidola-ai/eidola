@@ -995,7 +995,13 @@ impl BackendsSettingsView {
         out.push(subsection_header("Gemma 4 — official releases", cx).into_any_element());
         let mut catalog = v_flex().w_full();
         for (idx, entry) in LOCAL_MODEL_CATALOG.iter().enumerate() {
-            let installed = models.iter().any(|m| m.file_name == entry.file_name);
+            // `on_disk`, not row existence: a failed (or still streaming)
+            // download of this entry leaves a row named `<slug>.gguf` with no
+            // file behind it, and "Installed" *replaces* the Download verb —
+            // marking it would take away the retry.
+            let installed = models
+                .iter()
+                .any(|m| m.file_name == entry.file_name && m.on_disk);
             let mut row = h_flex()
                 .w_full()
                 .py_2()
