@@ -1959,6 +1959,149 @@ pub async fn list_global_agents(conn: &Connection) -> Result<Vec<GlobalAgentRow>
     Ok(out)
 }
 
+/// What [`grant_space_membership_tx`] did — the decision it took *inside* the
+/// transaction, reported so the caller can build its outcome and decide what to
+/// announce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GrantDecision {
+    /// The row was space-owned: promoted, and the membership written in the
+    /// same transaction. Carries what the promotion minted.
+    Promoted {
+        home_space_id: String,
+        notebook_space_id: String,
+    },
+    /// The row was already a shared global: membership joined (or revived).
+    Joined,
+    /// It was already a live member of this space — nothing to do. A competing
+    /// promotion that granted this very destination lands here.
+    AlreadyAMember,
+}
+
+/// **Grant `participant_id` membership of `space_id`, promoting first if — and
+/// only if — the row is still space-owned.** Task 37's grant, with the branch
+/// moved inside the transaction.
+///
+/// The picker's snapshot cannot decide this. It records whether a candidate was
+/// shared when the *list* landed, and another window sharing that agent before
+/// the reader confirms makes the snapshot a lie: a caller branching on it asked
+/// for a promotion of an already-global row, which is refused — for a
+/// membership that could simply have been added, and (when the competing
+/// promotion granted this very space) about a state that already held (Codex
+/// review, PR #280). So the scope is read where the write happens, under the
+/// same `BEGIN`, and each branch still carries its own premise into its own
+/// statement: `promote_participant_tx_body`'s `WHERE scope = 'space'` and
+/// `ensure_space_participant`'s `WHERE EXISTS (… removed_at IS NULL)`.
+///
+/// The caller's up-front refusals (unknown space, unknown/retired participant,
+/// not an agent, the shared human, a template-scoped row) still belong to the
+/// caller: they are typed errors a reader can act on, and finding them out in
+/// here would be a rollback where a message belongs.
+pub async fn grant_space_membership_tx(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    role: &str,
+    notebook_space_id: &str,
+    now: i64,
+) -> Result<GrantDecision, AppError> {
+    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    let body = grant_space_membership_tx_body(
+        conn,
+        space_id,
+        participant_id,
+        role,
+        notebook_space_id,
+        now,
+    )
+    .await;
+    match body {
+        Ok(decision) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(decision)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn grant_space_membership_tx_body(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    role: &str,
+    notebook_space_id: &str,
+    now: i64,
+) -> Result<GrantDecision, AppError> {
+    let row = get_participant(conn, participant_id)
+        .await?
+        .ok_or_else(|| AppError::NotConfigured {
+            message: format!("participant not found: {participant_id}"),
+        })?;
+    if row.removed_at.is_some() {
+        return Err(AppError::Config {
+            message: format!("{} has been retired and cannot rejoin a space", row.label),
+        });
+    }
+    // Already a live member: satisfied. This is the whole point of deciding
+    // here — the competing promotion may have granted this very space, and an
+    // operation that reports failure about a state that already holds is
+    // telling the reader something untrue.
+    let already = space_participants(conn, space_id)
+        .await?
+        .into_iter()
+        .any(|m| m.participant_id == participant_id);
+    if already {
+        return Ok(GrantDecision::AlreadyAMember);
+    }
+    match row.scope.as_str() {
+        "global" => {
+            ensure_space_participant(conn, space_id, participant_id, role, now).await?;
+            Ok(GrantDecision::Joined)
+        }
+        "space" => {
+            let home_space_id = row
+                .owner_space_id
+                .clone()
+                .ok_or_else(|| AppError::Internal {
+                    message: "space-owned participant has no owner space".into(),
+                })?;
+            // The promotion writes the home membership itself, so a grant
+            // naming the home space is satisfied by it rather than written
+            // twice (a second insert on the same key fails the transaction) —
+            // `promote_participant`'s own rule, applied here.
+            let grant = (space_id != home_space_id).then_some(MembershipGrant { space_id, role });
+            let notebook_title = format!("{} — notebook", row.label);
+            promote_participant_tx_body(
+                conn,
+                &Promotion {
+                    participant_id,
+                    home_space_id: &home_space_id,
+                    role: &row.role,
+                    notebook_space_id,
+                    notebook_title: &notebook_title,
+                    grant,
+                    persona: None,
+                    now,
+                },
+            )
+            .await?;
+            Ok(GrantDecision::Promoted {
+                home_space_id,
+                notebook_space_id: notebook_space_id.to_string(),
+            })
+        }
+        other => Err(AppError::Config {
+            message: format!(
+                "{} belongs to a space template, not a space, so it cannot be given membership \
+                 (scope: {other})",
+                row.label
+            ),
+        }),
+    }
+}
+
 /// One candidate for task 37's grant — an agent a reader could give membership
 /// of a space (see [`list_grantable_agents`]).
 #[derive(Clone, Debug)]

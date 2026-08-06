@@ -3211,6 +3211,99 @@ impl Inner {
         }
     }
 
+    /// **The grant** (task 37): give `participant_id` membership of `space_id`
+    /// as `role`, sharing it first if — and only if — it is still space-owned.
+    ///
+    /// One operation, because "which verb" is a question about a row that
+    /// another window can answer differently a moment later. The invite picker
+    /// records whether a candidate was shared when its list landed, and a
+    /// caller branching on that snapshot asks for a promotion of an
+    /// already-global row — refused, for a membership that could simply have
+    /// been added, and (when the competing promotion granted this very space)
+    /// about a state that already holds (Codex review, PR #280). The decision
+    /// moves inside the transaction: [`db::grant_space_membership_tx`].
+    ///
+    /// It is **not** `promote_participant` gaining tolerance for an
+    /// already-global row: that refusal is the Share affordance's own, and its
+    /// copy ("promotion is one-way and there is no demotion") is what a reader
+    /// who pressed *Share* needs to read. A grant is a different request — "let
+    /// this agent read this conversation" — and only it may be satisfied by a
+    /// row that is already shared.
+    ///
+    /// Refusals are decided here, before the transaction opens, so each is a
+    /// typed error rather than a rollback: unknown space, unknown or retired
+    /// participant, the shared human (a member of everywhere), Eidola-the-system
+    /// (a member of nowhere), and a non-agent. Emits [`Change::Participants`]
+    /// when something was written — a membership that already held writes
+    /// nothing and says nothing.
+    async fn grant_space_membership(
+        &self,
+        space_id: &str,
+        participant_id: &str,
+        role: MembershipRole,
+    ) -> Result<ParticipantInfo, AppError> {
+        let conn = self.db_conn().await?;
+        db::get_space(&conn, space_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            })?;
+        let row = db::get_participant(&conn, participant_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("participant not found: {participant_id}"),
+            })?;
+        if row.removed_at.is_some() {
+            return Err(AppError::Config {
+                message: format!("{} has been retired and cannot rejoin a space", row.label),
+            });
+        }
+        if participant_id == db::SYSTEM_PARTICIPANT_ID {
+            return Err(AppError::Config {
+                message: "Eidola itself is not a conversation participant".into(),
+            });
+        }
+        if participant_id == db::HUMAN_PARTICIPANT_ID {
+            return Err(AppError::Config {
+                message: "you already take part in every space you can see".into(),
+            });
+        }
+        if row.kind != "agent" {
+            return Err(AppError::Config {
+                message: format!(
+                    "only an agent can be given membership of a space (this is a {})",
+                    row.kind
+                ),
+            });
+        }
+        // Minted here so the transaction can be handed one: it is used only on
+        // the branch that promotes, and an unused uuid costs nothing.
+        let notebook_space_id = Uuid::now_v7().to_string();
+        let decision = db::grant_space_membership_tx(
+            &conn,
+            space_id,
+            participant_id,
+            role.as_str(),
+            &notebook_space_id,
+            now_ms(),
+        )
+        .await?;
+        if decision != db::GrantDecision::AlreadyAMember {
+            self.bus.emit(Change::Participants);
+        }
+        let member = db::space_participants(&conn, space_id)
+            .await?
+            .into_iter()
+            .find(|m| m.participant_id == participant_id)
+            .ok_or_else(|| AppError::Config {
+                message: format!(
+                    "{} could not be given membership — it may have been retired",
+                    row.label
+                ),
+            })?;
+        Ok(ParticipantInfo::from_effective(member))
+    }
+
     /// Promote a space-owned agent to a **global** identity — one colleague in
     /// many conversations (task 36).
     ///
@@ -8093,6 +8186,29 @@ impl AppCore {
             .spawn(async move {
                 inner
                     .add_global_participant(&space_id, &participant_id, role)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **The grant** (task 37): give an agent membership of a space as `role`,
+    /// sharing it first if it is still space-owned — one operation that decides
+    /// which from the row it finds, inside its own transaction. This is the
+    /// door the invite form uses; see the inner method for why the picker's
+    /// snapshot may not decide it. Emits [`Change::Participants`] when
+    /// something was written.
+    pub async fn grant_space_membership(
+        &self,
+        space_id: String,
+        participant_id: String,
+        role: MembershipRole,
+    ) -> Result<ParticipantInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .grant_space_membership(&space_id, &participant_id, role)
                     .await
             })
             .await

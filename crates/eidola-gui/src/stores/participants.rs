@@ -325,19 +325,25 @@ impl ParticipantsStore {
     /// **observer** — the read-only role the blocked-follow → grant → retry
     /// loop asks for.
     ///
-    /// One core call either way, and which one is decided by what the agent
-    /// already is: a shared agent joins by plain membership; a **space-owned**
-    /// one has to be shared first, and that pair travels as a single
-    /// transaction (`AppCore::promote_participant` carrying a `SpaceGrant`)
-    /// rather than two calls. Promotion is one-way, so a grant refused after a
-    /// promotion committed would leave the reader with an irreversible change
-    /// they never asked for on its own — the multi-call hazard this store's
-    /// share path already learned once (Codex review, PR #279).
+    /// **One core call, and it is not this store's job to say which.** A
+    /// space-owned agent has to be shared first and a shared one merely joins,
+    /// but *which* the row is is a fact another window can change between the
+    /// picker's listing and the reader's confirmation — and a store branching
+    /// on that snapshot asked for a promotion of an already-global row, which
+    /// app-core refuses, for a membership it would happily have added; where
+    /// the competing promotion granted this very space, it reported failure
+    /// about a state that already held (Codex review, PR #280). So the verb is
+    /// decided at the write, inside one transaction
+    /// (`AppCore::grant_space_membership`) — the same move that put the
+    /// persona inside the promoting transaction (PR #279), applied to the
+    /// choice of operation rather than to its arguments. The pair was never
+    /// allowed to be two calls anyway: promotion is one-way, so a grant refused
+    /// after a promotion committed leaves an irreversible change nobody asked
+    /// for.
     pub fn grant_membership(
         &mut self,
         space_id: String,
         participant_id: String,
-        shared: bool,
         cx: &mut Context<Self>,
     ) {
         let space = space_id.clone();
@@ -345,26 +351,9 @@ impl ParticipantsStore {
         self.write_then_settle(space_id, participant_id, cx, move |core| {
             Box::pin(async move {
                 bridge(core, move |c| async move {
-                    if shared {
-                        c.add_global_participant(
-                            space,
-                            pid,
-                            Some(eidola_app_core::MembershipRole::Observer),
-                        )
+                    c.grant_space_membership(space, pid, eidola_app_core::MembershipRole::Observer)
                         .await
                         .map(|_| ())
-                    } else {
-                        c.promote_participant(
-                            pid,
-                            None,
-                            Some(eidola_app_core::SpaceGrant {
-                                space_id: space,
-                                role: eidola_app_core::MembershipRole::Observer,
-                            }),
-                        )
-                        .await
-                        .map(|_| ())
-                    }
                 })
                 .await
                 .map_err(|e| e.to_string())
