@@ -4951,3 +4951,463 @@ fn space_inspector_shows_a_title_refusal_beside_a_standing_settings_one(cx: &mut
 
     probe::set_probes_enabled(false);
 }
+
+/// **The destination list is bounded *and* virtualized.** An unbounded column
+/// inside a popover clipped its own overflow, putting the far conversations out
+/// of reach; a capped height alone fixed the reach and left the cost, building
+/// an element — hover style, click closure, probe — for every conversation the
+/// reader has ever had, on every frame the picker stood open (Codex review, PR
+/// #280). The Library is a history, not a menu, so this takes the shape the
+/// doctrine already names for fixed-height lists: `uniform_list` renders the
+/// visible window and nothing else.
+#[gpui::test]
+fn space_quote_destination_list_is_bounded(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let many: Vec<_> = (0..60)
+        .map(|i| space_info(&format!("s{i}"), Some(&format!("Conversation {i}"))))
+        .collect();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.spaces = many;
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s0".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut post = probe_post("a1", "the quick brown fox");
+    post.blocks[0].id = "b1".into();
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+    draw(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+
+    let entries = fresh_entries(cx, window);
+    let (_, picker) = entries
+        .iter()
+        .find(|(n, _)| n == "space/quote-destination")
+        .expect("the picker painted");
+    assert!(
+        picker.bounds.size.height <= gpui::px(400.),
+        "59 destinations must not grow the popover past a popover's height: {:?}",
+        picker.bounds.size.height
+    );
+    // Only the visible window materializes. The count is what the frame paid
+    // for: 59 candidates, a 220px cap, 22px rows — a dozen or so, never the
+    // whole Library.
+    let rows = entries
+        .iter()
+        .filter(|(n, _)| {
+            n.starts_with("space/quote-destination/") && n[24..].parse::<u32>().is_ok()
+        })
+        .count();
+    assert!(
+        rows > 0 && rows <= 16,
+        "the list renders its visible window, not all 59 destinations: {rows}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|(n, _)| n == "space/quote-destination/0"),
+        "starting at the top"
+    );
+    // And the list itself is the `List` landmark, since `uniform_list` cannot
+    // carry a role.
+    assert_probe(
+        &entries,
+        "space/quote-destination/list",
+        gpui::Role::List,
+        "Conversations",
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/quote-destination/58"),
+        "the far end of the index is not materialized at rest"
+    );
+
+    // **The arc the single tab stop exists for.** The list holds the keyboard,
+    // End moves the cursor to the last destination, and `scroll_to_item`
+    // materializes it — so a row no tab order could have contained is now
+    // painted, readable, and the one Enter would arm.
+    cx.simulate_keystrokes(window, "end");
+    let entries = fresh_entries(cx, window);
+    let (_, last) = entries
+        .iter()
+        .find(|(n, _)| n == "space/quote-destination/58")
+        .expect("the cursor scrolled the last destination into being");
+    assert_eq!(last.role, gpui::Role::ListItem, "a managed descendant");
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/quote-destination/0"),
+        "…and the window moved: the first row is gone from the slice"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **The index has three states, and the picker reads all of them** (Codex
+/// review, PR #280). `list()` answers `&[]` for a read that failed exactly as
+/// it does for a genuinely empty Library, so collapsing them told the reader
+/// "no other conversations" about a failure — with nothing to press, and
+/// nothing else in a space window that ever re-reads the index.
+#[gpui::test]
+fn space_quote_destination_reads_the_index_states_apart(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    // An index that has not answered: `stub` leaves an empty seed `NotLoaded`.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+    });
+    let spaces = stores.spaces.clone();
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut post = probe_post("a1", "the quick brown fox");
+    post.blocks[0].id = "b1".into();
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+    draw(cx, window);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+
+    let unanswered = fresh_entries(cx, window);
+    assert_probe_value(
+        &unanswered,
+        "space/quote-destination/empty",
+        gpui::Role::Label,
+        "Conversations",
+        "Loading…",
+    );
+    assert!(
+        !unanswered
+            .iter()
+            .any(|(n, _)| n == "space/quote-destination/retry"),
+        "a read in flight is not a failure, so there is nothing to retry yet"
+    );
+
+    // A failed *initial* read: say so, and offer the door back — the only one
+    // there is, since nothing else in this window re-reads the index.
+    cx.update(|cx| {
+        spaces.update(cx, |s, cx| {
+            s.settle_for_test(None, Err("database is locked"), None, cx)
+        });
+    });
+    let failed = fresh_entries(cx, window);
+    assert_probe_value(
+        &failed,
+        "space/quote-destination/empty",
+        gpui::Role::Label,
+        "Conversations",
+        "Couldn't load your conversations.",
+    );
+    assert_probe(
+        &failed,
+        "space/quote-destination/retry",
+        gpui::Role::Button,
+        "Retry",
+    );
+
+    // And a genuinely empty Library keeps the honest sentence, with nothing to
+    // retry — a reader with one conversation has nowhere else to quote into.
+    cx.update(|cx| {
+        spaces.update(cx, |s, cx| {
+            s.settle_for_test(None, Ok(Vec::new()), None, cx)
+        });
+    });
+    let empty = fresh_entries(cx, window);
+    assert_probe_value(
+        &empty,
+        "space/quote-destination/empty",
+        gpui::Role::Label,
+        "Conversations",
+        "No other conversations yet.",
+    );
+    assert!(
+        !empty
+            .iter()
+            .any(|(n, _)| n == "space/quote-destination/retry"),
+        "nothing failed, so nothing offers a retry"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The cross-space creation UI and the denied-follow notice (task 37): the
+/// destination picker's rows, the statement the reader must be shown, its two
+/// verbs, and the notice's own dismiss — every one a driver target and an
+/// AccessKit node.
+#[gpui::test]
+fn space_probes_record_the_quote_destination_and_denied_follow(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.spaces = vec![
+            space_info("s", Some("Here")),
+            space_info("other", Some("Tides")),
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut post = probe_post("a1", "the quick brown fox");
+    post.blocks[0].id = "b1".into();
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+    draw(cx, window);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/quote-destination".to_string())
+            && names.contains(&"space/quote-destination/0".to_string()),
+        "the destination picker and its rows are probed: {names:?}"
+    );
+
+    // Arming one grows the statement — carried as the node's **value**, the
+    // channel a screen reader reads, because it is the content of the surface
+    // rather than its name.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.arm_quote_destination_for_test("other", "Tides", window, cx)
+        });
+    })
+    .unwrap();
+    draw(cx, window);
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let note = entries
+        .iter()
+        .find(|(n, _)| n == "space/quote-destination/note")
+        .expect("the visibility statement is probed");
+    assert!(
+        note.1
+            .value
+            .as_ref()
+            .is_some_and(|v| v.contains("visible to everyone in Tides")),
+        "the statement names the destination: {:?}",
+        note.1.value
+    );
+    let names: Vec<String> = entries.iter().map(|(n, _)| n.to_string()).collect();
+    assert!(
+        names.contains(&"space/quote-destination/confirm".to_string())
+            && names.contains(&"space/quote-destination/cancel".to_string()),
+        "both verbs are probed: {names:?}"
+    );
+
+    // The denied follow's quiet notice: an Alert carrying its sentence, plus a
+    // dismiss.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.close_quote_destination(window, cx);
+            v.report_navigation_failure_for_test(
+                eidola_app_core::error::AppError::NotAParticipant {
+                    participant_id: "p1".into(),
+                    action_id: "a-private".into(),
+                },
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    draw(cx, window);
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let notice = entries
+        .iter()
+        .find(|(n, _)| n == "space/reference-notice")
+        .expect("the denial notice is probed");
+    assert_eq!(notice.1.role, gpui::Role::Alert);
+    let said = notice.1.value.clone().unwrap_or_default();
+    assert!(
+        said.contains("don't take part in"),
+        "the sentence rides as the value: {said}"
+    );
+    assert!(
+        !said.contains("a-private") && !said.contains("p1"),
+        "and it names nothing about the refused conversation: {said}"
+    );
+    let names: Vec<String> = entries.iter().map(|(n, _)| n.to_string()).collect();
+    assert!(
+        names.contains(&"space/reference-notice/dismiss".to_string()),
+        "the notice is dismissible: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **The candidate list is bounded and virtualized.** The picker offers every
+/// live agent the reader could add, and a seeded space owns an agent — so this
+/// list grows with their *conversations*, exactly as the Library does (Codex
+/// review, PR #280). The panel around it scrolls, which the virtualized-list
+/// doctrine warns about; the warning's mechanism is `Auto` sizing collapsing
+/// with no parent height to fill, and this list's height is explicit, so the
+/// question is settled here rather than argued: the rows paint, and only the
+/// visible ones do.
+#[gpui::test]
+fn space_inspector_invite_list_is_bounded(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let (window, view) = open_participants_inspector(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+        view.update(cx, |v, cx| {
+            v.seed_invite_candidates_for_test(
+                (0..60)
+                    .map(|i| eidola_app_core::GrantableAgent {
+                        id: format!("agent-{i}"),
+                        label: format!("Agent {i}"),
+                        shared: true,
+                        home_space_title: None,
+                    })
+                    .collect(),
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    let entries = fresh_entries(cx, window);
+    let rows = entries
+        .iter()
+        .filter(|(n, _)| {
+            n.starts_with("space/inspector/participants/invite/")
+                && n.rsplit('/')
+                    .next()
+                    .is_some_and(|t| t.parse::<u32>().is_ok())
+        })
+        .count();
+    assert!(
+        rows > 0,
+        "the list renders inside the panel's own scroller — it does not collapse: {:?}",
+        entries.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    assert!(
+        rows <= 14,
+        "…and only its visible window, never all 60 candidates: {rows}"
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/participants/invite/list",
+        gpui::Role::List,
+        "Agents you can invite",
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/inspector/participants/invite/59"),
+        "the far end is not materialized at rest"
+    );
+
+    // The same arc: the list is the tab stop, End moves the cursor to the last
+    // candidate, and `scroll_to_item` materializes it.
+    let list = view
+        .read_with(cx, |v, _| v.invite_list_focus_handle())
+        .expect("the form is open");
+    cx.update_window(window, |_, window, cx| window.focus(&list, cx))
+        .unwrap();
+    cx.simulate_keystrokes(window, "end");
+    let entries = fresh_entries(cx, window);
+    let (_, last) = entries
+        .iter()
+        .find(|(n, _)| n == "space/inspector/participants/invite/59")
+        .expect("the cursor scrolled the last candidate into being");
+    assert_eq!(last.role, gpui::Role::ListItem, "a managed descendant");
+
+    // **Reopening starts at the top.** The scroll handle is a view field, so it
+    // outlives the form: a reopened list left showing the far end while its
+    // fresh cursor sat on candidate 0 would arm someone nobody could see
+    // (Codex review, PR #280).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_cancel_invite(window, cx));
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+        view.update(cx, |v, cx| {
+            v.seed_invite_candidates_for_test(
+                (0..60)
+                    .map(|i| eidola_app_core::GrantableAgent {
+                        id: format!("agent-{i}"),
+                        label: format!("Agent {i}"),
+                        shared: true,
+                        home_space_title: None,
+                    })
+                    .collect(),
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert!(
+        entries
+            .iter()
+            .any(|(n, _)| n == "space/inspector/participants/invite/0"),
+        "the reopened list shows the candidate its cursor is on"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "space/inspector/participants/invite/59"),
+        "…and not where the last one was left"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The grant door (task 37): "Invite an agent…" beside Add, and the form it
+/// opens — whose exit is probed in every state, including the one where the
+/// stub has no backend to list candidates from.
+#[gpui::test]
+fn space_inspector_invite_probes_its_door_and_its_form(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let (window, view) = open_participants_inspector(cx);
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/inspector/participants/invite".to_string()),
+        "the grant door sits with the roster's other verbs: {names:?}"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/inspector/participants/invite/form".to_string()),
+        "the form is a named group: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/inspector/participants/invite/cancel".to_string()),
+        "and its way out is offered even with nothing to list: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/inspector/participants/invite".to_string()),
+        "the door is replaced by the form it opened: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}

@@ -628,6 +628,146 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_quote_destination",
+                description: "Space view: quoting into another conversation — the destination picker over the page (task 37's creation UI)",
+                default_size: size(px(860.), px(760.)),
+                build: |window, cx| {
+                    let stores = stub_stores(cx, |s| {
+                        s.config_state = Some(config_state(true));
+                        s.eidola_trust = Some(eidola_trust());
+                        s.models = models();
+                        s.backends = backends();
+                        s.participants = Some(participants_fixture());
+                        s.spaces = fixtures::destination_spaces();
+                    });
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    let (posts, _) = fixtures::quoted_reference_posts();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(posts.into_iter().take(1).collect(), cx)
+                    });
+                    view.update(cx, |v, cx| {
+                        v.seed_quote_destination_for_test(
+                            "q1",
+                            "blk-1",
+                            "kimi-k2",
+                            "the care is real",
+                            None,
+                            cx,
+                        )
+                    });
+                    let _ = window;
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_quote_visibility",
+                description: "Space view: the visibility statement — a chosen destination and what quoting into it means, the step the reader confirms (task 37)",
+                default_size: size(px(860.), px(760.)),
+                build: |window, cx| {
+                    let stores = stub_stores(cx, |s| {
+                        s.config_state = Some(config_state(true));
+                        s.eidola_trust = Some(eidola_trust());
+                        s.models = models();
+                        s.backends = backends();
+                        s.participants = Some(participants_fixture());
+                        s.spaces = fixtures::destination_spaces();
+                    });
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    let (posts, _) = fixtures::quoted_reference_posts();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(posts.into_iter().take(1).collect(), cx)
+                    });
+                    view.update(cx, |v, cx| {
+                        v.seed_quote_destination_for_test(
+                            "q1",
+                            "blk-1",
+                            "kimi-k2",
+                            "the care is real",
+                            Some(("tides", "Tides and the moon")),
+                            cx,
+                        )
+                    });
+                    let _ = window;
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_reference_denied",
+                description: "Space view: a quote followed into a conversation you take no part in — the quiet, non-leaking refusal (task 37)",
+                default_size: size(px(860.), px(760.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    let (posts, _) = fixtures::quoted_reference_posts();
+                    space.update(cx, |s, cx| s.set_post_tree_for_test(posts, cx));
+                    view.update(cx, |v, cx| {
+                        v.report_navigation_failure_for_test(
+                            eidola_app_core::error::AppError::NotAParticipant {
+                                participant_id: "p-ada".into(),
+                                action_id: "a-private".into(),
+                            },
+                            cx,
+                        )
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_inspector_invite",
+                description: "Space inspector: the grant — inviting an agent from another conversation as an observer, with the sentence that says what sharing costs (task 37)",
+                default_size: size(px(900.), px(760.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
+                    });
+                    view.update(cx, |v, cx| {
+                        v.set_inspector_open_for_test(true, window, cx);
+                        v.inspector_begin_invite(window, cx);
+                        v.seed_invite_candidates_for_test(fixtures::grantable_agents(), cx);
+                        v.inspector_arm_invite("agent-mara", window, cx);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "onboarding",
                 description: "Onboarding window: the first-run 'Get Started' slide flow (scroll-snap, branching CTAs)",
                 default_size: size(px(640.), px(760.)),

@@ -38,7 +38,7 @@ use eidola_app_core::{
     AppCore, ChatResult, ChatStreamEvent, IncomingReference, NotificationPlan, PostNode,
     PostReference, PostTrace, ReferenceSpec, SpaceMessage,
 };
-use gpui::{Context, EventEmitter, Task};
+use gpui::{AnyWindowHandle, Context, EventEmitter, Task, WindowId};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::bridge;
@@ -414,6 +414,63 @@ pub struct Space {
     /// so a reload — or the other window on the same space — can't collapse one
     /// under the reader.
     traces_expanded: std::collections::HashSet<String>,
+    /// Quotes handed to this space from **other windows** — task 37's
+    /// cross-space quote creation, in flight.
+    ///
+    /// A draft is window-local by design (STATE.md: two windows on one space
+    /// are two cursors), so a quote made in space A's window cannot be written
+    /// into space B's composer directly: the two windows share nothing but this
+    /// entity. So the entity is the courier — a **queue** the receiving view
+    /// drains, after which each offer is an ordinary pending reference and
+    /// nothing durable happens until the draft is posted (accept-before-consume,
+    /// exactly as an in-space quote).
+    ///
+    /// **A queue, not a slot** (Codex review, PR #280). Each entry is a
+    /// confirmed act over a passage the reader chose, and quotes *compose* — a
+    /// draft carries as many references as it is given. A slot dropped the
+    /// first of two confirms silently whenever the destination had not redrawn
+    /// in between, which a minimised window makes ordinary. Order is the order
+    /// they were confirmed in, and that is the order their ordinals take.
+    ///
+    /// Entries are **addressed** (see [`PendingOffer::to`]) because "which
+    /// window" has to mean "the one the reader is looking at".
+    offered_quotes: std::collections::VecDeque<PendingOffer>,
+    /// The windows currently drawing this space, in the order they opened.
+    ///
+    /// A space is *not* a singleton on screen (see the GUI AGENTS.md window
+    /// model), and the entity is the only thing its windows share — so a
+    /// cross-window handoff that must land somewhere the reader can see has to
+    /// ask *here* whether this conversation is already open. Weakly, in effect:
+    /// a handle whose window has gone is dropped by [`Space::open_windows`],
+    /// the only reader, which answers against `cx.windows()`.
+    windows: Vec<AnyWindowHandle>,
+}
+
+/// A quote waiting in the mailbox, and the window it is waiting *for*.
+struct PendingOffer {
+    quote: OfferedQuote,
+    /// The window the sender presented to the reader — the only one allowed to
+    /// take this offer. `None` addresses no one in particular: the sender found
+    /// no window on this space and opened one, which does not exist yet at
+    /// offer time, so the next view to draw this space takes it.
+    ///
+    /// Without the address the mailbox is first-render-wins among *all* windows
+    /// on the space, which is a coin flip between the window that was raised
+    /// and any other one sharing this entity — the reader then looks at an
+    /// empty composer while the passage sits in a window behind it (Codex
+    /// review, PR #280).
+    to: Option<WindowId>,
+}
+
+/// A quote travelling between windows (see [`Space::offer_quote`]): the write
+/// spec app-core validates, plus the two strings the receiving draft's footnote
+/// row needs. It carries **no** node or space of the source window — the
+/// reference names a concrete generation and nothing else survives the trip.
+#[derive(Clone, Debug)]
+pub struct OfferedQuote {
+    pub spec: eidola_app_core::ReferenceSpec,
+    pub byline: gpui::SharedString,
+    pub snippet: gpui::SharedString,
 }
 
 impl EventEmitter<SpaceEvent> for Space {}
@@ -441,6 +498,8 @@ impl Space {
             traces: Loadable::NotLoaded,
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
+            offered_quotes: std::collections::VecDeque::new(),
+            windows: Vec::new(),
         }
     }
 
@@ -467,6 +526,8 @@ impl Space {
             traces: Loadable::NotLoaded,
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
+            offered_quotes: std::collections::VecDeque::new(),
+            windows: Vec::new(),
         };
         space.load_transcript(cx);
         space
@@ -494,6 +555,8 @@ impl Space {
             traces: Loadable::NotLoaded,
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
+            offered_quotes: std::collections::VecDeque::new(),
+            windows: Vec::new(),
         }
     }
 
@@ -509,6 +572,30 @@ impl Space {
         &self.transcript
     }
 
+    /// Whether the transcript has **answered** — the precondition for anything
+    /// that attaches itself to the post tree.
+    ///
+    /// A window opened on an existing conversation draws several frames before
+    /// its first read lands, and in those frames the tree is not "empty", it is
+    /// *unknown*: `sync_tail_drafts` mints no tail composer, and anything that
+    /// picks a parent from what it can see picks the root (see
+    /// `SpaceView::adopt_offered_quote`). One predicate, so the two cannot
+    /// drift.
+    ///
+    /// **A retained value is an answer.** The question is "is there a tree on
+    /// screen to attach to", and `Failed { prior: Some(..) }` — a *refresh*
+    /// that failed over a listing we still hold — is exactly that: `messages()`
+    /// reads through `Loadable::value`, so those posts are what the reader is
+    /// looking at and what the tail composer already hangs off. Asking only for
+    /// `Loaded` left a quote sent to such a window waiting in the mailbox
+    /// indefinitely, with a usable tail draft in plain sight (Codex review, PR
+    /// #280). What still waits is a load with **no** value behind it —
+    /// `NotLoaded`, `Loading`, and a failed *initial* read — which is the state
+    /// the gate was introduced for.
+    pub fn transcript_visible(&self) -> bool {
+        self.transcript.value().is_some()
+    }
+
     /// The transcript as a slice (empty if not loaded).
     pub fn messages(&self) -> &[ChatMessageView] {
         self.transcript.value().map(|v| v.as_slice()).unwrap_or(&[])
@@ -517,6 +604,123 @@ impl Space {
     /// The in-flight streaming turns, in start (`seq`) order.
     pub fn streams(&self) -> &[StreamingTurn] {
         &self.streams
+    }
+
+    // -- The windows drawing this space ------------------------------------
+
+    /// Record that a window has opened onto this space. Called once per
+    /// `SpaceView`, at construction — the view's whole life is its window's.
+    pub fn attach_window(&mut self, window: AnyWindowHandle) {
+        self.windows.push(window);
+    }
+
+    /// The windows drawing this space right now, oldest first — dead handles
+    /// dropped in passing, since nothing tells the entity when a window closes.
+    ///
+    /// Deriving liveness from `cx.windows()` rather than tracking closes is the
+    /// same self-healing shape the singleton raise uses
+    /// (`try_focus_existing_singleton`): a stale id is simply not in the list.
+    pub fn open_windows(&mut self, cx: &gpui::App) -> &[AnyWindowHandle] {
+        let live: Vec<_> = cx.windows().iter().map(|w| w.window_id()).collect();
+        self.windows.retain(|h| live.contains(&h.window_id()));
+        &self.windows
+    }
+
+    // -- Cross-space quote handoff -----------------------------------------
+
+    /// Hand this space a quote made in another window (task 37's creation UI),
+    /// addressed to the window the sender is presenting (`to`); `None` when the
+    /// sender is opening one and there is no window to name yet.
+    ///
+    /// It is deliberately **not** merged with anything: a second offer replaces
+    /// the first, because an undelivered offer means the addressed window has
+    /// not drawn yet and the newer one is what the reader just asked for.
+    /// Nothing durable happens here — the receiving view attaches it to a
+    /// draft, and the draft is what a post consumes.
+    pub fn offer_quote(
+        &mut self,
+        quote: OfferedQuote,
+        to: Option<WindowId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.offered_quotes.push_back(PendingOffer { quote, to });
+        cx.notify();
+    }
+
+    /// Take every offer that is `window`'s to take, oldest first — **the whole
+    /// batch in one drain**, not one per frame, because two confirms are two
+    /// references on one draft and a reader who made them both should see them
+    /// both at once.
+    ///
+    /// Three kinds are `window`'s: those **addressed** to it (so the window the
+    /// reader was just shown is the one that receives them), those addressed to
+    /// **no one** (the sender found no window and opened one; the next view to
+    /// draw this space takes them), and those **orphaned** — addressed to a
+    /// window that has since closed. An orphan has no better claimant than a
+    /// live window on the same conversation, and the alternative is a confirmed
+    /// passage stranded in an entity nobody drains. *Which* live window takes
+    /// an orphan is a race, deliberately: its addressee is gone, so any window
+    /// the reader can see beats none.
+    pub fn take_offered_quotes(&mut self, window: WindowId, cx: &gpui::App) -> Vec<OfferedQuote> {
+        let live = self.live_window_ids(cx);
+        let mut taken = Vec::new();
+        let mut kept = std::collections::VecDeque::with_capacity(self.offered_quotes.len());
+        for offer in std::mem::take(&mut self.offered_quotes) {
+            match offer.to {
+                // Unaddressed, mine, or orphaned — see the doc above.
+                None => taken.push(offer.quote),
+                Some(to) if to == window || !live.contains(&to) => taken.push(offer.quote),
+                Some(_) => kept.push_back(offer),
+            }
+        }
+        self.offered_quotes = kept;
+        taken
+    }
+
+    /// Re-address **every** offer waiting for `window` to no one in particular
+    /// — the sender's recovery when the window it addressed turned out to be
+    /// gone by the time it went to raise it. Unaddressed offers are taken by
+    /// the next view to draw this space, which is the window the sender opens
+    /// instead. All of them, because a failed raise says nothing about how many
+    /// passages were waiting on it.
+    pub fn readdress_offers_to_any_window(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        let mut moved = false;
+        for offer in self.offered_quotes.iter_mut() {
+            if offer.to == Some(window) {
+                offer.to = None;
+                moved = true;
+            }
+        }
+        if moved {
+            cx.notify();
+        }
+    }
+
+    /// Whether any offer is waiting for `window` (the `&self` render path's
+    /// question, asked before the `&mut` drain — the same three kinds).
+    pub fn has_offered_quote_for(&self, window: WindowId, cx: &gpui::App) -> bool {
+        let live = self.live_window_ids(cx);
+        self.offered_quotes
+            .iter()
+            .any(|o| o.to.is_none_or(|to| to == window || !live.contains(&to)))
+    }
+
+    /// Whether any offer is waiting at all, addressed or not (tests, and the
+    /// sender's own "is it still standing" question).
+    pub fn has_offered_quote(&self) -> bool {
+        !self.offered_quotes.is_empty()
+    }
+
+    /// The ids of the windows drawing this space that still exist — read-only,
+    /// because the drain's question is asked from a `&self` path too (the
+    /// pruning half lives in [`Self::open_windows`]).
+    fn live_window_ids(&self, cx: &gpui::App) -> Vec<WindowId> {
+        let open: Vec<WindowId> = cx.windows().iter().map(|w| w.window_id()).collect();
+        self.windows
+            .iter()
+            .map(|h| h.window_id())
+            .filter(|id| open.contains(id))
+            .collect()
     }
 
     // -- Incoming references (source highlights) ---------------------------
@@ -1605,6 +1809,18 @@ impl Space {
     #[doc(hidden)]
     pub fn set_post_tree_for_test(&mut self, nodes: Vec<PostNode>, cx: &mut Context<Self>) {
         self.transcript = Loadable::loaded(views_from_nodes(nodes));
+        cx.notify();
+    }
+
+    /// Test-only: fail the transcript's *refresh*, keeping the posts already
+    /// loaded — `Failed { prior: Some(..) }`, the state a bus-driven reload
+    /// lands in when the read behind it fails. The reader still sees the
+    /// conversation; only its freshness is in doubt.
+    #[doc(hidden)]
+    pub fn fail_transcript_refresh_for_test(&mut self, cx: &mut Context<Self>) {
+        self.transcript = std::mem::take(&mut self.transcript).resolve(Err(AppError::Internal {
+            message: "database is locked".into(),
+        }));
         cx.notify();
     }
 

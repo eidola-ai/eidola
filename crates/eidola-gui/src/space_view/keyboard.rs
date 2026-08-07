@@ -352,6 +352,25 @@ impl SpaceView {
             .unwrap_or_else(|| self.post_focus.clone())
     }
 
+    /// **Where the keyboard belongs when a surface that borrowed it closes** —
+    /// the reader's own place in the conversation if they have one, else the
+    /// view root.
+    ///
+    /// The same answer [`SpaceView::sync_tree_focus`]'s falling edge gives, so
+    /// a close that hands the keyboard back explicitly (the quote-destination
+    /// picker, which *takes* focus when it opens and so owes it back) agrees
+    /// with the observation that runs a frame later rather than fighting it:
+    /// restoring the level's own handle leaves that edge's `live` check true
+    /// and the level intact, and restoring the root when there is no level
+    /// leaves it early-returning as it always has.
+    pub(crate) fn keyboard_home(&self) -> FocusHandle {
+        match self.tree_focus.as_ref().map(|f| f.level.clone()) {
+            Some(FocusLevel::Post) => self.post_focus.clone(),
+            Some(FocusLevel::Affordance(i)) => self.affordance_slot_or_post(i),
+            None => self.focus_handle.clone(),
+        }
+    }
+
     /// Which affordance slot the window's focus is actually on, if any — the
     /// observation the level's index is resynced from.
     pub(crate) fn focused_affordance_slot(&self, window: &Window) -> Option<usize> {
@@ -374,6 +393,11 @@ impl SpaceView {
         self.context_menu.is_some()
             || self.band_menu.is_some()
             || self.highlight_picker.is_some()
+            // The quote-destination picker is one too, and for the sharper
+            // version of the same reason: it holds a passage on its way into
+            // another conversation, and a printable behind it would start a
+            // draft here instead.
+            || self.quote_destination.is_some()
             // The inspector's router dropdown is one too: it is a choice
             // hovering over the panel, and a printable behind it would start a
             // draft the reader cannot see.

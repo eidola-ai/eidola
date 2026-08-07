@@ -40,6 +40,8 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
+use eidola_app_core::error::AppError;
+
 use crate::actions::{Quote, QuoteInReply};
 use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
@@ -83,6 +85,86 @@ impl PostSelection {
             range_end: Some(self.range.end as i64),
             annotation: None,
         }
+    }
+}
+
+/// What a reader is told when a quote points into a conversation they take no
+/// part in (task 37's denial, the human arm).
+///
+/// It may confirm that the passage came from somewhere — existence is public
+/// **within this conversation**, which is the one the reader is in — and names
+/// nothing else: no title, no participants, not a byte of what is there. The
+/// wording is ours rather than the error's, so no future change to a typed
+/// error's `Display` can widen what this surface says.
+pub(crate) const FOLLOW_DENIED_HERE: SharedString = SharedString::new_static(
+    "That passage was quoted from a conversation you don't take part in, so there is nowhere \
+     to go from here.",
+);
+
+/// The open "quote into another conversation" picker (task 37's creation UI).
+///
+/// It holds the passage, because the reader's selection in the source post is
+/// dropped the moment the quote lands somewhere and because the picker outlives
+/// a click that lands elsewhere in the page. `confirming` is the second step:
+/// a chosen destination, held so the **visibility statement can name it** —
+/// which is the whole reason this is two steps and not a menu of one-click
+/// verbs.
+#[derive(Clone, Debug)]
+pub(crate) struct QuoteDestination {
+    pub(crate) selection: PostSelection,
+    pub(crate) confirming: Option<(String, SharedString)>,
+    /// The popover subtree's focus handle — what the handback asks containment
+    /// of, and where the keyboard goes when arming a destination unmounts the
+    /// row that was pressed (the rule `set_inspector_promote_confirm` states).
+    pub(crate) focus: gpui::FocusHandle,
+    /// **The list's single tab stop.** A virtualized list has one (the
+    /// Library's rule): `uniform_list` materializes only the visible window, so
+    /// a tab stop per row is a tab order that does not contain the rows nobody
+    /// has scrolled to — Tab walked off the end of the slice and out of the
+    /// picker (Codex review, PR #280). Tracked on the element carrying the
+    /// `List` role, because a handle on the `uniform_list` itself would focus a
+    /// node the AccessKit tree has no entry for.
+    pub(crate) list_focus: gpui::FocusHandle,
+    /// The roving cursor: which destination the keyboard is on. Read through
+    /// [`SpaceView::quote_destination_cursor`], never directly — the Library
+    /// index moves under it (a bus re-list, another window archiving), so the
+    /// stored value is clamped at every use rather than chased at every change.
+    pub(crate) cursor: usize,
+}
+
+/// Row height for the virtualized destination list. The rows are one line by
+/// construction (a conversation's title, truncated), so `uniform_list`'s
+/// single-measure layout holds — the doctrine's "normalize rows to an explicit
+/// `.h(ROW_H)`".
+const DESTINATION_ROW_H: gpui::Pixels = gpui::px(22.);
+
+/// The picker's list stops growing here: a popover, not a page. Below it the
+/// list is exactly as tall as its rows.
+const DESTINATION_LIST_MAX_H: gpui::Pixels = gpui::px(220.);
+
+/// **The sentence the creation UI must show** (task 37): what quoting into
+/// `title` means, in two facts a reader needs before they do it — who will be
+/// able to read the passage, and that it is a *copy* (references name concrete
+/// generations and are never remapped, so what leaves this conversation is
+/// exactly the bytes chosen, once).
+///
+/// Pure, so the wording is asserted directly rather than through a painted
+/// band, and so no destination can ever be shown without it.
+pub(crate) fn visibility_statement(title: &str) -> SharedString {
+    SharedString::from(format!(
+        "This passage will be visible to everyone in {title}. Quoting copies it — later edits \
+         here won't change it there."
+    ))
+}
+
+/// How a conversation reads in the destination picker — the Library's own
+/// rule (title, else the opening line, else "Untitled space"), so the two
+/// surfaces name the same conversation the same way.
+fn space_label(space: &eidola_app_core::SpaceInfo) -> SharedString {
+    match (&space.title, &space.snippet) {
+        (Some(t), _) => SharedString::from(t.clone()),
+        (None, Some(s)) => SharedString::from(s.clone()),
+        (None, None) => SharedString::from("Untitled space"),
     }
 }
 
@@ -514,15 +596,41 @@ impl SpaceView {
     }
 
     /// Push `selection` onto `draft_id` as its next reference and inject the
-    /// marker: the editor learns the embed map first (so the marker
-    /// materializes as a quote block the instant it lands), then the marker is
-    /// inserted at the caret through the editor's normal update pipeline (one
-    /// undo step; a marker dropped into a verbatim region degrades to literal
-    /// text, which is the documented honest behavior).
+    /// marker.
     fn attach_quote(
         &mut self,
         draft_id: &SharedString,
         selection: PostSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.attach_reference(
+            draft_id,
+            selection.spec(),
+            selection.byline.clone(),
+            selection.snippet.clone(),
+            window,
+            cx,
+        );
+    }
+
+    /// Push a reference onto `draft_id` and inject the marker: the editor
+    /// learns the embed map first (so the marker materializes as a quote block
+    /// the instant it lands), then the marker is inserted at the caret through
+    /// the editor's normal update pipeline (one undo step; a marker dropped
+    /// into a verbatim region degrades to literal text, which is the documented
+    /// honest behavior).
+    ///
+    /// Takes the reference's three parts rather than a [`PostSelection`],
+    /// because a **cross-space** quote arrives from another window with no
+    /// selection of ours behind it — the spec names a concrete generation, and
+    /// that is all that travels.
+    fn attach_reference(
+        &mut self,
+        draft_id: &SharedString,
+        spec: eidola_app_core::ReferenceSpec,
+        byline: SharedString,
+        snippet: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -532,9 +640,9 @@ impl SpaceView {
         let ordinal = draft.next_ordinal();
         draft.references.push(PendingReference {
             ordinal,
-            spec: selection.spec(),
-            byline: selection.byline.clone(),
-            snippet: selection.snippet.clone(),
+            spec,
+            byline,
+            snippet,
         });
         let embeds = draft.embed_map();
         let editor = draft.editor.clone();
@@ -548,6 +656,769 @@ impl SpaceView {
         let focus = editor.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    // -- Quote into another conversation ------------------------------------
+
+    /// `Edit > Quote in Another Conversation…` — the cross-space arm of the
+    /// quote affordances (task 37's creation UI).
+    ///
+    /// **The mechanism is a destination picker, not a drag**: a quote is a
+    /// write into a conversation, so it is chosen from a list of conversations
+    /// (the Library's own index), and the reader confirms a sentence naming
+    /// the one they picked. Cross-window drag would be a second, gestural way
+    /// to say the same thing with nowhere to put the sentence.
+    pub fn quote_elsewhere(
+        &mut self,
+        _: &crate::actions::QuoteElsewhere,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.post_selection.clone() else {
+            return;
+        };
+        // **A reveal focuses what it revealed** — the mount-side rule, owed by
+        // both doors this action has. The context-menu row is the one that
+        // makes it a defect rather than an inconvenience: `run_context_item`
+        // unmounts the focused menu row *before* dispatching here, so a
+        // keyboard reader was left holding a handle to a row nobody paints —
+        // keystrokes reaching nothing, Tab restarting from the window root —
+        // while the surface they had just asked for stood unfocused (Codex
+        // review, PR #280). The Edit-menu door owes it for the plainer reason:
+        // a picker you have to hunt for with Tab is not reachable.
+        let focus = cx.focus_handle();
+        let list_focus = cx
+            .focus_handle()
+            .tab_index(crate::focus::region::MAIN)
+            .tab_stop(true);
+        // **The reveal focuses the list, when there is one.** The list is the
+        // surface's single tab stop, so landing there is what makes ↑/↓ work
+        // the moment the picker opens; with nothing to list (an index still
+        // loading, a failed read, a reader with one conversation) that handle
+        // is tracked on no element this frame, and focusing it would be the
+        // dead handle this whole family of fixes is about — so the popover
+        // itself takes it, and it is live either way.
+        let here = self.space.read(cx).id().map(str::to_string);
+        match self.quote_destination_count(here.as_deref(), cx) {
+            0 => window.focus(&focus, cx),
+            _ => window.focus(&list_focus, cx),
+        }
+        self.quote_destination = Some(QuoteDestination {
+            selection,
+            confirming: None,
+            focus,
+            list_focus,
+            cursor: 0,
+        });
+        // Ask for a fresh index as the picker opens — what `OpenLibrary` does
+        // on every invocation, and the only thing that re-reads a `Failed` one
+        // besides a bus signal. A fresh scroll for a freshly opened list.
+        self.quote_destination_scroll = gpui::UniformListScrollHandle::new();
+        self.stores.spaces.update(cx, |s, cx| s.refresh(cx));
+        cx.notify();
+    }
+
+    /// Close the destination picker (Escape, click-out, Cancel). Returns
+    /// whether it was open — the Escape rung's answer.
+    ///
+    /// **A surface that took the keyboard owes it back.** The picker focuses
+    /// itself as it opens (above) and its rows and verbs are real tab stops, so
+    /// dropping it while it holds the focus leaves the window on a dead handle:
+    /// the reader's next keystroke reaches nothing and Tab restarts from the
+    /// window root (Codex review, PR #280). One door, so Escape, the click-out
+    /// and Cancel are covered by construction.
+    ///
+    /// Asked as **containment of the picker's subtree**, before the drop — the
+    /// idiom `hand_back_inspector_focus` uses — so a reader who clicked into
+    /// the page or the composer while it stood open keeps their caret: a
+    /// surface that was not holding the keyboard has none to give back.
+    pub fn close_quote_destination(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(dest) = self.quote_destination.take() else {
+            return false;
+        };
+        self.hand_back_quote_focus(&dest, window, cx);
+        cx.notify();
+        true
+    }
+
+    /// The picker's half of the handback: if its subtree still holds the
+    /// keyboard, put it where a closing overlay's keyboard belongs
+    /// ([`SpaceView::keyboard_home`] — the reader's place in the conversation
+    /// if they have one, else the view root), which is also what keeps the
+    /// falling edge of `sync_tree_focus` from disagreeing a frame later.
+    fn hand_back_quote_focus(
+        &self,
+        dest: &QuoteDestination,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if dest.focus.contains_focused(window, cx) {
+            window.focus(&self.keyboard_home(), cx);
+        }
+    }
+
+    /// Arm the confirmation for one destination: the picker keeps the passage
+    /// and grows the sentence that says who will be able to read it.
+    fn arm_quote_destination(
+        &mut self,
+        space_id: String,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dest) = self.quote_destination.as_mut() else {
+            return;
+        };
+        dest.confirming = Some((space_id, title));
+        // The chosen row unmounts with the list it was in; the surface itself
+        // survives, so the keyboard stays on it — and only if it was the
+        // surface holding it, so a pointer press elsewhere takes nothing.
+        let focus = dest.focus.clone();
+        if focus.contains_focused(window, cx) {
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// Send the quote to the confirmed destination: hand it to that space's
+    /// entity and present that conversation's window.
+    ///
+    /// The two windows share nothing but the [`Space`](crate::space::Space)
+    /// entity (a draft is window-local by design), so the entity is the
+    /// courier — see [`Space::offer_quote`](crate::space::Space::offer_quote).
+    /// Nothing durable happens here: the passage lands in a **draft**, which
+    /// the reader still has to post, and app-core validates the reference at
+    /// that write (a quote into a conversation you have left is refused there,
+    /// with zero trace, rather than being second-guessed here).
+    ///
+    /// **The window presented is the window holding the quote.** The
+    /// destination may already be open — the `Space` registry joins windows on
+    /// one entity — so this raises that window rather than opening a second one
+    /// onto the same conversation, and *addresses* the offer to it so the
+    /// one-shot mailbox cannot be drained by a window the reader never sees
+    /// (Codex review, PR #280: opening unconditionally left the reader looking
+    /// at a fresh, empty composer while an existing window had taken the
+    /// passage). This is a targeted navigation, not a `⌘N`/Library open, which
+    /// is what the window model's "no window dedup" residual covers; the
+    /// raise-or-open shape is [`crate::open_record_request`]'s.
+    fn send_quote_to_destination(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dest) = self.quote_destination.take() else {
+            return;
+        };
+        // The same handback: "Quote there" unmounts the verb that was pressed.
+        // The passage leaves for another window — which this raises — so what
+        // is owed *here* is only that this window's keyboard stays live, at the
+        // reader's place in the conversation they quoted from.
+        self.hand_back_quote_focus(&dest, window, cx);
+        let Some((space_id, _)) = dest.confirming else {
+            return;
+        };
+        let quote = crate::space::OfferedQuote {
+            spec: dest.selection.spec(),
+            byline: dest.selection.byline.clone(),
+            snippet: dest.selection.snippet.clone(),
+        };
+        // The same space may already be open in another window; `open` is
+        // get-or-create, so the offer reaches the one shared entity either way.
+        let space = self
+            .stores
+            .spaces
+            .update(cx, |spaces, cx| spaces.open(space_id.clone(), cx));
+        // The newest window on this conversation, if any — the one a reader who
+        // has several open was last working in.
+        let target = space.update(cx, |space, cx| space.open_windows(cx).last().copied());
+        space.update(cx, |space, cx| {
+            space.offer_quote(quote, target.map(|w| w.window_id()), cx)
+        });
+        // The quote has left this post; drop the selection so the same passage
+        // can't be sent twice by a second press (the in-space quote's rule).
+        self.post_selection = None;
+        let stores = self.stores.clone();
+        let intent = crate::lifecycle::intend_to_open(cx);
+        cx.defer(move |cx: &mut gpui::App| {
+            if !intent.still_wanted(cx) {
+                return;
+            }
+            if let Some(handle) = target {
+                if crate::raise_space_window(cx, handle) {
+                    return;
+                }
+                // The window went away between the offer and this defer. Its
+                // address now names nobody, so hand the offer back to whoever
+                // draws this space next — the window opened just below.
+                space.update(cx, |space, cx| {
+                    space.readdress_offers_to_any_window(handle.window_id(), cx)
+                });
+            }
+            crate::open_space_window(cx, stores, space_id);
+        });
+        let _ = window;
+        cx.notify();
+    }
+
+    /// Take a quote another window handed this space and attach it to a draft
+    /// — the receiving half of the handoff, drained once per offer at the head
+    /// of `render`.
+    ///
+    /// It lands exactly where `Edit > Quote` would put it (the branch's tail
+    /// composer, activated), because from here on it *is* an ordinary pending
+    /// reference: same ordinal minting, same footnote row, same
+    /// accept-before-consume.
+    ///
+    /// Offers are addressed, so a window that shares this space with the one
+    /// the sender presented draws straight past them (see
+    /// [`Space::take_offered_quotes`](crate::space::Space::take_offered_quotes)).
+    /// **All of this window's offers land in the same frame**, in the order
+    /// they were confirmed: two confirms are two references on one draft, and a
+    /// reader who made them both should not watch them arrive one frame apart.
+    pub(crate) fn adopt_offered_quotes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let here = window.window_handle().window_id();
+        if !self.space.read(cx).has_offered_quote_for(here, cx) {
+            return;
+        }
+        // **Wait for the tail this belongs to.** Quoting into a conversation
+        // that was not already open lands in a window whose first frames run
+        // before its transcript has answered, and `sync_tail_drafts` mints no
+        // composer in that state — so taking the offer there made
+        // `draft_for_quote` pick a parent from a tree with no posts in it: a
+        // *root* draft, attached to nothing on screen, submitting with no
+        // `reply_to` and persisted under whatever the tail turned out to be
+        // (Codex review, PR #280). The mailbox already survives frames, so the
+        // offer simply stays in it — no second pending mechanism — and is taken
+        // on the first frame there is somewhere for it to land.
+        //
+        // The same predicate `sync_tail_drafts` gates on, deliberately without
+        // its *streaming* half: a streaming space has a loaded tree, so
+        // `draft_for_quote`'s fallback picks the branch's last real post — a
+        // parent that exists — where waiting would leave the reader looking at
+        // the window they were just shown with an empty composer.
+        //
+        // Rethreading cannot cure this after the fact (the doctrine's usual
+        // move): `rethread_drafts` forwards a draft through the *identity* its
+        // parent named, and a root draft names nothing — "root because this
+        // space is empty" and "root because we had not read it yet" are the
+        // same value. A draft minted against an unloaded tree is a guess; the
+        // doctrine's drafts attach to what exists.
+        if !self.space.read(cx).transcript_visible() {
+            return;
+        }
+        // The gate above governs the drain **as a whole**: either this frame can
+        // hold the batch or none of it leaves the queue.
+        let offers = self
+            .space
+            .update(cx, |space, cx| space.take_offered_quotes(here, cx));
+        if offers.is_empty() {
+            return;
+        }
+        let Some(draft_id) = self.draft_for_quote(window, cx) else {
+            return;
+        };
+        for offer in offers {
+            self.attach_reference(
+                &draft_id,
+                offer.spec,
+                offer.byline,
+                offer.snippet,
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// The destination picker: which conversation to quote into, and — once one
+    /// is chosen — **the sentence that says what choosing it means**.
+    ///
+    /// The statement is the point of the surface (task 37): references name
+    /// concrete generations and are never remapped, so the source space leaks
+    /// exactly the bytes deliberately quoted, once — and the person doing the
+    /// quoting is the flow-control point. So the destination is named in the
+    /// sentence, and the verb below it is the only way through.
+    pub(crate) fn render_quote_destination(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let dest = self.quote_destination.as_ref()?;
+        let theme = cx.theme();
+        let here = self.space.read(cx).id().map(str::to_string);
+
+        let mut col = v_flex()
+            .id("space-quote-destination")
+            .track_focus(&dest.focus)
+            .probe(
+                "space/quote-destination",
+                gpui::Role::Group,
+                "Quote into another conversation",
+            )
+            // An opaque popover over the page (see `crate::overlay`).
+            .contain_mouse(Overlay::Popover)
+            .absolute()
+            .right(GUTTER_GAP)
+            .bottom(px(96.))
+            .w(px(320.))
+            .p_1()
+            .gap_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.close_quote_destination(window, cx);
+            }));
+
+        if let Some((_, title)) = dest.confirming.clone() {
+            // The mandatory statement, naming the destination.
+            let statement = visibility_statement(&title);
+            col = col
+                .child(
+                    div()
+                        .id("space-quote-destination-note")
+                        .px_1()
+                        .py_0p5()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .probe_value(
+                            "space/quote-destination/note",
+                            gpui::Role::Label,
+                            "What quoting there means",
+                            statement.clone(),
+                        )
+                        .child(statement),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .px_1()
+                        .py_0p5()
+                        .child(
+                            div()
+                                .id("space-quote-destination-confirm")
+                                .probe(
+                                    "space/quote-destination/confirm",
+                                    gpui::Role::Button,
+                                    SharedString::from(format!("Quote into {title}")),
+                                )
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .text_color(theme.foreground)
+                                .hover(|s| s.bg(theme.muted))
+                                .child("Quote there")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.send_quote_to_destination(window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("space-quote-destination-cancel")
+                                .probe(
+                                    "space/quote-destination/cancel",
+                                    gpui::Role::Button,
+                                    "Cancel",
+                                )
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .text_color(theme.muted_foreground)
+                                .hover(|s| s.bg(theme.muted))
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_quote_destination(window, cx);
+                                })),
+                        ),
+                );
+            return Some(col.into_any_element());
+        }
+
+        col = col.child(
+            div()
+                .px_1()
+                .pb_0p5()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Quote into"),
+        );
+
+        // **The index has states, and this surface has to read all of them**
+        // (Codex review, PR #280). `list()` answers `&[]` for a failed read
+        // exactly as it does for a real empty Library — the Library window's
+        // own "Failed is not empty" rule — so collapsing them said "No other
+        // conversations yet" about a read that failed, with nothing to press:
+        // quoting elsewhere was simply dead for the session, since the index is
+        // re-read only on a bus signal or an `OpenLibrary`.
+        let (load_error, has_listing) = {
+            let cell = self.stores.spaces.read(cx).index();
+            (cell.error().map(|e| e.to_string()), cell.has_value())
+        };
+        let destinations = self.quote_destination_count(here.as_deref(), cx);
+
+        if destinations == 0 {
+            let (line, retry) = match (&load_error, has_listing) {
+                // A failed *initial* read: say so, and offer the door back. The
+                // quiet retry line rather than the full `load_error_panel` — a
+                // 320px popover is the Library's "couldn't refresh" idiom, not
+                // its centred panel.
+                (Some(_), false) => ("Couldn't load your conversations.", true),
+                // Nothing has answered yet. A read in flight knows nothing, and
+                // an unanswered index is not an empty one.
+                (None, false) => ("Loading…", false),
+                // Genuinely empty (or empty-but-stale, which the retry says).
+                _ => ("No other conversations yet.", load_error.is_some()),
+            };
+            col = col.child(
+                div()
+                    .id("space-quote-destination-empty")
+                    // A static readout rides its own `Label` node (the a11y
+                    // rule): three states, three sentences, and which one is
+                    // showing is the whole point of Finding C.
+                    .probe_value(
+                        "space/quote-destination/empty",
+                        gpui::Role::Label,
+                        "Conversations",
+                        line,
+                    )
+                    .px_1()
+                    .py_0p5()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(line),
+            );
+            if retry {
+                col = col.child(self.quote_destination_retry(cx));
+            }
+            return Some(col.into_any_element());
+        }
+
+        // **A bounded, virtualized list.** Bounded because an unbounded column
+        // inside a popover clipped its own overflow — every conversation past
+        // the first handful unreachable — and **virtualized** because the
+        // Library is a history, not a menu: a capped height alone still built
+        // an element, with its own hover and click closures, for every
+        // conversation the reader has ever had, on every frame the picker
+        // stood open (Codex review, PR #280). This is the shape the doctrine
+        // already names for fixed-height lists (the Library's, the Record's):
+        // a dumb indexer over `uniform_list` rendering exactly the visible
+        // window. The height is exact rather than flex-derived — the rows are
+        // one line by construction, so the list is `count × ROW_H` capped at
+        // `MAX_H`, and `uniform_list` scrolls inside it.
+        let shown = px((destinations as f32 * DESTINATION_ROW_H.to_f64() as f32)
+            .min(DESTINATION_LIST_MAX_H.to_f64() as f32));
+        let list_focus = dest.list_focus.clone();
+        let list = gpui::uniform_list(
+            "space-quote-destination-list",
+            destinations,
+            cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                this.render_quote_destination_rows(range, window, cx)
+            }),
+        )
+        .h(shown)
+        .w_full()
+        .track_scroll(&self.quote_destination_scroll);
+        col = col.child(
+            div()
+                .id("space-quote-destination-list-wrap")
+                // `uniform_list` implements `InteractiveElement` but not
+                // `StatefulInteractiveElement`, where gpui's aria builders
+                // live, so the `List` parent goes on the wrapper that already
+                // spans it — the Library's rule.
+                .probe(
+                    "space/quote-destination/list",
+                    gpui::Role::List,
+                    "Conversations",
+                )
+                // The single tab stop lives on the element carrying the role
+                // (see `QuoteDestination::list_focus`), and the roving key map
+                // rides with it.
+                .track_focus(&list_focus)
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                    if this.handle_quote_destination_key(ev, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .relative()
+                .w_full()
+                .child(list)
+                .child(crate::scrollbar::vertical_floating(
+                    "quote-destination-scrollbar",
+                    &self.quote_destination_scroll,
+                )),
+        );
+        // A failed *refresh* over a listing we still hold keeps the rows — they
+        // are honest as of the last read — and says the last read is no longer
+        // the last word.
+        if load_error.is_some() {
+            col = col.child(self.quote_destination_retry(cx));
+        }
+        Some(col.into_any_element())
+    }
+
+    /// The **effective** roving cursor: clamped into the current listing, and
+    /// `None` when there is nothing to point at. Derived on read, because the
+    /// Library index moves under it — the Library's own rule, for the same
+    /// reason: a cursor one past the end is a dead Enter and a ring nobody
+    /// draws.
+    fn quote_destination_cursor(&self, cx: &gpui::App) -> Option<usize> {
+        let dest = self.quote_destination.as_ref()?;
+        let here = self.space.read(cx).id().map(str::to_string);
+        self.quote_destination_count(here.as_deref(), cx)
+            .checked_sub(1)
+            .map(|last| dest.cursor.min(last))
+    }
+
+    /// The destination list's roving-focus key map: ↑/↓ move the cursor,
+    /// Home/End take its ends, Enter arms the destination it sits on. Returns
+    /// whether it consumed the press.
+    ///
+    /// **Escape is deliberately not among them.** The picker holds a passage on
+    /// its way out of this conversation, and Escape means *dismiss* — a rung of
+    /// the space root's own chain (`close_quote_destination`). A roving cursor
+    /// that consumed Escape would shadow the only way out, so this handler
+    /// answers five keys and lets everything else propagate.
+    fn handle_quote_destination_key(
+        &mut self,
+        ev: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(dest) = self.quote_destination.as_ref() else {
+            return false;
+        };
+        // Gated on the **list** holding focus, not on containing it: once Tab
+        // has moved on, whatever it reached owns the keyboard.
+        if !dest.list_focus.is_focused(window) || ev.keystroke.modifiers.modified() {
+            return false;
+        }
+        let here = self.space.read(cx).id().map(str::to_string);
+        let count = self.quote_destination_count(here.as_deref(), cx);
+        let (Some(last), Some(cursor)) = (count.checked_sub(1), self.quote_destination_cursor(cx))
+        else {
+            return false;
+        };
+        let target = match ev.keystroke.key.as_str() {
+            "up" => cursor.saturating_sub(1),
+            "down" => (cursor + 1).min(last),
+            "home" => 0,
+            "end" => last,
+            "enter" => {
+                let picked = {
+                    let store = self.stores.spaces.read(cx);
+                    store
+                        .list()
+                        .iter()
+                        .filter(|s| here.as_deref() != Some(s.id.as_str()))
+                        .nth(cursor)
+                        .map(|s| (s.id.clone(), space_label(s)))
+                };
+                if let Some((id, label)) = picked {
+                    self.arm_quote_destination(id, label, window, cx);
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        self.move_quote_destination_cursor(target, cx);
+        true
+    }
+
+    /// Move the roving cursor and scroll it into view. **The scroll is what
+    /// makes one tab stop equivalent to a per-row one**: an off-screen row is
+    /// materialized by the list before it can be read.
+    fn move_quote_destination_cursor(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(dest) = self.quote_destination.as_mut() {
+            dest.cursor = idx;
+        }
+        self.quote_destination_scroll
+            .scroll_to_item(idx, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// **The cursor as the row renders it** — `None` unless the list itself
+    /// holds the keyboard. The invite list's twin, and the Library's rule: the
+    /// cursor is the row's focus identity, so a row may only claim it while the
+    /// list is the focused element. This surface reaches the ungated state
+    /// through Tab (its failed-index retry line is a stop beside the list) and
+    /// through a reader clicking back into the page with the picker still open
+    /// — where a persisting ring is two focus indications for one focus, and
+    /// the active descendant names a row that is not where focus is (Codex
+    /// review, PR #280).
+    fn quote_destination_cursor_row(&self, window: &Window, cx: &gpui::App) -> Option<usize> {
+        let dest = self.quote_destination.as_ref()?;
+        dest.list_focus
+            .is_focused(window)
+            .then(|| self.quote_destination_cursor(cx))
+            .flatten()
+    }
+
+    /// Test seam over [`Self::quote_destination_cursor_row`] — the computation
+    /// the rows render from.
+    #[doc(hidden)]
+    pub fn quote_destination_cursor_row_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Option<usize> {
+        self.quote_destination_cursor_row(window, cx)
+    }
+
+    /// Test seam: where the picker's roving cursor effectively sits.
+    #[doc(hidden)]
+    pub fn quote_destination_cursor_for_test(&self, cx: &gpui::App) -> Option<usize> {
+        self.quote_destination_cursor(cx)
+    }
+
+    /// Test seam: the list's own focus handle (the surface's single tab stop).
+    #[doc(hidden)]
+    pub fn quote_destination_list_focus_handle(&self) -> Option<gpui::FocusHandle> {
+        self.quote_destination
+            .as_ref()
+            .map(|d| d.list_focus.clone())
+    }
+
+    /// The destination list's **dumb indexer**: exactly the rows
+    /// `uniform_list` asks for, rebuilt from the store each frame.
+    ///
+    /// Reconstructed rather than cached because a bare range *can* reconstruct
+    /// it — the Library index plus "not this conversation" is the whole display
+    /// model — and a cached one would be another thing to invalidate when the
+    /// index moves. The scan is over `SpaceInfo` references; what virtualizing
+    /// removes is the per-row **element** (its hover style, its click closure,
+    /// its probe), which is what the frame actually pays for.
+    fn render_quote_destination_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let theme = cx.theme();
+        let muted = theme.muted;
+        let here = self.space.read(cx).id().map(str::to_string);
+        // **The range is applied before anything is cloned.** A dumb indexer
+        // that materializes the whole display model and then slices it has
+        // virtualized the *elements* and left the rest O(loaded) — half the
+        // move (Codex review, PR #280). The scan itself is over `SpaceInfo`
+        // references (a filter cannot be a `get(range)` the way the Library's
+        // unfiltered listing can); what stops at the visible window is every
+        // allocation: the id, the label, and the row.
+        let (total, visible) = {
+            let store = self.stores.spaces.read(cx);
+            let rows = store
+                .list()
+                .iter()
+                .filter(|s| here.as_deref() != Some(s.id.as_str()));
+            let visible: Vec<(String, SharedString)> = rows
+                .clone()
+                .skip(range.start)
+                .take(range.len())
+                .map(|s| (s.id.clone(), space_label(s)))
+                .collect();
+            (rows.count(), visible)
+        };
+        // Focus-gated, then modality-gated again for the ring alone.
+        let cursor = self.quote_destination_cursor_row(window, cx);
+        let on_cursor = |i: usize| cursor == Some(i);
+        let keyboard = window.last_input_was_keyboard();
+        visible
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (id, label))| {
+                let i = range.start + offset;
+                let for_arm = label.clone();
+                div()
+                    .id(SharedString::from(format!("space-quote-destination-{i}")))
+                    // The list holds the keyboard and moves a cursor over its
+                    // rows, so a row is a **managed descendant**, never a tab
+                    // stop — `probe_delegating`, the Library's rule.
+                    .probe_delegating(
+                        format!("space/quote-destination/{i}"),
+                        gpui::Role::ListItem,
+                        label.clone(),
+                    )
+                    // **Set position on a virtualized row**: AT sees six of six
+                    // hundred otherwise, and the index is over the *data* rows
+                    // (there are no other kinds here).
+                    .aria_position_in_set(i + 1)
+                    .aria_size_of_set(total)
+                    // The a11y state is not modality-gated: the cursor is where
+                    // the keyboard is whether or not the last press was one.
+                    .aria_selected(on_cursor(i))
+                    .when(on_cursor(i), |d| d.aria_active_descendant())
+                    .w_full()
+                    .h(DESTINATION_ROW_H)
+                    .flex()
+                    .items_center()
+                    .px_1()
+                    .rounded_sm()
+                    .text_xs()
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(muted))
+                    // The ring *is* modality-gated: a programmatic cursor must
+                    // not paint a keyboard indicator for a pointer user.
+                    .when(on_cursor(i) && keyboard, |d| {
+                        d.bg(muted)
+                            .shadow(crate::focus::ring_shadows(crate::focus::ring_colors()))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.arm_quote_destination(id.clone(), for_arm.clone(), window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// How many conversations this space may be quoted into: the Library index
+    /// less this one. A **count**, not a listing — the render needs the number
+    /// (for the list's height and the empty-state question) and nothing else,
+    /// and materializing a vector to ask its length is the same defect the
+    /// indexer above cures.
+    fn quote_destination_count(&self, here: Option<&str>, cx: &gpui::App) -> usize {
+        self.stores
+            .spaces
+            .read(cx)
+            .list()
+            .iter()
+            .filter(|s| here != Some(s.id.as_str()))
+            .count()
+    }
+
+    /// Test seam: run one frame's worth of the destination picker's work — the
+    /// count the render asks for plus the rows the list asks for — and answer
+    /// how many rows were built. What a frame pays for, callable without a
+    /// painted popover.
+    #[doc(hidden)]
+    pub fn quote_destination_frame_work_for_test(
+        &mut self,
+        range: std::ops::Range<usize>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let here = self.space.read(cx).id().map(str::to_string);
+        let _ = self.quote_destination_count(here.as_deref(), cx);
+        self.render_quote_destination_rows(range, window, cx).len()
+    }
+
+    /// The picker's quiet retry line — the Library's "couldn't refresh" strip,
+    /// in a popover. It is the **only** door to a fresh index from here: the
+    /// store re-reads on a bus `Change::SpaceIndex` or an `OpenLibrary`, so
+    /// without it a reader whose index failed has to know that opening the
+    /// Library is what fixes quoting elsewhere.
+    fn quote_destination_retry(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        div()
+            .id("space-quote-destination-retry")
+            .probe("space/quote-destination/retry", gpui::Role::Button, "Retry")
+            .px_1()
+            .py_0p5()
+            .text_xs()
+            .cursor_pointer()
+            .text_color(theme.muted_foreground)
+            .hover(|s| s.text_color(theme.foreground))
+            .child("Couldn't refresh — retry")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.stores.spaces.update(cx, |s, cx| s.refresh(cx));
+            }))
+            .into_any_element()
     }
 
     /// Drop a pending reference from a draft: remove the row **and** its embed
@@ -999,7 +1870,23 @@ impl SpaceView {
         let stores = self.stores.clone();
         let intent = crate::lifecycle::intend_to_open(cx);
         self.navigate_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some((item_id, space_id)))) = rx.await else {
+            let located = match rx.await {
+                Ok(Ok(located)) => located,
+                // **The denial the reader is allowed to see** (task 37 rule 4):
+                // the resolve is membership-gated, so a quote into a
+                // conversation this reader takes no part in refuses here. It is
+                // said in the app's voice and says nothing about that space —
+                // the typed error carries no title, participant or content, and
+                // the copy adds none. Any other failure is an ordinary error
+                // band; a cancelled receiver is a closing window, and silent.
+                Ok(Err(err)) => {
+                    this.update(cx, |this, cx| this.report_navigation_failure(err, cx))
+                        .ok();
+                    return;
+                }
+                Err(_) => return,
+            };
+            let Some((item_id, space_id)) = located else {
                 return;
             };
             let selected = this
@@ -1016,6 +1903,21 @@ impl SpaceView {
                 }
             });
         }));
+    }
+
+    /// A follow that could not be taken. A **refusal** is not a failure: it
+    /// gets the quiet notice (the cascade band's family — muted, dismissible),
+    /// worded in the app's own voice so nothing about the refused conversation
+    /// can ride along in a rendered error. Anything else is a real error and
+    /// takes the danger band.
+    fn report_navigation_failure(&mut self, err: AppError, cx: &mut Context<Self>) {
+        match err {
+            AppError::NotAParticipant { .. } => {
+                self.reference_notice = Some(FOLLOW_DENIED_HERE);
+            }
+            other => self.error = Some(other.to_string()),
+        }
+        cx.notify();
     }
 
     /// Select the post now carrying `item_id`'s current generation, if this
@@ -1244,6 +2146,97 @@ impl SpaceView {
             );
         }
         Some(col.into_any_element())
+    }
+
+    // -- Test seams ---------------------------------------------------------
+
+    /// Whether the quote-destination picker is open, and the statement it is
+    /// showing (`None` while it is still a list of conversations).
+    #[doc(hidden)]
+    pub fn quote_destination_for_test(&self) -> Option<Option<SharedString>> {
+        let dest = self.quote_destination.as_ref()?;
+        Some(
+            dest.confirming
+                .as_ref()
+                .map(|(_, title)| visibility_statement(title)),
+        )
+    }
+
+    /// Open the destination picker on a made-up selection — the driver and the
+    /// visual harness build a scene before any frame has minted the post
+    /// editors a real selection would come from (the same reason
+    /// `seed_draft_quote_for_test` exists).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_quote_destination_for_test(
+        &mut self,
+        action_id: &str,
+        block_id: &str,
+        byline: &str,
+        snippet: &str,
+        armed: Option<(&str, &str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.quote_destination = Some(QuoteDestination {
+            selection: PostSelection {
+                node_id: SharedString::from(action_id.to_string()),
+                action_id: action_id.to_string(),
+                block_id: block_id.to_string(),
+                range: 0..snippet.len(),
+                snippet: SharedString::from(snippet.to_string()),
+                byline: SharedString::from(byline.to_string()),
+            },
+            confirming: armed
+                .map(|(id, title)| (id.to_string(), SharedString::from(title.to_string()))),
+            focus: cx.focus_handle(),
+            list_focus: cx.focus_handle(),
+            cursor: 0,
+        });
+        cx.notify();
+    }
+
+    /// Choose a destination without a pointer (the rows are painted from the
+    /// Library index; the behavior tier drives the transition, the driver the
+    /// pixels).
+    #[doc(hidden)]
+    pub fn arm_quote_destination_for_test(
+        &mut self,
+        space_id: &str,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.arm_quote_destination(
+            space_id.to_string(),
+            SharedString::from(title.to_string()),
+            window,
+            cx,
+        );
+    }
+
+    /// The open destination picker's subtree focus handle (tests).
+    #[doc(hidden)]
+    pub fn quote_destination_focus_handle(&self) -> Option<gpui::FocusHandle> {
+        self.quote_destination.as_ref().map(|d| d.focus.clone())
+    }
+
+    /// Confirm the armed destination — the "Quote there" verb.
+    #[doc(hidden)]
+    pub fn confirm_quote_destination_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_quote_to_destination(window, cx);
+    }
+
+    /// Feed a resolve failure through the follow path's reporting rule — what
+    /// the app *says* when a follow is refused. The refusal itself is app-core's
+    /// (`action_location` is membership-gated, and its own tests pin both the
+    /// gate and the non-leaking payload); this seam pins the voice.
+    #[doc(hidden)]
+    pub fn report_navigation_failure_for_test(&mut self, err: AppError, cx: &mut Context<Self>) {
+        self.report_navigation_failure(err, cx);
     }
 }
 

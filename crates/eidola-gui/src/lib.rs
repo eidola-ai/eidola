@@ -45,7 +45,8 @@ use crate::about::AboutView;
 use crate::actions::{
     About, ActualSize, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize,
     NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenRecord, OpenSettings, Quit, QuitApp, Quote,
-    QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn, ZoomOut,
+    QuoteElsewhere, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn,
+    ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::lifecycle::LaunchOptions;
@@ -375,6 +376,7 @@ fn install_menus(cx: &mut App) {
                 // exists, so macOS greys them the rest of the time.
                 MenuItem::action("Quote", Quote),
                 MenuItem::action("Quote in Reply", QuoteInReply),
+                MenuItem::action("Quote in Another Conversation…", QuoteElsewhere),
             ],
             disabled: false,
         },
@@ -856,6 +858,25 @@ fn open_main_window(cx: &mut App) {
 /// installed.
 pub fn open_space_window(cx: &mut App, stores: Stores, space_id: String) {
     open_chat_window(cx, stores, Some(space_id));
+}
+
+/// Bring an already-open space window to the front. Returns whether it was
+/// still there to raise — a caller that addressed work to it (task 37's quote
+/// handoff) has to know, since a `false` means it must open one instead.
+///
+/// Space windows are non-singleton by design, so there is no `AppGlobal` slot
+/// to raise from: the handle comes from the `Space` entity's own list of the
+/// windows drawing it. `cx.activate` follows the raise for the same reason
+/// [`open_chat_window`] calls it — being made key within our app is not being
+/// brought forward from another one.
+pub fn raise_space_window(cx: &mut App, handle: gpui::AnyWindowHandle) -> bool {
+    let raised = handle
+        .update(cx, |_, window, _| window.activate_window())
+        .is_ok();
+    if raised {
+        cx.activate(true);
+    }
+    raised
 }
 
 /// Open a chat window onto a fresh blank space (⌘N). Takes the stores

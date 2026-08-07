@@ -403,6 +403,27 @@ pub struct SpaceView {
     /// quoted, awaiting a choice of which referencing post to visit. Window-
     /// local picker state, like the band menu.
     pub(crate) highlight_picker: Option<HighlightPicker>,
+    /// The open **quote-into-another-conversation** picker, if any (task 37's
+    /// creation UI): the passage, and — once a destination is chosen — the
+    /// destination the visibility statement names. Window-local transient
+    /// state, like the highlight picker it sits beside.
+    pub(crate) quote_destination: Option<references::QuoteDestination>,
+    /// Scroll position of the destination picker's bounded, **virtualized**
+    /// list — a stored `UniformListScrollHandle`, per the virtualized-list
+    /// idiom (it survives re-renders and is what the floating indicator binds
+    /// to). Reset to the top each time the picker opens.
+    pub(crate) quote_destination_scroll: gpui::UniformListScrollHandle,
+    /// One focus handle per **bottom band** — the failure notice, the
+    /// denied-follow notice, the cascade notice.
+    ///
+    /// Each band's Dismiss (and the failure band's Retry/Copy) is a real tab
+    /// stop, and dismissing unmounts the band around it, so a keyboard reader
+    /// who pressed one was left holding a handle to something nobody paints:
+    /// the dead-handle class again, on the surfaces this PR added and the two
+    /// beside them (Codex review, PR #280). Tracked on each band's container
+    /// while it paints, so the dismiss can ask *containment* before it clears
+    /// and hand the keyboard back only from a band that was holding it.
+    pub(crate) band_focus: [FocusHandle; 3],
     /// The open right-click menu over one of the space's editors, if any —
     /// window-local transient state, like the band menu and the picker (one
     /// open at a time; see [`context_menu`]).
@@ -682,6 +703,13 @@ pub struct SpaceView {
     /// exists). Full onboarding is a later, separate window.
     pub(crate) error: Option<String>,
 
+    /// A quiet notice about a **reference** that could not be followed (task
+    /// 37): the reader clicked a quote from a conversation they take no part
+    /// in. Its own field rather than `error`'s, because a refusal is not a
+    /// failure — nothing broke, there is nothing to retry, and the band it
+    /// renders in is the muted one.
+    pub(crate) reference_notice: Option<SharedString>,
+
     /// Whether this window's **inspector** (the per-space settings panel) is
     /// open. Per-window by design — two windows on one space are two vantage
     /// points, and the panel is a way of looking, not a property of the space
@@ -709,10 +737,21 @@ pub struct SpaceView {
     pub(crate) inspector_participant_add: Option<inspector_participants::ParticipantAdd>,
     /// The open "save these participants as a template" form, if any.
     pub(crate) inspector_template_form: Option<inspector_participants::TemplateForm>,
+    /// The open "Invite an agent…" form, if any — task 37's grant, where a
+    /// space gives an agent (shared, or one that has to be shared first)
+    /// membership as an observer.
+    pub(crate) inspector_invite: Option<inspector_participants::InviteForm>,
+    /// The invite form's own candidate read. View-owned: the list is only ever
+    /// looked at while the form is open, so a window closing mid-read strands
+    /// nothing (STATE.md — owner = blast radius).
+    pub(crate) inspector_invite_task: Option<Task<()>>,
     /// Which participant model dropdown is open (at most one).
     pub(crate) inspector_participant_picker: Option<inspector_participants::ParticipantPicker>,
     /// That dropdown's own scroll (reset to the top on each open).
     pub(crate) inspector_participant_picker_scroll: ScrollHandle,
+    /// Scroll position of the invite form's **virtualized** candidate list —
+    /// a stored `UniformListScrollHandle` per the virtualized-list idiom.
+    pub(crate) inspector_invite_scroll: gpui::UniformListScrollHandle,
 
     /// The window title last pushed to the platform (and to the a11y root
     /// node), so an unchanged title never re-enters AppKit every frame. The
@@ -743,6 +782,14 @@ impl SpaceView {
             Some(id) => spaces.update(cx, |s, cx| s.open(id, cx)),
             None => spaces.update(cx, |s, cx| s.blank(cx)),
         };
+        // Tell the entity this window is drawing it. A space is not a singleton
+        // on screen, so a cross-window handoff (task 37's quote) has to be able
+        // to ask whether this conversation is *already* open, and to address
+        // itself to one of the windows that has it. Registered on the entity
+        // rather than by space id because a blank ⌘N space is adopted into the
+        // registry only once it earns an id — the entity is what stays put.
+        let handle = window.window_handle();
+        space.update(cx, |space, _| space.attach_window(handle));
 
         let _subs = vec![
             // Any space change re-derives the render snapshot and re-renders.
@@ -808,6 +855,9 @@ impl SpaceView {
             body_subs: HashMap::new(),
             post_selection: None,
             highlight_picker: None,
+            quote_destination: None,
+            quote_destination_scroll: gpui::UniformListScrollHandle::new(),
+            band_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
             context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),
@@ -867,6 +917,7 @@ impl SpaceView {
             minimap_bounds: Rc::new(Cell::new(None)),
             minimap_drag: None,
             error: None,
+            reference_notice: None,
             inspector_open: false,
             inspector_scroll: ScrollHandle::new(),
             inspector_title: None,
@@ -876,8 +927,11 @@ impl SpaceView {
             inspector_participant_edit: None,
             inspector_participant_add: None,
             inspector_template_form: None,
+            inspector_invite: None,
+            inspector_invite_task: None,
             inspector_participant_picker: None,
             inspector_participant_picker_scroll: ScrollHandle::new(),
+            inspector_invite_scroll: gpui::UniformListScrollHandle::new(),
             window_title: None,
         };
         this.rebuild(cx);
@@ -2001,6 +2055,9 @@ impl Render for SpaceView {
         // before anything reads what it claims — `sync_tree_focus` below asks
         // whether an overlay owns the keyboard.
         self.sync_inspector_participant_edit(window, cx);
+        // …and an invite form over a space that turns out to be a notebook: the
+        // grant door is withheld there, and a form is a door left standing.
+        self.sync_inspector_invite(window, cx);
         // Tree focus is *observed*, not merely bookkept: see
         // `keyboard::sync_tree_focus`.
         self.sync_tree_focus(window, cx);
@@ -2040,6 +2097,11 @@ impl Render for SpaceView {
         // Keep a docked tail draft at the end of every branch (the always-present
         // composer that replaces the leaf "+").
         self.sync_tail_drafts(window, cx);
+        // A quote another window sent this space (task 37): take it and attach
+        // it to a draft. **After** `sync_tail_drafts`, so it lands in the
+        // branch's real tail composer rather than minting one that the sync
+        // would then prune.
+        self.adopt_offered_quotes(window, cx);
 
         let turns = self.stream_overlays(cx);
         let streaming = !turns.is_empty();
@@ -2261,6 +2323,10 @@ impl Render for SpaceView {
             // the clicked passage to visit. Above the composer, below the
             // notices — it's a choice, not a state.
             .children(self.render_highlight_picker(cx))
+            // The quote destination picker + its visibility statement: the
+            // same layer as the highlight picker — a choice, not a state.
+            .children(self.render_quote_destination(cx))
+            .child(self.render_reference_notice(cx))
             .child(self.render_cascade_band(cx))
             .child(self.render_error_band(cx))
             // The minimap is the last sibling, so it paints after the composer
@@ -2296,6 +2362,7 @@ impl Render for SpaceView {
             .when(self.post_selection.is_some(), |d| {
                 d.on_action(cx.listener(Self::quote))
                     .on_action(cx.listener(Self::quote_in_reply))
+                    .on_action(cx.listener(Self::quote_elsewhere))
             })
             // **The sole owner of "Escape closes the context menu."** Key
             // dispatch bubbles inner→outer, so the root runs *last* — after
@@ -2316,6 +2383,11 @@ impl Render for SpaceView {
                     // transient overlay, so the conversation's handler yields
                     // to it and something has to close it.
                     if this.close_inspector_picker(cx) {
+                        return;
+                    }
+                    // …and the quote-destination picker, an overlay of the
+                    // same kind over the conversation itself.
+                    if this.close_quote_destination(window, cx) {
                         return;
                     }
                     // …and its Participants section's model dropdown, which is
@@ -2857,6 +2929,9 @@ impl SpaceView {
             .child(
                 v_flex()
                     .id("space-error-band")
+                    // The band's own handle: its verbs are tab stops, so a
+                    // dismiss has to know whether it is holding the keyboard.
+                    .track_focus(&self.band_focus[Self::BAND_ERROR])
                     // Contained on the *card*, never on the transparent
                     // full-width wrapper above (which spans the window and
                     // would swallow clicks nowhere near the notice) — see
@@ -2908,7 +2983,9 @@ impl SpaceView {
                                         s.text_color(cx.theme().foreground).bg(cx.theme().muted)
                                     })
                                     .child("×")
-                                    .on_click(cx.listener(|this, _, _, cx| this.dismiss_error(cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.dismiss_error(window, cx)
+                                    })),
                             ),
                     )
                     .child(actions),
@@ -2921,10 +2998,29 @@ impl SpaceView {
     /// a later sibling turn finishing can't resurrect an orphaned notice and
     /// `can_retry` reads honestly (`false`) afterward. The saved user post and
     /// the composer are untouched — the space is already recovered.
-    pub fn dismiss_error(&mut self, cx: &mut Context<Self>) {
+    pub fn dismiss_error(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.band_holds_focus(Self::BAND_ERROR, window, cx);
         self.error = None;
         self.space.update(cx, |s, cx| s.clear_failed_turn(cx));
+        self.hand_back_band_focus(held, window, cx);
         cx.notify();
+    }
+
+    /// Whether the band at `slot` is the one holding the keyboard — asked
+    /// **before** it is cleared, because the answer is about the subtree that
+    /// is about to stop being painted.
+    fn band_holds_focus(&self, slot: usize, window: &Window, cx: &gpui::App) -> bool {
+        self.band_focus[slot].contains_focused(window, cx)
+    }
+
+    /// Give the keyboard back where a closing surface's keyboard belongs — the
+    /// reader's place in the conversation if they have one, else the view root
+    /// ([`Self::keyboard_home`]) — and only from a band that was holding it, so
+    /// a reader typing beside a notice keeps their caret.
+    fn hand_back_band_focus(&self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if held {
+            window.focus(&self.keyboard_home(), cx);
+        }
     }
 
     /// Re-ask the failed turn's participant (the notice's Retry action).
@@ -2946,10 +3042,127 @@ impl SpaceView {
         cx.notify();
     }
 
+    /// Dismiss the "that quote leads somewhere you're not" notice.
+    pub fn dismiss_reference_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.band_holds_focus(Self::BAND_REFERENCE, window, cx);
+        self.reference_notice = None;
+        self.hand_back_band_focus(held, window, cx);
+        cx.notify();
+    }
+
+    /// Test seam: a bottom band's own focus handle, if it is painting — the
+    /// question a dismiss asks containment of (0 failure, 1 denied-follow,
+    /// 2 cascade).
+    #[doc(hidden)]
+    pub fn band_focus_for_test(&self, slot: usize) -> Option<FocusHandle> {
+        self.band_focus.get(slot).cloned()
+    }
+
+    /// What the reference notice says right now (behavior tests read it here
+    /// rather than through the painted band).
+    #[doc(hidden)]
+    pub fn reference_notice_for_test(&self) -> Option<SharedString> {
+        self.reference_notice.clone()
+    }
+
+    /// Slots in [`SpaceView::band_focus`] — the failure notice, the denied-follow
+    /// notice, the cascade notice, in the precedence order they render in.
+    const BAND_ERROR: usize = 0;
+    const BAND_REFERENCE: usize = 1;
+    const BAND_CASCADE: usize = 2;
+
+    /// The quiet, dismissible **denied-follow** notice (task 37): a quote whose
+    /// source conversation this reader takes no part in. Muted, not danger —
+    /// nothing failed, and there is nothing to retry; the way onward is a
+    /// membership the reader would have to be given. It carries no Copy either:
+    /// the sentence is ours, fixed, and says all there is to say.
+    fn render_reference_notice(&self, cx: &Context<Self>) -> AnyElement {
+        let Some(notice) = self.reference_notice.clone() else {
+            return div().into_any_element();
+        };
+        // The failure band still wins: an error is the more urgent state, and
+        // both bottom-anchor.
+        if self.error.is_some() {
+            return div().into_any_element();
+        }
+        let theme = cx.theme();
+        div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .p_3()
+            .child(
+                v_flex()
+                    .id("space-reference-notice")
+                    .track_focus(&self.band_focus[Self::BAND_REFERENCE])
+                    .contain_mouse(Overlay::Popover)
+                    // The sentence rides as the **value** — the announcement
+                    // channel, the shape the other two notices already use.
+                    .probe_value(
+                        "space/reference-notice",
+                        Role::Alert,
+                        "Quote leads elsewhere",
+                        notice.clone(),
+                    )
+                    .max_w(rems(34.))
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.muted)
+                    .child(
+                        h_flex()
+                            .items_start()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(notice),
+                            )
+                            .child(
+                                div()
+                                    .id("space-reference-notice-dismiss")
+                                    .probe(
+                                        "space/reference-notice/dismiss",
+                                        Role::Button,
+                                        "Dismiss",
+                                    )
+                                    .flex_none()
+                                    .size_5()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(theme.muted_foreground)
+                                    .hover(|s| {
+                                        s.text_color(cx.theme().foreground).bg(cx.theme().muted)
+                                    })
+                                    .child("×")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.dismiss_reference_notice(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Dismiss the cascade-paused notice (window-local; the paused state is
     /// re-announced if a later plan pauses again).
-    pub fn dismiss_cascade(&mut self, cx: &mut Context<Self>) {
+    pub fn dismiss_cascade(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.band_holds_focus(Self::BAND_CASCADE, window, cx);
         self.cascade_notice = None;
+        self.hand_back_band_focus(held, window, cx);
         cx.notify();
     }
 
@@ -2962,8 +3175,9 @@ impl SpaceView {
             return div().into_any_element();
         };
         // The failure notice takes precedence over the pause notice — both
-        // bottom-anchor, and an error is the more urgent state.
-        if self.error.is_some() {
+        // bottom-anchor, and an error is the more urgent state. So does the
+        // reference notice, which answers a click the reader **just made**.
+        if self.error.is_some() || self.reference_notice.is_some() {
             return div().into_any_element();
         }
         let theme = cx.theme();
@@ -3014,6 +3228,7 @@ impl SpaceView {
             .child(
                 v_flex()
                     .id("space-cascade-band")
+                    .track_focus(&self.band_focus[Self::BAND_CASCADE])
                     // Contained on the card, not the full-width wrapper (see
                     // the failure notice above and `crate::overlay`).
                     .contain_mouse(Overlay::Popover)
@@ -3063,9 +3278,9 @@ impl SpaceView {
                                         s.text_color(cx.theme().foreground).bg(cx.theme().muted)
                                     })
                                     .child("×")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.dismiss_cascade(cx)),
-                                    ),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.dismiss_cascade(window, cx)
+                                    })),
                             ),
                     )
                     .child(actions),

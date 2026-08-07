@@ -219,6 +219,67 @@ pub struct PromotionOutcome {
     /// from the Library listing; the residence of core memory blocks it writes
     /// from now on.
     pub notebook_space_id: String,
+    /// The space the promotion also granted membership of, when the caller
+    /// carried a [`SpaceGrant`] — task 37's "Share this agent **and add it to
+    /// *A* as an observer**". `None` when nothing was granted, and when the
+    /// grant named the home space the promotion was joining anyway.
+    pub granted_space_id: Option<String>,
+}
+
+/// A membership role on a space — the vocabulary the schema's `role` column
+/// pins (`owner` / `member` / `observer`).
+///
+/// **Descriptive today**: nothing in the turn path, the notify plan, or the
+/// permission model reads it — membership itself is the ACL (task 37), so
+/// `observer` is what the read-only grant is *called*, not a second gate. It is
+/// spelled as a type anyway so a caller cannot invent a value the CHECK
+/// constraint would refuse at the bottom of a transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MembershipRole {
+    Owner,
+    Member,
+    Observer,
+}
+
+impl MembershipRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Member => "member",
+            Self::Observer => "observer",
+        }
+    }
+}
+
+/// A membership to grant in the **same transaction** as a promotion — the
+/// space-owned half of task 37's blocked-follow → grant → retry loop.
+///
+/// The spec's one-click moment ("Share this agent and add it to *A* as an
+/// observer") is two writes, and doing them as two calls is the multi-call
+/// hazard app-core keeps closing: promotion is **one-way**, so a promotion that
+/// lands beside a refused grant leaves the reader with an irreversible change
+/// they did not ask for on its own. Carried here, both land or neither does.
+#[derive(Clone, Debug)]
+pub struct SpaceGrant {
+    pub space_id: String,
+    pub role: MembershipRole,
+}
+
+/// One agent a reader could grant membership of a space (task 37's grant
+/// picker) — see [`AppCore::list_grantable_agents`].
+#[derive(Clone, Debug)]
+pub struct GrantableAgent {
+    pub id: String,
+    pub label: String,
+    /// Already shared, so the grant is plain membership
+    /// ([`AppCore::add_global_participant`]). `false` means the grant must
+    /// promote it first, which [`AppCore::promote_participant`] does in one
+    /// transaction when handed a [`SpaceGrant`].
+    pub shared: bool,
+    /// The title of the space that owns it — what identifies a space-owned
+    /// agent to a reader granting it somewhere else. `None` when shared or the
+    /// home space is untitled.
+    pub home_space_title: Option<String>,
 }
 
 /// One **global agent** — a shared identity in the agent library (task 36), as
@@ -3078,10 +3139,15 @@ impl Inner {
     /// its own config; "your role in this room" is the existing per-membership
     /// override surface (`set_space_participant_override`). Idempotent — adding
     /// a member twice is not an error, and re-adding one that left rejoins it.
+    ///
+    /// `role` names the membership (task 37's read-only grant is
+    /// [`MembershipRole::Observer`]); `None` keeps the agent's own default. The
+    /// role is descriptive — membership is the ACL, not the role.
     async fn add_global_participant(
         &self,
         space_id: &str,
         participant_id: &str,
+        role: Option<MembershipRole>,
     ) -> Result<ParticipantInfo, AppError> {
         let conn = self.db_conn().await?;
         db::get_space(&conn, space_id)
@@ -3119,30 +3185,119 @@ impl Inner {
         // The checks above give the typed refusals a caller can act on; the
         // insert's own `WHERE EXISTS` is what makes them terminal, since a
         // retirement can commit between a read and a write that follows it.
+        let role = role.map(|r| r.as_str()).unwrap_or(row.role.as_str());
+        // The join and the read that describes it are **one transaction**, so
+        // the answer is about the commit point: a removal or retirement landing
+        // right after the write cannot turn a committed join into a failure
+        // message (Codex review, PR #280).
         let joined =
-            db::ensure_space_participant(&conn, space_id, participant_id, &row.role, now_ms())
-                .await?;
-        let member = db::space_participants(&conn, space_id)
-            .await?
-            .into_iter()
-            .find(|m| m.participant_id == participant_id);
-        match member {
+            db::join_space_participant_tx(&conn, space_id, participant_id, role, now_ms()).await?;
+        match joined {
             // Joined now, or already a member — either way it is one, and the
             // emission is honest (an idempotent re-join changes nothing, but
-            // `INSERT OR IGNORE` cannot tell us so without a second read).
-            Some(member) => {
-                if joined {
+            // the insert-or-revive cannot tell us so without the read beside
+            // it, which is why they share a transaction).
+            Some((changed, member)) => {
+                if changed {
                     self.bus.emit(Change::Participants);
                 }
                 Ok(ParticipantInfo::from_effective(member))
             }
-            // Nothing inserted and not a member: the premise expired between
-            // the read above and the write — a retirement won. Zero trace, and
-            // a typed refusal rather than the `Internal` this used to raise.
+            // Nothing inserted and not a member: the premise expired before the
+            // write — a retirement won. Zero trace, and a typed refusal.
             None => Err(AppError::Config {
                 message: format!("{} has been retired and cannot rejoin a space", row.label),
             }),
         }
+    }
+
+    /// **The grant** (task 37): give `participant_id` membership of `space_id`
+    /// as `role`, sharing it first if — and only if — it is still space-owned.
+    ///
+    /// One operation, because "which verb" is a question about a row that
+    /// another window can answer differently a moment later. The invite picker
+    /// records whether a candidate was shared when its list landed, and a
+    /// caller branching on that snapshot asks for a promotion of an
+    /// already-global row — refused, for a membership that could simply have
+    /// been added, and (when the competing promotion granted this very space)
+    /// about a state that already holds (Codex review, PR #280). The decision
+    /// moves inside the transaction: [`db::grant_space_membership_tx`].
+    ///
+    /// It is **not** `promote_participant` gaining tolerance for an
+    /// already-global row: that refusal is the Share affordance's own, and its
+    /// copy ("promotion is one-way and there is no demotion") is what a reader
+    /// who pressed *Share* needs to read. A grant is a different request — "let
+    /// this agent read this conversation" — and only it may be satisfied by a
+    /// row that is already shared.
+    ///
+    /// Refusals are decided here, before the transaction opens, so each is a
+    /// typed error rather than a rollback: unknown space, unknown or retired
+    /// participant, the shared human (a member of everywhere), Eidola-the-system
+    /// (a member of nowhere), and a non-agent. Emits [`Change::Participants`]
+    /// when something was written — a membership that already held writes
+    /// nothing and says nothing.
+    async fn grant_space_membership(
+        &self,
+        space_id: &str,
+        participant_id: &str,
+        role: MembershipRole,
+    ) -> Result<ParticipantInfo, AppError> {
+        let conn = self.db_conn().await?;
+        db::get_space(&conn, space_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            })?;
+        let row = db::get_participant(&conn, participant_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("participant not found: {participant_id}"),
+            })?;
+        if row.removed_at.is_some() {
+            return Err(AppError::Config {
+                message: format!("{} has been retired and cannot rejoin a space", row.label),
+            });
+        }
+        if participant_id == db::SYSTEM_PARTICIPANT_ID {
+            return Err(AppError::Config {
+                message: "Eidola itself is not a conversation participant".into(),
+            });
+        }
+        if participant_id == db::HUMAN_PARTICIPANT_ID {
+            return Err(AppError::Config {
+                message: "you already take part in every space you can see".into(),
+            });
+        }
+        if row.kind != "agent" {
+            return Err(AppError::Config {
+                message: format!(
+                    "only an agent can be given membership of a space (this is a {})",
+                    row.kind
+                ),
+            });
+        }
+        // Minted here so the transaction can be handed one: it is used only on
+        // the branch that promotes, and an unused uuid costs nothing.
+        let notebook_space_id = Uuid::now_v7().to_string();
+        let outcome = db::grant_space_membership_tx(
+            &conn,
+            space_id,
+            participant_id,
+            role.as_str(),
+            &notebook_space_id,
+            now_ms(),
+        )
+        .await?;
+        if outcome.decision != db::GrantDecision::AlreadyAMember {
+            self.bus.emit(Change::Participants);
+        }
+        // **The result describes the commit point.** It is read inside the
+        // transaction and handed back, never re-read after it: between the
+        // commit and a second read another window can end this membership or
+        // retire the agent, and the call would then report failure for work
+        // that committed — including, for a space-owned candidate, an
+        // irreversible promotion (Codex review, PR #280).
+        Ok(ParticipantInfo::from_effective(outcome.member))
     }
 
     /// Promote a space-owned agent to a **global** identity — one colleague in
@@ -3177,10 +3332,25 @@ impl Inner {
     /// `scope = 'space' AND removed_at IS NULL` guard the flip uses — so every
     /// refusal, raced or not, leaves zero trace. Exactly one
     /// `Change::Participants` is emitted either way.
+    ///
+    /// **`grant` is task 37's other one-click moment.** The blocked-follow →
+    /// grant → retry loop's middle step, for a space-owned agent, is *promotion
+    /// and membership*: "Share this agent and add it to *A* as an observer".
+    /// Two calls would be two transactions over a database several windows
+    /// share, and promotion is **one-way** — so a grant refused after the
+    /// promotion landed leaves the reader with an irreversible change they
+    /// never asked for on its own, under a message saying the operation failed.
+    /// Carried here, the membership is validated up front (the space exists)
+    /// and written inside the promoting transaction, behind the same guard: all
+    /// of it, or none of it. Granting the **home space** is dropped rather than
+    /// refused — the promotion joins that space anyway, so the caller's ask is
+    /// already satisfied and a second insert on the same key would fail the
+    /// transaction.
     async fn promote_participant(
         &self,
         participant_id: &str,
         persona: Option<ParticipantUpdate>,
+        grant: Option<SpaceGrant>,
     ) -> Result<PromotionOutcome, AppError> {
         // Before anything is read, let alone written: a refusal about the
         // persona must not depend on how far the promotion got.
@@ -3242,6 +3412,24 @@ impl Inner {
                 message: "space-owned participant has no owner space".into(),
             })?;
 
+        // The grant's own up-front refusal, before the transaction opens: an
+        // unknown space is the caller's mistake, and finding it out inside the
+        // promoting transaction would be a rollback where a typed error
+        // belongs. The home space needs no membership — the promotion writes
+        // one — so a grant naming it is satisfied, not refused.
+        let grant = match grant {
+            Some(g) if g.space_id == home_space_id => None,
+            Some(g) => {
+                db::get_space(&conn, &g.space_id).await?.ok_or_else(|| {
+                    AppError::NotConfigured {
+                        message: format!("space not found: {}", g.space_id),
+                    }
+                })?;
+                Some(g)
+            }
+            None => None,
+        };
+
         let notebook_space_id = Uuid::now_v7().to_string();
         // The notebook is named for the agent being shared — which, when a
         // persona travels with the promotion, is the name the reader typed, not
@@ -3262,6 +3450,10 @@ impl Inner {
                 notebook_space_id: &notebook_space_id,
                 notebook_title: &notebook_title,
                 persona: persona.as_ref(),
+                grant: grant.as_ref().map(|g| db::MembershipGrant {
+                    space_id: &g.space_id,
+                    role: g.role.as_str(),
+                }),
                 now: now_ms(),
             },
         )
@@ -3280,7 +3472,35 @@ impl Inner {
             participant_id: participant_id.to_string(),
             home_space_id,
             notebook_space_id,
+            granted_space_id: grant.map(|g| g.space_id),
         })
+    }
+
+    /// The agents a reader could grant membership of `space_id` — task 37's
+    /// grant picker, viewer-scoped like every other read.
+    async fn list_grantable_agents(
+        &self,
+        space_id: &str,
+        viewer_participant_id: &str,
+    ) -> Result<Vec<GrantableAgent>, AppError> {
+        let conn = self.db_conn().await?;
+        db::get_space(&conn, space_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            })?;
+        Ok(
+            db::list_grantable_agents(&conn, space_id, viewer_participant_id)
+                .await?
+                .into_iter()
+                .map(|r| GrantableAgent {
+                    id: r.id,
+                    label: r.label,
+                    shared: r.shared,
+                    home_space_title: r.home_space_title,
+                })
+                .collect(),
+        )
     }
 
     /// The live global agents — the shared library a promotion adds to.
@@ -6476,15 +6696,42 @@ impl AppCore {
     /// what survives that, letting the GUI select the tip that superseded the
     /// quoted generation instead of mistaking a same-space post for a foreign
     /// one and opening a duplicate window.
+    ///
+    /// **This is the human click path of task 37's rule 4, so it is gated like
+    /// the agent one.** Following a reference is following it whoever does it:
+    /// the read answers only for a `viewer_participant_id` that is a live
+    /// member of the action's space, and otherwise refuses with
+    /// [`AppError::NotAParticipant`] — which names no title, no participant and
+    /// no content (rule 3 already made *existence* public inside the
+    /// referencing space; nothing else is). The viewer is a required argument
+    /// rather than a second entry point so no caller can navigate without
+    /// asking: the ungated read would have opened an agent's private notebook
+    /// to a reader who is not in it, which is the one space the human is
+    /// genuinely not a member of.
+    ///
+    /// `Ok(None)` stays "no such action" — an unknown id is not a refusal, and
+    /// conflating the two would make this read a membership oracle.
     pub async fn action_location(
         &self,
+        viewer_participant_id: String,
         action_id: String,
     ) -> Result<Option<(String, String)>, AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move {
                 let conn = inner.db_conn().await?;
-                db::action_item_and_space(&conn, &action_id).await
+                let Some((item_id, space_id)) =
+                    db::action_item_and_space(&conn, &action_id).await?
+                else {
+                    return Ok(None);
+                };
+                if !db::is_space_member(&conn, &space_id, &viewer_participant_id).await? {
+                    return Err(AppError::NotAParticipant {
+                        participant_id: viewer_participant_id,
+                        action_id,
+                    });
+                }
+                Ok(Some((item_id, space_id)))
             })
             .await
             .map_err(join_err)?
@@ -7921,16 +8168,43 @@ impl AppCore {
     /// Add an existing global participant to a space (a shared agent joining
     /// another conversation — the read side of promotion). Idempotent. Emits
     /// [`Change::Participants`].
+    ///
+    /// `role` is the membership's name — [`MembershipRole::Observer`] for task
+    /// 37's read-only grant; `None` keeps the agent's own default.
     pub async fn add_global_participant(
         &self,
         space_id: String,
         participant_id: String,
+        role: Option<MembershipRole>,
     ) -> Result<ParticipantInfo, AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move {
                 inner
-                    .add_global_participant(&space_id, &participant_id)
+                    .add_global_participant(&space_id, &participant_id, role)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **The grant** (task 37): give an agent membership of a space as `role`,
+    /// sharing it first if it is still space-owned — one operation that decides
+    /// which from the row it finds, inside its own transaction. This is the
+    /// door the invite form uses; see the inner method for why the picker's
+    /// snapshot may not decide it. Emits [`Change::Participants`] when
+    /// something was written.
+    pub async fn grant_space_membership(
+        &self,
+        space_id: String,
+        participant_id: String,
+        role: MembershipRole,
+    ) -> Result<ParticipantInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .grant_space_membership(&space_id, &participant_id, role)
                     .await
             })
             .await
@@ -7958,18 +8232,57 @@ impl AppCore {
     /// the gap between them is where a persona gets published under a failure
     /// message.
     ///
+    /// `grant`, when given, adds the agent to **another** space in the same
+    /// transaction — task 37's "Share this agent and add it to *A* as an
+    /// observer", the space-owned arm of the blocked-follow → grant → retry
+    /// loop. Promotion is one-way, so the pair may not be two calls: a grant
+    /// refused after the promotion committed would leave an irreversible change
+    /// nobody asked for standing beside a failure message. A grant naming the
+    /// promotion's own home space is satisfied by the promotion itself and
+    /// dropped; an unknown space is a typed refusal before any write.
+    ///
     /// **One-way**: there is no demotion. Typed errors for a participant that
     /// is already global, belongs to a template, is the shared human, is not
     /// an agent, or is unknown/removed. Emits exactly one
-    /// [`Change::Participants`], persona or no persona.
+    /// [`Change::Participants`], persona or no persona, grant or no grant.
     pub async fn promote_participant(
         &self,
         participant_id: String,
         persona: Option<ParticipantUpdate>,
+        grant: Option<SpaceGrant>,
     ) -> Result<PromotionOutcome, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.promote_participant(&participant_id, persona).await })
+            .spawn(async move {
+                inner
+                    .promote_participant(&participant_id, persona, grant)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The agents a reader could grant membership of `space_id` — task 37's
+    /// grant picker: every live agent that is not already a member, shared ones
+    /// (plain membership) and space-owned ones (whose grant is a promotion)
+    /// alike.
+    ///
+    /// Viewer-scoped: a space-owned agent is listed only when the viewer takes
+    /// part in the space that owns it, so the listing cannot announce agents —
+    /// or, through their home space's title, conversations — the viewer has no
+    /// part in. Pure read.
+    pub async fn list_grantable_agents(
+        &self,
+        space_id: String,
+        viewer_participant_id: String,
+    ) -> Result<Vec<GrantableAgent>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .list_grantable_agents(&space_id, &viewer_participant_id)
+                    .await
+            })
             .await
             .map_err(join_err)?
     }

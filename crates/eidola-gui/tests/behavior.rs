@@ -4347,8 +4347,8 @@ fn space_sibling_success_keeps_failed_turn_notice(cx: &mut TestAppContext) {
     });
 
     // Dismiss ends the recovery: the notice is gone and nothing is retryable.
-    cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.dismiss_error(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_error(window, cx));
     })
     .unwrap();
     view.read_with(cx, |v, cx| {
@@ -4385,8 +4385,8 @@ fn space_cascade_notice_renders_dismisses_and_asks_to_continue(cx: &mut TestAppC
     });
 
     // Dismissible (window-local; nothing else changes).
-    cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.dismiss_cascade(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_cascade(window, cx));
     })
     .unwrap();
     view.read_with(cx, |v, _| assert!(v.cascade_notice_for_test().is_none()));
@@ -6030,8 +6030,8 @@ fn space_failed_ask_notice_is_dismissible(cx: &mut TestAppContext) {
     });
 
     // Dismissing clears only the notice — the space is untouched.
-    cx.update_window(window, |_, _, cx| {
-        view.update(cx, |v, cx| v.dismiss_error(cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_error(window, cx));
     })
     .unwrap();
     view.read_with(cx, |v, cx| {
@@ -7653,7 +7653,7 @@ fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
     // Another window shares the same agent. Its id does not move — only what it
     // *is* — so the roster-leave rule alone sees nothing.
     core.runtime()
-        .block_on(core.promote_participant(agent.clone(), None))
+        .block_on(core.promote_participant(agent.clone(), None, None))
         .expect("the other window's share");
     stores
         .participants
@@ -8027,7 +8027,7 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
         .id;
     core_handle
         .runtime()
-        .block_on(core_handle.promote_participant(agent_b.clone(), None))
+        .block_on(core_handle.promote_participant(agent_b.clone(), None, None))
         .expect("share the second agent");
     stores.agents.update(cx, |s, cx| s.refresh(cx));
     wait_until(cx, "the library lists both", |cx| {
@@ -10174,6 +10174,7 @@ fn space_post_context_menu_offers_select_all_then_the_selection_verbs(cx: &mut T
                 "Copy".to_string(),
                 "Quote".to_string(),
                 "Quote in Reply".to_string(),
+                "Quote Elsewhere…".to_string(),
                 "Select All".to_string(),
             ]),
             "a quotable selection adds Copy and the Edit menu's quote pair"
@@ -13297,5 +13298,1585 @@ fn space_inspector_repaints_when_a_model_catalog_lands(cx: &mut TestAppContext) 
          keeps showing the options it drew before the fetch completed"
     );
 
+    drain_runtime(&core);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-space references (task 37) — creation, handoff, denied follow
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn space_quoting_elsewhere_names_who_will_see_the_passage(cx: &mut TestAppContext) {
+    // The creation UI's whole point: choosing a destination makes the app say
+    // what choosing it *means* — the passage becomes visible to everyone in
+    // that conversation, as a copy. The reader is the flow-control point, so
+    // the sentence stands between the choice and the write.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.quote_destination_for_test(),
+            Some(None),
+            "the picker opens on the list of conversations, with nothing said yet"
+        );
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.arm_quote_destination_for_test("other", "Tides", window, cx)
+        });
+    })
+    .unwrap();
+    let statement = view
+        .read_with(cx, |v, _| v.quote_destination_for_test())
+        .expect("still open")
+        .expect("a destination is armed");
+    assert!(
+        statement.contains("visible to everyone in Tides"),
+        "the statement names the destination: {statement}"
+    );
+    assert!(
+        statement.contains("copies"),
+        "…and says the passage is copied, not linked: {statement}"
+    );
+
+    // Confirming hands the quote to the destination's own entity — nothing
+    // durable, and nothing written into this conversation.
+    let destination = stores
+        .spaces
+        .update(cx, |spaces, cx| spaces.open("other".into(), cx));
+    // Read the mailbox *inside* the same update: the confirm's deferred window
+    // open runs when this closure's effects flush, and that window drains the
+    // offer at once — which is the feature working, not a race to observe.
+    let handed_over = cx
+        .update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.confirm_quote_destination_for_test(window, cx));
+            destination.read(cx).has_offered_quote()
+        })
+        .unwrap();
+    assert!(
+        handed_over,
+        "the passage is handed to the destination's entity — the only thing two windows share"
+    );
+    // …and the deferred window open takes it from there — once that window has
+    // actually read the conversation. Until then the offer waits rather than
+    // guessing a tail (see `space_a_quote_into_an_unloaded_conversation_waits_
+    // for_its_tail`), which in stub mode is where it would stay.
+    cx.run_until_parked();
+    destination.read_with(cx, |space, _| {
+        assert!(
+            space.has_offered_quote(),
+            "the window opened, but it has not read the conversation yet"
+        );
+    });
+    cx.update(|cx| {
+        destination.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![fixture_post_with_block(
+                    "d1",
+                    "db1",
+                    "a conversation over here",
+                )],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    destination.read_with(cx, |space, _| {
+        assert!(
+            !space.has_offered_quote(),
+            "the transcript landed, so the window that opened on it took the offer"
+        );
+    });
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.quote_destination_for_test().is_none(),
+            "the picker closed"
+        );
+        assert!(
+            !v.has_post_selection_for_test(),
+            "the passage has left this post; a second press can't re-send it"
+        );
+        assert!(
+            v.active_draft_references_for_test().is_empty(),
+            "…and nothing was attached to a draft *here*"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_quote_into_an_open_conversation_lands_in_the_window_it_raises(cx: &mut TestAppContext) {
+    // The destination is **already open**. The passage must land in that
+    // window, and no second window may open onto the same conversation: the
+    // one-shot mailbox is drained by whichever view draws first, so opening a
+    // duplicate is a coin flip between showing the reader their quote and
+    // showing them a fresh, empty composer with the quote in the window behind
+    // it (Codex review, PR #280). The invariant: the window presented is the
+    // window holding the quote.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    // Two windows on the destination, because that is where "whichever view
+    // renders first" stops being a shape and starts being a coin flip: the
+    // offer is addressed, so only the raised one — the newest — may take it.
+    let (_older_window, older_view) = open_space(cx, &stores, Some("other".into()));
+    let (dest_window, dest_view) = open_space(cx, &stores, Some("other".into()));
+    // Both windows share the one entity, so seeding through either gives the
+    // destination the loaded tail an offer waits for.
+    seed_quotable_space(
+        &dest_view,
+        dest_window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let windows_before = cx.update(|cx| cx.windows().len());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+        view.update(cx, |v, cx| {
+            v.arm_quote_destination_for_test("other", "Tides", window, cx)
+        });
+        view.update(cx, |v, cx| v.confirm_quote_destination_for_test(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        windows_before,
+        "the conversation was already open — raising it, not opening a duplicate"
+    );
+    dest_view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "the window the reader is shown is the one holding the passage"
+        );
+    });
+    older_view.read_with(cx, |v, _| {
+        assert!(
+            v.active_draft_references_for_test().is_empty(),
+            "the window sharing the conversation drew straight past an offer              addressed to its sibling"
+        );
+    });
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.active_draft_references_for_test().is_empty(),
+            "and nothing was attached here"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_quote_into_an_unloaded_conversation_waits_for_its_tail(cx: &mut TestAppContext) {
+    // Quoting into a conversation that was **not** already open lands in a
+    // window whose first frames run while the transcript is still loading.
+    // `sync_tail_drafts` deliberately does nothing in that state, so a take on
+    // that frame minted a draft against a tree with no posts in it: a *root*
+    // draft, visually attached to nothing, that submitted with no `reply_to`
+    // and was persisted under whatever the tail turned out to be — a guess
+    // that looked like an answer (Codex review, PR #280). The mailbox already
+    // survives frames, so the offer simply waits for the tail it belongs to.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("dest".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    assert!(
+        space.read_with(cx, |s, _| !matches!(
+            s.transcript(),
+            eidola_gui::loadable::Loadable::Loaded { .. }
+        )),
+        "the premise: this window opened on a conversation it has not read yet"
+    );
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.offer_quote(
+                eidola_gui::space::OfferedQuote {
+                    spec: eidola_app_core::ReferenceSpec {
+                        antecedent_action_id: "a1".into(),
+                        content_block_id: Some("b1".into()),
+                        range_start: Some(4),
+                        range_end: Some(15),
+                        annotation: None,
+                    },
+                    byline: "You".into(),
+                    snippet: "quick brown".into(),
+                },
+                None,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    assert!(
+        space.read_with(cx, |s, _| s.has_offered_quote()),
+        "the offer waits in the mailbox rather than minting a draft against a tree with no tail"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.active_draft_references_for_test().is_empty(),
+            "nothing is attached yet"
+        );
+    });
+
+    // The transcript lands, `sync_tail_drafts` mints the real tail composer,
+    // and the offer is taken on that same frame.
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "the passage lands once there is somewhere for it to land"
+        );
+        assert_eq!(
+            v.active_draft_parent_for_test().as_deref(),
+            Some("d1"),
+            "and in the branch's real tail composer — what a submit will carry \
+             as its reply antecedent, rather than a root draft's nothing"
+        );
+    });
+    assert!(
+        space.read_with(cx, |s, _| !s.has_offered_quote()),
+        "taken exactly once"
+    );
+}
+
+#[gpui::test]
+fn space_quote_destination_frame_work_is_constant_in_library_size(cx: &mut TestAppContext) {
+    // Virtualizing the *elements* and then materializing the whole display
+    // model to slice it is half the move: the indexer cloned an id and a label
+    // for every conversation the reader has ever had, and the render built the
+    // same vector again to ask its length (Codex review, PR #280). The range
+    // now goes on before anything is cloned, and the count is a count — so a
+    // frame's allocations are O(visible) and only a pointer scan is O(loaded).
+    let small: Vec<_> = (0..40)
+        .map(|i| {
+            stub_space(
+                &format!("s{i}"),
+                Some(&format!("Conversation {i}")),
+                None,
+                i as i64,
+            )
+        })
+        .collect();
+    let large: Vec<_> = (0..2000)
+        .map(|i| {
+            stub_space(
+                &format!("s{i}"),
+                Some(&format!("Conversation {i}")),
+                None,
+                i as i64,
+            )
+        })
+        .collect();
+    let visible = 0..10usize;
+
+    let run = |rows: Vec<eidola_app_core::SpaceInfo>, cx: &mut TestAppContext| {
+        let stores = stub_stores(cx, |s| {
+            s.config_state = Some(config_state(true));
+            s.spaces = rows;
+        });
+        let (window, view) = open_space(cx, &stores, Some("s0".into()));
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.quote_destination_frame_work_for_test(visible.clone(), window, cx)
+            })
+        })
+        .unwrap()
+    };
+
+    let small_built = run(small, cx);
+    let large_built = run(large, cx);
+
+    assert_eq!(small_built, 10, "the visible window is what gets built");
+    assert_eq!(
+        large_built, 10,
+        "…and it does not grow with the Library — 2000 conversations, ten rows"
+    );
+    // **What this test does *not* claim.** The remaining half of the finding —
+    // that the ids and labels are cloned only for the visible range — is not
+    // gated here, deliberately. Both shapes walk the index (the total that
+    // `aria_size_of_set` needs is a count over it), so only the allocations
+    // differ, and wall-clock separates them by ~3.5× at any fixture size: a
+    // ratio gate at that margin passed a materialize-then-slice regression on
+    // a second run, which is worse than no gate at all. The locality is held
+    // by construction instead — the range goes on the iterator *before* the
+    // `map` that clones, and the count returns `usize` so there is no vector
+    // to materialize — and a gate for it would want allocation counting the
+    // crate does not have. What is pinned here is the half that paints.
+}
+
+#[gpui::test]
+fn space_two_quotes_offered_before_a_draw_both_land(cx: &mut TestAppContext) {
+    // Two source windows quote into the same conversation before it redraws —
+    // it may be minimised, or simply behind. Each confirm is a deliberate act
+    // over a passage the reader chose, and quotes **compose**: the draft takes
+    // as many pending references as it is given. A mailbox that held one
+    // dropped the first silently (Codex review, PR #280) — the second offer
+    // replaced it, and nothing said so.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("dest".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let here = cx
+        .update_window(window, |_, window, _| window.window_handle().window_id())
+        .unwrap();
+
+    let offer = |snippet: &str| eidola_gui::space::OfferedQuote {
+        spec: eidola_app_core::ReferenceSpec {
+            antecedent_action_id: "a1".into(),
+            content_block_id: Some("b1".into()),
+            range_start: Some(4),
+            range_end: Some(15),
+            annotation: None,
+        },
+        byline: "You".into(),
+        snippet: snippet.into(),
+    };
+
+    // Both confirms land before this window draws a single frame.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.offer_quote(offer("quick brown"), Some(here), cx);
+            s.offer_quote(offer("lazy dog"), Some(here), cx);
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![
+                (1u64, "quick brown".to_string()),
+                (2u64, "lazy dog".to_string())
+            ],
+            "both passages are pending references, in the order they were confirmed"
+        );
+    });
+    assert!(
+        space.read_with(cx, |s, _| !s.has_offered_quote()),
+        "and the queue is empty — nothing stranded behind the one that landed"
+    );
+    // (That the drain takes the *batch* rather than one entry per frame is the
+    // implementation's own choice — no flicker of ordinals arriving one at a
+    // time — but it is not separately gated here: this harness redraws until
+    // quiescent, so a one-per-frame drain converges to the same assertions.)
+}
+
+#[gpui::test]
+fn space_a_quote_addressed_to_a_closed_window_still_lands(cx: &mut TestAppContext) {
+    // An offer whose addressed window is gone has no claimant: the sender's
+    // raise-failure path re-addresses what it knows about, but a window that
+    // dies after a successful raise and before it draws leaves the passage
+    // behind. It is a confirmed act over a passage the reader chose, so it goes
+    // to a live window on the same conversation rather than waiting in an
+    // entity nobody drains. *Which* live window is a race, deliberately: the
+    // addressee is gone, and any window the reader can see beats none.
+    //
+    // (That an offer addressed to a **live** sibling is not this window's to
+    // take is pinned by `space_a_quote_into_an_open_conversation_lands_in_the_
+    // window_it_raises`, where the older window draws straight past one.)
+    let stores = stub_stores_with_config(cx);
+    let (gone_window, _gone_view) = open_space(cx, &stores, Some("dest".into()));
+    let gone_id = cx
+        .update_window(gone_window, |_, window, _| {
+            window.window_handle().window_id()
+        })
+        .unwrap();
+    cx.update_window(gone_window, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+
+    let (window, view) = open_space(cx, &stores, Some("dest".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.offer_quote(
+                eidola_gui::space::OfferedQuote {
+                    spec: eidola_app_core::ReferenceSpec {
+                        antecedent_action_id: "a1".into(),
+                        content_block_id: Some("b1".into()),
+                        range_start: Some(4),
+                        range_end: Some(15),
+                        annotation: None,
+                    },
+                    byline: "You".into(),
+                    snippet: "quick brown".into(),
+                },
+                // Addressed to a window that no longer exists.
+                Some(gone_id),
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "orphaned, so the live window on this conversation takes it"
+        );
+    });
+    assert!(
+        space.read_with(cx, |s, _| !s.has_offered_quote()),
+        "and nothing is left stranded"
+    );
+}
+
+#[gpui::test]
+fn space_a_quote_lands_in_a_conversation_whose_refresh_failed(cx: &mut TestAppContext) {
+    // The other side of the wait: `Failed { prior: Some(..) }` is a *refresh*
+    // that failed over posts we still hold, and those posts are what the reader
+    // is looking at — `messages()` reads through `Loadable::value` — with the
+    // tail composer already hanging off them. A gate that accepted only
+    // `Loaded` left a quote sent to such a window waiting in the mailbox
+    // indefinitely, in plain sight of somewhere to land (Codex review, PR
+    // #280). A retained value is an answer.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("dest".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // The next reload fails; the conversation stays on screen.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.fail_transcript_refresh_for_test(cx));
+    })
+    .unwrap();
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.transcript().error().is_some(),
+            "the refresh failed, as the premise requires"
+        );
+        assert_eq!(
+            s.messages().len(),
+            1,
+            "and the posts it failed over are still the ones on screen"
+        );
+    });
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.offer_quote(
+                eidola_gui::space::OfferedQuote {
+                    spec: eidola_app_core::ReferenceSpec {
+                        antecedent_action_id: "a1".into(),
+                        content_block_id: Some("b1".into()),
+                        range_start: Some(4),
+                        range_end: Some(15),
+                        annotation: None,
+                    },
+                    byline: "You".into(),
+                    snippet: "quick brown".into(),
+                },
+                None,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "the passage lands in the conversation the reader can see"
+        );
+        assert_eq!(
+            v.active_draft_parent_for_test().as_deref(),
+            Some("d1"),
+            "in its real tail composer, not a root draft"
+        );
+    });
+    assert!(
+        space.read_with(cx, |s, _| !s.has_offered_quote()),
+        "and the mailbox is empty rather than holding it forever"
+    );
+}
+
+#[gpui::test]
+fn space_a_quote_from_another_window_lands_in_this_ones_draft(cx: &mut TestAppContext) {
+    // The receiving half. A draft is window-local, so the shared `Space`
+    // entity is the courier: the window the offer names takes it and attaches
+    // it exactly as `Edit > Quote` would — ordinal 1, a footnote row, a marker
+    // in the body, and nothing durable until it posts.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("dest".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.offer_quote(
+                eidola_gui::space::OfferedQuote {
+                    spec: eidola_app_core::ReferenceSpec {
+                        antecedent_action_id: "a1".into(),
+                        content_block_id: Some("b1".into()),
+                        range_start: Some(4),
+                        range_end: Some(15),
+                        annotation: None,
+                    },
+                    byline: "You".into(),
+                    snippet: "quick brown".into(),
+                },
+                // Unaddressed: the sender found no window on this space and
+                // opened one, so the next view to draw it takes the offer.
+                None,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "the offered passage is an ordinary pending reference now"
+        );
+    });
+    space.read_with(cx, |s, _| {
+        assert!(
+            !s.has_offered_quote(),
+            "the mailbox is a one-shot: a second window must not paste it again"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_dismissing_a_bottom_band_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    // Every bottom band's Dismiss is a real tab stop (`probe(Role::Button)`
+    // derives `focusable()` + `tab_index(0)`), and pressing it unmounts the
+    // band around it — the dead-handle class, on the denied-follow notice this
+    // PR added and on the two bands beside it (Codex review, PR #280). Each
+    // asks containment before it clears, so a reader composing beside a notice
+    // keeps their caret.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let root = view.read_with(cx, |v, _| v.focus_handle());
+
+    // The denied-follow notice.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.report_navigation_failure_for_test(
+                eidola_app_core::error::AppError::NotAParticipant {
+                    participant_id: "p1".into(),
+                    action_id: "a-private".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    let band = view
+        .read_with(cx, |v, _| v.band_focus_for_test(1))
+        .expect("the notice paints");
+    cx.update_window(window, |_, window, cx| window.focus(&band, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_reference_notice(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "the notice handed the keyboard back rather than leaving it on a band nobody paints"
+    );
+
+    // The cascade notice — same family, same rule (pre-existing gap).
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.emit_cascade_paused_for_test(2, 2, "a1".into(), cx)
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    let band = view
+        .read_with(cx, |v, _| v.band_focus_for_test(2))
+        .expect("the cascade notice paints");
+    cx.update_window(window, |_, window, cx| window.focus(&band, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_cascade(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "and so does the cascade band"
+    );
+
+    // …and a band that was not holding the keyboard takes nothing.
+    open_space_draft(&view, window, cx, Some("a1"));
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("a draft is open");
+    let caret = composer.read_with(cx, |e, cx| e.focus_handle(cx));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.report_navigation_failure_for_test(
+                eidola_app_core::error::AppError::NotAParticipant {
+                    participant_id: "p1".into(),
+                    action_id: "a-private".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    cx.update_window(window, |_, window, cx| window.focus(&caret, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_reference_notice(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| caret.is_focused(window))
+            .unwrap(),
+        "a reader composing beside a notice keeps their caret"
+    );
+}
+
+#[gpui::test]
+fn space_a_denied_follow_says_so_without_naming_the_conversation(cx: &mut TestAppContext) {
+    // Rule 4's human arm. The refusal is app-core's (the resolve behind a
+    // footnote click is membership-gated, and its tests pin both the gate and
+    // the non-leaking payload); what this pins is the **voice**: a quiet
+    // notice, not a failure — nothing broke and there is nothing to retry —
+    // and one that names nothing about the conversation it refused.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.report_navigation_failure_for_test(
+                eidola_app_core::error::AppError::NotAParticipant {
+                    participant_id: "p-cartographer".into(),
+                    action_id: "a-private-post".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    let notice = view
+        .read_with(cx, |v, _| v.reference_notice_for_test())
+        .expect("the reader is told the follow went nowhere");
+    assert!(
+        notice.contains("don't take part in"),
+        "said in the app's voice: {notice}"
+    );
+    for leak in ["a-private-post", "p-cartographer"] {
+        assert!(
+            !notice.contains(leak),
+            "the notice leaked {leak:?}: {notice}"
+        );
+    }
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.error_for_test().is_none(),
+            "a refusal is not a failure — no danger band, no Retry"
+        );
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_reference_notice(window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(v.reference_notice_for_test().is_none(), "and it dismisses");
+    });
+}
+
+#[gpui::test]
+fn inspector_inviting_an_agent_from_another_space_shares_it_and_adds_it_here(
+    cx: &mut TestAppContext,
+) {
+    // Task 37's grant, from the surface a reader would use it from: the space
+    // whose privacy the decision is about. The candidate here is a **space-
+    // owned** agent from another conversation, so the grant is a share *and* a
+    // membership — one core call, so the irreversible half can never land
+    // alone — and the sentence says both, including the part that can't be
+    // undone.
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let elsewhere = core
+        .runtime()
+        .block_on(core.create_space(Some("Tides".into())))
+        .expect("a second conversation")
+        .id;
+    let visitor = core
+        .runtime()
+        .block_on(core.list_space_participants(elsewhere.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the template seeds an agent there too");
+
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+    })
+    .unwrap();
+    wait_until(cx, "the candidates land", |cx| {
+        view.read_with(cx, |v, _| {
+            v.inspector_invite_for_test()
+                .is_some_and(|(labels, _)| !labels.is_empty())
+        })
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_arm_invite(&visitor.id, window, cx));
+    })
+    .unwrap();
+    let statement = view
+        .read_with(cx, |v, _| v.inspector_invite_for_test())
+        .expect("the form is open")
+        .1
+        .expect("a candidate is armed");
+    assert!(
+        statement.contains("shares it across spaces") && statement.contains("can't be undone"),
+        "an unshared agent's grant says what it costs: {statement}"
+    );
+    assert!(
+        statement.contains("read this conversation"),
+        "…and what it gives: {statement}"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_confirm_invite(window, cx));
+    })
+    .unwrap();
+    wait_until(cx, "the grant lands", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.list(&space).iter().any(|p| p.id == visitor.id))
+    });
+
+    let member = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.id == visitor.id)
+            .expect("granted")
+            .clone()
+    });
+    assert_eq!(member.scope, "global", "it had to be shared to join at all");
+    assert_eq!(member.role, "observer", "read-only is what was granted");
+    assert_eq!(
+        member.label, visitor.label,
+        "and it arrives as itself — promotion moves ownership, not configuration"
+    );
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_invite_for_test().is_none()),
+        "the form closes on the grant"
+    );
+
+    // It is no longer a candidate here (an affordance that could only be a
+    // no-op is not offered), and its own space still has it.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+    })
+    .unwrap();
+    wait_until(cx, "the second read lands", |cx| {
+        view.read_with(cx, |v, _| {
+            v.inspector_invite_for_test().is_some_and(|(l, _)| {
+                !l.iter().any(|label| label == &visitor.label) || l.is_empty()
+            })
+        })
+    });
+    drain_runtime(&core);
+}
+
+#[gpui::test]
+fn inspector_the_invite_form_takes_the_keyboard_its_door_had(cx: &mut TestAppContext) {
+    // The mount side of the handback rule. Opening the form **replaces** the
+    // "Invite an agent…" door, and arming a candidate replaces the rows inside
+    // the form — both are real tab stops (`probe(Role::Button)` derives
+    // `focusable()` + `tab_index(0)`), so a transition that mounts a surface
+    // and focuses nothing leaves the window on a dead handle: keystrokes reach
+    // nothing and Tab restarts from the window root (Codex review, PR #280).
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let elsewhere = core
+        .runtime()
+        .block_on(core.create_space(Some("Tides".into())))
+        .expect("a second conversation")
+        .id;
+    let visitor = core
+        .runtime()
+        .block_on(core.list_space_participants(elsewhere.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the template seeds an agent there too");
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "participants load", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+
+    // Opening it: a reveal focuses what it revealed — the rule the disclosure,
+    // Add and the template form already follow. This form has no text field,
+    // so the keyboard goes to the form itself.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+    })
+    .unwrap();
+    let form = view
+        .read_with(cx, |v, _| v.inspector_invite_focus_handle())
+        .expect("the form is open");
+    assert!(
+        cx.update_window(window, |_, window, _| form.is_focused(window))
+            .unwrap(),
+        "the form the door became holds the keyboard"
+    );
+
+    wait_until(cx, "the candidates land", |cx| {
+        view.read_with(cx, |v, _| {
+            v.inspector_invite_for_test()
+                .is_some_and(|(labels, _)| !labels.is_empty())
+        })
+    });
+    draw_window(cx, window);
+
+    // Tab onto a candidate row, then arm it: the row unmounts with the list it
+    // was in, and the form survives, so the keyboard stays on the form — the
+    // rule the share confirmation already applies to its own verbs.
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, cx| {
+            form.contains_focused(window, cx) && !form.is_focused(window)
+        })
+        .unwrap(),
+        "Tab from the form lands on a control inside it"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_arm_invite(&visitor.id, window, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(
+        cx.update_window(window, |_, window, cx| form.contains_focused(window, cx))
+            .unwrap(),
+        "arming the grant leaves the keyboard on the form it replaced a row in"
+    );
+    drain_runtime(&core);
+}
+
+#[gpui::test]
+fn space_the_quote_picker_takes_the_keyboard_and_gives_it_back(cx: &mut TestAppContext) {
+    // Both sides of the picker's own focus contract (Codex review, PR #280).
+    // **Mount:** a reveal focuses what it revealed — and the context-menu door
+    // makes it a defect rather than an inconvenience, since `run_context_item`
+    // unmounts the focused menu row *before* dispatching, leaving a keyboard
+    // reader on a dead handle while the surface they asked for stands
+    // unfocused. **Unmount:** a surface that took the keyboard owes it back;
+    // its rows and verbs are real tab stops, so dropping it while it holds the
+    // focus is the same dead handle one step later.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let root = view.read_with(cx, |v, _| v.focus_handle());
+    let open_the_picker = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+            view.update(cx, |v, cx| {
+                v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+            });
+        })
+        .unwrap();
+        view.read_with(cx, |v, _| v.quote_destination_focus_handle())
+            .expect("the picker is open")
+    };
+
+    // Opening it — from either door; both funnel through this action, which is
+    // why one focus call covers the context menu's row and the Edit menu's item.
+    // The keyboard lands on the **list**, the surface's single tab stop, so ↑/↓
+    // work the moment it opens; the popover subtree contains it either way,
+    // which is what the handback below asks about.
+    let picker = open_the_picker(cx);
+    let list = view
+        .read_with(cx, |v, _| v.quote_destination_list_focus_handle())
+        .expect("the picker is open");
+    assert!(
+        cx.update_window(window, |_, window, _| list.is_focused(window))
+            .unwrap(),
+        "the list holds the keyboard the picker revealed"
+    );
+    assert!(
+        cx.update_window(window, |_, window, cx| picker.contains_focused(window, cx))
+            .unwrap(),
+        "…inside the picker, so a close still knows it is holding it"
+    );
+
+    // Escape: the picker goes, and the keyboard comes back to the view root —
+    // live, so the conversation's own key model answers the next press.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| assert!(v.close_quote_destination(window, cx)));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "Escape hands the keyboard back rather than leaving it on a picker nobody paints"
+    );
+
+    // "Quote there" unmounts the verb that was pressed. The passage leaves for
+    // another window; what is owed here is that this one's keyboard stays live.
+    let _picker = open_the_picker(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.arm_quote_destination_for_test("other", "Tides", window, cx)
+        });
+        view.update(cx, |v, cx| v.confirm_quote_destination_for_test(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "the quote left for another window; the keyboard stayed in this one"
+    );
+    cx.run_until_parked();
+
+    // **A reader navigating the conversation gets their place back, not the
+    // root.** `keyboard_home` gives the same answer `sync_tree_focus`'s falling
+    // edge would, so the explicit handback and the observation a frame later
+    // agree — and the level survives instead of being cleared as "the
+    // conversation lost focus".
+    {
+        let mut vcx = VisualTestContext::from_window(window, cx);
+        vcx.simulate_keystrokes("down");
+        vcx.run_until_parked();
+    }
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), None)),
+            "the reader is on the post"
+        );
+    });
+    let _picker = open_the_picker(cx);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.close_quote_destination(window, cx));
+    })
+    .unwrap();
+    assert!(
+        !cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "not the view root — the reader had a place in the conversation"
+    );
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a1".to_string(), None)),
+            "and their level stands"
+        );
+    });
+
+    // And the borrow rule: a picker that never held the keyboard has none to
+    // give back — a reader composing beside it keeps their caret.
+    open_space_draft(&view, window, cx, Some("a1"));
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("a draft is open");
+    let picker = open_the_picker(cx);
+    let caret = composer.read_with(cx, |e, cx| e.focus_handle(cx));
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&caret, cx);
+    })
+    .unwrap();
+    assert!(
+        !cx.update_window(window, |_, window, cx| picker.contains_focused(window, cx))
+            .unwrap(),
+        "the reader moved the keyboard out of the picker"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.close_quote_destination(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| caret.is_focused(window))
+            .unwrap(),
+        "closing a picker that was not holding the keyboard takes nothing"
+    );
+}
+
+#[gpui::test]
+fn space_the_quote_picker_roves_a_cursor_over_its_whole_index(cx: &mut TestAppContext) {
+    // A virtualized list is **one** tab stop with a roving cursor. Per-row tab
+    // stops describe a tab order that does not contain the rows nobody has
+    // scrolled to: Tab walked off the end of the materialized slice and out of
+    // the picker, and every conversation past the first dozen was unreachable
+    // by keyboard (Codex review, PR #280). ↑/↓/Home/End move the cursor,
+    // `scroll_to_item` materializes what it lands on, Enter arms it.
+    let many: Vec<_> = (0..60)
+        .map(|i| {
+            stub_space(
+                &format!("s{i}"),
+                Some(&format!("Conversation {i}")),
+                None,
+                i as i64,
+            )
+        })
+        .collect();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = many;
+    });
+    let (window, view) = open_space(cx, &stores, Some("s0".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.quote_destination_cursor_for_test(cx),
+            Some(0),
+            "the cursor starts at the top"
+        );
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("down down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, cx| {
+        assert_eq!(
+            v.quote_destination_cursor_for_test(cx),
+            Some(2),
+            "↓ moves it"
+        );
+    });
+    vcx.simulate_keystrokes("up");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, cx| {
+        assert_eq!(
+            v.quote_destination_cursor_for_test(cx),
+            Some(1),
+            "↑ moves it back"
+        );
+    });
+
+    // **End reaches the last destination — one the visible slice never held.**
+    // This is the arc the single tab stop exists for: the cursor moves, the
+    // list scrolls it into being, and it is readable and activatable there.
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, cx| {
+        assert_eq!(
+            v.quote_destination_cursor_for_test(cx),
+            Some(58),
+            "End lands on the last of 59 destinations, far past the ten that painted"
+        );
+    });
+
+    // **The same focus gate the invite list has.** The stored cursor is where
+    // ↑/↓ left it; whether a row *claims* it is a question about where the
+    // keyboard is — this surface reaches the ungated state by Tab (its retry
+    // line is a stop beside the list) and by a reader clicking back into the
+    // page with the picker still open.
+    let popover = view
+        .read_with(&vcx, |v, _| v.quote_destination_focus_handle())
+        .expect("the picker is open");
+    vcx.update(|window, cx| window.focus(&popover, cx));
+    let (stored, shown) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, app| {
+            (
+                v.quote_destination_cursor_for_test(app),
+                v.quote_destination_cursor_row_for_test(window, app),
+            )
+        })
+    });
+    assert_eq!(stored, Some(58), "the cursor stands");
+    assert_eq!(
+        shown, None,
+        "…and no row claims it from a focus it doesn't have"
+    );
+    let list = view
+        .read_with(&vcx, |v, _| v.quote_destination_list_focus_handle())
+        .expect("the picker is open");
+    vcx.update(|window, cx| window.focus(&list, cx));
+    let shown = vcx.update(|window, cx| {
+        view.read_with(cx, |v, app| {
+            v.quote_destination_cursor_row_for_test(window, app)
+        })
+    });
+    assert_eq!(shown, Some(58), "and returns with the keyboard");
+
+    // Enter arms *that* one — the statement names it, so what the cursor
+    // reached is what the reader is about to quote into.
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let statement = view
+        .read_with(&vcx, |v, _| v.quote_destination_for_test())
+        .expect("still open")
+        .expect("a destination is armed");
+    assert!(
+        statement.contains("Conversation 59"),
+        "Enter armed the destination the cursor was on: {statement}"
+    );
+}
+
+#[gpui::test]
+fn space_the_quote_pickers_cursor_leaves_escape_alone(cx: &mut TestAppContext) {
+    // The roving idiom answers five keys and nothing else. Escape over this
+    // surface means *dismiss* — a rung of the space root's own chain — so a
+    // cursor that consumed it would shadow the picker's only way out.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.quote_destination_for_test().is_some(),
+            "the picker is open"
+        );
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.quote_destination_for_test().is_none(),
+            "Escape still closes it — the cursor took no rung of the chain"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_arming_a_quote_destination_keeps_the_keyboard_on_the_picker(cx: &mut TestAppContext) {
+    // The same rule, one surface over: choosing a destination replaces the list
+    // of conversations with the visibility statement and its two verbs, so the
+    // row that was pressed unmounts. The picker survives it and keeps the
+    // keyboard (Codex review, PR #280) — and only if the picker was the one
+    // holding it, so a pointer press from the page takes nothing.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    let picker = view
+        .read_with(cx, |v, _| v.quote_destination_focus_handle())
+        .expect("the picker is open");
+
+    // A reader who tabbed into the picker is on one of its rows.
+    cx.update_window(window, |_, window, cx| {
+        window.focus(&picker, cx);
+        window.focus_next(cx);
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, cx| {
+            picker.contains_focused(window, cx) && !picker.is_focused(window)
+        })
+        .unwrap(),
+        "Tab from the picker lands on a destination row"
+    );
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.arm_quote_destination_for_test("other", "Tides", window, cx)
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+    assert!(
+        cx.update_window(window, |_, window, cx| picker.contains_focused(window, cx))
+            .unwrap(),
+        "the statement's verbs are where the keyboard is, not a row nobody paints"
+    );
+}
+
+#[gpui::test]
+fn inspector_a_notebook_offers_no_grant_door(cx: &mut TestAppContext) {
+    // A notebook is an agent's private space, and whether an agent may be
+    // *granted* observer membership of another agent's notebook is a decision
+    // task 37 deliberately leaves open. Until it is made, the panel offers no
+    // new door there — app-core's rules are untouched, so nothing is
+    // foreclosed either way.
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the template seeds an agent")
+        .id;
+    let notebook = core
+        .runtime()
+        .block_on(core.promote_participant(agent.clone(), None, None))
+        .expect("promotion")
+        .notebook_space_id;
+
+    let (window, view) = open_participants_inspector(cx, &stores, &notebook);
+    wait_until(cx, "the notebook's settings land", |cx| {
+        stores.space_settings.read_with(cx, |s, _| {
+            s.settings(&notebook)
+                .value()
+                .is_some_and(|s| s.notebook_participant_id.is_some())
+        })
+    });
+    assert!(
+        !view.read_with(cx, |v, cx| v.inspector_offers_grant_door_for_test(cx)),
+        "a notebook withholds the grant door"
+    );
+
+    // An ordinary conversation still offers it.
+    let (_w2, view2) = open_participants_inspector(cx, &stores, &space);
+    wait_until(cx, "the space's settings land", |cx| {
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&space).value().is_some())
+    });
+    assert!(
+        view2.read_with(cx, |v, cx| v.inspector_offers_grant_door_for_test(cx)),
+        "an ordinary conversation offers the grant"
+    );
+    let _ = window;
+    drain_runtime(&core);
+}
+
+#[gpui::test]
+fn inspector_the_invite_list_roves_a_cursor_over_all_its_candidates(cx: &mut TestAppContext) {
+    // The candidate list's half of the same rule: one tab stop, a roving
+    // cursor, `scroll_to_item` materializing what it lands on — because the
+    // candidates are every agent this reader could add, and per-row tab stops
+    // reach only the dozen that painted (Codex review, PR #280).
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.participants = Some(("s".into(), vec![agent_participant("a-1", "Mara")]));
+        s.space_settings = Some(("s".into(), eidola_app_core::SpaceSettings::default()));
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+        view.update(cx, |v, cx| {
+            v.seed_invite_candidates_for_test(
+                (0..40)
+                    .map(|i| eidola_app_core::GrantableAgent {
+                        id: format!("agent-{i}"),
+                        label: format!("Agent {i}"),
+                        shared: true,
+                        home_space_title: None,
+                    })
+                    .collect(),
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    // The list is the tab stop; put the keyboard there as a Tab would.
+    let list = view
+        .read_with(cx, |v, _| v.invite_list_focus_handle())
+        .expect("the form is open");
+    cx.update_window(window, |_, window, cx| window.focus(&list, cx))
+        .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.invite_cursor_for_test(), Some(0), "starting at the top");
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("down down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.invite_cursor_for_test(), Some(2));
+    });
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.invite_cursor_for_test(),
+            Some(39),
+            "End reaches the last candidate — far past the visible slice"
+        );
+    });
+
+    // Enter arms it: the grant statement names the agent the cursor reached.
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let (_, statement) = view
+        .read_with(&vcx, |v, _| v.inspector_invite_for_test())
+        .expect("the form is open");
+    let statement = statement.expect("a candidate is armed");
+    assert!(
+        statement.contains("Agent 39"),
+        "Enter armed what the cursor was on: {statement}"
+    );
+
+    // **The cursor is the row's focus identity, so it belongs to the row only
+    // while the list holds the keyboard.** Gated on modality alone it painted a
+    // ring on the first candidate the moment the read landed — the door's own
+    // reveal focuses the *form* — and left it there after Tab reached Cancel:
+    // two focus indications for one focus (Codex review, PR #280).
+    let form = view
+        .read_with(&vcx, |v, _| v.inspector_invite_focus_handle())
+        .expect("the form is open");
+    vcx.update(|window, cx| window.focus(&form, cx));
+    let (stored, shown) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, _| {
+            (
+                v.invite_cursor_for_test(),
+                v.invite_cursor_row_for_test(window),
+            )
+        })
+    });
+    assert_eq!(stored, Some(39), "the cursor is still where ↑/↓ left it");
+    assert_eq!(
+        shown, None,
+        "…but no row claims it while the keyboard is elsewhere in the form"
+    );
+    vcx.update(|window, cx| window.focus(&list, cx));
+    let shown =
+        vcx.update(|window, cx| view.read_with(cx, |v, _| v.invite_cursor_row_for_test(window)));
+    assert_eq!(shown, Some(39), "and it comes back with the keyboard");
+
+    // And Escape is none of its business — the form's exit is its Cancel, and
+    // the panel's Escape rungs belong to its dropdowns.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.inspector_invite_for_test().is_some(),
+            "the cursor consumed no Escape, and none of the rungs closes this form"
+        );
+    });
+}
+
+#[gpui::test]
+fn inspector_withholds_the_grant_door_until_the_settings_say_what_this_space_is(
+    cx: &mut TestAppContext,
+) {
+    // The withheld door is only as good as the question behind it. That
+    // question is a **settings read**, and a cell that has not answered is not
+    // an answer of "ordinary" — folding the two offered the grant in the window
+    // before the read landed, and confirming it succeeds, because app-core
+    // deliberately does not refuse a notebook grant (task 37 left that decision
+    // open, which is exactly why the GUI's withholding is the only thing
+    // standing between the reader and a notebook's whole history). Codex
+    // review, PR #280.
+    let (stores, core, _dir, space) = participants_scene(cx);
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the template seeds an agent")
+        .id;
+    let notebook = core
+        .runtime()
+        .block_on(core.promote_participant(agent.clone(), None, None))
+        .expect("promotion")
+        .notebook_space_id;
+
+    let (window, view) = open_participants_inspector(cx, &stores, &notebook);
+    assert!(
+        stores
+            .space_settings
+            .read_with(cx, |s, _| s.settings(&notebook).value().is_none()),
+        "the premise of this test: the panel has asked, and nothing has answered yet"
+    );
+    assert!(
+        !view.read_with(cx, |v, cx| v.inspector_offers_grant_door_for_test(cx)),
+        "unknown withholds the door — it comes back on the frame the read answers"
+    );
+
+    // And the form is a door left standing: one opened while the answer was
+    // still unknown must not be confirmable once it arrives.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_begin_invite(window, cx));
+    })
+    .unwrap();
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_invite_for_test().is_some()),
+        "the form is open over a space nobody has classified yet"
+    );
+
+    wait_until(cx, "the notebook's settings land", |cx| {
+        stores.space_settings.read_with(cx, |s, _| {
+            s.settings(&notebook)
+                .value()
+                .is_some_and(|s| s.notebook_participant_id.is_some())
+        })
+    });
+    draw_window(cx, window);
+    assert!(
+        view.read_with(cx, |v, _| v.inspector_invite_for_test().is_none()),
+        "the answer retires the form, rather than leaving a grant one press away"
+    );
+    assert!(
+        !view.read_with(cx, |v, cx| v.inspector_offers_grant_door_for_test(cx)),
+        "…and the door stays withheld, now on evidence"
+    );
     drain_runtime(&core);
 }

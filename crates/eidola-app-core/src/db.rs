@@ -212,6 +212,40 @@ pub async fn open(data_dir: &Path) -> Result<Database, AppError> {
     Ok(db)
 }
 
+/// Open a **write** transaction — `BEGIN IMMEDIATE`, reserving the writer
+/// before the first read.
+///
+/// Every transaction in this module reads before it writes: it checks a scope,
+/// a membership, a `left_at`, and decides what to write from what it found.
+/// That is the whole point of deciding at the write — and a *deferred* `BEGIN`
+/// (what plain `BEGIN` means, here as in SQLite) does not reserve anything, so
+/// two connections could both read the old state and the second one's write
+/// would be refused rather than serialized. Measured on turso at our pin, with
+/// two live connections on one `Database` (`AppCore::db_conn` mints a fresh one
+/// per call, so this is an in-process race, not just a cross-process one):
+///
+/// ```text
+/// BEGIN            A reads scope=space
+///                  B begins, writes scope=global, commits   (A is not blocked)
+///                  A writes -> Err(BusySnapshot("database snapshot is stale"))
+/// BEGIN IMMEDIATE  A reserves the writer, reads, writes
+///                  B waits on its own BEGIN IMMEDIATE (328ms, the hold)
+///                  …then acquires and reads scope=global — the join branch
+/// ```
+///
+/// `busy_timeout` does not rescue the deferred case: a stale snapshot cannot be
+/// waited out, only retried, and the whole decision would have to be re-taken.
+/// Reserving up front converts the race into an ordinary wait — the loser reads
+/// the winner's committed state and decides against *that*, which is what the
+/// grant's promote-or-join branch (and #279's promote / retire / remove
+/// guards) were always meant to do (Codex review, PR #280).
+async fn begin_write(conn: &Connection) -> Result<(), AppError> {
+    conn.execute("BEGIN IMMEDIATE", ())
+        .await
+        .map_err(AppError::db)?;
+    Ok(())
+}
+
 /// Open a connection with FK enforcement enabled. turso defaults
 /// `foreign_keys` **OFF** (every `REFERENCES`/composite FK is then unenforced
 /// documentation), and the scope-owned participant model relies on the tuple
@@ -358,7 +392,7 @@ async fn ensure_default_participants(conn: &Connection) -> Result<(), AppError> 
 /// unrepresentable instead: there is nothing to detect, so nothing to
 /// misinterpret, and the seed simply stays retryable on the next open.
 async fn ensure_default_template_tx(conn: &Connection, now: i64) -> Result<(), AppError> {
-    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    begin_write(conn).await?;
     match ensure_default_template_tx_body(conn, now).await {
         Ok(()) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
@@ -1710,7 +1744,21 @@ impl PersonaWrite {
     }
 }
 
-/// What [`promote_participant_tx`] writes — one struct rather than eight
+/// A membership to write **inside** another transaction — task 37's grant.
+///
+/// The blocked-follow → grant → retry loop's middle step is ordinary
+/// membership, and for a space-owned agent it can only follow a promotion. Two
+/// calls would be two transactions: the promotion could land and the grant be
+/// refused, leaving an agent shared (irreversibly — promotion is one-way) for a
+/// grant the reader asked for and did not get. So the grant travels *with* the
+/// promotion, as an argument, exactly as the persona does.
+#[derive(Clone, Debug)]
+pub struct MembershipGrant<'a> {
+    pub space_id: &'a str,
+    pub role: &'a str,
+}
+
+/// What [`promote_participant_tx`] writes — one struct rather than nine
 /// positional arguments.
 pub struct Promotion<'a> {
     pub participant_id: &'a str,
@@ -1718,6 +1766,11 @@ pub struct Promotion<'a> {
     pub role: &'a str,
     pub notebook_space_id: &'a str,
     pub notebook_title: &'a str,
+    /// A membership in **another** space to grant in the same transaction (task
+    /// 37's "Share this agent and add it to *A* as an observer"). The caller has
+    /// already established that the space exists and is not the home space (a
+    /// second insert on the same PK would fail the whole transaction).
+    pub grant: Option<MembershipGrant<'a>>,
     /// A persona to adopt **in the promoting transaction**, if the caller is
     /// carrying one (the GUI's "Share this agent…" promotes what its editor is
     /// showing). Inside the same transaction *and behind the same guard*, so a
@@ -1754,7 +1807,7 @@ pub async fn promote_participant_tx(
     conn: &Connection,
     promotion: &Promotion<'_>,
 ) -> Result<(), AppError> {
-    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    begin_write(conn).await?;
     match promote_participant_tx_body(conn, promotion).await {
         Ok(()) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
@@ -1825,6 +1878,19 @@ async fn promote_participant_tx_body(
         promotion.now,
     )
     .await?;
+    // Task 37's grant. Inside the transaction the scope flip has just proved
+    // this row live and space-owned, so the membership cannot be joined onto a
+    // retired agent and a refusal anywhere above takes the grant back with it.
+    if let Some(grant) = &promotion.grant {
+        insert_space_participant(
+            conn,
+            grant.space_id,
+            participant_id,
+            grant.role,
+            promotion.now,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -1927,6 +1993,316 @@ pub async fn list_global_agents(conn: &Connection) -> Result<Vec<GlobalAgentRow>
     Ok(out)
 }
 
+/// What [`grant_space_membership_tx`] did — the decision it took *inside* the
+/// transaction, reported so the caller can build its outcome and decide what to
+/// announce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GrantDecision {
+    /// The row was space-owned: promoted, and the membership written in the
+    /// same transaction. Carries what the promotion minted.
+    Promoted {
+        home_space_id: String,
+        notebook_space_id: String,
+    },
+    /// The row was already a shared global: membership joined (or revived).
+    Joined,
+    /// It was already a live member of this space — nothing to do. A competing
+    /// promotion that granted this very destination lands here.
+    AlreadyAMember,
+}
+
+/// **Grant `participant_id` membership of `space_id`, promoting first if — and
+/// only if — the row is still space-owned.** Task 37's grant, with the branch
+/// moved inside the transaction.
+///
+/// The picker's snapshot cannot decide this. It records whether a candidate was
+/// shared when the *list* landed, and another window sharing that agent before
+/// the reader confirms makes the snapshot a lie: a caller branching on it asked
+/// for a promotion of an already-global row, which is refused — for a
+/// membership that could simply have been added, and (when the competing
+/// promotion granted this very space) about a state that already held (Codex
+/// review, PR #280). So the scope is read where the write happens, under the
+/// same `BEGIN`, and each branch still carries its own premise into its own
+/// statement: `promote_participant_tx_body`'s `WHERE scope = 'space'` and
+/// `ensure_space_participant`'s `WHERE EXISTS (… removed_at IS NULL)`.
+///
+/// The caller's up-front refusals (unknown space, unknown/retired participant,
+/// not an agent, the shared human, a template-scoped row) still belong to the
+/// caller: they are typed errors a reader can act on, and finding them out in
+/// here would be a rollback where a message belongs.
+pub async fn grant_space_membership_tx(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    role: &str,
+    notebook_space_id: &str,
+    now: i64,
+) -> Result<GrantOutcome, AppError> {
+    begin_write(conn).await?;
+    let body = grant_space_membership_tx_body(
+        conn,
+        space_id,
+        participant_id,
+        role,
+        notebook_space_id,
+        now,
+    )
+    .await;
+    match body {
+        Ok(outcome) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(outcome)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+/// Join a global into a space and answer with the membership **as of the
+/// commit** — the insert-or-revive plus the read that describes it, in one
+/// transaction.
+///
+/// `add_global_participant` used to run the join and then read the roster
+/// outside any transaction, which is the same window the grant had: a removal
+/// or retirement landing in between made the read find nothing, and the call
+/// reported a failure for a join that had committed (Codex review, PR #280).
+/// `None` means the join struck nothing — the liveness premise expired — with
+/// nothing written and nothing to announce.
+pub async fn join_space_participant_tx(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    role: &str,
+    now: i64,
+) -> Result<Option<(bool, EffectiveParticipantRow)>, AppError> {
+    begin_write(conn).await?;
+    let body = async {
+        let joined = ensure_space_participant(conn, space_id, participant_id, role, now).await?;
+        let member = space_participants(conn, space_id)
+            .await?
+            .into_iter()
+            .find(|m| m.participant_id == participant_id);
+        Ok::<_, AppError>(member.map(|m| (joined, m)))
+    }
+    .await;
+    match body {
+        Ok(found) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(found)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+/// What the grant did **and what it left behind** — the membership as of the
+/// commit point.
+///
+/// The caller's answer is built here rather than from a roster read *after* the
+/// transaction, because between that commit and that read another window can
+/// remove the membership or retire the agent: the read then finds nothing and
+/// the call returns an error about an operation that committed — and, for a
+/// space-owned candidate, committed an **irreversible promotion** (Codex
+/// review, PR #280). That is precisely the failure-message-beside-a-committed-
+/// write state this transaction exists to prevent, reintroduced one line after
+/// it. A result that describes the commit point cannot be overtaken by what
+/// happens next.
+#[derive(Clone, Debug)]
+pub struct GrantOutcome {
+    pub decision: GrantDecision,
+    /// The membership as the transaction wrote it — effective label, role and
+    /// overrides, read inside the same `BEGIN IMMEDIATE`.
+    pub member: EffectiveParticipantRow,
+}
+
+async fn grant_space_membership_tx_body(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    role: &str,
+    notebook_space_id: &str,
+    now: i64,
+) -> Result<GrantOutcome, AppError> {
+    let row = get_participant(conn, participant_id)
+        .await?
+        .ok_or_else(|| AppError::NotConfigured {
+            message: format!("participant not found: {participant_id}"),
+        })?;
+    if row.removed_at.is_some() {
+        return Err(AppError::Config {
+            message: format!("{} has been retired and cannot rejoin a space", row.label),
+        });
+    }
+    // Already a live member: satisfied. This is the whole point of deciding
+    // here — the competing promotion may have granted this very space, and an
+    // operation that reports failure about a state that already holds is
+    // telling the reader something untrue.
+    let already = space_participants(conn, space_id)
+        .await?
+        .into_iter()
+        .find(|m| m.participant_id == participant_id);
+    if let Some(member) = already {
+        return Ok(GrantOutcome {
+            decision: GrantDecision::AlreadyAMember,
+            member,
+        });
+    }
+    let decision = match row.scope.as_str() {
+        "global" => {
+            ensure_space_participant(conn, space_id, participant_id, role, now).await?;
+            GrantDecision::Joined
+        }
+        "space" => {
+            let home_space_id = row
+                .owner_space_id
+                .clone()
+                .ok_or_else(|| AppError::Internal {
+                    message: "space-owned participant has no owner space".into(),
+                })?;
+            // The promotion writes the home membership itself, so a grant
+            // naming the home space is satisfied by it rather than written
+            // twice (a second insert on the same key fails the transaction) —
+            // `promote_participant`'s own rule, applied here.
+            let grant = (space_id != home_space_id).then_some(MembershipGrant { space_id, role });
+            let notebook_title = format!("{} — notebook", row.label);
+            promote_participant_tx_body(
+                conn,
+                &Promotion {
+                    participant_id,
+                    home_space_id: &home_space_id,
+                    role: &row.role,
+                    notebook_space_id,
+                    notebook_title: &notebook_title,
+                    grant,
+                    persona: None,
+                    now,
+                },
+            )
+            .await?;
+            GrantDecision::Promoted {
+                home_space_id,
+                notebook_space_id: notebook_space_id.to_string(),
+            }
+        }
+        other => {
+            return Err(AppError::Config {
+                message: format!(
+                    "{} belongs to a space template, not a space, so it cannot be given \
+                     membership (scope: {other})",
+                    row.label
+                ),
+            });
+        }
+    };
+    // Read **inside** the transaction: the membership this write just made, as
+    // of the commit point. A row missing here is a genuine failure of the write
+    // (and rolls back with it), never the race a post-commit read invents.
+    let member = space_participants(conn, space_id)
+        .await?
+        .into_iter()
+        .find(|m| m.participant_id == participant_id)
+        .ok_or_else(|| AppError::Internal {
+            message: format!("membership for {participant_id} vanished inside its own write"),
+        })?;
+    Ok(GrantOutcome { decision, member })
+}
+
+/// One candidate for task 37's grant — an agent a reader could give membership
+/// of a space (see [`list_grantable_agents`]).
+#[derive(Clone, Debug)]
+pub struct GrantableAgentRow {
+    pub id: String,
+    pub label: String,
+    /// Already a shared identity, so the grant is plain membership. `false` is
+    /// a space-owned agent, whose grant is promotion + membership in one
+    /// transaction ([`promote_participant_tx`] carrying a [`MembershipGrant`]).
+    pub shared: bool,
+    /// The title of the space that owns it (`None` when shared, or when its
+    /// home space is untitled) — what names the agent to a reader who knows it
+    /// from somewhere else.
+    pub home_space_title: Option<String>,
+}
+
+/// The agents that could be granted membership of `space_id`, as the viewer
+/// may see them (task 37's grant picker).
+///
+/// Three exclusions, each a rule rather than a nicety:
+///
+/// - **Already a member** — of either kind (a space's own agent, or a global
+///   already referenced in). Offering a grant that would change nothing is the
+///   fake affordance the honest-states rule exists to prevent.
+/// - **Not an agent, or retired** — the shared human and Eidola-the-system are
+///   globals nobody grants, and a retired agent cannot rejoin a space
+///   (`add_global_participant` refuses one; the picker must not offer it).
+/// - **Owned by a space the viewer does not take part in** — the listing is a
+///   read like any other, so it obeys the same ACL: without this it would
+///   announce the existence of agents (and, through `home_space_title`, of
+///   conversations) in spaces the viewer has no part in, which is exactly the
+///   leak rule 4 exists to close. A global has no home space to leak, so it is
+///   listed unconditionally.
+///
+/// Ordered by label, the name the reader sees.
+pub async fn list_grantable_agents(
+    conn: &Connection,
+    space_id: &str,
+    viewer_participant_id: &str,
+) -> Result<Vec<GrantableAgentRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.id, p.label, p.scope = 'global', s.title \
+             FROM participant p \
+             LEFT JOIN space s ON s.id = p.owner_space_id \
+             WHERE p.kind = 'agent' AND p.removed_at IS NULL \
+               AND p.scope IN ('global', 'space') \
+               AND COALESCE(p.owner_space_id, '') <> ?1 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM space_participant r \
+                   WHERE r.participant_id = p.id AND r.space_id = ?1 \
+                     AND r.left_at IS NULL \
+               ) \
+               AND ( \
+                   p.scope = 'global' \
+                   OR EXISTS ( \
+                       SELECT 1 FROM participant v \
+                       WHERE v.id = ?2 AND v.owner_space_id = p.owner_space_id \
+                         AND v.removed_at IS NULL \
+                   ) \
+                   OR EXISTS ( \
+                       SELECT 1 FROM space_participant vr \
+                       JOIN participant v ON v.id = vr.participant_id \
+                       WHERE vr.participant_id = ?2 \
+                         AND vr.space_id = p.owner_space_id \
+                         AND vr.left_at IS NULL AND v.removed_at IS NULL \
+                   ) \
+               ) \
+             ORDER BY p.label, p.id",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(space_id.to_string()),
+            Value::Text(viewer_participant_id.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        let shared = row.get::<i64>(2).map_err(AppError::db)? != 0;
+        out.push(GrantableAgentRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            label: row.get::<String>(1).map_err(AppError::db)?,
+            shared,
+            home_space_title: row.get::<Option<String>>(3).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
 /// Retire a global agent: the soft-remove **and** its notebook's archival, in
 /// one transaction (task 36 — "archival tied to retirement").
 ///
@@ -1944,7 +2320,7 @@ pub async fn retire_participant_tx(
     participant_id: &str,
     now: i64,
 ) -> Result<bool, AppError> {
-    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    begin_write(conn).await?;
     match retire_participant_tx_body(conn, participant_id, now).await {
         Ok(retired) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
@@ -2222,9 +2598,14 @@ pub async fn insert_space_participant(
     .await
 }
 
-/// Ensure a global is referenced into a space (idempotent — INSERT OR IGNORE on
-/// the PK). Used to guarantee "You" joins every instantiated space even if a
-/// copied template reference already added it.
+/// Ensure a global is referenced into a space — **insert or revive**, on the
+/// space's primary key. Used to guarantee "You" joins every instantiated space
+/// even if a copied template reference already added it, and to let an agent
+/// that left be invited back.
+///
+/// Answers whether the membership *changed*: a fresh join or a revived one.
+/// A membership that was already live is left exactly as it stands, which is
+/// what "idempotent" has always meant here.
 pub async fn ensure_space_participant(
     conn: &Connection,
     space_id: &str,
@@ -2232,23 +2613,48 @@ pub async fn ensure_space_participant(
     role: &str,
     joined_at: i64,
 ) -> Result<bool, AppError> {
-    // **Liveness rides the insert.** The caller reads the participant first for
+    // **Liveness rides the write.** The caller reads the participant first for
     // its typed refusals, but a read cannot answer for a write that lands after
     // it: a retirement committing in between left a durable membership joined
     // *after* retirement, plus an invalidation and an `Internal` error where a
     // refusal belonged (Codex review, PR #279). `INSERT … SELECT … WHERE EXISTS`
-    // makes the premise part of the statement, so a lost race writes nothing.
-    // `OR IGNORE` keeps the join idempotent, as it has always been.
+    // makes the premise part of the statement, so a lost race writes nothing —
+    // and it guards the revive too, since a `SELECT` that yields no row can
+    // conflict with nothing.
+    //
+    // **A departure is not an absence.** Leaving is soft (`left_at`), so the row
+    // survives on the PK and an insert-only join struck nothing: the caller's
+    // roster read then found no member and reported the *live* agent retired —
+    // a sentence about the wrong thing, and permanent, since every retry took
+    // the same path (Codex review, PR #280). The upsert revives that row and
+    // applies the role being asked for, so the offer the picker makes (an agent
+    // that left is grantable again) is the one the write honours.
+    //
+    // The `WHERE left_at IS NOT NULL` on the update is what keeps this a
+    // *revive* rather than an overwrite: a live membership is never rewritten,
+    // so the template instantiation's "You" (inserted a few lines earlier with
+    // the template's own role and overrides) survives the `ensure` that follows
+    // it, exactly as `OR IGNORE` made it.
     let n = conn
         .execute(
-            "INSERT OR IGNORE INTO space_participant \
+            "INSERT INTO space_participant \
              (space_id, participant_id, participant_scope, role, joined_at, \
               override_label, override_model_ref, override_system_prompt, \
               override_notify_policy) \
              SELECT ?1, ?2, 'global', ?3, ?4, NULL, NULL, NULL, NULL \
              WHERE EXISTS ( \
                  SELECT 1 FROM participant WHERE id = ?2 AND removed_at IS NULL \
-             )",
+             ) \
+             ON CONFLICT (space_id, participant_id) DO UPDATE SET \
+                 participant_scope = 'global', \
+                 role = excluded.role, \
+                 joined_at = excluded.joined_at, \
+                 left_at = NULL, \
+                 override_label = NULL, \
+                 override_model_ref = NULL, \
+                 override_system_prompt = NULL, \
+                 override_notify_policy = NULL \
+             WHERE space_participant.left_at IS NOT NULL",
             (
                 Value::Text(space_id.to_string()),
                 Value::Text(participant_id.to_string()),
@@ -2419,7 +2825,7 @@ pub async fn remove_space_participant_tx(
     participant_id: &str,
     now: i64,
 ) -> Result<SpaceRemoval, AppError> {
-    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    begin_write(conn).await?;
     match remove_space_participant_tx_body(conn, space_id, participant_id, now).await {
         Ok(outcome) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
@@ -2928,7 +3334,7 @@ pub async fn update_template_tx(
     participants: Option<&[TemplateParticipantInput]>,
     now: i64,
 ) -> Result<(), AppError> {
-    conn.execute("BEGIN", ()).await.map_err(AppError::db)?;
+    begin_write(conn).await?;
     match update_template_tx_body(conn, id, title, cascade_limit, participants, now).await {
         Ok(()) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
@@ -7274,6 +7680,7 @@ mod tests {
                     notebook_space_id: notebook,
                     notebook_title: "Cartographer — notebook",
                     persona: None,
+                    grant: None,
                     now: 2,
                 },
             )
@@ -7415,6 +7822,122 @@ mod tests {
                 .await
                 .unwrap(),
             "re-adding an existing member changes nothing"
+        );
+    }
+
+    /// **A departure is not an absence.** Leaving is soft, so the row stays on
+    /// the space's primary key; an insert-only join struck nothing and the
+    /// membership could never be given back (Codex review, PR #280). The three
+    /// things the upsert has to get right, in one place: the revive, the
+    /// premise still riding it, and the live row it must not touch.
+    #[tokio::test]
+    async fn a_membership_that_left_is_revived_and_a_live_one_is_left_alone() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        insert_space(&conn, "s", Some("Home"), "unlinked", 1)
+            .await
+            .unwrap();
+        for (id, label) in [("g", "Ada"), ("r", "Cy"), ("t", "You")] {
+            insert_participant(
+                &conn, id, "global", None, None, "agent", label, None, None, "explicit", "member",
+                None, 1,
+            )
+            .await
+            .unwrap();
+        }
+
+        // It joined, then left.
+        assert!(
+            ensure_space_participant(&conn, "s", "g", "member", 2)
+                .await
+                .unwrap()
+        );
+        assert!(leave_space_participant(&conn, "s", "g", 3).await.unwrap());
+        assert!(
+            space_participants(&conn, "s")
+                .await
+                .unwrap()
+                .iter()
+                .all(|m| m.participant_id != "g"),
+            "a member that left is not a member"
+        );
+
+        // Inviting it back revives that row — one membership, the new role.
+        assert!(
+            ensure_space_participant(&conn, "s", "g", "observer", 4)
+                .await
+                .unwrap(),
+            "the membership came back, so the write reports a change"
+        );
+        let roster = space_participants(&conn, "s").await.unwrap();
+        let back: Vec<_> = roster.iter().filter(|m| m.participant_id == "g").collect();
+        assert_eq!(back.len(), 1, "revived, not duplicated");
+        assert_eq!(back[0].role, "observer", "the requested role rides it");
+
+        // The premise rides the revive as it rides the insert: a retired
+        // participant's departed row stays departed.
+        assert!(
+            ensure_space_participant(&conn, "s", "r", "member", 5)
+                .await
+                .unwrap()
+        );
+        assert!(leave_space_participant(&conn, "s", "r", 6).await.unwrap());
+        assert!(soft_remove_participant(&conn, "r", 7).await.unwrap());
+        assert!(
+            !ensure_space_participant(&conn, "s", "r", "member", 8)
+                .await
+                .unwrap(),
+            "a retired participant cannot be revived into a space either"
+        );
+        assert!(
+            space_participants(&conn, "s")
+                .await
+                .unwrap()
+                .iter()
+                .all(|m| m.participant_id != "r")
+        );
+
+        // And a **live** membership is not rewritten — what the template
+        // instantiation's copied "You" reference depends on (it is inserted
+        // with the template's own role and overrides, and the `ensure` that
+        // follows must leave both standing).
+        insert_participant_ref(
+            &conn,
+            "space_participant",
+            "space_id",
+            "s",
+            "t",
+            "member",
+            9,
+            &ParticipantRefRow {
+                participant_id: "t".into(),
+                role: "member".into(),
+                joined_at: 9,
+                override_label: Some("Scribe".into()),
+                override_model_ref: None,
+                override_system_prompt: None,
+                override_notify_policy: None,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ensure_space_participant(&conn, "s", "t", "owner", 10)
+                .await
+                .unwrap(),
+            "a live membership is already what it is"
+        );
+        let kept = space_participants(&conn, "s")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.participant_id == "t")
+            .expect("still a member");
+        assert_eq!(kept.role, "member", "its role was not overwritten");
+        assert_eq!(
+            kept.label, "Scribe",
+            "nor were the overrides it was inserted with"
         );
     }
 }
