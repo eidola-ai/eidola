@@ -78,6 +78,15 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // Read for measurement verification only — the OTLP exporter
+        // consumes this straight from the environment. Grafana routes by
+        // these auth headers to a tenant, so leaving the hash unverified
+        // would let a different telemetry destination be injected without
+        // a measurement change (privacy-guarantees.md §7.4).
+        let otel_exporter_otlp_headers = std::env::var("OTEL_EXPORTER_OTLP_HEADERS")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         let pricing_markup = std::env::var("PRICING_MARKUP")
             .ok()
             .filter(|s| !s.is_empty())
@@ -116,6 +125,10 @@ impl Config {
             (
                 "STRIPE_WEBHOOK_SECRET",
                 stripe_webhook_secret.as_deref().unwrap_or(""),
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                otel_exporter_otlp_headers.as_deref().unwrap_or(""),
             ),
         ])?;
 

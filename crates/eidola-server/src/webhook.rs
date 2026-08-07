@@ -117,11 +117,12 @@ impl WebhookOutcome {
 
 /// The Stripe event types this handler dispatches on.
 ///
-/// Doubles as the label domain for `WEBHOOK_OUTCOME`: `event_type` arrives
-/// from Stripe, so it is caller-derived and must not become a metric label
-/// unfiltered. Resolving through this list bounds the cardinality; anything
-/// outside it — including a new type Stripe starts sending — lands on
-/// `other`, which is also the dispatch table's fallthrough.
+/// Doubles as the label domain for `WEBHOOK_OUTCOME` and for every log
+/// line that mentions an event type: `event_type` arrives from Stripe, so
+/// it is caller-derived and must not become a metric label or a logged
+/// value unfiltered. Resolving through this list bounds the cardinality;
+/// anything outside it — including a new type Stripe starts sending —
+/// lands on `other`, which is also the dispatch table's fallthrough.
 const HANDLED_EVENT_TYPES: &[&str] = &[
     "charge.dispute.closed",
     "charge.dispute.created",
@@ -207,13 +208,24 @@ pub async fn stripe_webhook(
     let event: StripeEvent = match serde_json::from_slice(&body) {
         Ok(e) => e,
         Err(e) => {
-            error!("webhook: failed to parse event: {}", e);
+            // serde messages quote offending values from the Stripe-authored
+            // body; log only the category/position summary.
+            error!(
+                "webhook: failed to parse event: {}",
+                crate::error::parse_error_summary(&e)
+            );
             record_webhook_outcome("", "unparseable");
             return ok_empty();
         }
     };
 
-    info!("webhook: received {} ({})", event.event_type, event.id);
+    // `event_type` is Stripe-authored, so the log carries its fixed-list
+    // resolution, never the verbatim value (privacy-guarantees.md §3.3).
+    info!(
+        "webhook: received {} ({})",
+        event_type_label(&event.event_type),
+        event.id
+    );
 
     let outcome = match event.event_type.as_str() {
         "checkout.session.completed" => {
@@ -231,10 +243,10 @@ pub async fn stripe_webhook(
         "charge.dispute.created" => handle_dispute_created(&event, &state.db_pool).await,
         "charge.dispute.closed" => handle_dispute_closed(&event, &state.db_pool).await,
         _ => {
-            info!(
-                "webhook: ignoring unhandled event type {}",
-                event.event_type
-            );
+            // The verbatim type is unrecognized by definition here, so
+            // there is nothing loggable beyond the fact of the fallthrough
+            // (the receipt log above already recorded the `other` label).
+            info!("webhook: ignoring unhandled event type");
             WebhookOutcome::Handled
         }
     };

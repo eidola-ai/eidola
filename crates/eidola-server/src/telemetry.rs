@@ -278,19 +278,17 @@ pub mod metrics {
         opentelemetry::global::meter("eidola-server")
     }
 
-    /// The SDK's default explicit-bucket boundaries, reproduced for reference
-    /// (`opentelemetry_sdk::metrics::pipeline`). Any histogram built without
-    /// `.with_boundaries()` gets these:
-    ///
-    /// ```text
-    /// 0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000
-    /// ```
-    ///
-    /// The ladder is scaled for **milliseconds** while every duration
-    /// instrument here records **seconds**, so on the defaults a 4-second
-    /// request and a 5-millisecond one share the first bucket and the whole
-    /// realistic range collapses into it. Any duration histogram added here
-    /// must set its own boundaries.
+    // The SDK's default explicit-bucket boundaries, reproduced for reference
+    // (`opentelemetry_sdk::metrics::pipeline`). Any histogram built without
+    // `.with_boundaries()` gets these:
+    //
+    //   0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000
+    //
+    // The ladder is scaled for **milliseconds** while every duration
+    // instrument here records **seconds**, so on the defaults a 4-second
+    // request and a 5-millisecond one share the first bucket and the whole
+    // realistic range collapses into it. Any duration histogram added here
+    // must set its own boundaries.
 
     /// Second-scale buckets for request and inference latencies, spanning
     /// "fast local hop" to "something is badly wrong".

@@ -430,8 +430,13 @@ impl ChatBackend for TinfoilBackend {
         }
 
         let completion: ChatCompletionResponse = serde_json::from_slice(&body).map_err(|e| {
-            tracing::error!("Failed to parse backend response: {}", e);
-            ServerError::Parse(e.to_string())
+            // Privacy: serde messages quote offending values, and this body
+            // is inference content — only the category/position summary may
+            // reach the log path or the `Parse` message (which `Display`s
+            // into logs via `err` instrumentation).
+            let summary = crate::error::parse_error_summary(&e);
+            tracing::error!("failed to parse backend response: {summary}");
+            ServerError::Parse(summary)
         })?;
 
         let meta = BackendMeta {
@@ -536,11 +541,14 @@ impl ChatBackend for TinfoilBackend {
                                     }
                                 }
                                 Err(e) => {
-                                    // Privacy: a parse failure is a structural
-                                    // problem, not a content one. We log the
-                                    // serde error, which names the offending
-                                    // field or token but never echoes a value.
-                                    tracing::warn!("Failed to parse SSE chunk: {}", e);
+                                    // Privacy: serde messages quote offending
+                                    // values, and this chunk is inference
+                                    // content — log only the category/position
+                                    // summary.
+                                    tracing::warn!(
+                                        "failed to parse SSE chunk: {}",
+                                        crate::error::parse_error_summary(&e)
+                                    );
                                 }
                             }
                         }
