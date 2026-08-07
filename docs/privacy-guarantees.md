@@ -6,21 +6,20 @@ Each item is stated as an invariant. Contributors maintain these invariants when
 
 Every item is an inherent attribute of the attested source: a property you can check against the release's exact code, and one that cannot change without producing a different release. If a promise could be broken without changing the attested source, it does not belong here — it belongs in the [privacy policy](https://www.eidola.ai/privacy/), where it binds us as conduct rather than as code. Where an item is enforced architecturally — typed routing, blind-signature math, build-time pinning — it names the mechanism; where none is named, the enforcement is the plainest kind: code that behaves as described.
 
-These invariants describe what you get when you install and run an attested, **generally-available release of Eidola** running under the trust root that release was built with. They do not extend to development builds, contributor-installed test versions, or any scenario where configuration overrides have been set (see [Client](client.md#configuration-overrides) and [Trust root](trust-root.md#whats-pinned)).
+> [!IMPORTANT]
+> These invariants describe an attested, **generally-available release of Eidola** running under the built-in trust root. They do not extend to development builds, contributor-installed test versions, or any scenario where configuration overrides have been set (see [Client](client.md#configuration-overrides) and [Trust root](trust-root.md#whats-pinned)).
 
 ---
 
 ## 1. Identity and authorization
 
-**1.1.** Every server endpoint is classified `linked`, `unlinked`, or `public`. The classification is bound to the handler in code and checked in middleware before the handler executes. (See [Server](server.md#linked-vs-unlinked).)
+**1.1.** Every server endpoint belongs to exactly one of three surfaces: `linked`, `unlinked`, or `public`. Which surface it belongs to is a property of its handler's signature rather than of configuration or routing: the `BasicAuth` and `TokenAuth` extractors are distinct types and no handler takes both, so the two authenticated surfaces are disjoint at the type level and moving an endpoint between them requires a code change visible in a diff. (See [Server](server.md#linked-vs-unlinked).)
 
-**1.2.** `unlinked` endpoints accept only anonymous credential tokens (Privacy Pass ACT, `draft-schlesinger-privacypass-act-01`). They never receive, derive, persist, or log any identifier that ties a request to its issuance transaction, to the account it was issued to, or to other requests from the same client.
+**1.2.** `unlinked` endpoints take only the `TokenAuth` extractor, so they accept only anonymous credential tokens ([Privacy Pass ACT](https://datatracker.ietf.org/doc/draft-schlesinger-privacypass-act/)) and cannot accept an account credential. They never receive, derive, persist, or log any identifier that ties a request to its issuance transaction, to the account it was issued to, or to other requests from the same client.
 
-**1.3.** `linked` endpoints accept only the HTTP Basic `(account_uuid, account_secret)` bearer pair. They never accept ACTs, and they never receive or emit inference request or response content.
+**1.3.** `linked` endpoints never take the `TokenAuth` extractor, so an anonymous credential is never accepted on the account surface. Those authenticated as the account holder take the `BasicAuth` extractor and only that — the HTTP Basic `(account_uuid, account_secret)` pair. Two are authenticated otherwise, of necessity: account creation, which mints the credential it would otherwise require, and the Stripe webhook, which is authenticated by HMAC signature over the request body. None of them receives or emits inference request or response content.
 
-**1.4.** The two authentication surfaces are disjoint at the type level: the `BasicAuth` and `TokenAuth` extractors are distinct types, and an endpoint may take only one. Cross-acceptance requires a code change visible in a diff.
-
-**1.5.** No personally identifiable information is requested or accepted at account creation. Email, phone, name, address, and government identifiers are never collected by Eidola's API or stored on Eidola's servers. Payment runs through Stripe; what Stripe collects and retains is conduct outside the attested source, covered by the [privacy policy](https://www.eidola.ai/privacy/) and bounded in §8.4.
+**1.4.** No personally identifiable information is requested or accepted at account creation. Email, phone, name, address, and government identifiers are never collected by Eidola's API or stored on Eidola's servers. Payment runs through Stripe; what Stripe collects and retains is conduct outside the attested source, covered by the [privacy policy](https://www.eidola.ai/privacy/) and bounded in §8.4.
 
 ## 2. Unlinkability
 
@@ -38,13 +37,13 @@ These invariants describe what you get when you install and run an attested, **g
 
 **3.1.** Inference request and response content (prompts, attachments, model outputs, tool inputs and tool results) is never written to durable storage on Eidola-controlled infrastructure.
 
-**3.2.** Inference content is never included in logs, telemetry, traces, error reports, or crash dumps, nor in any derived form that could meaningfully identify a request or link it to other requests — including content hashes, content lengths at request granularity, or per-request metadata beyond what is needed to bill, route, or operate the request. Aggregate counters (e.g. tokens-by-model totals) and request-shaped operational fields (status code, latency, route) are not in scope: they do not encode content and do not bind to any account identifier.
+**3.2.** Inference content is never included in logs, telemetry, traces, error reports, or crash dumps, nor in any derived form that could meaningfully identify a request or link it to other requests — including content hashes, content lengths at request granularity, or per-request metadata beyond what is needed to bill, route, or operate the request.
 
-**3.3.** Telemetry on the inference path is limited to model name, token counts, status code, and latency. The classifier that splits telemetry between the linked and unlinked surfaces runs in middleware before the span is created. (See [server.md](server.md#telemetry-scope-and-boundary).)
+**3.3.** Telemetry is limited to generic, unidentifiable fields as aggregate counters and histograms, keyed only by low-cardinality attributes the server controls (route template, model, operation, status, outcome), unless a request explicitly asks to be traced. Diagnostic logs are written per-event, but carry no content, no value derived from content, and no span context by which to group them back into a request. Values that originate outside the server, such as the requested model id or a Stripe event type, are resolved against a fixed list before use, and anything unrecognized collapses to a shared bucket.
 
 **3.4.** Eidola service handlers do not persist or emit client IP addresses, user-agent strings, TLS fingerprints, or other network-layer identifiers. Network infrastructure outside the enclave (CDNs, load balancers, ISPs, the user's own network path) may log such identifiers and is out of scope for this invariant; the application-level promise is that Eidola code does not re-introduce them into its own observability or persistence surfaces.
 
-**3.5.** Inference content is never cleartext on the wire. It is decrypted only in the ephemeral memory of confidential-compute enclaves: (a) the Eidola server enclave, while being routed to the upstream, and (b) the upstream provider's inference enclaves — the router the Eidola server connects to (whose attestation it verifies per-handshake) and the per-model enclave that router forwards to. Every link is TLS terminated inside the respective enclave, so no host, orchestrator, or network observer has cleartext access in transit. The bounded part (§8.9): Eidola independently attests only the enclave it connects to; the per-model enclave's confidential-compute guarantee rests on the provider's own attestation of it, which Eidola does not re-derive. (See [upstream.md](upstream.md) and [gaps.md § Inference upstream](gaps.md#inference-upstream).)
+**3.5.** Inference content is never cleartext on the wire or anywhere outside the ephemeral memory of confidential-compute enclaves: (a) the Eidola server enclave, while being routed to the upstream, and (b) the upstream provider's inference enclaves — the router the Eidola server connects to (whose attestation it verifies per-handshake) and the per-model enclave that router forwards to. Every link is TLS terminated inside the respective enclave, so no host, orchestrator, or network observer has cleartext access in transit. The bounded part (§8.9): Eidola independently attests only the enclave it connects to; the per-model enclave's confidential-compute guarantee rests on the provider's own attestation of it, which Eidola does not re-derive. (See [upstream.md](upstream.md) and [gaps.md § Inference upstream](gaps.md#inference-upstream).)
 
 **3.6.** The Eidola server is request-based: on the inference path, there is no cross-connection cache persisted outside ephemeral enclave memory, and no per-account learned state. There is no operator-facing interface for inspecting, reviewing, approving, flagging, or replaying inference traffic.
 
@@ -118,7 +117,7 @@ These invariants describe what you get when you install and run an attested, **g
 
 **8.3.** Eidola does not promise unforgeability of ACTs from a compromised issuer key. Forgery-enabled service abuse is an operator-borne financial loss; it is never permitted to become a user-borne privacy loss, because unlinkability (§2) survives.
 
-**8.4.** Eidola does not promise anonymity against Stripe with respect to payment metadata. The boundary Eidola enforces is between payment metadata and service usage (§1.5). Stripe's own retention and Eidola's retention of Stripe-collected data are out of scope.
+**8.4.** Eidola does not promise anonymity against Stripe with respect to payment metadata. The boundary Eidola enforces is between payment metadata and service usage (§1.4). Stripe's own retention and Eidola's retention of Stripe-collected data are out of scope.
 
 **8.5.** Eidola does not promise defense against traffic analysis. Network metadata (the fact that a connection occurred, its size, timing, originating IP) is visible to network observers. Users who need that property should layer Eidola behind Tor or a similar anonymity network. (See [gaps.md](gaps.md#network--metadata).)
 

@@ -1,6 +1,7 @@
 //! Top-level HTTP handlers: health, models, chat completions.
 
 use std::convert::Infallible;
+use std::time::{Duration, Instant};
 
 use anonymous_credit_tokens::{Scalar, SpendProof, credit_to_scalar, scalar_to_credit};
 use axum::Json;
@@ -427,6 +428,7 @@ async fn handle_non_streaming_request(
     };
 
     // Make the backend request. On error, issue a full refund.
+    let dispatched_at = Instant::now();
     let backend_response = match state.backend.send(request).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -442,6 +444,10 @@ async fn handle_non_streaming_request(
             return Ok(error_response_with_refund(&e, refund.ok()));
         }
     };
+    crate::telemetry::metrics::CHAT_DURATION.record(
+        dispatched_at.elapsed().as_secs_f64(),
+        &[KeyValue::new("model", model.id.clone())],
+    );
 
     // Record token usage metrics (safe for unlinked layer: only model + counts).
     if let Some(usage) = &backend_response.meta.usage {
@@ -505,6 +511,98 @@ async fn handle_non_streaming_request(
     Ok(Json(eidola_response).into_response())
 }
 
+/// Per-stream timing accumulator behind the streaming instruments.
+///
+/// Lives for exactly one stream and reports once, when the stream terminates.
+/// Everything it holds is a duration or a count: it never sees content, and no
+/// value it produces is attributed to an individual request — each one lands
+/// in a histogram bucket or a counter keyed only by model.
+struct StreamTiming {
+    model_id: String,
+    dispatched_at: Instant,
+    first_chunk_at: Option<Instant>,
+    last_chunk_at: Option<Instant>,
+    chunks: u64,
+    max_gap: Duration,
+}
+
+impl StreamTiming {
+    fn new(model_id: String, dispatched_at: Instant) -> Self {
+        Self {
+            model_id,
+            dispatched_at,
+            first_chunk_at: None,
+            last_chunk_at: None,
+            chunks: 0,
+            max_gap: Duration::ZERO,
+        }
+    }
+
+    fn model_attr(&self) -> [KeyValue; 1] {
+        [KeyValue::new("model", self.model_id.clone())]
+    }
+
+    /// Note the arrival of a chunk from upstream. Records time-to-first-token
+    /// on the first one and tracks the largest inter-chunk gap after that.
+    fn on_chunk(&mut self) {
+        let now = Instant::now();
+        match self.last_chunk_at {
+            None => {
+                self.first_chunk_at = Some(now);
+                crate::telemetry::metrics::CHAT_TTFT.record(
+                    now.duration_since(self.dispatched_at).as_secs_f64(),
+                    &self.model_attr(),
+                );
+            }
+            Some(previous) => {
+                self.max_gap = self.max_gap.max(now.duration_since(previous));
+            }
+        }
+        self.last_chunk_at = Some(now);
+        self.chunks += 1;
+    }
+
+    /// Report the stream's outcome. Called exactly once, on every terminal
+    /// path, so the outcome counter totals the stream count.
+    ///
+    /// The output rate is measured across the *generation* window (first chunk
+    /// to last), not the whole stream: time-to-first-token is already its own
+    /// histogram, and leaving prefill in the denominator would make the rate
+    /// move for two unrelated reasons at once.
+    fn finish(self, reason: &'static str, completion_tokens: Option<u64>) {
+        let attrs = self.model_attr();
+
+        crate::telemetry::metrics::CHAT_STREAM_OUTCOME.add(
+            1,
+            &[
+                KeyValue::new("model", self.model_id.clone()),
+                KeyValue::new("reason", reason),
+            ],
+        );
+        crate::telemetry::metrics::CHAT_STREAM_DURATION
+            .record(self.dispatched_at.elapsed().as_secs_f64(), &attrs);
+
+        // Both remaining instruments need at least two chunks to mean
+        // anything: one chunk gives no gap and a ~zero rate denominator.
+        if self.chunks < 2 {
+            return;
+        }
+        let (Some(first), Some(last)) = (self.first_chunk_at, self.last_chunk_at) else {
+            return;
+        };
+
+        crate::telemetry::metrics::CHAT_INTER_TOKEN_GAP_MAX
+            .record(self.max_gap.as_secs_f64(), &attrs);
+
+        let generation = last.duration_since(first).as_secs_f64();
+        if let Some(tokens) = completion_tokens
+            && generation > 0.0
+        {
+            crate::telemetry::metrics::CHAT_OUTPUT_RATE.record(tokens as f64 / generation, &attrs);
+        }
+    }
+}
+
 /// Handle a streaming chat completion request.
 async fn handle_streaming_request(
     state: AppState,
@@ -517,6 +615,10 @@ async fn handle_streaming_request(
         method: AuthMethod::AnonymousCredential,
     };
 
+    // Stream timing is measured from upstream dispatch, not from request
+    // arrival: everything before this point is our own verification work,
+    // which the HTTP-level histogram already covers.
+    let dispatched_at = Instant::now();
     let mut upstream_rx = match state.backend.send_stream(request).await {
         Ok(rx) => rx,
         Err(e) => {
@@ -615,10 +717,12 @@ async fn handle_streaming_request(
         }
 
         let mut final_usage: Option<Usage> = None;
+        let mut timing = StreamTiming::new(model_id.clone(), dispatched_at);
 
         while let Some(event_result) = upstream_rx.recv().await {
             match event_result {
                 Ok(BackendStreamEvent::Chunk(chunk)) => {
+                    timing.on_chunk();
                     // Capture usage from the final chunk if present.
                     if chunk.usage.is_some() {
                         final_usage.clone_from(&chunk.usage);
@@ -632,6 +736,7 @@ async fn handle_streaming_request(
                         // receive this, but we issue it for consistency.
                         warn!("Client disconnected mid-stream, issuing zero refund");
                         let _ = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
+                        timing.finish("client_disconnect", None);
                         return;
                     }
                 }
@@ -679,6 +784,10 @@ async fn handle_streaming_request(
                         meta.chat_id.unwrap_or_default(),
                     )
                     .await;
+                    timing.finish(
+                        "done",
+                        final_usage.as_ref().map(|u| u.completion_tokens as u64),
+                    );
                     return;
                 }
                 Err(e) => {
@@ -691,6 +800,7 @@ async fn handle_streaming_request(
                     let verification = build_verification_metadata(None);
                     send_metadata_event(&tx, refund_info, privacy, verification, String::new())
                         .await;
+                    timing.finish("upstream_error", None);
                     return;
                 }
             }
@@ -703,6 +813,7 @@ async fn handle_streaming_request(
         let privacy = build_privacy_metadata(&auth_context, true, "tinfoil");
         let verification = build_verification_metadata(None);
         send_metadata_event(&tx, refund_info, privacy, verification, String::new()).await;
+        timing.finish("channel_closed", None);
     });
 
     let stream = ReceiverStream::new(rx);
