@@ -147,8 +147,21 @@
 //! and emitting it would spuriously invalidate a store that reads nothing new
 //! (STATE.md's 1:1 variant↔store rule). `add_global_participant` (a shared
 //! agent joining another space) emits `Change::Participants` like the rest of
-//! the membership CRUD; it is idempotent, and a re-join of an existing member
-//! still emits (the write is an upsert, not a no-op check). Memory is
+//! the membership CRUD — **when the membership changed**: a fresh join, or a
+//! **revive** of one that had left (the join is an insert-or-revive upsert,
+//! task 37 / Codex review PR #280). Re-adding a member that is already live
+//! writes nothing and emits nothing, which is what its idempotence has always
+//! meant; the older wording here claimed the opposite and was never true.
+//! **`grant_space_membership`** (task 37's grant door: give an agent membership
+//! of a space, sharing it first iff the row is still space-owned) is a third
+//! exit point onto the same variant, and the same rule — the promotion branch
+//! emits what `promote_participant` would, the join branch what
+//! `add_global_participant` would, and a membership that **already held**
+//! writes nothing and emits nothing (Codex review, PR #280). It never emits
+//! `SpaceIndex` for the same reason promotion does not: the one space its
+//! promoting branch creates is a notebook. Covered by
+//! `a_grant_decides_from_the_row_it_finds_not_from_the_pickers_snapshot`
+//! (`cross_space_references.rs`), which pins the silent-satisfaction arm. Memory is
 //! untouched by promotion — no block moves, so nothing memory-shaped emits.
 //! Both are refusal-first: every typed error (already global, template-scoped,
 //! the shared human, unknown, retired, not-a-global) is decided before any
@@ -1200,14 +1213,20 @@ fn action_location_resolves_a_posts_item_and_space_without_emitting() {
         let mut rx = core.subscribe_changes();
         let (item_id, space_id) = core
             .runtime()
-            .block_on(core.action_location(posted.action_id.clone()))
+            .block_on(core.action_location(
+                eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+                posted.action_id.clone(),
+            ))
             .unwrap()
             .expect("a persisted post resolves");
         assert_eq!(space_id, posted.space_id);
         assert!(!item_id.is_empty());
         let unknown = core
             .runtime()
-            .block_on(core.action_location("no-such-action".into()))
+            .block_on(core.action_location(
+                eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+                "no-such-action".into(),
+            ))
             .unwrap();
         assert_eq!(unknown, None);
         assert!(
@@ -1224,7 +1243,10 @@ fn action_location_resolves_a_posts_item_and_space_without_emitting() {
             .unwrap();
         let (edited_item, _) = core
             .runtime()
-            .block_on(core.action_location(edited.action_id.clone()))
+            .block_on(core.action_location(
+                eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+                edited.action_id.clone(),
+            ))
             .unwrap()
             .expect("the edit resolves");
         assert_eq!(
@@ -1539,7 +1561,7 @@ fn promote_and_retire_emit_participants_only() {
         let mut rx = core.subscribe_changes();
         let outcome = core
             .runtime()
-            .block_on(core.promote_participant(agent.clone(), None))
+            .block_on(core.promote_participant(agent.clone(), None, None))
             .expect("promotion");
         let emitted = drain(&mut rx);
         assert!(
@@ -1573,6 +1595,7 @@ fn promote_and_retire_emit_participants_only() {
                     label: Some("Cartographer".into()),
                     ..Default::default()
                 }),
+                None,
             ))
             .expect("promotion carrying a persona");
         let emitted = drain(&mut rx);
@@ -1609,7 +1632,7 @@ fn promote_and_retire_emit_participants_only() {
         );
         assert!(
             core.runtime()
-                .block_on(core.promote_participant(agent, None))
+                .block_on(core.promote_participant(agent, None, None))
                 .is_err()
         );
         assert!(drain(&mut rx).is_empty(), "refusals must not emit");

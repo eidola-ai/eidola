@@ -173,14 +173,33 @@ pub fn edit_post(
     })
 }
 
-/// Every current-generation post referencing `action_id` (the reverse index
-/// behind source-post highlights). Pure read.
+/// Every post referencing `action_id` **that this reader could follow** — the
+/// reverse index behind source-post highlights, filtered per viewer (task 37's
+/// inbound-exposure decision: "you can see it" and "you can open it" are the
+/// same set, so the app never paints a backlink whose click it would refuse).
+/// Same-space backlinks are unaffected, since the reader takes part in the
+/// space they are reading. Pure read.
 pub fn references_to(
     core: Arc<AppCore>,
     action_id: String,
 ) -> oneshot::Receiver<Result<Vec<IncomingReference>, AppError>> {
     spawn_oneshot(core, move |core| async move {
-        core.references_to(action_id).await
+        core.references_to_visible_to(action_id, eidola_app_core::HUMAN_PARTICIPANT_ID.to_string())
+            .await
+    })
+}
+
+/// The agents a reader could grant membership of a space — task 37's grant
+/// picker. Viewer-scoped in app-core (a space-owned agent is listed only where
+/// the viewer takes part in the space that owns it), so this passes the shared
+/// human, the reader every GUI window acts as. Pure read.
+pub fn list_grantable_agents(
+    core: Arc<AppCore>,
+    space_id: String,
+) -> oneshot::Receiver<Result<Vec<eidola_app_core::GrantableAgent>, AppError>> {
+    spawn_oneshot(core, move |core| async move {
+        core.list_grantable_agents(space_id, eidola_app_core::HUMAN_PARTICIPANT_ID.to_string())
+            .await
     })
 }
 
@@ -200,12 +219,19 @@ pub fn space_traces(
 /// resolves where a quoted post lives before navigating a footnote: its item
 /// finds the tip that superseded an edited generation in *this* space, its
 /// space opens the window for a genuinely cross-space reference.
+///
+/// **Membership-gated** (task 37 rule 4): the reader is the shared human, and a
+/// reference into a space they take no part in — an agent's notebook is the one
+/// that exists — refuses with `AppError::NotAParticipant`, which the view
+/// renders as its own notice. The gate lives in app-core, on the read itself,
+/// so the click path and the agent's tool call answer to one rule.
 pub fn action_location(
     core: Arc<AppCore>,
     action_id: String,
 ) -> oneshot::Receiver<Result<Option<(String, String)>, AppError>> {
     spawn_oneshot(core, move |core| async move {
-        core.action_location(action_id).await
+        core.action_location(eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(), action_id)
+            .await
     })
 }
 

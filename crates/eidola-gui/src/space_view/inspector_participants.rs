@@ -54,6 +54,15 @@ use super::SpaceView;
 /// a choice rather than a missing value.
 const PROMPT_PLACEHOLDER: &str = "A short instruction for how this participant behaves.";
 
+/// Row height for the virtualized invite-candidate list. One line by
+/// construction (a name, and where a space-owned agent works today), so
+/// `uniform_list`'s single-measure layout holds.
+const INVITE_ROW_H: gpui::Pixels = gpui::px(22.);
+
+/// The candidate list stops growing here — a form inside a 320px panel, not a
+/// page. Below it the list is exactly as tall as its rows.
+const INVITE_LIST_MAX_H: gpui::Pixels = gpui::px(180.);
+
 /// The open editor for one participant — the row's disclosure. Holds the field
 /// inputs plus the working model/notify/mode, and (for a referenced global) the
 /// reference detail the two modes seed from.
@@ -115,6 +124,66 @@ pub(crate) struct ParticipantAdd {
     notify_policy: String,
 }
 
+/// **The sentence a grant has to say** (task 37), for each of the two shapes a
+/// candidate comes in.
+///
+/// A shared agent joins by ordinary membership, and what the reader needs to
+/// know is what membership *is* here: it can read this conversation. A
+/// **space-owned** one cannot join at all without being shared first, so the
+/// sentence says that too — including the part that cannot be taken back, and
+/// the reassurance promotion actually earns (its persona where it works today
+/// is preserved byte-for-byte, because promotion moves ownership, not config).
+pub(crate) fn grant_statement(
+    label: &str,
+    shared: bool,
+    home_space_title: Option<&str>,
+) -> SharedString {
+    if shared {
+        return SharedString::from(format!(
+            "{label} will be able to read this conversation, including everything already in it."
+        ));
+    }
+    let home = match home_space_title {
+        Some(home) => format!(" It keeps its persona in {home} exactly as it is."),
+        None => String::new(),
+    };
+    SharedString::from(format!(
+        "{label} works in one conversation today, so adding it here shares it across spaces.\
+{home} It will be able to read this conversation, including everything already in it. \
+Sharing can't be undone."
+    ))
+}
+
+/// The open **"Invite an agent…"** form (task 37's grant): the candidates this
+/// space could give membership to, and — once one is chosen — the sentence that
+/// says what granting it means.
+///
+/// Its data is a **view-owned read**, not a store cell: the list is a transient
+/// picker's material, only ever looked at while this form is open, and killing
+/// its fetch when the window closes strands nothing (STATE.md's owner = blast
+/// radius). The *write* it leads to is the store's, like every other membership
+/// change.
+pub(crate) struct InviteForm {
+    pub(crate) focus: gpui::FocusHandle,
+    /// **The candidate list's single tab stop** — a virtualized list has one
+    /// (the Library's rule): `uniform_list` materializes only the visible
+    /// window, so a tab stop per row is a tab order that does not contain the
+    /// candidates nobody has scrolled to (Codex review, PR #280). Tracked on
+    /// the element carrying the `List` role.
+    pub(crate) list_focus: gpui::FocusHandle,
+    /// The roving cursor over the candidates, read through
+    /// [`SpaceView::invite_cursor`] — the listing can be replaced under it by
+    /// the form's own read landing.
+    pub(crate) cursor: usize,
+    /// `None` while the read is in flight — the form says "Loading…" rather
+    /// than reading as an empty library.
+    pub(crate) candidates: Option<Vec<eidola_app_core::GrantableAgent>>,
+    /// A failed read, said out loud rather than shown as "nobody to invite".
+    pub(crate) error: Option<SharedString>,
+    /// The chosen candidate: `(id, label, shared, home space title)`.
+    pub(crate) confirming: Option<(String, SharedString, bool, Option<SharedString>)>,
+}
+
 /// The open "Save these participants as a template…" form.
 pub(crate) struct TemplateForm {
     focus: gpui::FocusHandle,
@@ -155,6 +224,47 @@ impl SpaceView {
             == Some(participant_id)
     }
 
+    /// Whether this space is some agent's private **notebook** — `None` while
+    /// the settings read has not answered.
+    ///
+    /// **Flagged, not decided** (task 37): whether an agent may be granted
+    /// observer membership of another agent's notebook is one of the two
+    /// questions the spec leaves to Mike, so this surface takes the
+    /// conservative reading and offers no *new* door here — app-core's rules
+    /// are unchanged either way (`add_global_participant` has never refused a
+    /// notebook), so nothing here forecloses the answer. If notebooks turn out
+    /// to be grantable, deleting [`Self::inspector_offers_grant_door`]'s one
+    /// use is the whole change.
+    ///
+    /// **The three states are three answers**, because that unchanged app-core
+    /// rule is exactly what makes the unknown one dangerous: nothing refuses a
+    /// notebook grant *underneath* this decision, so a predicate that folds "no
+    /// answer yet" into "an ordinary space" offers the door in the window
+    /// before the read lands, and confirming it succeeds — a notebook's whole
+    /// history handed to an agent by a surface that had decided not to allow it
+    /// (Codex review, PR #280). A cell that has not answered knows nothing; only
+    /// a listing that answered may say anything (the status menu's rule, and
+    /// [`Self::sync_inspector_participant_edit`]'s).
+    fn inspector_space_is_a_notebook(&self, cx: &gpui::App) -> Option<bool> {
+        let space_id = self.space_id(cx)?;
+        Some(
+            self.stores
+                .space_settings
+                .read(cx)
+                .settings(&space_id)
+                .value()?
+                .notebook_participant_id
+                .is_some(),
+        )
+    }
+
+    /// Whether the roster offers the grant door: only where the settings have
+    /// **affirmed** an ordinary conversation. Unknown withholds it — the door
+    /// comes back on the frame the read answers.
+    fn inspector_offers_grant_door(&self, cx: &gpui::App) -> bool {
+        self.inspector_space_is_a_notebook(cx) == Some(false)
+    }
+
     /// This space's membership as the store holds it.
     fn inspector_participants(&self, cx: &gpui::App) -> Vec<ParticipantInfo> {
         match self.space_id(cx) {
@@ -193,6 +303,13 @@ impl SpaceView {
                 .inspector_template_form
                 .as_ref()
                 .is_some_and(|t| holds(&t.focus))
+            // The invite form is the section's fourth, and it is a form in
+            // exactly this sense: its rows and verbs are tab stops, so a
+            // keystroke inside it is a keystroke inside the panel.
+            || self
+                .inspector_invite
+                .as_ref()
+                .is_some_and(|i| holds(&i.focus))
     }
 
     // -- Test seams --------------------------------------------------------
@@ -301,6 +418,7 @@ impl SpaceView {
         };
         self.inspector_participant_add = None;
         self.inspector_template_form = None;
+        self.inspector_invite = None;
         self.inspector_participant_picker = None;
         let is_referenced = p.source == "referenced";
         let label = cx.new(|cx| InputState::new(window, cx).default_value(&p.label));
@@ -613,6 +731,7 @@ impl SpaceView {
     pub fn inspector_begin_add_participant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.inspector_participant_edit = None;
         self.inspector_template_form = None;
+        self.inspector_invite = None;
         self.inspector_participant_picker = None;
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("Participant name"));
         label.update(cx, |s, cx| s.focus(window, cx));
@@ -684,11 +803,220 @@ impl SpaceView {
         cx.notify();
     }
 
+    // -- Inviting an agent (task 37's grant) -------------------------------
+
+    /// Open the invite form and start its read. The candidates come from
+    /// app-core's viewer-scoped listing, so this surface can only ever offer
+    /// agents this reader already knows about.
+    ///
+    /// **The reveal focuses what it revealed** — the Settings idiom every other
+    /// form in this section follows (the disclosure, Add and the template form
+    /// each focus their first field). It is the mount-side half of the handback
+    /// rule, and it is owed here for the same reason: the form *replaces* the
+    /// "Invite an agent…" door, which is a real tab stop (`probe(Role::Button)`
+    /// derives `focusable()` + `tab_index(0)`), so opening it otherwise leaves
+    /// the window holding a handle to something nobody paints — keystrokes
+    /// reach nothing and Tab restarts from the window root (Codex review, PR
+    /// #280). This form has no text field to focus, so the keyboard goes to the
+    /// form itself, which is what `contains_focused` asks about anyway.
+    pub fn inspector_begin_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.inspector_participant_edit = None;
+        self.inspector_participant_add = None;
+        self.inspector_template_form = None;
+        self.inspector_participant_picker = None;
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        // **A fresh list starts where its cursor does.** The scroll handle is a
+        // view field, so it outlives the form: reopening built a form whose
+        // cursor is 0 while the list still showed wherever the last one was
+        // left, and Enter armed a candidate nobody could see (Codex review, PR
+        // #280). Replaced with the form, the way `quote_elsewhere` replaces the
+        // picker's.
+        self.inspector_invite_scroll = gpui::UniformListScrollHandle::new();
+        self.inspector_invite = Some(InviteForm {
+            focus,
+            list_focus: cx
+                .focus_handle()
+                .tab_index(crate::focus::region::MAIN)
+                .tab_stop(true),
+            cursor: 0,
+            candidates: None,
+            error: None,
+            confirming: None,
+        });
+        let (Some(space_id), Some(core)) = (self.space_id(cx), self.stores.app_core()) else {
+            // No backend (stub mode) or no space yet: the form stands empty and
+            // honest rather than spinning forever.
+            if let Some(form) = self.inspector_invite.as_mut() {
+                form.candidates = Some(Vec::new());
+            }
+            cx.notify();
+            return;
+        };
+        let rx = crate::bridge::list_grantable_agents(core, space_id);
+        self.inspector_invite_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = rx.await;
+            this.update(cx, |this, cx| {
+                if let Some(form) = this.inspector_invite.as_mut() {
+                    match result {
+                        Ok(Ok(candidates)) => form.candidates = Some(candidates),
+                        Ok(Err(err)) => {
+                            form.candidates = Some(Vec::new());
+                            form.error = Some(SharedString::from(err.to_string()));
+                        }
+                        // A dropped receiver is a closing window; say nothing.
+                        Err(_) => {}
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Arm the confirmation for one candidate — where the consequence is said.
+    ///
+    /// The candidate rows are tab stops, and the confirmation **replaces** them
+    /// inside the same form, so the pressed row unmounts: the keyboard goes to
+    /// the form, exactly as it does when the share confirmation replaces a
+    /// verb ([`Self::set_inspector_promote_confirm`]) — and, as there, only
+    /// from a form that was holding it, so a pointer press from elsewhere in
+    /// the window takes nothing.
+    pub fn inspector_arm_invite(
+        &mut self,
+        participant_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(form) = self.inspector_invite.as_mut() else {
+            return;
+        };
+        let Some(candidate) = form
+            .candidates
+            .as_ref()
+            .and_then(|c| c.iter().find(|c| c.id == participant_id))
+        else {
+            return;
+        };
+        form.confirming = Some((
+            candidate.id.clone(),
+            SharedString::from(candidate.label.clone()),
+            candidate.shared,
+            candidate.home_space_title.clone().map(SharedString::from),
+        ));
+        let focus = form.focus.clone();
+        if focus.contains_focused(window, cx) {
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// The invite form's subtree focus handle (tests).
+    #[doc(hidden)]
+    pub fn inspector_invite_focus_handle(&self) -> Option<gpui::FocusHandle> {
+        self.inspector_invite.as_ref().map(|f| f.focus.clone())
+    }
+
+    pub fn inspector_cancel_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.inspector_field_focused(window, cx);
+        self.inspector_invite = None;
+        self.inspector_invite_task = None;
+        self.hand_back_inspector_focus(held, window, cx);
+        cx.notify();
+    }
+
+    /// Grant the armed candidate membership of this space, as an observer.
+    ///
+    /// The candidate's `shared` flag is what the **sentence** was written from,
+    /// never what the write branches on: whether the row still needs sharing is
+    /// decided inside the grant's own transaction (see
+    /// `ParticipantsStore::grant_membership`), because another window can share
+    /// it between this form's listing and this press.
+    pub fn inspector_confirm_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(space_id) = self.space_id(cx) else {
+            return;
+        };
+        let Some((participant_id, _, _, _)) = self
+            .inspector_invite
+            .as_ref()
+            .and_then(|f| f.confirming.clone())
+        else {
+            return;
+        };
+        self.stores
+            .participants
+            .update(cx, |s, cx| s.grant_membership(space_id, participant_id, cx));
+        self.inspector_cancel_invite(window, cx);
+    }
+
+    /// Retire an open invite form over a space that turns out to be a
+    /// **notebook** — the door's own lifetime rule, run at the head of `render`
+    /// beside [`Self::sync_inspector_participant_edit`].
+    ///
+    /// The withheld door is a decision about *where* the grant may be made, and
+    /// a form is a door left standing: gating the render alone leaves any form
+    /// opened while the settings were still unknown mounted and confirmable
+    /// after the answer arrives, which app-core will not refuse (Codex review,
+    /// PR #280). So the same question that decides the door decides the form
+    /// for as long as it is open — "a form is valid only while what it was
+    /// opened over still answers to the same shape", where the shape here is
+    /// the space's own kind. Only an **affirmed** notebook retires it; unknown
+    /// withholds the door but disturbs nothing already open, because unknown is
+    /// not evidence either way.
+    pub(crate) fn sync_inspector_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inspector_invite.is_none() || self.inspector_space_is_a_notebook(cx) != Some(true) {
+            return;
+        }
+        // The same exit Cancel takes — the form, its read, and the keyboard it
+        // may be holding, through the one handback door.
+        self.inspector_cancel_invite(window, cx);
+    }
+
+    /// Whether the roster offers the grant door here (the notebook question,
+    /// asked of the surface rather than of a painted frame).
+    #[doc(hidden)]
+    pub fn inspector_offers_grant_door_for_test(&self, cx: &gpui::App) -> bool {
+        self.inspector_offers_grant_door(cx)
+    }
+
+    /// Seed the invite form's candidates without a backend — the driver and
+    /// the visual harness run on stub stores, where there is nothing to list.
+    #[doc(hidden)]
+    pub fn seed_invite_candidates_for_test(
+        &mut self,
+        candidates: Vec<eidola_app_core::GrantableAgent>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(form) = self.inspector_invite.as_mut() {
+            form.candidates = Some(candidates);
+        }
+        cx.notify();
+    }
+
+    /// What the invite form is showing (behavior tests read the transition
+    /// here rather than through the painted panel): the candidate labels, and
+    /// the sentence an armed candidate is showing.
+    #[doc(hidden)]
+    pub fn inspector_invite_for_test(&self) -> Option<(Vec<String>, Option<SharedString>)> {
+        let form = self.inspector_invite.as_ref()?;
+        Some((
+            form.candidates
+                .as_ref()
+                .map(|c| c.iter().map(|c| c.label.clone()).collect())
+                .unwrap_or_default(),
+            form.confirming
+                .as_ref()
+                .map(|(_, label, shared, home)| grant_statement(label, *shared, home.as_deref())),
+        ))
+    }
+
     // -- Save as template --------------------------------------------------
 
     pub fn inspector_begin_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.inspector_participant_edit = None;
         self.inspector_participant_add = None;
+        self.inspector_invite = None;
         let default_title = self
             .space_title(cx)
             .map(|t| t.to_string())
@@ -1011,6 +1339,34 @@ impl SpaceView {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.inspector_begin_add_participant(window, cx)
                     })),
+            ),
+        };
+
+        col = match (
+            self.inspector_invite.is_some(),
+            self.inspector_offers_grant_door(cx),
+        ) {
+            (true, _) => col.child(self.render_inspector_invite_form(cx)),
+            // A notebook withholds the grant door — and so does a settings read
+            // that has not said which this is (see
+            // `inspector_space_is_a_notebook`).
+            (false, false) => col,
+            (false, true) => col.child(
+                div()
+                    .id("space-inspector-participants-invite")
+                    .probe(
+                        "space/inspector/participants/invite",
+                        gpui::Role::Button,
+                        "Invite an agent",
+                    )
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(link)
+                    .hover(move |s| s.text_color(fg))
+                    .child("Invite an agent…")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.inspector_begin_invite(window, cx)),
+                    ),
             ),
         };
 
@@ -1489,6 +1845,363 @@ impl SpaceView {
                     )),
             )
             .into_any_element()
+    }
+
+    /// The invite form: who could join, and — once one is chosen — what
+    /// letting them in means.
+    fn render_inspector_invite_form(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let Some(form) = self.inspector_invite.as_ref() else {
+            return div().into_any_element();
+        };
+        let muted = theme.muted_foreground;
+        let mut col = v_flex()
+            .id("space-inspector-invite-form")
+            .track_focus(&form.focus)
+            .probe(
+                "space/inspector/participants/invite/form",
+                gpui::Role::Group,
+                "Invite an agent",
+            )
+            .w_full()
+            .p_2()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary.opacity(0.3));
+
+        if let Some((id, label, shared, home)) = form.confirming.clone() {
+            let statement = grant_statement(&label, shared, home.as_deref());
+            let verb = if shared {
+                "Add as observer"
+            } else {
+                "Share and add"
+            };
+            let _ = id;
+            return col
+                .child(
+                    div()
+                        .id("space-inspector-invite-note")
+                        .probe_value(
+                            "space/inspector/participants/invite/note",
+                            gpui::Role::Label,
+                            "What this grant does",
+                            statement.clone(),
+                        )
+                        .text_xs()
+                        .text_color(muted)
+                        .child(statement),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(ghost_button(
+                            "space-inspector-invite-cancel".into(),
+                            "space/inspector/participants/invite/cancel".into(),
+                            "Not now",
+                            false,
+                            cx,
+                            cx.listener(|this, _, window, cx| {
+                                this.inspector_cancel_invite(window, cx)
+                            }),
+                        ))
+                        .child(ghost_button(
+                            "space-inspector-invite-confirm".into(),
+                            "space/inspector/participants/invite/confirm".into(),
+                            verb,
+                            true,
+                            cx,
+                            cx.listener(|this, _, window, cx| {
+                                this.inspector_confirm_invite(window, cx)
+                            }),
+                        )),
+                )
+                .into_any_element();
+        }
+
+        col = col.child(field_label("Invite an agent", cx));
+        match form.candidates.as_ref() {
+            // A read in flight knows nothing — and an unanswered list is not an
+            // empty one (the Agents pane's rule).
+            None => {
+                col = col.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted.opacity(0.8))
+                        .child("Loading…"),
+                );
+            }
+            Some(candidates) if candidates.is_empty() => {
+                let line = match &form.error {
+                    Some(err) => err.clone(),
+                    None => {
+                        SharedString::from("Every agent you could invite already takes part here.")
+                    }
+                };
+                col = col.child(div().text_xs().text_color(muted).child(line));
+            }
+            Some(candidates) => {
+                // **Bounded and virtualized**, the destination picker's shape
+                // (Codex review, PR #280). The size argument is the same one:
+                // the candidates are every live agent the viewer could add, and
+                // a seeded space owns an agent — so this list grows with the
+                // reader's *conversations*, not with a curated roster. The
+                // panel around it is itself an `overflow_y_scroll`, which the
+                // virtualized-list doctrine warns about, but the warning's
+                // mechanism is `ListSizingBehavior::Auto` collapsing with no
+                // parent height to fill: the height here is **explicit**
+                // (`count × ROW_H`, capped), so nothing collapses, and a
+                // bounded inner scroller inside this panel is what its model
+                // dropdown already is.
+                let count = candidates.len();
+                let shown = px((count as f32 * INVITE_ROW_H.to_f64() as f32)
+                    .min(INVITE_LIST_MAX_H.to_f64() as f32));
+                let list = gpui::uniform_list(
+                    "space-inspector-invite-list",
+                    count,
+                    cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                        this.render_invite_candidate_rows(range, window, cx)
+                    }),
+                )
+                .h(shown)
+                .w_full()
+                .track_scroll(&self.inspector_invite_scroll);
+                col = col.child(
+                    div()
+                        .id("space-inspector-invite-list-wrap")
+                        // `uniform_list` carries no role (the Library's rule),
+                        // so the `List` parent goes on the wrapper.
+                        .probe(
+                            "space/inspector/participants/invite/list",
+                            gpui::Role::List,
+                            "Agents you can invite",
+                        )
+                        // The single tab stop, on the element carrying the
+                        // role, with the roving key map riding it.
+                        .track_focus(&form.list_focus)
+                        .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                            if this.handle_invite_key(ev, window, cx) {
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .relative()
+                        .w_full()
+                        .child(list)
+                        .child(crate::scrollbar::vertical_floating(
+                            "invite-candidates-scrollbar",
+                            &self.inspector_invite_scroll,
+                        )),
+                );
+            }
+        }
+        // The way out is offered in **every** state — empty and failed
+        // included: a form whose only exit is a successful listing is a dead
+        // end in exactly the state a reader most needs to leave it.
+        col = col.child(h_flex().justify_end().child(ghost_button(
+            "space-inspector-invite-close".into(),
+            "space/inspector/participants/invite/cancel".into(),
+            "Cancel",
+            false,
+            cx,
+            cx.listener(|this, _, window, cx| this.inspector_cancel_invite(window, cx)),
+        )));
+        col.into_any_element()
+    }
+
+    /// The **effective** cursor over the invite candidates: clamped into the
+    /// listing the form currently holds, and `None` while there is nothing to
+    /// point at (a read in flight, an empty answer). Derived on read — the
+    /// Library's rule, because the form's own fetch can replace the listing
+    /// under the cursor.
+    fn invite_cursor(&self) -> Option<usize> {
+        let form = self.inspector_invite.as_ref()?;
+        form.candidates
+            .as_ref()?
+            .len()
+            .checked_sub(1)
+            .map(|last| form.cursor.min(last))
+    }
+
+    /// The candidate list's roving-focus key map: ↑/↓ move the cursor,
+    /// Home/End take its ends, Enter arms the candidate it sits on.
+    ///
+    /// **Escape is not among them, deliberately.** This form's way out is its
+    /// Cancel (offered in every state), and the panel's Escape rungs belong to
+    /// its dropdowns; a cursor that consumed Escape would put a rung in front
+    /// of both. Five keys, everything else propagates.
+    fn handle_invite_key(
+        &mut self,
+        ev: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(form) = self.inspector_invite.as_ref() else {
+            return false;
+        };
+        // The **list** holding focus, not containing it: once Tab has moved on
+        // to Cancel, that verb owns the keyboard.
+        if !form.list_focus.is_focused(window) || ev.keystroke.modifiers.modified() {
+            return false;
+        }
+        let count = form.candidates.as_ref().map(|c| c.len()).unwrap_or(0);
+        let (Some(last), Some(cursor)) = (count.checked_sub(1), self.invite_cursor()) else {
+            return false;
+        };
+        let target = match ev.keystroke.key.as_str() {
+            "up" => cursor.saturating_sub(1),
+            "down" => (cursor + 1).min(last),
+            "home" => 0,
+            "end" => last,
+            "enter" => {
+                let picked = self
+                    .inspector_invite
+                    .as_ref()
+                    .and_then(|f| f.candidates.as_ref())
+                    .and_then(|c| c.get(cursor))
+                    .map(|c| c.id.clone());
+                if let Some(id) = picked {
+                    self.inspector_arm_invite(&id, window, cx);
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        self.move_invite_cursor(target, cx);
+        true
+    }
+
+    /// Move the cursor and scroll it into view — the scroll is what makes one
+    /// tab stop equivalent to a per-row one.
+    fn move_invite_cursor(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(form) = self.inspector_invite.as_mut() {
+            form.cursor = idx;
+        }
+        self.inspector_invite_scroll
+            .scroll_to_item(idx, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// **The cursor as the row renders it** — `None` unless the list itself
+    /// holds the keyboard.
+    ///
+    /// The stored cursor is where ↑/↓ left it; whether a row should *say* so is
+    /// a different question, and the answer is the Library's: the cursor is the
+    /// row's focus identity, so it belongs to the row only while the list is
+    /// the focused element. Otherwise the form's own focus (the door's reveal,
+    /// before the read has even landed) painted a ring on the first candidate,
+    /// and Tab moving on to Cancel left it there — two focus indications for
+    /// one focus, and an `aria_active_descendant` claiming a row is focused
+    /// while the real focus is a button beside it (Codex review, PR #280).
+    fn invite_cursor_row(&self, window: &Window) -> Option<usize> {
+        let form = self.inspector_invite.as_ref()?;
+        form.list_focus
+            .is_focused(window)
+            .then(|| self.invite_cursor())
+            .flatten()
+    }
+
+    /// Test seam over [`Self::invite_cursor_row`] — the same computation the
+    /// rows render from, so pinning it pins the render (the Library's
+    /// `cursor_and_reveal_for_test` idiom).
+    #[doc(hidden)]
+    pub fn invite_cursor_row_for_test(&self, window: &Window) -> Option<usize> {
+        self.invite_cursor_row(window)
+    }
+
+    /// Test seam: where the invite list's roving cursor effectively sits.
+    #[doc(hidden)]
+    pub fn invite_cursor_for_test(&self) -> Option<usize> {
+        self.invite_cursor()
+    }
+
+    /// Test seam: the candidate list's own focus handle (its single tab stop).
+    #[doc(hidden)]
+    pub fn invite_list_focus_handle(&self) -> Option<gpui::FocusHandle> {
+        self.inspector_invite.as_ref().map(|f| f.list_focus.clone())
+    }
+
+    /// The invite form's dumb indexer: exactly the candidate rows
+    /// `uniform_list` asks for.
+    ///
+    /// The candidates are already a materialized `Vec` on the form (a fetch
+    /// result, not a store listing), so the range is a slice — no scan, and
+    /// only the visible rows' strings are built.
+    fn render_invite_candidate_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let (muted, fg) = {
+            let theme = cx.theme();
+            (theme.muted, theme.foreground)
+        };
+        let Some(form) = self.inspector_invite.as_ref() else {
+            return Vec::new();
+        };
+        let Some(candidates) = form.candidates.as_ref() else {
+            return Vec::new();
+        };
+        let total = candidates.len();
+        let visible: Vec<(usize, String, SharedString)> = candidates
+            .get(range.clone())
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(offset, c)| {
+                let line = match (&c.home_space_title, c.shared) {
+                    (_, true) => SharedString::from(c.label.clone()),
+                    (Some(home), false) => SharedString::from(format!("{} — from {home}", c.label)),
+                    (None, false) => SharedString::from(c.label.clone()),
+                };
+                (range.start + offset, c.id.clone(), line)
+            })
+            .collect();
+        // Focus-gated (the row's focus identity), then modality-gated again for
+        // the ring alone: a programmatic cursor must not paint a keyboard
+        // indicator for a pointer reader.
+        let cursor = self.invite_cursor_row(window);
+        let on_cursor = |i: usize| cursor == Some(i);
+        let keyboard = window.last_input_was_keyboard();
+        visible
+            .into_iter()
+            .map(|(i, id, line)| {
+                div()
+                    .id(SharedString::from(format!("space-inspector-invite-{i}")))
+                    // A managed descendant of the list, never a tab stop.
+                    .probe_delegating(
+                        format!("space/inspector/participants/invite/{i}"),
+                        gpui::Role::ListItem,
+                        line.clone(),
+                    )
+                    // Set position on a virtualized row (the a11y rule).
+                    .aria_position_in_set(i + 1)
+                    .aria_size_of_set(total)
+                    .aria_selected(on_cursor(i))
+                    .when(on_cursor(i), |d| d.aria_active_descendant())
+                    .w_full()
+                    .h(INVITE_ROW_H)
+                    .flex()
+                    .items_center()
+                    .px_1()
+                    .rounded_sm()
+                    .text_xs()
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(muted).text_color(fg))
+                    .when(on_cursor(i) && keyboard, |d| {
+                        d.bg(muted)
+                            .shadow(crate::focus::ring_shadows(crate::focus::ring_colors()))
+                    })
+                    .child(line)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.inspector_arm_invite(&id, window, cx)
+                    }))
+                    .into_any_element()
+            })
+            .collect()
     }
 
     fn render_inspector_template_form(&self, cx: &mut Context<Self>) -> AnyElement {

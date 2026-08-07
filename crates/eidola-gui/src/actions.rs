@@ -69,6 +69,12 @@ actions!(
         /// on the quoted post, so the answer branches where the passage is.
         /// Same registration and greying as [`Quote`].
         QuoteInReply,
+        /// **Quote in Another Conversation…** — the cross-space arm (task 37).
+        /// Opens a destination picker over the Library's conversations; the
+        /// chosen one is named in a visibility statement the reader confirms,
+        /// because quoting *copies* the passage to that audience. Same
+        /// registration and greying as [`Quote`].
+        QuoteElsewhere,
         /// Show the Updates window (singleton, like Settings) and run a
         /// manual update check. Lives in the Eidola menu directly under
         /// "About Eidola" — the standard macOS placement.

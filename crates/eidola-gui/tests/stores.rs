@@ -1285,7 +1285,7 @@ fn two_shared_agents(cx: &mut TestAppContext, stores: &Stores) -> (String, Strin
             .expect("the default template seeds one agent")
             .id;
         core.runtime()
-            .block_on(core.promote_participant(agent.clone(), None))
+            .block_on(core.promote_participant(agent.clone(), None, None))
             .expect("promotion");
         ids.push(agent);
     }
@@ -1419,7 +1419,7 @@ fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
     // is looking at a space-owned agent — that snapshot is what makes the draft
     // stale, and nothing about the two-call shape can notice.
     core.runtime()
-        .block_on(core.promote_participant(agent.clone(), None))
+        .block_on(core.promote_participant(agent.clone(), None, None))
         .expect("the other window's share");
     let before = core
         .runtime()
@@ -1461,6 +1461,57 @@ fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
     assert_eq!(
         after.system_prompt, before.system_prompt,
         "nor rewrite its charter — across every space that follows the shared row"
+    );
+}
+
+/// **A grant decides at the write, not from the picker's snapshot** (Codex
+/// review, PR #280). The invite form records whether a candidate was shared
+/// when its listing landed; another window sharing it before the reader
+/// confirms made that snapshot a lie, and a store that branched on it asked for
+/// a promotion of an already-global row — refused, for a membership app-core
+/// would have added without complaint. The store now names the *outcome* it
+/// wants and lets one transaction decide the verb.
+#[gpui::test]
+fn a_grant_that_loses_the_race_to_a_promotion_still_adds_the_membership(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let home = core
+        .runtime()
+        .block_on(core.create_space(Some("Home".into())))
+        .expect("create space")
+        .id;
+    let here = core
+        .runtime()
+        .block_on(core.create_space(Some("Here".into())))
+        .expect("create space")
+        .id;
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(home.clone()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent")
+        .id;
+
+    // The form listed it as space-owned; another window shares it meanwhile.
+    core.runtime()
+        .block_on(core.promote_participant(agent.clone(), None, None))
+        .expect("the other window's share");
+
+    stores.participants.update(cx, |s, cx| {
+        s.grant_membership(here.clone(), agent.clone(), cx)
+    });
+    wait_until(cx, "the grant lands", |cx| {
+        stores
+            .participants
+            .read_with(cx, |s, _| s.list(&here).iter().any(|p| p.id == agent))
+    });
+    assert!(
+        stores
+            .participants
+            .read_with(cx, |s, _| s.op_errors_for(&here).is_empty()),
+        "a grant onto a row someone else shared first is not a refusal"
     );
 }
 
@@ -1642,7 +1693,7 @@ fn a_stale_owned_save_refuses_once_the_row_is_shared(cx: &mut TestAppContext) {
 
     // The other window's Share lands first.
     core.runtime()
-        .block_on(core.promote_participant(agent.clone(), None))
+        .block_on(core.promote_participant(agent.clone(), None, None))
         .expect("the share");
 
     // The Save that was already in flight, composed against the owned row.
