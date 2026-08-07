@@ -846,7 +846,9 @@ impl SpaceView {
                 // The window went away between the offer and this defer. Its
                 // address now names nobody, so hand the offer back to whoever
                 // draws this space next — the window opened just below.
-                space.update(cx, |space, cx| space.readdress_offer_to_any_window(cx));
+                space.update(cx, |space, cx| {
+                    space.readdress_offers_to_any_window(handle.window_id(), cx)
+                });
             }
             crate::open_space_window(cx, stores, space_id);
         });
@@ -863,12 +865,15 @@ impl SpaceView {
     /// reference: same ordinal minting, same footnote row, same
     /// accept-before-consume.
     ///
-    /// The offer is addressed, so a window that shares this space with the one
-    /// the sender presented draws straight past it (see
-    /// [`Space::take_offered_quote`](crate::space::Space::take_offered_quote)).
-    pub(crate) fn adopt_offered_quote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Offers are addressed, so a window that shares this space with the one
+    /// the sender presented draws straight past them (see
+    /// [`Space::take_offered_quotes`](crate::space::Space::take_offered_quotes)).
+    /// **All of this window's offers land in the same frame**, in the order
+    /// they were confirmed: two confirms are two references on one draft, and a
+    /// reader who made them both should not watch them arrive one frame apart.
+    pub(crate) fn adopt_offered_quotes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let here = window.window_handle().window_id();
-        if !self.space.read(cx).has_offered_quote_for(here) {
+        if !self.space.read(cx).has_offered_quote_for(here, cx) {
             return;
         }
         // **Wait for the tail this belongs to.** Quoting into a conversation
@@ -897,23 +902,27 @@ impl SpaceView {
         if !self.space.read(cx).transcript_visible() {
             return;
         }
-        let Some(offer) = self
+        // The gate above governs the drain **as a whole**: either this frame can
+        // hold the batch or none of it leaves the queue.
+        let offers = self
             .space
-            .update(cx, |space, _| space.take_offered_quote(here))
-        else {
+            .update(cx, |space, cx| space.take_offered_quotes(here, cx));
+        if offers.is_empty() {
             return;
-        };
+        }
         let Some(draft_id) = self.draft_for_quote(window, cx) else {
             return;
         };
-        self.attach_reference(
-            &draft_id,
-            offer.spec,
-            offer.byline,
-            offer.snippet,
-            window,
-            cx,
-        );
+        for offer in offers {
+            self.attach_reference(
+                &draft_id,
+                offer.spec,
+                offer.byline,
+                offer.snippet,
+                window,
+                cx,
+            );
+        }
     }
 
     /// The destination picker: which conversation to quote into, and — once one

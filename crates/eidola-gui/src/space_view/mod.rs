@@ -2101,7 +2101,7 @@ impl Render for SpaceView {
         // it to a draft. **After** `sync_tail_drafts`, so it lands in the
         // branch's real tail composer rather than minting one that the sync
         // would then prune.
-        self.adopt_offered_quote(window, cx);
+        self.adopt_offered_quotes(window, cx);
 
         let turns = self.stream_overlays(cx);
         let streaming = !turns.is_empty();
