@@ -13662,6 +13662,146 @@ fn space_quote_destination_frame_work_is_constant_in_library_size(cx: &mut TestA
 }
 
 #[gpui::test]
+fn space_two_quotes_offered_before_a_draw_both_land(cx: &mut TestAppContext) {
+    // Two source windows quote into the same conversation before it redraws —
+    // it may be minimised, or simply behind. Each confirm is a deliberate act
+    // over a passage the reader chose, and quotes **compose**: the draft takes
+    // as many pending references as it is given. A mailbox that held one
+    // dropped the first silently (Codex review, PR #280) — the second offer
+    // replaced it, and nothing said so.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("dest".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let here = cx
+        .update_window(window, |_, window, _| window.window_handle().window_id())
+        .unwrap();
+
+    let offer = |snippet: &str| eidola_gui::space::OfferedQuote {
+        spec: eidola_app_core::ReferenceSpec {
+            antecedent_action_id: "a1".into(),
+            content_block_id: Some("b1".into()),
+            range_start: Some(4),
+            range_end: Some(15),
+            annotation: None,
+        },
+        byline: "You".into(),
+        snippet: snippet.into(),
+    };
+
+    // Both confirms land before this window draws a single frame.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.offer_quote(offer("quick brown"), Some(here), cx);
+            s.offer_quote(offer("lazy dog"), Some(here), cx);
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![
+                (1u64, "quick brown".to_string()),
+                (2u64, "lazy dog".to_string())
+            ],
+            "both passages are pending references, in the order they were confirmed"
+        );
+    });
+    assert!(
+        space.read_with(cx, |s, _| !s.has_offered_quote()),
+        "and the queue is empty — nothing stranded behind the one that landed"
+    );
+    // (That the drain takes the *batch* rather than one entry per frame is the
+    // implementation's own choice — no flicker of ordinals arriving one at a
+    // time — but it is not separately gated here: this harness redraws until
+    // quiescent, so a one-per-frame drain converges to the same assertions.)
+}
+
+#[gpui::test]
+fn space_a_quote_addressed_to_a_closed_window_still_lands(cx: &mut TestAppContext) {
+    // An offer whose addressed window is gone has no claimant: the sender's
+    // raise-failure path re-addresses what it knows about, but a window that
+    // dies after a successful raise and before it draws leaves the passage
+    // behind. It is a confirmed act over a passage the reader chose, so it goes
+    // to a live window on the same conversation rather than waiting in an
+    // entity nobody drains. *Which* live window is a race, deliberately: the
+    // addressee is gone, and any window the reader can see beats none.
+    //
+    // (That an offer addressed to a **live** sibling is not this window's to
+    // take is pinned by `space_a_quote_into_an_open_conversation_lands_in_the_
+    // window_it_raises`, where the older window draws straight past one.)
+    let stores = stub_stores_with_config(cx);
+    let (gone_window, _gone_view) = open_space(cx, &stores, Some("dest".into()));
+    let gone_id = cx
+        .update_window(gone_window, |_, window, _| {
+            window.window_handle().window_id()
+        })
+        .unwrap();
+    cx.update_window(gone_window, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+
+    let (window, view) = open_space(cx, &stores, Some("dest".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block(
+            "d1",
+            "db1",
+            "a conversation over here",
+        )],
+    );
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.offer_quote(
+                eidola_gui::space::OfferedQuote {
+                    spec: eidola_app_core::ReferenceSpec {
+                        antecedent_action_id: "a1".into(),
+                        content_block_id: Some("b1".into()),
+                        range_start: Some(4),
+                        range_end: Some(15),
+                        annotation: None,
+                    },
+                    byline: "You".into(),
+                    snippet: "quick brown".into(),
+                },
+                // Addressed to a window that no longer exists.
+                Some(gone_id),
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.active_draft_references_for_test(),
+            vec![(1u64, "quick brown".to_string())],
+            "orphaned, so the live window on this conversation takes it"
+        );
+    });
+    assert!(
+        space.read_with(cx, |s, _| !s.has_offered_quote()),
+        "and nothing is left stranded"
+    );
+}
+
+#[gpui::test]
 fn space_a_quote_lands_in_a_conversation_whose_refresh_failed(cx: &mut TestAppContext) {
     // The other side of the wait: `Failed { prior: Some(..) }` is a *refresh*
     // that failed over posts we still hold, and those posts are what the reader

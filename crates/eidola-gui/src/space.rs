@@ -414,20 +414,27 @@ pub struct Space {
     /// so a reload — or the other window on the same space — can't collapse one
     /// under the reader.
     traces_expanded: std::collections::HashSet<String>,
-    /// A quote handed to this space from **another window** — task 37's
+    /// Quotes handed to this space from **other windows** — task 37's
     /// cross-space quote creation, in flight.
     ///
     /// A draft is window-local by design (STATE.md: two windows on one space
     /// are two cursors), so a quote made in space A's window cannot be written
     /// into space B's composer directly: the two windows share nothing but this
-    /// entity. So the entity is the courier — a **one-shot mailbox**, not
-    /// state: one `SpaceView` takes it and attaches it to its draft, and
-    /// nothing durable happens until that draft is posted
-    /// (accept-before-consume, exactly as an in-space quote).
+    /// entity. So the entity is the courier — a **queue** the receiving view
+    /// drains, after which each offer is an ordinary pending reference and
+    /// nothing durable happens until the draft is posted (accept-before-consume,
+    /// exactly as an in-space quote).
     ///
-    /// The offer is **addressed** (see [`PendingOffer::to`]) because "one" has
-    /// to mean "the window the reader is looking at".
-    offered_quote: Option<PendingOffer>,
+    /// **A queue, not a slot** (Codex review, PR #280). Each entry is a
+    /// confirmed act over a passage the reader chose, and quotes *compose* — a
+    /// draft carries as many references as it is given. A slot dropped the
+    /// first of two confirms silently whenever the destination had not redrawn
+    /// in between, which a minimised window makes ordinary. Order is the order
+    /// they were confirmed in, and that is the order their ordinals take.
+    ///
+    /// Entries are **addressed** (see [`PendingOffer::to`]) because "which
+    /// window" has to mean "the one the reader is looking at".
+    offered_quotes: std::collections::VecDeque<PendingOffer>,
     /// The windows currently drawing this space, in the order they opened.
     ///
     /// A space is *not* a singleton on screen (see the GUI AGENTS.md window
@@ -491,7 +498,7 @@ impl Space {
             traces: Loadable::NotLoaded,
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
-            offered_quote: None,
+            offered_quotes: std::collections::VecDeque::new(),
             windows: Vec::new(),
         }
     }
@@ -519,7 +526,7 @@ impl Space {
             traces: Loadable::NotLoaded,
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
-            offered_quote: None,
+            offered_quotes: std::collections::VecDeque::new(),
             windows: Vec::new(),
         };
         space.load_transcript(cx);
@@ -548,7 +555,7 @@ impl Space {
             traces: Loadable::NotLoaded,
             traces_task: None,
             traces_expanded: std::collections::HashSet::new(),
-            offered_quote: None,
+            offered_quotes: std::collections::VecDeque::new(),
             windows: Vec::new(),
         }
     }
@@ -636,44 +643,84 @@ impl Space {
         to: Option<WindowId>,
         cx: &mut Context<Self>,
     ) {
-        self.offered_quote = Some(PendingOffer { quote, to });
+        self.offered_quotes.push_back(PendingOffer { quote, to });
         cx.notify();
     }
 
-    /// Take the pending offer if it is `window`'s to take — a one-shot, so two
-    /// windows never both receive it (a quote pasted twice would be two
-    /// references to write), and an **addressed** one, so the window that takes
-    /// it is the window the reader was just shown.
-    pub fn take_offered_quote(&mut self, window: WindowId) -> Option<OfferedQuote> {
-        match self.offered_quote.as_ref()?.to {
-            Some(to) if to != window => None,
-            _ => self.offered_quote.take().map(|o| o.quote),
+    /// Take every offer that is `window`'s to take, oldest first — **the whole
+    /// batch in one drain**, not one per frame, because two confirms are two
+    /// references on one draft and a reader who made them both should see them
+    /// both at once.
+    ///
+    /// Three kinds are `window`'s: those **addressed** to it (so the window the
+    /// reader was just shown is the one that receives them), those addressed to
+    /// **no one** (the sender found no window and opened one; the next view to
+    /// draw this space takes them), and those **orphaned** — addressed to a
+    /// window that has since closed. An orphan has no better claimant than a
+    /// live window on the same conversation, and the alternative is a confirmed
+    /// passage stranded in an entity nobody drains. *Which* live window takes
+    /// an orphan is a race, deliberately: its addressee is gone, so any window
+    /// the reader can see beats none.
+    pub fn take_offered_quotes(&mut self, window: WindowId, cx: &gpui::App) -> Vec<OfferedQuote> {
+        let live = self.live_window_ids(cx);
+        let mut taken = Vec::new();
+        let mut kept = std::collections::VecDeque::with_capacity(self.offered_quotes.len());
+        for offer in std::mem::take(&mut self.offered_quotes) {
+            match offer.to {
+                // Unaddressed, mine, or orphaned — see the doc above.
+                None => taken.push(offer.quote),
+                Some(to) if to == window || !live.contains(&to) => taken.push(offer.quote),
+                Some(_) => kept.push_back(offer),
+            }
         }
+        self.offered_quotes = kept;
+        taken
     }
 
-    /// Re-address a standing offer to no one in particular — the sender's
-    /// recovery when the window it addressed turned out to be gone by the time
-    /// it went to raise it. An unaddressed offer is taken by the next view to
-    /// draw this space, which is the window the sender opens instead.
-    pub fn readdress_offer_to_any_window(&mut self, cx: &mut Context<Self>) {
-        if let Some(offer) = self.offered_quote.as_mut() {
-            offer.to = None;
+    /// Re-address **every** offer waiting for `window` to no one in particular
+    /// — the sender's recovery when the window it addressed turned out to be
+    /// gone by the time it went to raise it. Unaddressed offers are taken by
+    /// the next view to draw this space, which is the window the sender opens
+    /// instead. All of them, because a failed raise says nothing about how many
+    /// passages were waiting on it.
+    pub fn readdress_offers_to_any_window(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        let mut moved = false;
+        for offer in self.offered_quotes.iter_mut() {
+            if offer.to == Some(window) {
+                offer.to = None;
+                moved = true;
+            }
+        }
+        if moved {
             cx.notify();
         }
     }
 
-    /// Whether an offer is waiting for `window` (the `&self` render path's
-    /// question, asked before the `&mut` take).
-    pub fn has_offered_quote_for(&self, window: WindowId) -> bool {
-        self.offered_quote
-            .as_ref()
-            .is_some_and(|o| o.to.is_none_or(|to| to == window))
+    /// Whether any offer is waiting for `window` (the `&self` render path's
+    /// question, asked before the `&mut` drain — the same three kinds).
+    pub fn has_offered_quote_for(&self, window: WindowId, cx: &gpui::App) -> bool {
+        let live = self.live_window_ids(cx);
+        self.offered_quotes
+            .iter()
+            .any(|o| o.to.is_none_or(|to| to == window || !live.contains(&to)))
     }
 
-    /// Whether any offer is waiting, addressed or not (tests, and the sender's
-    /// own "is it still standing" question).
+    /// Whether any offer is waiting at all, addressed or not (tests, and the
+    /// sender's own "is it still standing" question).
     pub fn has_offered_quote(&self) -> bool {
-        self.offered_quote.is_some()
+        !self.offered_quotes.is_empty()
+    }
+
+    /// The ids of the windows drawing this space that still exist — read-only,
+    /// because the drain's question is asked from a `&self` path too (the
+    /// pruning half lives in [`Self::open_windows`]).
+    fn live_window_ids(&self, cx: &gpui::App) -> Vec<WindowId> {
+        let open: Vec<WindowId> = cx.windows().iter().map(|w| w.window_id()).collect();
+        self.windows
+            .iter()
+            .map(|h| h.window_id())
+            .filter(|id| open.contains(id))
+            .collect()
     }
 
     // -- Incoming references (source highlights) ---------------------------
