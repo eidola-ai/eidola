@@ -16,6 +16,11 @@
 //!
 //! These are intentionally data-only: no methods, no business logic, just
 //! `Serialize`/`Deserialize`. Behaviour belongs in the consuming crates.
+//!
+//! Every shape carries `#[serde(deny_unknown_fields)]`: release documents
+//! must not grow fields without a `schema_version` bump, and a document
+//! with fields the verifier doesn't understand is rejected rather than
+//! silently accepted (docs/privacy-guarantees.md §6.8).
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +37,7 @@ use serde::{Deserialize, Serialize};
 /// `#[allow(dead_code)]` so each consumer compiles cleanly without
 /// having to fork the struct.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustConstants {
     pub schema_version: u32,
     pub trusted_attestant_fingerprints: Vec<String>,
@@ -79,6 +85,7 @@ pub struct TrustConstants {
 /// **deliberately absent**: those live in the verifier's embedded trust
 /// root so a forged index can't downgrade them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseIndex {
     pub schema_version: u32,
     pub version: String,
@@ -92,18 +99,21 @@ pub struct ReleaseIndex {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreviousRelease {
     pub version: String,
     pub git_commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactManifestRef {
     pub url: String,
     pub sigstore_bundle_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HumanAttestationRef {
     pub attestant_id: String,
     pub url: String,
