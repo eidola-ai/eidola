@@ -834,12 +834,13 @@ async fn handle_streaming_request(
 /// "(422): unknown error". This wrapper makes those failures visible
 /// to operators.
 ///
-/// **Privacy:** the rejection error message produced by axum + serde is
-/// **structural only** — it names the offending field and the kind of
-/// error ("unknown field `foo`", "missing field `model`", "expected u32
-/// at line N column M") and does not include the user's prompt or any
-/// other request body content. We log only that error string. Body
-/// bytes are owned by axum's extractor and never reach the log path.
+/// **Privacy:** the rejection message produced by axum + serde **can
+/// echo client-authored body values** — `deny_unknown_fields` quotes the
+/// unrecognized field name verbatim, and serde's data errors quote the
+/// offending scalar (`invalid type: string "<the whole string>",
+/// expected u32`). Only the rejection *class* reaches the log path; the
+/// full detail still goes to the client in the rejection response — its
+/// own data, over its own attested connection.
 pub struct LoggedJson<T>(pub T);
 
 impl<S, T> FromRequest<S> for LoggedJson<T>
@@ -854,12 +855,18 @@ where
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(Self(value)),
             Err(rejection) => {
-                // Field-shape diagnostic only — the source error from
-                // axum/serde names the field but never echoes the body
-                // value. Safe to log.
+                // Class only — the rejection's message can quote body
+                // values (see the type-level privacy note).
+                let class = match &rejection {
+                    JsonRejection::JsonDataError(_) => "data",
+                    JsonRejection::JsonSyntaxError(_) => "syntax",
+                    JsonRejection::MissingJsonContentType(_) => "missing content-type",
+                    JsonRejection::BytesRejection(_) => "bytes",
+                    _ => "other",
+                };
                 warn!(
-                    target = std::any::type_name::<T>(),
-                    "request body rejected: {rejection}"
+                    payload_type = std::any::type_name::<T>(),
+                    "request body rejected: {class} error"
                 );
                 Err(rejection)
             }

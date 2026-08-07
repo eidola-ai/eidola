@@ -118,11 +118,11 @@ impl FromRequestParts<AppState> for TokenAuth {
         // Parse token_type (2 bytes, big-endian)
         let token_type = u16::from_be_bytes([token_bytes[0], token_bytes[1]]);
         if token_type != ACT_TOKEN_TYPE {
+            // The presented token type is caller-derived and this message
+            // reaches the logs via `Unauthorized`'s `Display`, so only the
+            // expected constant is interpolated.
             return Err(ServerError::Unauthorized {
-                message: format!(
-                    "unsupported token type: 0x{:04X}, expected 0x{:04X}",
-                    token_type, ACT_TOKEN_TYPE
-                ),
+                message: format!("unsupported token type, expected 0x{ACT_TOKEN_TYPE:04X}"),
             });
         }
 

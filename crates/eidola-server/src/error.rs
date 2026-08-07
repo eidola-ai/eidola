@@ -113,8 +113,10 @@ impl ServerError {
 ///   `docs/privacy-guarantees.md` §3.2 rules out.
 /// - `Backend` carries the upstream's own error string. That string is
 ///   outside our control and can quote token counts or fragments of the
-///   request, so only the status and the upstream's short error-type
-///   classifier are logged.
+///   request, so only the status and a fixed-list resolution of the
+///   upstream's error-type classifier are logged — the classifier is
+///   itself upstream-authored free text, so anything outside
+///   [`KNOWN_UPSTREAM_ERROR_TYPES`] collapses to `other`.
 ///
 /// Every other variant's message is authored by this crate from constants (or
 /// from an error that describes a *shape* failure, not a value), so it is
@@ -127,7 +129,12 @@ impl std::fmt::Display for ServerError {
             ServerError::Unauthorized { message } => write!(f, "unauthorized: {}", message),
             ServerError::Backend {
                 status, error_type, ..
-            } => write!(f, "backend error ({}): {}", status, error_type),
+            } => write!(
+                f,
+                "backend error ({}): {}",
+                status,
+                upstream_error_type_label(error_type)
+            ),
             ServerError::PaymentRequired { .. } => write!(f, "payment required"),
             ServerError::NotFound { message } => write!(f, "not found: {}", message),
             ServerError::Conflict { message } => write!(f, "conflict: {}", message),
@@ -143,6 +150,45 @@ impl std::fmt::Display for ServerError {
 }
 
 impl std::error::Error for ServerError {}
+
+/// Upstream error-type classifiers the log path recognizes. `error_type`
+/// arrives as upstream-authored free text, so the `Display` rendering
+/// resolves it against this list and collapses anything unrecognized to
+/// `other` — the client response keeps the verbatim value. `unknown` is
+/// this crate's own bucket for upstream error bodies that didn't parse.
+const KNOWN_UPSTREAM_ERROR_TYPES: &[&str] = &[
+    "authentication_error",
+    "insufficient_quota",
+    "invalid_request_error",
+    "not_found_error",
+    "permission_error",
+    "rate_limit_error",
+    "server_error",
+    "unknown",
+];
+
+fn upstream_error_type_label(error_type: &str) -> &'static str {
+    KNOWN_UPSTREAM_ERROR_TYPES
+        .iter()
+        .copied()
+        .find(|known| *known == error_type)
+        .unwrap_or("other")
+}
+
+/// Log-safe summary of a `serde_json` error.
+///
+/// serde's own messages echo offending values verbatim — `invalid type:
+/// string "<the value>", expected u32`, ``unknown field `<the name>` `` —
+/// so nothing a serde error `Display`s may reach the log path. Only the
+/// error category and position survive.
+pub(crate) fn parse_error_summary(e: &serde_json::Error) -> String {
+    format!(
+        "{:?} error at line {} column {}",
+        e.classify(),
+        e.line(),
+        e.column()
+    )
+}
 
 impl axum::response::IntoResponse for ServerError {
     fn into_response(self) -> axum::response::Response {
@@ -205,6 +251,37 @@ mod tests {
         );
 
         assert!(err.to_error_response().error.message.contains("8501"));
+    }
+
+    /// `error_type` is upstream-authored free text; an unrecognized value
+    /// must collapse to the shared bucket instead of reaching the logs.
+    #[test]
+    fn backend_display_buckets_unrecognized_error_type() {
+        let err = ServerError::Backend {
+            status: 400,
+            error_type: "you requested 9001 tokens".to_string(),
+            message: "irrelevant".to_string(),
+        };
+        assert_eq!(err.to_string(), "backend error (400): other");
+
+        // The client still receives the verbatim classifier.
+        assert_eq!(
+            err.to_error_response().error.error_type,
+            "you requested 9001 tokens"
+        );
+    }
+
+    /// serde error messages quote offending values; the log-safe summary
+    /// must carry only the category and position.
+    #[test]
+    fn parse_error_summary_omits_offending_values() {
+        let err = serde_json::from_str::<u32>("\"sk-secret-value\"").unwrap_err();
+        let summary = parse_error_summary(&err);
+        assert!(
+            !summary.contains("secret"),
+            "offending value leaked: {summary}"
+        );
+        assert_eq!(summary, "Data error at line 1 column 17");
     }
 
     /// Server-authored messages stay in the logs — redaction is targeted, not
