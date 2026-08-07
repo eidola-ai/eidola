@@ -537,15 +537,9 @@ impl ChatBackend for TinfoilBackend {
                                 Err(e) => {
                                     // Privacy: a parse failure is a structural
                                     // problem, not a content one. We log the
-                                    // error message and the data length only —
-                                    // never `data` itself, since SSE chunks
-                                    // carry model output deltas that can
-                                    // indirectly reflect prompt content.
-                                    tracing::warn!(
-                                        data_len = data.len(),
-                                        "Failed to parse SSE chunk: {}",
-                                        e
-                                    );
+                                    // serde error, which names the offending
+                                    // field or token but never echoes a value.
+                                    tracing::warn!("Failed to parse SSE chunk: {}", e);
                                 }
                             }
                         }

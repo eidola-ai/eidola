@@ -49,7 +49,12 @@ CI enforces the ordering contract: any PR changing a legal document's bytes must
 
 ## Observability
 
-OpenTelemetry ships traces, metrics, and logs directly to Grafana Cloud (or any OTLP endpoint) via HTTP/protobuf, enabled when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; otherwise stdout logging only. Telemetry respects the privacy boundary between the "linked" account layer and the "unlinked" anonymous service layer: chat completion spans/metrics contain only model name, token counts, status, latency — never account IDs, credential data, or message content. Account-layer spans may include account_id. `middleware.rs` classifies routes and creates per-request spans; instruments live in `telemetry.rs`.
+OpenTelemetry ships traces, metrics, and logs directly to Grafana Cloud (or any OTLP endpoint) via HTTP/protobuf, enabled when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; otherwise stdout logging only. Telemetry respects the privacy boundary between the "linked" account layer and the "unlinked" anonymous service layer. `middleware.rs` classifies routes and creates one span per request; instruments live in `telemetry.rs`. Per-signal doctrine (and the reasoning) is in [docs/server.md](../../docs/server.md#telemetry-scope-and-boundary), enforcing `privacy-guarantees.md` §3.2–3.3:
+
+- **Spans** carry route, method, status, latency, and layer — nothing content-derived. Account-layer spans may include `account_id`; chat spans carry no identifier at all.
+- **Metrics** are the only home for content-derived quantities (token counts), and only aggregated across requests. Never use a caller-supplied string as a label — `lookup_model` resolves the requested id against the known model list first, which is what keeps label cardinality bounded.
+- **`Display` on `ServerError` is the log-safe rendering, not the full one** — `to_error_response` is the full detail and goes only to the client. `PaymentRequired` and `Backend` deliberately omit their `message` because those carry, respectively, a function of the prompt's chargeable bytes and an upstream-authored string. Unit tests in `error.rs` pin this. A new error message that interpolates anything request-derived must join the redacted set.
+- Log call sites take `{e}` on a `ServerError` freely — the redaction lives in the type, not in the call site. Do not hand-format an error's fields into a log instead.
 
 ## Tinfoil Containers / TEE integration
 

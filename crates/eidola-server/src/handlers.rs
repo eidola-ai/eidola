@@ -300,7 +300,7 @@ fn validate_request(
             .backend
             .lookup_model(&request.model)
             .ok_or_else(|| ServerError::BadRequest {
-                message: format!("unknown model: {}", request.model),
+                message: "unknown model".to_string(),
             })?;
 
     // Pre-flight go/no-go: the presented charge must cover the worst-case
