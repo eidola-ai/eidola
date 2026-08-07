@@ -283,10 +283,15 @@ pub async fn create_account(
 }
 
 /// GET /v1/terms — the document versions whose acceptance is required.
+///
+/// Public, and necessarily so: a client fetches this *before* it has an
+/// account, to learn what it must accept. It takes no credential and returns
+/// no account-specific data. (Accepting them is `POST /v1/account/terms`,
+/// which is on the linked surface.)
 #[utoipa::path(
     get,
     path = "/v1/terms",
-    tag = "Linked",
+    tag = "Public",
     responses(
         (status = 200, description = "Currently required document versions", body = TermsResponse)
     )

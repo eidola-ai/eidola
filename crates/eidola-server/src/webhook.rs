@@ -115,6 +115,45 @@ impl WebhookOutcome {
     }
 }
 
+/// The Stripe event types this handler dispatches on.
+///
+/// Doubles as the label domain for `WEBHOOK_OUTCOME`: `event_type` arrives
+/// from Stripe, so it is caller-derived and must not become a metric label
+/// unfiltered. Resolving through this list bounds the cardinality; anything
+/// outside it — including a new type Stripe starts sending — lands on
+/// `other`, which is also the dispatch table's fallthrough.
+const HANDLED_EVENT_TYPES: &[&str] = &[
+    "charge.dispute.closed",
+    "charge.dispute.created",
+    "charge.refunded",
+    "checkout.session.completed",
+    "customer.subscription.deleted",
+    "invoice.paid",
+];
+
+fn event_type_label(event_type: &str) -> &'static str {
+    HANDLED_EVENT_TYPES
+        .iter()
+        .copied()
+        .find(|known| *known == event_type)
+        .unwrap_or("other")
+}
+
+/// Record how one webhook delivery ended.
+///
+/// Stripe originates these requests, so we can never opt one into a
+/// per-request trace the way we can with our own traffic. This counter is
+/// what keeps the failure modes visible in aggregate instead.
+fn record_webhook_outcome(event_type: &str, reason: &'static str) {
+    crate::telemetry::metrics::WEBHOOK_OUTCOME.add(
+        1,
+        &[
+            opentelemetry::KeyValue::new("event_type", event_type_label(event_type)),
+            opentelemetry::KeyValue::new("reason", reason),
+        ],
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
@@ -130,14 +169,19 @@ impl WebhookOutcome {
         (status = 503, description = "Webhook secret not configured", body = crate::types::ErrorResponse)
     )
 )]
+#[tracing::instrument(skip_all, name = "webhook.process")]
 pub async fn stripe_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    // The pre-parse rejections have no event type yet, so they count against
+    // the `other` bucket. That is honest: we genuinely do not know what
+    // Stripe was trying to tell us.
     let webhook_secret = match &state.stripe_webhook_secret {
         Some(s) => s,
         None => {
+            record_webhook_outcome("", "not_configured");
             return ServerError::ServiceUnavailable("webhook secret is not configured".to_string())
                 .into_response();
         }
@@ -148,11 +192,15 @@ pub async fn stripe_webhook(
         .and_then(|v| v.to_str().ok())
     {
         Some(h) => h.to_string(),
-        None => return bad_request("missing stripe-signature header"),
+        None => {
+            record_webhook_outcome("", "missing_signature");
+            return bad_request("missing stripe-signature header");
+        }
     };
 
     if let Err(reason) = verify_signature(&sig_header, &body, webhook_secret) {
         warn!("webhook: signature verification failed: {}", reason);
+        record_webhook_outcome("", "bad_signature");
         return bad_request(&format!("signature verification failed: {}", reason));
     }
 
@@ -160,6 +208,7 @@ pub async fn stripe_webhook(
         Ok(e) => e,
         Err(e) => {
             error!("webhook: failed to parse event: {}", e);
+            record_webhook_outcome("", "unparseable");
             return ok_empty();
         }
     };
@@ -191,9 +240,11 @@ pub async fn stripe_webhook(
     };
 
     if outcome.is_retryable() {
+        record_webhook_outcome(&event.event_type, "retryable_error");
         return internal_error();
     }
 
+    record_webhook_outcome(&event.event_type, "handled");
     ok_empty()
 }
 

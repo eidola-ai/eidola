@@ -209,6 +209,7 @@ pub async fn insert_account(
 }
 
 /// Retrieve an account by ID.
+#[tracing::instrument(skip_all, name = "db.get_account", err)]
 pub async fn get_account_by_id(pool: &Pool, id: Uuid) -> Result<AccountRow, ServerError> {
     let client = pool
         .get()
@@ -307,6 +308,7 @@ pub async fn get_account_by_stripe_customer(
 ///
 /// `stripe_payment_intent` links payment-originated credits to their Stripe
 /// PaymentIntent so a later refund can be matched back to the same pool.
+#[tracing::instrument(skip_all, name = "db.insert_credit_ledger", err)]
 pub async fn insert_credit_ledger(
     pool: &Pool,
     account_id: Uuid,
@@ -582,6 +584,7 @@ where
 
 /// Retrieve all issuer keys that are still accepted (accept_until > now()),
 /// plus any future keys (issue_from > now()). Ordered by issue_from ASC.
+#[tracing::instrument(skip_all, name = "db.get_valid_issuer_keys", err)]
 pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, ServerError> {
     let client = pool
         .get()
@@ -736,6 +739,7 @@ pub async fn refund_matched_to_payment_intent(
 }
 
 /// Get the current available balance for an account.
+#[tracing::instrument(skip_all, name = "db.get_available_balance", err)]
 pub async fn get_available_balance(pool: &Pool, account_id: Uuid) -> Result<i64, ServerError> {
     let client = pool
         .get()
@@ -804,6 +808,7 @@ pub async fn get_balance_pools(
 }
 
 /// Retrieve an issuer key by its hex-encoded hash (if still valid for acceptance).
+#[tracing::instrument(skip_all, name = "db.get_issuer_key", err)]
 pub async fn get_issuer_key_by_hash(
     pool: &Pool,
     key_hash: &[u8],
@@ -829,6 +834,7 @@ pub async fn get_issuer_key_by_hash(
 
 /// Atomically record a nullifier. Returns `true` if successfully recorded,
 /// `false` if the nullifier was already present (double-spend attempt).
+#[tracing::instrument(skip_all, name = "db.record_nullifier", err)]
 pub async fn record_nullifier(
     pool: &Pool,
     issuer_key_id: &str,
@@ -852,6 +858,7 @@ pub async fn record_nullifier(
 }
 
 /// Store a CBOR-encoded refund token on an existing nullifier row.
+#[tracing::instrument(skip_all, name = "db.store_refund_token", err)]
 pub async fn store_refund_token(
     pool: &Pool,
     issuer_key_id: &str,
@@ -877,6 +884,7 @@ pub async fn store_refund_token(
 
 /// Retrieve a stored refund token for a nullifier. Returns `None` if the
 /// nullifier does not exist or no refund token has been stored yet.
+#[tracing::instrument(skip_all, name = "db.get_refund_token", err)]
 pub async fn get_refund_token(
     pool: &Pool,
     issuer_key_id: &str,

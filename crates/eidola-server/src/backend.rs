@@ -393,6 +393,7 @@ impl ChatBackend for TinfoilBackend {
         })
     }
 
+    #[tracing::instrument(skip_all, name = "upstream.chat", err)]
     async fn send(&self, request: &ChatCompletionRequest) -> Result<BackendResponse, ServerError> {
         let url = format!("{}/chat/completions", self.base_url);
 
@@ -448,6 +449,7 @@ impl ChatBackend for TinfoilBackend {
         })
     }
 
+    #[tracing::instrument(skip_all, name = "upstream.chat_stream", err)]
     async fn send_stream(
         &self,
         request: &ChatCompletionRequest,
