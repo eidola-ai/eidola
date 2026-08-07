@@ -590,12 +590,20 @@ fn verify_attestation_content(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AttestationProse {
     schema_version: u32,
     release_version: String,
     git_commit: String,
     #[serde(default)]
     previous_release_git_commit: Option<String>,
+    /// Consumed by template rendering through the raw JSON roots rather
+    /// than through this struct; modeled here so `deny_unknown_fields`
+    /// accepts the documents release-tool emits.
+    #[allow(dead_code)]
+    artifact_manifest_sha256: String,
+    #[allow(dead_code)]
+    privacy_guarantees_doc_sha256: String,
     attestant: AttestantBlock,
     attested_at: String,
     attestant_statement: String,
@@ -603,6 +611,7 @@ struct AttestationProse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AttestantBlock {
     id: String,
     name: String,
@@ -611,6 +620,7 @@ struct AttestantBlock {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SignedClaim {
     statement: String,
     #[serde(default)]

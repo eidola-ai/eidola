@@ -42,6 +42,7 @@ pub use trust_shapes::{
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Templates {
     pub schema_version: u32,
     pub attestant_statement_template: TemplateEntry,
@@ -49,12 +50,14 @@ pub struct Templates {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TemplateEntry {
     pub template: String,
     pub sources: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimTemplate {
     pub template: String,
     pub sources: BTreeMap<String, String>,

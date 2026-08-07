@@ -420,6 +420,24 @@ pub async fn check_for_update_with(
         verified_attestations.push(verified);
     }
 
+    // Independence: each counted attestation must be signed by a distinct
+    // hardware key. `release.json` is unsigned and attacker-suppliable, so
+    // without this check an index listing the same attestation twice (or
+    // one key signing under two attestant ids) would count twice toward
+    // the threshold below.
+    let mut seen_fingerprints = std::collections::HashSet::new();
+    for att in &verified_attestations {
+        if !seen_fingerprints.insert(att.fingerprint_hex.to_ascii_lowercase()) {
+            return Err(AppError::Update {
+                message: format!(
+                    "release lists multiple attestations signed by the same key \
+                     (fingerprint sha256:{}); attestations must be independent",
+                    att.fingerprint_hex
+                ),
+            });
+        }
+    }
+
     // Policy: minimum number of independently-verified attestations. The
     // threshold is pinned in the *embedded* trust root rather than in
     // `release.json` so an adversary who controls the index can't lower

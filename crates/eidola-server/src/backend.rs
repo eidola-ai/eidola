@@ -431,7 +431,6 @@ impl ChatBackend for TinfoilBackend {
 
         let completion: ChatCompletionResponse = serde_json::from_slice(&body).map_err(|e| {
             tracing::error!("Failed to parse backend response: {}", e);
-            tracing::debug!("Response body: {}", String::from_utf8_lossy(&body));
             ServerError::Parse(e.to_string())
         })?;
 
