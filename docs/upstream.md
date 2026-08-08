@@ -8,7 +8,7 @@ This page explains what runs where, what the user is trusting at this layer, and
 
 The upstream inference provider:
 
-- Runs an OpenAI-compatible API in a confidential-compute enclave (currently AMD SEV-SNP; Intel TDX support is tracked).
+- Runs an OpenAI-compatible API in a confidential-compute enclave (currently AMD SEV-SNP; Intel TDX values are tracked in releases but refused by Eidola's verifier — [gaps.md](gaps.md#tdx-acceptance)).
 - Publishes signed measurements of the running enclave through Sigstore (Fulcio identity + Rekor inclusion), tied to a public source repository.
 - Serves its TLS endpoint from inside the enclave with attestation encoded in the certificate SANs, the same construction the Eidola server itself uses.
 
@@ -43,7 +43,7 @@ The Eidola server's outbound HTTPS client (constructed by `tinfoil-verifier::att
 
 - Inline `GET /.well-known/tinfoil-attestation?nonce=<hex>` (a fresh random nonce per handshake) over the same TCP+TLS connection that will carry the application request.
 - Freshness check (echoed nonce matches) and document-signature check against the embedded TLS cert.
-- AMD VCEK chain verification, SEV-SNP / TDX report verification, TCB policy enforcement.
+- AMD VCEK chain verification, SEV-SNP report verification, TCB policy enforcement. (TDX presentations are refused outright — see [gaps.md](gaps.md#tdx-acceptance).)
 - Measurement check against the runtime-resolved allowed set (see [What pins the upstream measurement](#what-pins-the-upstream-measurement)).
 - Binding of the report's `REPORT_DATA` to `sha256(tls_key_fp ‖ hpke_key ‖ nonce ‖ …)`, where `tls_key_fp == sha256(SPKI(peer_cert))`.
 

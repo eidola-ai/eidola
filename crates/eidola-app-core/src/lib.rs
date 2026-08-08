@@ -1372,9 +1372,13 @@ struct Inner {
     /// returns a clone of this client *instead of* constructing the
     /// attesting client, letting integration tests drive `chat`/`chat_stream`
     /// (and every other HTTP path) against a plain-HTTP mock upstream without
-    /// satisfying the per-handshake enclave attestation. Always `None` in
-    /// production — only [`AppCore::with_test_http_client`] ever sets it — so
-    /// the production attestation path is unchanged.
+    /// satisfying the per-handshake enclave attestation. Only
+    /// [`AppCore::with_test_http_client`] ever sets it, and the whole seam —
+    /// this field, that constructor, and every branch that reads it — exists
+    /// only under the non-default `test-support` feature (enabled by this
+    /// crate's dev-dependency self-reference for `cargo test`), so release
+    /// builds contain no bypass path at all.
+    #[cfg(feature = "test-support")]
     http_override: Option<reqwest::Client>,
     /// The process-lifetime exclusive advisory lock on the local database
     /// (`<data_dir>/eidola.db.lock`). Taken in [`AppCore::build`] — a second
@@ -1678,9 +1682,11 @@ impl Inner {
         // Test seam: a plain-HTTP client injected via
         // `AppCore::with_test_http_client` short-circuits attestation so
         // integration tests can drive the HTTP paths against a mock upstream.
-        // `None` in every production build, so the attesting path below is the
-        // only one that ever runs outside tests. The attestation observer is
-        // simply never invoked on this client (no enclave to observe).
+        // Compiled only under the non-default `test-support` feature, so in a
+        // release build the attesting path below is the only path that
+        // *exists*. The attestation observer is simply never invoked on this
+        // client (no enclave to observe).
+        #[cfg(feature = "test-support")]
         if let Some(client) = &self.http_override {
             return Ok(client.clone());
         }
@@ -1710,6 +1716,18 @@ impl Inner {
         .map_err(|e| AppError::Attestation {
             message: format!("attestation client build failed: {e}"),
         })
+    }
+
+    /// The plain-HTTP client used for local-engine and generic
+    /// OpenAI-compatible backends (no enclave, so nothing to attest). Under
+    /// the `test-support` feature an injected test client takes its place so
+    /// the chat harness can intercept these paths too.
+    fn plain_client(&self) -> Result<reqwest::Client, AppError> {
+        #[cfg(feature = "test-support")]
+        if let Some(client) = &self.http_override {
+            return Ok(client.clone());
+        }
+        local_models::plain_http_client()
     }
 }
 
@@ -4604,10 +4622,7 @@ impl Inner {
                 engine_lease = Some(lease);
                 let provider_id =
                     db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
-                let client = match &self.http_override {
-                    Some(c) => c.clone(),
-                    None => local_models::plain_http_client()?,
-                };
+                let client = self.plain_client()?;
                 (
                     provider_id,
                     client,
@@ -4627,10 +4642,7 @@ impl Inner {
                     })?;
                 let provider_id =
                     db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
-                let client = match &self.http_override {
-                    Some(c) => c.clone(),
-                    None => local_models::plain_http_client()?,
-                };
+                let client = self.plain_client()?;
                 let auth = backend.api_key.as_ref().map(|k| format!("Bearer {k}"));
                 // Context length is unknown for a generic server — 0
                 // resolves to the 4096 completion default below.
@@ -6808,7 +6820,11 @@ impl AppCore {
     /// silently. The lock is released when the returned `AppCore` (and any
     /// task holding its inner `Arc`) drops.
     pub fn new(config_dir: PathBuf, data_dir: PathBuf) -> Result<Self, AppError> {
-        Self::build(config_dir, data_dir, None)
+        #[cfg(feature = "test-support")]
+        let core = Self::build(config_dir, data_dir, None);
+        #[cfg(not(feature = "test-support"))]
+        let core = Self::build(config_dir, data_dir);
+        core
     }
 
     /// Construct an `AppCore` whose HTTP client is the supplied plain
@@ -6817,12 +6833,15 @@ impl AppCore {
     /// **Test-only seam.** This bypasses per-handshake enclave attestation so
     /// integration tests can exercise `chat` / `chat_stream` (and the account /
     /// credential HTTP paths) against an in-process mock upstream over plain
-    /// HTTP. It has no production use — `#[doc(hidden)]` keeps it out of the
-    /// rendered API — and `AppCore::new` always passes `None`, so the
-    /// production attestation path is untouched. Tests must still point
-    /// `base_url` at the mock (via [`AppCore::set_base_url`]); the injected
-    /// client only governs *how* requests are made, not *where*.
+    /// HTTP. It exists only under the non-default `test-support` feature
+    /// (enabled by this crate's dev-dependency self-reference, so `cargo
+    /// test` sees it while downstream release builds cannot even name it) —
+    /// the production attestation path is untouched by construction. Tests
+    /// must still point `base_url` at the mock (via
+    /// [`AppCore::set_base_url`]); the injected client only governs *how*
+    /// requests are made, not *where*.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn with_test_http_client(
         config_dir: PathBuf,
         data_dir: PathBuf,
@@ -6834,7 +6853,7 @@ impl AppCore {
     fn build(
         config_dir: PathBuf,
         data_dir: PathBuf,
-        http_override: Option<reqwest::Client>,
+        #[cfg(feature = "test-support")] http_override: Option<reqwest::Client>,
     ) -> Result<Self, AppError> {
         // Loud DB contention: claim the single-writer database before
         // building anything else, so a second opener is refused with a typed
@@ -6868,6 +6887,7 @@ impl AppCore {
                 memory_enabled: std::sync::atomic::AtomicBool::new(false),
                 tools: std::sync::RwLock::new(tools::ToolRegistry::new()),
                 tool_incapable_backends: std::sync::RwLock::new(std::collections::HashSet::new()),
+                #[cfg(feature = "test-support")]
                 http_override,
                 _db_lock: db_lock,
             }),
@@ -7646,6 +7666,7 @@ impl AppCore {
     /// drive engine-backed chat turns against a mock upstream without
     /// spawning a real `llama-server`.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn test_register_loaded_local_model(&self, backend_id: &str, slug: &str, port: u16) {
         self.inner.local.register_for_test(backend_id, slug, port);
     }
@@ -7653,6 +7674,7 @@ impl AppCore {
     /// Test-only seam: register a fake ready engine with explicit
     /// footprint / pin / LRU timestamp — the eviction tests' fixture.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     #[allow(clippy::too_many_arguments)]
     pub fn test_register_engine(
         &self,
@@ -7680,6 +7702,7 @@ impl AppCore {
     /// ceiling — see [`MAX_TURN_ROUNDS`]). This exposes it so the chat-path
     /// tests can pin the mid-loop budget exit, which is otherwise unreachable.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub async fn test_chat_with_budget(
         &self,
         prompt: String,
@@ -7709,6 +7732,7 @@ impl AppCore {
     /// parent — **including** the `tool_call` / `tool_result` trace rows that
     /// [`Self::get_space_tree`] collapses out of the render by design.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub async fn test_space_actions(
         &self,
         space_id: String,
@@ -7731,6 +7755,7 @@ impl AppCore {
     /// `include_archived` branches, and nothing else reports `archived_at`. A
     /// behavior with no observer is a behavior no test can pin.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub async fn test_space_archived(&self, space_id: String) -> Result<bool, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -7747,6 +7772,7 @@ impl AppCore {
     /// notebooks), and the promoting transaction names the notebook after the
     /// agent it is sharing, including the name a persona brought with it.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub async fn test_space_title(&self, space_id: String) -> Result<Option<String>, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -7769,6 +7795,7 @@ impl AppCore {
     /// should be added: `post_with_references` is the seam that writes
     /// references, and it validates.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub async fn test_insert_unvalidated_reference(
         &self,
         action_id: String,
@@ -7806,6 +7833,7 @@ impl AppCore {
     /// lets a test pin that the record matches the messages actually sent
     /// (traces included, at their real positions).
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub async fn test_context_assembly(
         &self,
         inference_action_id: String,
@@ -7825,6 +7853,7 @@ impl AppCore {
     /// debounce. Draining also disarms those passes (each checks its own stamp
     /// before running), which keeps a background pass out of a test's counts.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn test_take_summary_triggers(&self) -> Vec<String> {
         let mut pending: Vec<String> = self
             .inner
@@ -7845,6 +7874,7 @@ impl AppCore {
     /// effects assertable. The pass is serialized and re-checks its cache
     /// inside the gate, so racing a background trigger cannot double-generate.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub async fn test_refresh_branch_summaries(&self, space_id: String) -> Result<(), AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -7856,6 +7886,7 @@ impl AppCore {
     /// Test-only seam: pin the engine-pool memory budget so eviction tests
     /// are deterministic on any machine.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn test_set_memory_budget(&self, budget: u64) {
         self.inner.local.set_memory_budget_for_test(budget);
     }

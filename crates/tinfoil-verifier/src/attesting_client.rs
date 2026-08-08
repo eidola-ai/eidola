@@ -234,18 +234,25 @@ struct AttestationCheck {
     /// document is missing required elements (today: the VCEK). The
     /// connector itself does not call AMD KDS — ATC is the single fallback.
     atc_fallback: AtcFallback,
+    // The three `tdx_*` fields below are dormant: the platform dispatch in
+    // `verify` refuses `Platform::Tdx` outright until MRTD/RTMR0 policy
+    // checks exist. The machinery is kept wired so re-enabling is a one-line
+    // dispatch change plus the policy.
     /// Per-client cache of TDX collateral fetched from Intel PCS, keyed by
     /// `(fmspc, ca)`. Bounds Intel PCS request volume to roughly one set of
     /// fetches per FMSPC per TCB advisory cycle. Unused on SEV-SNP backends.
+    #[allow(dead_code)]
     tdx_collateral_cache: tdx::CollateralCache,
     /// Acceptance policy applied on top of `dcap_verify`'s built-in checks.
     /// Unused on SEV-SNP backends.
+    #[allow(dead_code)]
     tdx_policy: tdx::TcbPolicy,
     /// Optional consumer-provided observer fired for every TDX
     /// attestation that completes signature verification (including ones
     /// the policy then rejects). Lets the consuming application record
     /// metrics or alerts without `tinfoil-verifier` taking a dependency
     /// on a metrics framework. Unused on SEV-SNP backends.
+    #[allow(dead_code)]
     tdx_observer: Option<tdx::TdxObserver>,
     /// Per-component minimum SVNs the SEV-SNP `reported_tcb` must satisfy.
     /// Also drives the rollback check (`reported_tcb >= committed_tcb`),
@@ -352,7 +359,17 @@ impl AttestationCheck {
 
         match resolved.platform {
             bundle::Platform::SevSnp => self.verify_snp(resolved, peer_spki).await,
-            bundle::Platform::Tdx => self.verify_tdx(resolved, peer_spki).await,
+            // Refused outright — not because TDX hardware is distrusted,
+            // but because the policy checks for it are incomplete: MRTD
+            // (the only register measured by the TDX module itself) and
+            // RTMR0 are not checked, and RTMR1/RTMR2 are guest-extendable,
+            // so any firmware on a genuine TDX machine can replay the
+            // published digests into them. The document author chooses the
+            // platform branch, so accepting TDX would let anyone holding a
+            // valid cert for the endpoint sidestep the SNP measurement pin
+            // entirely. Fail closed until MRTD/RTMR0 (+ MR_SEAM/XFAM/
+            // FMSPC) policy lands.
+            bundle::Platform::Tdx => Err(Error::TdxNotAccepted),
         }
     }
 
@@ -527,6 +544,10 @@ impl AttestationCheck {
         Ok(())
     }
 
+    // Unreachable while the dispatch refuses `Platform::Tdx`; retained,
+    // with its policy plumbing, for the re-enable path (which must add
+    // MRTD/RTMR0 checks first.
+    #[allow(dead_code)]
     async fn verify_tdx(
         &self,
         resolved: &bundle::ResolvedAttestation,

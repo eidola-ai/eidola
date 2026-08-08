@@ -453,7 +453,13 @@ jobs:
             sandbox = true
             sandbox-fallback = false
 
+      # Skipped on v* release tags so the attested Linux artifact is
+      # rebuilt from source instead of substituted from the project
+      # cache — mirroring the OCI job's empty CACHE_REGISTRY on tags.
+      # (Upstream store paths still come from cache.nixos.org, pinned by
+      # flake.lock narHashes.)
       - name: Configure Nix binary cache
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: eidola

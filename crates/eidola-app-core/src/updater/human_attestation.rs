@@ -577,6 +577,7 @@ fn verify_attestation_content(
         attestant_id: prose.attestant.id,
         attestant_name: prose.attestant.name,
         jurisdiction: prose.attestant.jurisdiction,
+        artifact_manifest_sha256: prose.artifact_manifest_sha256,
         fingerprint_hex: fingerprint_hex.to_string(),
         rekor_log_index,
         attested_at: prose.attested_at,
@@ -597,11 +598,14 @@ struct AttestationProse {
     git_commit: String,
     #[serde(default)]
     previous_release_git_commit: Option<String>,
+    /// Surfaced on [`VerifiedAttestation`] so the updater can bind the
+    /// attested hash to the manifest it actually fetched.
+    artifact_manifest_sha256: String,
     /// Consumed by template rendering through the raw JSON roots rather
     /// than through this struct; modeled here so `deny_unknown_fields`
-    /// accepts the documents release-tool emits.
-    #[allow(dead_code)]
-    artifact_manifest_sha256: String,
+    /// accepts the documents release-tool emits. Not re-derivable by the
+    /// client (the doc lives at the release commit, which the updater
+    /// does not fetch).
     #[allow(dead_code)]
     privacy_guarantees_doc_sha256: String,
     attestant: AttestantBlock,
@@ -760,7 +764,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {

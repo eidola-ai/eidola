@@ -2661,6 +2661,7 @@ dependencies = [
  "dirs",
  "ecdsa",
  "ed25519-dalek",
+ "eidola-app-core",
  "eidola-attestation",
  "eidola-common",
  "fs4",

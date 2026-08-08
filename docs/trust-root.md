@@ -12,7 +12,7 @@ Generated into the client at compile time by `crates/eidola-app-core/build.rs`, 
 | --- | --- | --- |
 | `SERVER_URL` | derived from `releases/trust/server-enclave.json` | `gateway-<hash>.eidola.containers.tinfoil.sh`, where `<hash>` ties the URL to a server measurement |
 | `SERVER_SNP_MEASUREMENT` | `releases/trust/server-enclave.json` → `snp_measurement` | SEV-SNP launch measurement of the paired server enclave |
-| `SERVER_TDX_RTMR1` / `SERVER_TDX_RTMR2` | `releases/trust/server-enclave.json` → `tdx_measurement` | TDX runtime measurements of the paired server enclave |
+| `SERVER_TDX_RTMR1` / `SERVER_TDX_RTMR2` | `releases/trust/server-enclave.json` → `tdx_measurement` | TDX runtime measurements of the paired server enclave — recorded for the release, but TDX presentations are currently refused by the verifier ([gaps.md](gaps.md#tdx-acceptance)) |
 | `TRUSTED_ATTESTANT_FINGERPRINTS` | `releases/trust/trust-constants.json` | `sha256(PKIX SubjectPublicKeyInfo DER)` in hex, for each authorized human-attestant key |
 | `MIN_HUMAN_ATTESTATIONS` | `releases/trust/trust-constants.json` | Minimum independently-verified human attestations a release must carry. Pinned here, not in `release.json`, so a forged index cannot lower it |
 | `EXPECTED_CI_IDENTITY_PATTERN` | `releases/trust/trust-constants.json` | Fulcio cert SAN pattern the release-signing workflow's OIDC identity must match |
