@@ -1,5 +1,5 @@
-//! The space window's keyboard model — wave B of the accessibility program
-//! (`work/tasks/12`), Mike's decided design.
+//! The space window's keyboard model — wave B of the accessibility program,
+//! Mike's decided design.
 //!
 //! **Two devices, two jobs.** Tab moves *between* regions (the focus model in
 //! [`crate::focus`]); the arrow keys are the *within-region* device for the

@@ -46,11 +46,11 @@ The unlinkability invariants in [privacy-guarantees.md §2](privacy-guarantees.m
 
 **Why this prevents timing correlation between linked and unlinked requests.** Issuance happens on the authenticated (linked) account surface. Redemption happens on the anonymous (unlinked) inference surface. If issuance and redemption were forced to be near-simultaneous, an observer of both surfaces could correlate "account X issued at time T, anonymous token redeemed at time T+ε" with high confidence. The batched-and-deferred-redemption policy decouples those timestamps by design: the issuance request is a separate, asynchronous event from any individual redemption.
 
-What this policy does *not* defend against is a small total anonymity set during the early life of the deployment (when only a few users are issuing under a given key). That is named in [gaps.md#anonymity-set-size](gaps.md) as an early-stage residual.
+What this policy does *not* defend against is a small total anonymity set during the early life of the deployment (when only a few users are issuing under a given key). That is named in [gaps.md § Anonymity-set size](gaps.md#anonymity-set-size) as an early-stage residual.
 
 ## What runs in confidential compute
 
-The server runs inside a **Tinfoil Container** on confidential-compute hardware (AMD SEV-SNP, with TDX support tracked in measurements). The relevant properties:
+The server runs inside a **Tinfoil Container** on confidential-compute hardware (AMD SEV-SNP; TDX values are recorded in the trust root but TDX presentations are refused by the verifier — see [gaps.md](gaps.md#tdx-acceptance)). The relevant properties:
 
 - **TLS termination is inside the enclave.** The Tinfoil shim generates TLS certificates whose Subject Alternative Names encode the attestation hash and an HPKE public key. The certificate is issued by a public CA via ACME, so any client can validate the chain; the *binding to the enclave* is what the Eidola verifier checks beyond the basic WebPKI chain.
 - **Secrets are sealed into the enclave.** Both `CREDENTIAL_MASTER_KEY` and `DATABASE_PASSWORD` are Tinfoil secrets, decrypted only inside the verified enclave. They are not visible to the host, the orchestrator, or any operator.

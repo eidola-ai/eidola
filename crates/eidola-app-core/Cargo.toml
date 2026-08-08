@@ -6,6 +6,15 @@ authors.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only seams (`AppCore::with_test_http_client`, the `test_*` observer
+# methods): compiled only when this feature is on. It is NOT a default
+# feature and must never appear in a downstream `[dependencies]` entry — the
+# self-referential `[dev-dependencies]` below enables it for this crate's own
+# unit + integration tests, so `cargo test` sees the seams while release
+# builds of the cli/GUI provably contain no attestation-bypass path.
+test-support = []
+
 [dependencies]
 anonymous-credit-tokens = "0.4"
 base64 = "0.22"
@@ -57,6 +66,9 @@ serde_json = "1"
 sha2 = "0.11"
 
 [dev-dependencies]
+# Self-reference: turns the `test-support` feature on for this crate's own
+# test builds (unit + `tests/`) without exposing it to downstream consumers.
+eidola-app-core = { path = ".", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
 wiremock = "0.6"

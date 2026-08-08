@@ -572,10 +572,7 @@ impl Inner {
                 let base_url = row.base_url.as_deref().ok_or_else(|| AppError::Config {
                     message: format!("backend `{id}` has no base URL"),
                 })?;
-                let client = match &self.http_override {
-                    Some(c) => c.clone(),
-                    None => crate::local_models::plain_http_client()?,
-                };
+                let client = self.plain_client()?;
                 let mut req = client.get(format!("{base_url}/v1/models"));
                 if let Some(key) = &row.api_key {
                     req = req.bearer_auth(key);

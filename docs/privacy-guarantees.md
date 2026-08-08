@@ -4,7 +4,7 @@ This document enumerates the privacy and integrity properties Eidola commits to.
 
 Each item is stated as an invariant. Contributors maintain these invariants when changing code and release attestants walk a diff against them before signing.
 
-Every item is an inherent attribute of the attested source: a property you can check against the release's exact code, and one that cannot change without producing a different release. If a promise could be broken without changing the attested source, it does not belong here — it belongs in the [privacy policy](https://www.eidola.ai/privacy/), where it binds us as conduct rather than as code. Where an item is enforced architecturally — typed routing, blind-signature math, build-time pinning — it names the mechanism; where none is named, the enforcement is the plainest kind: code that behaves as described.
+Every item is a permanent property of a specific release. Most are inherent attributes of the attested source: properties you can check against the release's exact code, while the rest are facts fixed at release time by a signed attestation claim. If a promise could be broken *after* a release ships — ongoing operational conduct, the future behavior of a third party — it does not belong here; it belongs in the [privacy policy](https://www.eidola.ai/privacy/), where it binds us as conduct rather than as code. Where an item is enforced architecturally — typed routing, blind-signature math, build-time pinning — it names the mechanism; where none is named, the enforcement is simply that the fact is as described.
 
 > [!IMPORTANT]
 > These invariants describe an attested, **generally-available release of Eidola** running under the built-in trust root. They do not extend to development builds, contributor-installed test versions, or any scenario where configuration overrides have been set (see [Client](client.md#configuration-overrides) and [Trust root](trust-root.md#whats-pinned)).
@@ -27,7 +27,7 @@ Every item is an inherent attribute of the attested source: a property you can c
 
 **2.2.** *Redemption ↔ redemption.* ACTs presented across different requests are cryptographically unlinkable to each other. The server cannot answer "which inference requests came from the same account."
 
-**2.3.** The anonymity set for a given token is the set of accounts that received at least one token under the same `(issuer_key, domain_separator)` during the issuer key's issuance window. Issuance and key-rotation policies are tuned to keep this set sufficiently large. (See [server.md](server.md#anonymity-set).)
+**2.3.** The anonymity set for a given token is the set of accounts that received at least one token under the same `(issuer_key, domain_separator)` during the issuer key's issuance window. The partition parameters — the issuance-epoch length, the fixed non-rotating domain separator, and the acceptance window — are compile-time constants chosen to keep this partition as coarse as billing correctness allows. How many accounts actually populate a window is a deployment fact the code cannot promise; the small-population residual is disclosed in [gaps.md](gaps.md#anonymity-set-size). (See [server.md](server.md#anonymity-set).)
 
 **2.4.** Issuance and redemption are temporally decoupled: tokens remain redeemable across an acceptance window that extends beyond their issuance window, so the issuance timestamp on the linked surface and the redemption timestamp on the unlinked surface are not forced to be near-equal.
 
@@ -49,13 +49,13 @@ Every item is an inherent attribute of the attested source: a property you can c
 
 ## 4. Transport and server attestation
 
-**4.1.** TLS is terminated inside the Eidola server enclave. The TLS private key is sealed to the enclave by the confidential- compute runtime; no operator, host, or orchestrator has access to it.
+**4.1.** TLS is terminated inside the Eidola server enclave by the attestation shim, which is part of the measured boot image (§5.1). The private key is generated and held only in enclave memory; no operator, host, or orchestrator interface can export it. This is a behavior of the pinned image itself, not of any external secret store. The residual — a defect in that image leaking the key would undermine the per-handshake verification built on it — is disclosed in [gaps.md](gaps.md#tls-key-exfiltration-and-channel-binding).
 
 **4.2.** The client re-verifies the server's hardware attestation on every new TCP+TLS handshake. There is no "verified once" cache; policy changes (TCB floor, allowed measurements) take effect on the next handshake. (See [client.md](client.md#per-handshake-attestation-no-caching).)
 
 **4.3.** The attestation report is bound to the expected peer cert (its `REPORT_DATA` commits to `sha256(SPKI(peer_cert))`). The inline attestation rides the *same* TCP+TLS connection as the subsequent application request, so attestation and request share one HTTP lifecycle and the load-balancer-routed backend that served the attestation is the one that serves the request.
 
-**4.4.** A TCB policy floor is enforced on every attestation. Measurements outside `ALLOWED_MEASUREMENTS` are rejected.
+**4.4.** A TCB policy floor is enforced on every attestation. Measurements outside `ALLOWED_MEASUREMENTS` are rejected. Only SEV-SNP attestations are accepted: TDX presentations are refused outright rather than checked under a weaker policy, so the attestation document's author cannot select a softer platform branch. (See [gaps.md](gaps.md#tdx-acceptance).)
 
 **4.5.** The same per-handshake verification discipline applies to the Eidola server's outbound connections to the inference upstream. (See [upstream.md](upstream.md#per-connection-verification).)
 
@@ -65,19 +65,17 @@ Every item is an inherent attribute of the attested source: a property you can c
 
 ## 5. Server measurement and configuration binding
 
-**5.1.** The server-enclave measurement is a deterministic function of source: OVMF firmware (pinned), CVM kernel + initrd (pinned), the kernel command line (which embeds the SHA-256 of `tinfoil-config.yml`), and the vCPU count and type. Any change to the attested boot path produces a different measurement, which the client refuses to connect to. TODO: <https://github.com/tinfoilsh/measure-image-action/pull/48>
+**5.1.** The server-enclave measurement is a deterministic function of source: OVMF firmware and the CVM kernel + initrd (hash-pinned — OVMF and the CVM release manifest by committed sha256 digests, the kernel and initrd via the hashes inside that pinned manifest), the kernel command line (which embeds the SHA-256 of `tinfoil-config.yml`), and the vCPU count and type. Any change to the attested boot path produces a different measurement, which the client refuses to connect to.
 
-**5.2.** The full server runtime configuration — image digest, argument list, environment variable schema, and hashes of all measured secrets — lives in `tinfoil-config.yml` and is therefore bound into the measurement via §5.1. Configuration changes are release events.
+**5.2.** The full server runtime configuration — image digest, argument list, environment variable schema, and hashes of all measured secrets — lives in `tinfoil-config.yml` and is therefore bound into the measurement via §5.1. At startup the server verifies each injected secret against its measured hash and refuses to run on a mismatch, so the secrets a running enclave operates with are the ones committed to at release. Configuration changes are release events.
 
-**5.3.** Secrets that allow access to persisted state inside the enclave (`CREDENTIAL_MASTER_KEY`, `DATABASE_PASSWORD`) are injected as Tinfoil secrets bound to the enclave measurement. A different measurement cannot retrieve them; the server image itself has no intrinsic ability to access its own persisted state outside the attested boot path.
+**5.3.** The Eidola server resolves the upstream inference enclave-measurement set at runtime from the provider's latest release, verifying its Sigstore provenance (Fulcio chain + Rekor, against the expected repository identity and exact release tag) before trusting it. It refuses to connect to — or start against — any enclave whose measurement it has not resolved and verified this way. (See [upstream.md](upstream.md#what-pins-the-upstream-measurement).)
 
-**5.4.** The Eidola server resolves the upstream inference enclave-measurement set at runtime from the provider's latest release, verifying its Sigstore provenance (Fulcio chain + Rekor, against the expected repository identity and exact release tag) before trusting it. It refuses to connect to — or start against — any enclave whose measurement it has not resolved and verified this way. (See [upstream.md](upstream.md#what-pins-the-upstream-measurement).)
-
-**5.5.** Hardware-attestation collateral that the operator could plausibly poison (AMD KDS CRLs for SEV-SNP, Intel PCS collateral — TCB info, QE identity, PCK CRLs — for TDX) is fetched by the verifier directly from the hardware vendor in production mode; the operator is never a relay for its own collateral.
+**5.4.** Hardware-attestation collateral that the operator could plausibly poison (AMD KDS CRLs for SEV-SNP, Intel PCS collateral for TDX) is fetched by the verifier directly from the hardware vendor in production mode; the operator is never a relay for its own collateral. (TDX presentations are currently refused outright — §4.4 — but the collateral discipline holds for any platform the verifier checks.)
 
 ## 6. Release integrity
 
-**6.1.** Every released binary is bit-reproducible from public source. CI re-derives `artifact-manifest.json` on every PR to `main` and refuses to merge if the result differs from the committed copy; reproducibility is a *merge invariant*, not just a release-time property.
+**6.1.** Every released binary is bit-reproducible from public source. The only pull requests merged into `main` are through the promotion of the verified integration branch; the promotion pipeline re-derives `artifact-manifest.json` and refuses to advance if the result differs from the committed copy, and every other PR into `main` is refused outright.
 
 **6.2.** Every release carries at least `MIN_HUMAN_ATTESTATIONS` independent human attestations conforming to the schema pinned in the client trust root. Each attestation is signed via `cosign sign-blob` under a hardware-bound key whose `sha256(PKIX SubjectPublicKeyInfo DER)` matches a fingerprint in `TRUSTED_ATTESTANT_FINGERPRINTS`, and is recorded in the Sigstore Rekor transparency log as a `hashedrekord` v0.0.1 entry.
 
@@ -85,7 +83,7 @@ Every item is an inherent attribute of the attested source: a property you can c
 
 **6.4.** Every release attestation contains positive, prose-equal claims that the attestant is **not** subject to legal compulsion that has caused the release to weaken any guarantee, is **not** subject to a gag order preventing truthful attestation, is **not** coerced, and is signing of their own volition with a hardware-held key under their exclusive physical control.
 
-**6.5.** The client trust root (server-enclave measurement, attestant fingerprints, CI identity pattern, supported schema versions, attestation-claim templates, Sigstore trusted root) is embedded at build time from committed source files. There is no runtime API to mutate the trust root or alter policy. (See [trust-root.md](trust-root.md#whats-pinned).)
+**6.5.** The client trust root (server-enclave measurement, attestant fingerprints, CI identity pattern, supported schema versions, attestation-claim templates, Sigstore trusted root) is embedded at build time from committed source files. Release-verification policy — which keys, how many attestations, which schemas, which claim prose — has no override surface of any kind. Connection identity — which server to contact, which measurement and CA set to accept for it, and which endpoints serve attestation collateral and release discovery — is mutable only through the explicit configuration surface described in [client.md](client.md#configuration-overrides), which the scope note above already excludes from these invariants; any value left unset falls back to the compiled-in pin. (See [trust-root.md](trust-root.md#whats-pinned).)
 
 **6.6.** `MIN_HUMAN_ATTESTATIONS` is pinned in the *currently-installed* client, not in the incoming release. A coerced single attestant cannot lower the bar by shipping a release that requires fewer signatures.
 
@@ -95,9 +93,9 @@ Every item is an inherent attribute of the attested source: a property you can c
 
 ## 7. Source, build, and operational discipline
 
-**7.1.** All client code, server code, build configuration, and release tooling are published in a public monorepo.
+**7.1.** All client code, server code, build configuration, and release tooling live in a single repository, public at the moment of release: one git commit identifies the complete first-party source of a release. Dependencies — including temporarily maintained forks, themselves public — may sit outside that tree but are pinned from within it by version and hash (§7.3).
 
-**7.2.** Build environments are pinned and reproducible: StageX (source-bootstrapped) for the server/CLI Linux OCI images, Nix flake (hermetic, narHash-pinned) for the desktop binaries (the macOS universal CLI and GUI builds, and the Linux GUI). Build-environment hashes flow into the artifact manifest.
+**7.2.** Build environments are pinned and reproducible: StageX (source-bootstrapped) for the server/CLI Linux OCI images, Nix flake (hermetic, narHash-pinned) for the desktop binaries (the macOS universal CLI and GUI builds, and the Linux GUI). The artifact manifest records the *output* hashes these environments produce (OCI digests, narHashes); because the environment pins live in the same commit and the builds are hermetic, those outputs transitively bind the build environment that produced them.
 
 **7.3.** Source dependencies are pinned by version and hash. Updates are explicit commits.
 

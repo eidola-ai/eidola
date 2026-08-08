@@ -3808,6 +3808,7 @@ pub async fn content_block_owner_text(
 /// Test-only support for `AppCore::test_insert_unvalidated_reference`; the
 /// production reference path never needs to name a block it wasn't given.
 #[doc(hidden)]
+#[cfg(feature = "test-support")]
 pub async fn first_content_block(
     conn: &Connection,
     action_id: &str,

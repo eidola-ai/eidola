@@ -147,8 +147,7 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
     /// "Balance", an alert's message. **Never bind it to text that mutates at
     /// speed** (a streaming reply, a live editor buffer, a download counter):
     /// assistive technology re-reads the whole value on every change of a
-    /// focused control, which turns annotation into noise. See the audit's §4
-    /// (`work/tasks/12a`).
+    /// focused control, which turns annotation into noise.
     fn probe_value(
         self,
         name: impl Into<SharedString>,

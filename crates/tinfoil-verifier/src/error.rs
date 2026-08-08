@@ -22,6 +22,13 @@ pub enum Error {
     #[error("TDX verification error: {0}")]
     Tdx(String),
 
+    #[error(
+        "TDX attestation refused: MRTD/RTMR0 policy checks are not implemented, and \
+         RTMR1/RTMR2 alone are replayable by guest firmware — only SEV-SNP attestations \
+         are accepted (see docs/gaps.md § TDX acceptance)"
+    )]
+    TdxNotAccepted,
+
     #[error("VCEK certificate chain verification failed: {0}")]
     CertChain(String),
 

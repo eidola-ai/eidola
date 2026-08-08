@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::Deserialize;
+use sha2::Digest;
 
 use crate::error::AppError;
 use crate::trust_root;
@@ -220,6 +221,11 @@ pub struct VerifiedAttestation {
     pub attestant_id: String,
     pub attestant_name: String,
     pub jurisdiction: String,
+    /// The manifest hash the attestant swore to inside the signed prose.
+    /// The updater binds this to the sha256 of the manifest it actually
+    /// fetched (see `verify_release`) — the template `cross_checks` only
+    /// bind prose values to `release.json`, which is unsigned.
+    pub artifact_manifest_sha256: String,
     pub fingerprint_hex: String,
     pub rekor_log_index: u64,
     pub attested_at: String,
@@ -364,6 +370,8 @@ pub async fn check_for_update_with(
     let _verified_ci = ci_sigstore::verify_ci_signature(&manifest_bytes, &bundle_bytes, &trust)?;
     tracer.log("verify-ci", "ok");
 
+    let manifest_sha256_hex = human_attestation::hex_encode(&sha2::Sha256::digest(&manifest_bytes));
+
     // ── verify each human attestation (signature + content) ─────────────
     let mut verified_attestations: Vec<VerifiedAttestation> =
         Vec::with_capacity(release.human_attestations.len());
@@ -407,6 +415,23 @@ pub async fn check_for_update_with(
                     "release.human_attestations[].attestant_id `{}` ≠ attestation prose \
                      attestant.id `{}`",
                     human.attestant_id, verified.attestant_id
+                ),
+            });
+        }
+        // The attestant swears to a specific manifest hash inside the
+        // signed prose; bind it to the manifest actually fetched and
+        // CI-verified above, so a compromised pipeline can't pair a
+        // legitimate human attestation with a *different* CI-signed
+        // manifest for the same version and commit.
+        if !verified
+            .artifact_manifest_sha256
+            .eq_ignore_ascii_case(&manifest_sha256_hex)
+        {
+            return Err(AppError::Update {
+                message: format!(
+                    "attestation `{}` attests artifact-manifest.json sha256 `{}`, but the \
+                     fetched manifest hashes to `{}`",
+                    verified.attestant_id, verified.artifact_manifest_sha256, manifest_sha256_hex
                 ),
             });
         }

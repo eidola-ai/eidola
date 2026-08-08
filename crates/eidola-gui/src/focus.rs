@@ -1,5 +1,5 @@
 //! The focus model — what is focusable, what the ring looks like, and when it
-//! shows. Wave B of the accessibility program (`work/tasks/12`).
+//! shows.
 //!
 //! **One internal focus model, two audiences.** The same focus state feeds the
 //! app-drawn ring (keyboard-heavy users with no assistive technology enabled —
