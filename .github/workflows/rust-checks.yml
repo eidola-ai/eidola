@@ -92,7 +92,19 @@ jobs:
           # `diff BASE_SHA HEAD` needs only the two trees, not shared history, so
           # a single-commit fetch of the PR base is enough on the shallow
           # checkout. HEAD is the PR's merge commit; BASE_SHA is its base parent.
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          #
+          # Retried: git 2.54.0 (current runner image) has a shallow-fetch
+          # regression (upstream 3ef68ff40e, fixed in 2.55) that intermittently
+          # kills a --depth fetch into an already-shallow checkout with
+          # "fatal: shallow file has changed since we read it"; a rerun
+          # succeeds. Drop the retry loops (here and in the legal-doc step)
+          # once runner images ship git >= 2.55.
+          for attempt in 1 2 3; do
+            git fetch --no-tags --depth=1 origin "$BASE_SHA" && break
+            [ "$attempt" -lt 3 ] || exit 1
+            echo "git fetch attempt $attempt failed; retrying..." >&2
+            sleep 2
+          done
           changed=$(git diff --name-only "$BASE_SHA" HEAD)
           echo "Changed files:"
           echo "$changed" | sed 's/^/  /'
@@ -158,7 +170,18 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          # The scope step above has usually fetched BASE_SHA already (every
+          # PR into `next`) — skip the redundant fetch then, and retry the one
+          # we do run (PRs into `main`) around the git 2.54 shallow-fetch
+          # regression described on the scope step's fetch.
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2> /dev/null; then
+            for attempt in 1 2 3; do
+              git fetch --no-tags --depth=1 origin "$BASE_SHA" && break
+              [ "$attempt" -lt 3 ] || exit 1
+              echo "git fetch attempt $attempt failed; retrying..." >&2
+              sleep 2
+            done
+          fi
           ./scripts/check-legal-doc-versions.sh "$BASE_SHA"
 
       - name: Free up disk space
