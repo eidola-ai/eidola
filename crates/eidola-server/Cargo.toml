@@ -112,3 +112,8 @@ tokio-stream = "0.1"
 
 [build-dependencies]
 serde_json = "1"
+
+[dev-dependencies]
+# `InMemoryLogExporter` for the telemetry regression test pinning that
+# exported log records carry no trace context.
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
