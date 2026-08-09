@@ -104,14 +104,31 @@ struct StripeEventData {
 // Webhook outcome
 // ---------------------------------------------------------------------------
 
+/// How one delivery ended, carrying the bounded `reason` label the
+/// `WEBHOOK_OUTCOME` counter records. Every reason is a code-authored
+/// constant — never a value off the event — so the label set stays fixed
+/// (privacy-guarantees.md §3.3) while still separating the failure modes:
+/// a ledger write is `handled`, a redelivery of a spent event is
+/// `duplicate`, a permanently unusable event names what it lacked, and a
+/// transient failure names which dependency failed.
 enum WebhookOutcome {
-    Handled,
-    RetryableError,
+    /// Answer 200 so Stripe stops redelivering — the event was applied,
+    /// deliberately ignored, or is permanently unusable (retrying cannot
+    /// change what the event contains).
+    Done(&'static str),
+    /// Answer 500 so Stripe redelivers.
+    Retryable(&'static str),
 }
 
 impl WebhookOutcome {
     fn is_retryable(&self) -> bool {
-        matches!(self, Self::RetryableError)
+        matches!(self, Self::Retryable(_))
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Done(reason) | Self::Retryable(reason) => reason,
+        }
     }
 }
 
@@ -220,12 +237,11 @@ pub async fn stripe_webhook(
     };
 
     // `event_type` is Stripe-authored, so the log carries its fixed-list
-    // resolution, never the verbatim value (privacy-guarantees.md §3.3).
-    info!(
-        "webhook: received {} ({})",
-        event_type_label(&event.event_type),
-        event.id
-    );
+    // resolution, never the verbatim value — and no `event.id`: a Stripe
+    // identifier in the log would join our diagnostics to Stripe's own
+    // records (privacy-guarantees.md §3.3). The database keeps the id for
+    // idempotency; logs stay identifier-free.
+    info!("webhook: received {}", event_type_label(&event.event_type));
 
     let outcome = match event.event_type.as_str() {
         "checkout.session.completed" => {
@@ -233,11 +249,8 @@ pub async fn stripe_webhook(
         }
         "invoice.paid" => handle_invoice_paid(&event, &state.db_pool, &state.stripe).await,
         "customer.subscription.deleted" => {
-            info!(
-                "webhook: subscription deleted (event {}), no ledger action",
-                event.id
-            );
-            WebhookOutcome::Handled
+            info!("webhook: subscription deleted, no ledger action");
+            WebhookOutcome::Done("ignored")
         }
         "charge.refunded" => handle_charge_refunded(&event, &state.db_pool).await,
         "charge.dispute.created" => handle_dispute_created(&event, &state.db_pool).await,
@@ -247,16 +260,14 @@ pub async fn stripe_webhook(
             // there is nothing loggable beyond the fact of the fallthrough
             // (the receipt log above already recorded the `other` label).
             info!("webhook: ignoring unhandled event type");
-            WebhookOutcome::Handled
+            WebhookOutcome::Done("ignored")
         }
     };
 
+    record_webhook_outcome(&event.event_type, outcome.reason());
     if outcome.is_retryable() {
-        record_webhook_outcome(&event.event_type, "retryable_error");
         return internal_error();
     }
-
-    record_webhook_outcome(&event.event_type, "handled");
     ok_empty()
 }
 
@@ -271,20 +282,23 @@ async fn handle_checkout_completed(
 ) -> WebhookOutcome {
     let obj = &event.data.object;
 
+    // `mode` is Stripe-authored, so the log states the branch taken rather
+    // than the verbatim value — the same rule as every identifier below
+    // (session, customer, product ids): they steer the code and reach the
+    // database where the flow needs them, but never the logs.
     let mode = obj["mode"].as_str().unwrap_or("");
     if mode != "payment" {
         info!(
-            "webhook: checkout mode={}, skipping (invoice.paid handles subscriptions)",
-            mode
+            "webhook: checkout mode is not payment, skipping (invoice.paid handles subscriptions)"
         );
-        return WebhookOutcome::Handled;
+        return WebhookOutcome::Done("ignored");
     }
 
     let session_id = match obj["id"].as_str() {
         Some(id) => id,
         None => {
             error!("webhook: checkout.session.completed missing session id");
-            return WebhookOutcome::Handled;
+            return WebhookOutcome::Done("malformed_event");
         }
     };
 
@@ -292,25 +306,19 @@ async fn handle_checkout_completed(
         Some(c) => c,
         None => {
             error!("webhook: checkout.session.completed missing customer");
-            return WebhookOutcome::Handled;
+            return WebhookOutcome::Done("malformed_event");
         }
     };
 
     let account = match db::get_account_by_stripe_customer(pool, customer_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {
-            warn!(
-                "webhook: orphan customer {} in checkout.session.completed",
-                customer_id
-            );
-            return WebhookOutcome::Handled;
+            warn!("webhook: orphan customer in checkout.session.completed");
+            return WebhookOutcome::Done("orphan_customer");
         }
         Err(e) => {
-            error!(
-                "webhook: db error looking up customer {}: {}",
-                customer_id, e
-            );
-            return WebhookOutcome::RetryableError;
+            error!("webhook: db error looking up customer: {}", e);
+            return WebhookOutcome::Retryable("db_error");
         }
     };
 
@@ -318,37 +326,31 @@ async fn handle_checkout_completed(
         Some(s) => s,
         None => {
             error!("webhook: stripe client not configured, cannot fetch line items");
-            return WebhookOutcome::RetryableError;
+            return WebhookOutcome::Retryable("stripe_unconfigured");
         }
     };
 
     let line_items = match stripe.list_checkout_line_items(session_id).await {
         Ok(items) => items,
         Err(e) => {
-            error!(
-                "webhook: failed to fetch line items for {}: {}",
-                session_id, e
-            );
-            return WebhookOutcome::RetryableError;
+            error!("webhook: failed to fetch line items for checkout: {}", e);
+            return WebhookOutcome::Retryable("stripe_api_error");
         }
     };
 
     let product_id = match line_items.first().map(|item| item.price.product.as_str()) {
         Some(id) => id,
         None => {
-            error!("webhook: no line items for checkout session {}", session_id);
-            return WebhookOutcome::Handled;
+            error!("webhook: no line items for checkout session");
+            return WebhookOutcome::Done("no_line_items");
         }
     };
 
     let product = match stripe.get_product(product_id).await {
         Ok(p) => p,
         Err(e) => {
-            error!(
-                "webhook: failed to fetch product {} for checkout: {}",
-                product_id, e
-            );
-            return WebhookOutcome::RetryableError;
+            error!("webhook: failed to fetch product for checkout: {}", e);
+            return WebhookOutcome::Retryable("stripe_api_error");
         }
     };
 
@@ -359,11 +361,8 @@ async fn handle_checkout_completed(
     {
         Some(c) => c,
         None => {
-            error!(
-                "webhook: no credits metadata on product {} for session {}",
-                product_id, session_id
-            );
-            return WebhookOutcome::Handled;
+            error!("webhook: no credits metadata on checkout product");
+            return WebhookOutcome::Done("no_credits_metadata");
         }
     };
 
@@ -390,18 +389,22 @@ async fn handle_checkout_completed(
     )
     .await
     {
-        Ok(true) => info!(
-            "webhook: credited {} to account {} (purchase, event {})",
-            credits, account.id, event.id
-        ),
-        Ok(false) => info!("webhook: duplicate event {}, skipping", event.id),
+        Ok(true) => {
+            info!(
+                "webhook: credited {} to account {} (purchase)",
+                credits, account.id
+            );
+            WebhookOutcome::Done("handled")
+        }
+        Ok(false) => {
+            info!("webhook: duplicate event, skipping");
+            WebhookOutcome::Done("duplicate")
+        }
         Err(e) => {
             error!("webhook: failed to insert ledger entry: {}", e);
-            return WebhookOutcome::RetryableError;
+            WebhookOutcome::Retryable("db_error")
         }
     }
-
-    WebhookOutcome::Handled
 }
 
 async fn handle_invoice_paid(
@@ -413,33 +416,27 @@ async fn handle_invoice_paid(
 
     let billing_reason = obj["billing_reason"].as_str().unwrap_or("");
     if billing_reason != "subscription_create" && billing_reason != "subscription_cycle" {
-        info!(
-            "webhook: invoice.paid billing_reason={}, skipping",
-            billing_reason
-        );
-        return WebhookOutcome::Handled;
+        info!("webhook: invoice.paid billing_reason is not a subscription charge, skipping");
+        return WebhookOutcome::Done("ignored");
     }
 
     let customer_id = match obj["customer"].as_str() {
         Some(c) => c,
         None => {
             error!("webhook: invoice.paid missing customer");
-            return WebhookOutcome::Handled;
+            return WebhookOutcome::Done("malformed_event");
         }
     };
 
     let account = match db::get_account_by_stripe_customer(pool, customer_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {
-            warn!("webhook: orphan customer {} in invoice.paid", customer_id);
-            return WebhookOutcome::Handled;
+            warn!("webhook: orphan customer in invoice.paid");
+            return WebhookOutcome::Done("orphan_customer");
         }
         Err(e) => {
-            error!(
-                "webhook: db error looking up customer {}: {}",
-                customer_id, e
-            );
-            return WebhookOutcome::RetryableError;
+            error!("webhook: db error looking up customer: {}", e);
+            return WebhookOutcome::Retryable("db_error");
         }
     };
 
@@ -447,19 +444,16 @@ async fn handle_invoice_paid(
     let first_line = match lines.as_array().and_then(|arr| arr.first()) {
         Some(line) => line,
         None => {
-            error!("webhook: no line items on invoice (event {})", event.id);
-            return WebhookOutcome::Handled;
+            error!("webhook: no line items on invoice");
+            return WebhookOutcome::Done("no_line_items");
         }
     };
 
     let product_id = match first_line["pricing"]["price_details"]["product"].as_str() {
         Some(id) => id,
         None => {
-            error!(
-                "webhook: no product ID on invoice line item (event {})",
-                event.id
-            );
-            return WebhookOutcome::Handled;
+            error!("webhook: no product ID on invoice line item");
+            return WebhookOutcome::Done("malformed_event");
         }
     };
 
@@ -467,18 +461,15 @@ async fn handle_invoice_paid(
         Some(s) => s,
         None => {
             error!("webhook: stripe client not configured, cannot fetch product");
-            return WebhookOutcome::RetryableError;
+            return WebhookOutcome::Retryable("stripe_unconfigured");
         }
     };
 
     let product = match stripe.get_product(product_id).await {
         Ok(p) => p,
         Err(e) => {
-            error!(
-                "webhook: failed to fetch product {} for invoice: {}",
-                product_id, e
-            );
-            return WebhookOutcome::RetryableError;
+            error!("webhook: failed to fetch product for invoice: {}", e);
+            return WebhookOutcome::Retryable("stripe_api_error");
         }
     };
 
@@ -489,11 +480,8 @@ async fn handle_invoice_paid(
     {
         Some(c) => c,
         None => {
-            error!(
-                "webhook: no credits metadata on product {} (event {})",
-                product_id, event.id
-            );
-            return WebhookOutcome::Handled;
+            error!("webhook: no credits metadata on invoice product");
+            return WebhookOutcome::Done("no_credits_metadata");
         }
     };
 
@@ -517,18 +505,22 @@ async fn handle_invoice_paid(
     )
     .await
     {
-        Ok(true) => info!(
-            "webhook: credited {} to account {} (subscription_renewal, event {})",
-            credits, account.id, event.id
-        ),
-        Ok(false) => info!("webhook: duplicate event {}, skipping", event.id),
+        Ok(true) => {
+            info!(
+                "webhook: credited {} to account {} (subscription_renewal)",
+                credits, account.id
+            );
+            WebhookOutcome::Done("handled")
+        }
+        Ok(false) => {
+            info!("webhook: duplicate event, skipping");
+            WebhookOutcome::Done("duplicate")
+        }
         Err(e) => {
             error!("webhook: failed to insert ledger entry: {}", e);
-            return WebhookOutcome::RetryableError;
+            WebhookOutcome::Retryable("db_error")
         }
     }
-
-    WebhookOutcome::Handled
 }
 
 async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutcome {
@@ -538,25 +530,19 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         Some(c) => c,
         None => {
             error!("webhook: charge.refunded missing customer");
-            return WebhookOutcome::Handled;
+            return WebhookOutcome::Done("malformed_event");
         }
     };
 
     let account = match db::get_account_by_stripe_customer(pool, customer_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {
-            warn!(
-                "webhook: orphan customer {} in charge.refunded",
-                customer_id
-            );
-            return WebhookOutcome::Handled;
+            warn!("webhook: orphan customer in charge.refunded");
+            return WebhookOutcome::Done("orphan_customer");
         }
         Err(e) => {
-            error!(
-                "webhook: db error looking up customer {}: {}",
-                customer_id, e
-            );
-            return WebhookOutcome::RetryableError;
+            error!("webhook: db error looking up customer: {}", e);
+            return WebhookOutcome::Retryable("db_error");
         }
     };
 
@@ -564,18 +550,15 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         Some(a) => a,
         None => {
             error!("webhook: charge.refunded missing amount_refunded");
-            return WebhookOutcome::Handled;
+            return WebhookOutcome::Done("malformed_event");
         }
     };
 
     let amount = match cents_to_microdollars(amount_refunded) {
         Some(a) => a,
         None => {
-            error!(
-                "webhook: amount overflow in charge.refunded (event {})",
-                event.id
-            );
-            return WebhookOutcome::Handled;
+            error!("webhook: amount overflow in charge.refunded");
+            return WebhookOutcome::Done("amount_overflow");
         }
     };
 
@@ -594,7 +577,7 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
                 Ok(outcome) => outcome,
                 Err(e) => {
                     error!("webhook: failed to insert matched refund: {}", e);
-                    return WebhookOutcome::RetryableError;
+                    return WebhookOutcome::Retryable("db_error");
                 }
             }
         }
@@ -602,28 +585,35 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
     };
 
     match matched {
-        Some(true) => info!(
-            "webhook: debited {} from account {} (refund matched to {}, event {})",
-            amount,
-            account.id,
-            payment_intent.unwrap_or_default(),
-            event.id
-        ),
-        Some(false) => info!("webhook: duplicate event {}, skipping", event.id),
+        Some(true) => {
+            info!(
+                "webhook: debited {} from account {} (refund matched to its payment intent)",
+                amount, account.id
+            );
+            WebhookOutcome::Done("handled")
+        }
+        Some(false) => {
+            info!("webhook: duplicate event, skipping");
+            WebhookOutcome::Done("duplicate")
+        }
         None => match db::debit_stripe_event(pool, account.id, amount, "refund", &event.id).await {
-            Ok(true) => info!(
-                "webhook: debited {} from account {} (refund, event {})",
-                amount, account.id, event.id
-            ),
-            Ok(false) => info!("webhook: duplicate event {}, skipping", event.id),
+            Ok(true) => {
+                info!(
+                    "webhook: debited {} from account {} (refund)",
+                    amount, account.id
+                );
+                WebhookOutcome::Done("handled")
+            }
+            Ok(false) => {
+                info!("webhook: duplicate event, skipping");
+                WebhookOutcome::Done("duplicate")
+            }
             Err(e) => {
                 error!("webhook: failed to insert ledger entry: {}", e);
-                return WebhookOutcome::RetryableError;
+                WebhookOutcome::Retryable("db_error")
             }
         },
     }
-
-    WebhookOutcome::Handled
 }
 
 async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutcome {
@@ -640,25 +630,19 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         Some(c) => c,
         None => {
             error!("webhook: charge.dispute.created missing customer");
-            return WebhookOutcome::Handled;
+            return WebhookOutcome::Done("malformed_event");
         }
     };
 
     let account = match db::get_account_by_stripe_customer(pool, customer_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {
-            warn!(
-                "webhook: orphan customer {} in charge.dispute.created",
-                customer_id
-            );
-            return WebhookOutcome::Handled;
+            warn!("webhook: orphan customer in charge.dispute.created");
+            return WebhookOutcome::Done("orphan_customer");
         }
         Err(e) => {
-            error!(
-                "webhook: db error looking up customer {}: {}",
-                customer_id, e
-            );
-            return WebhookOutcome::RetryableError;
+            error!("webhook: db error looking up customer: {}", e);
+            return WebhookOutcome::Retryable("db_error");
         }
     };
 
@@ -666,18 +650,15 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         Some(a) => a,
         None => {
             error!("webhook: charge.dispute.created missing amount");
-            return WebhookOutcome::Handled;
+            return WebhookOutcome::Done("malformed_event");
         }
     };
 
     let microdollars = match cents_to_microdollars(amount) {
         Some(d) => d,
         None => {
-            error!(
-                "webhook: amount overflow in charge.dispute.created (event {})",
-                event.id
-            );
-            return WebhookOutcome::Handled;
+            error!("webhook: amount overflow in charge.dispute.created");
+            return WebhookOutcome::Done("amount_overflow");
         }
     };
 
@@ -690,18 +671,22 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
     )
     .await
     {
-        Ok(true) => info!(
-            "webhook: debited {} from account {} (dispute_clawback, event {})",
-            microdollars, account.id, event.id
-        ),
-        Ok(false) => info!("webhook: duplicate event {}, skipping", event.id),
+        Ok(true) => {
+            info!(
+                "webhook: debited {} from account {} (dispute_clawback)",
+                microdollars, account.id
+            );
+            WebhookOutcome::Done("handled")
+        }
+        Ok(false) => {
+            info!("webhook: duplicate event, skipping");
+            WebhookOutcome::Done("duplicate")
+        }
         Err(e) => {
             error!("webhook: failed to insert ledger entry: {}", e);
-            return WebhookOutcome::RetryableError;
+            WebhookOutcome::Retryable("db_error")
         }
     }
-
-    WebhookOutcome::Handled
 }
 
 async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutcome {
@@ -709,36 +694,27 @@ async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutco
 
     let status = obj["status"].as_str().unwrap_or("");
     if status != "won" {
-        info!(
-            "webhook: dispute closed with status={}, no reversal",
-            status
-        );
-        return WebhookOutcome::Handled;
+        info!("webhook: dispute closed without a won status, no reversal");
+        return WebhookOutcome::Done("ignored");
     }
 
     let customer_id = match obj["customer"].as_str() {
         Some(c) => c,
         None => {
             error!("webhook: charge.dispute.closed missing customer");
-            return WebhookOutcome::Handled;
+            return WebhookOutcome::Done("malformed_event");
         }
     };
 
     let account = match db::get_account_by_stripe_customer(pool, customer_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {
-            warn!(
-                "webhook: orphan customer {} in charge.dispute.closed",
-                customer_id
-            );
-            return WebhookOutcome::Handled;
+            warn!("webhook: orphan customer in charge.dispute.closed");
+            return WebhookOutcome::Done("orphan_customer");
         }
         Err(e) => {
-            error!(
-                "webhook: db error looking up customer {}: {}",
-                customer_id, e
-            );
-            return WebhookOutcome::RetryableError;
+            error!("webhook: db error looking up customer: {}", e);
+            return WebhookOutcome::Retryable("db_error");
         }
     };
 
@@ -746,18 +722,15 @@ async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutco
         Some(a) => a,
         None => {
             error!("webhook: charge.dispute.closed missing amount");
-            return WebhookOutcome::Handled;
+            return WebhookOutcome::Done("malformed_event");
         }
     };
 
     let delta = match cents_to_microdollars(amount) {
         Some(d) => d,
         None => {
-            error!(
-                "webhook: amount overflow in charge.dispute.closed (event {})",
-                event.id
-            );
-            return WebhookOutcome::Handled;
+            error!("webhook: amount overflow in charge.dispute.closed");
+            return WebhookOutcome::Done("amount_overflow");
         }
     };
 
@@ -772,18 +745,22 @@ async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutco
     )
     .await
     {
-        Ok(true) => info!(
-            "webhook: credited {} to account {} (dispute_reversal, event {})",
-            delta, account.id, event.id
-        ),
-        Ok(false) => info!("webhook: duplicate event {}, skipping", event.id),
+        Ok(true) => {
+            info!(
+                "webhook: credited {} to account {} (dispute_reversal)",
+                delta, account.id
+            );
+            WebhookOutcome::Done("handled")
+        }
+        Ok(false) => {
+            info!("webhook: duplicate event, skipping");
+            WebhookOutcome::Done("duplicate")
+        }
         Err(e) => {
             error!("webhook: failed to insert ledger entry: {}", e);
-            return WebhookOutcome::RetryableError;
+            WebhookOutcome::Retryable("db_error")
         }
     }
-
-    WebhookOutcome::Handled
 }
 
 // ---------------------------------------------------------------------------
