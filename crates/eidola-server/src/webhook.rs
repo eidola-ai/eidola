@@ -285,7 +285,11 @@ async fn handle_checkout_completed(
     // `mode` is Stripe-authored, so the log states the branch taken rather
     // than the verbatim value — the same rule as every identifier below
     // (session, customer, product ids): they steer the code and reach the
-    // database where the flow needs them, but never the logs.
+    // database where the flow needs them, but never the logs. The success
+    // lines here and in the other handlers carry no account id or amount
+    // either: the ledger already records both durably, and an exported log
+    // stream naming them would hand the telemetry vendor a per-account
+    // payment history.
     let mode = obj["mode"].as_str().unwrap_or("");
     if mode != "payment" {
         info!(
@@ -390,10 +394,7 @@ async fn handle_checkout_completed(
     .await
     {
         Ok(true) => {
-            info!(
-                "webhook: credited {} to account {} (purchase)",
-                credits, account.id
-            );
+            info!("webhook: ledger credited (purchase)");
             WebhookOutcome::Done("handled")
         }
         Ok(false) => {
@@ -506,10 +507,7 @@ async fn handle_invoice_paid(
     .await
     {
         Ok(true) => {
-            info!(
-                "webhook: credited {} to account {} (subscription_renewal)",
-                credits, account.id
-            );
+            info!("webhook: ledger credited (subscription_renewal)");
             WebhookOutcome::Done("handled")
         }
         Ok(false) => {
@@ -586,10 +584,7 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
 
     match matched {
         Some(true) => {
-            info!(
-                "webhook: debited {} from account {} (refund matched to its payment intent)",
-                amount, account.id
-            );
+            info!("webhook: ledger debited (refund matched to its payment intent)");
             WebhookOutcome::Done("handled")
         }
         Some(false) => {
@@ -598,10 +593,7 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         }
         None => match db::debit_stripe_event(pool, account.id, amount, "refund", &event.id).await {
             Ok(true) => {
-                info!(
-                    "webhook: debited {} from account {} (refund)",
-                    amount, account.id
-                );
+                info!("webhook: ledger debited (refund)");
                 WebhookOutcome::Done("handled")
             }
             Ok(false) => {
@@ -672,10 +664,7 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
     .await
     {
         Ok(true) => {
-            info!(
-                "webhook: debited {} from account {} (dispute_clawback)",
-                microdollars, account.id
-            );
+            info!("webhook: ledger debited (dispute_clawback)");
             WebhookOutcome::Done("handled")
         }
         Ok(false) => {
@@ -746,10 +735,7 @@ async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutco
     .await
     {
         Ok(true) => {
-            info!(
-                "webhook: credited {} to account {} (dispute_reversal)",
-                delta, account.id
-            );
+            info!("webhook: ledger credited (dispute_reversal)");
             WebhookOutcome::Done("handled")
         }
         Ok(false) => {
