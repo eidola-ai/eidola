@@ -566,7 +566,11 @@ impl StreamTiming {
     }
 
     /// Report the stream's outcome. Called exactly once, on every terminal
-    /// path, so the outcome counter totals the stream count.
+    /// path, at the moment the terminal condition is observed — before
+    /// refund settlement and metadata delivery, which are our own
+    /// post-stream work: the duration histogram is documented as
+    /// dispatch-to-final-chunk, and recording it later would let a slow
+    /// database read as an upstream generation regression.
     ///
     /// The output rate is measured across the *generation* window (first chunk
     /// to last), not the whole stream: time-to-first-token is already its own
@@ -759,8 +763,8 @@ async fn handle_streaming_request(
                         // (returns blind remaining value c - s). The client can't
                         // receive this, but we issue it for consistency.
                         warn!("Client disconnected mid-stream, issuing zero refund");
-                        let _ = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
                         timing.finish("client_disconnect", None);
+                        let _ = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
                         return;
                     }
                 }
@@ -771,6 +775,11 @@ async fn handle_streaming_request(
                     if final_usage.is_none() {
                         final_usage = meta.usage.clone();
                     }
+
+                    timing.finish(
+                        "done",
+                        final_usage.as_ref().map(|u| u.completion_tokens as u64),
+                    );
 
                     // Record token usage metrics (safe: only model + counts).
                     if let Some(usage) = &final_usage {
@@ -808,23 +817,19 @@ async fn handle_streaming_request(
                         meta.chat_id.unwrap_or_default(),
                     )
                     .await;
-                    timing.finish(
-                        "done",
-                        final_usage.as_ref().map(|u| u.completion_tokens as u64),
-                    );
                     return;
                 }
                 Err(e) => {
                     // Some chunks may have been delivered and billed; we don't
                     // know the actual cost. Refund 0 (blind remaining value).
                     error!("Stream error, issuing zero refund: {}", e);
+                    timing.finish("upstream_error", None);
                     let refund_info =
                         try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
                     let privacy = build_privacy_metadata(&auth_context, true, "tinfoil");
                     let verification = build_verification_metadata(None);
                     send_metadata_event(&tx, refund_info, privacy, verification, String::new())
                         .await;
-                    timing.finish("upstream_error", None);
                     return;
                 }
             }
@@ -833,11 +838,11 @@ async fn handle_streaming_request(
         // upstream_rx closed without a Done event (unexpected). Chunks may
         // have been delivered and billed; we don't know the cost. Refund 0.
         warn!("Upstream channel closed without Done event, issuing zero refund");
+        timing.finish("channel_closed", None);
         let refund_info = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
         let privacy = build_privacy_metadata(&auth_context, true, "tinfoil");
         let verification = build_verification_metadata(None);
         send_metadata_event(&tx, refund_info, privacy, verification, String::new()).await;
-        timing.finish("channel_closed", None);
     });
 
     let stream = ReceiverStream::new(rx);
