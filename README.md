@@ -4,7 +4,9 @@ This is an early work in progress. This repository is intended as a monorepo for
 
 Over the coming months, its shape will change substantially as we port several external proofs-of-concept into a coherent, maintainable single source of truth.
 
-We plan to release the functional components of this repo under appropriate open source licenses, but have not finalized the details.
+## Licensing
+
+Eidola is open source under per-component licenses: the server is AGPL-3.0-only, the app layer (app core, GUI, CLI) is GPL-3.0-only, and the reusable libraries, utilities, and everything else default to MIT OR Apache-2.0; documentation and website content are CC-BY-4.0. [`LICENSE.md`](LICENSE.md) is the full map, including the trademark notice and the carve-out for Eidola, Inc.'s legal documents.
 
 ## Documentation
 
@@ -28,7 +30,7 @@ To sign, add the appropriate entry to `CLA-SIGNERS.txt` in a commit to this repo
 
 The Rust toolchain version is pinned in `rust-toolchain.toml` and installed automatically by rustup. On first `cd` into the repo, `direnv` builds the pinned Rust-based dev tools (including `just` itself) from `crates/devtools/` and puts them on `PATH`, so `rustup` + `direnv` is the whole setup — no separate `just` install. Run `just` to see all available recipes.
 
-All Rust workspace packages live under `crates/`, including the code generation binary `generate-openapi` and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`. `crates/devtools/` is an anchor crate that version-pins upstream Rust-based dev tools — `just` and the [rumdl](https://rumdl.dev/) markdown linter — in `Cargo.lock`; `.envrc` builds them and direnv exposes them on `PATH`. `just check` runs rumdl, and `just lint-md-fix` applies auto-fixes.
+All Rust workspace packages live under `crates/`, including the code generation binary `generate-openapi` and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`. `crates/devtools/` is an anchor crate that version-pins upstream Rust-based dev tools — `just`, the [rumdl](https://rumdl.dev/) markdown linter, and [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) — in `Cargo.lock`; `.envrc` builds them and direnv exposes them on `PATH`. `just check` runs rumdl and cargo-deny, and `just lint-md-fix` applies auto-fixes.
 
 ### Server
 

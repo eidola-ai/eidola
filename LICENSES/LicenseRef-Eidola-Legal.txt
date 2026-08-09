@@ -1,0 +1,11 @@
+Copyright © Eidola, Inc. All rights reserved.
+
+This file is a legal instrument of Eidola, Inc. — a contract, policy, or
+agreement — published in this repository for transparency and auditability,
+not as a work offered for reuse.
+
+You may reproduce it verbatim wherever this repository or its history is
+mirrored, forked, or quoted, and you may quote from it for commentary,
+review, or comparison. You may not adapt it for your own products or
+services, or present it (modified or not) as governing any offering other
+than Eidola, Inc.'s.

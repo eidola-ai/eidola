@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish.workspace = true
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
