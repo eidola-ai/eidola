@@ -29,7 +29,9 @@ use crate::response::{
     EidolaResponse, EidolaStreamMetadata, RefundInfo, build_privacy_metadata,
     build_verification_metadata,
 };
-use crate::types::{ChatCompletionRequest, ErrorResponse, Model, ModelsResponse, Usage};
+use crate::types::{
+    ChatCompletionChunk, ChatCompletionRequest, ErrorResponse, Model, ModelsResponse, Usage,
+};
 
 /// Health check endpoint.
 #[utoipa::path(
@@ -542,8 +544,9 @@ impl StreamTiming {
         [KeyValue::new("model", self.model_id.clone())]
     }
 
-    /// Note the arrival of a chunk from upstream. Records time-to-first-token
-    /// on the first one and tracks the largest inter-chunk gap after that.
+    /// Note the arrival of an output-bearing chunk from upstream. Records
+    /// time-to-first-token on the first one and tracks the largest
+    /// inter-chunk gap after that.
     fn on_chunk(&mut self) {
         let now = Instant::now();
         match self.last_chunk_at {
@@ -601,6 +604,25 @@ impl StreamTiming {
             crate::telemetry::metrics::CHAT_OUTPUT_RATE.record(tokens as f64 / generation, &attrs);
         }
     }
+}
+
+/// Whether a streamed chunk carries generated output — content, reasoning,
+/// or tool-call fragments. The role preamble, the bare finish-reason chunk,
+/// and the usage-only final chunk (which we force via `include_usage`) carry
+/// none, and must not feed [`StreamTiming`]: they would start the
+/// time-to-first-token clock before the first generated token and stretch
+/// the generation window the output rate and max-gap instruments measure.
+fn carries_output(chunk: &ChatCompletionChunk) -> bool {
+    chunk.choices.iter().any(|choice| {
+        let delta = &choice.delta;
+        delta.content.as_deref().is_some_and(|s| !s.is_empty())
+            || delta
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            || delta.reasoning.as_deref().is_some_and(|s| !s.is_empty())
+            || delta.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+    })
 }
 
 /// Handle a streaming chat completion request.
@@ -722,7 +744,9 @@ async fn handle_streaming_request(
         while let Some(event_result) = upstream_rx.recv().await {
             match event_result {
                 Ok(BackendStreamEvent::Chunk(chunk)) => {
-                    timing.on_chunk();
+                    if carries_output(&chunk) {
+                        timing.on_chunk();
+                    }
                     // Capture usage from the final chunk if present.
                     if chunk.usage.is_some() {
                         final_usage.clone_from(&chunk.usage);
@@ -914,6 +938,49 @@ mod tests {
             "max_completion_tokens": max_completion_tokens,
         }))
         .expect("valid request")
+    }
+
+    /// Parse a chunk from the exact JSON shape the upstream sends.
+    fn chunk(json: serde_json::Value) -> ChatCompletionChunk {
+        serde_json::from_value(json).expect("valid chunk")
+    }
+
+    #[test]
+    fn carries_output_ignores_non_token_chunks() {
+        // Role preamble with an empty content string.
+        assert!(!carries_output(&chunk(serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]
+        }))));
+        // Bare finish-reason chunk.
+        assert!(!carries_output(&chunk(serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }))));
+        // Forced usage-only final chunk (empty choices).
+        assert!(!carries_output(&chunk(serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        }))));
+    }
+
+    #[test]
+    fn carries_output_accepts_content_reasoning_and_tool_calls() {
+        for delta in [
+            serde_json::json!({"content": "Hi"}),
+            serde_json::json!({"reasoning_content": "hmm"}),
+            serde_json::json!({"reasoning": "hmm"}),
+            serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": "{"}}]}),
+        ] {
+            assert!(
+                carries_output(&chunk(serde_json::json!({
+                    "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+                }))),
+                "delta should count as output: {delta}"
+            );
+        }
     }
 
     #[test]
