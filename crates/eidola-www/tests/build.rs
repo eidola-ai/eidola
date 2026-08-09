@@ -81,6 +81,36 @@ fn builds_the_real_site() {
     assert!(read(&out, "privacy/index.html").contains("Privacy policy"));
     assert!(read(&out, "terms/index.html").contains("Terms of service"));
 
+    // Hash-versioned docs (HASH_PUBLISHED_DOCS): privacy-guarantees
+    // publishes its exact source bytes and their SHA-256 — the same
+    // whole-file hash `release-tool attest` signs — with no version
+    // number, plus a history link for reaching release-pinned copies.
+    {
+        let html = read(&out, "docs/privacy-guarantees/index.html");
+        let source = read(&out, "docs/privacy-guarantees/source.md");
+        let repo_bytes =
+            fs::read_to_string(repo_root().join("docs/privacy-guarantees.md")).unwrap();
+        assert_eq!(
+            source, repo_bytes,
+            "docs/privacy-guarantees/source.md must be byte-identical to docs/privacy-guarantees.md"
+        );
+        use sha2::{Digest, Sha256};
+        let hash: String = Sha256::digest(repo_bytes.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(html.contains(&format!(
+            "<meta name=\"eidola:source-sha256\" content=\"{hash}\">"
+        )));
+        assert!(!html.contains("eidola:version"));
+        assert!(html.contains(&format!(
+            "Versioned by content hash · sha256 <code>{hash}</code> · <a href=\"source.md\">source</a>"
+        )));
+        assert!(html.contains(
+            "<a href=\"https://github.com/eidola-ai/eidola/commits/main/docs/privacy-guarantees.md\">history</a>"
+        ));
+    }
+
     // Docs: index + a nested page, with .md links rewritten to routes and
     // out-of-docs links rewritten to GitHub.
     let docs_index = read(&out, "docs/index.html");

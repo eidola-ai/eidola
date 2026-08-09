@@ -36,6 +36,27 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// Static files that belong at the site root rather than under `/assets/`.
 const ROOT_STATIC: &[&str] = &["robots.txt", "favicon.svg", "CNAME"];
 
+/// Docs (paths relative to `docs/`) whose exact source bytes are published
+/// at `<route>/source.md` with their SHA-256 in the page identity. These
+/// are hash-versioned documents: the content hash *is* the version —
+/// release attestations pin the hash of the copy at the release commit,
+/// and the site identifies the copy it renders the same way. Deliberately
+/// not the legal-document `version` front matter: front matter would
+/// change the bytes the release attestation hashes, and a monotonic
+/// version number would imply ongoing-conduct semantics these documents
+/// reject.
+const HASH_PUBLISHED_DOCS: &[&str] = &["privacy-guarantees.md"];
+
+/// Lowercase hex SHA-256 — the same whole-file-bytes hash
+/// `release-tool attest` computes for `privacy_guarantees_doc_sha256`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 pub struct BuildOptions {
     /// Repo root (the directory containing `www/` and `docs/`).
     pub root: PathBuf,
@@ -77,10 +98,7 @@ fn load_page(path: &Path, kind: PageKind, route: String, source_dir: &str) -> Re
     // SHA-256 of those bytes — the acceptance hash the server's
     // terms-acceptance gate polls and verifies.
     let (source_sha256, source_raw) = if matter.version.is_some() {
-        use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(src.as_bytes());
-        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        (Some(hex), Some(src.clone()))
+        (Some(sha256_hex(src.as_bytes())), Some(src.clone()))
     } else {
         (None, None)
     };
@@ -380,6 +398,12 @@ pub fn build(opts: &BuildOptions) -> Result<BuildStats, Error> {
         };
         let mut page = load_page(&docs.join(rel), PageKind::Doc, route, &source_dir)?;
         page.source_path = Some(format!("docs/{rel}"));
+        if HASH_PUBLISHED_DOCS.contains(&rel.as_str()) {
+            let src = fs::read_to_string(docs.join(rel))
+                .map_err(|e| format!("reading docs/{rel}: {e}"))?;
+            page.source_sha256 = Some(sha256_hex(src.as_bytes()));
+            page.source_raw = Some(src);
+        }
         doc_pages.push(page);
     }
 
