@@ -119,6 +119,19 @@ fn parse_traceparent(value: &str) -> Option<SpanContext> {
         return None;
     }
 
+    // Exact W3C field shapes, checked before parsing: `from_hex` /
+    // `from_str_radix` alone accept variable-length (and uppercase, and
+    // `+`-prefixed) values, so without this a header like `00-1-1-01`
+    // would opt its request into export against this function's
+    // well-formed-only contract.
+    let exact_lower_hex = |s: &str, len: usize| {
+        s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if !exact_lower_hex(trace_id, 32) || !exact_lower_hex(span_id, 16) || !exact_lower_hex(flags, 2)
+    {
+        return None;
+    }
+
     let trace_id = TraceId::from_hex(trace_id).ok()?;
     let span_id = SpanId::from_hex(span_id).ok()?;
     if trace_id == TraceId::INVALID || span_id == SpanId::INVALID {
@@ -184,6 +197,17 @@ mod tests {
             "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
             "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
             "00-nothex-00f067aa0ba902b7-01",
+            // Wrong field lengths: `u128::from_str_radix` would happily
+            // parse these, so the shape check is what rejects them.
+            "00-1-1-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e47361-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1",
+            // `from_str_radix` accepts a leading `+`; W3C hex has none.
+            "00-+bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            // W3C requires lowercase hex.
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0F",
         ] {
             assert!(
                 parse_traceparent(bad).is_none(),
