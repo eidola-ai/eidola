@@ -78,15 +78,27 @@ pub fn run(args: Args) -> Result<()> {
     );
 
     println!("== comparing CI manifest with committed manifest ==");
+    // Byte equality is the required bar, not JSON equivalence:
+    // `release-tool attest` signs the sha256 of the committed file's exact
+    // bytes, and the updater rejects the release unless the fetched asset
+    // hashes to that value — a formatting-only difference would publish an
+    // attestation no client accepts. The canonical comparison survives only
+    // to say *which* kind of divergence this is.
     let committed_path = args.workspace_root.join("artifact-manifest.json");
-    let ci_canonical = canonical_json(&manifest_path)?;
-    let committed_canonical = canonical_json(&committed_path)?;
-    if ci_canonical != committed_canonical {
-        eprintln!(
-            "  ✗ committed `artifact-manifest.json` differs from the CI-built one!\n\
-             this means either:\n\
+    let committed_bytes = fs::read(&committed_path)
+        .with_context(|| format!("reading {}", committed_path.display()))?;
+    if committed_bytes != manifest_bytes {
+        let kind = if canonical_json(&manifest_path)? == canonical_json(&committed_path)? {
+            "the two parse to identical JSON, so the difference is formatting only —\n\
+             which still changes the sha256 that `release-attest` signs and clients check"
+        } else {
+            "the two differ in content, meaning either:\n\
                (a) you forgot to run `just update-manifest` before pushing the tag, or\n\
-               (b) the build is not reproducible on your hardware vs CI.\n\
+               (b) the build is not reproducible on your hardware vs CI"
+        };
+        eprintln!(
+            "  ✗ committed `artifact-manifest.json` differs byte-for-byte from the CI-built one!\n\
+             {kind}.\n\
              abort, fix, retag, and re-run.\n\
              committed: {}\n\
              ci:        {}",
@@ -95,7 +107,7 @@ pub fn run(args: Args) -> Result<()> {
         );
         bail!("manifest mismatch");
     }
-    println!("  ✓ committed manifest matches CI (reproducible)");
+    println!("  ✓ committed manifest matches CI byte-for-byte (reproducible)");
 
     if let Some((prev_tag, prev_commit)) = prev.as_ref() {
         println!();
