@@ -179,15 +179,13 @@ fn upstream_error_type_label(error_type: &str) -> &'static str {
 ///
 /// serde's own messages echo offending values verbatim — `invalid type:
 /// string "<the value>", expected u32`, ``unknown field `<the name>` `` —
-/// so nothing a serde error `Display`s may reach the log path. Only the
-/// error category and position survive.
+/// so nothing a serde error `Display`s may reach the log path. The error
+/// position is dropped along with the message: line/column identify a byte
+/// offset into the failed document, and on a minified inference response
+/// that is per-request content-length material (an EOF failure's column is
+/// the response length). Only the fixed error category survives.
 pub(crate) fn parse_error_summary(e: &serde_json::Error) -> String {
-    format!(
-        "{:?} error at line {} column {}",
-        e.classify(),
-        e.line(),
-        e.column()
-    )
+    format!("{:?} error", e.classify())
 }
 
 impl axum::response::IntoResponse for ServerError {
@@ -271,17 +269,19 @@ mod tests {
         );
     }
 
-    /// serde error messages quote offending values; the log-safe summary
-    /// must carry only the category and position.
+    /// serde error messages quote offending values, and the error position
+    /// is a byte offset into the failed document (per-request length
+    /// material on a minified body); the log-safe summary must carry only
+    /// the fixed category.
     #[test]
-    fn parse_error_summary_omits_offending_values() {
+    fn parse_error_summary_omits_offending_values_and_position() {
         let err = serde_json::from_str::<u32>("\"sk-secret-value\"").unwrap_err();
         let summary = parse_error_summary(&err);
         assert!(
             !summary.contains("secret"),
             "offending value leaked: {summary}"
         );
-        assert_eq!(summary, "Data error at line 1 column 17");
+        assert_eq!(summary, "Data error");
     }
 
     /// Server-authored messages stay in the logs — redaction is targeted, not

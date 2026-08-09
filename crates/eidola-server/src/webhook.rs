@@ -209,7 +209,7 @@ pub async fn stripe_webhook(
         Ok(e) => e,
         Err(e) => {
             // serde messages quote offending values from the Stripe-authored
-            // body; log only the category/position summary.
+            // body; log only the category summary.
             error!(
                 "webhook: failed to parse event: {}",
                 crate::error::parse_error_summary(&e)
