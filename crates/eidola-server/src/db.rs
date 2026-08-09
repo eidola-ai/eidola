@@ -1,9 +1,10 @@
 //! Database connection pool and query helpers.
 
-use std::io::BufReader;
 use std::time::SystemTime;
 
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 use tokio_postgres::NoTls;
 use tokio_postgres::config::SslMode;
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -62,10 +63,9 @@ fn build_tls_config(database_ssl_cert: Option<&str>) -> Result<rustls::ClientCon
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     if let Some(database_ssl_cert) = database_ssl_cert.filter(|value| !value.is_empty()) {
-        let mut reader = BufReader::new(database_ssl_cert.as_bytes());
-        let certificates = rustls_pemfile::certs(&mut reader)
+        let certificates = CertificateDer::pem_slice_iter(database_ssl_cert.as_bytes())
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("invalid DATABASE_SSL_CERT PEM: {e}"))?;
+            .map_err(|e| format!("invalid DATABASE_SSL_CERT PEM: {e:?}"))?;
 
         if certificates.is_empty() {
             return Err("DATABASE_SSL_CERT did not contain any PEM certificates".to_string());

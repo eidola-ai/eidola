@@ -67,6 +67,12 @@ feature-depth = 1
 #db-path = "$CARGO_HOME/advisory-dbs"
 # The url(s) of the advisory databases to use
 #db-urls = ["https://github.com/rustsec/advisory-db"]
+# How to handle unmaintained-crate advisories. `workspace` flags only crates
+# our own manifests depend on directly — a transitive unmaintained crate is
+# actionable in the upstream that chose it, not here, and at `all` the
+# transitive noise (gpui's text stack alone carries several) would bury real
+# vulnerability findings.
+unmaintained = "workspace"
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
@@ -74,6 +80,26 @@ ignore = [
     #{ id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
     #"a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
+
+    # rsa: Marvin timing side channel, no fixed release exists. Every use of
+    # the crate in this graph is signature *verification* (public-key
+    # operations) — rustls-rustcrypto TLS signatures, sev ARK→ASK and CRLs,
+    # dcap-qvl PCK chains — while the side channel requires observing RSA
+    # private-key operations, which no Eidola binary performs via this crate.
+    { id = "RUSTSEC-2023-0071", reason = "rsa is verification-only in this graph; Marvin requires RSA private-key operations, and no fixed release exists" },
+
+    # rustls-webpki 0.102.8 (the four IDs below): resolved only because
+    # rustls-rustcrypto 0.0.2-alpha pins ^0.102, and that crate imports
+    # nothing from it but the `alg_id` DER constants (its src/verify/*.rs) —
+    # webpki's chain-building, CRL, and name-constraint code, where these
+    # CVEs live, is never invoked from the 0.102.8 copy. All real WebPKI
+    # verification runs on rustls's own rustls-webpki 0.103.13, which is
+    # patched. Drop these when rustls-rustcrypto releases against
+    # webpki >=0.103.10.
+    { id = "RUSTSEC-2026-0049", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.13" },
+    { id = "RUSTSEC-2026-0098", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.13" },
+    { id = "RUSTSEC-2026-0099", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.13" },
+    { id = "RUSTSEC-2026-0104", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.13" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
@@ -88,6 +114,15 @@ ignore = [
 # List of explicitly allowed licenses
 # See https://spdx.org/licenses/ for list of possible licenses
 # [possible values: any SPDX 3.11 short identifier (+ optional exception)].
+#
+# Keep this list aligned with `allow-licenses` in
+# .github/workflows/dependency-review.yml (the CI gate): the two tools walk
+# different graphs — dependency-review checks the whole Cargo.lock while
+# cargo-deny resolves only the enabled feature set — so an entry here may be
+# exercised only by the CI side (e.g. NCSA, required by libfuzzer-sys's
+# `(MIT OR Apache-2.0) AND NCSA` in the lockfile), but the *policy* is one
+# list. LicenseRef-* entries in the workflow are action-specific synthetics
+# with no cargo-deny equivalent.
 allow = [
     "0BSD",
     "Apache-2.0",
@@ -96,12 +131,14 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
+    "bzip2-1.0.6",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MIT-0",
     "MPL-2.0",
+    "NCSA",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",

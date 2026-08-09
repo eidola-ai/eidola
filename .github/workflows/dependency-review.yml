@@ -50,12 +50,23 @@ jobs:
             Unlicense,
             Zlib
           # Per-package license exemptions. Unlike adding to `allow-licenses`,
-          # these don't relax the policy for anything else — distributed Rust
-          # crates stay strict — and vulnerability checks still apply. Listed
-          # here are GitHub Actions: CI tooling we run but never distribute, so
-          # a copyleft license creates no obligation. Versionless purls so they
-          # survive SHA bumps.
+          # these don't relax the policy for anything else — third-party Rust
+          # crates stay strict — and vulnerability checks still apply.
+          # Versionless purls so entries survive SHA/version bumps.
+          #
+          # GitHub Actions: CI tooling we run but never distribute, so a
+          # copyleft license creates no obligation.
           #   * Swatinem/rust-cache — LGPL-3.0. (Pre-existing dep; the workflow
           #     refactor is just the first PR to bring it into review scope.)
+          #   * tinfoilsh/measure-image-action — AGPL-3.0.
+          #
+          # First-party workspace crates: copyleft by our own choice (see
+          # LICENSE.md), exempted so a workspace version bump appearing in the
+          # Cargo.lock diff doesn't trip the third-party gate.
           allow-dependencies-licenses: >-
-            pkg:githubactions/Swatinem/rust-cache
+            pkg:githubactions/Swatinem/rust-cache,
+            pkg:githubactions/tinfoilsh/measure-image-action,
+            pkg:cargo/eidola-server,
+            pkg:cargo/eidola-app-core,
+            pkg:cargo/eidola-cli,
+            pkg:cargo/eidola-gui

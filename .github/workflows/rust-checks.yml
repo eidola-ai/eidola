@@ -1,6 +1,7 @@
 name: Rust Checks
 
-# Cheap cargo gates (fmt, clippy, test, markdown lint, OpenAPI freshness). Split
+# Cheap cargo gates (fmt, clippy, test, markdown lint, OpenAPI freshness,
+# dependency policy). Split
 # out of the `Build & Verify Artifacts` workflow so it runs on PRs to *both*
 # `next` and `main` — that expensive chain (oci/apple/artifact-manifest) stays
 # scoped to `main`. See
@@ -261,3 +262,18 @@ jobs:
             echo "Run: just update-openapi"
             exit 1
           fi
+
+      - name: Check dependency policy (cargo-deny)
+        # Validates the entire resolved graph against deny.toml — licenses,
+        # bans, and sources. This complements dependency-review.yml, which
+        # only inspects each PR's Cargo.lock *diff* and so never re-checks the
+        # standing graph; the two share one license policy (see the alignment
+        # note in deny.toml). `advisories` is deliberately excluded here:
+        # advisories publish on their own clock, so gating PRs on them fails
+        # work that didn't introduce anything — the scheduled advisories
+        # workflow covers those. cargo-deny is pinned by the crates/devtools
+        # anchor and built from the lockfile, same as rumdl above.
+        if: steps.scope.outputs.rust == 'true'
+        run: |
+          cargo build --quiet -p cargo-deny
+          ./target/debug/cargo-deny check licenses bans sources

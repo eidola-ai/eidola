@@ -6,6 +6,8 @@ Thank you for your interest in contributing to Eidola.
 
 Contributions require a signed Contributor License Agreement: [CLA-INDIVIDUAL.md](CLA-INDIVIDUAL.md) for individuals, or [CLA-CORPORATE.md](CLA-CORPORATE.md) for contributions made on behalf of a company. Each agreement's "How To Sign" section describes the process: you add a line to [CLA-SIGNERS.txt](CLA-SIGNERS.txt) and commit it — that entry and its Git history are the signature record.
 
+This repository contains components under different licenses; [LICENSE.md](LICENSE.md) is the map. Your contribution is licensed outbound under the license of the component it touches.
+
 ## Contributions are a permanent public record
 
 Everything you contribute — the content of the contribution itself, the name, email address, and timestamps in your Git commits, and your entry in `CLA-SIGNERS.txt` — becomes part of this repository's history. That history is a distributed, immutable public record: it is cloned and mirrored by machines nobody controls, and it cannot be rewritten after the fact — by you or by us — without breaking every downstream copy. Requests to delete it, including requests under privacy laws, cannot un-publish it.

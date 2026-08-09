@@ -1,0 +1,51 @@
+name: Dependency Advisories
+
+# `cargo deny check advisories` audits the lockfile against the RustSec
+# advisory database. It is deliberately NOT part of the rust-checks PR gate:
+# advisories publish on their own clock, so a PR gate that included them would
+# fail work that didn't introduce anything. Instead this runs daily against
+# the default branch (plus on demand), and a new advisory shows up as a red
+# scheduled run rather than as a block on unrelated PRs. The PR-time policy
+# checks (licenses, bans, sources) live in rust-checks.yml.
+on:
+  schedule:
+    # Daily; minute/hour chosen off the whole-hour spikes GitHub asks
+    # schedules to avoid.
+    - cron: "23 14 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  advisories:
+    name: Advisory audit
+    runs-on: ubuntu-24.04
+    # Generous for a COLD-cache run: cargo-deny's dep tree builds at
+    # opt-level 2 (root Cargo.toml dev profile). Warm runs are minutes.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        # Job-scoped key (no shared-key), so this cache holds only the
+        # cargo-deny build — a sliver next to the rust-checks cache — and the
+        # daily run keeps it warm. Schedule and dispatch both run on the
+        # default branch, so saving here never thrashes per-PR.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Audit advisories
+        # cargo-deny is pinned by the crates/devtools anchor and built from
+        # the lockfile — the same binary the rust-checks gate and local `just
+        # check` use.
+        run: |
+          cargo build --quiet -p cargo-deny
+          ./target/debug/cargo-deny check advisories
