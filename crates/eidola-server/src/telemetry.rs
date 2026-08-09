@@ -161,8 +161,7 @@ pub fn init() -> Option<OtelGuard> {
 
     let (otel_trace_layer, otel_log_layer) = match &otel {
         Some(guard) => {
-            let tracer = guard.tracer_provider.tracer("eidola-server");
-            let trace_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+            let trace_layer = otel_trace_layer(guard.tracer_provider.tracer("eidola-server"));
             let log_layer = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
                 &guard.logger_provider,
             );
@@ -179,6 +178,30 @@ pub fn init() -> Option<OtelGuard> {
         .init();
 
     otel
+}
+
+/// The OTel trace layer exactly as production runs it.
+///
+/// Context activation (the `tracing-opentelemetry` default) makes entering
+/// a tracing span attach its OpenTelemetry context to the ambient
+/// task-local — and the SDK logger stamps that context's trace and span
+/// IDs onto every log record it exports, sampled or not. That would give
+/// each request's log lines a shared trace id: exactly the "span context
+/// by which to group them back into a request" that privacy-guarantees.md
+/// §3.3 rules out. Nothing in this server consumes the ambient context
+/// (no propagator, no OTel-API spans), so activation buys nothing and
+/// stays off. The `exported_logs_carry_no_trace_context` test builds its
+/// stack through this same function, so the configuration under test is
+/// the configuration deployed.
+fn otel_trace_layer<S>(
+    tracer: opentelemetry_sdk::trace::SdkTracer,
+) -> tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_context_activation(false)
 }
 
 /// Create OTel providers for traces, metrics, and logs via OTLP/HTTP.
@@ -610,5 +633,77 @@ mod tests {
     #[test]
     fn root_request_span_is_left_to_middleware() {
         assert_eq!(metrics::span_operation("http.request"), None);
+    }
+
+    /// Exported log records must carry no trace context — the §3.3 "no span
+    /// context by which to group them back into a request" invariant as it
+    /// applies to the OTLP log stream. The SDK logger stamps a record's
+    /// `trace_context` from OpenTelemetry's *ambient* context whenever one
+    /// holds an active span at the log call site, sampled or not — and
+    /// `tracing-opentelemetry`'s default context activation attaches that
+    /// ambient context on every span entry, which linked each request's
+    /// whole log output under one trace id until [`otel_trace_layer`]
+    /// turned activation off (Codex review, PR #282). The stack here is
+    /// built through that same function; this test holds for ordinary
+    /// `RecordOnly` traffic and client-directed traces alike, and fails if
+    /// activation is ever re-enabled or an upgrade starts syncing the
+    /// ambient context again.
+    #[test]
+    fn exported_logs_carry_no_trace_context() {
+        use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceState};
+        use opentelemetry_sdk::logs::InMemoryLogExporter;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+        let exporter = InMemoryLogExporter::default();
+        let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_sampler(ClientDirectedSampler)
+            .with_span_processor(AggregatingSpanProcessor)
+            .build();
+
+        let subscriber = tracing_subscriber::registry()
+            .with(otel_trace_layer(tracer_provider.tracer("eidola-server")))
+            .with(
+                opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                    &logger_provider,
+                ),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            // An ordinary request: a recorded, unsampled (`RecordOnly`) span.
+            {
+                let span = tracing::info_span!("http.request");
+                let _entered = span.enter();
+                tracing::info!("log inside an ordinary request span");
+            }
+            // A client-directed trace: sampled remote parent, exactly as
+            // middleware installs it. Sampling exports the *spans*; the
+            // logs must stay uncorrelated regardless.
+            {
+                let span = tracing::info_span!("http.request");
+                let parent = SpanContext::new(
+                    TraceId::from_bytes([7; 16]),
+                    SpanId::from_bytes([7; 8]),
+                    TraceFlags::SAMPLED,
+                    true,
+                    TraceState::default(),
+                );
+                let _ =
+                    span.set_parent(opentelemetry::Context::new().with_remote_span_context(parent));
+                let _entered = span.enter();
+                tracing::info!("log inside a client-directed traced span");
+            }
+        });
+
+        let logs = exporter.get_emitted_logs().expect("reading emitted logs");
+        assert_eq!(logs.len(), 2, "both log events must reach the exporter");
+        for log in &logs {
+            assert!(
+                log.record.trace_context().is_none(),
+                "an exported log record carries a trace context"
+            );
+        }
     }
 }
