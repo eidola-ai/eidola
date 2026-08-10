@@ -3,13 +3,15 @@
 //! Both the release-tool (signing side) and the client's updater
 //! (verifier side) MUST agree on rendering output character-for-character.
 //! This crate is the single source of truth; the on-disk templates file
-//! [`releases/schema/attestation-templates-v1.json`] is just data
+//! [`releases/schema/attestation-templates.json`] is just data
 //! consumed through these functions.
 //!
 //! ## Loading
 //!
-//! - Release-tool reads `releases/schema/attestation-templates-v1.json`
-//!   from the working tree at sign time → use [`load_from_path`].
+//! - Release-tool reads `releases/schema/attestation-templates.json` as
+//!   committed at the *previous* release tag (the copy installed clients
+//!   verify against) at sign time → use [`load_from_str`] on the
+//!   `git show` output, or [`load_from_path`] for an explicit override.
 //! - Client verifier reads the build-time-embedded
 //!   `eidola_app_core::trust_root::ATTESTATION_TEMPLATES_JSON` constant →
 //!   use [`load_from_str`].
@@ -36,12 +38,18 @@ pub use trust_shapes::{
     ArtifactManifestRef, HumanAttestationRef, PreviousRelease, ReleaseIndex, TrustConstants,
 };
 
-/// The single schema version this crate understands. Bumping templates
-/// (adding/removing/changing a claim) requires shipping a new version
-/// alongside the old, then retiring the old over an overlap window.
+/// The single schema version this crate understands. It versions the
+/// file *format* (the field shape these structs parse), not the claim
+/// text: prose changes leave it untouched and roll out via the
+/// transition rule (the release that changes templates is attested
+/// under the previous release's copy — see `releases/README.md`).
+/// A format change bumps this and the file's `schema_version` in the
+/// same commit, and must keep the previous release's templates loadable
+/// for the transition release's signing pass.
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Templates {
     pub schema_version: u32,
     pub attestant_statement_template: TemplateEntry,
@@ -49,12 +57,14 @@ pub struct Templates {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TemplateEntry {
     pub template: String,
     pub sources: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimTemplate {
     pub template: String,
     pub sources: BTreeMap<String, String>,
@@ -254,5 +264,37 @@ mod tests {
         let t = load_from_str(json).unwrap();
         assert_eq!(t.schema_version, 1);
         assert!(t.claims.is_empty());
+    }
+
+    /// The committed templates file must load through this crate exactly
+    /// as the client verifier and release-tool will load it — a
+    /// file/loader drift (schema_version, unknown fields) fails here
+    /// instead of failing every release verification at runtime.
+    ///
+    /// The claim-ID list is asserted so that adding, removing, or
+    /// renaming a claim is a deliberate event: update this list and
+    /// follow the template-change procedure in `releases/README.md`
+    /// (the release that changes templates is attested under the
+    /// previous release's copy).
+    #[test]
+    fn committed_templates_file_loads_under_pinned_schema() {
+        let json = include_str!("../../../releases/schema/attestation-templates.json");
+        let templates = load_from_str(json).expect("committed templates file must load");
+        assert_eq!(templates.schema_version, SUPPORTED_SCHEMA_VERSION);
+        let claim_ids: Vec<&str> = templates.claims.keys().map(String::as_str).collect();
+        assert_eq!(
+            claim_ids,
+            [
+                "code_delivers_guarantees",
+                "diff_reviewed",
+                "manifest_reproduced",
+                "no_coercion",
+                "no_compelled_subversion",
+                "no_gag_preventing_attestation",
+                "no_known_backdoor",
+                "privacy_guarantees_not_weakened",
+                "signing_freely",
+            ],
+        );
     }
 }

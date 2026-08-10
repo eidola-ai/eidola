@@ -12,7 +12,7 @@ Generated into the client at compile time by `crates/eidola-app-core/build.rs`, 
 | --- | --- | --- |
 | `SERVER_URL` | derived from `releases/trust/server-enclave.json` | `gateway-<hash>.eidola.containers.tinfoil.sh`, where `<hash>` ties the URL to a server measurement |
 | `SERVER_SNP_MEASUREMENT` | `releases/trust/server-enclave.json` → `snp_measurement` | SEV-SNP launch measurement of the paired server enclave |
-| `SERVER_TDX_RTMR1` / `SERVER_TDX_RTMR2` | `releases/trust/server-enclave.json` → `tdx_measurement` | TDX runtime measurements of the paired server enclave |
+| `SERVER_TDX_RTMR1` / `SERVER_TDX_RTMR2` | `releases/trust/server-enclave.json` → `tdx_measurement` | TDX runtime measurements of the paired server enclave — recorded for the release, but TDX presentations are currently refused by the verifier ([gaps.md](gaps.md#tdx-acceptance)) |
 | `TRUSTED_ATTESTANT_FINGERPRINTS` | `releases/trust/trust-constants.json` | `sha256(PKIX SubjectPublicKeyInfo DER)` in hex, for each authorized human-attestant key |
 | `MIN_HUMAN_ATTESTATIONS` | `releases/trust/trust-constants.json` | Minimum independently-verified human attestations a release must carry. Pinned here, not in `release.json`, so a forged index cannot lower it |
 | `EXPECTED_CI_IDENTITY_PATTERN` | `releases/trust/trust-constants.json` | Fulcio cert SAN pattern the release-signing workflow's OIDC identity must match |
@@ -20,7 +20,7 @@ Generated into the client at compile time by `crates/eidola-app-core/build.rs`, 
 | `SUPPORTED_RELEASE_SCHEMA_VERSIONS` | `releases/trust/trust-constants.json` | Integer `schema_version` values of `release.json` this client will parse |
 | `SUPPORTED_ATTESTATION_SCHEMA_VERSIONS` | `releases/trust/trust-constants.json` | Integer `schema_version` values of `attestation.json` this client will parse |
 | `UPDATE_DISCOVERY_URL` | `releases/trust/trust-constants.json` | Where to look for the next release (GitHub releases API) |
-| `ATTESTATION_TEMPLATES_JSON` | `releases/schema/attestation-templates-v1.json` | Pinned claim templates the verifier re-renders during equality checks |
+| `ATTESTATION_TEMPLATES_JSON` | `releases/schema/attestation-templates.json` | Pinned claim templates the verifier re-renders during equality checks |
 | `SIGSTORE_TRUSTED_ROOT_JSON` | `releases/trust/sigstore-trusted-root.json` | Pinned Sigstore tlog / Fulcio / CT log keys with validity windows |
 
 The `eidola` backend row's overrides (`base_url`, `trusted_measurements`, and the hardware ARK/ASK CAs — set via `eidola configure` or Settings → Backends → Eidola) take precedence at runtime — use them to point a build at a local server or alternate enclave. With a column left NULL, the pinned value above is what gets used.
@@ -50,7 +50,7 @@ Each document's shape is owned by the Rust `serde` types shared between the rele
 | `release.json` | `eidola_attestation::ReleaseIndex` — `crates/eidola-attestation/src/trust_shapes.rs` | Unsigned URL-only index; cross-checked via referenced documents (see caveat below) |
 | `attestation.json` | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via `cosign sign-blob` (local PEM, PKCS#11 URI, or any KMS URI cosign supports), logged to Rekor as a `hashedrekord` v0.0.1 entry with a PKIX SubjectPublicKeyInfo (ECDSA-P256/P384 or Ed25519) in `signature.publicKey.content` |
 | `trust-constants.json` | `eidola_attestation::TrustConstants` — `crates/eidola-attestation/src/trust_shapes.rs` | Pinned trust values baked into the verifier at build time |
-| Templates | `releases/schema/attestation-templates-v1.json` (data, not a schema) | Pinned claim templates the verifier re-renders during equality checks |
+| Templates | `releases/schema/attestation-templates.json` (data, not a schema) | Pinned claim templates the verifier re-renders during equality checks |
 
 ## `release.json` is a pure URL index — no hashes, no policy
 
@@ -99,7 +99,7 @@ Almost everything under `releases/` is a **build input** — pinned data the cli
 releases/
   README.md                             # contributor README: per-file detail + rotation procedures
   schema/
-    attestation-templates-v1.json       # pinned claim templates
+    attestation-templates.json          # pinned claim templates
   trust/
     trust-constants.json                # non-derivable trust values (input)
     sigstore-trusted-root.json          # upstream Sigstore TrustedRoot snapshot (input — both eidola-app-core (updater) and eidola-server (runtime upstream-measurement resolver) build.rs embed it)

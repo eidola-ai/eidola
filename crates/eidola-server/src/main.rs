@@ -78,6 +78,15 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // Read for measurement verification only — the OTLP exporter
+        // consumes this straight from the environment. Grafana routes by
+        // these auth headers to a tenant, so leaving the hash unverified
+        // would let a different telemetry destination be injected without
+        // a measurement change (privacy-guarantees.md §7.4).
+        let otel_exporter_otlp_headers = std::env::var("OTEL_EXPORTER_OTLP_HEADERS")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         let pricing_markup = std::env::var("PRICING_MARKUP")
             .ok()
             .filter(|s| !s.is_empty())
@@ -95,8 +104,10 @@ impl Config {
 
         let credential_master_key_hex = std::env::var("CREDENTIAL_MASTER_KEY")
             .map_err(|_| "CREDENTIAL_MASTER_KEY environment variable is required")?;
+        // The hex error is discarded, not interpolated: its Display quotes
+        // the offending character — a byte of the configured master key.
         let key_bytes = hex::decode(&credential_master_key_hex)
-            .map_err(|e| format!("invalid CREDENTIAL_MASTER_KEY hex: {e}"))?;
+            .map_err(|_| "invalid CREDENTIAL_MASTER_KEY hex".to_string())?;
         let credential_master_key: [u8; 32] = key_bytes.try_into().map_err(|_| {
             "CREDENTIAL_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string()
         })?;
@@ -116,6 +127,10 @@ impl Config {
             (
                 "STRIPE_WEBHOOK_SECRET",
                 stripe_webhook_secret.as_deref().unwrap_or(""),
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                otel_exporter_otlp_headers.as_deref().unwrap_or(""),
             ),
         ])?;
 

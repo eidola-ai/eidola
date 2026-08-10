@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 1,
   "attestant_statement_template": {
     "template": "I, {name}, holder of the private key with fingerprint sha256:{key_fingerprint_sha256}, affirm under penalty of perjury under the laws of the jurisdiction of {jurisdiction} that the following claims are true and correct to the best of my knowledge.",
     "sources": {
@@ -55,8 +55,7 @@
       "sources": {
         "privacy_guarantees_doc_sha256": "attestation.privacy_guarantees_doc_sha256"
       },
-      "cross_checks": {},
-      "required_when": "previous_release_present"
+      "cross_checks": {}
     },
     "code_delivers_guarantees": {
       "template": "Based on the review described above, I am not aware of any change in this release that causes the code to fail to deliver the privacy and security guarantees stated in docs/privacy-guarantees.md (sha256 {privacy_guarantees_doc_sha256}).",

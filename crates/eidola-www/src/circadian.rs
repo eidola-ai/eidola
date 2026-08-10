@@ -39,6 +39,12 @@ const SLOTS: &[(&str, &str, &str)] = &[
     ("secondary-foreground", "#66615b", "#a89c88"),
     ("accent-foreground", "#615344", "#a89c88"),
     ("scrollbar-thumb", "#d8d8d8", "#4d5156"),
+    // Status — theme.rs's semantic colors; the site uses them for the
+    // GFM alert blockquotes (site.css `.markdown-alert-*`).
+    ("info", "#3a6f8c", "#7fa4bf"),
+    ("success", "#3f7d4a", "#7eae8a"),
+    ("warning", "#a3741a", "#d2a45a"),
+    ("danger", "#b3401a", "#d2664b"),
 ];
 
 /// Day slots that take only `DAY_PAPER_TINT_FACTOR` of the tint, so the
@@ -201,6 +207,25 @@ mod tests {
         assert!(css.contains("prefers-color-scheme: dark"));
         assert!(css.contains("--background: #ffffff;"));
         assert!(css.contains("--background: #15191e;"));
+    }
+
+    #[test]
+    fn status_slots_match_the_app() {
+        // Pinned to theme.rs's Status blocks (day_colors/night_colors) so
+        // drift from the app palette is loud, like every other slot.
+        let css = stylesheet();
+        for pinned in [
+            "--info: #3a6f8c;",
+            "--info: #7fa4bf;",
+            "--success: #3f7d4a;",
+            "--success: #7eae8a;",
+            "--warning: #a3741a;",
+            "--warning: #d2a45a;",
+            "--danger: #b3401a;",
+            "--danger: #d2664b;",
+        ] {
+            assert!(css.contains(pinned), "missing {pinned}");
+        }
     }
 
     #[test]

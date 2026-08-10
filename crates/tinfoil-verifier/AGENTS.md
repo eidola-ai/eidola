@@ -12,7 +12,7 @@ It then verifies, in `bundle.rs` + `attesting_client.rs`:
 2. `report_data.tls_key_fp == sha256(SPKI(peer_cert))` and the document's embedded cert matches the peer cert.
 3. The document's ECDSA signature against that cert (P-384 production, P-256 mock, both SHA-256-prehash — signature reconstructed by blanking the `signature` value in the raw served bytes so unknown fields survive).
 4. The AMD VCEK chain (ARK → ASK → VCEK, RSA-PSS SHA-384).
-5. SEV-SNP / TDX report signature.
+5. SEV-SNP report signature. (TDX presentations are refused outright at the platform dispatch — `Error::TdxNotAccepted` — because MRTD/RTMR0 are not yet policy-checked and RTMR1/RTMR2 alone are guest-replayable; the TDX verification plumbing stays wired for the re-enable path.)
 6. TCB policy (bl≥0x07, snp≥0x0e, ucode≥0x48).
 7. Measurement against the caller-supplied allowed set (the client's pinned server-enclave measurement on the client→server path; the runtime-resolved set from the server's `upstream_trust` on the server→upstream path).
 8. The hardware report's `REPORT_DATA` equals the recomputed hash — which authenticates every claimed `report_data` field against the AMD/Intel signature.

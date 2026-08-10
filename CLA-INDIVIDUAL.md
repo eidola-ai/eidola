@@ -19,7 +19,7 @@ Except for the license granted herein to the Project Owner and to recipients of 
 
 ## 1. Definitions
 
-**"Project Owner"** shall mean Michael Thomas Marcacci, or any successor individual or legal entity to which ownership of the Eidola project is subsequently assigned or transferred.
+**"Project Owner"** shall mean Eidola, Inc., a Delaware public benefit corporation, or any successor individual or legal entity to which ownership of the Eidola project is subsequently assigned or transferred.
 
 **"You"** (or **"Your"**) shall mean the copyright owner or legal entity authorized by the copyright owner that is making this Agreement. For legal entities, the entity making a Contribution and all other entities that control, are controlled by, or are under common control with that entity are considered to be a single Contributor. For the purposes of this definition, **"control"** means (i) the power, direct or indirect, to cause the direction or management of such entity, whether by contract or otherwise, (ii) ownership of fifty percent (50%) or more of the outstanding shares, or (iii) beneficial ownership of such entity.
 

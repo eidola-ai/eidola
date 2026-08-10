@@ -1,0 +1,56 @@
+# REUSE (https://reuse.software) licensing declarations for this repository.
+# Licenses are declared here by path rather than as per-file SPDX headers.
+# Per the REUSE specification, when multiple annotations cover the same file,
+# the one declared later in this file takes precedence — so the repository-wide
+# default comes first and narrower declarations follow.
+#
+# LICENSE.md is the human-readable map of the same information.
+
+version = 1
+SPDX-PackageName = "eidola"
+SPDX-PackageDownloadLocation = "https://github.com/eidola-ai/eidola"
+
+# Repository-wide default: everything not covered by a later annotation.
+[[annotations]]
+path = "**"
+precedence = "closest"
+SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# Server layer.
+[[annotations]]
+path = "crates/eidola-server/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+# App layer.
+[[annotations]]
+path = [
+    "crates/eidola-app-core/**",
+    "crates/eidola-cli/**",
+    "crates/eidola-gui/**",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
+SPDX-License-Identifier = "GPL-3.0-only"
+
+# Documentation and website content (the site generator crate stays under the
+# repository default above).
+[[annotations]]
+path = ["docs/**", "www/**"]
+precedence = "closest"
+SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+# Legal instruments of Eidola, Inc.: published for transparency, not reuse.
+[[annotations]]
+path = [
+    "www/pages/terms.md",
+    "www/pages/privacy.md",
+    "CLA-INDIVIDUAL.md",
+    "CLA-CORPORATE.md",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© Eidola, Inc."
+SPDX-License-Identifier = "LicenseRef-Eidola-Legal"

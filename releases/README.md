@@ -10,7 +10,7 @@ This file is for contributors who need to *modify* something here.
 
 | Path | Purpose | Consumed by |
 | --- | --- | --- |
-| `schema/attestation-templates-v1.json` | Pinned claim templates for human release attestations. Schema-versioned; the verifier re-renders each claim from these templates and rejects attestations whose claim text does not match | `crates/eidola-app-core/build.rs` |
+| `schema/attestation-templates.json` | Pinned claim templates for human release attestations. The verifier re-renders each claim from these templates and rejects attestations whose claim text does not match; `schema_version` (inside the file) tracks the file format, pinned by `SUPPORTED_SCHEMA_VERSION` in `crates/eidola-attestation` | `crates/eidola-app-core/build.rs`, `release-tool attest` (as committed at the previous release tag) |
 | `trust/trust-constants.json` | Non-derivable trust values: pinned attestant fingerprints, CI identity pattern, minimum-attestation count, supported schema versions, update-discovery URL | `crates/eidola-app-core/build.rs` |
 | `trust/sigstore-trusted-root.json` | Snapshot of the upstream Sigstore `TrustedRoot` (Fulcio CAs, Rekor public keys, CT log keys, TSAs) | `crates/eidola-app-core/build.rs` (updater) and `crates/eidola-server/build.rs` (runtime upstream-measurement resolver) |
 | `trust/server-enclave.json` | The paired server enclave measurement (SEV-SNP launch digest, TDX RTMR1/RTMR2, kernel cmdline). Materialized as its own file so the cli build can COPY it without dragging the full manifest into its build context | `crates/eidola-app-core/build.rs` |
@@ -46,16 +46,24 @@ The trust root pins `https://github.com/eidola-ai/eidola/.github/workflows/tinfo
 2. Cut a release signed by the **current** workflow under the **current** pattern. You can't change the workflow path in the same commit that introduces the new pattern — the next release's CI would sign under the new path, which clients with only the old pattern would reject.
 3. After clients have updated, rename or move the workflow. The next release's CI signs under the new path; clients accept it because they already embed the new pattern.
 
-### Rotating schema versions
+### Changing attestation templates
 
-Any change to `attestation-templates-v1.json`, the release schema, or the attestation schema requires bumping `schema_version` to the next integer (never a "patch" or "minor" — every change is fully breaking by contract):
+Templates are pinned by embedding: each installed client re-renders every claim from *its own* copy of `schema/attestation-templates.json` and rejects any character mismatch, so the copy that matters for release N is the one committed at release N−1. `release-tool attest` therefore renders and signs from the templates as committed at the **previous** release tag (via `git show`), never the working tree (`--templates <path>` exists as a deliberate-chain-break escape hatch):
 
-1. Copy `attestation-templates-v1.json` → `attestation-templates-v2.json`, make the change. Same for the companion schema file if the structural shape changes.
-2. Update `trust-constants.json`: `supported_attestation_schema_versions` lists both `1` and `2`.
-3. Cut a release. Clients now accept both versions. Engineer continues signing schema-`1` attestations.
-4. Once in-the-wild clients have updated, cut another release where the engineer signs schema-`2` attestations. `1` can be removed from the supported list in a later release.
+1. Edit `schema/attestation-templates.json` — claim prose, adding or removing claims. `schema_version` stays put; it versions the file *format*, not the claim text.
+2. Cut a release as normal. Its attestation is automatically rendered from the previous release's templates, so installed clients verify it, while the new binaries embed the changed templates.
+3. The next release's attestation is signed under the changed templates.
 
-This is the mechanism that prevents a coerced release from silently weakening a required claim: weakening it requires a schema bump, which itself requires a release under the current schema.
+A change to the file *format* (field shape) additionally bumps the file's `schema_version` and `SUPPORTED_SCHEMA_VERSION` in `crates/eidola-attestation` in the same commit, and must keep the previous release's templates loadable for the transition release's signing pass. A test in `eidola-attestation` loads the committed file and asserts the claim-ID set, and `eidola-app-core`'s build script loads it through the same verifier code path, so file/loader drift fails the build rather than every release verification.
+
+This ordering is what prevents a coerced release from silently weakening a required claim: the release that changes claim text is itself attested under the unchanged prior text, and the change sits in the public release diff for a full release cycle before any attestation is signed under it.
+
+### Rotating document schema versions
+
+`release.json` and `attestation.json` carry integer `schema_version` values pinned by the supported sets in `trust-constants.json` (never a "patch" or "minor" — every change is fully breaking by contract):
+
+1. Make the change; ship a release whose `supported_release_schema_versions` / `supported_attestation_schema_versions` list both `1` and `2`. The engineer continues signing schema-`1` documents.
+2. Once in-the-wild clients have updated, cut another release where the engineer signs schema-`2` documents. `1` can be removed from the supported list in a later release.
 
 ### Rotating the Sigstore trusted root
 

@@ -325,11 +325,16 @@ CREATE INDEX idx_ledger_payment_intent ON credit_ledger (stripe_payment_intent)
 -- Nullifier
 -- ---------------------------------------------------------------------------
 
+-- Deliberately timestamp-free: a per-spend timestamp on the unlinked
+-- surface would sit in the same database as per-account issuance
+-- timestamps in credit_ledger, giving the operator statistical
+-- issuance-to-redemption correlation material under low traffic
+-- (privacy-guarantees.md §2.5). Rows carry only what double-spend
+-- prevention and refund recovery require.
 CREATE TABLE nullifier (
     issuer_key_id TEXT NOT NULL REFERENCES issuer_key(id),
     value         BYTEA NOT NULL,
     refund_token  BYTEA,
-    recorded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (issuer_key_id, value)
 );
 
@@ -357,10 +362,6 @@ COMMENT ON COLUMN nullifier.refund_token IS
     'can recover it via POST /v1/credentials/refund if the original response '
     'was lost (network error, timeout, etc.). The token is already blinded — '
     'it is only useful to the client holding the matching PreRefund state.';
-
-COMMENT ON COLUMN nullifier.recorded_at IS
-    'When the nullifier was recorded. Useful for debugging and for verifying '
-    'that nullifiers were recorded before refunds were issued.';
 
 -- ---------------------------------------------------------------------------
 -- Helper Functions

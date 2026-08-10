@@ -1,7 +1,7 @@
 //! Read the workspace's `releases/trust/trust-constants.json` at runtime.
 //!
 //! The tool intentionally reads from disk (not from a build-time embed)
-//! because the release engineer's workflow does not version-lock these
+//! because the release officer's workflow does not version-lock these
 //! values: when a trust-root rotation lands, the engineer pulls the new
 //! commit and the next `release-tool verify` reads the new constants
 //! without needing a fresh `cargo build`.

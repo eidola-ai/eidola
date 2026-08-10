@@ -117,6 +117,7 @@ check:
     cargo clippy --all-targets -- -D warnings
     cargo fmt --check
     rumdl check .
+    cargo-deny check licenses bans sources
 
 # Apply auto-fixable markdown formatting via rumdl
 format:

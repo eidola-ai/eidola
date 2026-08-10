@@ -502,6 +502,7 @@ impl LocalRuntime {
     /// Test seam: pin the memory budget so eviction tests are
     /// deterministic on any machine.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub(crate) fn set_memory_budget_for_test(&self, budget: u64) {
         *self.budget_override.lock().expect("budget lock") = Some(budget);
     }
@@ -510,6 +511,7 @@ impl LocalRuntime {
     /// integration tests can route local turns at a mock upstream without
     /// spawning a real llama-server.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub(crate) fn register_for_test(&self, backend_id: &str, slug: &str, port: u16) {
         self.register_engine_for_test(backend_id, slug, port, ENGINE_OVERHEAD_BYTES, false, 0);
     }
@@ -517,6 +519,7 @@ impl LocalRuntime {
     /// Test seam: like [`register_for_test`] but with explicit footprint,
     /// pin state, and LRU timestamp — the eviction tests' fixture.
     #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub(crate) fn register_engine_for_test(
         &self,
         backend_id: &str,
@@ -1288,10 +1291,7 @@ impl Inner {
             .remove(&key);
         self.bus.emit(Change::LocalModels);
 
-        let client = match &self.http_override {
-            Some(c) => c.clone(),
-            None => plain_http_client()?,
-        };
+        let client = self.plain_client()?;
         let bus = self.bus.clone();
         let local = self.local.clone();
         let slug_task = slug.clone();
@@ -1532,10 +1532,7 @@ impl Inner {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let bus = self.bus.clone();
         let local = self.local.clone();
-        let http = match &self.http_override {
-            Some(c) => c.clone(),
-            None => plain_http_client()?,
-        };
+        let http = self.plain_client()?;
         reservation.defuse();
         // Supervisor task: owns the child for its whole life. Cancellation
         // authority is the shutdown channel (map removal → send) — and if

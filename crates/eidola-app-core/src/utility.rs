@@ -138,7 +138,7 @@ impl Inner {
                     }
                 };
                 Ok(UtilityRoute {
-                    client: self.plain_or_test_client()?,
+                    client: self.plain_client()?,
                     base_url: engine_url,
                     wire_model: target.canonical.clone(),
                     pricing: None,
@@ -154,7 +154,7 @@ impl Inner {
                         message: format!("backend `{}` has no base URL", backend.id),
                     })?;
                 Ok(UtilityRoute {
-                    client: self.plain_or_test_client()?,
+                    client: self.plain_client()?,
                     base_url,
                     wire_model: target.model.clone(),
                     pricing: None,
@@ -188,15 +188,6 @@ impl Inner {
                     engine_lease: None,
                 })
             }
-        }
-    }
-
-    /// The plain (non-attesting) HTTP client a loopback or external chore call
-    /// uses — the injected test client when one is set.
-    fn plain_or_test_client(&self) -> Result<reqwest::Client, AppError> {
-        match &self.http_override {
-            Some(c) => Ok(c.clone()),
-            None => local_models::plain_http_client(),
         }
     }
 

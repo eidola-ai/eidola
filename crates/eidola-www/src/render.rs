@@ -166,6 +166,30 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
                 ),
             )
         }
+        // Hash-versioned docs (`HASH_PUBLISHED_DOCS`): the content hash
+        // *is* the version. The line identifies only the copy being
+        // rendered — a release attestation pins the hash of the copy at
+        // its release commit, which can differ from what the site
+        // currently serves — so it links the exact bytes and the git
+        // history rather than claiming any release status.
+        (None, Some(hash)) => {
+            let history = page
+                .source_path
+                .as_deref()
+                .map(|p| {
+                    format!(
+                        " · <a href=\"https://github.com/eidola-ai/eidola/commits/main/{}\">history</a>",
+                        escape_html(p)
+                    )
+                })
+                .unwrap_or_default();
+            (
+                format!("<meta name=\"eidola:source-sha256\" content=\"{hash}\">\n"),
+                format!(
+                    "<p class=\"byline doc-version\">Versioned by content hash · sha256 <code>{hash}</code> · <a href=\"source.md\">source</a>{history}</p>\n"
+                ),
+            )
+        }
         _ => (String::new(), String::new()),
     };
     let main_class = match page.kind {
@@ -342,6 +366,26 @@ mod tests {
         let html = layout(&doc_page(), None);
         assert!(!html.contains("eidola:version"));
         assert!(!html.contains("doc-version"));
+    }
+
+    #[test]
+    fn hash_versioned_docs_get_hash_line_without_version() {
+        let mut page = doc_page();
+        page.route = "/docs/privacy-guarantees/".into();
+        page.source_path = Some("docs/privacy-guarantees.md".into());
+        page.source_sha256 = Some("cd".repeat(32));
+        let html = layout(&page, None);
+        assert!(html.contains(&format!(
+            "<meta name=\"eidola:source-sha256\" content=\"{}\">",
+            "cd".repeat(32)
+        )));
+        assert!(!html.contains("eidola:version"));
+        assert!(html.contains(&format!(
+            "Versioned by content hash · sha256 <code>{}</code> · \
+             <a href=\"source.md\">source</a> · \
+             <a href=\"https://github.com/eidola-ai/eidola/commits/main/docs/privacy-guarantees.md\">history</a>",
+            "cd".repeat(32)
+        )));
     }
 
     #[test]

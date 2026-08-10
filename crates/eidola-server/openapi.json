@@ -678,9 +678,10 @@
     "/v1/terms": {
       "get": {
         "tags": [
-          "Linked"
+          "Public"
         ],
         "summary": "GET /v1/terms — the document versions whose acceptance is required.",
+        "description": "Public, and necessarily so: a client fetches this *before* it has an\naccount, to learn what it must accept. It takes no credential and returns\nno account-specific data. (Accepting them is `POST /v1/account/terms`,\nwhich is on the linked surface.)",
         "operationId": "get_terms",
         "responses": {
           "200": {

@@ -52,6 +52,14 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **Future.** A *freshness anchor* is something a fresh install *can* validate at the moment of download, without needing prior state. The general shape: every release embeds (or references) a recent timestamped artifact from a public, append-only system that an attacker cannot retroactively forge.
 
+### Anonymity-set size
+
+**Current behavior.** An anonymous credit token is unlinkable to its issuance only *within its anonymity set*: the accounts that received tokens under the same `(issuer_key, domain_separator)` during that key's issuance window ([privacy-guarantees.md](privacy-guarantees.md) §2.3). The partition parameters — weekly issuance epochs, a single non-rotating domain separator, an acceptance window one full epoch beyond issuance — are compile-time constants, but the *population* inside a partition is a deployment fact the code cannot control. Early in the deployment, or during a quiet week, a window may contain few active accounts; in the degenerate one-account case the cryptography still holds, but the operator could attribute spends by elimination.
+
+**What constrains it today.** Temporal decoupling (§2.4) keeps issuance and redemption timestamps from being forced near-equal, the server persists no per-redemption timestamps, and nothing in the protocol subdivides the partition further. What nothing can do is conjure a crowd.
+
+**Future.** The set grows with the user base. If population per window stays small, the epoch length can be raised (a release-visible constant change) to trade key-rotation hygiene for coarser partitions.
+
 ### Multi-jurisdiction attestant distribution
 
 **Current behavior.** Attestants share a small operational surface and may share a jurisdiction.
@@ -67,6 +75,22 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 **Mitigations today.** Limited. The use of WebPKI for our TLS certificate provides a defense in depth, ensuring that an outside party issuing a fraudulent attestation must also produce or obtain a fraudulent WebPKI certificate. However, this provides little resistance in the case of a malicious insider. Generally, we accept hardware vendor trust as residual.
 
 **Future.** Open hardware roots like OpenTitan reduce the scope of vendors the trust chain depends on. This is an industry-wide direction, not an Eidola-specific roadmap item, but it is the long-term mitigation for this residual trust.
+
+### TLS-key exfiltration and channel binding
+
+**Current behavior.** Everything the per-handshake verifier proves rides on the enclave-held TLS key: the hardware report commits to the peer certificate (`REPORT_DATA` = `sha256(SPKI)`), and the inline attestation shares the request's connection ([privacy-guarantees.md](privacy-guarantees.md) §4.3). An adversary who exfiltrated that private key from the enclave could terminate TLS outside it and relay fresh attestations from a real one — an active MITM that fails no client-side check.
+
+**What constrains it today.** The key is generated and held only in enclave memory by the attestation shim, which is part of the measured boot image (§4.1, §5.1) — there is no export interface, so exfiltration requires a defect in that hash-pinned image, not any code path in this repository. The image being measurement-bound means the code that would have to leak it is fixed and inspectable.
+
+**Future.** Stronger channel binding upstream — e.g. attestation freshness bound into the TLS key-exchange transcript rather than to a long-lived per-boot key — would shrink the value of a leaked key to a single session. This is shim-side (Tinfoil) work we track rather than control.
+
+### TDX acceptance
+
+**Current behavior.** The verifier refuses Intel TDX attestations outright — only SEV-SNP presentations are accepted, on both attested paths (client → Eidola server, Eidola server → inference upstream). This is deliberate fail-closed behavior, not an omission: the policy checks TDX acceptance requires are incomplete. MRTD — the only register measured by the TDX module itself, covering the virtual firmware — and RTMR0 are not policy-checked, and RTMR1/RTMR2, the values the trust root records, are guest-extendable: any firmware on a genuine TDX machine can replay the published digests into them. Since the attestation document's author selects the platform branch, accepting TDX on RTMR1/2 alone would let an operator sidestep the SEV-SNP measurement pin entirely.
+
+**What constrains it today.** The refusal itself. Both live paths run SEV-SNP, so refusal costs nothing; if the platform provider moves a path to TDX, that path fails closed until proper support ships — the correct failure mode for this system. The trust root continues to record RTMR1/RTMR2 as the honest statement of what the release would measure; recording is not acceptance.
+
+**Future.** Proper acceptance needs MRTD + RTMR0 reference values — host-side inputs the platform provider would have to publish for our container shape — plus MR_SEAM/XFAM pins and a platform (FMSPC) allowlist for parity with the SNP path's structural generation pin. The dormant verification plumbing is kept wired so the change reduces to policy plus reference values.
 
 ## Network / metadata
 
@@ -129,6 +153,6 @@ In the meantime, the runtime-resolution scheme above is the honest interim: it c
 - **Linux GUI Nix build.** Hermetic and reproducible (`narHash` pinning) from the open nixpkgs toolchain, but not source-bootstrapped in the StageX sense. A desktop GUI must be a glibc dynamic binary to interoperate with the host GPU stack (the Vulkan loader dlopens glibc-built Mesa drivers), which the musl-by-design StageX pipeline cannot produce.
 - **`cvmimage` and OVMF firmware.** Pinned by hash, but their build chains do not match Eidola's source-bootstrapping discipline. Their contents are bound into the server's enclave measurement, so they cannot be changed silently — but the original build chain is more trusted than we ideally want.
 
-**What constrains it today.** Each of these has digest pinning and provenance verification at the import boundary (Sigstore provenance for `cvmimage`, narHash for Nix outputs, committed hashes for OVMF), so silent substitution is detectable. The gap is that the upstream *builders* of those artifacts are trusted to a degree we don't fully audit.
+**What constrains it today.** Each of these has digest pinning and provenance verification at the import boundary (committed sha256 pins for OVMF and the `cvmimage` release manifest — with Sigstore provenance verified on top — and narHash for Nix outputs), so silent substitution is detectable. The gap is that the upstream *builders* of those artifacts are trusted to a degree we don't fully audit.
 
 **Future.** This is a long-term direction matched to ecosystem progress: source-bootstrapped macOS toolchains, reproducible CVM/firmware builds. We follow the relevant ecosystems and will adopt as they mature. Until then, this is an unavoidable residual.

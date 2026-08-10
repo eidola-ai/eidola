@@ -37,6 +37,12 @@ pub struct Args {
     pub attestant_id: String,
     pub attestant_name: String,
     pub jurisdiction: String,
+    /// Escape hatch: sign from this templates file instead of the ones
+    /// committed at the previous release tag. Only for deliberate
+    /// chain-breaking releases — attestations rendered from anything
+    /// other than the previous release's templates will be rejected by
+    /// every installed client.
+    pub templates_override: Option<PathBuf>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -44,11 +50,13 @@ pub fn run(args: Args) -> Result<()> {
     require_tool("cosign")?;
     require_tool("git")?;
 
+    // Before reading anything — the trust root below is a workspace read —
+    // assert the release-checkout invariant: remote tag == local tag ==
+    // HEAD, tree clean. Signing must not proceed from a checkout that
+    // isn't byte-for-byte the commit the pushed tag names.
+    crate::preflight::assert_release_checkout(&args.workspace_root, &args.repo, &args.tag)?;
+
     let trust = trust::load(&args.workspace_root)?;
-    let templates_path = args
-        .workspace_root
-        .join("releases/schema/attestation-templates-v1.json");
-    let templates = eidola_attestation::load_from_path(&templates_path)?;
 
     validate_attestant_id(&args.attestant_id)?;
     if args.attestant_name.trim().is_empty() {
@@ -103,6 +111,29 @@ pub fn run(args: Args) -> Result<()> {
     let prev_tag = previous_release_tag(&args.workspace_root, &args.tag)?;
     let previous_release_git_commit = git_rev_parse(&args.workspace_root, &prev_tag)?;
 
+    // Render from the templates the verifying clients actually pin: the
+    // ones embedded in the *previous* release. Installed clients
+    // re-render every claim from their own embedded copy and reject any
+    // mismatch, so signing from the working tree's templates would break
+    // the update chain whenever the templates change. In the steady
+    // state the two are identical; across a template change this makes
+    // the transition release verifiable automatically (the new templates
+    // take effect for the release after it).
+    let templates = match &args.templates_override {
+        Some(path) => {
+            println!();
+            println!(
+                "WARNING: signing from --templates {} instead of the previous \
+                 release's committed templates. Installed clients verify against \
+                 the templates embedded at {prev_tag}; a mismatch means they \
+                 will reject this release.",
+                path.display()
+            );
+            eidola_attestation::load_from_path(path)?
+        }
+        None => templates_at_tag(&args.workspace_root, &prev_tag)?,
+    };
+
     // Print the resolved SHAs in the same format as `release-verify`'s
     // diff header, before any prompts. The `diff_reviewed` claim later
     // echoes these same SHAs inside the signed bytes; surfacing them up
@@ -118,16 +149,34 @@ pub fn run(args: Args) -> Result<()> {
          recorded verbatim in the signed attestation."
     );
 
-    let manifest_path = args.workspace_root.join("artifact-manifest.json");
-    let artifact_manifest_sha256 = sha256_hex(&fs::read(&manifest_path)?);
+    // The hash the attestant signs must be the hash of the bytes clients
+    // will fetch. Re-fetch, re-verify, and re-compare the release asset
+    // here rather than assuming `release-verify` ran and that the
+    // workspace manifest hasn't moved since: this is the same function
+    // the verify subcommand goes through, so a manifest that drifted
+    // after verification (or an attest run that skipped verify) stops
+    // here instead of publishing an attestation every client rejects.
+    let manifest_bytes =
+        crate::manifest::fetch_verified_manifest(&args.workspace_root, &args.repo, &args.tag)?;
+    let artifact_manifest_sha256 = sha256_hex(&manifest_bytes);
 
-    let privacy_doc_path = args.workspace_root.join("docs/privacy-guarantees.md");
-    let privacy_guarantees_doc_sha256 = match fs::read(&privacy_doc_path) {
+    // The claim names the doc "at the time of this release", so the hash
+    // comes from the bytes committed at the tag, never the working tree: a
+    // dirty or stale checkout would otherwise sign a hash of a file the
+    // tag does not contain — and unlike the artifact manifest, nothing
+    // downstream cross-checks this hash (the doc is not a release asset),
+    // so the divergence would never be caught.
+    let privacy_guarantees_doc_sha256 = match git_show_bytes(
+        &args.workspace_root,
+        &args.tag,
+        "docs/privacy-guarantees.md",
+    ) {
         Ok(bytes) => sha256_hex(&bytes),
         Err(_) => bail!(
-            "`docs/privacy-guarantees.md` not found. \
+            "`docs/privacy-guarantees.md` not committed at `{}`. \
              The `privacy_guarantees_not_weakened` claim references its sha256; \
-             create the document and commit it before attesting."
+             the document must exist in the tagged source.",
+            args.tag
         ),
     };
 
@@ -482,6 +531,22 @@ fn read_rekor_log_index(bundle_path: &Path) -> Result<u64> {
         .with_context(|| format!("parsing bundle logIndex `{log_index_str}` as u64"))
 }
 
+/// The exact bytes of `path` as committed at `refname` (via `git show`).
+fn git_show_bytes(workspace_root: &Path, refname: &str, path: &str) -> Result<Vec<u8>> {
+    let out = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["show", &format!("{refname}:{path}")])
+        .output()
+        .context("running `git show <ref>:<path>`")?;
+    if !out.status.success() {
+        bail!(
+            "`git show {refname}:{path}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out.stdout)
+}
+
 fn git_rev_parse(workspace_root: &Path, refname: &str) -> Result<String> {
     let out = Command::new("git")
         .current_dir(workspace_root)
@@ -503,6 +568,35 @@ fn previous_release_version(workspace_root: &Path, tag: &str) -> Result<String> 
         .strip_prefix('v')
         .ok_or_else(|| anyhow::anyhow!("prior tag `{prev}` does not start with `v`"))?
         .to_string())
+}
+
+/// Load the attestation templates as committed at `tag` (via `git show`).
+/// Tries the current filename first, then the pre-rename `-v1` name so a
+/// release whose predecessor predates the rename still resolves.
+fn templates_at_tag(workspace_root: &Path, tag: &str) -> Result<eidola_attestation::Templates> {
+    const CANDIDATE_PATHS: [&str; 2] = [
+        "releases/schema/attestation-templates.json",
+        "releases/schema/attestation-templates-v1.json",
+    ];
+    for path in CANDIDATE_PATHS {
+        let out = Command::new("git")
+            .current_dir(workspace_root)
+            .args(["show", &format!("{tag}:{path}")])
+            .output()
+            .context("running `git show <tag>:<templates-path>`")?;
+        if !out.status.success() {
+            continue;
+        }
+        let json = String::from_utf8(out.stdout)
+            .with_context(|| format!("`{path}` at `{tag}` is not valid UTF-8"))?;
+        println!("  templates: {path} @ {tag}");
+        return eidola_attestation::load_from_str(&json)
+            .with_context(|| format!("loading `{path}` as committed at `{tag}`"));
+    }
+    bail!(
+        "no attestation templates found at `{tag}` (tried {CANDIDATE_PATHS:?}). \
+         If this transition is deliberate, supply --templates explicitly."
+    )
 }
 
 fn previous_release_tag(workspace_root: &Path, tag: &str) -> Result<String> {

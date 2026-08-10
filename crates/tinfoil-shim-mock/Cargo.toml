@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish.workspace = true
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "tinfoil-shim-mock"

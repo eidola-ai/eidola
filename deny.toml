@@ -42,7 +42,7 @@ targets = [
 # If true, metadata will be collected with `--all-features`. Note that this can't
 # be toggled off if true, if you want to conditionally enable `--all-features` it
 # is recommended to pass `--all-features` on the cmd line instead
-all-features = false
+all-features = true
 # If true, metadata will be collected with `--no-default-features`. The same
 # caveat with `all-features` applies
 no-default-features = false
@@ -67,6 +67,16 @@ feature-depth = 1
 #db-path = "$CARGO_HOME/advisory-dbs"
 # The url(s) of the advisory databases to use
 #db-urls = ["https://github.com/rustsec/advisory-db"]
+# How to handle unmaintained-crate advisories. `workspace` flags only crates
+# our own manifests depend on directly — a transitive unmaintained crate is
+# actionable in the upstream that chose it, not here, and at `all` the
+# transitive noise (gpui's text stack alone carries several) would bury real
+# vulnerability findings.
+unmaintained = "workspace"
+# A yanked lockfile entry is often the first signal of a withdrawn or
+# compromised release, ahead of any RUSTSEC id — fail on it rather than
+# the default warn.
+yanked = "deny"
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
@@ -74,6 +84,26 @@ ignore = [
     #{ id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
     #"a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
+
+    # rsa: Marvin timing side channel, no fixed release exists. Every use of
+    # the crate in this graph is signature *verification* (public-key
+    # operations) — rustls-rustcrypto TLS signatures, sev ARK→ASK and CRLs,
+    # dcap-qvl PCK chains — while the side channel requires observing RSA
+    # private-key operations, which no Eidola binary performs via this crate.
+    { id = "RUSTSEC-2023-0071", reason = "rsa is verification-only in this graph; Marvin requires RSA private-key operations, and no fixed release exists" },
+
+    # rustls-webpki 0.102.8 (the four IDs below): resolved only because
+    # rustls-rustcrypto 0.0.2-alpha pins ^0.102, and that crate imports
+    # nothing from it but the `alg_id` DER constants (its src/verify/*.rs) —
+    # webpki's chain-building, CRL, and name-constraint code, where these
+    # CVEs live, is never invoked from the 0.102.8 copy. All real WebPKI
+    # verification runs on rustls's own rustls-webpki 0.103.13, which is
+    # patched. Drop these when rustls-rustcrypto releases against
+    # webpki >=0.103.10.
+    { id = "RUSTSEC-2026-0049", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.13" },
+    { id = "RUSTSEC-2026-0098", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.13" },
+    { id = "RUSTSEC-2026-0099", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.13" },
+    { id = "RUSTSEC-2026-0104", reason = "0.102.8 copy is alg_id-constants-only (rustls-rustcrypto); all chain/CRL verification runs on patched 0.103.13" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
@@ -88,6 +118,15 @@ ignore = [
 # List of explicitly allowed licenses
 # See https://spdx.org/licenses/ for list of possible licenses
 # [possible values: any SPDX 3.11 short identifier (+ optional exception)].
+#
+# Keep this list aligned with `allow-licenses` in
+# .github/workflows/dependency-review.yml (the CI gate): the two tools walk
+# different graphs — dependency-review checks the whole Cargo.lock while
+# cargo-deny resolves only the enabled feature set — so an entry here may be
+# exercised only by the CI side (e.g. NCSA, required by libfuzzer-sys's
+# `(MIT OR Apache-2.0) AND NCSA` in the lockfile), but the *policy* is one
+# list. LicenseRef-* entries in the workflow are action-specific synthetics
+# with no cargo-deny equivalent.
 allow = [
     "0BSD",
     "Apache-2.0",
@@ -96,12 +135,14 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
+    "bzip2-1.0.6",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MIT-0",
     "MPL-2.0",
+    "NCSA",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
@@ -148,8 +189,15 @@ registries = [
 [bans]
 # Lint level for when multiple versions of the same crate are detected
 multiple-versions = "warn"
-# Lint level for when a crate version requirement is `*`
-wildcards = "allow"
+# Lint level for when a crate version requirement is `*` — `deny`: a
+# wildcard requirement floats with whatever the registry serves, which the
+# reproducible-build posture (exact lockfile, pinned toolchain, pinned
+# actions) exists to rule out.
+wildcards = "deny"
+# Workspace-internal `path` dependencies carry no version requirement by
+# design (nothing is published); the wildcard lint is aimed at registry
+# requirements that float with whatever the registry serves.
+allow-wildcard-paths = true
 # The graph highlighting used when creating dotgraphs for crates
 # with multiple versions
 # * lowest-version - The path to the lowest versioned duplicate is highlighted
@@ -223,21 +271,28 @@ skip-tree = [
 # More documentation about the 'sources' section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
 [sources]
-# Lint level for what to happen when a crate from a crate registry that is not
-# in the allow list is encountered
-unknown-registry = "warn"
-# Lint level for what to happen when a crate from a git repository that is not
-# in the allow list is encountered
-unknown-git = "warn"
+# Both lints are `deny`: at `warn` the sources check succeeds no matter
+# what a PR pulls in, so the gate would claim to validate a source policy
+# it never enforces. A new git dependency must be added to the allow
+# lists below deliberately.
+unknown-registry = "deny"
+unknown-git = "deny"
 # List of URLs for allowed crate registries. Defaults to the crates.io index
 # if not specified. If it is specified but empty, no registries are allowed.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# List of URLs for allowed Git repositories
-allow-git = []
+# One-off pinned repositories outside the allowed orgs.
+allow-git = [
+    "https://github.com/Phala-Network/dcap-qvl",
+    "https://github.com/proptest-rs/proptest",
+    "https://github.com/virtee/tdx-measure",
+]
 
 [sources.allow-org]
-# github.com organizations to allow git sources for
-github = []
+# github.com organizations to allow git sources for:
+#   - eidola-ai: our own pinned forks (gpui-component, pulldown-cmark, turso)
+#   - zed-industries: gpui and the sibling repos its workspace pins; a gpui
+#     bump can move or add repos within the org, so the grant is org-level
+github = ["eidola-ai", "zed-industries"]
 # gitlab.com organizations to allow git sources for
 gitlab = []
 # bitbucket.org organizations to allow git sources for

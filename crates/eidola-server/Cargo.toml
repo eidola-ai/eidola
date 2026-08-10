@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish.workspace = true
+license = "AGPL-3.0-only"
 
 [[bin]]
 name = "eidola-server"
@@ -59,7 +60,9 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 deadpool-postgres = "0.14"
 tokio-postgres-rustls = "0.14.0"
-rustls-pemfile = "2.2.0"
+# PEM parsing for DATABASE_SSL_CERT (the `pem` module); already in the
+# rustls dep tree — this adds no new code to the graph.
+rustls-pki-types = "1"
 
 # Authentication
 argon2 = "0.5"
@@ -109,3 +112,8 @@ tokio-stream = "0.1"
 
 [build-dependencies]
 serde_json = "1"
+
+[dev-dependencies]
+# `InMemoryLogExporter` for the telemetry regression test pinning that
+# exported log records carry no trace context.
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }

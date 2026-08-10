@@ -1,6 +1,6 @@
 # Provisioning a YubiKey as the release attestant key
 
-This guide is for a release engineer setting up a fresh YubiKey 5 (e.g. a 5C) as a human release-attestation signing key — a key whose sha256 SPKI fingerprint is pinned in `releases/trust/trust-constants.json` (`trusted_attestant_fingerprints`) and which signs each release attestation via `just release-attest`.
+This guide is for a release officer setting up a fresh YubiKey 5 (e.g. a 5C) as a human release-attestation signing key — a key whose sha256 SPKI fingerprint is pinned in `releases/trust/trust-constants.json` (`trusted_attestant_fingerprints`) and which signs each release attestation via `just release-attest`.
 
 For the conceptual model of what the attestant key is and how it fits the trust root, see [`../trust-root.md`](../trust-root.md). For the rotation procedure once a key is already in service, see [`../../releases/README.md`](../../releases/README.md#rotating-an-attestant-key). This document covers the one-time hardware provisioning that those assume has already happened.
 
@@ -130,7 +130,7 @@ just release-provenance-check               # confirms the cert matches the pinn
 
 ## Using the key with the attestation script
 
-The release engineer's workflow is two recipes. Set the attestant identity once (preferably in your shell profile or `.envrc`), pointing `EIDOLA_ATTESTANT_COSIGN_KEY` at the URI from step 4:
+The release officer's workflow is two recipes. Set the attestant identity once (preferably in your shell profile or `.envrc`), pointing `EIDOLA_ATTESTANT_COSIGN_KEY` at the URI from step 4:
 
 ```bash
 # This URI carries no secret, so it is safe to persist.

@@ -26,7 +26,7 @@ The CI side gives us "this artifact came from the release workflow on this tag."
 
 ## What the engineer attests to
 
-Every release attestation is a structured JSON document where the engineer makes specific claims under their legal identity. The full template is at `releases/schema/attestation-templates-v1.json`; the claims include:
+Every release attestation is a structured JSON document where the engineer makes specific claims under their legal identity. The full template is at `releases/schema/attestation-templates.json`. The copy that binds is the one embedded in the *previous* release's clients — they re-render every claim and reject any mismatch — so `release-tool attest` renders from the templates as committed at the previous release tag, and a template change takes effect for the release after the one that ships it. The claims include:
 
 - `no_compelled_subversion` — the engineer is **not currently subject to any legal order, technical capability notice, or other legal compulsion** that has caused (or that requires them to cause) the release to weaken a privacy or security guarantee, introduce or preserve a backdoor or covert surveillance mechanism, or misrepresent any of these properties.
 - `no_gag_preventing_attestation` — the engineer is **not subject to a gag order or nondisclosure obligation** that prevents them from truthfully making any claim in this attestation.
@@ -34,7 +34,7 @@ Every release attestation is a structured JSON document where the engineer makes
 - `signing_freely` — the engineer is signing **of their own volition**, with a key whose private component exists only on hardware under their exclusive physical control.
 - `manifest_reproduced` — the engineer **personally reproduced** `artifact-manifest.json` from the source commit on hardware under their exclusive physical control, and confirmed bit-for-bit equality with CI's output.
 - `diff_reviewed` — the engineer **personally inspected the source-level diff** between the prior release commit and this release commit.
-- `privacy_guarantees_not_weakened` — the version of [`privacy-guarantees.md`](privacy-guarantees.md) at release time **does not weaken, narrow, or remove** any privacy or security guarantee that was stated in the prior release's version. (Required only when a prior release exists.)
+- `privacy_guarantees_not_weakened` — the version of [`privacy-guarantees.md`](privacy-guarantees.md) at release time **does not weaken, narrow, or remove** any privacy or security guarantee that was stated in the prior release's version.
 - `code_delivers_guarantees` — based on the diff review, the engineer is **not aware of any change** in this release that causes the code to fail to deliver the privacy and security guarantees stated in `privacy-guarantees.md`.
 - `no_known_backdoor` — based on the diff review, the engineer is **not aware of any backdoor**, covert surveillance mechanism, or undisclosed data path in this release that transmits user data in a manner not described in `privacy-guarantees.md` or the user-facing documentation it references.
 
