@@ -42,6 +42,7 @@ use clap::{Parser, Subcommand};
 mod attest;
 mod manifest;
 mod pkcs11;
+mod preflight;
 mod provenance;
 mod trust;
 mod verify;

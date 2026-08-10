@@ -21,13 +21,15 @@ pub fn run(args: Args) -> Result<()> {
     require_tool("gh")?;
     require_tool("git")?;
 
-    // Resolve the tag to its commit SHA up front. Both the displayed diff
-    // and the `release-attest` step act on this SHA, not on the tag name —
-    // so a reviewer can always re-run the diff later from the SHAs printed
-    // here and get the exact same bytes they signed off on. Using
-    // `<tag>^{commit}` instead of bare `<tag>` so an annotated signed tag
-    // also resolves to its underlying commit, not the tag object.
-    let tag_commit = resolve_to_commit(&args.workspace_root, &args.tag)?;
+    // Resolve the tag to its commit SHA up front — via the release-checkout
+    // invariant (remote tag == local tag == HEAD, tree clean), so every
+    // workspace read below is provably the tagged bytes and the SHA shown
+    // here is the one the *pushed* tag names. Both the displayed diff and
+    // the `release-attest` step act on this SHA, not on the tag name — a
+    // reviewer can always re-run the diff later from the SHAs printed here
+    // and get the exact same bytes they signed off on.
+    let tag_commit =
+        crate::preflight::assert_release_checkout(&args.workspace_root, &args.repo, &args.tag)?;
     let prev = previous_release_tag(&args.workspace_root, &args.tag)
         .ok()
         .map(|prev_tag| -> Result<(String, String)> {

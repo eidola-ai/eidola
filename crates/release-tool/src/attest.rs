@@ -50,6 +50,12 @@ pub fn run(args: Args) -> Result<()> {
     require_tool("cosign")?;
     require_tool("git")?;
 
+    // Before reading anything — the trust root below is a workspace read —
+    // assert the release-checkout invariant: remote tag == local tag ==
+    // HEAD, tree clean. Signing must not proceed from a checkout that
+    // isn't byte-for-byte the commit the pushed tag names.
+    crate::preflight::assert_release_checkout(&args.workspace_root, &args.repo, &args.tag)?;
+
     let trust = trust::load(&args.workspace_root)?;
 
     validate_attestant_id(&args.attestant_id)?;
