@@ -143,8 +143,16 @@ pub fn run(args: Args) -> Result<()> {
          recorded verbatim in the signed attestation."
     );
 
-    let manifest_path = args.workspace_root.join("artifact-manifest.json");
-    let artifact_manifest_sha256 = sha256_hex(&fs::read(&manifest_path)?);
+    // The hash the attestant signs must be the hash of the bytes clients
+    // will fetch. Re-fetch, re-verify, and re-compare the release asset
+    // here rather than assuming `release-verify` ran and that the
+    // workspace manifest hasn't moved since: this is the same function
+    // the verify subcommand goes through, so a manifest that drifted
+    // after verification (or an attest run that skipped verify) stops
+    // here instead of publishing an attestation every client rejects.
+    let manifest_bytes =
+        crate::manifest::fetch_verified_manifest(&args.workspace_root, &args.repo, &args.tag)?;
+    let artifact_manifest_sha256 = sha256_hex(&manifest_bytes);
 
     let privacy_doc_path = args.workspace_root.join("docs/privacy-guarantees.md");
     let privacy_guarantees_doc_sha256 = match fs::read(&privacy_doc_path) {

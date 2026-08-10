@@ -40,6 +40,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 mod attest;
+mod manifest;
 mod pkcs11;
 mod provenance;
 mod trust;
