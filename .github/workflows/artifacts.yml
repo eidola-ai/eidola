@@ -330,9 +330,11 @@ jobs:
     name: Apple builds
     needs: oci
     runs-on: self-hosted # zizmor: ignore[self-hosted-runner] -- macOS Nix universal-binary builds require an Apple-silicon runner
-    # 60 minutes covers a cold cachix miss for both the cli and the GUI
-    # (gpui is a large dep tree); warm runs typically finish in <10.
-    timeout-minutes: 60
+    # 90 minutes covers a from-source build of both the cli and the GUI
+    # (gpui is a large dep tree) — the cold-cache case, and every v* tag
+    # run, which skips the project cache below; warm runs typically
+    # finish in <10.
+    timeout-minutes: 90
     # Only main and v* tag pushes acquire the Cachix write token, gated by
     # the branch-restricted `cachix-write` environment in repo settings.
     # Other runs (PRs, schedule, dispatch) get no environment and pull
@@ -371,7 +373,13 @@ jobs:
             sandbox = true
             sandbox-fallback = false
 
+      # Skipped on v* release tags so the attested macOS artifacts are
+      # rebuilt from source instead of substituted from the project
+      # cache — the same exclusion as the linux-gui job and the OCI
+      # job's empty CACHE_REGISTRY on tags. (Upstream store paths still
+      # come from cache.nixos.org, pinned by flake.lock narHashes.)
       - name: Configure Nix binary cache
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: eidola
