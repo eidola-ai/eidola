@@ -132,6 +132,14 @@ jobs:
         with:
           version: v0.31.1
           platforms: linux/amd64
+          # The buildx CLI plugin itself is never restored from the Actions
+          # cache: the restored bytes are keyed only by version string and
+          # not hash-checked, and this is the tool whose bake metadata the
+          # manifest digests come from — a poisoned cache entry could emit
+          # chosen digests on the very run that signs them. The BuildKit
+          # daemon below is digest-pinned; hold the CLI to the same bar by
+          # downloading it fresh (it is release-signed by Docker) each run.
+          cache-binary: false
           driver-opts: |
             image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
 
@@ -335,11 +343,14 @@ jobs:
     # run, which skips the project cache below; warm runs typically
     # finish in <10.
     timeout-minutes: 90
-    # Only main and v* tag pushes acquire the Cachix write token, gated by
-    # the branch-restricted `cachix-write` environment in repo settings.
-    # Other runs (PRs, schedule, dispatch) get no environment and pull
-    # anonymously from the public Cachix cache.
-    environment: ${{ (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) && 'cachix-write' || '' }}
+    # Only main pushes acquire the Cachix write token, gated by the
+    # branch-restricted `cachix-write` environment in repo settings —
+    # that push is what warms the cache. v* tag runs skip the cache step
+    # entirely (below), so they get no environment and no token: a
+    # release build has no use for a cache credential, and materializing
+    # one anyway would expose it to the entire build. Other runs (PRs,
+    # schedule, dispatch) likewise pull anonymously from the public cache.
+    environment: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'cachix-write' || '' }}
     outputs:
       artifact_manifest: ${{ steps.partial.outputs.actual }}
     permissions:
@@ -407,10 +418,11 @@ jobs:
     # 120 minutes covers a cold cachix miss (gpui is a large dep tree);
     # warm runs typically finish in a few minutes.
     timeout-minutes: 120
-    # Same Cachix write-token gating as the apple job: only main and v* tag
-    # pushes get the branch-restricted `cachix-write` environment; other
-    # runs pull anonymously from the public cache.
-    environment: ${{ (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) && 'cachix-write' || '' }}
+    # Same Cachix write-token gating as the apple job: only main pushes get
+    # the branch-restricted `cachix-write` environment (v* tag runs skip
+    # the cache step, so they get no token); other runs pull anonymously
+    # from the public cache.
+    environment: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'cachix-write' || '' }}
     outputs:
       artifact_manifest: ${{ steps.partial.outputs.actual }}
     permissions:

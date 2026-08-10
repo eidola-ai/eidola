@@ -42,7 +42,7 @@ targets = [
 # If true, metadata will be collected with `--all-features`. Note that this can't
 # be toggled off if true, if you want to conditionally enable `--all-features` it
 # is recommended to pass `--all-features` on the cmd line instead
-all-features = false
+all-features = true
 # If true, metadata will be collected with `--no-default-features`. The same
 # caveat with `all-features` applies
 no-default-features = false
@@ -73,6 +73,10 @@ feature-depth = 1
 # transitive noise (gpui's text stack alone carries several) would bury real
 # vulnerability findings.
 unmaintained = "workspace"
+# A yanked lockfile entry is often the first signal of a withdrawn or
+# compromised release, ahead of any RUSTSEC id — fail on it rather than
+# the default warn.
+yanked = "deny"
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
@@ -185,8 +189,15 @@ registries = [
 [bans]
 # Lint level for when multiple versions of the same crate are detected
 multiple-versions = "warn"
-# Lint level for when a crate version requirement is `*`
-wildcards = "allow"
+# Lint level for when a crate version requirement is `*` — `deny`: a
+# wildcard requirement floats with whatever the registry serves, which the
+# reproducible-build posture (exact lockfile, pinned toolchain, pinned
+# actions) exists to rule out.
+wildcards = "deny"
+# Workspace-internal `path` dependencies carry no version requirement by
+# design (nothing is published); the wildcard lint is aimed at registry
+# requirements that float with whatever the registry serves.
+allow-wildcard-paths = true
 # The graph highlighting used when creating dotgraphs for crates
 # with multiple versions
 # * lowest-version - The path to the lowest versioned duplicate is highlighted
