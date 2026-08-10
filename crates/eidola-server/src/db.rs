@@ -92,6 +92,21 @@ fn build_tls_config(database_ssl_cert: Option<&str>) -> Result<rustls::ClientCon
 /// causes time-sensitive operations to fail closed.
 pub const MAX_CLOCK_SKEW: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Log-safe rendering of a `tokio_postgres` error: its `Display` (a fixed
+/// string per error kind — "db error", "connection closed", …) plus the
+/// SQLSTATE code when one exists. Never its `Debug`: that prints the
+/// server-authored message and DETAIL, and Postgres quotes row values
+/// there — a unique-violation DETAIL carries the conflicting key's
+/// values verbatim. The SQLSTATE alone (23505 unique_violation, 23514
+/// check_violation, …) names the failure class from a bounded vocabulary
+/// without carrying any value.
+fn db_error_summary(e: &tokio_postgres::Error) -> String {
+    match e.code() {
+        Some(code) => format!("{e} (sqlstate {})", code.code()),
+        None => e.to_string(),
+    }
+}
+
 /// Verify that this server's wall clock and the database's wall clock
 /// agree to within `max_skew`. Returns the measured absolute drift on
 /// success. Errors if the query fails or the drift exceeds `max_skew`.
@@ -116,7 +131,7 @@ pub async fn check_clock_skew(
     let client = pool.get().await.map_err(|e| {
         metrics::DB_CLOCK_SKEW_CHECK_FAILURES
             .add(1, &[opentelemetry::KeyValue::new("reason", "pool")]);
-        ServerError::Internal(format!("db pool error: {e:?}"))
+        ServerError::Internal(format!("db pool error: {e}"))
     })?;
 
     let t1 = SystemTime::now();
@@ -126,7 +141,7 @@ pub async fn check_clock_skew(
         .map_err(|e| {
             metrics::DB_CLOCK_SKEW_CHECK_FAILURES
                 .add(1, &[opentelemetry::KeyValue::new("reason", "query")]);
-            ServerError::Internal(format!("clock skew query failed: {e:?}"))
+            ServerError::Internal(format!("clock skew query failed: {}", db_error_summary(&e)))
         })?;
     let t2 = SystemTime::now();
 
@@ -195,7 +210,7 @@ pub async fn insert_account(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let row = client
         .query_one(
@@ -203,7 +218,9 @@ pub async fn insert_account(
             &[&id, &credential_hash],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("insert account failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!("insert account failed: {}", db_error_summary(&e)))
+        })?;
 
     Ok(row.get::<_, SystemTime>("created_at"))
 }
@@ -214,7 +231,7 @@ pub async fn get_account_by_id(pool: &Pool, id: Uuid) -> Result<AccountRow, Serv
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let row = client
         .query_opt(
@@ -223,7 +240,9 @@ pub async fn get_account_by_id(pool: &Pool, id: Uuid) -> Result<AccountRow, Serv
             &[&id],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("query account failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!("query account failed: {}", db_error_summary(&e)))
+        })?;
 
     match row {
         Some(row) => Ok(AccountRow {
@@ -251,7 +270,7 @@ pub async fn set_stripe_customer_id(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let rows_updated = client
         .execute(
@@ -260,7 +279,12 @@ pub async fn set_stripe_customer_id(
             &[&customer_id, &id],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("update stripe customer failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "update stripe customer failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     if rows_updated == 1 {
         return Ok(customer_id.to_string());
@@ -284,7 +308,7 @@ pub async fn get_account_by_stripe_customer(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let row = client
         .query_opt(
@@ -293,7 +317,12 @@ pub async fn get_account_by_stripe_customer(
             &[&customer_id],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("query account by customer failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "query account by customer failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     Ok(row.map(|row| AccountRow {
         id: row.get("id"),
@@ -321,7 +350,7 @@ pub async fn insert_credit_ledger(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let result = client
         .execute(
@@ -339,7 +368,12 @@ pub async fn insert_credit_ledger(
             ],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("insert credit_ledger failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "insert credit_ledger failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     Ok(result == 1)
 }
@@ -383,7 +417,7 @@ pub async fn record_required_document(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let rows = client
         .execute(
@@ -393,7 +427,12 @@ pub async fn record_required_document(
             &[&doc.document, &doc.version, &doc.sha256, &doc.url],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("record required_document failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "record required_document failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     if rows == 1 {
         return Ok(RecordRequiredOutcome::Recorded);
@@ -405,7 +444,12 @@ pub async fn record_required_document(
             &[&doc.document, &doc.version],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("query required_document failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "query required_document failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
     let stored_sha256: String = row.get("sha256");
 
     if stored_sha256 == doc.sha256 {
@@ -422,7 +466,7 @@ pub async fn get_required_documents(pool: &Pool) -> Result<Vec<RequiredDocumentR
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let rows = client
         .query(
@@ -431,7 +475,12 @@ pub async fn get_required_documents(pool: &Pool) -> Result<Vec<RequiredDocumentR
             &[],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("query required_document failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "query required_document failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     Ok(rows
         .iter()
@@ -457,7 +506,7 @@ pub async fn insert_acceptance(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     client
         .execute(
@@ -467,7 +516,12 @@ pub async fn insert_acceptance(
             &[&account_id, &document, &version, &sha256],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("insert acceptance failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "insert acceptance failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     Ok(())
 }
@@ -480,7 +534,7 @@ pub async fn get_accepted_versions(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let rows = client
         .query(
@@ -489,7 +543,12 @@ pub async fn get_accepted_versions(
             &[&account_id],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("query acceptances failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "query acceptances failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     Ok(rows
         .iter()
@@ -525,14 +584,19 @@ where
     let mut client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let tx = client
         .build_transaction()
         .isolation_level(tokio_postgres::IsolationLevel::Serializable)
         .start()
         .await
-        .map_err(|e| ServerError::Internal(format!("begin transaction failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "begin transaction failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     // Read the latest key inside the transaction.
     let latest_row = tx
@@ -543,16 +607,21 @@ where
             &[],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("query latest issuer_key failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "query latest issuer_key failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     let latest = latest_row.as_ref().map(map_issuer_key_row);
 
     let key = match check(latest.as_ref())? {
         Some(k) => k,
         None => {
-            tx.rollback()
-                .await
-                .map_err(|e| ServerError::Internal(format!("rollback failed: {e:?}")))?;
+            tx.rollback().await.map_err(|e| {
+                ServerError::Internal(format!("rollback failed: {}", db_error_summary(&e)))
+            })?;
             return Ok(None);
         }
     };
@@ -573,11 +642,16 @@ where
         ],
     )
     .await
-    .map_err(|e| ServerError::Internal(format!("insert issuer_key failed: {e:?}")))?;
+    .map_err(|e| {
+        ServerError::Internal(format!(
+            "insert issuer_key failed: {}",
+            db_error_summary(&e)
+        ))
+    })?;
 
     tx.commit()
         .await
-        .map_err(|e| ServerError::Internal(format!("commit failed: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("commit failed: {}", db_error_summary(&e))))?;
 
     Ok(Some(key))
 }
@@ -589,7 +663,7 @@ pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, Ser
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let rows = client
         .query(
@@ -600,7 +674,12 @@ pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, Ser
             &[],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("query valid issuer_keys failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "query valid issuer_keys failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     Ok(rows.iter().map(map_issuer_key_row).collect())
 }
@@ -632,7 +711,7 @@ pub async fn insert_credential_issuance(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let row = client
         .query_one(
@@ -640,7 +719,12 @@ pub async fn insert_credential_issuance(
             &[&account_id, &credits, &credential_key_id],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("credential issuance debit failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "credential issuance debit failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     let ids: Option<Vec<Uuid>> = row.get("ids");
     Ok(ids.and_then(|v| v.into_iter().next()))
@@ -662,7 +746,7 @@ pub async fn debit_stripe_event(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let row = client
         .query_one(
@@ -670,7 +754,12 @@ pub async fn debit_stripe_event(
             &[&account_id, &amount, &reason, &stripe_event_id],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("debit_stripe_event failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "debit_stripe_event failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     let ids: Option<Vec<Uuid>> = row.get("ids");
     match ids {
@@ -700,7 +789,7 @@ pub async fn refund_matched_to_payment_intent(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let original = client
         .query_opt(
@@ -710,7 +799,12 @@ pub async fn refund_matched_to_payment_intent(
             &[&account_id, &payment_intent],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("refund pool lookup failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "refund pool lookup failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     let Some(row) = original else {
         return Ok(None);
@@ -733,7 +827,12 @@ pub async fn refund_matched_to_payment_intent(
             ],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("matched refund insert failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "matched refund insert failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     Ok(Some(result == 1))
 }
@@ -744,12 +843,14 @@ pub async fn get_available_balance(pool: &Pool, account_id: Uuid) -> Result<i64,
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let row = client
         .query_one("SELECT available_balance($1) as balance", &[&account_id])
         .await
-        .map_err(|e| ServerError::Internal(format!("balance query failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!("balance query failed: {}", db_error_summary(&e)))
+        })?;
 
     Ok(row.get("balance"))
 }
@@ -769,12 +870,14 @@ pub async fn get_balance_pools(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let total_row = client
         .query_one("SELECT available_balance($1) as balance", &[&account_id])
         .await
-        .map_err(|e| ServerError::Internal(format!("balance query failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!("balance query failed: {}", db_error_summary(&e)))
+        })?;
 
     let total: i64 = total_row.get("balance");
 
@@ -793,7 +896,12 @@ pub async fn get_balance_pools(
             &[&account_id],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("balance pools query failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "balance pools query failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     let pools = rows
         .iter()
@@ -817,7 +925,7 @@ pub async fn get_issuer_key_by_hash(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let row = client
         .query_opt(
@@ -827,7 +935,12 @@ pub async fn get_issuer_key_by_hash(
             &[&id],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("query issuer_key by hash failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "query issuer_key by hash failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     Ok(row.as_ref().map(map_issuer_key_row))
 }
@@ -843,7 +956,7 @@ pub async fn record_nullifier(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let rows_affected = client
         .execute(
@@ -852,7 +965,9 @@ pub async fn record_nullifier(
             &[&issuer_key_id, &value],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("record_nullifier failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!("record_nullifier failed: {}", db_error_summary(&e)))
+        })?;
 
     Ok(rows_affected > 0)
 }
@@ -868,7 +983,7 @@ pub async fn store_refund_token(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     client
         .execute(
@@ -877,7 +992,12 @@ pub async fn store_refund_token(
             &[&issuer_key_id, &nullifier_value, &refund_token],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("store_refund_token failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "store_refund_token failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
 
     Ok(())
 }
@@ -893,7 +1013,7 @@ pub async fn get_refund_token(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let row = client
         .query_opt(
@@ -902,7 +1022,9 @@ pub async fn get_refund_token(
             &[&issuer_key_id, &nullifier_value],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("get_refund_token failed: {e:?}")))?;
+        .map_err(|e| {
+            ServerError::Internal(format!("get_refund_token failed: {}", db_error_summary(&e)))
+        })?;
 
     Ok(row.and_then(|r| r.get::<_, Option<Vec<u8>>>("refund_token")))
 }
@@ -926,7 +1048,7 @@ pub async fn get_ledger_entries(
     let client = pool
         .get()
         .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
     let rows = client
         .query(
@@ -936,7 +1058,7 @@ pub async fn get_ledger_entries(
             &[&account_id],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("ledger query failed: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("ledger query failed: {}", db_error_summary(&e))))?;
 
     Ok(rows
         .iter()

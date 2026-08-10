@@ -104,8 +104,10 @@ impl Config {
 
         let credential_master_key_hex = std::env::var("CREDENTIAL_MASTER_KEY")
             .map_err(|_| "CREDENTIAL_MASTER_KEY environment variable is required")?;
+        // The hex error is discarded, not interpolated: its Display quotes
+        // the offending character — a byte of the configured master key.
         let key_bytes = hex::decode(&credential_master_key_hex)
-            .map_err(|e| format!("invalid CREDENTIAL_MASTER_KEY hex: {e}"))?;
+            .map_err(|_| "invalid CREDENTIAL_MASTER_KEY hex".to_string())?;
         let credential_master_key: [u8; 32] = key_bytes.try_into().map_err(|_| {
             "CREDENTIAL_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string()
         })?;
