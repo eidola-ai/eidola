@@ -260,21 +260,28 @@ skip-tree = [
 # More documentation about the 'sources' section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
 [sources]
-# Lint level for what to happen when a crate from a crate registry that is not
-# in the allow list is encountered
-unknown-registry = "warn"
-# Lint level for what to happen when a crate from a git repository that is not
-# in the allow list is encountered
-unknown-git = "warn"
+# Both lints are `deny`: at `warn` the sources check succeeds no matter
+# what a PR pulls in, so the gate would claim to validate a source policy
+# it never enforces. A new git dependency must be added to the allow
+# lists below deliberately.
+unknown-registry = "deny"
+unknown-git = "deny"
 # List of URLs for allowed crate registries. Defaults to the crates.io index
 # if not specified. If it is specified but empty, no registries are allowed.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# List of URLs for allowed Git repositories
-allow-git = []
+# One-off pinned repositories outside the allowed orgs.
+allow-git = [
+    "https://github.com/Phala-Network/dcap-qvl",
+    "https://github.com/proptest-rs/proptest",
+    "https://github.com/virtee/tdx-measure",
+]
 
 [sources.allow-org]
-# github.com organizations to allow git sources for
-github = []
+# github.com organizations to allow git sources for:
+#   - eidola-ai: our own pinned forks (gpui-component, pulldown-cmark, turso)
+#   - zed-industries: gpui and the sibling repos its workspace pins; a gpui
+#     bump can move or add repos within the org, so the grant is org-level
+github = ["eidola-ai", "zed-industries"]
 # gitlab.com organizations to allow git sources for
 gitlab = []
 # bitbucket.org organizations to allow git sources for
