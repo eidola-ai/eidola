@@ -187,7 +187,7 @@ fn record_webhook_outcome(event_type: &str, reason: &'static str) {
         (status = 503, description = "Webhook secret not configured", body = crate::types::ErrorResponse)
     )
 )]
-#[tracing::instrument(skip_all, name = "webhook.process")]
+#[tracing::instrument(skip_all, name = "webhook.process", fields(otel.status_code = tracing::field::Empty))]
 pub async fn stripe_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -266,6 +266,11 @@ pub async fn stripe_webhook(
 
     record_webhook_outcome(&event.event_type, outcome.reason());
     if outcome.is_retryable() {
+        // This handler returns a response rather than an `Err`, so the
+        // `err` instrument sugar every other tracked span uses cannot mark
+        // the span — without this record, `operation.duration`'s outcome
+        // for webhook.process could never read "error".
+        tracing::Span::current().record("otel.status_code", "ERROR");
         return internal_error();
     }
     ok_empty()
