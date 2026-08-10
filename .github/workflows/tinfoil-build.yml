@@ -75,6 +75,17 @@ jobs:
           ACTUAL_RTMR2=$(jq -r '.tdx_measurement.rtmr2' output/tinfoil-deployment.json)
 
           FAIL=0
+          # A missing path renders as the literal string "null" on BOTH
+          # sides, so absent-vs-absent would compare equal and an assertion
+          # would silently assert nothing. Every expected value must
+          # actually exist — if a field is deliberately retired (e.g. the
+          # TDX block), delete its comparison here in the same change.
+          for v in "$EXPECTED_SNP" "$EXPECTED_CMDLINE" "$EXPECTED_RTMR1" "$EXPECTED_RTMR2"; do
+            if [ -z "$v" ] || [ "$v" = "null" ]; then
+              echo "::error::artifact-manifest.json is missing a measurement this cross-check compares"
+              FAIL=1
+            fi
+          done
           if [ "$EXPECTED_SNP" != "$ACTUAL_SNP" ]; then
             echo "::error::SNP measurement mismatch: expected $EXPECTED_SNP, got $ACTUAL_SNP"
             FAIL=1
