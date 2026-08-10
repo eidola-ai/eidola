@@ -154,13 +154,23 @@ pub fn run(args: Args) -> Result<()> {
         crate::manifest::fetch_verified_manifest(&args.workspace_root, &args.repo, &args.tag)?;
     let artifact_manifest_sha256 = sha256_hex(&manifest_bytes);
 
-    let privacy_doc_path = args.workspace_root.join("docs/privacy-guarantees.md");
-    let privacy_guarantees_doc_sha256 = match fs::read(&privacy_doc_path) {
+    // The claim names the doc "at the time of this release", so the hash
+    // comes from the bytes committed at the tag, never the working tree: a
+    // dirty or stale checkout would otherwise sign a hash of a file the
+    // tag does not contain — and unlike the artifact manifest, nothing
+    // downstream cross-checks this hash (the doc is not a release asset),
+    // so the divergence would never be caught.
+    let privacy_guarantees_doc_sha256 = match git_show_bytes(
+        &args.workspace_root,
+        &args.tag,
+        "docs/privacy-guarantees.md",
+    ) {
         Ok(bytes) => sha256_hex(&bytes),
         Err(_) => bail!(
-            "`docs/privacy-guarantees.md` not found. \
+            "`docs/privacy-guarantees.md` not committed at `{}`. \
              The `privacy_guarantees_not_weakened` claim references its sha256; \
-             create the document and commit it before attesting."
+             the document must exist in the tagged source.",
+            args.tag
         ),
     };
 
@@ -513,6 +523,22 @@ fn read_rekor_log_index(bundle_path: &Path) -> Result<u64> {
     log_index_str
         .parse::<u64>()
         .with_context(|| format!("parsing bundle logIndex `{log_index_str}` as u64"))
+}
+
+/// The exact bytes of `path` as committed at `refname` (via `git show`).
+fn git_show_bytes(workspace_root: &Path, refname: &str, path: &str) -> Result<Vec<u8>> {
+    let out = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["show", &format!("{refname}:{path}")])
+        .output()
+        .context("running `git show <ref>:<path>`")?;
+    if !out.status.success() {
+        bail!(
+            "`git show {refname}:{path}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out.stdout)
 }
 
 fn git_rev_parse(workspace_root: &Path, refname: &str) -> Result<String> {
