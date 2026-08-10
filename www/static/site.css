@@ -86,6 +86,7 @@ body {
   :root.circadian-ready pre,
   :root.circadian-ready code,
   :root.circadian-ready blockquote,
+  :root.circadian-ready blockquote::before,
   :root.circadian-ready td,
   :root.circadian-ready th,
   :root.circadian-ready hr,
@@ -257,6 +258,40 @@ main.prose {
   border-left: 2px solid var(--border);
   color: var(--muted-foreground);
 }
+
+/* GFM alert blockquotes (`> [!NOTE]` …, pulldown-cmark's markdown-alert-*
+ * classes) keep the quote's hairline form — no fills, no cards. The app's
+ * status colors carry the kind: the left rule takes the color, and an
+ * uppercase chrome label (the docs-nav-title voice) names it. The body
+ * stays at full foreground — an alert is content, not an aside. */
+.prose blockquote[class^="markdown-alert-"] {
+  color: inherit;
+  border-left-color: var(--alert-color);
+}
+
+.prose blockquote[class^="markdown-alert-"]::before {
+  content: var(--alert-label);
+  display: block;
+  margin-bottom: 0.25rem;
+  font-family: system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--alert-color);
+}
+
+/* The label suppresses margin collapse, so the first block's top margin
+ * would otherwise open a gap under it. */
+.prose blockquote[class^="markdown-alert-"] > :first-child {
+  margin-top: 0;
+}
+
+.prose .markdown-alert-note { --alert-color: var(--info); --alert-label: "Note"; }
+.prose .markdown-alert-tip { --alert-color: var(--success); --alert-label: "Tip"; }
+.prose .markdown-alert-important { --alert-color: var(--accent-foreground); --alert-label: "Important"; }
+.prose .markdown-alert-warning { --alert-color: var(--warning); --alert-label: "Warning"; }
+.prose .markdown-alert-caution { --alert-color: var(--danger); --alert-label: "Caution"; }
 
 .prose table {
   border-collapse: collapse;

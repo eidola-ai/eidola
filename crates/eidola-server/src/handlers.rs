@@ -1,6 +1,7 @@
 //! Top-level HTTP handlers: health, models, chat completions.
 
 use std::convert::Infallible;
+use std::time::{Duration, Instant};
 
 use anonymous_credit_tokens::{Scalar, SpendProof, credit_to_scalar, scalar_to_credit};
 use axum::Json;
@@ -28,7 +29,9 @@ use crate::response::{
     EidolaResponse, EidolaStreamMetadata, RefundInfo, build_privacy_metadata,
     build_verification_metadata,
 };
-use crate::types::{ChatCompletionRequest, ErrorResponse, Model, ModelsResponse, Usage};
+use crate::types::{
+    ChatCompletionChunk, ChatCompletionRequest, ErrorResponse, Model, ModelsResponse, Usage,
+};
 
 /// Health check endpoint.
 #[utoipa::path(
@@ -300,7 +303,7 @@ fn validate_request(
             .backend
             .lookup_model(&request.model)
             .ok_or_else(|| ServerError::BadRequest {
-                message: format!("unknown model: {}", request.model),
+                message: "unknown model".to_string(),
             })?;
 
     // Pre-flight go/no-go: the presented charge must cover the worst-case
@@ -355,9 +358,50 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     LoggedJson(request): LoggedJson<ChatCompletionRequest>,
 ) -> Result<axum::response::Response, ServerError> {
+    // The counter's `model` label must come from the catalog, never the
+    // caller's string (the fixed-list rule bounding label cardinality):
+    // resolve it up front, with anything unresolved collapsing to `other`.
+    let model_label = state
+        .backend
+        .lookup_model(&request.model)
+        .map(|m| m.id)
+        .unwrap_or_else(|| "other".to_string());
+    let stream = request.stream;
+
+    let result = chat_completions_phases(&state, &act, &request).await;
+
+    // An `Ok` from the phases can still be an error *response* — a
+    // refund-bearing 4xx/5xx built after the credential was spent — so
+    // the status label reads the response, not the `Result`. `rejected`
+    // is the pre-flight refusals (invalid or duplicate credential,
+    // unknown model, insufficient charge). A streaming request counts
+    // `ok` once the SSE response opens; how the stream itself ends is
+    // `CHAT_STREAM_OUTCOME`'s job.
+    let status = match &result {
+        Ok(response) if response.status().is_success() => "ok",
+        Ok(_) => "error",
+        Err(_) => "rejected",
+    };
+    crate::telemetry::metrics::CHAT_REQUESTS.add(
+        1,
+        &[
+            KeyValue::new("model", model_label),
+            KeyValue::new("stream", if stream { "true" } else { "false" }),
+            KeyValue::new("status", status),
+        ],
+    );
+
+    result
+}
+
+async fn chat_completions_phases(
+    state: &AppState,
+    act: &ActSpend,
+    request: &ChatCompletionRequest,
+) -> Result<axum::response::Response, ServerError> {
     // Phase 1: Verify the ACT cryptographically. Errors here mean the token
     // is invalid/malformed — no nullifier recorded, no refund needed.
-    verify_spend_proof(&state, &act).await?;
+    verify_spend_proof(state, act).await?;
 
     // Phase 2: Record the nullifier. After this succeeds, the credential is
     // consumed and we MUST issue a refund on every subsequent code path.
@@ -376,7 +420,7 @@ pub async fn chat_completions(
 
     // Phase 3: Validate the request (model, charge amount). On failure, issue
     // a full refund of the charge amount back to the client.
-    let (model, charge_credits) = match validate_request(&state, &act, &request) {
+    let (model, charge_credits) = match validate_request(state, act, request) {
         Ok(v) => v,
         Err(e) => {
             // Decode charge for the refund. If this also fails, fall back to
@@ -384,7 +428,7 @@ pub async fn chat_completions(
             let refund_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).unwrap_or(0);
             warn!("Request validation failed after nullifier recorded, issuing full refund: {e}");
             let refund = issue_refund_async(
-                &state,
+                state,
                 &act.spend_proof,
                 &act.issuer_key_hash,
                 refund_credits,
@@ -395,23 +439,11 @@ pub async fn chat_completions(
     };
 
     // Phase 4: Handle the request.
-    let result = if request.stream {
-        handle_streaming_request(state, &request, &act, &model, charge_credits).await
+    if request.stream {
+        handle_streaming_request(state.clone(), request, act, &model, charge_credits).await
     } else {
-        handle_non_streaming_request(&state, &request, &act, &model, charge_credits).await
-    };
-
-    let status = if result.is_ok() { "ok" } else { "error" };
-    crate::telemetry::metrics::CHAT_REQUESTS.add(
-        1,
-        &[
-            KeyValue::new("model", request.model.clone()),
-            KeyValue::new("stream", if request.stream { "true" } else { "false" }),
-            KeyValue::new("status", status),
-        ],
-    );
-
-    result
+        handle_non_streaming_request(state, request, act, &model, charge_credits).await
+    }
 }
 
 /// Handle a non-streaming chat completion request.
@@ -427,6 +459,7 @@ async fn handle_non_streaming_request(
     };
 
     // Make the backend request. On error, issue a full refund.
+    let dispatched_at = Instant::now();
     let backend_response = match state.backend.send(request).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -442,6 +475,10 @@ async fn handle_non_streaming_request(
             return Ok(error_response_with_refund(&e, refund.ok()));
         }
     };
+    crate::telemetry::metrics::CHAT_DURATION.record(
+        dispatched_at.elapsed().as_secs_f64(),
+        &[KeyValue::new("model", model.id.clone())],
+    );
 
     // Record token usage metrics (safe for unlinked layer: only model + counts).
     if let Some(usage) = &backend_response.meta.usage {
@@ -505,6 +542,169 @@ async fn handle_non_streaming_request(
     Ok(Json(eidola_response).into_response())
 }
 
+/// Per-stream timing accumulator behind the streaming instruments.
+///
+/// Lives for exactly one stream and reports once, when the stream terminates.
+/// Everything it holds is a duration or a count: it never sees content, and no
+/// value it produces is attributed to an individual request — each one lands
+/// in a histogram bucket or a counter keyed only by model.
+struct StreamTiming {
+    model_id: String,
+    dispatched_at: Instant,
+    first_chunk_at: Option<Instant>,
+    last_chunk_at: Option<Instant>,
+    chunks: u64,
+    /// Output chunks stamped strictly after `first_chunk_at`. Chunk stamps
+    /// have socket-read resolution — every SSE event parsed out of one
+    /// read shares one stamp — so this, not `chunks`, is what says how
+    /// much of the stream the observed timing window actually covers (see
+    /// `observations`).
+    chunks_after_first: u64,
+    max_gap: Duration,
+}
+
+impl StreamTiming {
+    fn new(model_id: String, dispatched_at: Instant) -> Self {
+        Self {
+            model_id,
+            dispatched_at,
+            first_chunk_at: None,
+            last_chunk_at: None,
+            chunks: 0,
+            chunks_after_first: 0,
+            max_gap: Duration::ZERO,
+        }
+    }
+
+    fn model_attr(&self) -> [KeyValue; 1] {
+        [KeyValue::new("model", self.model_id.clone())]
+    }
+
+    /// Note an output-bearing chunk, at the instant the upstream reader
+    /// took it off the socket (see [`BackendStreamEvent`] — handler-side
+    /// arrival would additionally fold this process's channel buffering
+    /// into every gap; the socket stamp removes that, though a client
+    /// slow enough to exhaust the bounded buffers still throttles the
+    /// socket itself). Records time-to-first-token on the first one and
+    /// tracks the largest inter-chunk gap after that.
+    fn on_chunk(&mut self, at: Instant) {
+        match self.last_chunk_at {
+            None => {
+                self.first_chunk_at = Some(at);
+                crate::telemetry::metrics::CHAT_TTFT.record(
+                    at.duration_since(self.dispatched_at).as_secs_f64(),
+                    &self.model_attr(),
+                );
+            }
+            Some(previous) => {
+                self.max_gap = self.max_gap.max(at.duration_since(previous));
+                if self.first_chunk_at.is_some_and(|first| at > first) {
+                    self.chunks_after_first += 1;
+                }
+            }
+        }
+        self.last_chunk_at = Some(at);
+        self.chunks += 1;
+    }
+
+    /// The max-gap and output-rate observations this stream yields, or
+    /// `None` where no meaningful observation exists. Pure, so the
+    /// arithmetic is unit-testable apart from the instruments.
+    ///
+    /// Both need real inter-chunk timing to exist: when every output chunk
+    /// shared one socket-read stamp (a coalesced read — common for short
+    /// responses), no timing was observed at all, and recording anyway
+    /// would fabricate a perfectly smooth zero gap and an unbounded rate.
+    ///
+    /// The rate's window opens at the first stamp, so it covers generating
+    /// only the chunks stamped after it — `chunks_after_first` of
+    /// `chunks`. The numerator is scaled to that share of the total
+    /// tokens; computing the share from stamped-after counts rather than
+    /// chunk ordinals is what keeps a coalesced burst honest (499 chunks
+    /// in one read followed by 1 more is 1/500 of the tokens across the
+    /// window, not 499/500). Assumes tokens spread roughly evenly across
+    /// chunks — exact in the common one-token-per-chunk case.
+    fn observations(&self, completion_tokens: Option<u64>) -> (Option<f64>, Option<f64>) {
+        if self.chunks < 2 || self.chunks_after_first == 0 {
+            return (None, None);
+        }
+        let (Some(first), Some(last)) = (self.first_chunk_at, self.last_chunk_at) else {
+            return (None, None);
+        };
+
+        let gap = Some(self.max_gap.as_secs_f64());
+
+        let generation = last.duration_since(first).as_secs_f64();
+        let rate = match completion_tokens {
+            Some(tokens) if tokens > 0 && generation > 0.0 => {
+                let tokens_in_window =
+                    tokens as f64 * self.chunks_after_first as f64 / self.chunks as f64;
+                Some(tokens_in_window / generation)
+            }
+            _ => None,
+        };
+
+        (gap, rate)
+    }
+
+    /// Report the stream's outcome. Called exactly once, on every terminal
+    /// path, at the moment the terminal condition is observed — before
+    /// refund settlement and metadata delivery, which are our own
+    /// post-stream work: the duration histogram is documented as
+    /// dispatch-to-final-chunk, and recording it later would let a slow
+    /// database read as an upstream generation regression. `ended_at` is
+    /// the upstream-side stamp of that terminal event where one exists
+    /// (the Done event carries one); error paths pass their observation
+    /// time.
+    ///
+    /// The output rate is measured across the *generation* window (first chunk
+    /// to last), not the whole stream: time-to-first-token is already its own
+    /// histogram, and leaving prefill in the denominator would make the rate
+    /// move for two unrelated reasons at once.
+    fn finish(self, reason: &'static str, completion_tokens: Option<u64>, ended_at: Instant) {
+        let attrs = self.model_attr();
+
+        crate::telemetry::metrics::CHAT_STREAM_OUTCOME.add(
+            1,
+            &[
+                KeyValue::new("model", self.model_id.clone()),
+                KeyValue::new("reason", reason),
+            ],
+        );
+        crate::telemetry::metrics::CHAT_STREAM_DURATION.record(
+            ended_at.duration_since(self.dispatched_at).as_secs_f64(),
+            &attrs,
+        );
+
+        let (gap, rate) = self.observations(completion_tokens);
+        if let Some(gap) = gap {
+            crate::telemetry::metrics::CHAT_INTER_TOKEN_GAP_MAX.record(gap, &attrs);
+        }
+        if let Some(rate) = rate {
+            crate::telemetry::metrics::CHAT_OUTPUT_RATE.record(rate, &attrs);
+        }
+    }
+}
+
+/// Whether a streamed chunk carries generated output — content, reasoning,
+/// or tool-call fragments. The role preamble, the bare finish-reason chunk,
+/// and the usage-only final chunk (which we force via `include_usage`) carry
+/// none, and must not feed [`StreamTiming`]: they would start the
+/// time-to-first-token clock before the first generated token and stretch
+/// the generation window the output rate and max-gap instruments measure.
+fn carries_output(chunk: &ChatCompletionChunk) -> bool {
+    chunk.choices.iter().any(|choice| {
+        let delta = &choice.delta;
+        delta.content.as_deref().is_some_and(|s| !s.is_empty())
+            || delta
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            || delta.reasoning.as_deref().is_some_and(|s| !s.is_empty())
+            || delta.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+    })
+}
+
 /// Handle a streaming chat completion request.
 async fn handle_streaming_request(
     state: AppState,
@@ -517,6 +717,10 @@ async fn handle_streaming_request(
         method: AuthMethod::AnonymousCredential,
     };
 
+    // Stream timing is measured from upstream dispatch, not from request
+    // arrival: everything before this point is our own verification work,
+    // which the HTTP-level histogram already covers.
+    let dispatched_at = Instant::now();
     let mut upstream_rx = match state.backend.send_stream(request).await {
         Ok(rx) => rx,
         Err(e) => {
@@ -580,9 +784,13 @@ async fn handle_streaming_request(
             match issue_refund_async(state, &proof, issuer_key_hash, refund_credits).await {
                 Ok(info) => Some(info),
                 Err(e) => {
+                    // No amount in the log: `refund_credits` is a function
+                    // of the prompt's chargeable bytes and the upstream's
+                    // token counts — the same content-derived quantity the
+                    // `PaymentRequired` redaction keeps out of logs.
                     error!(
-                        "CRITICAL: failed to issue refund ({} credits): {}, retrying with zero",
-                        refund_credits, e
+                        "CRITICAL: failed to issue refund: {}, retrying with zero",
+                        e
                     );
                     // Fall back to a zero refund (returns blind remaining value
                     // c - s) so the client doesn't lose the credential entirely.
@@ -615,10 +823,14 @@ async fn handle_streaming_request(
         }
 
         let mut final_usage: Option<Usage> = None;
+        let mut timing = StreamTiming::new(model_id.clone(), dispatched_at);
 
         while let Some(event_result) = upstream_rx.recv().await {
             match event_result {
-                Ok(BackendStreamEvent::Chunk(chunk)) => {
+                Ok(BackendStreamEvent::Chunk(chunk, at)) => {
+                    if carries_output(&chunk) {
+                        timing.on_chunk(at);
+                    }
                     // Capture usage from the final chunk if present.
                     if chunk.usage.is_some() {
                         final_usage.clone_from(&chunk.usage);
@@ -631,17 +843,24 @@ async fn handle_streaming_request(
                         // (returns blind remaining value c - s). The client can't
                         // receive this, but we issue it for consistency.
                         warn!("Client disconnected mid-stream, issuing zero refund");
+                        timing.finish("client_disconnect", None, at);
                         let _ = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
                         return;
                     }
                 }
-                Ok(BackendStreamEvent::Done(meta)) => {
+                Ok(BackendStreamEvent::Done(meta, at)) => {
                     let is_tee = meta.tee_type.is_some();
 
                     // Prefer usage from the final chunk, then from meta.
                     if final_usage.is_none() {
                         final_usage = meta.usage.clone();
                     }
+
+                    timing.finish(
+                        "done",
+                        final_usage.as_ref().map(|u| u.completion_tokens as u64),
+                        at,
+                    );
 
                     // Record token usage metrics (safe: only model + counts).
                     if let Some(usage) = &final_usage {
@@ -685,6 +904,7 @@ async fn handle_streaming_request(
                     // Some chunks may have been delivered and billed; we don't
                     // know the actual cost. Refund 0 (blind remaining value).
                     error!("Stream error, issuing zero refund: {}", e);
+                    timing.finish("upstream_error", None, Instant::now());
                     let refund_info =
                         try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
                     let privacy = build_privacy_metadata(&auth_context, true, "tinfoil");
@@ -699,6 +919,7 @@ async fn handle_streaming_request(
         // upstream_rx closed without a Done event (unexpected). Chunks may
         // have been delivered and billed; we don't know the cost. Refund 0.
         warn!("Upstream channel closed without Done event, issuing zero refund");
+        timing.finish("channel_closed", None, Instant::now());
         let refund_info = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
         let privacy = build_privacy_metadata(&auth_context, true, "tinfoil");
         let verification = build_verification_metadata(None);
@@ -723,12 +944,13 @@ async fn handle_streaming_request(
 /// "(422): unknown error". This wrapper makes those failures visible
 /// to operators.
 ///
-/// **Privacy:** the rejection error message produced by axum + serde is
-/// **structural only** — it names the offending field and the kind of
-/// error ("unknown field `foo`", "missing field `model`", "expected u32
-/// at line N column M") and does not include the user's prompt or any
-/// other request body content. We log only that error string. Body
-/// bytes are owned by axum's extractor and never reach the log path.
+/// **Privacy:** the rejection message produced by axum + serde **can
+/// echo client-authored body values** — `deny_unknown_fields` quotes the
+/// unrecognized field name verbatim, and serde's data errors quote the
+/// offending scalar (`invalid type: string "<the whole string>",
+/// expected u32`). Only the rejection *class* reaches the log path; the
+/// full detail still goes to the client in the rejection response — its
+/// own data, over its own attested connection.
 pub struct LoggedJson<T>(pub T);
 
 impl<S, T> FromRequest<S> for LoggedJson<T>
@@ -743,12 +965,18 @@ where
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(Self(value)),
             Err(rejection) => {
-                // Field-shape diagnostic only — the source error from
-                // axum/serde names the field but never echoes the body
-                // value. Safe to log.
+                // Class only — the rejection's message can quote body
+                // values (see the type-level privacy note).
+                let class = match &rejection {
+                    JsonRejection::JsonDataError(_) => "data",
+                    JsonRejection::JsonSyntaxError(_) => "syntax",
+                    JsonRejection::MissingJsonContentType(_) => "missing content-type",
+                    JsonRejection::BytesRejection(_) => "bytes",
+                    _ => "other",
+                };
                 warn!(
-                    target = std::any::type_name::<T>(),
-                    "request body rejected: {rejection}"
+                    payload_type = std::any::type_name::<T>(),
+                    "request body rejected: {class} error"
                 );
                 Err(rejection)
             }
@@ -796,6 +1024,117 @@ mod tests {
             "max_completion_tokens": max_completion_tokens,
         }))
         .expect("valid request")
+    }
+
+    /// Parse a chunk from the exact JSON shape the upstream sends.
+    fn chunk(json: serde_json::Value) -> ChatCompletionChunk {
+        serde_json::from_value(json).expect("valid chunk")
+    }
+
+    #[test]
+    fn carries_output_ignores_non_token_chunks() {
+        // Role preamble with an empty content string.
+        assert!(!carries_output(&chunk(serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]
+        }))));
+        // Bare finish-reason chunk.
+        assert!(!carries_output(&chunk(serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }))));
+        // Forced usage-only final chunk (empty choices).
+        assert!(!carries_output(&chunk(serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        }))));
+    }
+
+    #[test]
+    fn carries_output_accepts_content_reasoning_and_tool_calls() {
+        for delta in [
+            serde_json::json!({"content": "Hi"}),
+            serde_json::json!({"reasoning_content": "hmm"}),
+            serde_json::json!({"reasoning": "hmm"}),
+            serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": "{"}}]}),
+        ] {
+            assert!(
+                carries_output(&chunk(serde_json::json!({
+                    "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+                }))),
+                "delta should count as output: {delta}"
+            );
+        }
+    }
+
+    /// Drive `StreamTiming` with synthetic socket-read stamps and check the
+    /// pure `observations` math — the instruments themselves record to the
+    /// global (no-op in tests) meter and aren't asserted here.
+    #[test]
+    fn stream_observations_scale_to_the_observed_window() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        // Per-token streaming, one stamp per chunk: window spans 2 of 3
+        // chunks → rate = 3 tokens * 2/3 over 20 ms = 100 tok/s; max gap
+        // is the larger interval.
+        let mut timing = StreamTiming::new("m".into(), t0);
+        timing.on_chunk(at(100));
+        timing.on_chunk(at(108));
+        timing.on_chunk(at(120));
+        let (gap, rate) = timing.observations(Some(3));
+        assert_eq!(gap, Some(0.012));
+        assert_eq!(rate, Some(100.0));
+
+        // A coalesced burst: 4 chunks share one read, 1 more arrives 30 ms
+        // later. The window covers generating 1 of 5 chunks, so the rate is
+        // 500 * 1/5 / 0.030 — not 500 * 4/5 / 0.030.
+        let mut timing = StreamTiming::new("m".into(), t0);
+        for _ in 0..4 {
+            timing.on_chunk(at(100));
+        }
+        timing.on_chunk(at(130));
+        let (gap, rate) = timing.observations(Some(500));
+        assert_eq!(gap, Some(0.030));
+        assert!((rate.unwrap() - 500.0 / 5.0 / 0.030).abs() < 1e-9);
+    }
+
+    /// Streams that yield no usable inter-chunk timing must yield no
+    /// observation at all — recording would fabricate a perfectly smooth
+    /// zero gap and an unbounded rate.
+    #[test]
+    fn stream_observations_skip_unobservable_windows() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        // Everything in one coalesced read: one shared stamp.
+        let mut timing = StreamTiming::new("m".into(), t0);
+        for _ in 0..3 {
+            timing.on_chunk(at(100));
+        }
+        assert_eq!(timing.observations(Some(50)), (None, None));
+
+        // A single chunk.
+        let mut timing = StreamTiming::new("m".into(), t0);
+        timing.on_chunk(at(100));
+        assert_eq!(timing.observations(Some(50)), (None, None));
+
+        // No chunks at all.
+        let timing = StreamTiming::new("m".into(), t0);
+        assert_eq!(timing.observations(Some(50)), (None, None));
+
+        // Real timing but zero (or absent) reported tokens: the gap stands,
+        // the rate does not — 0 tok/s would read as a stall.
+        let mut timing = StreamTiming::new("m".into(), t0);
+        timing.on_chunk(at(100));
+        timing.on_chunk(at(110));
+        assert_eq!(timing.observations(Some(0)), (Some(0.010), None));
+        let mut timing = StreamTiming::new("m".into(), t0);
+        timing.on_chunk(at(100));
+        timing.on_chunk(at(110));
+        assert_eq!(timing.observations(None), (Some(0.010), None));
     }
 
     #[test]

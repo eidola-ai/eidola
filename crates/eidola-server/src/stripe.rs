@@ -51,7 +51,11 @@ struct StripeErrorResponse {
 
 #[derive(Debug, Deserialize)]
 struct StripeErrorBody {
-    pub message: String,
+    /// Stripe's enumerable error classifier (`type` in the JSON). The
+    /// free-text `message` field is deliberately not modeled — see
+    /// [`stripe_error`].
+    #[serde(rename = "type", default)]
+    pub error_type: Option<String>,
 }
 
 /// Stripe product (expanded from a price).
@@ -154,20 +158,24 @@ impl StripeClient {
             .form(&[("metadata[account_id]", account_id.to_string())])
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
         }
 
-        let customer: Customer = serde_json::from_slice(&body)
-            .map_err(|e| ServerError::Parse(format!("stripe customer: {}", e)))?;
+        let customer: Customer = serde_json::from_slice(&body).map_err(|e| {
+            ServerError::Parse(format!(
+                "stripe customer: {}",
+                crate::error::parse_error_summary(&e)
+            ))
+        })?;
 
         Ok(customer.id)
     }
@@ -184,20 +192,24 @@ impl StripeClient {
             .query(&[("customer", customer_id), ("limit", "10")])
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
         }
 
-        let list: ListResponse<Subscription> = serde_json::from_slice(&body)
-            .map_err(|e| ServerError::Parse(format!("stripe subscriptions: {}", e)))?;
+        let list: ListResponse<Subscription> = serde_json::from_slice(&body).map_err(|e| {
+            ServerError::Parse(format!(
+                "stripe subscriptions: {}",
+                crate::error::parse_error_summary(&e)
+            ))
+        })?;
 
         Ok(list.data)
     }
@@ -215,20 +227,24 @@ impl StripeClient {
             ])
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
         }
 
-        let list: ListResponse<StripePrice> = serde_json::from_slice(&body)
-            .map_err(|e| ServerError::Parse(format!("stripe prices: {}", e)))?;
+        let list: ListResponse<StripePrice> = serde_json::from_slice(&body).map_err(|e| {
+            ServerError::Parse(format!(
+                "stripe prices: {}",
+                crate::error::parse_error_summary(&e)
+            ))
+        })?;
 
         Ok(list.data)
     }
@@ -241,20 +257,24 @@ impl StripeClient {
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
         }
 
-        serde_json::from_slice(&body)
-            .map_err(|e| ServerError::Parse(format!("stripe price: {}", e)))
+        serde_json::from_slice(&body).map_err(|e| {
+            ServerError::Parse(format!(
+                "stripe price: {}",
+                crate::error::parse_error_summary(&e)
+            ))
+        })
     }
 
     /// Fetch a single product by ID.
@@ -265,20 +285,24 @@ impl StripeClient {
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
         }
 
-        serde_json::from_slice(&body)
-            .map_err(|e| ServerError::Parse(format!("stripe product: {}", e)))
+        serde_json::from_slice(&body).map_err(|e| {
+            ServerError::Parse(format!(
+                "stripe product: {}",
+                crate::error::parse_error_summary(&e)
+            ))
+        })
     }
 
     /// Create a Stripe Checkout Session and return the checkout URL.
@@ -319,20 +343,24 @@ impl StripeClient {
             .form(&form)
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
         }
 
-        let session: CheckoutSession = serde_json::from_slice(&body)
-            .map_err(|e| ServerError::Parse(format!("stripe checkout: {}", e)))?;
+        let session: CheckoutSession = serde_json::from_slice(&body).map_err(|e| {
+            ServerError::Parse(format!(
+                "stripe checkout: {}",
+                crate::error::parse_error_summary(&e)
+            ))
+        })?;
 
         session
             .url
@@ -354,20 +382,24 @@ impl StripeClient {
             .query(&[("expand[]", "data.price")])
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
         }
 
-        let list: ListResponse<CheckoutLineItem> = serde_json::from_slice(&body)
-            .map_err(|e| ServerError::Parse(format!("stripe line items: {}", e)))?;
+        let list: ListResponse<CheckoutLineItem> = serde_json::from_slice(&body).map_err(|e| {
+            ServerError::Parse(format!(
+                "stripe line items: {}",
+                crate::error::parse_error_summary(&e)
+            ))
+        })?;
 
         Ok(list.data)
     }
@@ -385,30 +417,53 @@ impl StripeClient {
             .form(&[("customer", customer_id), ("return_url", return_url)])
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
         }
 
-        let session: PortalSession = serde_json::from_slice(&body)
-            .map_err(|e| ServerError::Parse(format!("stripe portal: {}", e)))?;
+        let session: PortalSession = serde_json::from_slice(&body).map_err(|e| {
+            ServerError::Parse(format!(
+                "stripe portal: {}",
+                crate::error::parse_error_summary(&e)
+            ))
+        })?;
 
         Ok(session.url)
     }
 }
 
 /// Parse a Stripe error response body into a ServerError.
+///
+/// The body is Stripe-authored: its `message` is free text that can quote
+/// ids and customer-facing detail, and this error's `Display` reaches the
+/// logs — so only the fixed-list resolution of Stripe's `type` classifier
+/// is carried, never the raw body. Operators diagnose the specifics in
+/// the Stripe dashboard, which holds the authoritative request log anyway.
 fn stripe_error(body: &[u8]) -> ServerError {
-    if let Ok(err) = serde_json::from_slice::<StripeErrorResponse>(body) {
-        ServerError::Network(format!("stripe error: {}", err.error.message))
-    } else {
-        ServerError::Network(format!("stripe error: {}", String::from_utf8_lossy(body)))
+    const STRIPE_ERROR_TYPES: &[&str] = &[
+        "api_error",
+        "card_error",
+        "idempotency_error",
+        "invalid_request_error",
+    ];
+    match serde_json::from_slice::<StripeErrorResponse>(body) {
+        Ok(err) => {
+            let label = err
+                .error
+                .error_type
+                .as_deref()
+                .and_then(|t| STRIPE_ERROR_TYPES.iter().copied().find(|known| *known == t))
+                .unwrap_or("other");
+            ServerError::Network(format!("stripe error: {label}"))
+        }
+        Err(_) => ServerError::Network("stripe error: unparseable error body".to_string()),
     }
 }

@@ -21,6 +21,14 @@ set -euo pipefail
 
 base="${1:?usage: check-legal-doc-versions.sh <base-ref-or-sha>}"
 
+# TODO(pre-publication): the versioning contract begins when version 1 of
+# the legal documents is first published — until then no client can have
+# accepted any hash, so byte churn on the drafts is unordered and fine.
+# Delete this early exit in the same PR as the first post-publication
+# revision (the one that introduces version 2).
+echo "Legal documents are pre-publication drafts; versioning contract not yet in force."
+exit 0
+
 DOCS=(www/pages/terms.md www/pages/privacy.md)
 
 version_of() {

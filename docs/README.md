@@ -1,11 +1,11 @@
 # Documentation
 
-These docs describe how Eidola works, what it commits to, and what it doesn't yet defend against. They are written for a technical reader who wants to understand the design without necessarily reading every line of source — and who, in turn, can vouch for it to less technical friends and family.
+These docs describe how Eidola works, what it commits to, and what it doesn't yet defend against. They are written for a technical reader who wants to understand the design — and who, in turn, can vouch for it to less technical friends and family.
 
 ## Start here
 
 1. **[Paradigm](paradigm.md)** — How to think about Eidola. The user-sovereignty lens that everything else assumes.
-2. **[Privacy guarantees](privacy-guarantees.md)** — Enumerated, durable commitments that a release engineer signs against every release.
+2. **[Privacy guarantees](privacy-guarantees.md)** — Enumerated, durable commitments that a release officer signs against every release.
 3. **[Threat model](threat-model.md)** — Who Eidola defends against, who it doesn't, and what is left as residual trust.
 
 ## Design pieces
@@ -29,4 +29,4 @@ These docs describe how Eidola works, what it commits to, and what it doesn't ye
 
 ## For contributors
 
-Contributor-facing READMEs live alongside the code they describe. Start with the top-level [`README.md`](../README.md) for the project landing page and dev setup, [`AGENTS.md`](../AGENTS.md) for the architecture overview, and [`releases/README.md`](../releases/README.md) for release-pipeline operations. Task-oriented runbooks (e.g. provisioning the release signing YubiKey) live in [`contributing/`](contributing/README.md).
+Contributor-facing READMEs live alongside the code they describe. Start with the top-level [`README.md`](../README.md) for the project landing page and dev setup, and [`releases/README.md`](../releases/README.md) for release-pipeline operations. [`AGENTS.md`](../AGENTS.md) is intended for and almost entirely maintained by coding agents; while it is not written for a human audience *per se*, it contains a useful architecture overview. Task-oriented runbooks (e.g. provisioning the release signing YubiKey) live in [`contributing/`](contributing/README.md).

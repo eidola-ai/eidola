@@ -1,4 +1,4 @@
-//! Release engineer's tool. Two subcommands, run in order on a tag that has
+//! release officer's tool. Two subcommands, run in order on a tag that has
 //! already been pushed and built by CI:
 //!
 //! 1. `release-tool verify <tag>` — fetches the CI-built
@@ -8,7 +8,9 @@
 //!    the diff against the prior release tag for human review.
 //!
 //! 2. `release-tool attest <tag>` — interactively walks every claim in
-//!    `attestation-templates-v1.json`, rendering each from the engineer's
+//!    `attestation-templates.json` (as committed at the *previous*
+//!    release tag — the copy installed clients verify against),
+//!    rendering each from the engineer's
 //!    inputs. Each claim requires typing the word `yes` to affirm; anything
 //!    else aborts. On full affirmation, signs the attestation file via
 //!    `cosign sign-blob --key <ref>` (where `<ref>` is a local PEM, a
@@ -38,7 +40,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 mod attest;
+mod manifest;
 mod pkcs11;
+mod preflight;
 mod provenance;
 mod trust;
 mod verify;
@@ -46,7 +50,7 @@ mod verify;
 #[derive(Parser)]
 #[command(
     name = "release-tool",
-    about = "Eidola release engineer's verify + attest workflow",
+    about = "Eidola release officer's verify + attest workflow",
     version
 )]
 struct Cli {
@@ -108,6 +112,14 @@ enum Command {
         /// `the State of California, United States`).
         #[arg(long, env = "EIDOLA_ATTESTANT_JURISDICTION")]
         jurisdiction: String,
+
+        /// Escape hatch: sign from this templates file instead of the
+        /// ones committed at the previous release tag. Installed clients
+        /// verify against the templates embedded at the previous release,
+        /// so anything else produces a release they reject — use only for
+        /// a deliberate chain-breaking release.
+        #[arg(long)]
+        templates: Option<PathBuf>,
     },
 
     /// PKCS#11 helpers for hardware attestant keys (YubiKey / SmartCard /
@@ -236,6 +248,7 @@ fn main() -> Result<()> {
             attestant_id,
             attestant_name,
             jurisdiction,
+            templates,
         } => {
             let workspace_root = workspace_root()?;
             let repo = resolve_repo(cli.repo.as_deref(), &workspace_root)?;
@@ -247,6 +260,7 @@ fn main() -> Result<()> {
                 attestant_id,
                 attestant_name,
                 jurisdiction,
+                templates_override: templates,
             })
         }
     }

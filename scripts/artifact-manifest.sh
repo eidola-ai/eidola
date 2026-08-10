@@ -63,6 +63,27 @@ CVM_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/eidola/cvm"
 OVMF_VERSION="v0.0.3"
 OVMF_URL="https://github.com/tinfoilsh/edk2/releases/download/${OVMF_VERSION}/OVMF.fd"
 
+# SHA-256 of the OVMF.fd release asset at ${OVMF_VERSION}. GitHub release tags
+# are mutable, so the download (and any cache hit) is verified against this
+# committed hash. Cross-checked against the Sigstore-signed attestation for
+# the asset:
+#   gh attestation verify OVMF.fd -R tinfoilsh/edk2 \
+#     --predicate-type "https://tinfoil.sh/predicate/component-artifact/v1" \
+#     --deny-self-hosted-runners
+OVMF_SHA256="3a38d062226a2369b1bd85b5408ed597eec793dad71c466f82f5765e4e7b1c9f"
+
+# SHA-256 of the CVM release manifest for the cvm-version below. The manifest
+# is fetched from a mutable release tag, and it carries the kernel/initrd
+# hashes and the dm-verity roothash — so pinning it transitively pins the
+# whole CVM artifact set. Must be updated together with `cvm-version` in
+# tinfoil-config.yml; the version match is enforced at fetch time. An inline
+# `cvm-version: X@sha256:HEX` pin in tinfoil-config.yml (the
+# tinfoilsh/measure-image-action syntax) takes precedence over these
+# constants. Cross-checked against the Sigstore attestation:
+#   gh attestation verify <manifest> -R tinfoilsh/cvmimage --deny-self-hosted-runners
+CVM_MANIFEST_VERSION="0.7.3"
+CVM_MANIFEST_SHA256="515585830b6df4e737f01aa041dcc40e926df0af306cd9d7a8037651befa1aa5"
+
 COMMAND="${1:-}"
 if [[ "$COMMAND" = "-h" || "$COMMAND" = "--help" ]]; then
   usage
@@ -168,12 +189,38 @@ done
 
 # ── CVM artifact fetching ─────────────────────────────────────────────────────
 
-# Read the cvm-version field from tinfoil-config.yml.
-read_cvm_version() {
-  grep -E '^cvm-version:' "$CONFIG_FILE" | sed 's/^cvm-version:[[:space:]]*//'
+compute_sha256() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | cut -d' ' -f1
+  else
+    shasum -a 256 "$file" | cut -d' ' -f1
+  fi
+}
+
+# Read the cvm-version field from tinfoil-config.yml into CVM_VERSION and,
+# when the field carries an inline `@sha256:HEX` pin (the
+# tinfoilsh/measure-image-action digest-pinning syntax), CVM_MANIFEST_PIN.
+parse_cvm_version() {
+  local raw digest
+  raw="$(grep -E '^cvm-version:' "$CONFIG_FILE" | sed 's/^cvm-version:[[:space:]]*//')"
+  CVM_VERSION="${raw%%@*}"
+  CVM_MANIFEST_PIN=""
+  if [[ "$raw" == *@* ]]; then
+    digest="${raw#*@}"
+    if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      echo "error: malformed cvm-version pin in $CONFIG_FILE: $raw" >&2
+      echo "  expected: VERSION@sha256:<64 lowercase hex chars>" >&2
+      exit 1
+    fi
+    CVM_MANIFEST_PIN="${digest#sha256:}"
+  fi
 }
 
 # Download a URL to a local cache path, skipping if already present.
+# Only for artifacts that are hash-verified downstream (kernel/initrd, which
+# are checked against the pinned CVM manifest after fetch); everything else
+# must use verified_download.
 cached_download() {
   local url="$1" dest="$2"
   if [[ -f "$dest" ]]; then
@@ -184,51 +231,86 @@ cached_download() {
   curl -fsSL --retry 3 -o "$dest" "$url"
 }
 
+# Download a URL to a local cache path, verifying it against an expected
+# SHA-256. A cache hit is re-hashed rather than trusted; on mismatch the
+# stale file is discarded and re-downloaded. A fresh download that still
+# mismatches fails hard (mutable-tag substitution or a compromised mirror).
+verified_download() {
+  local url="$1" dest="$2" expected="$3" actual
+  if [[ -f "$dest" ]]; then
+    actual="$(compute_sha256 "$dest")"
+    if [[ "$actual" == "$expected" ]]; then
+      return 0
+    fi
+    echo "warning: cached $(basename "$dest") does not match its pinned hash; re-downloading" >&2
+    echo "  expected: $expected" >&2
+    echo "  actual:   $actual" >&2
+    rm -f "$dest"
+  fi
+  mkdir -p "$(dirname "$dest")"
+  echo "Downloading $(basename "$dest")..." >&2
+  curl -fsSL --retry 3 -o "$dest" "$url"
+  actual="$(compute_sha256 "$dest")"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "error: $(basename "$dest") hash mismatch after fresh download" >&2
+    echo "  url:      $url" >&2
+    echo "  expected: $expected" >&2
+    echo "  actual:   $actual" >&2
+    rm -f "$dest"
+    exit 1
+  fi
+}
+
 # Fetch CVM image artifacts (OVMF, kernel, initrd, manifest) and verify
 # kernel/initrd hashes against the CVM manifest.
 fetch_cvm_artifacts() {
-  local cvm_version cache_dir manifest_url manifest_file
+  local cache_dir manifest_url manifest_file manifest_expected
   local kernel_url kernel_file kernel_hash
   local initrd_url initrd_file initrd_hash
   local ovmf_file
 
-  cvm_version="$(read_cvm_version)"
-  cache_dir="${CVM_CACHE_DIR}/${cvm_version}"
+  parse_cvm_version
+  cache_dir="${CVM_CACHE_DIR}/${CVM_VERSION}"
 
-  # Fetch CVM manifest
-  manifest_url="https://github.com/tinfoilsh/cvmimage/releases/download/v${cvm_version}/tinfoil-inference-v${cvm_version}-manifest.json"
+  # Resolve the expected manifest hash: an inline pin in tinfoil-config.yml
+  # wins; otherwise the committed constants above apply and must agree with
+  # the config's cvm-version, so a version bump cannot silently outrun the pin.
+  if [[ -n "$CVM_MANIFEST_PIN" ]]; then
+    manifest_expected="$CVM_MANIFEST_PIN"
+  elif [[ "$CVM_VERSION" == "$CVM_MANIFEST_VERSION" ]]; then
+    manifest_expected="$CVM_MANIFEST_SHA256"
+  else
+    echo "error: cvm-version ${CVM_VERSION} has no committed manifest pin" >&2
+    echo "  Update CVM_MANIFEST_VERSION / CVM_MANIFEST_SHA256 in scripts/artifact-manifest.sh" >&2
+    echo "  (or pin inline in tinfoil-config.yml as: cvm-version: ${CVM_VERSION}@sha256:<hex>)." >&2
+    exit 1
+  fi
+
+  # Fetch CVM manifest (hash-pinned; release tags are mutable)
+  manifest_url="https://github.com/tinfoilsh/cvmimage/releases/download/v${CVM_VERSION}/tinfoil-inference-v${CVM_VERSION}-manifest.json"
   manifest_file="${cache_dir}/manifest.json"
-  cached_download "$manifest_url" "$manifest_file"
+  verified_download "$manifest_url" "$manifest_file" "$manifest_expected"
 
   # Extract expected hashes
   kernel_hash="$(jq -er '.kernel' "$manifest_file")"
   initrd_hash="$(jq -er '.initrd' "$manifest_file")"
 
   # Fetch kernel
-  kernel_url="https://images.tinfoil.sh/cvm/tinfoil-inference-v${cvm_version}.vmlinuz"
+  kernel_url="https://images.tinfoil.sh/cvm/tinfoil-inference-v${CVM_VERSION}.vmlinuz"
   kernel_file="${cache_dir}/vmlinuz"
   cached_download "$kernel_url" "$kernel_file"
 
   # Fetch initrd
-  initrd_url="https://images.tinfoil.sh/cvm/tinfoil-inference-v${cvm_version}.initrd"
+  initrd_url="https://images.tinfoil.sh/cvm/tinfoil-inference-v${CVM_VERSION}.initrd"
   initrd_file="${cache_dir}/initrd"
   cached_download "$initrd_url" "$initrd_file"
 
-  # Fetch OVMF (version-independent, cached by OVMF version)
+  # Fetch OVMF (hash-pinned; version-independent, cached by OVMF version)
   ovmf_file="${CVM_CACHE_DIR}/OVMF-${OVMF_VERSION}.fd"
-  cached_download "$OVMF_URL" "$ovmf_file"
+  verified_download "$OVMF_URL" "$ovmf_file" "$OVMF_SHA256"
 
   # Verify kernel and initrd against manifest hashes
   local actual_kernel_hash actual_initrd_hash
-
-  compute_sha256() {
-    local file="$1"
-    if command -v sha256sum >/dev/null 2>&1; then
-      sha256sum "$file" | cut -d' ' -f1
-    else
-      shasum -a 256 "$file" | cut -d' ' -f1
-    fi
-  }
 
   actual_kernel_hash="$(compute_sha256 "$kernel_file")"
   actual_initrd_hash="$(compute_sha256 "$initrd_file")"
@@ -250,8 +332,9 @@ fetch_cvm_artifacts() {
   fi
 
   # When --verify-attestations is set, verify CVM manifest provenance via
-  # Sigstore. This checks that the manifest was built on GitHub-hosted runners
-  # in the tinfoilsh/cvmimage repo. Fails hard if verification fails.
+  # Sigstore. The manifest is already hash-pinned above; this additionally
+  # checks that the pinned content was built on GitHub-hosted runners in the
+  # tinfoilsh/cvmimage repo. Fails hard if verification fails.
   if [[ "$VERIFY_ATTESTATIONS" -eq 1 ]]; then
     echo "Verifying CVM manifest attestation..." >&2
     if ! gh attestation verify "$manifest_file" -R tinfoilsh/cvmimage --deny-self-hosted-runners; then

@@ -309,6 +309,11 @@ pub(crate) fn check_snp_measurement(
 
 /// Check a TDX RTMR1+RTMR2 pair against the allowed list (case-insensitive).
 /// Returns the matched [`MatchedMeasurement::Tdx`] on success.
+///
+/// Unreachable while the platform dispatch refuses `Platform::Tdx` —
+/// RTMR1/RTMR2 alone are insufficient policy (guest-replayable without
+/// MRTD); retained for the eventual re-enable path.
+#[allow(dead_code)]
 pub(crate) fn check_tdx_measurement(
     allowed: &[EnclaveMeasurement],
     rtmr1_hex: &str,

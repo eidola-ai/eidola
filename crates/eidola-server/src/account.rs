@@ -283,10 +283,15 @@ pub async fn create_account(
 }
 
 /// GET /v1/terms — the document versions whose acceptance is required.
+///
+/// Public, and necessarily so: a client fetches this *before* it has an
+/// account, to learn what it must accept. It takes no credential and returns
+/// no account-specific data. (Accepting them is `POST /v1/account/terms`,
+/// which is on the linked surface.)
 #[utoipa::path(
     get,
     path = "/v1/terms",
-    tag = "Linked",
+    tag = "Public",
     responses(
         (status = 200, description = "Currently required document versions", body = TermsResponse)
     )
@@ -330,12 +335,14 @@ pub async fn accept_terms(
         .iter()
         .find(|d| d.document == req.document && d.sha256 == sha256)
     else {
+        // Value-free by design: `Conflict`'s message is logged verbatim,
+        // and `req.document` / `req.sha256` are client-authored strings
+        // that failed exactly the fixed-list lookup that would have
+        // bounded them. The client knows what it sent.
         return Err(ServerError::Conflict {
-            message: format!(
-                "{} with hash {} is not the currently required version — \
-                 fetch GET /v1/terms for the current documents",
-                req.document, req.sha256
-            ),
+            message: "the submitted document/hash pair is not a currently required \
+                      version — fetch GET /v1/terms for the current documents"
+                .to_string(),
         });
     };
 

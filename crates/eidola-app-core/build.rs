@@ -10,7 +10,7 @@
 //!     discovery URLs, server URL template).
 //!   * `releases/trust/sigstore-trusted-root.json` — pinned Sigstore tlog /
 //!     Fulcio / CT log keys (snapshot of the upstream TrustedRoot).
-//!   * `releases/schema/attestation-templates-v1.json` — pinned claim
+//!   * `releases/schema/attestation-templates.json` — pinned claim
 //!     templates the verifier re-renders during equality checks.
 //!
 //! Each input file is rerun-watched; the generator validates that everything
@@ -37,7 +37,7 @@ fn main() {
     let sigstore_trusted_root_path =
         workspace_root.join("releases/trust/sigstore-trusted-root.json");
     let attestation_templates_path =
-        workspace_root.join("releases/schema/attestation-templates-v1.json");
+        workspace_root.join("releases/schema/attestation-templates.json");
 
     for p in [
         &server_enclave_path,
@@ -55,7 +55,19 @@ fn main() {
     // Validate sibling JSON files parse, but include the raw bytes verbatim
     // so the on-disk file is the canonical form (no re-serialization drift).
     let _ = read_json(&sigstore_trusted_root_path);
-    let _ = read_json(&attestation_templates_path);
+
+    // The templates file must load through the same code the verifier
+    // uses at runtime — schema_version pin, deny_unknown_fields, all of
+    // it — so a file/loader mismatch fails this build instead of every
+    // release verification.
+    let templates_json = fs::read_to_string(&attestation_templates_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", attestation_templates_path.display()));
+    eidola_attestation::load_from_str(&templates_json).unwrap_or_else(|e| {
+        panic!(
+            "{} is not loadable by the pinned verifier: {e:#}",
+            attestation_templates_path.display()
+        )
+    });
 
     let enclave_schema_version = get_u32(&server_enclave, "schema_version");
     if enclave_schema_version != 1 {

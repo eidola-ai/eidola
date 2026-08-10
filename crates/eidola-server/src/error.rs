@@ -98,23 +98,44 @@ impl ServerError {
     }
 }
 
+/// The **log-safe** rendering of an error.
+///
+/// A `ServerError` has two renderings and they are deliberately not the same.
+/// [`to_error_response`](ServerError::to_error_response) is the full detail,
+/// and it goes only to the client that made the request — its own data, over
+/// its own attested connection. `Display` is the rendering that reaches
+/// stdout and the OTLP exporter, so it omits every field whose value is
+/// derived from request content or authored by the upstream:
+///
+/// - `PaymentRequired` carries the worst-case charge, which is a
+///   deterministic function of the prompt's chargeable bytes. Logging it
+///   would publish a prompt-length estimate at request granularity, which
+///   `docs/privacy-guarantees.md` §3.2 rules out.
+/// - `Backend` carries the upstream's own error string. That string is
+///   outside our control and can quote token counts or fragments of the
+///   request, so only the status and a fixed-list resolution of the
+///   upstream's error-type classifier are logged — the classifier is
+///   itself upstream-authored free text, so anything outside
+///   [`KNOWN_UPSTREAM_ERROR_TYPES`] collapses to `other`.
+///
+/// Every other variant's message is authored by this crate from constants (or
+/// from an error that describes a *shape* failure, not a value), so it is
+/// logged in full. Keep it that way: a message that interpolates anything
+/// request-derived belongs in the redacted set above, not here.
 impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ServerError::BadRequest { message } => write!(f, "bad request: {}", message),
             ServerError::Unauthorized { message } => write!(f, "unauthorized: {}", message),
             ServerError::Backend {
+                status, error_type, ..
+            } => write!(
+                f,
+                "backend error ({}): {}",
                 status,
-                error_type,
-                message,
-            } => write!(f, "backend error ({}): {}: {}", status, error_type, message),
-            ServerError::PaymentRequired { message, available } => {
-                write!(
-                    f,
-                    "payment required: {} (available: {})",
-                    message, available
-                )
-            }
+                upstream_error_type_label(error_type)
+            ),
+            ServerError::PaymentRequired { .. } => write!(f, "payment required"),
             ServerError::NotFound { message } => write!(f, "not found: {}", message),
             ServerError::Conflict { message } => write!(f, "conflict: {}", message),
             ServerError::TermsAcceptanceRequired { message } => {
@@ -130,6 +151,43 @@ impl std::fmt::Display for ServerError {
 
 impl std::error::Error for ServerError {}
 
+/// Upstream error-type classifiers the log path recognizes. `error_type`
+/// arrives as upstream-authored free text, so the `Display` rendering
+/// resolves it against this list and collapses anything unrecognized to
+/// `other` — the client response keeps the verbatim value. `unknown` is
+/// this crate's own bucket for upstream error bodies that didn't parse.
+const KNOWN_UPSTREAM_ERROR_TYPES: &[&str] = &[
+    "authentication_error",
+    "insufficient_quota",
+    "invalid_request_error",
+    "not_found_error",
+    "permission_error",
+    "rate_limit_error",
+    "server_error",
+    "unknown",
+];
+
+fn upstream_error_type_label(error_type: &str) -> &'static str {
+    KNOWN_UPSTREAM_ERROR_TYPES
+        .iter()
+        .copied()
+        .find(|known| *known == error_type)
+        .unwrap_or("other")
+}
+
+/// Log-safe summary of a `serde_json` error.
+///
+/// serde's own messages echo offending values verbatim — `invalid type:
+/// string "<the value>", expected u32`, ``unknown field `<the name>` `` —
+/// so nothing a serde error `Display`s may reach the log path. The error
+/// position is dropped along with the message: line/column identify a byte
+/// offset into the failed document, and on a minified inference response
+/// that is per-request content-length material (an EOF failure's column is
+/// the response length). Only the fixed error category survives.
+pub(crate) fn parse_error_summary(e: &serde_json::Error) -> String {
+    format!("{:?} error", e.classify())
+}
+
 impl axum::response::IntoResponse for ServerError {
     fn into_response(self) -> axum::response::Response {
         let status = self.status_code();
@@ -140,5 +198,102 @@ impl axum::response::IntoResponse for ServerError {
         }
         let body = self.to_error_response();
         (status, axum::Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The charge operands are a function of the prompt's chargeable bytes.
+    /// They belong to the client and must not reach the logs.
+    #[test]
+    fn payment_required_display_omits_charge_operands() {
+        let err = ServerError::PaymentRequired {
+            message: "insufficient charge: 120 credits provided, 4096 required (worst case)"
+                .to_string(),
+            available: 120,
+        };
+        let logged = err.to_string();
+        assert_eq!(logged, "payment required");
+        assert!(
+            !logged.contains("4096"),
+            "worst-case charge leaked: {logged}"
+        );
+        assert!(!logged.contains("120"), "presented charge leaked: {logged}");
+
+        // The client still gets the full detail on its own connection.
+        assert!(err.to_error_response().error.message.contains("4096"));
+    }
+
+    /// Upstream error strings are outside our control and can quote token
+    /// counts or request fragments. Only status + classifier are logged.
+    #[test]
+    fn backend_display_omits_upstream_message() {
+        let err = ServerError::Backend {
+            status: 400,
+            error_type: "invalid_request_error".to_string(),
+            message: "This model's maximum context length is 8192 tokens, however you \
+                      requested 9001 tokens (8501 in the messages)"
+                .to_string(),
+        };
+        let logged = err.to_string();
+        assert_eq!(logged, "backend error (400): invalid_request_error");
+        assert!(
+            !logged.contains("8501"),
+            "prompt token count leaked: {logged}"
+        );
+        assert!(
+            !logged.contains("context length"),
+            "upstream body leaked: {logged}"
+        );
+
+        assert!(err.to_error_response().error.message.contains("8501"));
+    }
+
+    /// `error_type` is upstream-authored free text; an unrecognized value
+    /// must collapse to the shared bucket instead of reaching the logs.
+    #[test]
+    fn backend_display_buckets_unrecognized_error_type() {
+        let err = ServerError::Backend {
+            status: 400,
+            error_type: "you requested 9001 tokens".to_string(),
+            message: "irrelevant".to_string(),
+        };
+        assert_eq!(err.to_string(), "backend error (400): other");
+
+        // The client still receives the verbatim classifier.
+        assert_eq!(
+            err.to_error_response().error.error_type,
+            "you requested 9001 tokens"
+        );
+    }
+
+    /// serde error messages quote offending values, and the error position
+    /// is a byte offset into the failed document (per-request length
+    /// material on a minified body); the log-safe summary must carry only
+    /// the fixed category.
+    #[test]
+    fn parse_error_summary_omits_offending_values_and_position() {
+        let err = serde_json::from_str::<u32>("\"sk-secret-value\"").unwrap_err();
+        let summary = parse_error_summary(&err);
+        assert!(
+            !summary.contains("secret"),
+            "offending value leaked: {summary}"
+        );
+        assert_eq!(summary, "Data error");
+    }
+
+    /// Server-authored messages stay in the logs — redaction is targeted, not
+    /// blanket, so operators keep the diagnostics that carry no request data.
+    #[test]
+    fn server_authored_messages_are_still_logged() {
+        let err = ServerError::Conflict {
+            message: "credential already spent (duplicate nullifier)".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "conflict: credential already spent (duplicate nullifier)"
+        );
     }
 }

@@ -597,15 +597,19 @@ pub async fn issue_credentials(
     // currently required terms/privacy versions (no-op when unconfigured).
     crate::account::ensure_terms_accepted(&state, account_id).await?;
 
+    // Both decode errors are discarded, not interpolated: their Display
+    // quotes the offending byte, its offset, and the input length — all
+    // derived from the client-supplied blob (`auth.rs` sets the same
+    // pattern for the spend-proof decode).
     let issuance_cbor = URL_SAFE_NO_PAD
         .decode(&request.issuance_request)
-        .map_err(|e| ServerError::BadRequest {
-            message: format!("invalid base64 in issuance_request: {}", e),
+        .map_err(|_| ServerError::BadRequest {
+            message: "invalid base64 in issuance_request".to_string(),
         })?;
 
     let issuance_request =
-        IssuanceRequest::from_cbor(&issuance_cbor).map_err(|e| ServerError::BadRequest {
-            message: format!("invalid CBOR issuance request: {}", e),
+        IssuanceRequest::from_cbor(&issuance_cbor).map_err(|_| ServerError::BadRequest {
+            message: "invalid CBOR issuance request".to_string(),
         })?;
 
     let credit_scalar =
@@ -668,11 +672,11 @@ pub async fn issue_credentials(
             }
         };
 
-    info!(
-        credits = request.credits,
-        ledger_entry = %ledger_entry_id,
-        "credential issued"
-    );
+    // No ledger id and no amount: the ledger row already records both
+    // durably, and an exported log line naming them would hand the
+    // telemetry vendor a timestamped per-issuance record — the same rule
+    // the webhook success logs follow.
+    info!("credential issued");
 
     Ok(Json(IssueCredentialsResponse {
         issuance_response: URL_SAFE_NO_PAD.encode(&response_cbor),

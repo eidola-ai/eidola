@@ -58,12 +58,23 @@ pub struct BackendResponse {
 }
 
 /// Events emitted by a streaming backend.
+///
+/// Chunk and Done carry the [`std::time::Instant`] at which the upstream
+/// reader took them off the socket. Timing must use that stamp, not the
+/// receive time on the handler side: both the backend and downstream
+/// channels are bounded, so a slow client backpressures the pipeline and
+/// arrival at the handler measures delivery delay, not upstream
+/// generation. (A persistently slow client eventually throttles the
+/// socket itself via TCP flow control — that residual coupling is
+/// inherent to bounded buffering and accepted.)
 pub enum BackendStreamEvent {
-    /// A content chunk (standard OpenAI format).
-    Chunk(ChatCompletionChunk),
+    /// A content chunk (standard OpenAI format), stamped with its arrival
+    /// off the upstream socket.
+    Chunk(ChatCompletionChunk, std::time::Instant),
 
-    /// The stream has completed. Carries final metadata.
-    Done(BackendMeta),
+    /// The stream has completed. Carries final metadata, stamped with the
+    /// moment the upstream stream ended.
+    Done(BackendMeta, std::time::Instant),
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +404,7 @@ impl ChatBackend for TinfoilBackend {
         })
     }
 
+    #[tracing::instrument(skip_all, name = "upstream.chat", err)]
     async fn send(&self, request: &ChatCompletionRequest) -> Result<BackendResponse, ServerError> {
         let url = format!("{}/chat/completions", self.base_url);
 
@@ -429,9 +441,13 @@ impl ChatBackend for TinfoilBackend {
         }
 
         let completion: ChatCompletionResponse = serde_json::from_slice(&body).map_err(|e| {
-            tracing::error!("Failed to parse backend response: {}", e);
-            tracing::debug!("Response body: {}", String::from_utf8_lossy(&body));
-            ServerError::Parse(e.to_string())
+            // Privacy: serde messages quote offending values, and this body
+            // is inference content — only the category summary may reach the
+            // log path or the `Parse` message (which `Display`s into logs
+            // via `err` instrumentation).
+            let summary = crate::error::parse_error_summary(&e);
+            tracing::error!("failed to parse backend response: {summary}");
+            ServerError::Parse(summary)
         })?;
 
         let meta = BackendMeta {
@@ -448,6 +464,7 @@ impl ChatBackend for TinfoilBackend {
         })
     }
 
+    #[tracing::instrument(skip_all, name = "upstream.chat_stream", err)]
     async fn send_stream(
         &self,
         request: &ChatCompletionRequest,
@@ -513,6 +530,13 @@ impl ChatBackend for TinfoilBackend {
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
+                        // One stamp per socket read: every SSE event
+                        // extracted from this buffer batch arrived
+                        // together, and stamping here (before any
+                        // channel send can block on backpressure) is
+                        // what keeps the timing instruments measuring
+                        // the upstream rather than the client.
+                        let received_at = std::time::Instant::now();
                         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                         while let Some(data) = extract_sse_data(&mut buffer) {
@@ -529,22 +553,22 @@ impl ChatBackend for TinfoilBackend {
                                     if chunk.usage.is_some() {
                                         final_usage.clone_from(&chunk.usage);
                                     }
-                                    if tx.send(Ok(BackendStreamEvent::Chunk(chunk))).await.is_err()
+                                    if tx
+                                        .send(Ok(BackendStreamEvent::Chunk(chunk, received_at)))
+                                        .await
+                                        .is_err()
                                     {
                                         return; // Client disconnected
                                     }
                                 }
                                 Err(e) => {
-                                    // Privacy: a parse failure is a structural
-                                    // problem, not a content one. We log the
-                                    // error message and the data length only —
-                                    // never `data` itself, since SSE chunks
-                                    // carry model output deltas that can
-                                    // indirectly reflect prompt content.
+                                    // Privacy: serde messages quote offending
+                                    // values, and this chunk is inference
+                                    // content — log only the category
+                                    // summary.
                                     tracing::warn!(
-                                        data_len = data.len(),
-                                        "Failed to parse SSE chunk: {}",
-                                        e
+                                        "failed to parse SSE chunk: {}",
+                                        crate::error::parse_error_summary(&e)
                                     );
                                 }
                             }
@@ -565,7 +589,12 @@ impl ChatBackend for TinfoilBackend {
                 tee_type: Some(TeeType::TinfoilEnclave),
                 usage: final_usage,
             };
-            let _ = tx.send(Ok(BackendStreamEvent::Done(meta))).await;
+            let _ = tx
+                .send(Ok(BackendStreamEvent::Done(
+                    meta,
+                    std::time::Instant::now(),
+                )))
+                .await;
         });
 
         Ok(rx)
