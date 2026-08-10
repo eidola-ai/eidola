@@ -544,24 +544,25 @@ impl StreamTiming {
         [KeyValue::new("model", self.model_id.clone())]
     }
 
-    /// Note the arrival of an output-bearing chunk from upstream. Records
+    /// Note an output-bearing chunk, at the instant the upstream reader
+    /// took it off the socket (see [`BackendStreamEvent`] — handler-side
+    /// arrival would fold client backpressure into every gap). Records
     /// time-to-first-token on the first one and tracks the largest
     /// inter-chunk gap after that.
-    fn on_chunk(&mut self) {
-        let now = Instant::now();
+    fn on_chunk(&mut self, at: Instant) {
         match self.last_chunk_at {
             None => {
-                self.first_chunk_at = Some(now);
+                self.first_chunk_at = Some(at);
                 crate::telemetry::metrics::CHAT_TTFT.record(
-                    now.duration_since(self.dispatched_at).as_secs_f64(),
+                    at.duration_since(self.dispatched_at).as_secs_f64(),
                     &self.model_attr(),
                 );
             }
             Some(previous) => {
-                self.max_gap = self.max_gap.max(now.duration_since(previous));
+                self.max_gap = self.max_gap.max(at.duration_since(previous));
             }
         }
-        self.last_chunk_at = Some(now);
+        self.last_chunk_at = Some(at);
         self.chunks += 1;
     }
 
@@ -570,13 +571,16 @@ impl StreamTiming {
     /// refund settlement and metadata delivery, which are our own
     /// post-stream work: the duration histogram is documented as
     /// dispatch-to-final-chunk, and recording it later would let a slow
-    /// database read as an upstream generation regression.
+    /// database read as an upstream generation regression. `ended_at` is
+    /// the upstream-side stamp of that terminal event where one exists
+    /// (the Done event carries one); error paths pass their observation
+    /// time.
     ///
     /// The output rate is measured across the *generation* window (first chunk
     /// to last), not the whole stream: time-to-first-token is already its own
     /// histogram, and leaving prefill in the denominator would make the rate
     /// move for two unrelated reasons at once.
-    fn finish(self, reason: &'static str, completion_tokens: Option<u64>) {
+    fn finish(self, reason: &'static str, completion_tokens: Option<u64>, ended_at: Instant) {
         let attrs = self.model_attr();
 
         crate::telemetry::metrics::CHAT_STREAM_OUTCOME.add(
@@ -586,8 +590,10 @@ impl StreamTiming {
                 KeyValue::new("reason", reason),
             ],
         );
-        crate::telemetry::metrics::CHAT_STREAM_DURATION
-            .record(self.dispatched_at.elapsed().as_secs_f64(), &attrs);
+        crate::telemetry::metrics::CHAT_STREAM_DURATION.record(
+            ended_at.duration_since(self.dispatched_at).as_secs_f64(),
+            &attrs,
+        );
 
         // Both remaining instruments need at least two chunks to mean
         // anything: one chunk gives no gap and a ~zero rate denominator.
@@ -605,7 +611,17 @@ impl StreamTiming {
         if let Some(tokens) = completion_tokens
             && generation > 0.0
         {
-            crate::telemetry::metrics::CHAT_OUTPUT_RATE.record(tokens as f64 / generation, &attrs);
+            // The window spans the chunks-1 intervals *between* this
+            // stream's chunks, but `tokens` counts every chunk's tokens —
+            // the first chunk's included, whose generation time lives in
+            // TTFT, not here. Scale the numerator to the window's share:
+            // exact when chunks carry equal token counts (the common
+            // one-token-per-chunk case), and the error shrinks as streams
+            // lengthen. Unscaled, a two-chunk stream reports double its
+            // sustained rate.
+            let tokens_in_window = tokens as f64 * (self.chunks - 1) as f64 / self.chunks as f64;
+            crate::telemetry::metrics::CHAT_OUTPUT_RATE
+                .record(tokens_in_window / generation, &attrs);
         }
     }
 }
@@ -747,9 +763,9 @@ async fn handle_streaming_request(
 
         while let Some(event_result) = upstream_rx.recv().await {
             match event_result {
-                Ok(BackendStreamEvent::Chunk(chunk)) => {
+                Ok(BackendStreamEvent::Chunk(chunk, at)) => {
                     if carries_output(&chunk) {
-                        timing.on_chunk();
+                        timing.on_chunk(at);
                     }
                     // Capture usage from the final chunk if present.
                     if chunk.usage.is_some() {
@@ -763,12 +779,12 @@ async fn handle_streaming_request(
                         // (returns blind remaining value c - s). The client can't
                         // receive this, but we issue it for consistency.
                         warn!("Client disconnected mid-stream, issuing zero refund");
-                        timing.finish("client_disconnect", None);
+                        timing.finish("client_disconnect", None, at);
                         let _ = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
                         return;
                     }
                 }
-                Ok(BackendStreamEvent::Done(meta)) => {
+                Ok(BackendStreamEvent::Done(meta, at)) => {
                     let is_tee = meta.tee_type.is_some();
 
                     // Prefer usage from the final chunk, then from meta.
@@ -779,6 +795,7 @@ async fn handle_streaming_request(
                     timing.finish(
                         "done",
                         final_usage.as_ref().map(|u| u.completion_tokens as u64),
+                        at,
                     );
 
                     // Record token usage metrics (safe: only model + counts).
@@ -823,7 +840,7 @@ async fn handle_streaming_request(
                     // Some chunks may have been delivered and billed; we don't
                     // know the actual cost. Refund 0 (blind remaining value).
                     error!("Stream error, issuing zero refund: {}", e);
-                    timing.finish("upstream_error", None);
+                    timing.finish("upstream_error", None, Instant::now());
                     let refund_info =
                         try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
                     let privacy = build_privacy_metadata(&auth_context, true, "tinfoil");
@@ -838,7 +855,7 @@ async fn handle_streaming_request(
         // upstream_rx closed without a Done event (unexpected). Chunks may
         // have been delivered and billed; we don't know the cost. Refund 0.
         warn!("Upstream channel closed without Done event, issuing zero refund");
-        timing.finish("channel_closed", None);
+        timing.finish("channel_closed", None, Instant::now());
         let refund_info = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
         let privacy = build_privacy_metadata(&auth_context, true, "tinfoil");
         let verification = build_verification_metadata(None);
