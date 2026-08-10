@@ -158,13 +158,13 @@ impl StripeClient {
             .form(&[("metadata[account_id]", account_id.to_string())])
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
@@ -192,13 +192,13 @@ impl StripeClient {
             .query(&[("customer", customer_id), ("limit", "10")])
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
@@ -227,13 +227,13 @@ impl StripeClient {
             ])
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
@@ -257,13 +257,13 @@ impl StripeClient {
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
@@ -285,13 +285,13 @@ impl StripeClient {
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
@@ -343,13 +343,13 @@ impl StripeClient {
             .form(&form)
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
@@ -382,20 +382,24 @@ impl StripeClient {
             .query(&[("expand[]", "data.price")])
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
         }
 
-        let list: ListResponse<CheckoutLineItem> = serde_json::from_slice(&body)
-            .map_err(|e| ServerError::Parse(format!("stripe line items: {}", e)))?;
+        let list: ListResponse<CheckoutLineItem> = serde_json::from_slice(&body).map_err(|e| {
+            ServerError::Parse(format!(
+                "stripe line items: {}",
+                crate::error::parse_error_summary(&e)
+            ))
+        })?;
 
         Ok(list.data)
     }
@@ -413,20 +417,24 @@ impl StripeClient {
             .form(&[("customer", customer_id), ("return_url", return_url)])
             .send()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
 
         if !status.is_success() {
             return Err(stripe_error(&body));
         }
 
-        let session: PortalSession = serde_json::from_slice(&body)
-            .map_err(|e| ServerError::Parse(format!("stripe portal: {}", e)))?;
+        let session: PortalSession = serde_json::from_slice(&body).map_err(|e| {
+            ServerError::Parse(format!(
+                "stripe portal: {}",
+                crate::error::parse_error_summary(&e)
+            ))
+        })?;
 
         Ok(session.url)
     }
