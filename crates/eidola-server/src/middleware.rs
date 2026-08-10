@@ -22,10 +22,14 @@ use crate::telemetry::metrics;
 /// Axum middleware that opens a request span and records HTTP metrics.
 pub async fn observe(matched_path: Option<MatchedPath>, request: Request, next: Next) -> Response {
     let method = request.method().to_string();
+    // `MatchedPath` is absent exactly when no route matched — and then the
+    // raw URI is caller-authored: labeling with it would let any scanner
+    // mint unbounded per-path series (and put attacker-chosen bytes into
+    // the metric stream). Everything unrouted shares one bucket.
     let path = matched_path
         .as_ref()
         .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
+        .unwrap_or_else(|| "unmatched".to_string());
 
     let span = tracing::info_span!(
         "http.request",
@@ -52,8 +56,9 @@ pub async fn observe(matched_path: Option<MatchedPath>, request: Request, next: 
 
         tracing::Span::current().record("http.response.status_code", status);
 
-        // `http.route` is the matched path template, never the raw URI, so it
-        // cannot carry request-derived values into a label.
+        // `http.route` is the matched path template or the fixed
+        // `unmatched` bucket, never the raw URI, so it cannot carry
+        // request-derived values into a label.
         let attrs = [
             KeyValue::new("http.request.method", method),
             KeyValue::new("http.route", path),
@@ -85,7 +90,14 @@ pub async fn observe(matched_path: Option<MatchedPath>, request: Request, next: 
 /// fresh random id per attempt, including on retries, where resending the
 /// original headers is the obvious implementation and the wrong one.
 fn requested_trace_parent(headers: &HeaderMap) -> Option<SpanContext> {
-    let value = headers.get("traceparent")?.to_str().ok()?;
+    let value = headers.get("traceparent")?;
+    // A header value that isn't visible ASCII is as malformed as a failed
+    // parse — count it, or byte-corrupted client instrumentation becomes
+    // invisible to the "watch the total" guidance on this instrument.
+    let Ok(value) = value.to_str() else {
+        metrics::TRACEPARENT_RECEIVED.add(1, &[KeyValue::new("outcome", "malformed")]);
+        return None;
+    };
 
     let Some(parent) = parse_traceparent(value) else {
         metrics::TRACEPARENT_RECEIVED.add(1, &[KeyValue::new("outcome", "malformed")]);
