@@ -49,9 +49,14 @@ Build: `just build gui` (or `cargo build -p eidola-gui && ./scripts/package-gui-
 22. A refusal (unsigned bundle, denied) shows macOS's own wording in a red banner under the row and leaves the switch where the system actually is — it never flips optimistically.
 23. Nothing is remembered app-side: the switch's state comes only from the system, so deleting `~/Library/Application Support/eidola` must not change it.
 
+## The app icon
+
+24. The Dock icon, the ⌘Tab switcher, and Finder's Get Info all show the hexagon-grid mark — a warm cluster on a dark tile, never the generic blank-document icon (which is what a missing or misnamed `Contents/Resources/AppIcon.icns` gives you). `mdls -name kMDItemDisplayName crates/eidola-gui/build/Eidola.app` is not the oracle here; look at it.
+25. Shrink a Finder window to list view and check the 16 pt slot: the cells should still be countable, not a smudge. That slot is drawn from the reduced-detail master (`brand/AGENTS.md`), so if it looks like the full-detail mark scaled down, the `.icns` was built from the wrong source.
+
 ## Regression sweep (nothing here should have moved)
 
-24. Every window still opens and closes normally: space, Library, Record, Settings, Participants, About, Updates, onboarding.
-25. Dock right-click → New Space / Library… still works while a window is open.
-26. `--windowless` still runs with no window and quits on `SIGTERM`. On macOS it starts retired (`UIElement`) with a status item, and its status-menu Quit is a full shutdown.
-27. **Linux is unchanged:** no tray, the windowed app quits with its last window / Ctrl+Q (a full shutdown), and the background layer is `eidola service` + `--windowless`.
+26. Every window still opens and closes normally: space, Library, Record, Settings, Participants, About, Updates, onboarding.
+27. Dock right-click → New Space / Library… still works while a window is open.
+28. `--windowless` still runs with no window and quits on `SIGTERM`. On macOS it starts retired (`UIElement`) with a status item, and its status-menu Quit is a full shutdown.
+29. **Linux is unchanged:** no tray, the windowed app quits with its last window / Ctrl+Q (a full shutdown), and the background layer is `eidola service` + `--windowless`.

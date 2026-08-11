@@ -397,16 +397,26 @@ fn table_context(markdown: &str, cursor: usize) -> Option<table::TableGeometry> 
     table::table_at(markdown, &tree, cursor)
 }
 
-/// Inject a space after a bare unordered list marker (`-`, `*`, `+`)
-/// when the next byte is non-space, non-newline, and not a repeat of
-/// the marker character.
+/// Inject a space after a bare unordered list marker (`-`, `+`) when
+/// the next byte is non-space, non-newline, and not a repeat of the
+/// marker character.
 ///
 /// Rationale: CommonMark requires `<marker><space>` to open a list,
 /// but typing `-foo` is a clear list intent that the editor can
 /// salvage by injecting the missing space. The repeat-character
-/// exception preserves thematic-break candidates (`---`, `***`,
-/// `___`) and emphasis runs of `*`/`*` from being prematurely
-/// converted into list items.
+/// exception preserves thematic-break candidates (`---`) from being
+/// prematurely converted into list items.
+///
+/// **`*` is deliberately not a trigger.** It is an emphasis
+/// delimiter as much as a bullet, and the two are indistinguishable
+/// from the prefix this pass sees: `*I` is the live prefix of both
+/// `*Italic*` and a would-be `* Italic` bullet, and injection fires
+/// on the *second* keystroke — long before a closing `*` could
+/// disambiguate, so no lookahead heuristic can rescue it. Emphasis
+/// opening a paragraph is far more common than a `*` bullet typed
+/// without its space, so `*` keeps its literal bytes; `* ` opens a
+/// bullet the ordinary way, and `-`/`+` are unambiguous and keep the
+/// injection. (`_` was never a trigger — it isn't a list marker.)
 ///
 /// Cursor guard: skip injection when the cursor would land at the
 /// would-be insertion point (the user is mid-typing — either they
@@ -455,7 +465,7 @@ fn inject_unordered_marker_space(state: EditorState, cache: &mut ParseCache) -> 
                     && !analysis::is_in_verbatim_region_blocks(&fences, &math_blocks, content_start)
                 {
                     let c = bytes[content_start];
-                    if matches!(c, b'-' | b'*' | b'+') {
+                    if matches!(c, b'-' | b'+') {
                         let next = content_start + 1;
                         if next < bytes.len() {
                             let nb = bytes[next];

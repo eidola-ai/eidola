@@ -3,10 +3,10 @@
 # how GNOME/KDE associate our windows with this entry (name in Alt-Tab and
 # the shell, icon, dock pinning).
 #
-# The Icon key names a themed icon (`tech.m6i.Eidola.{svg,png}` under
-# share/icons/hicolor/...) that does not exist yet — shipping the reference
-# is harmless (shells fall back to a generic icon) and it lights up the
-# moment a real brand asset lands. See AGENTS.md → Linux.
+# The Icon key names a themed icon shipped beside this file as
+# icons/hicolor/{scalable,48x48,128x128,256x256}/apps/tech.m6i.Eidola.{svg,png},
+# installed to share/icons/ by the Nix artifact. Generated from the vector
+# master by `just update-brand` — see brand/AGENTS.md.
 [Desktop Entry]
 Type=Application
 Name=Eidola

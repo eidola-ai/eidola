@@ -887,26 +887,41 @@ pub fn open_blank_space_window(cx: &mut App, stores: Stores) {
     open_chat_window(cx, stores, None);
 }
 
-/// The side length of the square "writing surface" windows — the space (chat)
-/// window and the onboarding window, which is sized to match. 90% of the
-/// smaller display dimension, capped at 840px so the prose column isn't lost in
-/// the middle of a 4K display; falls back to the cap with no primary display
-/// (rare; offscreen render contexts).
-fn writing_surface_side(cx: &mut App) -> f32 {
+/// The default size of the "writing surface" windows — the space (chat) window
+/// and the onboarding window, which is sized to match.
+///
+/// The **width is derived, not chosen**: the narrowest page that gives the
+/// reading column its full measure
+/// ([`space_view::layout::full_measure_page_width`]) plus the decoration inset
+/// sitting outside the content box, so prose in a fresh window never wraps
+/// short of the measure. Nothing else is subtracted from the page at open: the
+/// inspector starts closed and the minimap overlays the right gutter.
+///
+/// The **height** is 90% of the smaller display dimension, capped at 840px so
+/// the page isn't lost in the middle of a 4K display. Both fall back to fixed
+/// values with no primary display (rare; offscreen render contexts), and the
+/// width yields to a display too narrow to show it.
+fn writing_surface_size(cx: &mut App) -> (f32, f32) {
+    let width = (space_view::layout::full_measure_page_width()
+        + chrome::opening_content_inset() * 2.)
+        .as_f32();
     match cx.primary_display() {
         Some(d) => {
             let s = d.bounds().size;
             let smaller = f32::min(s.width.as_f32(), s.height.as_f32());
-            (smaller * 0.9).min(840.0)
+            (
+                width.min(s.width.as_f32() * 0.9),
+                (smaller * 0.9).min(840.0),
+            )
         }
-        None => 820.0,
+        None => (width, 820.0),
     }
 }
 
 fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
-    // Square chat window — a sheet of paper, not a wide chat pane.
-    let side = writing_surface_side(cx);
-    let bounds = centered_window_bounds(cx, side, side);
+    // A sheet of paper at its full measure, not a wide chat pane.
+    let (w, h) = writing_surface_size(cx);
+    let bounds = centered_window_bounds(cx, w, h);
     let opts = base_window_options(cx, bounds, 480., 360.);
 
     let _ = cx.open_window(opts, |window, cx| {
@@ -1022,12 +1037,12 @@ pub fn open_record_request(cx: &mut App, request_id: String) {
 }
 
 /// Open the onboarding window — the from-scratch "Get Started" flow, a
-/// singleton like Settings. Sized to match a new space window (the same square
-/// writing surface) so onboarding feels like the same page it leads into.
+/// singleton like Settings. Sized to match a new space window (the same writing
+/// surface) so onboarding feels like the same page it leads into.
 fn open_onboarding_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
-    let side = writing_surface_side(cx);
-    let bounds = centered_window_bounds(cx, side, side);
+    let (w, h) = writing_surface_size(cx);
+    let bounds = centered_window_bounds(cx, w, h);
     let opts = base_window_options(cx, bounds, 480., 360.);
 
     let handle = cx.open_window(opts, |window, cx| {
