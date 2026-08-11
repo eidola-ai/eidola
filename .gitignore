@@ -32,3 +32,7 @@ crates/eidola-gui/tests/snapshots/
 
 .buildx-cache
 .dev-certs/
+
+# Brand asset generator scratch
+__pycache__/
+brand/.render/
