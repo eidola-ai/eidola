@@ -10278,6 +10278,41 @@ fn expand_embed_strings(
     (out, expanded)
 }
 
+/// Drop a post's **recognized** `{{ embed N }}` blocks from a *preview*,
+/// leaving its own prose — the map's opening line and `list_branches`, where a
+/// post is summarized as chrome rather than read.
+///
+/// A preview is neither of the two things [`ReferenceEntry`] renders. Expanding
+/// there would lead the teaser with a byline (`[1] #q2m9zzr · Ada`) instead of
+/// the branch's subject, and quoting the bare passage would attribute someone
+/// else's words to the branch author on a line that already names them — the
+/// misattribution this whole rendering exists to prevent, reintroduced one line
+/// long. So a preview shows what its author wrote, and the marker's content is
+/// reached by descending (`read_thread` / `read_post`), which is what the map
+/// is *for*.
+///
+/// This is the rule the GUI already applies to its own previews
+/// (`space_view::references::strip_embed_blocks`) — "the `{{ embed N }}` marker
+/// is rendered content, never a string a reader should see" — and it degrades
+/// identically: recognition is [`eidola_common::embed::embed_marker_spans`]
+/// narrowed to ordinals that actually resolve, so an unmapped or fence-defused
+/// marker stays the literal text it literally is, on both surfaces.
+fn strip_embed_markers(text: &str, embeds: &std::collections::BTreeMap<u64, String>) -> String {
+    if embeds.is_empty() {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    for span in eidola_common::embed::embed_marker_spans(text)
+        .into_iter()
+        .rev()
+    {
+        if embeds.contains_key(&span.ordinal) {
+            out.replace_range(span.start..span.end, "");
+        }
+    }
+    out
+}
+
 /// The separator between a message header's handle and its author label:
 /// `#<handle>` U+00B7 `<label>`. Pinned — the strip-on-receipt scanner and the
 /// tests both key on it.
@@ -11198,7 +11233,10 @@ impl ThreadSnapshot {
             author: self.nodes[idx].participant.label.clone(),
             posts: sub.len(),
             last_activity,
-            opening: derive_space_title(&self.texts[idx]),
+            opening: derive_space_title(&strip_embed_markers(
+                &self.texts[idx],
+                &self.nodes[idx].embed_map(),
+            )),
             summary: self.summaries.get(&self.nodes[idx].item_id).cloned(),
         }
     }
@@ -12174,6 +12212,66 @@ mod tests {
             references: Vec::new(),
             created_at: 0,
         }
+    }
+
+    /// A branch that opens by quoting: the marker leads the body, and the
+    /// passage belongs to somebody else.
+    fn quote_led_branch() -> ThreadSnapshot {
+        let mut opener = tn(
+            "b1",
+            "ib1",
+            Some("i1"),
+            "Bo",
+            "{{ embed 1 }}\n\nIs that still true at neaps?",
+        );
+        opener.references = vec![PostReference {
+            antecedent_action_id: "i1".into(),
+            ordinal: 1,
+            content_block_id: Some("i1-b0".into()),
+            range_start: Some(0),
+            range_end: Some(20),
+            annotation: None,
+            snippet: Some("Because of the moon.".into()),
+            antecedent_author_label: "Ada".into(),
+        }];
+        ThreadSnapshot::new(
+            vec![
+                tn("u1", "iu1", None, "You", "How do tides work?"),
+                tn("i1", "ii1", Some("u1"), "Ada", "Because of the moon."),
+                tn("a1", "ia1", Some("i1"), "You", "What about spring tides?"),
+                opener,
+            ],
+            0,
+        )
+    }
+
+    /// **A branch preview shows the branch author's own prose.** The map is a
+    /// one-line teaser on the volatile tail of every branched request, so it
+    /// renders neither of the two things a reference can be rendered as: the
+    /// marker would leak the wire format to a model that sees it expanded
+    /// everywhere else, and the bare passage would attribute Ada's words to Bo
+    /// on a line that has just named Bo. The passage is reached by descending,
+    /// which is what the map is for.
+    #[test]
+    fn a_branch_that_opens_on_a_quote_previews_its_own_prose() {
+        let snap = quote_led_branch();
+        let forks = snap.spine_forks(&["u1".into(), "i1".into(), "a1".into()], None);
+        let entry = &forks[0].branches[0];
+        assert_eq!(
+            entry.opening.as_deref(),
+            Some("Is that still true at neaps?")
+        );
+
+        let map = snap.render_map(&forks, Some(&post_handle("ia1")));
+        assert!(
+            !map.contains("{{ embed"),
+            "no marker reaches the map: {map}"
+        );
+        assert!(
+            !map.contains("Because of the moon"),
+            "and no passage of Ada's is attributed to Bo: {map}"
+        );
+        assert!(map.contains("· Bo · 1 post"), "{map}");
     }
 
     /// `u1 → i1`, and `i1` forks into branch A (`a1 → a2`) and branch B (`b1`).
