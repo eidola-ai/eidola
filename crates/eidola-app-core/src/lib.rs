@@ -811,6 +811,12 @@ pub struct PostReference {
     /// range no longer maps honestly onto the block (never truncated or
     /// remapped heuristically).
     pub snippet: Option<String>,
+    /// The quoted post's author, as **its own** space names it. A reference is
+    /// the cross-space mechanism, so this is the one name the reading space
+    /// cannot derive for itself — and it is what a footnote byline says about
+    /// a passage from elsewhere, on both the rail and the wire. Blank only if
+    /// that space overrode the label to empty.
+    pub antecedent_author_label: String,
 }
 
 /// A reference to attach to a new post (the write-side twin of
@@ -9935,6 +9941,15 @@ const REFERENCE_UNRESOLVED: &str = "(the quoted range no longer maps onto that p
 /// backlink as a broken quote.
 const REFERENCE_BACKLINK: &str = "(referenced without quoting a passage)";
 
+/// A label to render, or `None` when there is none to render. A per-space
+/// override of `''` is "override to empty" (the schema's NULL-inherits rule),
+/// so an effective label really can be blank, and a blank one must degrade to
+/// "no author named" rather than to a stray space before the parenthetical.
+fn non_blank(label: &str) -> Option<String> {
+    let trimmed = one_line(label);
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 /// How a quoted post is named to a model.
 ///
 /// **The one place addressability is decided is where the variant is chosen**,
@@ -10004,7 +10019,7 @@ impl ReferenceEntry {
             }
         } else {
             ReferenceTarget::Elsewhere {
-                label: Some(row.antecedent_author_label.clone()),
+                label: non_blank(&row.antecedent_author_label),
             }
         };
         let body = match (row.has_range(), row.range_start, row.range_end) {
@@ -10036,7 +10051,13 @@ impl ReferenceEntry {
                 item_id: n.item_id.clone(),
                 label: n.participant.label.clone(),
             },
-            None => ReferenceTarget::Elsewhere { label: None },
+            // A sibling branch is absent from the turn's context, so a tool
+            // result is the *only* view a model gets of a post there. The
+            // author of what it quotes has to survive that, and only the
+            // source space can supply it.
+            None => ReferenceTarget::Elsewhere {
+                label: non_blank(&reference.antecedent_author_label),
+            },
         };
         let body = match (&reference.snippet, reference.range_start) {
             (Some(s), _) => ReferenceBody::Passage(s.clone()),
@@ -10063,7 +10084,7 @@ impl ReferenceEntry {
         let byline = match &self.target {
             ReferenceTarget::Addressable { item_id, label } => message_header(item_id, label),
             ReferenceTarget::Elsewhere { label: Some(l) } => {
-                format!("{} {REFERENCE_ELSEWHERE}", one_line(l))
+                format!("{l} {REFERENCE_ELSEWHERE}")
             }
             ReferenceTarget::Elsewhere { label: None } => REFERENCE_ELSEWHERE.to_string(),
         };
@@ -10759,6 +10780,7 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
                     range_end: e.range_end,
                     annotation: e.annotation,
                     snippet,
+                    antecedent_author_label: e.antecedent_author_label,
                 });
         }
     }
@@ -12261,6 +12283,7 @@ mod tests {
                 range_end: None,
                 annotation: None,
                 snippet: Some("Because of the moon.".into()),
+                antecedent_author_label: "Agent".into(),
             },
             PostReference {
                 antecedent_action_id: "elsewhere".into(),
@@ -12270,6 +12293,7 @@ mod tests {
                 range_end: None,
                 annotation: Some("no marker for this one".into()),
                 snippet: Some("from another space".into()),
+                antecedent_author_label: "Cy".into(),
             },
         ];
         let snap = ThreadSnapshot::new(
@@ -12284,7 +12308,7 @@ mod tests {
         let body = format!(
             "As it says:\n\n[1] #{} · Agent\n> Because of the moon.\n\n\
              Passages this post quotes:\n\
-             [2] {REFERENCE_ELSEWHERE} — no marker for this one\n> from another space",
+             [2] Cy {REFERENCE_ELSEWHERE} — no marker for this one\n> from another space",
             post_handle("ii1")
         );
         let post = snap.render_post(&post_handle("ib1"));
@@ -12482,6 +12506,7 @@ mod tests {
             block_text: None,
             antecedent_action_type: "user_input".into(),
             block_type: None,
+            antecedent_author_label: "You".into(),
         }
     }
 
@@ -12684,6 +12709,7 @@ mod tests {
                     block_text: Some("hello world".into()),
                     antecedent_action_type: "user_input".into(),
                     block_type: Some("text".into()),
+                    antecedent_author_label: "You".into(),
                 },
             ],
         };

@@ -881,6 +881,7 @@ mod tests {
             range_end: Some(1),
             snippet: Some(snippet.to_string()),
             annotation: None,
+            antecedent_author_label: "Ada".into(),
         }
     }
 
