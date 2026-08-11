@@ -10,13 +10,59 @@ use uuid::Uuid;
 
 use crate::error::ServerError;
 
+/// The Stripe API version every request pins, via the `Stripe-Version`
+/// header set once as a default on the client.
+///
+/// **Pinned deliberately.** Without this header a request is served at the
+/// *account's* default version — a dashboard setting, changeable by a human
+/// who is not looking at this repository, that silently rewrites what a
+/// sealed, attested server binary does. Everything else about this server's
+/// behavior is a function of its measured source; an unpinned API version
+/// was the one input that was not. It had already cost us: Basil moved the
+/// subscription billing period onto subscription items (2025-03-31), the
+/// response kept deserializing because the field was optional, and the
+/// app's "current billing period ends …" line quietly never rendered again.
+///
+/// `2025-03-31.basil` is the oldest version carrying the shapes below, which
+/// maximizes the runway before Stripe retires it.
+///
+/// **Bumping this is a review task, not a version bump.** Re-read the
+/// intervening changelogs against every shape this file parses:
+/// [`Subscription`] (+ [`SubscriptionItem`]), [`StripePrice`],
+/// [`StripeProduct`], [`CheckoutSession`], [`CheckoutLineItem`],
+/// [`Customer`], [`PortalSession`]. Note that this header pins **only what
+/// this client reads**: webhook payloads are rendered at the version
+/// configured on the webhook endpoint in Stripe's dashboard, so
+/// `webhook.rs`'s `serde_json::Value` lookups are versioned separately and
+/// are not covered by this constant.
+pub const STRIPE_API_VERSION: &str = "2025-03-31.basil";
+
 /// Minimal Stripe subscription representation.
 #[derive(Debug, Deserialize)]
 pub struct Subscription {
     pub id: String,
     pub status: String,
-    #[serde(default)]
-    pub current_period_end: Option<i64>,
+    /// The subscription's items, which is where the billing period lives.
+    /// Included in list responses by default.
+    pub items: SubscriptionItems,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SubscriptionItems {
+    pub data: Vec<SubscriptionItem>,
+}
+
+/// One line of a subscription. Since Basil this is what carries the billing
+/// period; the subscription itself no longer has one.
+#[derive(Debug, Deserialize)]
+pub struct SubscriptionItem {
+    /// **Required on purpose.** Optional here is what made the last shape
+    /// change silent — a removed field and a genuinely absent value became
+    /// the same `None`. Pinned to [`STRIPE_API_VERSION`], this field is
+    /// guaranteed present, so demanding it turns any future move into a
+    /// loud parse failure in dev and CI instead of a feature that quietly
+    /// stops rendering in production.
+    pub current_period_end: i64,
 }
 
 /// The Stripe subscription statuses Eidola treats as a subscription being
@@ -55,6 +101,17 @@ impl Subscription {
     /// [`IN_FORCE_SUBSCRIPTION_STATUSES`].
     pub fn is_in_force(&self) -> bool {
         IN_FORCE_SUBSCRIPTION_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// When the current billing period ends, as a Unix timestamp.
+    ///
+    /// Items can bill on different intervals, so there is not always one
+    /// period; the **soonest** boundary is reported, because that is the
+    /// next time anything happens to this subscription — and for Eidola's
+    /// single-price subscriptions it is simply that item's period. `None`
+    /// only if Stripe returned a subscription with no items at all.
+    pub fn current_period_end(&self) -> Option<i64> {
+        self.items.data.iter().map(|i| i.current_period_end).min()
     }
 }
 
@@ -180,8 +237,19 @@ pub struct StripeClient {
 
 impl StripeClient {
     pub fn new(api_key: String) -> Self {
+        // `Stripe-Version` rides as a client default rather than on each
+        // call site, so a request added later cannot forget it and fall
+        // back to the account's mutable default version. See
+        // [`STRIPE_API_VERSION`].
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "Stripe-Version",
+            reqwest::header::HeaderValue::from_static(STRIPE_API_VERSION),
+        );
+
         let client = reqwest::Client::builder()
             .tls_backend_preconfigured(crate::tls_config())
+            .default_headers(headers)
             .build()
             .expect("failed to build HTTP client");
 
@@ -591,7 +659,7 @@ mod tests {
         Subscription {
             id: "sub_1".to_string(),
             status: status.to_string(),
-            current_period_end: None,
+            items: SubscriptionItems { data: Vec::new() },
         }
     }
 
@@ -648,6 +716,8 @@ mod tests {
         /// Every request's query string, in order — the pagination protocol
         /// as it actually went over the wire.
         queries: Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>,
+        /// The `Stripe-Version` header each request carried, if any.
+        versions: Arc<std::sync::Mutex<Vec<Option<String>>>>,
         calls: Arc<AtomicUsize>,
     }
 
@@ -675,10 +745,17 @@ mod tests {
 
     async fn serve_page(
         State(stub): State<Stub>,
+        headers: axum::http::HeaderMap,
         Query(params): Query<HashMap<String, String>>,
     ) -> axum::Json<serde_json::Value> {
         let n = stub.calls.fetch_add(1, Ordering::SeqCst);
         stub.queries.lock().unwrap().push(params);
+        stub.versions.lock().unwrap().push(
+            headers
+                .get("Stripe-Version")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        );
 
         // The last page repeats if the client asks past the end, so a client
         // that fails to stop is caught by the page cap rather than by a 404.
@@ -688,22 +765,32 @@ mod tests {
             .cloned()
             .unwrap_or_else(|| stub.pages.last().unwrap().clone());
 
+        // The Basil shape: the billing period lives on the items, and the
+        // subscription itself has no `current_period_end` at all.
         let data: Vec<serde_json::Value> = page
             .statuses
             .iter()
             .enumerate()
-            .map(
-                |(i, status)| serde_json::json!({ "id": format!("sub_{n}_{i}"), "status": status }),
-            )
+            .map(|(i, status)| {
+                serde_json::json!({
+                    "id": format!("sub_{n}_{i}"),
+                    "status": status,
+                    "items": { "data": [{ "current_period_end": PERIOD_END }] },
+                })
+            })
             .collect();
         axum::Json(serde_json::json!({ "data": data, "has_more": page.has_more }))
     }
+
+    /// An arbitrary but fixed period end the stand-in stamps on every item.
+    const PERIOD_END: i64 = 1_900_000_000;
 
     /// Start the stand-in and return a client pointed at it.
     async fn stub_stripe(pages: Vec<Page>) -> (StripeClient, Stub) {
         let stub = Stub {
             pages,
             queries: Arc::new(std::sync::Mutex::new(Vec::new())),
+            versions: Arc::new(std::sync::Mutex::new(Vec::new())),
             calls: Arc::new(AtomicUsize::new(0)),
         };
         let app = Router::new()
@@ -821,6 +908,73 @@ mod tests {
             "expected a refusal, got {err:?}"
         );
         assert_eq!(stub.calls.load(Ordering::SeqCst), MAX_SUBSCRIPTION_PAGES);
+    }
+
+    #[tokio::test]
+    async fn every_request_pins_the_api_version() {
+        // Unpinned, a request is served at the account's default version —
+        // a dashboard setting that can rewrite this server's behavior
+        // without touching its measured source. That is how the billing
+        // period went missing.
+        let (client, stub) = stub_stripe(vec![Page {
+            statuses: vec!["active"],
+            has_more: false,
+        }])
+        .await;
+
+        client.in_force_subscription("cus_1").await.unwrap();
+        assert_eq!(
+            *stub.versions.lock().unwrap(),
+            vec![Some(STRIPE_API_VERSION.to_string())],
+            "the Stripe-Version header must ride every request"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_billing_period_is_read_from_the_subscriptions_items() {
+        // Since Basil the subscription object has no `current_period_end`;
+        // it lives on the items. Read from the subscription, the period is
+        // simply never found and the app's "billing period ends …" line
+        // never renders.
+        let (client, _) = stub_stripe(vec![Page {
+            statuses: vec!["active"],
+            has_more: false,
+        }])
+        .await;
+
+        let sub = client
+            .in_force_subscription("cus_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sub.current_period_end(),
+            Some(PERIOD_END),
+            "the billing period must come off the subscription's items"
+        );
+    }
+
+    #[test]
+    fn a_subscription_billing_on_mixed_intervals_reports_the_soonest_boundary() {
+        // Items can bill on different intervals, so there is no single
+        // period; the next thing that happens is what a reader is owed.
+        let mixed = Subscription {
+            id: "sub_1".to_string(),
+            status: "active".to_string(),
+            items: SubscriptionItems {
+                data: vec![
+                    SubscriptionItem {
+                        current_period_end: 2_000,
+                    },
+                    SubscriptionItem {
+                        current_period_end: 1_000,
+                    },
+                ],
+            },
+        };
+        assert_eq!(mixed.current_period_end(), Some(1_000));
+        // No items at all is the only way to have no period.
+        assert_eq!(sub("active").current_period_end(), None);
     }
 
     #[tokio::test]
