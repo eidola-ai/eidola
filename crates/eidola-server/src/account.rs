@@ -7,6 +7,7 @@ use axum::response::IntoResponse;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -44,10 +45,13 @@ pub struct GetAccountResponse {
 /// subscription" are different situations and lead to different UI.
 #[derive(Serialize, ToSchema)]
 pub struct SubscriptionResponse {
-    /// `none` — the account has no Stripe customer, so it has never
-    /// transacted and there is nothing to manage. `inactive` — a customer
-    /// exists but holds no subscription in a status Eidola treats as in
-    /// force. `active` — a subscription is in force.
+    /// `none` — the account has never transacted, so it has no payment
+    /// relationship and nothing to manage. That means no Stripe customer
+    /// *or* a customer record with no money ever moved under it, which
+    /// checkout can leave behind when a session is abandoned — a customer
+    /// id alone buys nobody a card, an invoice or a receipt. `inactive` — a
+    /// real payment history, but no subscription in a status Eidola treats
+    /// as in force. `active` — a subscription is in force.
     ///
     /// "In force" means Stripe status `active`, `trialing`, or `past_due`
     /// — the same set the checkout endpoint refuses to double-subscribe
@@ -66,8 +70,17 @@ pub struct SubscriptionResponse {
     /// is `active` and Stripe reported one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_period_end: Option<String>,
-    /// A Stripe billing-portal session for this customer. Absent exactly
-    /// when `state` is `none` — there is no customer to manage.
+    /// A Stripe billing-portal session for this customer, when one could be
+    /// minted.
+    ///
+    /// **Advisory, not a state signal.** It is always absent when `state` is
+    /// `none`, but its presence otherwise is not guaranteed: minting can
+    /// fail on its own (no portal configuration, a transient Stripe error)
+    /// without that saying anything about the subscription. A client must
+    /// read `state` for the standing and treat this purely as a link it may
+    /// have been handed — portal sessions are short-lived, so a client that
+    /// opens one should ask for a fresh one at the moment of use rather than
+    /// keep this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub management_url: Option<String>,
 }
@@ -453,32 +466,98 @@ pub async fn get_subscription(
         }));
     };
 
-    // A customer exists, so the portal is meaningful either way: it is
-    // where a lapsed subscriber restarts and where receipts live. The two
-    // calls are independent given the customer, so they run together
-    // rather than stacking their latencies.
-    let (management_url, in_force) = tokio::try_join!(
+    // The two calls are independent given the customer, so they run
+    // together rather than stacking their latencies — but with `join!`, not
+    // `try_join!`. They answer different questions and only one of them is
+    // load-bearing: if Stripe can list subscriptions but will not mint a
+    // portal session (no portal configuration on the account, or a
+    // transient failure), throwing away the standing would tell the app
+    // "unknown", which makes it offer recurring plans to a live subscriber
+    // whose checkout the guard then refuses.
+    let (portal, in_force) = tokio::join!(
         stripe.create_portal_session(&customer_id, BILLING_PORTAL_RETURN_URL),
         stripe.in_force_subscription(&customer_id),
-    )?;
+    );
+
+    // The standing is the answer; a failure here is a real failure.
+    let in_force = in_force?;
+
+    // A Stripe customer record is not a payment relationship, so the ledger
+    // decides whether there is one (see `subscription_standing`). Only asked
+    // when nothing is in force — an in-force subscription is a relationship
+    // by itself, whatever it has been billed yet.
+    let has_payment_history = match in_force {
+        Some(_) => true,
+        None => db::has_stripe_ledger_history(&state.db_pool, account_id).await?,
+    };
+
+    Ok(Json(subscription_standing(
+        portal,
+        in_force,
+        has_payment_history,
+    )))
+}
+
+/// Turn what Stripe and the ledger said into the account's standing.
+///
+/// Split out from the handler because the two properties worth pinning are
+/// about exactly this decision, and both used to be wrong:
+///
+/// - **A failed portal mint does not cost the answer.** The two Stripe calls
+///   run concurrently, but they answer different questions and only the
+///   subscription one is load-bearing. Coupling them (a `try_join!`) meant a
+///   customer with no portal configuration, or one transient error, reported
+///   as *unknown* — which makes the app offer recurring plans to a live
+///   subscriber and lets the checkout guard refuse the purchase it just
+///   advertised. The link is dropped; `management_url` is advisory.
+/// - **A customer record is not a payment history.** `create_checkout`
+///   persists the Stripe customer *before* it validates the price or the
+///   reader finishes paying, so a rejected request or an abandoned first
+///   checkout leaves a customer id with nothing under it. Calling that
+///   `inactive` points the reader at a billing portal holding no card, no
+///   invoice and no receipt — so `none` keeps the meaning it always
+///   documented ("has never transacted") by being decided on money that
+///   actually moved.
+fn subscription_standing(
+    portal: Result<String, ServerError>,
+    in_force: Option<crate::stripe::Subscription>,
+    has_payment_history: bool,
+) -> SubscriptionResponse {
+    let management_url = match portal {
+        Ok(url) => Some(url),
+        Err(e) => {
+            warn!("billing portal session could not be created: {}", e);
+            None
+        }
+    };
 
     let Some(sub) = in_force else {
-        return Ok(Json(SubscriptionResponse {
+        if !has_payment_history {
+            return SubscriptionResponse {
+                state: "none".to_string(),
+                id: None,
+                status: None,
+                current_period_end: None,
+                management_url: None,
+            };
+        }
+        return SubscriptionResponse {
             state: "inactive".to_string(),
             id: None,
             status: None,
             current_period_end: None,
-            management_url: Some(management_url),
-        }));
+            management_url,
+        };
     };
 
-    Ok(Json(SubscriptionResponse {
+    let current_period_end = sub.current_period_end().map(unix_to_iso);
+    SubscriptionResponse {
         state: "active".to_string(),
         id: Some(sub.id),
         status: Some(sub.status),
-        current_period_end: sub.current_period_end.map(unix_to_iso),
-        management_url: Some(management_url),
-    }))
+        current_period_end,
+        management_url,
+    }
 }
 
 /// GET /v1/prices — list available prices.
@@ -725,6 +804,77 @@ pub async fn get_ledger(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stripe::{Subscription, SubscriptionItem, SubscriptionItems};
+
+    fn in_force_sub(period_end: i64) -> Subscription {
+        Subscription {
+            id: "sub_1".to_string(),
+            status: "active".to_string(),
+            items: SubscriptionItems {
+                data: vec![SubscriptionItem {
+                    current_period_end: period_end,
+                }],
+            },
+        }
+    }
+
+    fn portal_failed() -> Result<String, ServerError> {
+        Err(ServerError::Network("stripe error: api_error".to_string()))
+    }
+
+    #[test]
+    fn a_failed_portal_mint_does_not_cost_the_subscription_answer() {
+        // Coupled to the portal call, a subscriber with no portal
+        // configuration reads as unknown — and the app then offers them the
+        // recurring plans the checkout guard will refuse.
+        let answer =
+            subscription_standing(portal_failed(), Some(in_force_sub(1_900_000_000)), true);
+        assert_eq!(answer.state, "active");
+        assert_eq!(answer.status.as_deref(), Some("active"));
+        assert!(
+            answer.management_url.is_none(),
+            "a link that could not be minted must not be invented"
+        );
+    }
+
+    #[test]
+    fn a_failed_portal_mint_does_not_cost_a_lapsed_answer_either() {
+        let answer = subscription_standing(portal_failed(), None, true);
+        assert_eq!(answer.state, "inactive");
+        assert!(answer.management_url.is_none());
+    }
+
+    #[test]
+    fn the_billing_period_reaches_the_wire_from_the_subscriptions_items() {
+        let answer =
+            subscription_standing(Ok("https://portal".into()), Some(in_force_sub(0)), true);
+        assert_eq!(
+            answer.current_period_end.as_deref(),
+            Some("1970-01-01T00:00:00Z"),
+            "the period must survive the trip from items.data onto the wire"
+        );
+    }
+
+    #[test]
+    fn a_customer_record_with_no_money_behind_it_is_not_a_relationship() {
+        // Checkout persists the customer before validating the price or
+        // taking payment, so an abandoned session leaves one with nothing
+        // under it. "Billing and receipts" for that reader is a door onto an
+        // empty room.
+        let answer = subscription_standing(Ok("https://portal".into()), None, false);
+        assert_eq!(answer.state, "none");
+        assert!(
+            answer.management_url.is_none(),
+            "no relationship means no portal, even though one was minted"
+        );
+    }
+
+    #[test]
+    fn a_real_payment_history_keeps_its_billing_door() {
+        let answer = subscription_standing(Ok("https://portal".into()), None, true);
+        assert_eq!(answer.state, "inactive");
+        assert_eq!(answer.management_url.as_deref(), Some("https://portal"));
+    }
 
     fn doc(document: &str, version: i64) -> db::RequiredDocumentRow {
         db::RequiredDocumentRow {

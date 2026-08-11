@@ -2072,11 +2072,11 @@
               "string",
               "null"
             ],
-            "description": "A Stripe billing-portal session for this customer. Absent exactly\nwhen `state` is `none` — there is no customer to manage."
+            "description": "A Stripe billing-portal session for this customer, when one could be\nminted.\n\n**Advisory, not a state signal.** It is always absent when `state` is\n`none`, but its presence otherwise is not guaranteed: minting can\nfail on its own (no portal configuration, a transient Stripe error)\nwithout that saying anything about the subscription. A client must\nread `state` for the standing and treat this purely as a link it may\nhave been handed — portal sessions are short-lived, so a client that\nopens one should ask for a fresh one at the moment of use rather than\nkeep this."
           },
           "state": {
             "type": "string",
-            "description": "`none` — the account has no Stripe customer, so it has never\ntransacted and there is nothing to manage. `inactive` — a customer\nexists but holds no subscription in a status Eidola treats as in\nforce. `active` — a subscription is in force.\n\n\"In force\" means Stripe status `active`, `trialing`, or `past_due`\n— the same set the checkout endpoint refuses to double-subscribe\nover, so the two answers cannot disagree."
+            "description": "`none` — the account has never transacted, so it has no payment\nrelationship and nothing to manage. That means no Stripe customer\n*or* a customer record with no money ever moved under it, which\ncheckout can leave behind when a session is abandoned — a customer\nid alone buys nobody a card, an invoice or a receipt. `inactive` — a\nreal payment history, but no subscription in a status Eidola treats\nas in force. `active` — a subscription is in force.\n\n\"In force\" means Stripe status `active`, `trialing`, or `past_due`\n— the same set the checkout endpoint refuses to double-subscribe\nover, so the two answers cannot disagree."
           },
           "status": {
             "type": [
