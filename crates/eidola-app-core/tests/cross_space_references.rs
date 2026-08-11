@@ -958,13 +958,20 @@ fn an_unvalidated_reference_to_a_non_post_is_withheld_by_every_read() {
             serde_json::json!({ "block": "about-this-space", "text": SECRET }).to_string(),
         )];
         turn(&core, "Noted?", Some(space.clone()));
-        let memory_action = core
+        let agent_label = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.id == agent)
+            .expect("the agent")
+            .label;
+        let blocks = core
             .runtime()
             .block_on(core.memory_blocks(agent))
-            .expect("memory")[0]
-            .revisions[0]
-            .action_id
-            .clone();
+            .expect("memory");
+        let memory_action = blocks[0].revisions[0].action_id.clone();
+        let memory_item = blocks[0].item_id.clone();
 
         // A post carrying an embed marker, and — below the gate — the edge the
         // gate would have refused.
@@ -1014,6 +1021,21 @@ fn an_unvalidated_reference_to_a_non_post_is_withheld_by_every_read() {
         assert!(
             !quoted_message.contains(SECRET),
             "a non-post reference must never expand into upstream context: {quoted_message}"
+        );
+        // The edge is still reported — existence is public — but it is *named*,
+        // never addressed: the action is current and lives in this space, yet
+        // the snapshot excludes it, so its item handle would resolve to
+        // nothing. Only a renderable post earns a handle.
+        assert!(
+            quoted_message.contains(&format!(
+                "Passages this post quotes:\n\
+                 [1] {agent_label} (a post outside this space, or an earlier version)"
+            )),
+            "an unaddressable target is named, not addressed: {quoted_message}"
+        );
+        assert!(
+            !quoted_message.contains(&format!("[1] #{}", post_handle(&memory_item))),
+            "no handle for a target read_post cannot return: {quoted_message}"
         );
 
         // (3) The follow refuses to render it, without saying what it is.

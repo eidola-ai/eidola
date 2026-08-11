@@ -847,6 +847,75 @@ fn a_reference_whose_marker_an_edit_removed_still_reaches_the_model() {
     });
 }
 
+/// A range-less reference is a **backlink** — a pointer to a post, not a quote
+/// of one (`ReferenceSpec`'s range fields are "both present or both absent").
+/// It has no passage to stand in for a marker, and reporting it as a quote
+/// whose range broke would be a plain untruth about an ordinary edge.
+#[test]
+fn a_reference_that_names_no_range_reads_as_a_backlink_not_a_broken_quote() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let source = core
+            .runtime()
+            .block_on(core.post("Tides come from the moon's pull.".into(), None))
+            .expect("source post");
+        let posted = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "See also.\n\n{{ embed 1 }}".into(),
+                Some(source.space_id.clone()),
+                None,
+                vec![eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: source.action_id.clone(),
+                    content_block_id: None,
+                    range_start: None,
+                    range_end: None,
+                    annotation: Some("for context".into()),
+                }],
+            ))
+            .expect("a range-less reference is a backlink, and is allowed");
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(async {
+                let collector = async { while events_rx.recv().await.is_some() {} };
+                let respond = core.respond_stream(
+                    posted.space_id.clone(),
+                    MODEL.into(),
+                    posted.action_id.clone(),
+                    tx,
+                );
+                let (res, ()) = tokio::join!(respond, collector);
+                res
+            })
+            .expect("respond_stream should succeed");
+
+        let last = flat_messages(&mock.chat_bodies()[0])
+            .pop()
+            .expect("the quoting post");
+        assert_eq!(
+            last.1,
+            headed(
+                &posted.item_id,
+                HUMAN_LABEL,
+                &format!(
+                    "See also.\n\n{{{{ embed 1 }}}}\n\n\
+                     Passages this post quotes:\n\
+                     [1] #{} · {HUMAN_LABEL} — for context\n\
+                     (referenced without quoting a passage)",
+                    eidola_app_core::post_handle(&source.item_id)
+                )
+            ),
+            "a backlink names its target and says it quoted nothing"
+        );
+    });
+}
+
 /// A quote names a **concrete generation**. Once that generation is superseded,
 /// the item's handle opens the *tip* — different text under the byline of the
 /// excerpt beside it — so the handle is withheld and the quote renders as an

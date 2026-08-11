@@ -3736,6 +3736,9 @@ pub struct ReferenceEdgeRow {
     /// superseded one may not be offered under the item's handle: that handle
     /// resolves to the tip, whose text is not the passage being read.
     pub antecedent_is_current: bool,
+    /// The quoted action's status. Part of the renderable-post test: an item's
+    /// tip may be a failed or in-flight generation, which no read renders.
+    pub antecedent_status: String,
     /// The quoted post's author, as its **own** space names it:
     /// `COALESCE(space_participant.override_label, participant.label)` joined
     /// on `ant.space_id`. A per-space override is that space's name for the
@@ -3751,6 +3754,31 @@ impl ReferenceEdgeRow {
     pub fn is_quotable(&self) -> bool {
         is_post_action_type(&self.antecedent_action_type)
             && self.block_type.as_deref() == Some(QUOTABLE_BLOCK_TYPE)
+    }
+
+    /// Whether the edge names a range at all. A range-less reference is a
+    /// plain backlink — a pointer to a post, not a quote of one — which
+    /// [`crate::ReferenceSpec`] permits deliberately ("both present or both
+    /// absent"), so a reader must not describe it as a quote that failed.
+    pub fn has_range(&self) -> bool {
+        self.range_start.is_some() && self.range_end.is_some()
+    }
+
+    /// Whether a reader in `reader_space_id` can open this edge's antecedent
+    /// **by handle** — i.e. whether the turn's `ThreadSnapshot` contains it.
+    ///
+    /// The snapshot is `get_space_tree_data`'s rows, so this is that query's
+    /// filter asked of one edge: the reading space's own, current-generation,
+    /// terminal-status, post-typed action. Every other case — another space, a
+    /// superseded generation, a trace or memory action, a failed one — is real
+    /// and must be *named* rather than addressed: a handle is item-derived, so
+    /// offering one for any of them either resolves to different text than the
+    /// passage beside it or resolves to nothing at all.
+    pub fn is_addressable_in(&self, reader_space_id: &str) -> bool {
+        self.antecedent_space_id == reader_space_id
+            && self.antecedent_is_current
+            && is_post_action_type(&self.antecedent_action_type)
+            && is_rendered_status(&self.antecedent_status)
     }
 }
 
@@ -3768,7 +3796,8 @@ pub async fn reference_antecedents(
                     aa.range_start, aa.range_end, aa.annotation, cb.text_content, \
                     ant.action_type, cb.block_type, ant.item_id, ant.space_id, \
                     COALESCE(sp.override_label, p.label), \
-                    COALESCE(ic.current_action_id = aa.antecedent_action_id, 0) \
+                    COALESCE(ic.current_action_id = aa.antecedent_action_id, 0), \
+                    ant.status \
              FROM action_antecedent aa \
              JOIN action ant ON ant.id = aa.antecedent_action_id \
              JOIN participant p ON p.id = ant.participant_id \
@@ -3802,6 +3831,7 @@ pub async fn reference_antecedents(
             antecedent_space_id: row.get::<String>(10).map_err(AppError::db)?,
             antecedent_author_label: row.get::<String>(11).map_err(AppError::db)?,
             antecedent_is_current: row.get::<i64>(12).map_err(AppError::db)? != 0,
+            antecedent_status: row.get::<String>(13).map_err(AppError::db)?,
         });
     }
     Ok(out)
@@ -5249,6 +5279,13 @@ pub fn is_post_action_type(action_type: &str) -> bool {
     POST_ACTION_TYPES.contains(&action_type)
 }
 
+/// The statuses every render-side query keeps (`status IN ('complete',
+/// 'cancelled')`), in Rust for the checks that happen outside SQL. A failed or
+/// still-running generation is not something any reader shows.
+pub fn is_rendered_status(status: &str) -> bool {
+    matches!(status, "complete" | "cancelled")
+}
+
 /// The only block type a reference may quote, and the only one any context
 /// query sends upstream. A `thinking` block is a render-side disclosure and a
 /// `tool_use` / `tool_result` block is trace plumbing; neither is transcript.
@@ -6055,6 +6092,103 @@ pub async fn list_credential_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reference edge naming a current, complete post of `space` — the one
+    /// shape a reader may address by handle. Each case below breaks exactly
+    /// one clause of that.
+    fn addressable_edge(space: &str) -> ReferenceEdgeRow {
+        ReferenceEdgeRow {
+            ordinal: 1,
+            antecedent_action_id: "a1".into(),
+            content_block_id: Some("cb1".into()),
+            range_start: Some(0),
+            range_end: Some(4),
+            annotation: None,
+            block_text: Some("text".into()),
+            antecedent_action_type: "user_input".into(),
+            block_type: Some("text".into()),
+            antecedent_item_id: "i1".into(),
+            antecedent_space_id: space.into(),
+            antecedent_is_current: true,
+            antecedent_status: "complete".into(),
+            antecedent_author_label: "Ada".into(),
+        }
+    }
+
+    /// A handle is item-derived and resolves through the turn's snapshot, which
+    /// is `get_space_tree_data`'s rows. So addressability is that query's
+    /// filter asked of one edge — and every clause of it has to be asked, or a
+    /// reader is handed an address that opens other text, or nothing.
+    #[test]
+    fn only_a_renderable_current_post_of_this_space_may_be_addressed() {
+        assert!(addressable_edge("s1").is_addressable_in("s1"));
+        // Cross-space: handles are global but a snapshot knows only its own.
+        assert!(!addressable_edge("s2").is_addressable_in("s1"));
+
+        let superseded = ReferenceEdgeRow {
+            antecedent_is_current: false,
+            ..addressable_edge("s1")
+        };
+        assert!(!superseded.is_addressable_in("s1"));
+
+        // A trace, decision or memory action: current and here, and excluded
+        // from every post render.
+        for action_type in ["tool_call", "decision", "memory", "checkpoint"] {
+            let non_post = ReferenceEdgeRow {
+                antecedent_action_type: action_type.into(),
+                ..addressable_edge("s1")
+            };
+            assert!(!non_post.is_addressable_in("s1"), "{action_type}");
+        }
+
+        // An item's tip may be a failed or in-flight generation; no read shows
+        // one, so no handle may name one.
+        for status in ["error", "pending", "streaming"] {
+            let unrendered = ReferenceEdgeRow {
+                antecedent_status: status.into(),
+                ..addressable_edge("s1")
+            };
+            assert!(!unrendered.is_addressable_in("s1"), "{status}");
+        }
+        assert!(
+            ReferenceEdgeRow {
+                antecedent_status: "cancelled".into(),
+                ..addressable_edge("s1")
+            }
+            .is_addressable_in("s1"),
+            "a cancelled post still renders, so it is still addressable"
+        );
+    }
+
+    /// The quotable rule and the range test are separate questions, and the
+    /// rendering needs both: a `thinking` block is a post's, so the *post* is
+    /// addressable while its passage is withheld; a range-less edge is a
+    /// backlink rather than a quote whose range broke.
+    #[test]
+    fn quotability_and_having_a_range_are_separate_from_addressability() {
+        let thinking = ReferenceEdgeRow {
+            block_type: Some("thinking".into()),
+            ..addressable_edge("s1")
+        };
+        assert!(!thinking.is_quotable());
+        assert!(thinking.has_range());
+        assert!(
+            thinking.is_addressable_in("s1"),
+            "the post is readable; only that block is not"
+        );
+
+        let backlink = ReferenceEdgeRow {
+            content_block_id: None,
+            range_start: None,
+            range_end: None,
+            block_text: None,
+            block_type: None,
+            ..addressable_edge("s1")
+        };
+        assert!(!backlink.has_range());
+        assert!(!backlink.is_quotable(), "no block, nothing to quote");
+        assert!(backlink.is_addressable_in("s1"));
+    }
 
     async fn open_memory_fresh() -> Database {
         let db = Builder::new_local(":memory:").build().await.unwrap();
