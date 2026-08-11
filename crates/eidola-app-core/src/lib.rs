@@ -565,6 +565,44 @@ pub struct PriceInfo {
     pub credits: i64,
 }
 
+/// Whether the account has a subscription in force, as the server answers
+/// it. Three values rather than a present/absent subscription because
+/// "never transacted" and "has a payment relationship but nothing in
+/// force" lead to different surfaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionState {
+    /// No payment customer exists — this account has never transacted, so
+    /// there is nothing to manage.
+    NoCustomer,
+    /// A payment customer exists, but holds no subscription in force.
+    Inactive,
+    /// A subscription is in force (the server's definition: Stripe status
+    /// `active`, `trialing`, or `past_due` — the same set it refuses to
+    /// double-subscribe over).
+    Active,
+}
+
+/// The account's subscription standing. **Fetched live and never
+/// persisted** — it is the payment processor's fact, not ours, and
+/// `management_url` is a short-lived one-shot session link that would be
+/// a lie the moment it were cached.
+///
+/// The subscription's own identifier is deliberately not carried: nothing
+/// in the client needs it, and it is a payment-side identifier.
+#[derive(Clone, Debug)]
+pub struct SubscriptionInfo {
+    pub state: SubscriptionState,
+    /// The in-force subscription's raw status, so a surface can say what
+    /// it actually is (`past_due` is in force and wants attention).
+    /// `Some` exactly when `state` is [`SubscriptionState::Active`].
+    pub status: Option<String>,
+    /// End of the current billing period, ms since the epoch.
+    pub current_period_end: Option<i64>,
+    /// A billing-portal session to open in a browser. Absent exactly when
+    /// `state` is [`SubscriptionState::NoCustomer`].
+    pub management_url: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct BalancesResult {
     pub available: i64,
@@ -2020,6 +2058,60 @@ impl Inner {
             })?;
 
         Ok(checkout.checkout_url)
+    }
+
+    /// The account's subscription standing, read live from the server.
+    ///
+    /// Persists nothing and emits no [`Change`]: there is no durable
+    /// commit to announce, and caching a billing-portal session link or a
+    /// subscription status would be caching someone else's truth. Callers
+    /// that want it fresh ask again.
+    async fn account_subscription(&self) -> Result<SubscriptionInfo, AppError> {
+        let cfg = self.load_config();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let (id, secret) = self.require_credentials(&cfg)?;
+
+        let client = self.build_client(&cfg, &eidola, None).await?;
+        let resp = client
+            .get(format!("{base_url}/v1/account/subscription"))
+            .basic_auth(id, Some(secret))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let sub: SubscriptionResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse response: {e}"),
+            })?;
+
+        // An unrecognized state is refused rather than guessed at. Both
+        // guesses are harmful — "active" hides the plans a paying reader
+        // wants, "inactive" offers a purchase the server will refuse — and
+        // the client and server ship together, so this can only mean the
+        // app is talking to something newer than it understands.
+        let state = match sub.state.as_str() {
+            "none" => SubscriptionState::NoCustomer,
+            "inactive" => SubscriptionState::Inactive,
+            "active" => SubscriptionState::Active,
+            _ => {
+                return Err(AppError::Network {
+                    message: "the server reported a subscription state this version of \
+                              Eidola does not understand — check for an update"
+                        .into(),
+                });
+            }
+        };
+
+        Ok(SubscriptionInfo {
+            state,
+            status: sub.status,
+            current_period_end: sub.current_period_end.map(|s| iso_to_ms(&s)).transpose()?,
+            management_url: sub.management_url,
+        })
     }
 
     async fn account_balances(&self) -> Result<BalancesResult, AppError> {
@@ -7347,6 +7439,16 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// The account's subscription standing. Live read, nothing persisted,
+    /// no [`Change`] emitted.
+    pub async fn account_subscription(&self) -> Result<SubscriptionInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.account_subscription().await })
+            .await
+            .map_err(join_err)?
+    }
+
     pub async fn account_balances(&self) -> Result<BalancesResult, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -8652,6 +8754,14 @@ struct RecurringResponse {
 #[derive(Deserialize)]
 struct CheckoutUrlResponse {
     checkout_url: String,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionResponse {
+    state: String,
+    status: Option<String>,
+    current_period_end: Option<String>,
+    management_url: Option<String>,
 }
 
 #[derive(Deserialize)]
