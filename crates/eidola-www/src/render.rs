@@ -255,6 +255,7 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
 <title>{title}</title>
 {description}<link rel="canonical" href="{canonical}">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="stylesheet" href="/assets/circadian.css">
 <link rel="stylesheet" href="/assets/site.css">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self';">

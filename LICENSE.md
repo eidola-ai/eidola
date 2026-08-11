@@ -30,6 +30,8 @@ The documentation (`docs/`) and website content (`www/`) are licensed under
 
 The Eidola name and the Eidola logo are trademarks of Eidola, Inc. The licenses above do not grant any right to use them. Forks must not present themselves as Eidola or as endorsed by Eidola, Inc.
 
+The logo is the hexagon-grid mark generated from [`brand/`](brand/); its derived assets are the macOS app icon (`crates/eidola-gui/Support/AppIcon.icns`), the website favicon and home-screen tile (`www/static/`), and the Linux themed icons (`releases/linux/icons/`). A fork should replace those files with its own identity.
+
 ## Other licensing
 
 If these licenses do not fit your use case, contact <hello@eidola.ai>.
