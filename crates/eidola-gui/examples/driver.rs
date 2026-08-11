@@ -77,13 +77,15 @@ mod driver {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    use eidola_app_core::error::AppError;
     use eidola_app_core::updates::{UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease};
     use eidola_app_core::{
         AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState, ModelInfo, ParticipantInfo,
         ParticipantReference, PriceInfo, SpaceInfo, SpaceMessage, SpaceTemplateInfo,
-        TemplateParticipantInfo,
+        SubscriptionInfo, SubscriptionState, TemplateParticipantInfo,
     };
     use eidola_gui::library::LibraryView;
+    use eidola_gui::loadable::Loadable;
     use eidola_gui::onboarding::OnboardingView;
     use eidola_gui::probe;
     use eidola_gui::record::RecordView;
@@ -835,6 +837,87 @@ mod driver {
                 },
             },
             Scene {
+                name: "settings_account_unsubscribed",
+                description: "Settings ▸ Account: funded account with no subscription — the full plans list",
+                default_size: size(px(620.), px(620.)),
+                build: |window, cx| {
+                    let stores =
+                        account_stores(cx, Some(subscription(SubscriptionState::NoCustomer)));
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "settings_account_subscribed",
+                description: "Settings ▸ Account: an active subscription — Manage subscription replaces the recurring plans, one-time top-ups stay",
+                default_size: size(px(620.), px(620.)),
+                build: |window, cx| {
+                    let stores = account_stores(cx, Some(subscription(SubscriptionState::Active)));
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "settings_account_subscription_checking",
+                description: "Settings ▸ Account: the subscription read is still in flight",
+                default_size: size(px(620.), px(620.)),
+                build: |window, cx| {
+                    let stores = account_stores(cx, None);
+                    stores.account.update(cx, |s, cx| {
+                        s.set_subscription_for_test(Loadable::Loading, cx)
+                    });
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "settings_account_subscription_failed",
+                description: "Settings ▸ Account: the subscription read failed — the honest retry, with every plan still offered",
+                default_size: size(px(620.), px(620.)),
+                build: |window, cx| {
+                    let stores = account_stores(cx, None);
+                    stores.account.update(cx, |s, cx| {
+                        s.set_subscription_for_test(
+                            Loadable::Failed {
+                                error: AppError::Network {
+                                    message: "connection reset by peer".into(),
+                                },
+                                prior: None,
+                            },
+                            cx,
+                        )
+                    });
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "settings_account_subscription_stale",
+                description: "Settings ▸ Account: a re-read failed over a known answer — the subscription stays on screen with a quiet check-again",
+                default_size: size(px(620.), px(620.)),
+                build: |window, cx| {
+                    let stores = account_stores(cx, None);
+                    stores.account.update(cx, |s, cx| {
+                        s.set_subscription_for_test(
+                            Loadable::Failed {
+                                error: AppError::Network {
+                                    message: "connection reset by peer".into(),
+                                },
+                                prior: Some(subscription(SubscriptionState::Active)),
+                            },
+                            cx,
+                        )
+                    });
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "updates_available",
                 description: "Updates window: a verified release is available",
                 default_size: size(px(480.), px(360.)),
@@ -1313,6 +1396,16 @@ mod driver {
                 amount_display: "20.00 USD".into(),
                 recurrence: "/month".into(),
                 credits: 20_000_000,
+            },
+            // A one-time price, so the plans surfaces show both kinds — it is
+            // what stays offered once a subscription is in force.
+            PriceInfo {
+                id: "price_topup".into(),
+                product_name: "Top-up".into(),
+                product_description: Some("Credit that keeps for a year".into()),
+                amount_display: "10.00 USD".into(),
+                recurrence: "".into(),
+                credits: 10_000_000,
             },
         ]
     }
@@ -1798,6 +1891,39 @@ mod driver {
             s.backends = backends();
             s.local_models = Some(local_models_state());
         })
+    }
+
+    /// `settings_stores` with the subscription cell set explicitly — the
+    /// Account pane's four subscription states are exactly what varies
+    /// across the scenes below.
+    fn account_stores(cx: &mut App, subscription: Option<SubscriptionInfo>) -> Stores {
+        stub_stores(cx, |s| {
+            s.config_state = Some(config_state(true));
+            s.eidola_trust = Some(eidola_trust());
+            s.balances = Some(BalancesResult {
+                available: 4_200_000,
+                pools: vec![BalancePoolInfo {
+                    amount: 4_200_000,
+                    source: "subscription".into(),
+                    expires_at: Some(eidola_app_core::now_ms() + 23 * 24 * 60 * 60 * 1000),
+                }],
+            });
+            s.prices = prices();
+            s.backends = backends();
+            s.local_models = Some(local_models_state());
+            s.subscription = subscription;
+        })
+    }
+
+    fn subscription(state: SubscriptionState) -> SubscriptionInfo {
+        SubscriptionInfo {
+            state,
+            status: (state == SubscriptionState::Active).then(|| "active".to_string()),
+            current_period_end: (state == SubscriptionState::Active)
+                .then(|| eidola_app_core::now_ms() + 23 * 24 * 60 * 60 * 1000),
+            management_url: (state != SubscriptionState::NoCustomer)
+                .then(|| "https://billing.stripe.com/session/demo".to_string()),
+        }
     }
 
     // ---------------------------------------------------------------------------

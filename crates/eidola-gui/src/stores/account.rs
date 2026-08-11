@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AccountCreateResult, AppCore, BalancesResult, PriceInfo};
+use eidola_app_core::{AccountCreateResult, AppCore, BalancesResult, PriceInfo, SubscriptionInfo};
 use gpui::{Context, Task};
 use tokio::sync::oneshot;
 
@@ -26,10 +26,16 @@ pub struct AccountStore {
     app_core: Option<Arc<AppCore>>,
     balances: Loadable<BalancesResult>,
     prices: Loadable<Vec<PriceInfo>>,
+    /// The account's subscription standing. Core-side this is a live read
+    /// that persists nothing, so nothing on the bus ever invalidates it —
+    /// it is refreshed when a surface that shows it opens, and by that
+    /// surface's own retry.
+    subscription: Loadable<SubscriptionInfo>,
     /// Supersede slots — replacing cancels the predecessor. `Loading` on a
     /// cell implies its slot is `Some`.
     balances_task: Option<Task<()>>,
     prices_task: Option<Task<()>>,
+    subscription_task: Option<Task<()>>,
     /// Slot for the fire-and-notify `create_account` op (its own slot so it
     /// never cancels a balances/prices refresh).
     lifecycle_task: Option<Task<()>>,
@@ -45,15 +51,21 @@ impl AccountStore {
             app_core,
             balances: Loadable::NotLoaded,
             prices: Loadable::NotLoaded,
+            subscription: Loadable::NotLoaded,
             balances_task: None,
             prices_task: None,
+            subscription_task: None,
             lifecycle_task: None,
             account_op_error: None,
         }
     }
 
-    /// A stub store with fixture balances/prices (tests).
-    pub fn stub(balances: Option<BalancesResult>, prices: Vec<PriceInfo>) -> Self {
+    /// A stub store with fixture balances/prices/subscription (tests).
+    pub fn stub(
+        balances: Option<BalancesResult>,
+        prices: Vec<PriceInfo>,
+        subscription: Option<SubscriptionInfo>,
+    ) -> Self {
         Self {
             app_core: None,
             balances: match balances {
@@ -65,8 +77,13 @@ impl AccountStore {
             } else {
                 Loadable::loaded(prices)
             },
+            subscription: match subscription {
+                Some(s) => Loadable::loaded(s),
+                None => Loadable::NotLoaded,
+            },
             balances_task: None,
             prices_task: None,
+            subscription_task: None,
             lifecycle_task: None,
             account_op_error: None,
         }
@@ -80,6 +97,10 @@ impl AccountStore {
 
     pub fn prices(&self) -> &Loadable<Vec<PriceInfo>> {
         &self.prices
+    }
+
+    pub fn subscription(&self) -> &Loadable<SubscriptionInfo> {
+        &self.subscription
     }
 
     /// True while either cell is doing an initial load — the panes' "Loading…"
@@ -122,6 +143,37 @@ impl AccountStore {
                 cx.notify();
             });
         }));
+        cx.notify();
+    }
+
+    /// Re-read the account's subscription standing. Only meaningful with an
+    /// account configured; callers gate on that the way they gate balances.
+    pub fn refresh_subscription(&mut self, cx: &mut Context<Self>) {
+        let Some(core) = self.app_core.clone() else {
+            return;
+        };
+        self.subscription = std::mem::take(&mut self.subscription).to_loading();
+        self.subscription_task = Some(cx.spawn(async move |this, cx| {
+            let result = bridge(core, |c| async move { c.account_subscription().await }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.subscription = std::mem::take(&mut this.subscription).resolve(result);
+                this.subscription_task = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Test-only: put the subscription cell in an arbitrary state, so a
+    /// behavior test or driver scene can render "checking" and "couldn't
+    /// check" without a backend that stalls or fails on cue.
+    #[doc(hidden)]
+    pub fn set_subscription_for_test(
+        &mut self,
+        cell: Loadable<SubscriptionInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        self.subscription = cell;
         cx.notify();
     }
 
@@ -196,6 +248,23 @@ impl AccountStore {
         Some(rx)
     }
 
+    /// Re-read the subscription standing for the sake of the billing-portal
+    /// link it carries. The link is a short-lived session the payment
+    /// processor mints on request, so "Manage subscription" asks for a fresh
+    /// one at the moment of the click rather than opening whatever the pane
+    /// fetched when it was opened — the same shape as `request_checkout`.
+    /// The caller awaits inside its own slot. `None` on a stub.
+    pub fn request_subscription(
+        &self,
+    ) -> Option<oneshot::Receiver<Result<SubscriptionInfo, AppError>>> {
+        let core = self.app_core.clone()?;
+        let (tx, rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let _ = tx.send(core.account_subscription().await);
+        });
+        Some(rx)
+    }
+
     /// Fetch balances; the caller (checkout poll) awaits inside its own loop.
     /// `None` on a stub.
     pub fn request_balances(&self) -> Option<oneshot::Receiver<Result<BalancesResult, AppError>>> {
@@ -247,6 +316,7 @@ impl AccountStore {
                         this.account_op_error = None;
                         this.refresh_prices(cx);
                         this.refresh_balances(cx);
+                        this.refresh_subscription(cx);
                     }
                     Err(e) => {
                         // Surface the failure instead of dropping it.
@@ -276,6 +346,11 @@ impl AccountStore {
             Ok(()) => {
                 self.balances = Loadable::NotLoaded;
                 self.balances_task = None;
+                // The subscription belonged to the account whose keys were
+                // just forgotten; keeping it on screen would attribute
+                // someone's subscription to nobody.
+                self.subscription = Loadable::NotLoaded;
+                self.subscription_task = None;
             }
             Err(e) => {
                 self.account_op_error = Some(e);

@@ -51,6 +51,7 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use eidola_app_core::SubscriptionState;
 use eidola_app_core::error::AppError;
 use gpui::{
     AnyElement, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
@@ -280,6 +281,16 @@ impl OnboardingView {
         if self.revealed.get(target) != Some(&next) {
             self.revealed.truncate(target);
             self.revealed.push(next);
+        }
+        // Reaching the plans is the moment this window needs to know whether
+        // the account already subscribes — the "existing account" branch can
+        // arrive here with one, and the server refuses a second. Nothing on
+        // the bus carries this (it is a live read that persists nothing), so
+        // the reveal is where it is asked for.
+        if next == Slide::Purchase {
+            self.stores
+                .account
+                .update(cx, |s, cx| s.refresh_subscription(cx));
         }
         self.pending_scroll = Some(target);
         cx.notify();
@@ -798,8 +809,19 @@ impl OnboardingView {
                 let on_select: plans::PlanSelectHandler = Rc::new(move |price_id, _window, app| {
                     let _ = weak.update(app, |this, cx| this.begin_checkout(price_id, cx));
                 });
+                // Only an answered, affirmative read narrows the list; an
+                // unanswered or failed one leaves every plan offered and
+                // lets the server refuse, which it does honestly. Managing
+                // an existing subscription is Settings' job, so this slide
+                // says where rather than growing a second door.
+                let subscribed = account
+                    .subscription()
+                    .value()
+                    .is_some_and(|s| s.state == SubscriptionState::Active);
+                let prices = account.prices().value().cloned().unwrap_or_default();
                 slides::Purchase {
-                    prices: account.prices().value().cloned().unwrap_or_default(),
+                    prices: plans::offered_plans(&prices, subscribed),
+                    subscribed,
                     loading: account.is_loading(),
                     checkout_pending: self.checkout_pending.clone(),
                     checkout_error: self.checkout_error.clone(),
