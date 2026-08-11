@@ -8,6 +8,12 @@
 	<string>Eidola</string>
 	<key>CFBundleIdentifier</key>
 	<string>tech.m6i.eidola-gpui</string>
+	<!--
+		The app icon, resolved as Contents/Resources/AppIcon.icns. Generated
+		from the vector master by `just update-brand` — see brand/AGENTS.md.
+	-->
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
