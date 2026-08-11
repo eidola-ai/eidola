@@ -916,6 +916,94 @@ fn a_reference_that_names_no_range_reads_as_a_backlink_not_a_broken_quote() {
     });
 }
 
+/// A per-space label overridden to **empty** is a documented state — on an
+/// override column `NULL` inherits and `''` means "override to empty", and
+/// `set_space_participant_override` deliberately allows it. Every byline has to
+/// survive it: the quoted post keeps its handle, with nothing dangling after
+/// the header separator.
+#[test]
+fn a_quote_whose_author_has_no_name_here_keeps_a_clean_handle() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let source = core
+            .runtime()
+            .block_on(core.post("Tides come from the moon's pull.".into(), None))
+            .expect("source post");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .expect("tree");
+        let posted = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "Is this right?\n\n{{ embed 1 }}".into(),
+                Some(source.space_id.clone()),
+                None,
+                vec![eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: source.action_id.clone(),
+                    content_block_id: Some(tree[0].blocks[0].id.clone()),
+                    range_start: Some(20),
+                    range_end: Some(31), // "moon's pull"
+                    annotation: None,
+                }],
+            ))
+            .expect("post with reference");
+
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                source.space_id.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                eidola_app_core::ParticipantOverride {
+                    label: Some(Some(String::new())),
+                    model_ref: None,
+                    system_prompt: None,
+                    notify_policy: None,
+                },
+            ))
+            .expect("an empty override is a real state");
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(async {
+                let collector = async { while events_rx.recv().await.is_some() {} };
+                let respond = core.respond_stream(
+                    posted.space_id.clone(),
+                    MODEL.into(),
+                    posted.action_id.clone(),
+                    tx,
+                );
+                let (res, ()) = tokio::join!(respond, collector);
+                res
+            })
+            .expect("respond_stream should succeed");
+
+        let sent = flat_messages(&mock.chat_bodies()[0])
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            sent.contains(&format!(
+                "[1] #{}\n> moon's pull",
+                eidola_app_core::post_handle(&source.item_id)
+            )),
+            "the handle stands alone when this space gives its author no name: {sent}"
+        );
+        assert!(
+            !sent.contains(&format!(
+                "[1] #{} · ",
+                eidola_app_core::post_handle(&source.item_id)
+            )),
+            "a byline never trails the header separator into nothing: {sent}"
+        );
+    });
+}
+
 /// A quote names a **concrete generation**. Once that generation is superseded,
 /// the item's handle opens the *tip* — different text under the byline of the
 /// excerpt beside it — so the handle is withheld and the quote renders as an

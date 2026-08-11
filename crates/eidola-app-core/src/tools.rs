@@ -511,7 +511,7 @@ impl ReadPostTool {
                 // earlier version rather than an address that opens nothing.
                 let Ok(references) = crate::reference_entries(
                     &conn,
-                    &self.current_space_id,
+                    &self.snapshot,
                     &reference.antecedent_action_id,
                 )
                 .await
