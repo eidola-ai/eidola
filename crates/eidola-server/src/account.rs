@@ -35,13 +35,41 @@ pub struct GetAccountResponse {
     pub created_at: String,
 }
 
+/// The account's subscription standing.
+///
+/// The `state` field is the answer; the rest is detail that exists only
+/// where it is meaningful. It is deliberately a three-value state rather
+/// than a present/absent subscription, because "this account has never
+/// transacted" and "this account has a payment relationship but no live
+/// subscription" are different situations and lead to different UI.
 #[derive(Serialize, ToSchema)]
 pub struct SubscriptionResponse {
-    pub id: String,
-    pub status: String,
+    /// `none` — the account has no Stripe customer, so it has never
+    /// transacted and there is nothing to manage. `inactive` — a customer
+    /// exists but holds no subscription in a status Eidola treats as in
+    /// force. `active` — a subscription is in force.
+    ///
+    /// "In force" means Stripe status `active`, `trialing`, or `past_due`
+    /// — the same set the checkout endpoint refuses to double-subscribe
+    /// over, so the two answers cannot disagree.
+    pub state: String,
+    /// The in-force subscription's Stripe id. Present exactly when `state`
+    /// is `active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The in-force subscription's raw Stripe status, so a client can show
+    /// what it actually is (a `past_due` subscription is in force and
+    /// wants attention). Present exactly when `state` is `active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// End of the current billing period, ISO-8601. Present when `state`
+    /// is `active` and Stripe reported one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_period_end: Option<String>,
-    pub management_url: String,
+    /// A Stripe billing-portal session for this customer. Absent exactly
+    /// when `state` is `none` — there is no customer to manage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub management_url: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -170,12 +198,21 @@ pub struct LedgerEntry {
     pub credential_credits: Option<i64>,
 }
 
+/// Where Stripe sends a browser when it is done with the user. All three
+/// are real routes on the published site (`www/pages/`), which generates
+/// flat routes only — a nested `/payment/success` would 404. `www.` is the
+/// canonical host the rest of the server already uses
+/// (`TERMS_FEED_BASE_URL`).
+const PAYMENT_COMPLETE_URL: &str = "https://www.eidola.ai/payment-complete/";
+const PAYMENT_CANCELED_URL: &str = "https://www.eidola.ai/payment-canceled/";
+const BILLING_PORTAL_RETURN_URL: &str = "https://www.eidola.ai/billing/";
+
 fn default_success_url() -> String {
-    "https://eidola.ai/payment/success".to_string()
+    PAYMENT_COMPLETE_URL.to_string()
 }
 
 fn default_cancel_url() -> String {
-    "https://eidola.ai/payment/cancel".to_string()
+    PAYMENT_CANCELED_URL.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -381,16 +418,21 @@ pub async fn get_account(
     }))
 }
 
-/// GET /v1/account/subscription — get subscription details (authenticated).
+/// GET /v1/account/subscription — the account's subscription standing
+/// (authenticated).
+///
+/// Always 200 on a reachable Stripe: having no subscription is an answer,
+/// not a failure. The states are distinguished so a client can tell "never
+/// transacted" from "has a payment relationship but nothing in force" —
+/// the second has a billing portal worth offering, the first does not.
 #[utoipa::path(
     get,
     path = "/v1/account/subscription",
     tag = "Linked",
     security(("basic" = [])),
     responses(
-        (status = 200, description = "Subscription details", body = SubscriptionResponse),
+        (status = 200, description = "Subscription standing", body = SubscriptionResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
-        (status = 404, description = "No Stripe customer or no subscription", body = crate::types::ErrorResponse),
         (status = 503, description = "Stripe not configured", body = crate::types::ErrorResponse)
     )
 )]
@@ -401,30 +443,43 @@ pub async fn get_subscription(
     let stripe = require_stripe(&state.stripe)?;
     let account = db::get_account_by_id(&state.db_pool, account_id).await?;
 
-    let customer_id = account
-        .stripe_customer_id
-        .ok_or_else(|| ServerError::NotFound {
-            message: "no_stripe_customer".to_string(),
-        })?;
+    let Some(customer_id) = account.stripe_customer_id else {
+        return Ok(Json(SubscriptionResponse {
+            state: "none".to_string(),
+            id: None,
+            status: None,
+            current_period_end: None,
+            management_url: None,
+        }));
+    };
 
-    let subscriptions = stripe.list_subscriptions(&customer_id).await?;
+    // A customer exists, so the portal is meaningful either way: it is
+    // where a lapsed subscriber restarts and where receipts live. The two
+    // calls are independent given the customer, so they run together
+    // rather than stacking their latencies.
+    let (management_url, subscriptions) = tokio::try_join!(
+        stripe.create_portal_session(&customer_id, BILLING_PORTAL_RETURN_URL),
+        stripe.list_subscriptions(&customer_id),
+    )?;
 
-    let sub = subscriptions
-        .into_iter()
-        .next()
-        .ok_or_else(|| ServerError::NotFound {
-            message: "no_subscription".to_string(),
-        })?;
+    let in_force = subscriptions.into_iter().find(|s| s.is_in_force());
 
-    let management_url = stripe
-        .create_portal_session(&customer_id, "https://eidola.ai")
-        .await?;
+    let Some(sub) = in_force else {
+        return Ok(Json(SubscriptionResponse {
+            state: "inactive".to_string(),
+            id: None,
+            status: None,
+            current_period_end: None,
+            management_url: Some(management_url),
+        }));
+    };
 
     Ok(Json(SubscriptionResponse {
-        id: sub.id,
-        status: sub.status,
+        state: "active".to_string(),
+        id: Some(sub.id),
+        status: Some(sub.status),
         current_period_end: sub.current_period_end.map(unix_to_iso),
-        management_url,
+        management_url: Some(management_url),
     }))
 }
 
@@ -519,10 +574,9 @@ pub async fn create_checkout(
 
     let mode = if price.recurring.is_some() {
         let subs = stripe.list_subscriptions(&customer_id).await?;
-        if subs
-            .iter()
-            .any(|s| s.status == "active" || s.status == "past_due" || s.status == "trialing")
-        {
+        // Same predicate `GET /v1/account/subscription` answers with, so a
+        // client shown "no subscription" is never refused here.
+        if subs.iter().any(|s| s.is_in_force()) {
             return Err(ServerError::Conflict {
                 message: "account already has an active subscription".to_string(),
             });

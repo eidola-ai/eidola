@@ -19,6 +19,34 @@ pub struct Subscription {
     pub current_period_end: Option<i64>,
 }
 
+/// The Stripe subscription statuses Eidola treats as a subscription being
+/// **in force** — the account has a live subscription relationship, so it
+/// may not start a second one and the app offers management rather than
+/// plans.
+///
+/// - `active` — paid and current.
+/// - `trialing` — entitling; billing has not started yet.
+/// - `past_due` — Stripe is still retrying payment and keeps the
+///   subscription alive; the right move is fixing the card in the billing
+///   portal, not buying a second subscription.
+///
+/// Everything else is not in force: `incomplete` (a first payment that
+/// never succeeded; Stripe expires it within a day), `incomplete_expired`,
+/// `unpaid`, `paused`, and `canceled`.
+///
+/// One list, one meaning: both the subscription read and the checkout
+/// guard resolve through this predicate, so the app can never be told
+/// "no subscription" by one and "already subscribed" by the other.
+pub const IN_FORCE_SUBSCRIPTION_STATUSES: &[&str] = &["active", "trialing", "past_due"];
+
+impl Subscription {
+    /// Whether this subscription is in force — see
+    /// [`IN_FORCE_SUBSCRIPTION_STATUSES`].
+    pub fn is_in_force(&self) -> bool {
+        IN_FORCE_SUBSCRIPTION_STATUSES.contains(&self.status.as_str())
+    }
+}
+
 /// Stripe list response wrapper.
 #[derive(Debug, Deserialize)]
 struct ListResponse<T> {
@@ -180,7 +208,12 @@ impl StripeClient {
         Ok(customer.id)
     }
 
-    /// List subscriptions for a Stripe customer.
+    /// List a Stripe customer's subscriptions, verbatim.
+    ///
+    /// Stripe's list endpoint takes at most one `status` value, so it
+    /// cannot express the in-force set; callers filter with
+    /// [`Subscription::is_in_force`]. Unfiltered, this returns everything
+    /// Stripe returns by default — every status except `canceled`.
     pub async fn list_subscriptions(
         &self,
         customer_id: &str,
@@ -465,5 +498,44 @@ fn stripe_error(body: &[u8]) -> ServerError {
             ServerError::Network(format!("stripe error: {label}"))
         }
         Err(_) => ServerError::Network("stripe error: unparseable error body".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub(status: &str) -> Subscription {
+        Subscription {
+            id: "sub_1".to_string(),
+            status: status.to_string(),
+            current_period_end: None,
+        }
+    }
+
+    #[test]
+    fn in_force_covers_paying_trialing_and_retrying_subscriptions() {
+        assert!(sub("active").is_in_force());
+        assert!(sub("trialing").is_in_force());
+        assert!(sub("past_due").is_in_force());
+    }
+
+    #[test]
+    fn a_subscription_that_never_started_or_has_ended_is_not_in_force() {
+        for status in [
+            "incomplete",
+            "incomplete_expired",
+            "canceled",
+            "unpaid",
+            "paused",
+        ] {
+            assert!(!sub(status).is_in_force(), "{status} counted as in force");
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_status_is_not_in_force() {
+        // Stripe adding a status must not silently entitle an account.
+        assert!(!sub("something_new").is_in_force());
     }
 }
