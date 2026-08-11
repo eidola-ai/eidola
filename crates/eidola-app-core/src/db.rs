@@ -3731,6 +3731,11 @@ pub struct ReferenceEdgeRow {
     /// The space the quoted post lives in. A reference is the cross-space
     /// mechanism, so this is not necessarily the space doing the reading.
     pub antecedent_space_id: String,
+    /// Whether the quoted **generation** is still its item's current one. A
+    /// reference names a concrete generation and is never remapped, so a
+    /// superseded one may not be offered under the item's handle: that handle
+    /// resolves to the tip, whose text is not the passage being read.
+    pub antecedent_is_current: bool,
     /// The quoted post's author, as its **own** space names it:
     /// `COALESCE(space_participant.override_label, participant.label)` joined
     /// on `ant.space_id`. A per-space override is that space's name for the
@@ -3762,12 +3767,15 @@ pub async fn reference_antecedents(
             "SELECT aa.ordinal, aa.antecedent_action_id, aa.content_block_id, \
                     aa.range_start, aa.range_end, aa.annotation, cb.text_content, \
                     ant.action_type, cb.block_type, ant.item_id, ant.space_id, \
-                    COALESCE(sp.override_label, p.label) \
+                    COALESCE(sp.override_label, p.label), \
+                    COALESCE(ic.current_action_id = aa.antecedent_action_id, 0) \
              FROM action_antecedent aa \
              JOIN action ant ON ant.id = aa.antecedent_action_id \
              JOIN participant p ON p.id = ant.participant_id \
              LEFT JOIN space_participant sp \
                ON sp.space_id = ant.space_id AND sp.participant_id = ant.participant_id \
+             LEFT JOIN item_current ic \
+               ON ic.space_id = ant.space_id AND ic.item_id = ant.item_id \
              LEFT JOIN content_block cb ON cb.id = aa.content_block_id \
              WHERE aa.action_id = ?1 AND aa.relation = 'reference' \
              ORDER BY aa.ordinal ASC",
@@ -3793,6 +3801,7 @@ pub async fn reference_antecedents(
             antecedent_item_id: row.get::<String>(9).map_err(AppError::db)?,
             antecedent_space_id: row.get::<String>(10).map_err(AppError::db)?,
             antecedent_author_label: row.get::<String>(11).map_err(AppError::db)?,
+            antecedent_is_current: row.get::<i64>(12).map_err(AppError::db)? != 0,
         });
     }
     Ok(out)
@@ -5252,6 +5261,13 @@ pub struct PostActionRow {
     pub action_id: String,
     pub item_id: String,
     pub participant_kind: String,
+    /// The author as **this** space names them
+    /// (`COALESCE(space_participant.override_label, participant.label)`) — the
+    /// same effective label every other author-rendering read returns, so a
+    /// post carries one byline whether it is read through the tree, the
+    /// transcript, the navigation tools or the trace rail. Deliberately not
+    /// liveness-filtered: who wrote a post goes on being named after
+    /// retirement.
     pub participant_label: String,
     pub action_type: String,
     pub model: Option<String>,
@@ -5321,10 +5337,13 @@ pub async fn get_space_tree_data(
     // here (render order → sibling/root order in the tree) and in the
     // upstream-context view (`get_space_actions_for_context`).
     let action_sql = format!(
-        "SELECT ar.action_id, ar.item_id, p.kind, p.label, ar.action_type, \
+        "SELECT ar.action_id, ar.item_id, p.kind, \
+                COALESCE(sp.override_label, p.label), ar.action_type, \
                 ar.model, ar.credits_consumed, ar.generation, ar.created_at \
          FROM action_resolved ar \
          JOIN participant p ON p.id = ar.participant_id \
+         LEFT JOIN space_participant sp \
+           ON sp.space_id = ar.space_id AND sp.participant_id = ar.participant_id \
          JOIN (SELECT space_id, item_id, \
                       MIN(created_at) AS born_at, MIN(id) AS first_action_id \
                FROM action GROUP BY space_id, item_id) origin \

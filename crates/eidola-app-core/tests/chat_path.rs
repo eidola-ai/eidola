@@ -847,6 +847,91 @@ fn a_reference_whose_marker_an_edit_removed_still_reaches_the_model() {
     });
 }
 
+/// A quote names a **concrete generation**. Once that generation is superseded,
+/// the item's handle opens the *tip* — different text under the byline of the
+/// excerpt beside it — so the handle is withheld and the quote renders as an
+/// earlier version, the same shape a cross-space quote takes. An address that
+/// resolves to something other than what the model is reading is worse than no
+/// address.
+#[test]
+fn a_quote_of_a_since_edited_post_is_not_offered_its_handle() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let source = core
+            .runtime()
+            .block_on(core.post("Tides come from the moon's pull.".into(), None))
+            .expect("source post");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .expect("tree");
+        let quoting = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "Is this right?\n\n{{ embed 1 }}".into(),
+                Some(source.space_id.clone()),
+                None,
+                vec![eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: source.action_id.clone(),
+                    content_block_id: Some(tree[0].blocks[0].id.clone()),
+                    range_start: Some(20),
+                    range_end: Some(31), // "moon's pull"
+                    annotation: None,
+                }],
+            ))
+            .expect("post with reference");
+
+        // The quoted post is edited: the passage stays what it was, the handle
+        // now opens something else.
+        core.runtime()
+            .block_on(core.edit_post(
+                source.action_id.clone(),
+                "Tides come from the sun as well.".into(),
+            ))
+            .expect("edit");
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(async {
+                let collector = async { while events_rx.recv().await.is_some() {} };
+                let respond = core.respond_stream(
+                    quoting.space_id.clone(),
+                    MODEL.into(),
+                    quoting.action_id.clone(),
+                    tx,
+                );
+                let (res, ()) = tokio::join!(respond, collector);
+                res
+            })
+            .expect("respond_stream should succeed");
+
+        let sent = flat_messages(&mock.chat_bodies()[0])
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            sent.contains(&format!(
+                "[1] {HUMAN_LABEL} (a post outside this space, or an earlier version)\n\
+                 > moon's pull"
+            )),
+            "a superseded generation is named as one, not addressed: {sent}"
+        );
+        assert!(
+            !sent.contains(&format!(
+                "[1] #{} · ",
+                eidola_app_core::post_handle(&source.item_id)
+            )),
+            "the item handle opens the edited text, so it may not be offered: {sent}"
+        );
+    });
+}
+
 #[test]
 fn branch_reply_sends_only_its_branch_context() {
     run(|| {
@@ -1504,6 +1589,68 @@ fn navigation_tools_round_trip_through_the_turn_loop() {
             !results[4].contains("{{ embed"),
             "no literal marker survives into a tool result: {}",
             results[4]
+        );
+    });
+}
+
+/// A post carries **one** byline. The transcript renders the author's
+/// effective label — the space's own override where there is one — and so must
+/// every tool result, or the same participant answers to two names in one turn.
+#[test]
+fn a_per_space_rename_reaches_the_tools_as_well_as_the_transcript() {
+    run(|| {
+        let script = chat_harness::tool_script();
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolScript,
+            tool_script: script.clone(),
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        let space = branched_external_space(&core);
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                space.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                eidola_app_core::ParticipantOverride {
+                    label: Some(Some("Skipper".into())),
+                    model_ref: None,
+                    system_prompt: None,
+                    notify_policy: None,
+                },
+            ))
+            .expect("override");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let u1_item = tree[0].item_id.clone();
+        *script.lock().unwrap() = vec![(
+            "read_post".into(),
+            serde_json::json!({ "handle": eidola_app_core::post_handle(&u1_item) }).to_string(),
+        )];
+        core.runtime()
+            .block_on(core.chat("Tell me more.".into(), "qwen3-8b@ext".into(), Some(space)))
+            .expect("turn");
+
+        let bodies = mock.chat_bodies();
+        let round1 = flat_messages(&bodies[bodies.len() - 2]);
+        assert!(
+            round1.iter().any(|(_, c)| c.starts_with(&headed(
+                &u1_item,
+                "Skipper",
+                "How do tides work?"
+            ))),
+            "the transcript renames the author: {round1:?}"
+        );
+        let result = flat_messages(bodies.last().expect("a follow-up round"))
+            .into_iter()
+            .rfind(|(role, _)| role == "tool")
+            .expect("a tool result")
+            .1;
+        assert!(
+            result.starts_with(&headed(&u1_item, "Skipper", "How do tides work?")),
+            "and so does read_post — one byline per post: {result}"
         );
     });
 }
