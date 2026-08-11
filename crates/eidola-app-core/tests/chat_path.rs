@@ -1952,6 +1952,92 @@ fn a_backend_observed_to_reject_tools_is_not_offered_them_again() {
     });
 }
 
+/// **The turn loop's true worst case, stated exactly.**
+///
+/// A turn issues at most `MAX_TURN_ROUNDS` *model rounds* plus at most **one**
+/// tool-capability probe — the rejected attempt the degrade retries. The probe
+/// is not a round: it carries no model output, and the retry re-runs the same
+/// round with the same messages. That the extra is exactly one, and that the
+/// cap still binds where it always did, is what this pins.
+///
+/// One probe per turn is structural: `should_degrade_tools` fires only on
+/// round 1 with the turn's own tools attached, and withdrawing them clears
+/// that latch, so a second degrade is unrepresentable.
+#[test]
+fn a_degraded_turn_costs_one_extra_request_and_no_more() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectAutoToolsThenToolRounds,
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        // A consumer tool survives the withdrawal, so the retry is accepted and
+        // the loop runs on to its cap — the only way to reach the worst case.
+        with_echo_tool(&core);
+
+        // Build the fork with `post` alone: this mock answers every accepted
+        // request with a tool call, so any fixture *turn* would run to the cap.
+        let post = core
+            .runtime()
+            .block_on(core.post("How do tides work?".into(), None))
+            .expect("post");
+        let space = post.space_id.clone();
+        for prompt in ["What about spring tides?", "And neap tides?"] {
+            core.runtime()
+                .block_on(core.post_reply(
+                    prompt.into(),
+                    Some(space.clone()),
+                    Some(post.action_id.clone()),
+                ))
+                .expect("branch post");
+        }
+        let fixture_requests = mock.chat_bodies().len();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat(
+                "Tell me more.".into(),
+                "qwen3-8b@ext".into(),
+                Some(space.clone()),
+            ))
+            .expect_err("the model never stops asking, so the round cap binds");
+        assert!(
+            matches!(err.root(), AppError::ToolLoop { .. }),
+            "the cap still ends the turn after a degrade: {err:?}"
+        );
+
+        let turn_requests = mock.chat_bodies().len() - fixture_requests;
+        assert_eq!(
+            turn_requests,
+            eidola_app_core::MAX_TURN_ROUNDS + 1,
+            "MAX_TURN_ROUNDS rounds plus exactly one probe"
+        );
+
+        let bodies = mock.chat_bodies();
+        let turn = &bodies[fixture_requests..];
+        assert!(
+            turn[0]["tools"]
+                .as_array()
+                .expect("the probe advertises tools")
+                .iter()
+                .any(|t| t["function"]["name"] == "list_branches"),
+            "request 1 is the probe: {}",
+            turn[0]
+        );
+        // Every later request carries only the consumer's tool — the degrade
+        // happened once, and nothing re-attached what it withdrew.
+        for (i, body) in turn[1..].iter().enumerate() {
+            let names: Vec<&str> = body["tools"]
+                .as_array()
+                .expect("the consumer's tool stays")
+                .iter()
+                .map(|t| t["function"]["name"].as_str().expect("a name"))
+                .collect();
+            assert_eq!(names, ["echo"], "request {} after the probe", i + 2);
+        }
+    });
+}
+
 /// **What the memo is keyed by.** A backend is a host, not a capability: the
 /// eidola catalog and a llama.cpp install both serve many models, and whether a
 /// `tools` field renders is a property of the model's chat template. So an
@@ -3550,6 +3636,82 @@ fn round_cap_ends_the_turn_honestly_with_the_rounds_persisted() {
             "got {changes:?}"
         );
         assert!(changes.contains(&Change::Record), "got {changes:?}");
+    });
+}
+
+/// **A settled hold announces itself even when the turn then fails.**
+///
+/// Settlement is a durable commit — the credential leaves `spending` the
+/// instant its successor is written — and the crate's rule is that every
+/// durable commit emits. The place that is easy to get wrong is the
+/// last-chance settlement inside `begin_next_round`: it commits, and then the
+/// budget check right below it can end the turn. A caller-side emission would
+/// never run, and every subscriber would go on showing a credential as
+/// spending that has in fact been spent, until something else refreshed it.
+/// So the emission belongs to the write, not to any caller.
+///
+/// The fixture is a **transient** settlement failure: round 1's own recovery
+/// 500s (leaving the hold unsettled), `begin_next_round`'s retry succeeds, and
+/// the budget then binds — commit, then failure, in that order.
+#[test]
+fn a_settlement_that_lands_before_a_failed_round_still_emits_wallet() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(u64::MAX),
+            // Round 1's in-round recovery fails; the next attempt — which is
+            // `begin_next_round`'s — succeeds.
+            refund: RefundMode::FailFirst(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        // Round 1's exact hold, so the budget admits it and refuses round 2.
+        let probe = core
+            .runtime()
+            .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, i64::MAX))
+            .expect_err("the probe hits the round cap");
+        let probe_space = probe.chat_space_id().expect("space id").to_string();
+        let round1 = core
+            .runtime()
+            .block_on(core.test_space_actions(probe_space))
+            .expect("raw actions")
+            .into_iter()
+            .find(|a| a.action_type == "tool_call")
+            .and_then(|a| a.credits_consumed)
+            .expect("round 1 recorded its hold");
+
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, round1))
+            .expect_err("round 2 must exceed the budget");
+        assert!(
+            matches!(err.root(), AppError::Credential { .. }),
+            "the budget refusal, not a settlement refusal: {err:?}"
+        );
+
+        // Exactly one hold was acquired (round 1's — the turn died before
+        // round 2's), so a single `Wallet` would be the spend-start alone.
+        // The second is the settlement that landed just before the refusal.
+        let wallets = drain(&mut rx)
+            .into_iter()
+            .filter(|c| matches!(c, Change::Wallet))
+            .count();
+        assert_eq!(
+            wallets, 2,
+            "spend start, then the successor credential's commit"
+        );
+
+        // And the durable half agrees: nothing is left holding.
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle");
+        assert!(
+            lifecycle.iter().all(|c| c.state != "spending"),
+            "the retried settlement really did land; got {lifecycle:?}"
+        );
     });
 }
 
