@@ -813,7 +813,10 @@ fn branch_reply_sends_only_its_branch_context() {
             vec![
                 (
                     "system".to_string(),
-                    system_message_with(Some(SEEDED_SYSTEM_PROMPT), &[THREAD_MAP_NOTE])
+                    system_message_with(
+                        Some(SEEDED_SYSTEM_PROMPT),
+                        &[THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE]
+                    )
                 ),
                 (
                     "user".to_string(),
@@ -976,14 +979,72 @@ fn a_branched_space_appends_a_thread_map_as_the_last_message() {
         );
         assert_eq!(
             msgs[0].1,
-            system_message_with(Some(SEEDED_SYSTEM_PROMPT), &[THREAD_MAP_NOTE]),
-            "the map note joins the system message; the tools note does not \
-             (the eidola backend cannot carry a `tools` field yet)"
+            system_message_with(
+                Some(SEEDED_SYSTEM_PROMPT),
+                &[THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE]
+            ),
+            "the map note and the tools note both join the system message"
         );
         assert!(
-            bodies[3].get("tools").is_none(),
-            "no tools on the eidola path until task 25: {}",
+            bodies[3].get("tools").is_some(),
+            "the eidola backend is offered the navigation tools like any other: {}",
             bodies[3]
+        );
+    });
+}
+
+/// The eidola backend goes through exactly the same gate as every other: a
+/// branched space's turn advertises the three navigation tools and tells the
+/// model they exist. Nothing about the kind is consulted — capability is
+/// learned, and an endpoint that has never refused the field is offered it.
+#[test]
+fn a_branched_eidola_turn_advertises_the_navigation_tools() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // u1 -> i1, then a branch off i1 so the next turn on the spine forks.
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let i1 = tree[1].action_id.clone();
+        core.runtime()
+            .block_on(core.post_reply(
+                "What about spring tides?".into(),
+                Some(space.clone()),
+                Some(i1.clone()),
+            ))
+            .expect("branch post");
+
+        turn(&core, "Anything else?", Some(space.clone()), Some(i1));
+
+        let bodies = mock.chat_bodies();
+        let branched = bodies.last().expect("the branched turn's request");
+        let advertised: Vec<String> = branched["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a branched eidola turn advertises tools: {branched}"))
+            .iter()
+            .map(|t| t["function"]["name"].as_str().expect("a name").to_string())
+            .collect();
+        assert_eq!(advertised, ["list_branches", "read_thread", "read_post"]);
+        assert!(
+            flat_messages(branched)[0].1.contains(THREAD_MAP_TOOLS_NOTE),
+            "…and the model is told how to use them: {}",
+            flat_messages(branched)[0].1
+        );
+
+        // The first turn predates the branch, so it is untouched: the pin that
+        // keeps linear eidola spaces byte-identical.
+        assert!(
+            bodies[0].get("tools").is_none(),
+            "a linear turn still attaches nothing: {}",
+            bodies[0]
         );
     });
 }
@@ -1189,12 +1250,13 @@ fn sibling_branch_turns_send_identical_trunk_bytes() {
 // ===========================================================================
 // Navigation tools (task 21)
 //
-// These run over an `openai` backend rather than the eidola one, because that
-// is the real production gate: `prepare_turn` attaches the navigation tools
-// only when the space has branches AND the backend can carry a `tools` field,
-// and the Eidola server rejects unknown body fields today (see
-// `backend_accepts_tools`). Testing through the gate rather than around it is
-// what makes the eidola-path assertion above meaningful.
+// `prepare_turn` attaches the navigation tools when the space has branches AND
+// the endpoint has not been observed to reject a `tools` field — no backend
+// kind is consulted. These run over an `openai` backend so the tool round-trip
+// is exercised without a spend in the way; the eidola path takes the identical
+// gate (`a_branched_eidola_turn_advertises_the_navigation_tools`) and its spend
+// interaction is pinned separately (`a_rejected_tools_field_on_a_spending_
+// backend_refunds_the_failed_hold`).
 // ===========================================================================
 
 /// An `openai` backend pointed at the mock — no account, no spend.
@@ -1454,10 +1516,404 @@ fn a_backend_that_rejects_tools_degrades_to_a_toolless_retry() {
     });
 }
 
+/// **The rejection shape the deployed server actually produces.**
+///
+/// An Eidola server too old to know the `tools` field fails it in the body
+/// extractor, and axum renders that rejection as a **plain-text 422** — not
+/// JSON. A client that decided "server error vs transport error" by whether the
+/// body parses would file this as a transport error and never degrade, so every
+/// branched turn against such a server would fail outright. The status is what
+/// classifies the response; the body is just the message.
+#[test]
+fn a_plain_text_rejection_still_degrades_to_a_toolless_retry() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectToolsUnparseable,
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        let space = branched_external_space(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat(
+                "Tell me more.".into(),
+                "qwen3-8b@ext".into(),
+                Some(space.clone()),
+            ))
+            .expect("an unparseable rejection body must still degrade, not fail the turn");
+        assert_eq!(result.content, "Hello from the mock.");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len(),
+            4,
+            "two fixture turns + the rejected try + the retry"
+        );
+        assert!(bodies[2].get("tools").is_some(), "{}", bodies[2]);
+        assert!(bodies[3].get("tools").is_none(), "{}", bodies[3]);
+
+        // The rejected exchange is recorded, and the plain-text body survives
+        // into the Record rather than becoming a JSON-parse complaint.
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        let rejected = requests
+            .iter()
+            .find(|r| r.response_status == Some(422))
+            .expect("the rejected attempt's request row");
+        let detail = core
+            .runtime()
+            .block_on(core.request_detail(rejected.id.clone()))
+            .expect("detail")
+            .expect("the row exists");
+        assert_eq!(
+            String::from_utf8_lossy(&detail.response_body.unwrap_or_default()),
+            chat_harness::UNKNOWN_FIELD_REJECTION,
+            "the endpoint's own words are kept verbatim"
+        );
+
+        // And it is remembered, so the next branched turn skips the probe.
+        core.runtime()
+            .block_on(core.chat(
+                "And more.".into(),
+                "qwen3-8b@ext".into(),
+                Some(space.clone()),
+            ))
+            .expect("second turn");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 5, "the second turn costs ONE request");
+        assert!(
+            bodies[4].get("tools").is_none(),
+            "the rejection was memoized: {}",
+            bodies[4]
+        );
+    });
+}
+
+/// The streaming twin classifies by status *before* reading the body, so it
+/// never had the blocking path's ordering problem — but the GUI is the
+/// streaming caller, so the behaviour is pinned rather than assumed.
+#[test]
+fn a_plain_text_rejection_degrades_on_the_streaming_path_too() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectToolsUnparseable,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // Branch an eidola space with streamed turns, then ask on the fork.
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        turn(&core, "And why two per day?", Some(space.clone()), None);
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        core.runtime()
+            .block_on(core.post_reply(
+                "What about spring tides?".into(),
+                Some(space.clone()),
+                Some(tree[1].action_id.clone()),
+            ))
+            .expect("branch post");
+
+        let result = turn(&core, "Tell me more.", Some(space.clone()), None);
+        assert_eq!(result.content, "Hello from the stream.");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 4, "two fixture turns + rejected try + retry");
+        assert!(bodies[2].get("tools").is_some(), "{}", bodies[2]);
+        assert!(bodies[3].get("tools").is_none(), "{}", bodies[3]);
+
+        // Nothing stranded on the spend path either.
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle");
+        assert!(
+            lifecycle.iter().all(|c| c.state != "spending"),
+            "no hold outlives the streamed degrade; got {lifecycle:?}"
+        );
+    });
+}
+
+/// Build a branched fixture space over the **eidola** backend — the spending
+/// one — and return its id. Same shape as `branched_external_space`: two
+/// linear turns (which attach no tools, so a tools-rejecting mock answers them
+/// normally) plus a saved branch off the first answer, so the next turn on the
+/// tail forks and attaches the navigation tools.
+fn branched_eidola_space(core: &AppCore) -> String {
+    let first = core
+        .runtime()
+        .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+        .expect("first turn");
+    let space = first.space_id.clone();
+    core.runtime()
+        .block_on(core.chat(
+            "And why two per day?".into(),
+            MODEL.into(),
+            Some(space.clone()),
+        ))
+        .expect("second turn");
+    let tree = core
+        .runtime()
+        .block_on(core.get_space_tree(space.clone()))
+        .expect("tree");
+    core.runtime()
+        .block_on(core.post_reply(
+            "What about spring tides?".into(),
+            Some(space.clone()),
+            Some(tree[1].action_id.clone()),
+        ))
+        .expect("branch post");
+    space
+}
+
+/// **The degrade-on-rejection retry, on a backend that spends.**
+///
+/// Every round holds its own credential: the ACT protocol binds a spend proof
+/// to one request and one charge, so a retry can never re-present the hold the
+/// rejected attempt burned. This pins the whole accounting of that, end to end:
+///
+/// * the rejected attempt's hold is **settled** — its 500 carries no inline
+///   refund, so the round recovers one and its credential reaches `spent`;
+/// * the retry holds a **different** credential, re-estimated over the array it
+///   is actually going to send, which is *smaller* because the withdrawn tool
+///   schemas are no longer being charged for;
+/// * nothing is stranded (no credential left `spending`) and nothing is lost —
+///   with the mock refunding each charge in full, the wallet's spendable total
+///   is exactly what it was before the turn;
+/// * one answer is persisted, not two.
+#[test]
+fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let space = branched_eidola_space(&core);
+
+        let credits_before: i64 = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet")
+            .iter()
+            .map(|c| c.credits)
+            .sum();
+        let refunds_before = mock.refund_hits();
+        let mut rx = core.subscribe_changes();
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
+            .expect("the turn must survive a server that rejects the tools field");
+        assert_eq!(result.content, "Hello from the mock.");
+
+        // The rejected attempt is an emission point of its own (bus.rs's
+        // degrade row): its request row lands, and the retry's fresh hold is a
+        // wallet change the moment the credential flips to `spending`.
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        assert!(changes.contains(&Change::Wallet), "got {changes:?}");
+        assert!(changes.contains(&Change::Space(space.clone())));
+
+        // --- the wire: one rejected attempt, one toolless retry -------------
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len(),
+            4,
+            "two fixture turns + the rejected try + the retry"
+        );
+        assert!(
+            bodies[2].get("tools").is_some(),
+            "the eidola backend is offered the tools first: {}",
+            bodies[2]
+        );
+        assert!(
+            bodies[3].get("tools").is_none(),
+            "the retry withdraws them: {}",
+            bodies[3]
+        );
+        assert_eq!(
+            flat_messages(&bodies[2]),
+            flat_messages(&bodies[3]),
+            "only the tools field is withdrawn — the messages, map included, are the same bytes"
+        );
+
+        // Each attempt presented its own ACT token: a hold is bound to one
+        // request, so reusing the rejected one would have been the bug.
+        let auths = mock.chat_auth_values();
+        assert!(
+            auths[2].is_some() && auths[3].is_some(),
+            "both attempts spend: {auths:?}"
+        );
+        assert_ne!(
+            auths[2], auths[3],
+            "the retry presents a fresh spend proof, not the rejected attempt's"
+        );
+
+        // --- the accounting -------------------------------------------------
+        // The 500 carries no inline refund, so the rejected attempt's hold had
+        // to be recovered through `/v1/credentials/refund`.
+        assert!(
+            mock.refund_hits() > refunds_before,
+            "the failed attempt recovered its refund rather than abandoning the credential"
+        );
+
+        let answer = result
+            .response_action_id
+            .clone()
+            .expect("the retry persisted the answer");
+        let trail = core
+            .runtime()
+            .block_on(core.spend_trail(50, 0))
+            .expect("spend trail");
+        // The rejected attempt is the one spend with no action: the inference
+        // is deliberately not persisted when the round is about to be retried.
+        let rejected = trail
+            .iter()
+            .find(|e| e.action_id.is_none())
+            .expect("the rejected attempt's request row");
+        let retry = trail
+            .iter()
+            .find(|e| e.action_id.as_deref() == Some(answer.as_str()))
+            .expect("the retry's request row");
+
+        assert_ne!(
+            rejected.credential_nonce, retry.credential_nonce,
+            "the retry acquired a fresh hold"
+        );
+        for (what, entry) in [("the rejected attempt", rejected), ("the retry", retry)] {
+            assert_eq!(
+                entry.credential_state, "spent",
+                "{what}'s credential is settled, not left holding: {}",
+                entry.credential_nonce
+            );
+        }
+        let rejected_hold = rejected.spend_amount.expect("the rejected attempt held");
+        let retry_hold = retry.spend_amount.expect("the retry held");
+        assert!(
+            retry_hold < rejected_hold,
+            "the retry re-estimates over the array it will actually send, so its hold \
+             drops by the withdrawn tool schemas: {retry_hold} vs {rejected_hold}"
+        );
+        assert_eq!(
+            result.credits_charged,
+            rejected_hold + retry_hold,
+            "the reported charge is the sum of the holds the turn actually took"
+        );
+
+        // Nothing stranded: no credential is still holding.
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle");
+        assert!(
+            lifecycle.iter().all(|c| c.state != "spending"),
+            "no hold outlives the turn; got {lifecycle:?}"
+        );
+        // Nothing lost: the mock refunds each charge in full, so a settled pair
+        // of holds leaves the spendable total exactly where it was. A leaked
+        // hold or a double-charge would show up here as a shortfall.
+        let credits_after: i64 = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet")
+            .iter()
+            .map(|c| c.credits)
+            .sum();
+        assert_eq!(
+            credits_after, credits_before,
+            "both holds came back — the failed attempt cost the wallet nothing"
+        );
+
+        // One answer, not two: the rejected attempt wrote no inference, so the
+        // retry could claim the turn's item identity.
+        assert_eq!(
+            trail
+                .iter()
+                .filter(|e| e.action_type.as_deref() == Some("inference"))
+                .count(),
+            3,
+            "one inference per turn — two fixture turns and this one: {trail:?}"
+        );
+    });
+}
+
+/// **A hold is never abandoned to take another one.**
+///
+/// The rejected attempt settles its own hold, but settlement is a network call
+/// and can fail. Acquiring the retry's hold overwrites the only in-memory
+/// handle to the materials that mint the first one's successor — so proceeding
+/// anyway would leave that credential `spending`, its face value locked out of
+/// the wallet until an explicit recovery, and would do it while spending a
+/// *second* credential against an endpoint that just failed to settle the
+/// first. `begin_next_round` refuses instead, and the turn ends honestly.
+#[test]
+fn a_retry_will_not_take_a_hold_while_the_last_one_is_unsettled() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            refund: RefundMode::Fail,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let space = branched_eidola_space(&core);
+
+        let holding_before = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle")
+            .iter()
+            .filter(|c| c.state == "spending")
+            .count();
+        let requests_before = mock.chat_bodies().len();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
+            .expect_err("an unsettleable hold must end the turn, not be abandoned");
+        assert!(
+            matches!(err.root(), AppError::Credential { .. }),
+            "the turn names the settlement failure: {err}"
+        );
+        assert_eq!(
+            err.chat_space_id(),
+            Some(space.as_str()),
+            "and still carries the space id for adoption"
+        );
+
+        // The retry never reached the wire: refusing happens *before* the hold.
+        assert_eq!(
+            mock.chat_bodies().len() - requests_before,
+            1,
+            "exactly one attempt — the rejected one"
+        );
+        // And exactly one new hold exists, not two. This is the whole finding:
+        // a second `acquire_spend` here would have stranded the first.
+        let holding_after = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle")
+            .iter()
+            .filter(|c| c.state == "spending")
+            .count();
+        assert_eq!(
+            holding_after - holding_before,
+            1,
+            "the failed turn took one hold, not two"
+        );
+    });
+}
+
 /// The degrade is remembered for the process, so the wasted request happens at
-/// most once per backend rather than on every branched turn. It is an
-/// in-process observation, not a config surface and not persisted — the
-/// capability flag stays genuinely deferred.
+/// most once per model rather than on every branched turn. It is an in-process
+/// observation, not a config surface and not persisted — the capability flag
+/// stays genuinely deferred.
 #[test]
 fn a_backend_observed_to_reject_tools_is_not_offered_them_again() {
     run(|| {
@@ -1492,6 +1948,142 @@ fn a_backend_observed_to_reject_tools_is_not_offered_them_again() {
                 .1
                 .starts_with("<thread-map>"),
             "…and still carries the map"
+        );
+    });
+}
+
+/// **The turn loop's true worst case, stated exactly.**
+///
+/// A turn issues at most `MAX_TURN_ROUNDS` *model rounds* plus at most **one**
+/// tool-capability probe — the rejected attempt the degrade retries. The probe
+/// is not a round: it carries no model output, and the retry re-runs the same
+/// round with the same messages. That the extra is exactly one, and that the
+/// cap still binds where it always did, is what this pins.
+///
+/// One probe per turn is structural: `should_degrade_tools` fires only on
+/// round 1 with the turn's own tools attached, and withdrawing them clears
+/// that latch, so a second degrade is unrepresentable.
+#[test]
+fn a_degraded_turn_costs_one_extra_request_and_no_more() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectAutoToolsThenToolRounds,
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        // A consumer tool survives the withdrawal, so the retry is accepted and
+        // the loop runs on to its cap — the only way to reach the worst case.
+        with_echo_tool(&core);
+
+        // Build the fork with `post` alone: this mock answers every accepted
+        // request with a tool call, so any fixture *turn* would run to the cap.
+        let post = core
+            .runtime()
+            .block_on(core.post("How do tides work?".into(), None))
+            .expect("post");
+        let space = post.space_id.clone();
+        for prompt in ["What about spring tides?", "And neap tides?"] {
+            core.runtime()
+                .block_on(core.post_reply(
+                    prompt.into(),
+                    Some(space.clone()),
+                    Some(post.action_id.clone()),
+                ))
+                .expect("branch post");
+        }
+        let fixture_requests = mock.chat_bodies().len();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat(
+                "Tell me more.".into(),
+                "qwen3-8b@ext".into(),
+                Some(space.clone()),
+            ))
+            .expect_err("the model never stops asking, so the round cap binds");
+        assert!(
+            matches!(err.root(), AppError::ToolLoop { .. }),
+            "the cap still ends the turn after a degrade: {err:?}"
+        );
+
+        let turn_requests = mock.chat_bodies().len() - fixture_requests;
+        assert_eq!(
+            turn_requests,
+            eidola_app_core::MAX_TURN_ROUNDS + 1,
+            "MAX_TURN_ROUNDS rounds plus exactly one probe"
+        );
+
+        let bodies = mock.chat_bodies();
+        let turn = &bodies[fixture_requests..];
+        assert!(
+            turn[0]["tools"]
+                .as_array()
+                .expect("the probe advertises tools")
+                .iter()
+                .any(|t| t["function"]["name"] == "list_branches"),
+            "request 1 is the probe: {}",
+            turn[0]
+        );
+        // Every later request carries only the consumer's tool — the degrade
+        // happened once, and nothing re-attached what it withdrew.
+        for (i, body) in turn[1..].iter().enumerate() {
+            let names: Vec<&str> = body["tools"]
+                .as_array()
+                .expect("the consumer's tool stays")
+                .iter()
+                .map(|t| t["function"]["name"].as_str().expect("a name"))
+                .collect();
+            assert_eq!(names, ["echo"], "request {} after the probe", i + 2);
+        }
+    });
+}
+
+/// **What the memo is keyed by.** A backend is a host, not a capability: the
+/// eidola catalog and a llama.cpp install both serve many models, and whether a
+/// `tools` field renders is a property of the model's chat template. So an
+/// observed rejection is remembered against the one endpoint that produced it —
+/// a sibling model on the same backend is still offered tools, and would
+/// otherwise have lost them to a neighbour's answer.
+#[test]
+fn one_models_tool_rejection_leaves_its_siblings_armed() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectToolsForModel("qwen3-8b"),
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        let space = branched_external_space(&core);
+
+        // The refusing model: rejected, then a toolless retry, then remembered.
+        for prompt in ["Tell me more.", "And more."] {
+            core.runtime()
+                .block_on(core.chat(prompt.into(), "qwen3-8b@ext".into(), Some(space.clone())))
+                .expect("the refusing model's turns still succeed");
+        }
+        // A different model on the SAME backend.
+        core.runtime()
+            .block_on(core.chat(
+                "What do you think?".into(),
+                "mistral-7b@ext".into(),
+                Some(space.clone()),
+            ))
+            .expect("the sibling model's turn succeeds");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len(),
+            6,
+            "two fixture turns + (rejected try + retry) + one remembered turn + the sibling's"
+        );
+        assert!(
+            bodies[4].get("tools").is_none(),
+            "the refusing model is not offered them again: {}",
+            bodies[4]
+        );
+        assert!(
+            bodies[5].get("tools").is_some(),
+            "its sibling on the same backend still is: {}",
+            bodies[5]
         );
     });
 }
@@ -3044,6 +3636,82 @@ fn round_cap_ends_the_turn_honestly_with_the_rounds_persisted() {
             "got {changes:?}"
         );
         assert!(changes.contains(&Change::Record), "got {changes:?}");
+    });
+}
+
+/// **A settled hold announces itself even when the turn then fails.**
+///
+/// Settlement is a durable commit — the credential leaves `spending` the
+/// instant its successor is written — and the crate's rule is that every
+/// durable commit emits. The place that is easy to get wrong is the
+/// last-chance settlement inside `begin_next_round`: it commits, and then the
+/// budget check right below it can end the turn. A caller-side emission would
+/// never run, and every subscriber would go on showing a credential as
+/// spending that has in fact been spent, until something else refreshed it.
+/// So the emission belongs to the write, not to any caller.
+///
+/// The fixture is a **transient** settlement failure: round 1's own recovery
+/// 500s (leaving the hold unsettled), `begin_next_round`'s retry succeeds, and
+/// the budget then binds — commit, then failure, in that order.
+#[test]
+fn a_settlement_that_lands_before_a_failed_round_still_emits_wallet() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(u64::MAX),
+            // Round 1's in-round recovery fails; the next attempt — which is
+            // `begin_next_round`'s — succeeds.
+            refund: RefundMode::FailFirst(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+
+        // Round 1's exact hold, so the budget admits it and refuses round 2.
+        let probe = core
+            .runtime()
+            .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, i64::MAX))
+            .expect_err("the probe hits the round cap");
+        let probe_space = probe.chat_space_id().expect("space id").to_string();
+        let round1 = core
+            .runtime()
+            .block_on(core.test_space_actions(probe_space))
+            .expect("raw actions")
+            .into_iter()
+            .find(|a| a.action_type == "tool_call")
+            .and_then(|a| a.credits_consumed)
+            .expect("round 1 recorded its hold");
+
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, round1))
+            .expect_err("round 2 must exceed the budget");
+        assert!(
+            matches!(err.root(), AppError::Credential { .. }),
+            "the budget refusal, not a settlement refusal: {err:?}"
+        );
+
+        // Exactly one hold was acquired (round 1's — the turn died before
+        // round 2's), so a single `Wallet` would be the spend-start alone.
+        // The second is the settlement that landed just before the refusal.
+        let wallets = drain(&mut rx)
+            .into_iter()
+            .filter(|c| matches!(c, Change::Wallet))
+            .count();
+        assert_eq!(
+            wallets, 2,
+            "spend start, then the successor credential's commit"
+        );
+
+        // And the durable half agrees: nothing is left holding.
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle");
+        assert!(
+            lifecycle.iter().all(|c| c.state != "spending"),
+            "the retried settlement really did land; got {lifecycle:?}"
+        );
     });
 }
 

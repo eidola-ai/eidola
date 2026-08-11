@@ -245,8 +245,9 @@ impl Tool for EchoTool {
 //
 // Attachment is `prepare_turn`'s job, and it is gated: only when the space
 // actually has branches (so a linear space stays byte-identical to pre-task-21)
-// and only when the backend can carry a `tools` field at all. See the
-// `backend_accepts_tools` comment there for the removal trigger.
+// and only when the endpoint has not been observed to reject a `tools` field.
+// See the `backend_accepts_tools` comment there for why capability is learned
+// per (backend, model) rather than assumed from the backend's kind.
 // ---------------------------------------------------------------------------
 
 /// Normalize a model-supplied handle: trim, drop a leading `#`, lowercase.

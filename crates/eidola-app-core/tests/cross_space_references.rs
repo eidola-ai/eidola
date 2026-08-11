@@ -31,8 +31,10 @@ use eidola_app_core::error::AppError;
 use eidola_app_core::tools::FOLLOW_DENIED;
 use eidola_app_core::{AppCore, PostResult, ReferenceSpec, post_handle};
 
-/// The external backend's model: the turn-scoped tools attach only where the
-/// backend can carry a `tools` field, which excludes the `eidola` backend.
+/// The external backend's model: the turn-scoped tools ride a learned
+/// per-`(backend, wire_model)` capability that excludes no backend kind; these
+/// tests run over an `openai` backend to keep the credential spend out of the
+/// way.
 const MODEL: &str = "qwen3-8b@ext";
 
 fn run<F>(f: F)

@@ -154,6 +154,39 @@ pub enum ChatBehavior {
     /// perfectly well and rejects only the `tools` field — which is the case
     /// backend kind cannot predict.
     RejectTools,
+    /// As [`ChatBehavior::RejectTools`], but only for the named **wire model**;
+    /// every other model on the same host answers a `tools`-bearing request
+    /// normally. One backend serves many models with many chat templates, which
+    /// is why the client's tool-capability memo is keyed by the pair.
+    RejectToolsForModel(&'static str),
+    /// Reject a `tools`-bearing request the way **an Eidola server too old to
+    /// know the field** does, and answer normally otherwise.
+    ///
+    /// This is the deployed shape, not an invented one. The server's request
+    /// type is `deny_unknown_fields`, so an unknown member fails in the
+    /// `LoggedJson` extractor, whose `Rejection` is axum's `JsonRejection`
+    /// (`crates/eidola-server/src/handlers.rs`). Axum renders `JsonDataError`
+    /// as `(422, String)` — **`text/plain`, not JSON** — and the handler body
+    /// never runs, so no `refund` rides the response and the ACT nullifier is
+    /// never recorded.
+    ///
+    /// The distinction from [`ChatBehavior::RejectTools`] is the whole point:
+    /// llama.cpp answers a JSON-bodied 500, the old enclave answers a
+    /// plain-text 422, and a client that decides "server error vs transport
+    /// error" by whether the body parses handles only the first.
+    RejectToolsUnparseable,
+    /// Blocking: reject a request advertising the turn's **own** navigation
+    /// tools (recognized by `list_branches`) with llama.cpp's 500, and answer
+    /// every other request with a tool call for [`TOOL_NAME`], forever.
+    ///
+    /// A *content-dependent* rejection is a real llama.cpp shape: with
+    /// `--jinja` it renders each advertised tool's schema and crashes on
+    /// filters the model's template lacks, so which tools are advertised
+    /// decides the outcome. It is also the only shape that reaches the turn
+    /// loop's true worst case — the degrade probe *plus* a full run of nominal
+    /// rounds — since the loop only continues if the toolless retry, which
+    /// still carries the consumer's own tools, is accepted.
+    RejectAutoToolsThenToolRounds,
     /// Blocking: the next chat request answers with **one round requesting
     /// every call currently in [`MockConfig::tool_script`]**, consuming the
     /// script; later requests answer normally.
@@ -251,6 +284,15 @@ pub enum RefundMode {
     Succeed,
     /// `/v1/credentials/refund` returns 500; inline refunds are omitted.
     Fail,
+    /// The first `n` calls to `/v1/credentials/refund` return 500 and every
+    /// later one succeeds; inline refunds are omitted throughout.
+    ///
+    /// A **transient** settlement failure — the case that separates "the hold
+    /// could not be settled" from "the hold was settled on a retry". The round
+    /// that took the hold fails to settle it and carries on best-effort; the
+    /// next `begin_next_round` then settles it on its own last-chance attempt,
+    /// which is a durable commit that must announce itself.
+    FailFirst(u64),
 }
 
 /// Mock upstream configuration.
@@ -777,8 +819,8 @@ async fn handle_conn(
             }
         }
         ("POST", "/v1/credentials/refund") => {
-            refund_hits.fetch_add(1, Ordering::SeqCst);
-            handle_refund(&mut stream, &issuer, &config, req.auth.as_deref()).await?;
+            let attempt = refund_hits.fetch_add(1, Ordering::SeqCst) + 1;
+            handle_refund(&mut stream, &issuer, &config, req.auth.as_deref(), attempt).await?;
         }
         ("POST", "/v1/chat/completions") => {
             // 1-based index of this chat request — the tool-calling
@@ -874,8 +916,15 @@ async fn handle_refund(
     issuer: &Issuer,
     config: &MockConfig,
     auth: Option<&str>,
+    // 1-based index of this recovery call.
+    attempt: u64,
 ) -> std::io::Result<()> {
-    if config.refund == RefundMode::Fail {
+    let failing = match config.refund {
+        RefundMode::Fail => true,
+        RefundMode::FailFirst(n) => attempt <= n,
+        RefundMode::Succeed => false,
+    };
+    if failing {
         return write_json(stream, 500, &error_body("refund unavailable")).await;
     }
     let refund = auth
@@ -1077,8 +1126,20 @@ async fn handle_chat(
             write_json(stream, 200, &body.to_string()).await
         }
         ChatBehavior::DeclineStreaming => write_sse_decline_stream(stream).await,
-        ChatBehavior::RejectTools => {
-            if request.get("tools").is_some() {
+        ChatBehavior::RejectTools | ChatBehavior::RejectToolsForModel(_) => {
+            // `RejectTools` refuses the field for every model on this host;
+            // `RejectToolsForModel` for exactly one.
+            let refused_model = match config.chat {
+                ChatBehavior::RejectToolsForModel(m) => Some(m),
+                _ => None,
+            };
+            let wire_model = request
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default();
+            if request.get("tools").is_some()
+                && refused_model.is_none_or(|refused| refused == wire_model)
+            {
                 return write_json(
                     stream,
                     500,
@@ -1093,6 +1154,53 @@ async fn handle_chat(
                 } }],
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::RejectToolsUnparseable => {
+            if request.get("tools").is_some() {
+                // The handler body never runs, so: no `refund` in the
+                // response, and the ACT nullifier is left unrecorded — which
+                // is what lets `/v1/credentials/refund` issue a full one.
+                return write_plain_text(stream, 422, UNKNOWN_FIELD_REJECTION).await;
+            }
+            // Answer in whichever transport asked, so one behaviour covers the
+            // blocking twin and the streaming one.
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_stream(stream, true, &[STREAM_CONTENT]).await;
+            }
+            let mut body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "Hello from the mock.",
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::RejectAutoToolsThenToolRounds => {
+            let advertises_auto_tools = request
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|t| t["function"]["name"].as_str() == Some("list_branches"))
+                });
+            if advertises_auto_tools {
+                return write_json(
+                    stream,
+                    500,
+                    &error_body("tools param requires --jinja flag"),
+                )
+                .await;
+            }
+            let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
             if let Some(refund) = inline_refund {
                 body["refund"] = refund;
             }
@@ -1467,6 +1575,32 @@ async fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io:
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\r\n{body}",
+        len = body.len(),
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
+}
+
+/// The exact bytes axum's `JsonDataError` rejection produces for an unknown
+/// body field: status 422, `text/plain`, and the rejection's `Display` text.
+/// Mirrors `axum_core::__define_rejection!`'s `(status, body_text)` response.
+pub const UNKNOWN_FIELD_REJECTION: &str = "Failed to deserialize the JSON body into the target type: unknown field `tools`, \
+     expected one of `model`, `messages`, `max_completion_tokens`, `temperature`, `top_p`, \
+     `stop`, `stream`, `stream_options`";
+
+/// Write a `text/plain` response — what an axum extractor rejection is, and
+/// what [`ChatBehavior::RejectToolsUnparseable`] answers with.
+async fn write_plain_text(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+    let reason = match status {
+        400 => "Bad Request",
+        422 => "Unprocessable Entity",
+        _ => "Status",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
          Content-Length: {len}\r\n\
          Connection: close\r\n\r\n{body}",
         len = body.len(),

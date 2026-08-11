@@ -34,8 +34,10 @@ use eidola_app_core::changes::Change;
 use eidola_app_core::discovery::{GLOBAL_AGENT_NOTE, LIST_MY_SPACES_TOOL_NAME};
 use eidola_app_core::memory::MEMORY_NOTE;
 
-/// The external backend's model. The turn-scoped tools attach only where the
-/// backend can carry a `tools` field, which excludes the `eidola` backend.
+/// The external backend's model. The turn-scoped tools ride a learned
+/// per-`(backend, wire_model)` capability that excludes no backend kind; these
+/// tests run over an `openai` backend to keep the credential spend out of the
+/// way.
 const MODEL: &str = "qwen3-8b@ext";
 
 fn run<F>(f: F)
