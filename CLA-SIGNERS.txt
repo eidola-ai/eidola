@@ -25,3 +25,5 @@
 88583b75 mike.marcacci@gmail.com mike.marcacci@gmail.com Michael Thomas Marcacci
 c470d7de mike.marcacci@gmail.com mike.marcacci@gmail.com Michael Thomas Marcacci
 e2c15d27 mike.marcacci@gmail.com mike.marcacci@gmail.com Michael Thomas Marcacci
+e2c15d27 mike.marcacci+agent@gmail.com mike.marcacci+agent@gmail.com Michael Thomas Marcacci
+a0418c8c @eidola.ai mike.marcacci@eidola.ai Michael Thomas Marcacci | Eidola, Inc.

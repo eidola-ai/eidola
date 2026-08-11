@@ -88,6 +88,19 @@ const CONTROL_HEIGHT: Pixels = px(36.);
 /// Width of one window-control button.
 const CONTROL_WIDTH: Pixels = px(40.);
 
+/// The per-side gap between a window's surface and its content box that a
+/// **creation-time** size must add to reach a wanted content width: there is no
+/// `Window` to ask yet, and a window opens untiled, so this is the widest
+/// [`content_insets`] can be. Zero off Linux (and harmlessly generous if the
+/// compositor then insists on server-side decorations).
+pub(crate) fn opening_content_inset() -> Pixels {
+    if cfg!(target_os = "linux") {
+        SHADOW_SIZE + FRAME_BORDER
+    } else {
+        px(0.)
+    }
+}
+
 /// Is this window currently drawing its own decorations? False on macOS, on
 /// server-decorated Wayland windows, and in test contexts.
 pub(crate) fn is_client_decorated(window: &Window) -> bool {
