@@ -6,6 +6,7 @@
 //! everywhere. Reset is destructive-ish (it forgets the local account keys),
 //! so it sits behind a two-step inline confirm — no modal.
 
+use eidola_app_core::SubscriptionState;
 use eidola_app_core::error::AppError;
 use gpui::{
     AsyncApp, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
@@ -35,6 +36,12 @@ pub struct AccountView {
     /// View-owned checkout task (the awaitable `request_checkout` is awaited
     /// here, in the view's own slot — it dies with the window).
     checkout_task: Option<gpui::Task<()>>,
+    /// "Manage subscription" mints a fresh billing-portal session on the
+    /// click, so it is a real request with its own in-flight marker, its own
+    /// error, and its own view-owned slot — the checkout shape exactly.
+    manage_pending: bool,
+    manage_error: Option<String>,
+    manage_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -63,6 +70,10 @@ impl AccountView {
             s.refresh_prices(cx);
             if has_account {
                 s.refresh_balances(cx);
+                // Nothing on the bus can invalidate this — it is a live read
+                // of the payment processor's state, held nowhere — so opening
+                // the pane is when it is asked for.
+                s.refresh_subscription(cx);
             }
         });
 
@@ -73,6 +84,9 @@ impl AccountView {
             checkout_pending: None,
             checkout_error: None,
             checkout_task: None,
+            manage_pending: false,
+            manage_error: None,
+            manage_task: None,
             _subscriptions,
         }
     }
@@ -141,6 +155,57 @@ impl AccountView {
             },
         ));
     }
+
+    // --- Manage subscription (the billing portal) ------------------------
+
+    pub fn manage_pending(&self) -> bool {
+        self.manage_pending
+    }
+
+    /// Open the billing portal. The portal link is a short-lived session, so
+    /// this asks for a fresh one now rather than opening the one the pane
+    /// fetched when it opened.
+    pub fn begin_manage(&mut self, cx: &mut Context<Self>) {
+        if self.manage_pending {
+            return;
+        }
+        self.manage_pending = true;
+        self.manage_error = None;
+        cx.notify();
+
+        let Some(rx) = self.account.read(cx).request_subscription() else {
+            // Stub core: the in-flight marker above is the observable state.
+            return;
+        };
+        self.manage_task = Some(cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let res = rx.await.unwrap_or_else(|_| {
+                    Err(AppError::Internal {
+                        message: "billing portal task cancelled".into(),
+                    })
+                });
+                let _ = this.update(cx, |this, cx| {
+                    this.manage_pending = false;
+                    this.manage_task = None;
+                    match res {
+                        Ok(info) => match info.management_url {
+                            Some(url) => cx.open_url(&url),
+                            // The server omits the link only for an account
+                            // with no payment customer at all — which is not
+                            // the state this button is offered in, so saying
+                            // so plainly beats inventing a reason.
+                            None => {
+                                this.manage_error =
+                                    Some("There is no billing portal for this account.".into());
+                            }
+                        },
+                        Err(e) => this.manage_error = Some(e.to_string()),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    }
 }
 
 impl Render for AccountView {
@@ -156,6 +221,17 @@ impl Render for AccountView {
         let balances = account.balances().value().cloned();
         let prices = account.prices().value().cloned().unwrap_or_default();
         let busy = account.is_loading();
+        let subscription = account.subscription().value().cloned();
+        let subscription_error = account.subscription().error().map(|e| e.to_string());
+        let subscription_loading = account.subscription().is_loading();
+        // Only an answered *and* affirmative read filters the plans. An
+        // unanswered or failed one leaves every plan offered: the server is
+        // the authority on whether a second subscription is allowed, and it
+        // refuses honestly, whereas hiding plans on a guess would strand a
+        // reader who has none.
+        let subscribed = subscription
+            .as_ref()
+            .is_some_and(|s| s.state == SubscriptionState::Active);
         let core_error = account
             .balances()
             .error()
@@ -383,11 +459,153 @@ impl Render for AccountView {
             );
         }
 
+        // --- Subscription ---------------------------------------------------
+        // Only with an account: without one there is nothing to have a
+        // subscription, and the pane never asked.
+        if has_account {
+            // A failed read with nothing behind it is a blank the reader
+            // can't get past — the panel says so and offers the way back.
+            // A failed *re-read* over a known answer is not: that keeps its
+            // value on screen (below) with a quiet retry beside it, so the
+            // section never blanks over a refresh error.
+            let failed_cold = subscription_error.is_some() && subscription.is_none();
+            if failed_cold {
+                let err = subscription_error.as_deref().unwrap_or_default();
+                col = col.child(div().pt_2().child(section_header("Subscription", cx)));
+                col = col.child(crate::participants::load_error_panel(
+                    "settings/account/subscription-retry",
+                    "Couldn't check your subscription",
+                    err,
+                    cx,
+                    cx.listener(|this, _, _, cx| {
+                        this.account.update(cx, |s, cx| s.refresh_subscription(cx));
+                    }),
+                ));
+            } else if subscription_loading {
+                col = col
+                    .child(div().pt_2().child(section_header("Subscription", cx)))
+                    .child(
+                        div()
+                            .id("subscription-loading")
+                            .probe_value(
+                                "settings/account/subscription",
+                                gpui::Role::Label,
+                                "Subscription",
+                                SharedString::from("Checking your subscription…"),
+                            )
+                            .text_color(theme.muted_foreground)
+                            .child("Checking your subscription…"),
+                    );
+            } else if subscribed {
+                let info = subscription.as_ref().expect("subscribed implies a value");
+                let summary = subscription_summary(
+                    info.status.as_deref(),
+                    info.current_period_end,
+                    eidola_app_core::now_ms(),
+                );
+                col =
+                    col.child(div().pt_2().child(section_header("Subscription", cx)))
+                        .child(
+                            div()
+                                .id("subscription-summary")
+                                .probe_value(
+                                    "settings/account/subscription",
+                                    gpui::Role::Label,
+                                    "Subscription",
+                                    SharedString::from(summary.clone()),
+                                )
+                                .child(SharedString::from(summary)),
+                        )
+                        .child(
+                            h_flex().pt_1().child(
+                                // Probed wrapper for the a11y role/label —
+                                // shrink-wraps the button so its bounds are an
+                                // honest click target.
+                                div()
+                                    .id("manage-subscription-wrap")
+                                    .probe(
+                                        "settings/account/manage-subscription",
+                                        gpui::Role::Button,
+                                        "Manage subscription",
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| this.begin_manage(cx)))
+                                    .child(
+                                        Button::new("manage-subscription")
+                                            .role(None)
+                                            .primary()
+                                            .small()
+                                            .label(if self.manage_pending {
+                                                "Opening…"
+                                            } else {
+                                                "Manage subscription"
+                                            })
+                                            .tab_stop(false),
+                                    ),
+                            ),
+                        )
+                        .child(div().text_sm().text_color(theme.muted_foreground).child(
+                            "Opens our payment processor's billing portal in your browser.",
+                        ));
+                if let Some(err) = self.manage_error.as_deref() {
+                    col = col.child(
+                        div()
+                            .id("manage-subscription-error")
+                            .probe(
+                                "settings/account/manage-error",
+                                gpui::Role::Alert,
+                                err.to_string(),
+                            )
+                            .text_sm()
+                            .text_color(theme.danger)
+                            .child(SharedString::from(err.to_string())),
+                    );
+                }
+            }
+
+            // A re-read that failed over a known answer keeps that answer on
+            // screen — above, and in what the plans below offer — so all this
+            // owes the reader is that it may be out of date, and the way to
+            // ask again.
+            if subscription_error.is_some() && !failed_cold {
+                col = col.child(
+                    h_flex()
+                        .pt_1()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Couldn't re-check your subscription — showing the last answer.")
+                        .child(
+                            div()
+                                .id("subscription-stale-retry")
+                                .probe(
+                                    "settings/account/subscription-retry",
+                                    gpui::Role::Button,
+                                    "Check again",
+                                )
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme.foreground))
+                                .child("Check again")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.account.update(cx, |s, cx| s.refresh_subscription(cx));
+                                })),
+                        ),
+                );
+            }
+        }
+
         // --- Plans ----------------------------------------------------------
-        col = col.child(div().pt_2().child(section_header("Plans", cx)));
-        if prices.is_empty() {
+        // A subscription in force means the server refuses a second one, so
+        // the recurring plans come out and the one-time top-ups stay.
+        let offered = plans::offered_plans(&prices, subscribed);
+        col = col.child(div().pt_2().child(section_header(
+            if subscribed { "Add credit" } else { "Plans" },
+            cx,
+        )));
+        if offered.is_empty() {
             col = col.child(div().text_color(theme.muted_foreground).child(if busy {
                 "Loading plans…"
+            } else if subscribed {
+                "No one-time top-ups are available right now."
             } else {
                 "No plans loaded."
             }));
@@ -405,7 +623,7 @@ impl Render for AccountView {
                         .child("Checkout opens in your browser; credit lands on this account."),
                 )
                 .child(plans::plan_rows(
-                    &prices,
+                    &offered,
                     self.checkout_pending.as_deref(),
                     on_select,
                     "settings/account",
@@ -435,29 +653,65 @@ impl Render for AccountView {
     }
 }
 
-/// Humanize a future expiry timestamp: "expires today", "expires in 5d",
-/// "expires in 3w", … Falls to "expired" for past timestamps. Coarse on
-/// purpose — the pools list wants a sense of urgency, not a deadline clock.
-fn humanize_expiry(expires_ms: i64, now_ms: i64) -> String {
+/// Coarse relative phrasing for a *future* instant: "today", "tomorrow",
+/// "in 5d", "in 3w", … `None` once the instant is past, because the
+/// sentences that follow differ (credits *expire*, a billing period
+/// *ends*) and only the caller knows which it is writing. Coarse on
+/// purpose — these surfaces want a sense of when, not a deadline clock.
+fn relative_future(then_ms: i64, now_ms: i64) -> Option<String> {
     const MINUTE: i64 = 60_000;
     const HOUR: i64 = 60 * MINUTE;
     const DAY: i64 = 24 * HOUR;
 
-    let delta = expires_ms - now_ms;
-    if delta < 0 {
-        "expired".to_string()
+    let delta = then_ms - now_ms;
+    Some(if delta < 0 {
+        return None;
     } else if delta < DAY {
-        "expires today".to_string()
+        "today".to_string()
     } else if delta < 2 * DAY {
-        "expires tomorrow".to_string()
+        "tomorrow".to_string()
     } else if delta < 14 * DAY {
-        format!("expires in {}d", delta / DAY)
+        format!("in {}d", delta / DAY)
     } else if delta < 60 * DAY {
-        format!("expires in {}w", delta / (7 * DAY))
+        format!("in {}w", delta / (7 * DAY))
     } else if delta < 365 * DAY {
-        format!("expires in {}mo", delta / (30 * DAY))
+        format!("in {}mo", delta / (30 * DAY))
     } else {
-        format!("expires in {}y", delta / (365 * DAY))
+        format!("in {}y", delta / (365 * DAY))
+    })
+}
+
+/// Humanize a credit pool's expiry: "expires today", "expires in 5d", …
+fn humanize_expiry(expires_ms: i64, now_ms: i64) -> String {
+    match relative_future(expires_ms, now_ms) {
+        Some(when) => format!("expires {when}"),
+        None => "expired".to_string(),
+    }
+}
+
+/// The one-line reading of an in-force subscription: what its status means
+/// and, when known, when the current period ends. `status` is the payment
+/// processor's own word for it; anything outside the three in-force
+/// statuses is reported plainly rather than dressed up, because being
+/// wrong about someone's billing is worse than being terse.
+fn subscription_summary(status: Option<&str>, period_end_ms: Option<i64>, now_ms: i64) -> String {
+    let standing = match status {
+        Some("active") => "Your subscription is active.".to_string(),
+        Some("trialing") => "Your subscription is in its trial period.".to_string(),
+        Some("past_due") => {
+            "Your subscription is active, but a payment did not go through. Update your \
+             payment method to keep it."
+                .to_string()
+        }
+        Some(other) => format!("Your subscription is in force, reported as “{other}”."),
+        None => "Your subscription is in force.".to_string(),
+    };
+    let Some(end) = period_end_ms else {
+        return standing;
+    };
+    match relative_future(end, now_ms) {
+        Some(when) => format!("{standing} The current billing period ends {when}."),
+        None => format!("{standing} The current billing period has ended."),
     }
 }
 
@@ -484,9 +738,46 @@ fn error_banner(message: &str, cx: &gpui::App) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::humanize_expiry;
+    use super::{humanize_expiry, subscription_summary};
 
     const DAY: i64 = 24 * 60 * 60 * 1000;
+
+    #[test]
+    fn subscription_summary_reads_each_in_force_status() {
+        let now = 1_900_000_000_000;
+        assert_eq!(
+            subscription_summary(Some("active"), None, now),
+            "Your subscription is active."
+        );
+        assert!(
+            subscription_summary(Some("trialing"), None, now).contains("trial"),
+            "a trial should say so"
+        );
+        assert!(
+            subscription_summary(Some("past_due"), None, now).contains("payment method"),
+            "a past-due subscription should point at the fix"
+        );
+    }
+
+    #[test]
+    fn subscription_summary_adds_the_period_end_only_when_there_is_one() {
+        let now = 1_900_000_000_000;
+        assert_eq!(
+            subscription_summary(Some("active"), Some(now + 12 * DAY), now),
+            "Your subscription is active. The current billing period ends in 12d."
+        );
+        assert_eq!(
+            subscription_summary(Some("active"), Some(now - DAY), now),
+            "Your subscription is active. The current billing period has ended."
+        );
+    }
+
+    #[test]
+    fn an_unfamiliar_status_is_reported_rather_than_dressed_up() {
+        let now = 1_900_000_000_000;
+        let line = subscription_summary(Some("grace"), None, now);
+        assert!(line.contains("grace"), "{line}");
+    }
 
     #[test]
     fn humanize_expiry_buckets() {

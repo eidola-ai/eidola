@@ -472,7 +472,12 @@ impl RenderOnce for ExistingAccount {
 /// Either branch: choose a plan / add credit via Stripe checkout.
 #[derive(IntoElement)]
 pub(super) struct Purchase {
+    /// The plans this account may actually buy — already narrowed to
+    /// one-time top-ups when `subscribed`.
     pub prices: Vec<PriceInfo>,
+    /// Whether a subscription is already in force. Changes what the empty
+    /// and populated states say, and points at where it is managed.
+    pub subscribed: bool,
     /// Whether the price list is still loading (empty-state copy).
     pub loading: bool,
     /// The plan whose checkout request is currently in flight, if any.
@@ -492,18 +497,40 @@ impl RenderOnce for Purchase {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
 
-        let extras = if self.prices.is_empty() {
+        // With a subscription already in force the server refuses a second,
+        // so the recurring plans are gone from `prices` and this says why —
+        // and where the existing one is managed.
+        let subscribed_note = self.subscribed.then(|| {
             div()
+                .text_sm()
                 .text_color(theme.muted_foreground)
-                .child(if self.loading {
-                    "Loading plans…"
-                } else {
-                    "No plans are available right now."
-                })
+                .child(
+                    "This account already has a subscription — manage it in Settings ▸ \
+                     Account. You can still add one-time credit here.",
+                )
+                .into_any_element()
+        });
+
+        let extras = if self.prices.is_empty() {
+            v_flex()
+                .gap_2()
+                .when_some(subscribed_note, |el, note| el.child(note))
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(if self.loading {
+                            "Loading plans…"
+                        } else if self.subscribed {
+                            "No one-time top-ups are available right now."
+                        } else {
+                            "No plans are available right now."
+                        }),
+                )
                 .into_any_element()
         } else {
             v_flex()
                 .gap_2()
+                .when_some(subscribed_note, |el, note| el.child(note))
                 .child(
                     div()
                         .text_sm()

@@ -10,6 +10,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AttestationInfo, BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
     PriceInfo, RequestInfo, SpendTrailEntry,
@@ -1643,6 +1644,136 @@ fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
             "account pane probe {expected:?} missing; recorded: {names:?}"
         );
     }
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_subscribed_account_is_offered_management_and_only_one_time_plans(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    let _guard = probes_on();
+
+    let stores = account_backends_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            eidola_gui::loadable::Loadable::loaded(eidola_app_core::SubscriptionInfo {
+                state: eidola_app_core::SubscriptionState::Active,
+                status: Some("active".into()),
+                current_period_end: None,
+                management_url: Some("https://billing.example/session".into()),
+            }),
+            cx,
+        );
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/account/subscription",
+        "settings/account/manage-subscription",
+        // One-time top-ups stay purchasable alongside the subscription.
+        "settings/account/plan/0",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "subscribed account probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/account/plan/1".to_string()),
+        "the recurring plan should be gone — the server refuses a second \
+         subscription; recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_failed_subscription_read_offers_a_retry_and_withholds_no_plans(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    let _guard = probes_on();
+
+    let stores = account_backends_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            eidola_gui::loadable::Loadable::Failed {
+                error: AppError::Network {
+                    message: "connection reset".into(),
+                },
+                prior: None,
+            },
+            cx,
+        );
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/account/subscription-retry".to_string()),
+        "a failed read must offer its way back; recorded: {names:?}"
+    );
+    // Not knowing is not knowing: every plan stays offered, and the server
+    // refuses honestly if one of them is not allowed.
+    for expected in ["settings/account/plan/0", "settings/account/plan/1"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "plan probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_failed_re_read_keeps_the_subscription_it_already_knew(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    let _guard = probes_on();
+
+    let stores = account_backends_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            eidola_gui::loadable::Loadable::Failed {
+                error: AppError::Network {
+                    message: "connection reset".into(),
+                },
+                prior: Some(eidola_app_core::SubscriptionInfo {
+                    state: eidola_app_core::SubscriptionState::Active,
+                    status: Some("active".into()),
+                    current_period_end: None,
+                    management_url: Some("https://billing.example/session".into()),
+                }),
+            },
+            cx,
+        );
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    // The known answer stays on screen — a failed refresh never blanks a
+    // cell that has data — with the quiet way to ask again beside it.
+    for expected in [
+        "settings/account/subscription",
+        "settings/account/manage-subscription",
+        "settings/account/subscription-retry",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "stale-subscription probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/account/plan/1".to_string()),
+        "the stale answer still governs what is offered; recorded: {names:?}"
+    );
 
     probe::set_probes_enabled(false);
 }
