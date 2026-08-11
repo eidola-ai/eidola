@@ -2078,8 +2078,9 @@ impl Render for SpaceView {
 
         // Point the height cache at the current **reading-column** width — the
         // only thing a post's measured height depends on — not the raw window
-        // width. Above ~836px the column is capped at `BODY_MAX_WIDTH`, so a
-        // resize there leaves `body_width` unchanged and the cache is *not*
+        // width. Above `full_measure_page_width()` the column is capped at
+        // `BODY_MAX_WIDTH`, so a resize there leaves `body_width` unchanged
+        // (where a fresh window opens — see `lib.rs`) and the cache is *not*
         // invalidated: the (partially measured) heights survive, the document
         // height stays put, and the scroll offset doesn't ratchet. Keying on the
         // raw width instead cleared the whole cache on every resize, dropping
