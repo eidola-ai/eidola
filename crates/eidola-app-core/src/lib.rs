@@ -5150,6 +5150,7 @@ impl Inner {
                 (charge_credits, Some(spend), Some(auth_value))
             }
         };
+        let spend_is_none = spend.is_none();
 
         Ok(TurnPrep {
             db_conn,
@@ -5182,6 +5183,9 @@ impl Inner {
             charge_credits,
             total_credits: charge_credits,
             spend,
+            // The turn's first hold is unsettled until its round processes a
+            // refund; a turn with no spend at all has nothing to settle.
+            spend_settled: spend_is_none,
             auth_value,
         })
     }
@@ -5356,6 +5360,24 @@ impl Inner {
         let Some(pricing) = prep.remote_pricing else {
             return Ok(());
         };
+        // **A hold is never abandoned to take another one.** Acquiring below
+        // overwrites `prep.spend`, which is the only in-memory handle to the
+        // materials that settle the current one — so an unsettled hold would be
+        // dropped mid-turn and its credential left `spending`, its face value
+        // locked out of the wallet until the next startup recovery sweep. The
+        // round that took it normally settles it (inline refund, or recovery
+        // when the response carries none); this is the last chance, and a
+        // failure here ends the turn rather than spending a second credential
+        // against an endpoint that has not settled the first. The guard lives
+        // here, at the one place `spend` is replaced, so no present or future
+        // caller has to remember it.
+        if prep.spend.is_some() && !prep.spend_settled && !prep.try_refund_recovery().await {
+            return Err(AppError::Credential {
+                message: "the previous round's credential could not be settled — its hold is \
+                          recoverable with `eidola wallet credentials recover`"
+                    .into(),
+            });
+        }
         let cfg = self.load_config();
         let charge_credits = estimate_charge_credits(
             &prep.messages,
@@ -5375,6 +5397,7 @@ impl Inner {
         prep.charge_credits = charge_credits;
         prep.total_credits += charge_credits;
         prep.spend = Some(spend);
+        prep.spend_settled = false;
         prep.auth_value = Some(auth_value);
         Ok(())
     }
@@ -5484,10 +5507,12 @@ impl Inner {
                 && self.should_degrade_tools(&prep, round, e)
             {
                 prep.withdraw_auto_tools();
-                // The failed attempt consumed its hold (and recovered its
-                // refund), so the retry acquires a fresh one — exactly what a
-                // tool round does. A no-op for the non-spend backends this can
-                // actually reach today.
+                // The rejected attempt consumed its hold, so the retry acquires
+                // a fresh one — exactly what a tool round does, and re-estimated
+                // over the array it will actually send, so the withdrawn
+                // schemas are no longer held for. `begin_next_round` refuses to
+                // replace a hold the rejected attempt failed to settle; a
+                // no-op on the non-spend backends.
                 self.begin_next_round(&mut prep)
                     .await
                     .map_err(|e| prep.wrap(e))?;
@@ -5568,12 +5593,34 @@ impl Inner {
                     })
                     .inspect_err(|_| emit_user_turn())
                     .map_err(|e| prep.wrap(e))?;
-                let parsed: serde_json::Value = serde_json::from_str(&text)
-                    .map_err(|e| AppError::Network {
-                        message: format!("failed to parse response JSON: {e}"),
-                    })
-                    .inspect_err(|_| emit_user_turn())
-                    .map_err(|e| prep.wrap(e))?;
+                // **The status classifies the response, not the body shape.**
+                // A non-2xx body is an error document and is never required to
+                // parse: a rejection raised by the endpoint's own body
+                // extractor is plain text (axum renders a `JsonRejection` as
+                // `(status, String)`), and that is exactly the shape a server
+                // too old for a field this turn sent answers with. Letting the
+                // parse decide would file such a response as `Network` — and
+                // the tool-rejection degrade keys on `Server`, so the turn
+                // would fail outright instead of retrying without the field.
+                // `parse_server_error_message` already reads a plain-text body.
+                //
+                // A **2xx** that is not JSON is a genuine protocol failure with
+                // no completion to read, and still fails as `Network` — with a
+                // refund recovery first, since nothing below this point runs to
+                // settle the hold this round took.
+                let parsed: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(parsed) => parsed,
+                    Err(_) if !status.is_success() => serde_json::Value::Null,
+                    Err(e) => {
+                        if prep.try_refund_recovery().await {
+                            self.bus.emit(Change::Wallet);
+                        }
+                        emit_user_turn();
+                        return Err(prep.wrap(AppError::Network {
+                            message: format!("failed to parse response JSON: {e}"),
+                        }));
+                    }
+                };
                 (status, text, parsed)
             }
             Err(e) => {
@@ -8869,6 +8916,18 @@ struct TurnPrep {
     /// no billing. Its absence disables the ACT header, the refund
     /// machinery, and the `Wallet` emissions throughout the transports.
     spend: Option<SpendPrep>,
+    /// Whether [`Self::spend`]'s hold has been **settled** — a refund applied
+    /// and its successor credential written.
+    ///
+    /// A hold is settled by the round that took it. This exists because
+    /// `spend` is the only in-memory handle to the materials that mint that
+    /// successor (`SpendPrep`'s proof, pre-refund and public key), so
+    /// replacing it while unsettled abandons them: the credential then sits
+    /// `spending` until the next startup recovery sweep, its face value locked
+    /// out of the wallet. [`Inner::begin_next_round`] refuses to replace an
+    /// unsettled hold, which is what makes that unrepresentable rather than
+    /// merely avoided at each call site.
+    spend_settled: bool,
     /// The `Authorization` header value; present iff `spend` is.
     auth_value: Option<String>,
 }
@@ -8958,7 +9017,7 @@ impl TurnPrep {
     /// Apply a refund object (inline from a response body, or recovered) to
     /// the pending spend — writes the successor credential. A no-op for
     /// local turns (nothing was spent).
-    async fn process_refund_obj(&self, refund_obj: &serde_json::Value) -> Result<(), AppError> {
+    async fn process_refund_obj(&mut self, refund_obj: &serde_json::Value) -> Result<(), AppError> {
         let Some(spend) = &self.spend else {
             return Ok(());
         };
@@ -8974,17 +9033,19 @@ impl TurnPrep {
             self.now,
         )
         .await
+        .inspect(|()| self.spend_settled = true)
     }
 
     /// Best-effort refund recovery via `/v1/credentials/refund`. Returns
     /// whether a successor credential was written (the caller decides whether
     /// that warrants an immediate `Wallet` emission). Always `false` for
     /// local turns — there is no spend to recover.
-    async fn try_refund_recovery(&self) -> bool {
+    async fn try_refund_recovery(&mut self) -> bool {
         let (Some(_), Some(auth_value)) = (&self.spend, &self.auth_value) else {
             return false;
         };
-        match recover_refund(&self.client, &self.base_url, auth_value).await {
+        let auth_value = auth_value.clone();
+        match recover_refund(&self.client, &self.base_url, &auth_value).await {
             Ok(refund_obj) => self.process_refund_obj(&refund_obj).await.is_ok(),
             Err(_) => false,
         }

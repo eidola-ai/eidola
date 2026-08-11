@@ -1516,6 +1516,130 @@ fn a_backend_that_rejects_tools_degrades_to_a_toolless_retry() {
     });
 }
 
+/// **The rejection shape the deployed server actually produces.**
+///
+/// An Eidola server too old to know the `tools` field fails it in the body
+/// extractor, and axum renders that rejection as a **plain-text 422** — not
+/// JSON. A client that decided "server error vs transport error" by whether the
+/// body parses would file this as a transport error and never degrade, so every
+/// branched turn against such a server would fail outright. The status is what
+/// classifies the response; the body is just the message.
+#[test]
+fn a_plain_text_rejection_still_degrades_to_a_toolless_retry() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectToolsUnparseable,
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        let space = branched_external_space(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat(
+                "Tell me more.".into(),
+                "qwen3-8b@ext".into(),
+                Some(space.clone()),
+            ))
+            .expect("an unparseable rejection body must still degrade, not fail the turn");
+        assert_eq!(result.content, "Hello from the mock.");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len(),
+            4,
+            "two fixture turns + the rejected try + the retry"
+        );
+        assert!(bodies[2].get("tools").is_some(), "{}", bodies[2]);
+        assert!(bodies[3].get("tools").is_none(), "{}", bodies[3]);
+
+        // The rejected exchange is recorded, and the plain-text body survives
+        // into the Record rather than becoming a JSON-parse complaint.
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        let rejected = requests
+            .iter()
+            .find(|r| r.response_status == Some(422))
+            .expect("the rejected attempt's request row");
+        let detail = core
+            .runtime()
+            .block_on(core.request_detail(rejected.id.clone()))
+            .expect("detail")
+            .expect("the row exists");
+        assert_eq!(
+            String::from_utf8_lossy(&detail.response_body.unwrap_or_default()),
+            chat_harness::UNKNOWN_FIELD_REJECTION,
+            "the endpoint's own words are kept verbatim"
+        );
+
+        // And it is remembered, so the next branched turn skips the probe.
+        core.runtime()
+            .block_on(core.chat(
+                "And more.".into(),
+                "qwen3-8b@ext".into(),
+                Some(space.clone()),
+            ))
+            .expect("second turn");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 5, "the second turn costs ONE request");
+        assert!(
+            bodies[4].get("tools").is_none(),
+            "the rejection was memoized: {}",
+            bodies[4]
+        );
+    });
+}
+
+/// The streaming twin classifies by status *before* reading the body, so it
+/// never had the blocking path's ordering problem — but the GUI is the
+/// streaming caller, so the behaviour is pinned rather than assumed.
+#[test]
+fn a_plain_text_rejection_degrades_on_the_streaming_path_too() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectToolsUnparseable,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // Branch an eidola space with streamed turns, then ask on the fork.
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        turn(&core, "And why two per day?", Some(space.clone()), None);
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        core.runtime()
+            .block_on(core.post_reply(
+                "What about spring tides?".into(),
+                Some(space.clone()),
+                Some(tree[1].action_id.clone()),
+            ))
+            .expect("branch post");
+
+        let result = turn(&core, "Tell me more.", Some(space.clone()), None);
+        assert_eq!(result.content, "Hello from the stream.");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 4, "two fixture turns + rejected try + retry");
+        assert!(bodies[2].get("tools").is_some(), "{}", bodies[2]);
+        assert!(bodies[3].get("tools").is_none(), "{}", bodies[3]);
+
+        // Nothing stranded on the spend path either.
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle");
+        assert!(
+            lifecycle.iter().all(|c| c.state != "spending"),
+            "no hold outlives the streamed degrade; got {lifecycle:?}"
+        );
+    });
+}
+
 /// Build a branched fixture space over the **eidola** backend — the spending
 /// one — and return its id. Same shape as `branched_external_space`: two
 /// linear turns (which attach no tools, so a tools-rejecting mock answers them
@@ -1716,6 +1840,72 @@ fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
                 .count(),
             3,
             "one inference per turn — two fixture turns and this one: {trail:?}"
+        );
+    });
+}
+
+/// **A hold is never abandoned to take another one.**
+///
+/// The rejected attempt settles its own hold, but settlement is a network call
+/// and can fail. Acquiring the retry's hold overwrites the only in-memory
+/// handle to the materials that mint the first one's successor — so proceeding
+/// anyway would leave that credential `spending`, its face value locked out of
+/// the wallet until an explicit recovery, and would do it while spending a
+/// *second* credential against an endpoint that just failed to settle the
+/// first. `begin_next_round` refuses instead, and the turn ends honestly.
+#[test]
+fn a_retry_will_not_take_a_hold_while_the_last_one_is_unsettled() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            refund: RefundMode::Fail,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let space = branched_eidola_space(&core);
+
+        let holding_before = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle")
+            .iter()
+            .filter(|c| c.state == "spending")
+            .count();
+        let requests_before = mock.chat_bodies().len();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
+            .expect_err("an unsettleable hold must end the turn, not be abandoned");
+        assert!(
+            matches!(err.root(), AppError::Credential { .. }),
+            "the turn names the settlement failure: {err}"
+        );
+        assert_eq!(
+            err.chat_space_id(),
+            Some(space.as_str()),
+            "and still carries the space id for adoption"
+        );
+
+        // The retry never reached the wire: refusing happens *before* the hold.
+        assert_eq!(
+            mock.chat_bodies().len() - requests_before,
+            1,
+            "exactly one attempt — the rejected one"
+        );
+        // And exactly one new hold exists, not two. This is the whole finding:
+        // a second `acquire_spend` here would have stranded the first.
+        let holding_after = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle")
+            .iter()
+            .filter(|c| c.state == "spending")
+            .count();
+        assert_eq!(
+            holding_after - holding_before,
+            1,
+            "the failed turn took one hold, not two"
         );
     });
 }
