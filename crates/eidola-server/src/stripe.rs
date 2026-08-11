@@ -332,11 +332,20 @@ impl StripeClient {
                 (false, _) => return Ok(None),
                 // More pages, and somewhere to resume from.
                 (true, Some(id)) => starting_after = Some(id),
-                // "More" after an empty page: there is no cursor to advance
-                // on, so treating it as the end is the only non-looping
-                // reading. Stripe does not do this; the arm exists so a
-                // surprise cannot spin.
-                (true, None) => return Ok(None),
+                // "More results exist" handed back with nothing to page
+                // from. The walk cannot continue and it has not finished —
+                // so this is an incomplete walk, and answering `None` about
+                // one is the very claim this method exists to stop making.
+                // It refuses, exactly as the page cap below does. Stripe
+                // does not do this; the arm exists so a surprise cannot
+                // spin, and stopping the spin is not a licence to guess.
+                (true, None) => {
+                    return Err(ServerError::ServiceUnavailable(
+                        "stripe: a page of a customer's subscriptions reported \
+                         more results but carried none"
+                            .to_string(),
+                    ));
+                }
             }
         }
 
@@ -908,6 +917,28 @@ mod tests {
             "expected a refusal, got {err:?}"
         );
         assert_eq!(stub.calls.load(Ordering::SeqCst), MAX_SUBSCRIPTION_PAGES);
+    }
+
+    #[tokio::test]
+    async fn a_page_promising_more_but_carrying_none_refuses_too() {
+        // The walk cannot continue (no cursor) and has not finished (Stripe
+        // says there is more). That is an incomplete walk, not an ended one,
+        // and "no subscription" said about an incomplete walk is what lets
+        // the checkout guard sell a second subscription over a live one.
+        let (client, stub) = stub_stripe(vec![Page {
+            statuses: vec![],
+            has_more: true,
+        }])
+        .await;
+
+        let err = client.in_force_subscription("cus_1").await.unwrap_err();
+        assert!(
+            matches!(err, ServerError::ServiceUnavailable(_)),
+            "expected a refusal, got {err:?}"
+        );
+        // Refusing on the spot: no cursor means nothing to retry with, so it
+        // must not burn the page budget either.
+        assert_eq!(stub.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
