@@ -719,26 +719,30 @@ mod tests {
     #[test]
     fn a_followed_post_renders_its_own_quotes() {
         let row = referenced("other", Some("Tides"), "As noted:\n\n{{ embed 1 }}");
-        let entry = |ordinal: i64, byline: &str, snippet: &str| crate::ReferenceEntry {
-            ordinal,
-            byline: byline.to_string(),
+        let addressed = crate::ReferenceEntry {
+            ordinal: 1,
+            target: crate::ReferenceTarget::Addressable {
+                item_id: "item-bo".to_string(),
+                label: "Bo".to_string(),
+            },
             annotation: None,
-            snippet: Some(snippet.to_string()),
+            body: crate::ReferenceBody::Passage("syzygy".to_string()),
         };
-        let references = std::collections::BTreeMap::from([
-            (1, entry(1, "#abc2345 · Bo", "syzygy")),
-            (
-                2,
-                entry(
-                    2,
-                    "Cy (a post outside this space, or an earlier version)",
-                    "neap",
-                ),
-            ),
-        ]);
+        let elsewhere = crate::ReferenceEntry {
+            ordinal: 2,
+            target: crate::ReferenceTarget::Elsewhere {
+                label: Some("Cy".to_string()),
+            },
+            annotation: None,
+            body: crate::ReferenceBody::Passage("neap".to_string()),
+        };
+        let references = std::collections::BTreeMap::from([(1, addressed), (2, elsewhere)]);
         let rendered = render_followed_post(&row, "here", &references);
         assert!(
-            rendered.contains("As noted:\n\n[1] #abc2345 · Bo\n> syzygy"),
+            rendered.contains(&format!(
+                "As noted:\n\n[1] {}\n> syzygy",
+                crate::message_header("item-bo", "Bo")
+            )),
             "{rendered}"
         );
         assert!(
