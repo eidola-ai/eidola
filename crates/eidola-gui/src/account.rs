@@ -189,7 +189,7 @@ impl AccountView {
         self.manage_error = None;
         cx.notify();
 
-        let Some(rx) = self.account.read(cx).request_subscription() else {
+        let Some(rx) = self.account.read(cx).request_portal() else {
             // Stub core: the in-flight marker above is the observable state.
             return;
         };
@@ -204,20 +204,11 @@ impl AccountView {
                     this.manage_pending = false;
                     this.manage_task = None;
                     match res {
-                        Ok(info) => match info.management_url {
-                            Some(url) => cx.open_url(&url),
-                            // The read succeeded and carried no link. Since
-                            // the door is only offered where a payment
-                            // relationship stands, that is the payment
-                            // processor declining to open the portal right
-                            // now — not a statement about the account. Say
-                            // the true, useful thing rather than either.
-                            None => {
-                                this.manage_error = Some(
-                                    "Couldn't open the billing portal just now. Try again.".into(),
-                                );
-                            }
-                        },
+                        Ok(url) => cx.open_url(&url),
+                        // The server refuses a portal for an account with no
+                        // payment relationship, which is not a state this
+                        // door is offered in — so anything landing here is
+                        // the mint itself failing, and the error says so.
                         Err(e) => this.manage_error = Some(e.to_string()),
                     }
                     cx.notify();
@@ -575,12 +566,11 @@ impl Render for AccountView {
                             .child(SharedString::from(summary)),
                     );
 
-                // The door is offered on the **standing**, never on the link
-                // the read happened to carry: that link is minted fresh on
-                // the click, and `management_url` is advisory — a portal
-                // session can fail to mint for reasons that say nothing
-                // about the subscription, and dropping the door for those
-                // would hide billing from a paying customer over a blip.
+                // The door is offered on the **standing**, and the standing is
+                // all the read carries: minting a portal session is its own
+                // request, made at the click. A door gated on a link fetched
+                // when the pane opened would vanish for a paying customer
+                // over a blip in a call they never needed.
                 if let Some((portal_label, portal_probe, portal_note)) = door {
                     col = col
                         .child(

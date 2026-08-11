@@ -1666,7 +1666,6 @@ fn a_lapsed_account_is_offered_its_billing_and_every_plan(cx: &mut TestAppContex
                 state: eidola_app_core::SubscriptionState::Inactive,
                 status: None,
                 current_period_end: None,
-                management_url: Some("https://billing.example/session".into()),
             }),
             cx,
         );
@@ -1714,7 +1713,6 @@ fn an_account_that_never_transacted_is_shown_no_billing_door(cx: &mut TestAppCon
                 state: eidola_app_core::SubscriptionState::NoCustomer,
                 status: None,
                 current_period_end: None,
-                management_url: None,
             }),
             cx,
         );
@@ -1775,7 +1773,6 @@ fn a_known_subscription_can_always_be_re_checked(cx: &mut TestAppContext) {
                 state: eidola_app_core::SubscriptionState::Active,
                 status: Some("active".into()),
                 current_period_end: None,
-                management_url: Some("https://billing.example/session".into()),
             }),
             cx,
         );
@@ -1807,7 +1804,6 @@ fn a_subscribed_account_is_offered_management_and_only_one_time_plans(cx: &mut T
                 state: eidola_app_core::SubscriptionState::Active,
                 status: Some("active".into()),
                 current_period_end: None,
-                management_url: Some("https://billing.example/session".into()),
             }),
             cx,
         );
@@ -1893,7 +1889,6 @@ fn a_failed_re_read_keeps_the_subscription_it_already_knew(cx: &mut TestAppConte
                     state: eidola_app_core::SubscriptionState::Active,
                     status: Some("active".into()),
                     current_period_end: None,
-                    management_url: Some("https://billing.example/session".into()),
                 }),
             },
             cx,

@@ -583,9 +583,8 @@ pub enum SubscriptionState {
 }
 
 /// The account's subscription standing. **Fetched live and never
-/// persisted** — it is the payment processor's fact, not ours, and
-/// `management_url` is a short-lived one-shot session link that would be
-/// a lie the moment it were cached.
+/// persisted** — it is the payment processor's fact, not ours, and it goes
+/// stale the moment the reader changes anything in a browser.
 ///
 /// The subscription's own identifier is deliberately not carried: nothing
 /// in the client needs it, and it is a payment-side identifier.
@@ -598,9 +597,6 @@ pub struct SubscriptionInfo {
     pub status: Option<String>,
     /// End of the current billing period, ms since the epoch.
     pub current_period_end: Option<i64>,
-    /// A billing-portal session to open in a browser. Absent exactly when
-    /// `state` is [`SubscriptionState::NoCustomer`].
-    pub management_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2110,8 +2106,36 @@ impl Inner {
             state,
             status: sub.status,
             current_period_end: sub.current_period_end.map(|s| iso_to_ms(&s)).transpose()?,
-            management_url: sub.management_url,
         })
+    }
+
+    /// Mint a billing-portal session and return its URL.
+    ///
+    /// Its own call, matching its own endpoint: the session is a write the
+    /// payment processor performs and it expires quickly, so it is asked
+    /// for at the moment the reader is about to open it and never held.
+    async fn account_portal(&self) -> Result<String, AppError> {
+        let cfg = self.load_config();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let (id, secret) = self.require_credentials(&cfg)?;
+
+        let client = self.build_client(&cfg, &eidola, None).await?;
+        let resp = client
+            .post(format!("{base_url}/v1/account/portal"))
+            .basic_auth(id, Some(secret))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let portal: PortalResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse response: {e}"),
+            })?;
+        Ok(portal.portal_url)
     }
 
     async fn account_balances(&self) -> Result<BalancesResult, AppError> {
@@ -7449,6 +7473,16 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// A billing-portal URL to open in a browser. Minted on demand and
+    /// never held — see [`Inner::account_portal`].
+    pub async fn account_portal(&self) -> Result<String, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.account_portal().await })
+            .await
+            .map_err(join_err)?
+    }
+
     pub async fn account_balances(&self) -> Result<BalancesResult, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -8761,7 +8795,11 @@ struct SubscriptionResponse {
     state: String,
     status: Option<String>,
     current_period_end: Option<String>,
-    management_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PortalResponse {
+    portal_url: String,
 }
 
 #[derive(Deserialize)]

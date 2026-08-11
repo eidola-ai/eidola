@@ -442,7 +442,11 @@ impl OnboardingView {
         self.create_error = None;
         cx.notify();
 
-        let Some(rx) = self.stores.account.read(cx).request_account_create() else {
+        let Some(rx) = self
+            .stores
+            .account
+            .update(cx, |s, cx| s.request_account_create(cx))
+        else {
             // Stub / no backend: the in-flight marker is the observable state.
             return;
         };
@@ -462,6 +466,11 @@ impl OnboardingView {
                         this.stores.account.update(cx, |s, cx| {
                             s.refresh_prices(cx);
                             s.refresh_balances(cx);
+                            // The cell was cleared when the switch began;
+                            // this fills it for the account that is now
+                            // current rather than waiting for a surface to
+                            // open.
+                            s.refresh_subscription(cx);
                         });
                         this.reveal(Slide::CreateAccount, Slide::NewAccount, cx);
                     }
@@ -494,8 +503,7 @@ impl OnboardingView {
         let Some(rx) = self
             .stores
             .account
-            .read(cx)
-            .request_verify_account(id, secret)
+            .update(cx, |s, cx| s.request_verify_account(id, secret, cx))
         else {
             return;
         };
@@ -515,6 +523,13 @@ impl OnboardingView {
                         this.stores.account.update(cx, |s, cx| {
                             s.set_balances(balances, cx);
                             s.refresh_prices(cx);
+                            // Linking a *different* account changes whose
+                            // subscription this is. The cell was cleared when
+                            // the switch began, so the worst case here is a
+                            // blank; filling it now means an Account pane
+                            // already on screen catches up without the reader
+                            // having to leave and come back.
+                            s.refresh_subscription(cx);
                         });
                         this.verify_result = Some(Ok(available));
                     }

@@ -1787,3 +1787,75 @@ fn two_saves_on_one_agent_are_sequenced(cx: &mut TestAppContext) {
     );
     assert_eq!(row.label, "Second", "and the later save is what stands");
 }
+
+/// Linking a different account must not leave the previous one's billing
+/// standing on screen.
+///
+/// Nothing on the bus can invalidate the subscription cell (it is a live
+/// server read that persists nothing), and the Account pane may already be
+/// open on the previous account's answer when the switch happens. Clearing
+/// is structural — it rides the request itself rather than a caller's
+/// success path — so the failure and cancellation exits are covered too.
+#[gpui::test]
+fn linking_another_account_drops_the_previous_ones_subscription(cx: &mut TestAppContext) {
+    use eidola_app_core::{SubscriptionInfo, SubscriptionState};
+    use eidola_gui::loadable::Loadable;
+
+    let (stores, _dir) = backed_stores(cx);
+
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            Loadable::loaded(SubscriptionInfo {
+                state: SubscriptionState::Active,
+                status: Some("active".into()),
+                current_period_end: None,
+            }),
+            cx,
+        );
+    });
+    stores.account.read_with(cx, |s, _| {
+        assert!(s.subscription().value().is_some(), "fixture is in place");
+    });
+
+    let _rx = stores.account.update(cx, |s, cx| {
+        s.request_verify_account("acct".into(), "secret".into(), cx)
+    });
+
+    stores.account.read_with(cx, |s, _| {
+        assert!(
+            matches!(s.subscription(), Loadable::NotLoaded),
+            "another account's subscription must not survive the switch"
+        );
+    });
+}
+
+/// Creating an account is the same identity switch, and owes the same.
+#[gpui::test]
+fn creating_an_account_drops_the_previous_ones_subscription(cx: &mut TestAppContext) {
+    use eidola_app_core::{SubscriptionInfo, SubscriptionState};
+    use eidola_gui::loadable::Loadable;
+
+    let (stores, _dir) = backed_stores(cx);
+
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            Loadable::loaded(SubscriptionInfo {
+                state: SubscriptionState::Inactive,
+                status: None,
+                current_period_end: None,
+            }),
+            cx,
+        );
+    });
+
+    let _rx = stores
+        .account
+        .update(cx, |s, cx| s.request_account_create(cx));
+
+    stores.account.read_with(cx, |s, _| {
+        assert!(
+            matches!(s.subscription(), Loadable::NotLoaded),
+            "a fresh account starts with no subscription on screen"
+        );
+    });
+}
