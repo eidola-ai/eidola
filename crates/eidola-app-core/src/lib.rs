@@ -1306,6 +1306,27 @@ pub enum ChatStreamEvent {
     ContentDelta(String),
 }
 
+/// What a `tools` field is actually offered to: one model on one backend.
+///
+/// The unit the tool-capability memo is keyed by (`Inner::tool_incapable_models`).
+/// A backend is a *host*, not a capability — eidola's catalog and a llama.cpp
+/// install each serve many models with different chat templates — so the pair
+/// is the narrowest thing an observed rejection is evidence about.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ToolEndpoint {
+    backend_id: String,
+    wire_model: String,
+}
+
+impl ToolEndpoint {
+    fn new(backend_id: &str, wire_model: &str) -> Self {
+        Self {
+            backend_id: backend_id.to_string(),
+            wire_model: wire_model.to_string(),
+        }
+    }
+}
+
 // ============================================================================
 // Inner — shared state used by AppCore, wrapped in Arc so it can move into
 // spawned futures on the owned tokio runtime.
@@ -1365,9 +1386,9 @@ struct Inner {
     /// entirely when the snapshot is empty. Consumers register through
     /// [`AppCore::register_tool`]; tasks 21/22 plug in here.
     tools: std::sync::RwLock<tools::ToolRegistry>,
-    /// Backends observed, this process, to reject a request carrying a `tools`
-    /// field — see `Inner::backend_rejects_tools`.
-    tool_incapable_backends: std::sync::RwLock<std::collections::HashSet<String>>,
+    /// Endpoints observed, this process, to reject a request carrying a `tools`
+    /// field — see `Inner::model_rejects_tools`.
+    tool_incapable_models: std::sync::RwLock<std::collections::HashSet<ToolEndpoint>>,
     /// Test-only HTTP client override. When `Some`, [`Inner::build_client`]
     /// returns a clone of this client *instead of* constructing the
     /// attesting client, letting integration tests drive `chat`/`chat_stream`
@@ -4520,46 +4541,6 @@ impl Inner {
                 message: format!("unknown backend kind `{}`", backend.kind),
             })?;
 
-        // Whether this backend can be offered a `tools` field at all.
-        //
-        // Two conditions, and the second is the important one.
-        //
-        // **Statically excluded: eidola.** The server's
-        // `ChatCompletionRequest` is `#[serde(deny_unknown_fields)]` with no
-        // `tools` member, so sending one is a certain 400. Removal trigger:
-        // task 25 (server-side tool support). The **map** rides in the messages
-        // array and is unaffected either way, so a branched eidola space still
-        // gets the whole structural view; only the descend-further affordance
-        // waits.
-        //
-        // **Everything else is a guess until proven, so it is *learned*, not
-        // assumed from the kind.** Backend kind does not establish
-        // tool-calling capability, and this is not hypothetical: llama.cpp
-        // returns HTTP 500 `tools param requires --jinja flag` without
-        // `--jinja`, and *with* `--jinja` still 500s with a template-render
-        // crash when the model's tool block uses Jinja filters it lacks (a
-        // mainstream case — Qwen3 Coder does exactly this). A generic
-        // OpenAI-compatible endpoint may reject the field outright. Since this
-        // turn attaches tools *automatically* the moment a space branches,
-        // assuming capability would mean "branching your conversation breaks
-        // every turn on this model", with no opt-out and triggered by a core
-        // UX action. So a backend that has rejected a `tools` field this
-        // process is remembered and simply not offered them again (the turn
-        // that discovered it degraded and carried on — see the round loop).
-        //
-        // Deliberately in-process and not persisted: it is an *observation*,
-        // not configuration. No column, no setting to get wrong, nothing to
-        // migrate, and a backend that gains tool support (a rebuilt engine, a
-        // different model, an upgraded proxy) is re-probed on the next restart
-        // rather than being written off forever. The real per-backend
-        // capability flag stays genuinely deferred.
-        //
-        // Note this gates only the tools *this turn attaches*. A consumer's own
-        // `AppCore::register_tool` registrations are untouched — that surface's
-        // wire compatibility is the consumer's call, exactly as task 20 left it.
-        let backend_accepts_tools =
-            backend_kind != BackendKind::Eidola && !self.backend_rejects_tools(&backend.id);
-
         // The canonical selection string (recorded on actions, shown in
         // UIs) and the wire model (what the backend's HTTP API expects).
         // Engine-backed aliases are spawned equal to the canonical id, so
@@ -4571,6 +4552,44 @@ impl Inner {
             _ => canonical_model.clone(),
         };
         let model = canonical_model.as_str();
+
+        // Whether this turn's endpoint can be offered a `tools` field at all.
+        //
+        // **Capability is *learned*, never assumed from the backend's kind.**
+        // Nothing about a kind establishes tool-calling support, and this is
+        // not hypothetical: llama.cpp returns HTTP 500 `tools param requires
+        // --jinja flag` without `--jinja`, and *with* `--jinja` still 500s with
+        // a template-render crash when the model's tool block uses Jinja
+        // filters it lacks (a mainstream case — Qwen3 Coder does exactly
+        // this). A generic OpenAI-compatible endpoint may reject the field
+        // outright, and a deployed enclave older than the server's tool wire
+        // types refuses it as an unknown member. Since this turn attaches tools
+        // *automatically* the moment a space branches, assuming capability
+        // would mean "branching your conversation breaks every turn on this
+        // model", with no opt-out and triggered by a core UX action. So an
+        // endpoint that has rejected a `tools` field this process is remembered
+        // and simply not offered them again (the turn that discovered it
+        // degraded and carried on — see the round loop).
+        //
+        // **The memo is per (backend, wire model)**, because one backend serves
+        // many models: eidola's catalog and a llama.cpp install both do. A
+        // single tool-incapable model must cost only itself its tools, not
+        // every sibling on the same host.
+        //
+        // Deliberately in-process and not persisted: it is an *observation*,
+        // not configuration. No column, no setting to get wrong, nothing to
+        // migrate, and an endpoint that gains tool support (a rebuilt engine, a
+        // redeployed enclave, an upgraded proxy) is re-probed on the next
+        // restart rather than being written off forever. The real per-model
+        // capability metadata stays genuinely deferred.
+        //
+        // Note this gates only the tools *this turn attaches*. A consumer's own
+        // `AppCore::register_tool` registrations are untouched — that surface's
+        // wire compatibility is the consumer's call, exactly as task 20 left it.
+        // The **map** rides the messages array and is never gated by any of
+        // this, so a branched space keeps its whole structural view even where
+        // the descend-further affordance is withdrawn.
+        let backend_accepts_tools = !self.model_rejects_tools(&backend.id, &wire_model);
 
         let mut engine_lease: Option<local_models::EngineLease> = None;
         let (
@@ -5131,6 +5150,7 @@ impl Inner {
                 (charge_credits, Some(spend), Some(auth_value))
             }
         };
+        let spend_is_none = spend.is_none();
 
         Ok(TurnPrep {
             db_conn,
@@ -5163,7 +5183,11 @@ impl Inner {
             charge_credits,
             total_credits: charge_credits,
             spend,
+            // The turn's first hold is unsettled until its round processes a
+            // refund; a turn with no spend at all has nothing to settle.
+            spend_settled: spend_is_none,
             auth_value,
+            bus: self.bus.clone(),
         })
     }
 
@@ -5337,6 +5361,24 @@ impl Inner {
         let Some(pricing) = prep.remote_pricing else {
             return Ok(());
         };
+        // **A hold is never abandoned to take another one.** Acquiring below
+        // overwrites `prep.spend`, which is the only in-memory handle to the
+        // materials that settle the current one — so an unsettled hold would be
+        // dropped mid-turn and its credential left `spending`, its face value
+        // locked out of the wallet until the next startup recovery sweep. The
+        // round that took it normally settles it (inline refund, or recovery
+        // when the response carries none); this is the last chance, and a
+        // failure here ends the turn rather than spending a second credential
+        // against an endpoint that has not settled the first. The guard lives
+        // here, at the one place `spend` is replaced, so no present or future
+        // caller has to remember it.
+        if prep.spend.is_some() && !prep.spend_settled && !prep.try_refund_recovery().await {
+            return Err(AppError::Credential {
+                message: "the previous round's credential could not be settled — its hold is \
+                          recoverable with `eidola wallet credentials recover`"
+                    .into(),
+            });
+        }
         let cfg = self.load_config();
         let charge_credits = estimate_charge_credits(
             &prep.messages,
@@ -5356,33 +5398,38 @@ impl Inner {
         prep.charge_credits = charge_credits;
         prep.total_credits += charge_credits;
         prep.spend = Some(spend);
+        prep.spend_settled = false;
         prep.auth_value = Some(auth_value);
         Ok(())
     }
 
-    /// Has this backend rejected a request carrying a `tools` field during
+    /// Has this endpoint rejected a request carrying a `tools` field during
     /// this process's lifetime? See the gate in `prepare_turn` for why this is
-    /// learned rather than assumed from the backend's kind.
-    fn backend_rejects_tools(&self, backend_id: &str) -> bool {
-        self.tool_incapable_backends
+    /// learned rather than assumed from the backend's kind, and why the
+    /// question is asked per model rather than per backend.
+    fn model_rejects_tools(&self, backend_id: &str, wire_model: &str) -> bool {
+        self.tool_incapable_models
             .read()
             .expect("tool capability memo lock poisoned")
-            .contains(backend_id)
+            .contains(&ToolEndpoint::new(backend_id, wire_model))
     }
 
-    /// Record that `backend_id` rejects a `tools` field, so later turns skip
-    /// straight to the toolless request instead of paying the probe again.
+    /// Record that `wire_model` on `backend_id` rejects a `tools` field, so
+    /// later turns on **that model** skip straight to the toolless request
+    /// instead of paying the probe again. Its siblings on the same backend are
+    /// untouched — a multi-model host is exactly where one model's answer must
+    /// not speak for the rest.
     ///
     /// Called **only when the toolless retry succeeded** — that is the evidence
     /// the `tools` field was the cause. A round that fails both with and
     /// without tools was failing for some other reason (an overloaded model, a
-    /// bad key), and must not silently cost the backend its tool support for
-    /// the rest of the process.
-    fn remember_tool_incapable(&self, backend_id: &str) {
-        self.tool_incapable_backends
+    /// bad key), and must not silently cost the model its tool support for the
+    /// rest of the process.
+    fn remember_tool_incapable(&self, backend_id: &str, wire_model: &str) {
+        self.tool_incapable_models
             .write()
             .expect("tool capability memo lock poisoned")
-            .insert(backend_id.to_string());
+            .insert(ToolEndpoint::new(backend_id, wire_model));
     }
 
     /// Should this round-1 failure be retried with the turn's own tools
@@ -5409,11 +5456,13 @@ impl Inner {
     /// `inference`) or asks for tools (the round is persisted as a
     /// `tool_call` / `tool_result` pair, the results are appended to the
     /// messages array, and the next round runs). At most
-    /// [`MAX_TURN_ROUNDS`] requests are issued; reaching the cap with the model
-    /// still asking for tools ends the turn with [`AppError::ToolLoop`] rather
-    /// than passing off a tool request as an answer. A turn with an empty tool
-    /// registry can only ever take one iteration, so nothing about the
-    /// single-inference path changes.
+    /// [`MAX_TURN_ROUNDS`] rounds are issued — plus, at most once, the
+    /// tool-capability probe a rejecting endpoint costs (see
+    /// [`MAX_TURN_ROUNDS`] for why that one is not a round). Reaching the cap
+    /// with the model still asking for tools ends the turn with
+    /// [`AppError::ToolLoop`] rather than passing off a tool request as an
+    /// answer. A turn with an empty tool registry can only ever take one
+    /// iteration, so nothing about the single-inference path changes.
     ///
     /// `budget`, if set, caps the estimated charge of **each round** — a later
     /// round re-estimates over the grown messages array and re-checks it (the
@@ -5461,16 +5510,18 @@ impl Inner {
                 && self.should_degrade_tools(&prep, round, e)
             {
                 prep.withdraw_auto_tools();
-                // The failed attempt consumed its hold (and recovered its
-                // refund), so the retry acquires a fresh one — exactly what a
-                // tool round does. A no-op for the non-spend backends this can
-                // actually reach today.
+                // The rejected attempt consumed its hold, so the retry acquires
+                // a fresh one — exactly what a tool round does, and re-estimated
+                // over the array it will actually send, so the withdrawn
+                // schemas are no longer held for. `begin_next_round` refuses to
+                // replace a hold the rejected attempt failed to settle; a
+                // no-op on the non-spend backends.
                 self.begin_next_round(&mut prep)
                     .await
                     .map_err(|e| prep.wrap(e))?;
                 outcome = Box::pin(self.run_turn_round(&mut prep, round)).await;
                 if outcome.is_ok() {
-                    self.remember_tool_incapable(&prep.backend_id);
+                    self.remember_tool_incapable(&prep.backend_id, &prep.wire_model);
                 }
             }
             match outcome? {
@@ -5545,12 +5596,32 @@ impl Inner {
                     })
                     .inspect_err(|_| emit_user_turn())
                     .map_err(|e| prep.wrap(e))?;
-                let parsed: serde_json::Value = serde_json::from_str(&text)
-                    .map_err(|e| AppError::Network {
-                        message: format!("failed to parse response JSON: {e}"),
-                    })
-                    .inspect_err(|_| emit_user_turn())
-                    .map_err(|e| prep.wrap(e))?;
+                // **The status classifies the response, not the body shape.**
+                // A non-2xx body is an error document and is never required to
+                // parse: a rejection raised by the endpoint's own body
+                // extractor is plain text (axum renders a `JsonRejection` as
+                // `(status, String)`), and that is exactly the shape a server
+                // too old for a field this turn sent answers with. Letting the
+                // parse decide would file such a response as `Network` — and
+                // the tool-rejection degrade keys on `Server`, so the turn
+                // would fail outright instead of retrying without the field.
+                // `parse_server_error_message` already reads a plain-text body.
+                //
+                // A **2xx** that is not JSON is a genuine protocol failure with
+                // no completion to read, and still fails as `Network` — with a
+                // refund recovery first, since nothing below this point runs to
+                // settle the hold this round took.
+                let parsed: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(parsed) => parsed,
+                    Err(_) if !status.is_success() => serde_json::Value::Null,
+                    Err(e) => {
+                        let _ = prep.try_refund_recovery().await;
+                        emit_user_turn();
+                        return Err(prep.wrap(AppError::Network {
+                            message: format!("failed to parse response JSON: {e}"),
+                        }));
+                    }
+                };
                 (status, text, parsed)
             }
             Err(e) => {
@@ -5558,9 +5629,7 @@ impl Inner {
                 // request. Try to recover the refund token; a written successor
                 // credential is a wallet change.
                 let original_err = AppError::from_request(e);
-                if prep.try_refund_recovery().await {
-                    self.bus.emit(Change::Wallet);
-                }
+                let _ = prep.try_refund_recovery().await;
                 // The user turn (space row + user-message, auto-title) is
                 // already committed — emit it so other windows see the persisted
                 // turn, then wrap with the space id for blank-space adoption.
@@ -5902,7 +5971,7 @@ impl Inner {
                     .map_err(|e| prep.wrap(e))?;
                 outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
                 if outcome.is_ok() {
-                    self.remember_tool_incapable(&prep.backend_id);
+                    self.remember_tool_incapable(&prep.backend_id, &prep.wire_model);
                 }
             }
             match outcome? {
@@ -5968,10 +6037,7 @@ impl Inner {
             }
             Err(e) => {
                 let original_err = AppError::from_request(e);
-                if prep.try_refund_recovery().await {
-                    // Successor credential written — wallet state updated.
-                    self.bus.emit(Change::Wallet);
-                }
+                let _ = prep.try_refund_recovery().await;
                 // User turn is committed — emit it, then wrap with the space id.
                 emit_user_turn();
                 return Err(prep.wrap(original_err));
@@ -5986,10 +6052,7 @@ impl Inner {
         // never produced one — so the request row stands alone.)
         if !status.is_success() {
             let response_text = resp.text().await.unwrap_or_default();
-            if prep.try_refund_recovery().await {
-                // Successor credential written — wallet state updated.
-                self.bus.emit(Change::Wallet);
-            }
+            let _ = prep.try_refund_recovery().await;
             prep.insert_unattached_request(
                 &request_body_json,
                 request_at,
@@ -6886,7 +6949,7 @@ impl AppCore {
                 memory_gate: tokio::sync::Mutex::new(()),
                 memory_enabled: std::sync::atomic::AtomicBool::new(false),
                 tools: std::sync::RwLock::new(tools::ToolRegistry::new()),
-                tool_incapable_backends: std::sync::RwLock::new(std::collections::HashSet::new()),
+                tool_incapable_models: std::sync::RwLock::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 http_override,
                 _db_lock: db_lock,
@@ -8846,8 +8909,23 @@ struct TurnPrep {
     /// no billing. Its absence disables the ACT header, the refund
     /// machinery, and the `Wallet` emissions throughout the transports.
     spend: Option<SpendPrep>,
+    /// Whether [`Self::spend`]'s hold has been **settled** — a refund applied
+    /// and its successor credential written.
+    ///
+    /// A hold is settled by the round that took it. This exists because
+    /// `spend` is the only in-memory handle to the materials that mint that
+    /// successor (`SpendPrep`'s proof, pre-refund and public key), so
+    /// replacing it while unsettled abandons them: the credential then sits
+    /// `spending` until the next startup recovery sweep, its face value locked
+    /// out of the wallet. [`Inner::begin_next_round`] refuses to replace an
+    /// unsettled hold, which is what makes that unrepresentable rather than
+    /// merely avoided at each call site.
+    spend_settled: bool,
     /// The `Authorization` header value; present iff `spend` is.
     auth_value: Option<String>,
+    /// The invalidation bus, so the one place a settled hold is durably
+    /// committed ([`Self::process_refund_obj`]) can emit at the write.
+    bus: BroadcastSource,
 }
 
 /// The credential-spend half of a prepared (remote) turn: the spendable
@@ -8935,7 +9013,16 @@ impl TurnPrep {
     /// Apply a refund object (inline from a response body, or recovered) to
     /// the pending spend — writes the successor credential. A no-op for
     /// local turns (nothing was spent).
-    async fn process_refund_obj(&self, refund_obj: &serde_json::Value) -> Result<(), AppError> {
+    ///
+    /// **This is where a settled hold emits `Change::Wallet`.** Writing the
+    /// successor is the durable commit — the credential leaves `spending` at
+    /// that instant — and every refund the turn applies, inline or recovered,
+    /// arrives through here. Emitting at the write rather than at each caller
+    /// is what keeps the crate's emit-after-every-durable-commit rule true by
+    /// construction: a caller that forgets (or an exit that returns before its
+    /// own emit could run) cannot leave subscribers showing a credential as
+    /// spending when it is not.
+    async fn process_refund_obj(&mut self, refund_obj: &serde_json::Value) -> Result<(), AppError> {
         let Some(spend) = &self.spend else {
             return Ok(());
         };
@@ -8951,17 +9038,23 @@ impl TurnPrep {
             self.now,
         )
         .await
+        .inspect(|()| {
+            self.spend_settled = true;
+            self.bus.emit(Change::Wallet);
+        })
     }
 
     /// Best-effort refund recovery via `/v1/credentials/refund`. Returns
-    /// whether a successor credential was written (the caller decides whether
-    /// that warrants an immediate `Wallet` emission). Always `false` for
-    /// local turns — there is no spend to recover.
-    async fn try_refund_recovery(&self) -> bool {
+    /// whether a successor credential was written — the `Wallet` emission for
+    /// it is [`Self::process_refund_obj`]'s, so a caller reads this only to
+    /// decide its own control flow, never to decide whether to emit. Always
+    /// `false` for local turns — there is no spend to recover.
+    async fn try_refund_recovery(&mut self) -> bool {
         let (Some(_), Some(auth_value)) = (&self.spend, &self.auth_value) else {
             return false;
         };
-        match recover_refund(&self.client, &self.base_url, auth_value).await {
+        let auth_value = auth_value.clone();
+        match recover_refund(&self.client, &self.base_url, &auth_value).await {
             Ok(refund_obj) => self.process_refund_obj(&refund_obj).await.is_ok(),
             Err(_) => false,
         }
@@ -9551,7 +9644,7 @@ async fn recover_refund(
 // Tool-calling turns
 // ---------------------------------------------------------------------------
 
-/// The maximum number of **model requests** one turn may issue.
+/// The maximum number of **model rounds** one turn may issue.
 ///
 /// A turn without tools issues exactly one, so this only ever binds a tool
 /// loop. Eight is deliberately a small fixed constant, not a setting: it caps
@@ -9560,6 +9653,17 @@ async fn recover_refund(
 /// still asking for tools ends the turn with [`AppError::ToolLoop`] — the
 /// rounds that did happen stay persisted, and no half-finished round is passed
 /// off as an answer.
+///
+/// **One request a turn may issue is not a round: the tool-capability probe.**
+/// A turn whose endpoint rejects the `tools` field retries that same round
+/// without it (see `Inner::should_degrade_tools`), so the worst case is
+/// `MAX_TURN_ROUNDS` rounds **plus one** rejected attempt. It is one and not
+/// more, structurally: the degrade fires only on round 1 with the turn's own
+/// tools attached, and withdrawing them clears that latch. It is not counted
+/// against the cap because it is not a round — no model output, same messages,
+/// and the spend this constant bounds is unaffected: the endpoint rejected the
+/// request before doing any work, so its hold refunds in full. Pinned by
+/// `a_degraded_turn_costs_one_extra_request_and_no_more`.
 pub const MAX_TURN_ROUNDS: usize = 8;
 
 /// What one round of a turn's bounded loop produced.
