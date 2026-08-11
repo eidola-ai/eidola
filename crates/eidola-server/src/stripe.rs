@@ -121,7 +121,14 @@ impl Subscription {
 #[derive(Debug, Deserialize)]
 struct ListResponse<T> {
     pub data: Vec<T>,
-    #[serde(default)]
+    /// **Required on purpose**, exactly like [`SubscriptionItem::current_period_end`]
+    /// and for the same reason. Defaulted, a response that omits it — a
+    /// shape change, a malformed intermediary — reads as `false`, which the
+    /// walk takes for "the whole list has been seen": an incomplete walk
+    /// becomes a confident "no subscription", and the checkout guard sells
+    /// a second subscription over a live one. A default here is precisely
+    /// the guess this field exists to replace, so its absence fails the
+    /// parse and the request refuses instead.
     pub has_more: bool,
 }
 
@@ -1006,6 +1013,42 @@ mod tests {
         assert_eq!(mixed.current_period_end(), Some(1_000));
         // No items at all is the only way to have no period.
         assert_eq!(sub("active").current_period_end(), None);
+    }
+
+    #[tokio::test]
+    async fn a_page_that_omits_has_more_refuses_rather_than_assuming_the_end() {
+        // Defaulted to `false`, a missing `has_more` reads as "the whole
+        // list has been seen" — so a shape change or a malformed
+        // intermediary turns an incomplete walk into a confident "no
+        // subscription", and the checkout guard sells a second subscription
+        // over a live one. Absence must fail the parse instead.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/subscriptions",
+            get(|| async {
+                // A page of non-entitling subscriptions and no `has_more` —
+                // exactly what the old default silently read as "done".
+                axum::Json(serde_json::json!({
+                    "data": [{
+                        "id": "sub_0",
+                        "status": "incomplete",
+                        "items": { "data": [{ "current_period_end": PERIOD_END }] },
+                    }],
+                }))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let mut client = StripeClient::new("sk_test".to_string());
+        client.base_url = format!("http://{addr}");
+
+        let err = client.in_force_subscription("cus_1").await.unwrap_err();
+        assert!(
+            matches!(err, ServerError::Parse(_)),
+            "expected the missing field to fail the parse, got {err:?}"
+        );
     }
 
     #[tokio::test]
