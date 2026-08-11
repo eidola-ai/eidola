@@ -176,6 +176,14 @@ pub(crate) fn body_width(page_width: Pixels) -> f32 {
         .as_f32()
 }
 
+/// The narrowest page whose [`body_width`] is the full [`BODY_MAX_WIDTH`]
+/// measure. Below it the reading column compresses (prose wraps short); above
+/// it only the gutters grow. `lib.rs::writing_surface_size` derives the default
+/// space-window width from this, so a fresh window opens at full measure.
+pub(crate) fn full_measure_page_width() -> Pixels {
+    BODY_MAX_WIDTH + (GUTTER_WIDTH + GUTTER_GAP) * 2.
+}
+
 /// The selected branch's two ends as page-scroll `y`s (both ≤ 0). See
 /// [`SpaceView::page_end_ys`] — `content` is where a reader comes to rest,
 /// `document` is only the scroll floor.
@@ -691,6 +699,13 @@ mod tests {
             (h - expected).abs() < 0.01,
             "single-line estimate {h} should match {expected} exactly",
         );
+    }
+
+    #[test]
+    fn full_measure_page_width_is_the_narrowest_full_column() {
+        let full = full_measure_page_width();
+        assert_eq!(body_width(full), BODY_MAX_WIDTH.as_f32());
+        assert!(body_width(full - gpui::px(1.)) < BODY_MAX_WIDTH.as_f32());
     }
 
     #[test]
