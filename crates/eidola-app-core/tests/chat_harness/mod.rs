@@ -175,6 +175,18 @@ pub enum ChatBehavior {
     /// plain-text 422, and a client that decides "server error vs transport
     /// error" by whether the body parses handles only the first.
     RejectToolsUnparseable,
+    /// Blocking: reject a request advertising the turn's **own** navigation
+    /// tools (recognized by `list_branches`) with llama.cpp's 500, and answer
+    /// every other request with a tool call for [`TOOL_NAME`], forever.
+    ///
+    /// A *content-dependent* rejection is a real llama.cpp shape: with
+    /// `--jinja` it renders each advertised tool's schema and crashes on
+    /// filters the model's template lacks, so which tools are advertised
+    /// decides the outcome. It is also the only shape that reaches the turn
+    /// loop's true worst case — the degrade probe *plus* a full run of nominal
+    /// rounds — since the loop only continues if the toolless retry, which
+    /// still carries the consumer's own tools, is accepted.
+    RejectAutoToolsThenToolRounds,
     /// Blocking: the next chat request answers with **one round requesting
     /// every call currently in [`MockConfig::tool_script`]**, consuming the
     /// script; later requests answer normally.
@@ -272,6 +284,15 @@ pub enum RefundMode {
     Succeed,
     /// `/v1/credentials/refund` returns 500; inline refunds are omitted.
     Fail,
+    /// The first `n` calls to `/v1/credentials/refund` return 500 and every
+    /// later one succeeds; inline refunds are omitted throughout.
+    ///
+    /// A **transient** settlement failure — the case that separates "the hold
+    /// could not be settled" from "the hold was settled on a retry". The round
+    /// that took the hold fails to settle it and carries on best-effort; the
+    /// next `begin_next_round` then settles it on its own last-chance attempt,
+    /// which is a durable commit that must announce itself.
+    FailFirst(u64),
 }
 
 /// Mock upstream configuration.
@@ -798,8 +819,8 @@ async fn handle_conn(
             }
         }
         ("POST", "/v1/credentials/refund") => {
-            refund_hits.fetch_add(1, Ordering::SeqCst);
-            handle_refund(&mut stream, &issuer, &config, req.auth.as_deref()).await?;
+            let attempt = refund_hits.fetch_add(1, Ordering::SeqCst) + 1;
+            handle_refund(&mut stream, &issuer, &config, req.auth.as_deref(), attempt).await?;
         }
         ("POST", "/v1/chat/completions") => {
             // 1-based index of this chat request — the tool-calling
@@ -895,8 +916,15 @@ async fn handle_refund(
     issuer: &Issuer,
     config: &MockConfig,
     auth: Option<&str>,
+    // 1-based index of this recovery call.
+    attempt: u64,
 ) -> std::io::Result<()> {
-    if config.refund == RefundMode::Fail {
+    let failing = match config.refund {
+        RefundMode::Fail => true,
+        RefundMode::FailFirst(n) => attempt <= n,
+        RefundMode::Succeed => false,
+    };
+    if failing {
         return write_json(stream, 500, &error_body("refund unavailable")).await;
     }
     let refund = auth
@@ -1150,6 +1178,29 @@ async fn handle_chat(
                 } }],
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::RejectAutoToolsThenToolRounds => {
+            let advertises_auto_tools = request
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|t| t["function"]["name"].as_str() == Some("list_branches"))
+                });
+            if advertises_auto_tools {
+                return write_json(
+                    stream,
+                    500,
+                    &error_body("tools param requires --jinja flag"),
+                )
+                .await;
+            }
+            let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
             if let Some(refund) = inline_refund {
                 body["refund"] = refund;
             }

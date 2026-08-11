@@ -65,8 +65,8 @@
 //!
 //! **Tool-calling turns add three exit points and no mid-loop emissions.**
 //! `run_turn` / `run_turn_stream` are bounded loops (at most
-//! `MAX_TURN_ROUNDS` model requests). A *successful* tool round is not an exit
-//! point: it commits `tool_call` / `tool_result` actions and a request row and
+//! `MAX_TURN_ROUNDS` model rounds, plus at most one tool-capability probe). A
+//! *successful* tool round is not an exit point: it commits `tool_call` / `tool_result` actions and a request row and
 //! then keeps going, **emitting nothing**. That is deliberate and safe —
 //! `get_space_tree` filters trace action types out of the render, so no
 //! subscriber's view of the thread is stale while the loop runs, and every

@@ -5187,6 +5187,7 @@ impl Inner {
             // refund; a turn with no spend at all has nothing to settle.
             spend_settled: spend_is_none,
             auth_value,
+            bus: self.bus.clone(),
         })
     }
 
@@ -5455,11 +5456,13 @@ impl Inner {
     /// `inference`) or asks for tools (the round is persisted as a
     /// `tool_call` / `tool_result` pair, the results are appended to the
     /// messages array, and the next round runs). At most
-    /// [`MAX_TURN_ROUNDS`] requests are issued; reaching the cap with the model
-    /// still asking for tools ends the turn with [`AppError::ToolLoop`] rather
-    /// than passing off a tool request as an answer. A turn with an empty tool
-    /// registry can only ever take one iteration, so nothing about the
-    /// single-inference path changes.
+    /// [`MAX_TURN_ROUNDS`] rounds are issued — plus, at most once, the
+    /// tool-capability probe a rejecting endpoint costs (see
+    /// [`MAX_TURN_ROUNDS`] for why that one is not a round). Reaching the cap
+    /// with the model still asking for tools ends the turn with
+    /// [`AppError::ToolLoop`] rather than passing off a tool request as an
+    /// answer. A turn with an empty tool registry can only ever take one
+    /// iteration, so nothing about the single-inference path changes.
     ///
     /// `budget`, if set, caps the estimated charge of **each round** — a later
     /// round re-estimates over the grown messages array and re-checks it (the
@@ -5612,9 +5615,7 @@ impl Inner {
                     Ok(parsed) => parsed,
                     Err(_) if !status.is_success() => serde_json::Value::Null,
                     Err(e) => {
-                        if prep.try_refund_recovery().await {
-                            self.bus.emit(Change::Wallet);
-                        }
+                        let _ = prep.try_refund_recovery().await;
                         emit_user_turn();
                         return Err(prep.wrap(AppError::Network {
                             message: format!("failed to parse response JSON: {e}"),
@@ -5628,9 +5629,7 @@ impl Inner {
                 // request. Try to recover the refund token; a written successor
                 // credential is a wallet change.
                 let original_err = AppError::from_request(e);
-                if prep.try_refund_recovery().await {
-                    self.bus.emit(Change::Wallet);
-                }
+                let _ = prep.try_refund_recovery().await;
                 // The user turn (space row + user-message, auto-title) is
                 // already committed — emit it so other windows see the persisted
                 // turn, then wrap with the space id for blank-space adoption.
@@ -6038,10 +6037,7 @@ impl Inner {
             }
             Err(e) => {
                 let original_err = AppError::from_request(e);
-                if prep.try_refund_recovery().await {
-                    // Successor credential written — wallet state updated.
-                    self.bus.emit(Change::Wallet);
-                }
+                let _ = prep.try_refund_recovery().await;
                 // User turn is committed — emit it, then wrap with the space id.
                 emit_user_turn();
                 return Err(prep.wrap(original_err));
@@ -6056,10 +6052,7 @@ impl Inner {
         // never produced one — so the request row stands alone.)
         if !status.is_success() {
             let response_text = resp.text().await.unwrap_or_default();
-            if prep.try_refund_recovery().await {
-                // Successor credential written — wallet state updated.
-                self.bus.emit(Change::Wallet);
-            }
+            let _ = prep.try_refund_recovery().await;
             prep.insert_unattached_request(
                 &request_body_json,
                 request_at,
@@ -8930,6 +8923,9 @@ struct TurnPrep {
     spend_settled: bool,
     /// The `Authorization` header value; present iff `spend` is.
     auth_value: Option<String>,
+    /// The invalidation bus, so the one place a settled hold is durably
+    /// committed ([`Self::process_refund_obj`]) can emit at the write.
+    bus: BroadcastSource,
 }
 
 /// The credential-spend half of a prepared (remote) turn: the spendable
@@ -9017,6 +9013,15 @@ impl TurnPrep {
     /// Apply a refund object (inline from a response body, or recovered) to
     /// the pending spend — writes the successor credential. A no-op for
     /// local turns (nothing was spent).
+    ///
+    /// **This is where a settled hold emits `Change::Wallet`.** Writing the
+    /// successor is the durable commit — the credential leaves `spending` at
+    /// that instant — and every refund the turn applies, inline or recovered,
+    /// arrives through here. Emitting at the write rather than at each caller
+    /// is what keeps the crate's emit-after-every-durable-commit rule true by
+    /// construction: a caller that forgets (or an exit that returns before its
+    /// own emit could run) cannot leave subscribers showing a credential as
+    /// spending when it is not.
     async fn process_refund_obj(&mut self, refund_obj: &serde_json::Value) -> Result<(), AppError> {
         let Some(spend) = &self.spend else {
             return Ok(());
@@ -9033,13 +9038,17 @@ impl TurnPrep {
             self.now,
         )
         .await
-        .inspect(|()| self.spend_settled = true)
+        .inspect(|()| {
+            self.spend_settled = true;
+            self.bus.emit(Change::Wallet);
+        })
     }
 
     /// Best-effort refund recovery via `/v1/credentials/refund`. Returns
-    /// whether a successor credential was written (the caller decides whether
-    /// that warrants an immediate `Wallet` emission). Always `false` for
-    /// local turns — there is no spend to recover.
+    /// whether a successor credential was written — the `Wallet` emission for
+    /// it is [`Self::process_refund_obj`]'s, so a caller reads this only to
+    /// decide its own control flow, never to decide whether to emit. Always
+    /// `false` for local turns — there is no spend to recover.
     async fn try_refund_recovery(&mut self) -> bool {
         let (Some(_), Some(auth_value)) = (&self.spend, &self.auth_value) else {
             return false;
@@ -9635,7 +9644,7 @@ async fn recover_refund(
 // Tool-calling turns
 // ---------------------------------------------------------------------------
 
-/// The maximum number of **model requests** one turn may issue.
+/// The maximum number of **model rounds** one turn may issue.
 ///
 /// A turn without tools issues exactly one, so this only ever binds a tool
 /// loop. Eight is deliberately a small fixed constant, not a setting: it caps
@@ -9644,6 +9653,17 @@ async fn recover_refund(
 /// still asking for tools ends the turn with [`AppError::ToolLoop`] — the
 /// rounds that did happen stay persisted, and no half-finished round is passed
 /// off as an answer.
+///
+/// **One request a turn may issue is not a round: the tool-capability probe.**
+/// A turn whose endpoint rejects the `tools` field retries that same round
+/// without it (see `Inner::should_degrade_tools`), so the worst case is
+/// `MAX_TURN_ROUNDS` rounds **plus one** rejected attempt. It is one and not
+/// more, structurally: the degrade fires only on round 1 with the turn's own
+/// tools attached, and withdrawing them clears that latch. It is not counted
+/// against the cap because it is not a round — no model output, same messages,
+/// and the spend this constant bounds is unaffected: the endpoint rejected the
+/// request before doing any work, so its hold refunds in full. Pinned by
+/// `a_degraded_turn_costs_one_extra_request_and_no_more`.
 pub const MAX_TURN_ROUNDS: usize = 8;
 
 /// What one round of a turn's bounded loop produced.
