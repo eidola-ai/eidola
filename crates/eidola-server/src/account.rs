@@ -521,11 +521,16 @@ pub async fn create_portal_session(
 
     let customer_id = account.stripe_customer_id.ok_or_else(no_portal)?;
 
-    // An in-force subscription is a relationship by itself; otherwise it
-    // takes money that actually moved. Same predicate as the `none` state,
-    // so the app is never offered a door the server then refuses.
-    let entitled = stripe.in_force_subscription(&customer_id).await?.is_some()
-        || db::has_stripe_ledger_history(&state.db_pool, account_id).await?;
+    // Same predicate as the `none` state, so the app is never offered a door
+    // the server then refuses — but asked local-first. A ledger row already
+    // settles the question, and evaluating the subscription walk ahead of it
+    // put a Stripe round trip in front of an answer we hold: every returning
+    // customer paid for it, and a slow or failing `/subscriptions` withheld
+    // their billing portal while the portal itself was perfectly healthy.
+    // Stripe is consulted only for the customer the ledger cannot vouch for
+    // — an unbilled trial.
+    let entitled = db::has_stripe_ledger_history(&state.db_pool, account_id).await?
+        || stripe.in_force_subscription(&customer_id).await?.is_some();
     if !entitled {
         return Err(no_portal());
     }
@@ -828,6 +833,19 @@ mod tests {
     use super::*;
     use crate::stripe::{Subscription, SubscriptionItem, SubscriptionItems};
 
+    /// One handler's source, from its signature to the next item at column
+    /// zero. The seam the two ordering/absence scans below share.
+    fn handler_body(signature: &str) -> &'static str {
+        let source = include_str!("account.rs");
+        let start = source.find(signature).expect("the handler");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        &body[..end]
+    }
+
     fn in_force_sub(period_end: i64) -> Subscription {
         Subscription {
             id: "sub_1".to_string(),
@@ -854,18 +872,7 @@ mod tests {
     /// database, and what is being asserted is the *absence* of a call.
     #[test]
     fn the_subscription_read_mints_no_portal_session() {
-        let source = include_str!("account.rs");
-        let start = source
-            .find("pub async fn get_subscription(")
-            .expect("the handler");
-        // Up to the next item at column 0 — the handler's whole body.
-        let body = &source[start..];
-        let end = body[1..]
-            .find("\npub ")
-            .map(|i| i + 1)
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
+        let body = handler_body("pub async fn get_subscription(");
         assert!(
             !body.contains("create_portal_session"),
             "get_subscription must not mint a portal session — minting is a \
@@ -875,6 +882,34 @@ mod tests {
         assert!(
             body.contains("in_force_subscription"),
             "sanity: the scan found the right function body"
+        );
+    }
+
+    /// The portal must not put a Stripe round trip in front of an answer the
+    /// ledger already holds.
+    ///
+    /// `||` short-circuits left to right, so the *order* of the two operands
+    /// is the whole behavior: with the subscription walk first, every
+    /// returning customer paid for a remote call whose result could not
+    /// change the outcome, and a slow or failing `/subscriptions` withheld
+    /// their billing portal while the portal itself was healthy.
+    ///
+    /// A source scan for the same reason as the sibling below: the handler
+    /// needs a database, and what is asserted is an ordering, not a value.
+    #[test]
+    fn the_portal_asks_the_ledger_before_it_asks_stripe() {
+        let body = handler_body("pub async fn create_portal_session(");
+        let ledger = body
+            .find("has_stripe_ledger_history")
+            .expect("the ledger check");
+        let stripe = body
+            .find("in_force_subscription")
+            .expect("the subscription walk");
+        assert!(
+            ledger < stripe,
+            "the local answer must be evaluated first — `||` short-circuits, \
+             so putting the walk first spends a Stripe round trip on every \
+             customer whose ledger already settles it"
         );
     }
 

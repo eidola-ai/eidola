@@ -180,6 +180,23 @@ impl AccountStore {
         cx.notify();
     }
 
+    /// The configured account is now a *different* account: drop what the
+    /// old one owned and read the new one's standing.
+    ///
+    /// **Called on the commit, never on the attempt.** Creating and linking
+    /// both refuse outright when credentials already exist, so clearing when
+    /// the request went out blanked the cell for an operation that never
+    /// happened — an Account pane already open then lost its billing section
+    /// entirely, with no error branch to put it back. Clearing *and*
+    /// refreshing together is the point: a bare refresh would leave the
+    /// previous account's value on screen as `Loaded { stale }` while the
+    /// new read is in flight, which on a billing surface is the wrong
+    /// account's answer wearing the right account's name.
+    pub fn account_identity_changed(&mut self, cx: &mut Context<Self>) {
+        self.forget_account_scoped_state(cx);
+        self.refresh_subscription(cx);
+    }
+
     /// Test-only: put the subscription cell in an arbitrary state, so a
     /// behavior test or driver scene can render "checking" and "couldn't
     /// check" without a backend that stalls or fails on cue.
@@ -222,12 +239,8 @@ impl AccountStore {
     /// returned receiver inside its own task and refreshes config on success.
     /// `None` on a stub.
     pub fn request_account_create(
-        &mut self,
-        cx: &mut Context<Self>,
+        &self,
     ) -> Option<oneshot::Receiver<Result<AccountCreateResult, AppError>>> {
-        // A fresh account has no subscription; anything held now belongs to
-        // whoever this machine was linked to a moment ago.
-        self.forget_account_scoped_state(cx);
         let core = self.app_core.clone()?;
         let (tx, rx) = oneshot::channel();
         core.runtime().handle().clone().spawn(async move {
@@ -243,19 +256,10 @@ impl AccountStore {
     /// The caller (onboarding "existing account" slide) awaits the returned
     /// receiver in its own task slot. `None` on a stub.
     pub fn request_verify_account(
-        &mut self,
+        &self,
         id: String,
         secret: String,
-        cx: &mut Context<Self>,
     ) -> Option<oneshot::Receiver<Result<BalancesResult, AppError>>> {
-        // The account is changing identity as of now, so whatever this cell
-        // holds describes someone else. Cleared here rather than on the
-        // caller's success path: a stale *billing* answer attributed to the
-        // wrong account is worse than a blank, and clearing at the request
-        // covers the failure and cancellation exits too — a rollback leaves
-        // the original account current, whose standing an empty cell simply
-        // re-reads. See `forget_account_scoped_state`.
-        self.forget_account_scoped_state(cx);
         let core = self.app_core.clone()?;
         let (tx, rx) = oneshot::channel();
         core.runtime().handle().clone().spawn(async move {
