@@ -9938,16 +9938,16 @@ const REFERENCE_UNRESOLVED: &str = "(the quoted range no longer maps onto that p
 /// The `[N]` is the ordinal seam itself: the body's marker, the footnote index
 /// the human sees, and the `read_post(quote: N)` argument that follows the
 /// passage back to its source.
-struct ReferenceEntry {
-    ordinal: i64,
+pub(crate) struct ReferenceEntry {
+    pub(crate) ordinal: i64,
     /// `#<handle> · <author>` ([`message_header`]) when this rendering can
     /// address the quoted post; otherwise the author (where known) plus
     /// [`REFERENCE_ELSEWHERE`].
-    byline: String,
-    annotation: Option<String>,
+    pub(crate) byline: String,
+    pub(crate) annotation: Option<String>,
     /// The quoted markdown, or `None` when the range no longer maps (or the
     /// edge names something unquotable).
-    snippet: Option<String>,
+    pub(crate) snippet: Option<String>,
 }
 
 impl ReferenceEntry {
@@ -9984,7 +9984,7 @@ impl ReferenceEntry {
 /// state (a draft whose marker was deleted; `edit_post` replicating an edge
 /// onto a body that no longer embeds it), which the human sees and the model
 /// used to receive nothing about.
-fn render_post_for_model(
+pub(crate) fn render_post_for_model(
     text: &str,
     entries: &std::collections::BTreeMap<u64, ReferenceEntry>,
 ) -> String {
@@ -10017,10 +10017,12 @@ fn reference_block(
     out
 }
 
-/// Every reference edge of `action_id`, keyed by ordinal, rendered from the
-/// point of view of a reader in `space_id`.
+/// Every reference edge of `action_id`, keyed by ordinal, rendered for a reader
+/// whose addressable space is `space_id` — the space whose handles this turn's
+/// `ThreadSnapshot` can resolve, which is the turn's own space even when the
+/// post being rendered was followed into another one.
 ///
-/// Two rules ride here:
+/// Three rules ride here:
 ///
 /// * **The quotable rule is re-applied** — only a post's `text` block resolves
 ///   to a passage. This path needs no tool call and no membership: whatever it
@@ -10033,7 +10035,12 @@ fn reference_block(
 ///   the author where they wrote, not where they are being read. The reading
 ///   space's override of the same participant is a different name for a
 ///   different room.
-async fn reference_entries(
+/// * **A handle is offered only where it resolves to the passage being read.**
+///   A quote names a concrete generation; once that generation is superseded,
+///   the item's handle opens the *tip* — different text under the byline of
+///   the excerpt above it, which is worse than no address at all. Such a quote
+///   renders as an earlier version, exactly like one from another space.
+pub(crate) async fn reference_entries(
     conn: &turso::Connection,
     space_id: &str,
     action_id: &str,
@@ -10049,7 +10056,7 @@ async fn reference_entries(
             }
             _ => None,
         };
-        let byline = if r.antecedent_space_id == space_id {
+        let byline = if r.antecedent_space_id == space_id && r.antecedent_is_current {
             message_header(&r.antecedent_item_id, &r.antecedent_author_label)
         } else {
             format!(

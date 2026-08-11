@@ -503,6 +503,88 @@ fn an_agent_follows_a_quote_only_once_it_is_granted_membership() {
     });
 }
 
+/// A followed post is a post. It reaches the model through its own rendering
+/// path (`render_followed_post`), and that path renders references the way
+/// every other one does: the embedded quote expanded and attributed where the
+/// author put it, the un-embedded one footnoted, no literal marker anywhere.
+/// Its bylines are addressed from **this** turn's space, so a quote of a post
+/// in the followed conversation is named rather than given a handle that would
+/// open nothing here.
+#[test]
+fn a_followed_post_renders_its_own_quotes_like_every_other_post() {
+    run(|| {
+        let script = tool_script();
+        let (mock, core, _dir) = setup(script.clone());
+        let s = scenario(&core);
+
+        // In the source conversation, a post that itself quotes twice: once
+        // embedded, once with no marker at all.
+        let embedded = quote_of(&core, &s.source_space, &s.source_post, "sun and moon align");
+        let orphaned = quote_of(&core, &s.source_space, &s.source_post, "twice a month");
+        let quoting_there = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "As I said:\n\n{{ embed 1 }}\n\nAnd there is more.".into(),
+                Some(s.source_space.clone()),
+                None,
+                vec![embedded, orphaned],
+            ))
+            .expect("a post that quotes in its own space");
+
+        // Here, a post quoting *that* post — the one the model will follow.
+        let spec = quote_of(
+            &core,
+            &s.source_space,
+            &quoting_there.action_id,
+            "As I said",
+        );
+        let here = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "Look at this:\n\n{{ embed 1 }}".into(),
+                Some(s.space.clone()),
+                None,
+                vec![spec],
+            ))
+            .expect("the human quotes a space it belongs to");
+
+        core.runtime()
+            .block_on(core.grant_space_membership(
+                s.source_space.clone(),
+                s.agent.clone(),
+                eidola_app_core::MembershipRole::Observer,
+            ))
+            .expect("share and grant");
+
+        script_follow(&script, &post_handle(&here.item_id), 1);
+        turn(&core, "Where is that from?", Some(s.space.clone()));
+        let followed = last_tool_result(&mock);
+
+        assert!(
+            followed.starts_with("From another conversation you take part in — Tides.\n\n#"),
+            "{followed}"
+        );
+        assert!(
+            followed.contains(
+                "As I said:\n\n[1] You (a post outside this space, or an earlier version)\n\
+                 > sun and moon align\n\nAnd there is more."
+            ),
+            "the followed post's embedded quote expands in place, attributed: {followed}"
+        );
+        assert!(
+            followed.ends_with(
+                "Passages this post quotes:\n\
+                 [2] You (a post outside this space, or an earlier version)\n> twice a month"
+            ),
+            "and the one it never embedded is footnoted: {followed}"
+        );
+        assert!(
+            !followed.contains("{{ embed"),
+            "no literal marker survives a follow: {followed}"
+        );
+    });
+}
+
 /// A tool that retires the responding agent from inside its own turn — the
 /// interleave the finding is about, made deterministic (the `PromoteMidTurn`
 /// idiom from `global_agents.rs`).
