@@ -5352,6 +5352,12 @@ pub struct AntecedentEdgeRow {
     /// renders (its existence is public); only the passage is withheld.
     pub antecedent_action_type: String,
     pub block_type: Option<String>,
+    /// The quoted post's author, as **its own** space names it
+    /// (`COALESCE(space_participant.override_label, participant.label)` joined
+    /// on `ant.space_id`). Carried because a reference is the cross-space
+    /// mechanism: the reading space cannot name an author it has never met,
+    /// and a sibling branch's quote is a model's *only* view of that passage.
+    pub antecedent_author_label: String,
 }
 
 /// The raw materials for one space's threaded-post render.
@@ -5453,10 +5459,14 @@ pub async fn get_space_tree_data(
         "SELECT aa.action_id, aa.antecedent_action_id, aa.ordinal, aa.relation, \
                 aa.range_start, aa.range_end, aa.annotation, \
                 ic.current_action_id, aa.content_block_id, qcb.text_content, \
-                ant.action_type, qcb.block_type \
+                ant.action_type, qcb.block_type, \
+                COALESCE(asp.override_label, ap.label) \
          FROM action_antecedent aa \
          JOIN action_resolved ar ON ar.action_id = aa.action_id \
          JOIN action ant ON ant.id = aa.antecedent_action_id \
+         JOIN participant ap ON ap.id = ant.participant_id \
+         LEFT JOIN space_participant asp \
+           ON asp.space_id = ant.space_id AND asp.participant_id = ant.participant_id \
          LEFT JOIN item_current ic \
            ON ic.space_id = ant.space_id AND ic.item_id = ant.item_id \
          LEFT JOIN content_block qcb ON qcb.id = aa.content_block_id \
@@ -5486,6 +5496,7 @@ pub async fn get_space_tree_data(
             block_text: row.get::<Option<String>>(9).map_err(AppError::db)?,
             antecedent_action_type: row.get::<String>(10).map_err(AppError::db)?,
             block_type: row.get::<Option<String>>(11).map_err(AppError::db)?,
+            antecedent_author_label: row.get::<String>(12).map_err(AppError::db)?,
         });
     }
 

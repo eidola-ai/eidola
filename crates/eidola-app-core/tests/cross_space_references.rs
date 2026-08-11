@@ -503,6 +503,90 @@ fn an_agent_follows_a_quote_only_once_it_is_granted_membership() {
     });
 }
 
+/// **A sibling branch is absent from the turn's context, so a tool result is
+/// the model's only view of a post there** — and the author of what that post
+/// quotes has to survive the trip. `read_thread` reads a snapshot, and only the
+/// source space can name a cross-space author, so the label travels on the
+/// reference row rather than being re-derived from the reading space (which has
+/// never met that participant, and whose own name for them would misattribute).
+#[test]
+fn a_sibling_branchs_cross_space_quote_keeps_its_author_through_read_thread() {
+    run(|| {
+        let script = tool_script();
+        let (mock, core, _dir) = setup(script.clone());
+        let s = scenario(&core);
+
+        // The same participant, named differently on each side.
+        let rename = |space: &str, label: &str| {
+            core.runtime()
+                .block_on(core.set_space_participant_override(
+                    space.to_string(),
+                    eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                    eidola_app_core::ParticipantOverride {
+                        label: Some(Some(label.to_string())),
+                        model_ref: None,
+                        system_prompt: None,
+                        notify_policy: None,
+                    },
+                ))
+                .expect("override");
+        };
+        rename(&s.source_space, "Tide Watcher");
+        rename(&s.space, "Skipper");
+
+        // Answer in the *other* branch, so the quoting post is a sibling: it is
+        // not in this turn's ancestry and reaches the model only if it asks.
+        let other_branch = core
+            .runtime()
+            .block_on(core.get_space_tree(s.space.clone()))
+            .expect("tree")
+            .into_iter()
+            .find(|n| {
+                n.blocks.iter().any(|b| {
+                    b.text
+                        .as_deref()
+                        .is_some_and(|t| t.contains("Another angle entirely"))
+                })
+            })
+            .expect("the other branch")
+            .action_id;
+        reply(&core, "Let's stay on this one.", &s.space, &other_branch);
+
+        *script.lock().unwrap() = vec![(
+            "read_thread".into(),
+            serde_json::json!({ "handle": s.quoting_handle }).to_string(),
+        )];
+        turn(&core, "What else is there?", Some(s.space.clone()));
+
+        // The premise, pinned: the sibling branch's post is nowhere in the
+        // context the turn was given.
+        let context = mock
+            .chat_bodies()
+            .iter()
+            .flat_map(|b| flat_messages(b).into_iter().map(|(_, c)| c))
+            .filter(|c| !c.starts_with("Thread from"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !context.contains(s.quoted_text),
+            "a sibling branch must not leak into the context: {context}"
+        );
+
+        let read = last_tool_result(&mock);
+        assert!(
+            read.contains(&format!(
+                "[1] Tide Watcher (a post outside this space, or an earlier version)\n> {}",
+                s.quoted_text
+            )),
+            "the only view of that passage keeps the name it was written under: {read}"
+        );
+        assert!(
+            !read.contains("Skipper (a post outside"),
+            "and never the reading space's name for the same participant: {read}"
+        );
+    });
+}
+
 /// A followed post is a post. It reaches the model through its own rendering
 /// path (`render_followed_post`), and that path renders references the way
 /// every other one does: the embedded quote expanded and attributed where the
