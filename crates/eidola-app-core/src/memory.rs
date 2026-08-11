@@ -75,14 +75,13 @@
 //! `decline`): the whole feature — the loading read *and* the tool — is gated
 //! on [`crate::AppCore::set_memory_enabled`]. That is what preserves the
 //! `tools.rs` invariant that an install which has not opted in sends
-//! byte-identical requests. Note the `eidola` backend cannot carry a `tools`
-//! field at all (its request type is `deny_unknown_fields`), so a remote turn
-//! still *reads* its memory but cannot revise it until task 25 — the same
-//! limitation the navigation tools have. A turn that discovers its backend
-//! rejects `tools` withdraws `remember` with the rest (`withdraw_auto_tools`)
-//! and keeps [`MEMORY_NOTE`] in the already-sent system message, exactly as it
-//! does for the thread-map note: the notes describe the affordance, the
-//! absence of a schema is what makes it uncallable.
+//! byte-identical requests. Attachment then rides the same learned capability
+//! gate the navigation tools do — no backend kind is excluded. A turn that
+//! discovers its endpoint rejects `tools` withdraws `remember` with the rest
+//! (`withdraw_auto_tools`) and keeps [`MEMORY_NOTE`] in the already-sent system
+//! message, exactly as it does for the thread-map note: the notes describe the
+//! affordance, the absence of a schema is what makes it uncallable. Such a turn
+//! still *reads* its memory; only the revision is out of reach.
 //!
 //! # Hygiene
 //!

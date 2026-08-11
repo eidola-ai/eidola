@@ -154,6 +154,11 @@ pub enum ChatBehavior {
     /// perfectly well and rejects only the `tools` field — which is the case
     /// backend kind cannot predict.
     RejectTools,
+    /// As [`ChatBehavior::RejectTools`], but only for the named **wire model**;
+    /// every other model on the same host answers a `tools`-bearing request
+    /// normally. One backend serves many models with many chat templates, which
+    /// is why the client's tool-capability memo is keyed by the pair.
+    RejectToolsForModel(&'static str),
     /// Blocking: the next chat request answers with **one round requesting
     /// every call currently in [`MockConfig::tool_script`]**, consuming the
     /// script; later requests answer normally.
@@ -1077,8 +1082,20 @@ async fn handle_chat(
             write_json(stream, 200, &body.to_string()).await
         }
         ChatBehavior::DeclineStreaming => write_sse_decline_stream(stream).await,
-        ChatBehavior::RejectTools => {
-            if request.get("tools").is_some() {
+        ChatBehavior::RejectTools | ChatBehavior::RejectToolsForModel(_) => {
+            // `RejectTools` refuses the field for every model on this host;
+            // `RejectToolsForModel` for exactly one.
+            let refused_model = match config.chat {
+                ChatBehavior::RejectToolsForModel(m) => Some(m),
+                _ => None,
+            };
+            let wire_model = request
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default();
+            if request.get("tools").is_some()
+                && refused_model.is_none_or(|refused| refused == wire_model)
+            {
                 return write_json(
                     stream,
                     500,
