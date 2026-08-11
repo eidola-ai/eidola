@@ -3725,6 +3725,18 @@ pub struct ReferenceEdgeRow {
     /// replication that silently lost one would rewrite history.
     pub antecedent_action_type: String,
     pub block_type: Option<String>,
+    /// The quoted post's **item** id — its handle (`post_handle`) and so the
+    /// byline the upstream rendering attributes the passage to.
+    pub antecedent_item_id: String,
+    /// The space the quoted post lives in. A reference is the cross-space
+    /// mechanism, so this is not necessarily the space doing the reading.
+    pub antecedent_space_id: String,
+    /// The quoted post's author, as its **own** space names it:
+    /// `COALESCE(space_participant.override_label, participant.label)` joined
+    /// on `ant.space_id`. A per-space override is that space's name for the
+    /// participant, so the reading space's override would misattribute a
+    /// cross-space passage.
+    pub antecedent_author_label: String,
 }
 
 impl ReferenceEdgeRow {
@@ -3739,7 +3751,8 @@ impl ReferenceEdgeRow {
 
 /// The `reference`-relation antecedents of an action, ordinal order. Used by
 /// `edit_post` to replicate references onto a new generation and by the
-/// upstream-context embed expansion.
+/// upstream-context embed expansion — which also renders each passage's
+/// byline, hence the author join (on the **antecedent's** space).
 pub async fn reference_antecedents(
     conn: &Connection,
     action_id: &str,
@@ -3748,9 +3761,13 @@ pub async fn reference_antecedents(
         .prepare(
             "SELECT aa.ordinal, aa.antecedent_action_id, aa.content_block_id, \
                     aa.range_start, aa.range_end, aa.annotation, cb.text_content, \
-                    ant.action_type, cb.block_type \
+                    ant.action_type, cb.block_type, ant.item_id, ant.space_id, \
+                    COALESCE(sp.override_label, p.label) \
              FROM action_antecedent aa \
              JOIN action ant ON ant.id = aa.antecedent_action_id \
+             JOIN participant p ON p.id = ant.participant_id \
+             LEFT JOIN space_participant sp \
+               ON sp.space_id = ant.space_id AND sp.participant_id = ant.participant_id \
              LEFT JOIN content_block cb ON cb.id = aa.content_block_id \
              WHERE aa.action_id = ?1 AND aa.relation = 'reference' \
              ORDER BY aa.ordinal ASC",
@@ -3773,6 +3790,9 @@ pub async fn reference_antecedents(
             block_text: row.get::<Option<String>>(6).map_err(AppError::db)?,
             antecedent_action_type: row.get::<String>(7).map_err(AppError::db)?,
             block_type: row.get::<Option<String>>(8).map_err(AppError::db)?,
+            antecedent_item_id: row.get::<String>(9).map_err(AppError::db)?,
+            antecedent_space_id: row.get::<String>(10).map_err(AppError::db)?,
+            antecedent_author_label: row.get::<String>(11).map_err(AppError::db)?,
         });
     }
     Ok(out)

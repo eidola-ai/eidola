@@ -2885,55 +2885,53 @@ impl Inner {
         Ok(())
     }
 
-    /// Expand `{{ embed N }}` quote markers in upstream-context rows into the
-    /// referenced passages (see [`expand_embed_strings`]). One reference query
-    /// per distinct marker-bearing action; rows without a `{{` pass through
-    /// untouched.
+    /// Render each upstream-context post the way every model-facing path
+    /// renders it: `{{ embed N }}` markers expanded into their attributed
+    /// passages, plus a trailing block for the references the body never
+    /// embedded (see [`render_post_for_model`]).
+    ///
+    /// One reference query per distinct context action — the marker-bearing
+    /// fast path is gone on purpose: a reference with no marker is precisely
+    /// what used to reach nobody, and the query count stays proportional to the
+    /// ancestry walk `get_upstream_context` already performs per hop.
+    ///
+    /// `rows` are (action, content block) pairs in order, so an action's blocks
+    /// are one consecutive run: markers expand block by block and the trailing
+    /// block joins the run's **last** row, where `render_messages`'
+    /// concatenation ends it up in one message.
     async fn expand_context_embeds(
         &self,
         conn: &turso::Connection,
+        space_id: &str,
         mut rows: Vec<db::SpaceActionRow>,
     ) -> Result<Vec<db::SpaceActionRow>, AppError> {
-        let mut cache: std::collections::HashMap<String, std::collections::BTreeMap<u64, String>> =
-            std::collections::HashMap::new();
-        for row in &mut rows {
-            let Some(text) = row.text_content.as_deref() else {
-                continue;
-            };
-            if !text.contains("{{") {
-                continue;
+        let mut start = 0;
+        while start < rows.len() {
+            let mut end = start + 1;
+            while end < rows.len() && rows[end].action_id == rows[start].action_id {
+                end += 1;
             }
-            if !cache.contains_key(&row.action_id) {
-                let refs = db::reference_antecedents(conn, &row.action_id).await?;
-                let mut map = std::collections::BTreeMap::new();
-                for r in refs {
-                    // Only a post's `text` block expands. This is the path that
-                    // needs no tool call and no membership — whatever it
-                    // expands goes straight into the next reader's context — so
-                    // it re-applies the quotable rule rather than trusting that
-                    // every edge came through `validate_reference_spec`. An
-                    // unquotable edge simply doesn't expand: its marker stays
-                    // literal, exactly like an unmapped ordinal.
-                    if !r.is_quotable() {
-                        continue;
-                    }
-                    let (Some(rs), Some(re), Some(block_text)) =
-                        (r.range_start, r.range_end, r.block_text.as_deref())
-                    else {
-                        continue;
-                    };
-                    if let (Ok(ordinal), Some(snippet)) =
-                        (u64::try_from(r.ordinal), quote_snippet(block_text, rs, re))
-                    {
-                        map.insert(ordinal, snippet.to_string());
+            let entries = reference_entries(conn, space_id, &rows[start].action_id).await?;
+            if !entries.is_empty() {
+                let mut expanded = std::collections::BTreeSet::new();
+                for row in &mut rows[start..end] {
+                    if let Some(text) = row.text_content.as_deref() {
+                        let (rendered, ordinals) = expand_embed_strings(text, &entries);
+                        expanded.extend(ordinals);
+                        row.text_content = Some(rendered);
                     }
                 }
-                cache.insert(row.action_id.clone(), map);
+                if let Some(block) = reference_block(&entries, &expanded) {
+                    let last = &mut rows[end - 1];
+                    let mut text = last.text_content.take().unwrap_or_default();
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&block);
+                    last.text_content = Some(text);
+                }
             }
-            let map = &cache[&row.action_id];
-            if !map.is_empty() {
-                row.text_content = Some(expand_embed_strings(text, map));
-            }
+            start = end;
         }
         Ok(rows)
     }
@@ -4791,11 +4789,13 @@ impl Inner {
                 db::get_upstream_context(&db_conn, target_action_id, false).await?
             }
         };
-        // Expand each post's `{{ embed N }}` quote markers into the referenced
-        // passages (as markdown blockquotes) so the model reads what the
-        // author quoted, not an opaque marker. Charge estimation below runs on
-        // the expanded array, so the hold covers the expanded bytes.
-        let context_rows = self.expand_context_embeds(&db_conn, context_rows).await?;
+        // Render each post's references the way the human reads them: markers
+        // expanded into their attributed passages, and the ones the body never
+        // embedded listed in a trailing block. Charge estimation below runs on
+        // the rendered array, so the hold covers those bytes.
+        let context_rows = self
+            .expand_context_embeds(&db_conn, &space_id, context_rows)
+            .await?;
 
         // ---- Thread map (task 21) -----------------------------------------
         //
@@ -9909,9 +9909,176 @@ fn canonicalize_model_ref(model_ref: &str) -> String {
     backends::qualified_model_id(&mr.model, &mr.backend_id)
 }
 
+/// Heading of the trailing block listing the references a post's body did not
+/// embed. Shared by the upstream context and the navigation tools, so the
+/// footnote a model reads is one dialect wherever it reaches the post.
+const REFERENCE_BLOCK_HEADING: &str = "Passages this post quotes:";
+
+/// The byline of a quoted post this rendering cannot address: a reference
+/// names a *concrete generation*, which may have been superseded, or may live
+/// in another space entirely (references are the cross-space mechanism).
+const REFERENCE_ELSEWHERE: &str = "(a post outside this space, or an earlier version)";
+
+/// Stands in for a passage whose stored range no longer maps onto its block —
+/// and for one withheld by the quotable rule. The edge renders either way (its
+/// existence is public); only the passage is absent.
+const REFERENCE_UNRESOLVED: &str = "(the quoted range no longer maps onto that post's text)";
+
+/// One reference edge as a model reads it. The same entry renders in all three
+/// places a quoted passage can reach a model — spliced in at its
+/// `{{ embed N }}` marker, listed in the trailing block for references the body
+/// never embedded, and in `read_post`/`read_thread` — so a post says the same
+/// thing whichever path reached it.
+///
+/// ```text
+/// [2] #q2m9zzr · Ada — why it matters
+/// > the quoted passage
+/// ```
+///
+/// The `[N]` is the ordinal seam itself: the body's marker, the footnote index
+/// the human sees, and the `read_post(quote: N)` argument that follows the
+/// passage back to its source.
+struct ReferenceEntry {
+    ordinal: i64,
+    /// `#<handle> · <author>` ([`message_header`]) when this rendering can
+    /// address the quoted post; otherwise the author (where known) plus
+    /// [`REFERENCE_ELSEWHERE`].
+    byline: String,
+    annotation: Option<String>,
+    /// The quoted markdown, or `None` when the range no longer maps (or the
+    /// edge names something unquotable).
+    snippet: Option<String>,
+}
+
+impl ReferenceEntry {
+    /// The entry's lines, without a trailing newline.
+    fn render(&self) -> String {
+        let mut out = format!("[{}] {}", self.ordinal, self.byline);
+        if let Some(a) = &self.annotation {
+            out.push_str(&format!(" — {}", one_line(a)));
+        }
+        out.push('\n');
+        match &self.snippet {
+            Some(s) => {
+                for (j, line) in s.split('\n').enumerate() {
+                    if j > 0 {
+                        out.push('\n');
+                    }
+                    out.push_str("> ");
+                    out.push_str(line);
+                }
+            }
+            None => out.push_str(REFERENCE_UNRESOLVED),
+        }
+        out
+    }
+}
+
+/// Render a post's body the way every model-facing path renders it: expand the
+/// structurally recognized `{{ embed N }}` markers into their attributed
+/// passages, then append a trailing block for every reference the body did not
+/// embed — exactly the rows the human reads in the footnote rail.
+///
+/// Both halves matter and neither replaces the other: an embedded reference
+/// belongs where the author put it, and a marker-less one is a real, reachable
+/// state (a draft whose marker was deleted; `edit_post` replicating an edge
+/// onto a body that no longer embeds it), which the human sees and the model
+/// used to receive nothing about.
+fn render_post_for_model(
+    text: &str,
+    entries: &std::collections::BTreeMap<u64, ReferenceEntry>,
+) -> String {
+    let (mut out, expanded) = expand_embed_strings(text, entries);
+    if let Some(block) = reference_block(entries, &expanded) {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&block);
+    }
+    out
+}
+
+/// The trailing footnote block for every entry `expanded` does not contain, or
+/// `None` when the body embedded them all.
+fn reference_block(
+    entries: &std::collections::BTreeMap<u64, ReferenceEntry>,
+    expanded: &std::collections::BTreeSet<u64>,
+) -> Option<String> {
+    let mut out: Option<String> = None;
+    for entry in entries
+        .iter()
+        .filter(|(ordinal, _)| !expanded.contains(*ordinal))
+        .map(|(_, e)| e)
+    {
+        let block = out.get_or_insert_with(|| REFERENCE_BLOCK_HEADING.to_string());
+        block.push('\n');
+        block.push_str(&entry.render());
+    }
+    out
+}
+
+/// Every reference edge of `action_id`, keyed by ordinal, rendered from the
+/// point of view of a reader in `space_id`.
+///
+/// Two rules ride here:
+///
+/// * **The quotable rule is re-applied** — only a post's `text` block resolves
+///   to a passage. This path needs no tool call and no membership: whatever it
+///   resolves goes straight into the next reader's context, so it re-checks
+///   rather than trusting that every edge came through
+///   `validate_reference_spec`. A withheld passage still gets its footnote row
+///   (existence is public; the passage is not).
+/// * **A cross-space passage is attributed by its *source* space** — the label
+///   join is on the antecedent's `space_id`, so a per-space override renames
+///   the author where they wrote, not where they are being read. The reading
+///   space's override of the same participant is a different name for a
+///   different room.
+async fn reference_entries(
+    conn: &turso::Connection,
+    space_id: &str,
+    action_id: &str,
+) -> Result<std::collections::BTreeMap<u64, ReferenceEntry>, AppError> {
+    let mut entries = std::collections::BTreeMap::new();
+    for r in db::reference_antecedents(conn, action_id).await? {
+        let Ok(ordinal) = u64::try_from(r.ordinal) else {
+            continue;
+        };
+        let snippet = match (r.range_start, r.range_end, r.block_text.as_deref()) {
+            (Some(rs), Some(re), Some(text)) if r.is_quotable() => {
+                quote_snippet(text, rs, re).map(str::to_string)
+            }
+            _ => None,
+        };
+        let byline = if r.antecedent_space_id == space_id {
+            message_header(&r.antecedent_item_id, &r.antecedent_author_label)
+        } else {
+            format!(
+                "{} {REFERENCE_ELSEWHERE}",
+                one_line(&r.antecedent_author_label)
+            )
+        };
+        entries.insert(
+            ordinal,
+            ReferenceEntry {
+                ordinal: r.ordinal,
+                byline,
+                annotation: r.annotation,
+                snippet,
+            },
+        );
+    }
+    Ok(entries)
+}
+
 /// Replace **structurally recognized** `{{ embed N }}` markers in a post's
-/// markdown with the referenced quote rendered as a markdown blockquote —
-/// what upstream models read in place of the marker.
+/// markdown with the referenced quote, attributed to the post it came from —
+/// what upstream models read in place of the marker. Returns the rewritten
+/// text and the ordinals that expanded (the rest are the trailing block's, see
+/// [`render_post_for_model`]).
+///
+/// Attribution is the difference between "someone said this" and "I am saying
+/// this" in a multi-agent transcript: a bare blockquote inside another
+/// participant's post reads as that participant's own indented prose.
 ///
 /// Recognition is `eidola_common::embed::embed_marker_spans` — the shared
 /// structural contract with the editor's embed plugin: only a marker
@@ -9919,33 +10086,33 @@ fn canonicalize_model_ref(model_ref: &str) -> String {
 /// editor renders as embed blocks. A marker the author "defused" — inline,
 /// inside a fenced/indented code block, in a blockquote/list, escaped —
 /// renders literal in the UI and therefore goes upstream literal too (the UI
-/// and the wire must never disagree). Ordinals absent from `snippets` also
-/// stay literal (the editor's unmapped-marker degradation). The lockstep
+/// and the wire must never disagree). Ordinals absent from `entries`, and
+/// ones whose passage did not resolve, also stay literal (the editor's
+/// unmapped-marker degradation) — and are footnoted instead. The lockstep
 /// proof between the scanner and the editor's parser-driven recognition is
 /// `crates/eidola-gui/tests/embed_lockstep.rs`.
-fn expand_embed_strings(text: &str, snippets: &std::collections::BTreeMap<u64, String>) -> String {
+fn expand_embed_strings(
+    text: &str,
+    entries: &std::collections::BTreeMap<u64, ReferenceEntry>,
+) -> (String, std::collections::BTreeSet<u64>) {
+    let mut expanded = std::collections::BTreeSet::new();
     let spans = eidola_common::embed::embed_marker_spans(text);
     if spans.is_empty() {
-        return text.to_string();
+        return (text.to_string(), expanded);
     }
     let mut out = String::with_capacity(text.len());
     let mut pos = 0;
     for span in spans {
-        let Some(snippet) = snippets.get(&span.ordinal) else {
+        let Some(entry) = entries.get(&span.ordinal).filter(|e| e.snippet.is_some()) else {
             continue;
         };
         out.push_str(&text[pos..span.start]);
-        for (j, ql) in snippet.split('\n').enumerate() {
-            if j > 0 {
-                out.push('\n');
-            }
-            out.push_str("> ");
-            out.push_str(ql);
-        }
+        out.push_str(&entry.render());
+        expanded.insert(span.ordinal);
         pos = span.end;
     }
     out.push_str(&text[pos..]);
-    out
+    (out, expanded)
 }
 
 /// The separator between a message header's handle and its author label:
@@ -11158,7 +11325,7 @@ impl ThreadSnapshot {
             out.push_str(&with_header(
                 &n.item_id,
                 &n.participant.label,
-                &self.texts[i],
+                &self.post_body(i),
             ));
             out.push_str("\n\n");
         }
@@ -11178,39 +11345,47 @@ impl ThreadSnapshot {
             return self.unknown_handle(handle);
         };
         let n = &self.nodes[idx];
-        let mut out = with_header(&n.item_id, &n.participant.label, &self.texts[idx]);
-        if !n.references.is_empty() {
-            out.push_str("\n\nPassages this post quotes:\n");
-            for r in &n.references {
-                let target = match self.by_action.get(&r.antecedent_action_id) {
-                    Some(&i) => format!("#{}", self.handles[i]),
-                    // A reference names a *concrete generation*, which may have
-                    // been superseded, or may live in another space entirely
-                    // (references are the cross-space mechanism). Say so rather
-                    // than remapping.
-                    None => "(a post outside this space, or an earlier version)".to_string(),
-                };
-                out.push_str(&format!("[{}] {target}", r.ordinal));
-                if let Some(a) = &r.annotation {
-                    out.push_str(&format!(" — {}", one_line(a)));
-                }
-                out.push('\n');
-                match &r.snippet {
-                    Some(s) => {
-                        for line in s.split('\n') {
-                            out.push_str("> ");
-                            out.push_str(line);
-                            out.push('\n');
-                        }
-                    }
-                    None => {
-                        out.push_str("(the quoted range no longer maps onto that post's text)\n")
-                    }
-                }
-            }
-        }
+        let mut out = with_header(&n.item_id, &n.participant.label, &self.post_body(idx));
         out.truncate(out.trim_end().len());
         out
+    }
+
+    /// A post's body as a model reads it — the same rendering the turn's own
+    /// context gets ([`render_post_for_model`]), so `read_thread`, `read_post`
+    /// and the upstream context cannot tell three different stories about one
+    /// post.
+    ///
+    /// The bylines are this snapshot's own: a reference whose concrete
+    /// generation is not a post *of this space* cannot be addressed here, and
+    /// says so rather than remapping. (The upstream path, which reads the edge
+    /// row itself, can still name that author — see [`reference_entries`].)
+    fn post_body(&self, idx: usize) -> String {
+        let n = &self.nodes[idx];
+        if n.references.is_empty() {
+            return self.texts[idx].clone();
+        }
+        let entries: std::collections::BTreeMap<u64, ReferenceEntry> = n
+            .references
+            .iter()
+            .filter_map(|r| {
+                let byline = match self.by_action.get(&r.antecedent_action_id) {
+                    Some(&i) => {
+                        message_header(&self.nodes[i].item_id, &self.nodes[i].participant.label)
+                    }
+                    None => REFERENCE_ELSEWHERE.to_string(),
+                };
+                Some((
+                    u64::try_from(r.ordinal).ok()?,
+                    ReferenceEntry {
+                        ordinal: r.ordinal,
+                        byline,
+                        annotation: r.annotation.clone(),
+                        snippet: r.snippet.clone(),
+                    },
+                ))
+            })
+            .collect();
+        render_post_for_model(&self.texts[idx], &entries)
     }
 
     /// The honest answer to a handle this snapshot does not know — a *result*,
@@ -11981,6 +12156,67 @@ mod tests {
         );
     }
 
+    /// `read_thread` and `read_post` render one post one way: markers expanded
+    /// and attributed, un-embedded references footnoted. A model that descends
+    /// into a branch used to read literal `{{ embed N }}` markers with the
+    /// passage nowhere in sight.
+    #[test]
+    fn the_navigation_tools_render_a_quoting_post_the_same_way() {
+        let mut quoting = tn(
+            "b1",
+            "ib1",
+            Some("i1"),
+            "You",
+            "As it says:\n\n{{ embed 1 }}",
+        );
+        quoting.references = vec![
+            PostReference {
+                antecedent_action_id: "i1".into(),
+                ordinal: 1,
+                content_block_id: Some("i1-b0".into()),
+                range_start: None,
+                range_end: None,
+                annotation: None,
+                snippet: Some("Because of the moon.".into()),
+            },
+            PostReference {
+                antecedent_action_id: "elsewhere".into(),
+                ordinal: 2,
+                content_block_id: Some("x".into()),
+                range_start: None,
+                range_end: None,
+                annotation: Some("no marker for this one".into()),
+                snippet: Some("from another space".into()),
+            },
+        ];
+        let snap = ThreadSnapshot::new(
+            vec![
+                tn("u1", "iu1", None, "You", "How do tides work?"),
+                tn("i1", "ii1", Some("u1"), "Agent", "Because of the moon."),
+                quoting,
+            ],
+            0,
+        );
+
+        let body = format!(
+            "As it says:\n\n[1] #{} · Agent\n> Because of the moon.\n\n\
+             Passages this post quotes:\n\
+             [2] {REFERENCE_ELSEWHERE} — no marker for this one\n> from another space",
+            post_handle("ii1")
+        );
+        let post = snap.render_post(&post_handle("ib1"));
+        assert_eq!(post, with_header("ib1", "You", &body));
+        assert!(
+            snap.render_thread(&post_handle("ib1"), 0, 10)
+                .contains(&body),
+            "read_thread renders what read_post renders"
+        );
+        assert!(
+            !post.contains("{{ embed"),
+            "no literal marker survives: {post}"
+        );
+    }
+
     #[test]
     fn an_unknown_handle_is_answered_honestly_rather_than_failing() {
         let snap = forked_snapshot();
@@ -12424,28 +12660,95 @@ mod tests {
         assert_eq!(parse_embed_marker("\\{{ embed 0 }}"), None);
     }
 
+    /// A [`ReferenceEntry`] fixture.
+    fn entry(
+        ordinal: i64,
+        byline: &str,
+        annotation: Option<&str>,
+        snippet: Option<&str>,
+    ) -> ReferenceEntry {
+        ReferenceEntry {
+            ordinal,
+            byline: byline.to_string(),
+            annotation: annotation.map(String::from),
+            snippet: snippet.map(String::from),
+        }
+    }
+
     /// `expand_embed_strings` — structurally recognized mapped markers become
-    /// blockquotes; unmapped markers, inline occurrences, and markers inside
-    /// fenced code (defused by the author — the editor renders them literal)
-    /// stay literal, so the UI and the wire agree.
+    /// attributed quotes; unmapped markers, inline occurrences, and markers
+    /// inside fenced code (defused by the author — the editor renders them
+    /// literal) stay literal, so the UI and the wire agree.
     #[test]
     fn expand_embed_strings_quotes_mapped_markers() {
         let mut map = std::collections::BTreeMap::new();
-        map.insert(1u64, "quoted line one\nquoted line two".to_string());
+        map.insert(
+            1u64,
+            entry(
+                1,
+                "#abc2345 · Ada",
+                None,
+                Some("quoted line one\nquoted line two"),
+            ),
+        );
         let text = "intro\n\n{{ embed 1 }}\n\n{{ embed 2 }}\n\nsee {{ embed 1 }} inline";
-        let out = expand_embed_strings(text, &map);
+        let (out, expanded) = expand_embed_strings(text, &map);
         assert_eq!(
             out,
-            "intro\n\n> quoted line one\n> quoted line two\n\n{{ embed 2 }}\n\nsee {{ embed 1 }} inline"
+            "intro\n\n[1] #abc2345 · Ada\n> quoted line one\n> quoted line two\n\n\
+             {{ embed 2 }}\n\nsee {{ embed 1 }} inline"
         );
+        assert_eq!(expanded, [1].into_iter().collect());
 
         // Fence-defused markers do NOT expand, even when mapped — the editor
         // shows them literal, so upstream must see them literal.
         let fenced = "```\n\n{{ embed 1 }}\n\n```\n\n{{ embed 1 }}";
-        let out = expand_embed_strings(fenced, &map);
+        let (out, _) = expand_embed_strings(fenced, &map);
         assert_eq!(
             out,
-            "```\n\n{{ embed 1 }}\n\n```\n\n> quoted line one\n> quoted line two"
+            "```\n\n{{ embed 1 }}\n\n```\n\n[1] #abc2345 · Ada\n> quoted line one\n> quoted line two"
+        );
+
+        // A reference whose passage did not resolve stays literal at its
+        // marker — the editor's unmapped-marker degradation — and is reported
+        // in the trailing block instead.
+        let mut unresolved = std::collections::BTreeMap::new();
+        unresolved.insert(3u64, entry(3, REFERENCE_ELSEWHERE, None, None));
+        let (out, expanded) = expand_embed_strings("a\n\n{{ embed 3 }}", &unresolved);
+        assert_eq!(out, "a\n\n{{ embed 3 }}");
+        assert!(expanded.is_empty());
+    }
+
+    /// The whole point of the three-path rendering: what the body embeds is
+    /// spliced in where the author put it, and what it does not embed is
+    /// footnoted — never dropped. Marker-less references are a reachable state
+    /// (a deleted marker, an edit that kept the edge), and the human's footnote
+    /// rail has always shown them.
+    #[test]
+    fn a_reference_the_body_never_embedded_is_footnoted_not_dropped() {
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(1u64, entry(1, "#abc2345 · Ada", None, Some("embedded")));
+        entries.insert(
+            2u64,
+            entry(2, "#def2345 · Bo", Some("worth reading"), Some("orphaned")),
+        );
+        entries.insert(3u64, entry(3, REFERENCE_ELSEWHERE, None, None));
+
+        assert_eq!(
+            render_post_for_model("look\n\n{{ embed 1 }}", &entries),
+            "look\n\n[1] #abc2345 · Ada\n> embedded\n\n\
+             Passages this post quotes:\n\
+             [2] #def2345 · Bo — worth reading\n> orphaned\n\
+             [3] (a post outside this space, or an earlier version)\n\
+             (the quoted range no longer maps onto that post's text)"
+        );
+
+        // Every ordinal embedded → no trailing block at all.
+        let mut one = std::collections::BTreeMap::new();
+        one.insert(1u64, entry(1, "#abc2345 · Ada", None, Some("embedded")));
+        assert_eq!(
+            render_post_for_model("{{ embed 1 }}", &one),
+            "[1] #abc2345 · Ada\n> embedded"
         );
     }
 

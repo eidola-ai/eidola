@@ -654,9 +654,10 @@ fn regenerate_sends_only_upstream_context_at_current_versions() {
     });
 }
 
-/// Quoted references (wave 1): a post carrying a `{{ embed N }}` marker sends
-/// the referenced passage upstream as a markdown blockquote in that post's
-/// message — the model reads what was quoted, never the opaque marker.
+/// Quoted references: a post carrying a `{{ embed N }}` marker sends the
+/// referenced passage upstream **attributed** — handle, author, annotation —
+/// in that post's message, and a reference the body never embedded rides in a
+/// trailing footnote block rather than reaching the model as nothing at all.
 /// Unmapped markers stay literal (honest degradation, mirroring the editor).
 #[test]
 fn upstream_context_expands_embed_markers_into_quotes() {
@@ -683,7 +684,9 @@ fn upstream_context_expands_embed_markers_into_quotes() {
         // The body carries a structural marker (expands), an unmapped marker
         // (stays literal), and a fence-defused marker of the SAME mapped
         // ordinal (stays literal — the editor renders it literal, so the
-        // wire must too; expansion is structural, not line-based).
+        // wire must too; expansion is structural, not line-based). Reference 2
+        // has no marker anywhere — the human reads it in the footnote rail, so
+        // the model must read it too.
         let posted = core
             .runtime()
             .block_on(
@@ -693,13 +696,22 @@ fn upstream_context_expands_embed_markers_into_quotes() {
                         .into(),
                     Some(source.space_id.clone()),
                     None,
-                    vec![eidola_app_core::ReferenceSpec {
-                        antecedent_action_id: source.action_id.clone(),
-                        content_block_id: Some(block_id),
-                        range_start: Some(24),
-                        range_end: Some(34), // "powerhouse"
-                        annotation: None,
-                    }],
+                    vec![
+                        eidola_app_core::ReferenceSpec {
+                            antecedent_action_id: source.action_id.clone(),
+                            content_block_id: Some(block_id.clone()),
+                            range_start: Some(24),
+                            range_end: Some(34), // "powerhouse"
+                            annotation: None,
+                        },
+                        eidola_app_core::ReferenceSpec {
+                            antecedent_action_id: source.action_id.clone(),
+                            content_block_id: Some(block_id),
+                            range_start: Some(4),
+                            range_end: Some(16), // "mitochondria"
+                            annotation: Some("the organelle itself".into()),
+                        },
+                    ],
                 ),
             )
             .expect("post with reference");
@@ -734,15 +746,103 @@ fn upstream_context_expands_embed_markers_into_quotes() {
             3,
             "system + two user turns; got {contents:?}"
         );
+        let quoted = format!(
+            "#{} · {HUMAN_LABEL}",
+            eidola_app_core::post_handle(&source.item_id)
+        );
         assert_eq!(
             contents[2],
             headed(
                 &posted.item_id,
                 HUMAN_LABEL,
-                "What does this mean?\n\n> powerhouse\n\nAnd {{ embed 9 }} is unmapped.\n\n\
-                 ```\n\n{{ embed 1 }}\n\n```"
+                &format!(
+                    "What does this mean?\n\n[1] {quoted}\n> powerhouse\n\n\
+                     And {{{{ embed 9 }}}} is unmapped.\n\n\
+                     ```\n\n{{{{ embed 1 }}}}\n\n```\n\n\
+                     Passages this post quotes:\n\
+                     [2] {quoted} — the organelle itself\n> mitochondria"
+                )
             ),
-            "structural marker expands; unmapped and fence-defused markers go upstream literal"
+            "the embedded passage expands attributed, in place; the un-embedded one is \
+             footnoted; unmapped and fence-defused markers go upstream literal"
+        );
+    });
+}
+
+/// The second route to a marker-less reference (the first is a draft whose
+/// marker was deleted): `edit_post` replicates every surviving reference edge
+/// onto the new generation without consulting the new body. The human keeps
+/// reading the passage in the footnote rail, so the model keeps receiving it —
+/// as a footnote, since the edited body no longer embeds it.
+#[test]
+fn a_reference_whose_marker_an_edit_removed_still_reaches_the_model() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let source = core
+            .runtime()
+            .block_on(core.post("Tides come from the moon's pull.".into(), None))
+            .expect("source post");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(source.space_id.clone()))
+            .expect("tree");
+        let block_id = tree[0].blocks[0].id.clone();
+        let quoting = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "Is this right?\n\n{{ embed 1 }}".into(),
+                Some(source.space_id.clone()),
+                None,
+                vec![eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: source.action_id.clone(),
+                    content_block_id: Some(block_id),
+                    range_start: Some(20),
+                    range_end: Some(31), // "moon's pull"
+                    annotation: None,
+                }],
+            ))
+            .expect("post with reference");
+
+        // The edit drops the marker and keeps the edge.
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(quoting.action_id.clone(), "Is this right?".into()))
+            .expect("edit");
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(async {
+                let collector = async { while events_rx.recv().await.is_some() {} };
+                let respond = core.respond_stream(
+                    edited.space_id.clone(),
+                    MODEL.into(),
+                    edited.action_id.clone(),
+                    tx,
+                );
+                let (res, ()) = tokio::join!(respond, collector);
+                res
+            })
+            .expect("respond_stream should succeed");
+
+        let bodies = mock.chat_bodies();
+        let last = flat_messages(&bodies[0]).pop().expect("the edited post");
+        assert_eq!(
+            last.1,
+            headed(
+                &edited.item_id,
+                HUMAN_LABEL,
+                &format!(
+                    "Is this right?\n\nPassages this post quotes:\n[1] #{} · {HUMAN_LABEL}\n\
+                     > moon's pull",
+                    eidola_app_core::post_handle(&source.item_id)
+                )
+            ),
+            "an edge the edited body no longer embeds is footnoted, not dropped"
         );
     });
 }
@@ -1251,11 +1351,24 @@ fn navigation_tools_round_trip_through_the_turn_loop() {
         let u2_item = tree[2].item_id.clone();
         let i2_item = tree[3].item_id.clone();
         let i1_item = tree[1].item_id.clone();
-        core.runtime()
-            .block_on(core.post_reply(
-                "What about spring tides?".into(),
+        // The branch post quotes the post it branches off, so `read_thread`'s
+        // window has to render an embed marker (task 63): a model descending
+        // into a branch reads the passage, not the marker.
+        let quoted = tree[1].blocks[0].text.clone().expect("i1 text");
+        let i1_label = tree[1].participant.label.clone();
+        let branch = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "What about spring tides?\n\n{{ embed 1 }}".into(),
                 Some(space.clone()),
                 Some(i1),
+                vec![eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: tree[1].action_id.clone(),
+                    content_block_id: Some(tree[1].blocks[0].id.clone()),
+                    range_start: Some(0),
+                    range_end: Some(quoted.len() as i64),
+                    annotation: None,
+                }],
             ))
             .expect("branch post");
 
@@ -1278,6 +1391,13 @@ fn navigation_tools_round_trip_through_the_turn_loop() {
             (
                 "read_post".into(),
                 serde_json::json!({ "handle": "#zzzzzzz" }).to_string(),
+            ),
+            (
+                "read_thread".into(),
+                serde_json::json!({
+                    "handle": eidola_app_core::post_handle(&branch.item_id),
+                })
+                .to_string(),
             ),
         ];
         let result = core
@@ -1310,7 +1430,7 @@ fn navigation_tools_round_trip_through_the_turn_loop() {
             .filter(|(role, _)| role == "tool")
             .map(|(_, c)| c)
             .collect();
-        assert_eq!(results.len(), 4, "one result per call, in order");
+        assert_eq!(results.len(), 5, "one result per call, in order");
 
         // list_branches: the whole space's structure, not just the map's.
         assert!(
@@ -1363,6 +1483,27 @@ fn navigation_tools_round_trip_through_the_turn_loop() {
             !results[3].starts_with("error:"),
             "a stale handle is an answer, not a tool error: {}",
             results[3]
+        );
+
+        // read_thread renders a post's quotes exactly as read_post does —
+        // attributed and in place, never a literal marker.
+        assert!(
+            results[4].contains(&headed(
+                &branch.item_id,
+                HUMAN_LABEL,
+                &format!(
+                    "What about spring tides?\n\n[1] #{} · {}\n> {quoted}",
+                    eidola_app_core::post_handle(&i1_item),
+                    i1_label,
+                )
+            )),
+            "{}",
+            results[4]
+        );
+        assert!(
+            !results[4].contains("{{ embed"),
+            "no literal marker survives into a tool result: {}",
+            results[4]
         );
     });
 }
