@@ -5410,11 +5410,11 @@ fn typing_dash_then_letter_injects_marker_space(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn typing_star_then_letter_injects_marker_space(cx: &mut TestAppContext) {
-    // Same rule applies to `*` and `+`. Trade-off: `*foo*` typed at
-    // line start gets converted to a list opener — users who want
-    // italic at the start of a paragraph type the leading text first
-    // or escape the star.
+fn typing_star_then_letter_does_not_inject_marker_space(cx: &mut TestAppContext) {
+    // `*` is excluded from the rule: it opens emphasis at least as
+    // often as it opens a bullet, and the ambiguity can't be resolved
+    // from the prefix alone (`*x` is the live prefix of both `*x*`
+    // and a `* x` bullet). A `*` bullet is typed with its space.
     let initial = EditorState {
         markdown: "".into(),
         selection: Selection::Cursor(0),
@@ -5423,8 +5423,169 @@ fn typing_star_then_letter_injects_marker_space(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "*x");
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.value(), "* x");
+        assert_eq!(e.value(), "*x");
     });
+}
+
+/// Type `text` one keystroke at a time, the way a user does — each
+/// character is its own event, so the cursor guards in
+/// `enforce_invariants` see every intermediate buffer.
+fn type_chars(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    editor: &Entity<MarkdownEditorState>,
+    text: &str,
+) {
+    let mut buf = [0u8; 4];
+    for ch in text.chars() {
+        type_text(cx, handle, editor, ch.encode_utf8(&mut buf));
+    }
+}
+
+fn assert_no_list(spec: &RenderSpec, what: &str) {
+    assert!(
+        spec.blocks.iter().all(|b| !b
+            .containers
+            .iter()
+            .any(|c| matches!(c, Container::ListItem { .. }))),
+        "{what}: expected no list container, blocks: {:#?}",
+        spec.blocks,
+    );
+}
+
+#[gpui::test]
+fn typing_italic_at_paragraph_start_stays_a_paragraph(cx: &mut TestAppContext) {
+    // The regression: keystroke-by-keystroke, `*Italic* text …` used
+    // to become `* Italic* text …` — a bullet — the instant the
+    // second character landed.
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_chars(cx, handle, &editor, "*Italic* text at the beginning.");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "*Italic* text at the beginning.");
+    });
+    let spec = current_spec(cx, &editor);
+    assert_no_list(&spec, "typed italic paragraph");
+    assert!(
+        spec.blocks[0]
+            .inlines
+            .iter()
+            .any(|r| r.style.italic && r.source_range == (1..7)),
+        "emphasis run over `Italic`, inlines: {:#?}",
+        spec.blocks[0].inlines,
+    );
+}
+
+#[gpui::test]
+fn typing_underscore_italic_at_paragraph_start_stays_a_paragraph(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_chars(cx, handle, &editor, "_italic_ text at the beginning.");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "_italic_ text at the beginning.");
+    });
+    assert_no_list(&current_spec(cx, &editor), "typed underscore paragraph");
+}
+
+#[gpui::test]
+fn typing_bold_at_paragraph_start_stays_a_paragraph(cx: &mut TestAppContext) {
+    // Already covered by the repeat-marker exception; pinned so the
+    // `*` exclusion can't be undone by a change that only looks at
+    // the doubled case.
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_chars(cx, handle, &editor, "**bold** start");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "**bold** start");
+    });
+    assert_no_list(&current_spec(cx, &editor), "typed bold paragraph");
+}
+
+#[gpui::test]
+fn seeded_italic_paragraph_survives_an_edit_elsewhere(cx: &mut TestAppContext) {
+    // The cursor guard only protects the byte under the caret, so a
+    // document *containing* an italic-opening paragraph was rewritten
+    // by the next keystroke anywhere in the buffer.
+    let initial = EditorState {
+        markdown: "Intro\n\n*Italic* text at the beginning.".into(),
+        selection: Selection::Cursor(5),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "!");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "Intro!\n\n*Italic* text at the beginning.");
+    });
+    assert_no_list(&current_spec(cx, &editor), "seeded italic paragraph");
+}
+
+#[gpui::test]
+fn seeded_italic_paragraph_in_a_blockquote_survives_an_edit(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "> *Italic* text".into(),
+        selection: Selection::Cursor(15),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "!");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "> *Italic* text!");
+    });
+    assert_no_list(&current_spec(cx, &editor), "italic paragraph in BQ");
+}
+
+#[gpui::test]
+fn typing_star_space_still_opens_a_bullet(cx: &mut TestAppContext) {
+    // The explicit spelling is untouched by the exclusion.
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+        ..Default::default()
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_chars(cx, handle, &editor, "* foo");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "* foo");
+        assert!(
+            e.render_spec()
+                .blocks
+                .iter()
+                .any(|b| list_item_depth(b) >= 1),
+            "`* foo` is a bullet",
+        );
+    });
+}
+
+#[gpui::test]
+fn fresh_empty_nested_marker_is_still_a_bullet(cx: &mut TestAppContext) {
+    // The pulldown fork's `ENABLE_EMPTY_NESTED_LISTS` behavior: a
+    // just-typed empty marker line inside an item opens a nested list
+    // instead of being claimed as a setext underline. Nothing about
+    // the `*` exclusion may disturb it.
+    let initial = EditorState {
+        markdown: "- one\n  - ".into(),
+        selection: Selection::Cursor(10),
+        ..Default::default()
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    assert!(
+        spec.blocks.iter().any(|b| list_item_depth(b) == 2),
+        "nested empty item present, blocks: {:#?}",
+        spec.blocks,
+    );
 }
 
 #[gpui::test]
