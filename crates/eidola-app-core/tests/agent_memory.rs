@@ -38,10 +38,9 @@ use eidola_app_core::AppCore;
 use eidola_app_core::changes::Change;
 use eidola_app_core::memory::{MAX_MEMORY_BLOCK_BYTES, MAX_MEMORY_BLOCKS, MEMORY_NOTE};
 
-/// The external backend's model. Memory's `remember` tool attaches only where
-/// the backend can carry a `tools` field at all, which excludes the `eidola`
-/// backend (its request type is `deny_unknown_fields`) — the same limit the
-/// navigation tools have.
+/// The external backend's model. `remember` rides the same learned capability
+/// gate the navigation tools do, so any endpoint reaches it; these tests run
+/// over an `openai` backend to keep the credential spend out of the way.
 const MODEL: &str = "qwen3-8b@ext";
 
 fn run<F>(f: F)

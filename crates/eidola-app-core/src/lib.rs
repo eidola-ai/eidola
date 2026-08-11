@@ -1306,6 +1306,27 @@ pub enum ChatStreamEvent {
     ContentDelta(String),
 }
 
+/// What a `tools` field is actually offered to: one model on one backend.
+///
+/// The unit the tool-capability memo is keyed by (`Inner::tool_incapable_models`).
+/// A backend is a *host*, not a capability — eidola's catalog and a llama.cpp
+/// install each serve many models with different chat templates — so the pair
+/// is the narrowest thing an observed rejection is evidence about.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ToolEndpoint {
+    backend_id: String,
+    wire_model: String,
+}
+
+impl ToolEndpoint {
+    fn new(backend_id: &str, wire_model: &str) -> Self {
+        Self {
+            backend_id: backend_id.to_string(),
+            wire_model: wire_model.to_string(),
+        }
+    }
+}
+
 // ============================================================================
 // Inner — shared state used by AppCore, wrapped in Arc so it can move into
 // spawned futures on the owned tokio runtime.
@@ -1365,9 +1386,9 @@ struct Inner {
     /// entirely when the snapshot is empty. Consumers register through
     /// [`AppCore::register_tool`]; tasks 21/22 plug in here.
     tools: std::sync::RwLock<tools::ToolRegistry>,
-    /// Backends observed, this process, to reject a request carrying a `tools`
-    /// field — see `Inner::backend_rejects_tools`.
-    tool_incapable_backends: std::sync::RwLock<std::collections::HashSet<String>>,
+    /// Endpoints observed, this process, to reject a request carrying a `tools`
+    /// field — see `Inner::model_rejects_tools`.
+    tool_incapable_models: std::sync::RwLock<std::collections::HashSet<ToolEndpoint>>,
     /// Test-only HTTP client override. When `Some`, [`Inner::build_client`]
     /// returns a clone of this client *instead of* constructing the
     /// attesting client, letting integration tests drive `chat`/`chat_stream`
@@ -4520,46 +4541,6 @@ impl Inner {
                 message: format!("unknown backend kind `{}`", backend.kind),
             })?;
 
-        // Whether this backend can be offered a `tools` field at all.
-        //
-        // Two conditions, and the second is the important one.
-        //
-        // **Statically excluded: eidola.** The server's
-        // `ChatCompletionRequest` is `#[serde(deny_unknown_fields)]` with no
-        // `tools` member, so sending one is a certain 400. Removal trigger:
-        // task 25 (server-side tool support). The **map** rides in the messages
-        // array and is unaffected either way, so a branched eidola space still
-        // gets the whole structural view; only the descend-further affordance
-        // waits.
-        //
-        // **Everything else is a guess until proven, so it is *learned*, not
-        // assumed from the kind.** Backend kind does not establish
-        // tool-calling capability, and this is not hypothetical: llama.cpp
-        // returns HTTP 500 `tools param requires --jinja flag` without
-        // `--jinja`, and *with* `--jinja` still 500s with a template-render
-        // crash when the model's tool block uses Jinja filters it lacks (a
-        // mainstream case — Qwen3 Coder does exactly this). A generic
-        // OpenAI-compatible endpoint may reject the field outright. Since this
-        // turn attaches tools *automatically* the moment a space branches,
-        // assuming capability would mean "branching your conversation breaks
-        // every turn on this model", with no opt-out and triggered by a core
-        // UX action. So a backend that has rejected a `tools` field this
-        // process is remembered and simply not offered them again (the turn
-        // that discovered it degraded and carried on — see the round loop).
-        //
-        // Deliberately in-process and not persisted: it is an *observation*,
-        // not configuration. No column, no setting to get wrong, nothing to
-        // migrate, and a backend that gains tool support (a rebuilt engine, a
-        // different model, an upgraded proxy) is re-probed on the next restart
-        // rather than being written off forever. The real per-backend
-        // capability flag stays genuinely deferred.
-        //
-        // Note this gates only the tools *this turn attaches*. A consumer's own
-        // `AppCore::register_tool` registrations are untouched — that surface's
-        // wire compatibility is the consumer's call, exactly as task 20 left it.
-        let backend_accepts_tools =
-            backend_kind != BackendKind::Eidola && !self.backend_rejects_tools(&backend.id);
-
         // The canonical selection string (recorded on actions, shown in
         // UIs) and the wire model (what the backend's HTTP API expects).
         // Engine-backed aliases are spawned equal to the canonical id, so
@@ -4571,6 +4552,44 @@ impl Inner {
             _ => canonical_model.clone(),
         };
         let model = canonical_model.as_str();
+
+        // Whether this turn's endpoint can be offered a `tools` field at all.
+        //
+        // **Capability is *learned*, never assumed from the backend's kind.**
+        // Nothing about a kind establishes tool-calling support, and this is
+        // not hypothetical: llama.cpp returns HTTP 500 `tools param requires
+        // --jinja flag` without `--jinja`, and *with* `--jinja` still 500s with
+        // a template-render crash when the model's tool block uses Jinja
+        // filters it lacks (a mainstream case — Qwen3 Coder does exactly
+        // this). A generic OpenAI-compatible endpoint may reject the field
+        // outright, and a deployed enclave older than the server's tool wire
+        // types refuses it as an unknown member. Since this turn attaches tools
+        // *automatically* the moment a space branches, assuming capability
+        // would mean "branching your conversation breaks every turn on this
+        // model", with no opt-out and triggered by a core UX action. So an
+        // endpoint that has rejected a `tools` field this process is remembered
+        // and simply not offered them again (the turn that discovered it
+        // degraded and carried on — see the round loop).
+        //
+        // **The memo is per (backend, wire model)**, because one backend serves
+        // many models: eidola's catalog and a llama.cpp install both do. A
+        // single tool-incapable model must cost only itself its tools, not
+        // every sibling on the same host.
+        //
+        // Deliberately in-process and not persisted: it is an *observation*,
+        // not configuration. No column, no setting to get wrong, nothing to
+        // migrate, and an endpoint that gains tool support (a rebuilt engine, a
+        // redeployed enclave, an upgraded proxy) is re-probed on the next
+        // restart rather than being written off forever. The real per-model
+        // capability metadata stays genuinely deferred.
+        //
+        // Note this gates only the tools *this turn attaches*. A consumer's own
+        // `AppCore::register_tool` registrations are untouched — that surface's
+        // wire compatibility is the consumer's call, exactly as task 20 left it.
+        // The **map** rides the messages array and is never gated by any of
+        // this, so a branched space keeps its whole structural view even where
+        // the descend-further affordance is withdrawn.
+        let backend_accepts_tools = !self.model_rejects_tools(&backend.id, &wire_model);
 
         let mut engine_lease: Option<local_models::EngineLease> = None;
         let (
@@ -5360,29 +5379,33 @@ impl Inner {
         Ok(())
     }
 
-    /// Has this backend rejected a request carrying a `tools` field during
+    /// Has this endpoint rejected a request carrying a `tools` field during
     /// this process's lifetime? See the gate in `prepare_turn` for why this is
-    /// learned rather than assumed from the backend's kind.
-    fn backend_rejects_tools(&self, backend_id: &str) -> bool {
-        self.tool_incapable_backends
+    /// learned rather than assumed from the backend's kind, and why the
+    /// question is asked per model rather than per backend.
+    fn model_rejects_tools(&self, backend_id: &str, wire_model: &str) -> bool {
+        self.tool_incapable_models
             .read()
             .expect("tool capability memo lock poisoned")
-            .contains(backend_id)
+            .contains(&ToolEndpoint::new(backend_id, wire_model))
     }
 
-    /// Record that `backend_id` rejects a `tools` field, so later turns skip
-    /// straight to the toolless request instead of paying the probe again.
+    /// Record that `wire_model` on `backend_id` rejects a `tools` field, so
+    /// later turns on **that model** skip straight to the toolless request
+    /// instead of paying the probe again. Its siblings on the same backend are
+    /// untouched — a multi-model host is exactly where one model's answer must
+    /// not speak for the rest.
     ///
     /// Called **only when the toolless retry succeeded** — that is the evidence
     /// the `tools` field was the cause. A round that fails both with and
     /// without tools was failing for some other reason (an overloaded model, a
-    /// bad key), and must not silently cost the backend its tool support for
-    /// the rest of the process.
-    fn remember_tool_incapable(&self, backend_id: &str) {
-        self.tool_incapable_backends
+    /// bad key), and must not silently cost the model its tool support for the
+    /// rest of the process.
+    fn remember_tool_incapable(&self, backend_id: &str, wire_model: &str) {
+        self.tool_incapable_models
             .write()
             .expect("tool capability memo lock poisoned")
-            .insert(backend_id.to_string());
+            .insert(ToolEndpoint::new(backend_id, wire_model));
     }
 
     /// Should this round-1 failure be retried with the turn's own tools
@@ -5470,7 +5493,7 @@ impl Inner {
                     .map_err(|e| prep.wrap(e))?;
                 outcome = Box::pin(self.run_turn_round(&mut prep, round)).await;
                 if outcome.is_ok() {
-                    self.remember_tool_incapable(&prep.backend_id);
+                    self.remember_tool_incapable(&prep.backend_id, &prep.wire_model);
                 }
             }
             match outcome? {
@@ -5902,7 +5925,7 @@ impl Inner {
                     .map_err(|e| prep.wrap(e))?;
                 outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
                 if outcome.is_ok() {
-                    self.remember_tool_incapable(&prep.backend_id);
+                    self.remember_tool_incapable(&prep.backend_id, &prep.wire_model);
                 }
             }
             match outcome? {
@@ -6886,7 +6909,7 @@ impl AppCore {
                 memory_gate: tokio::sync::Mutex::new(()),
                 memory_enabled: std::sync::atomic::AtomicBool::new(false),
                 tools: std::sync::RwLock::new(tools::ToolRegistry::new()),
-                tool_incapable_backends: std::sync::RwLock::new(std::collections::HashSet::new()),
+                tool_incapable_models: std::sync::RwLock::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 http_override,
                 _db_lock: db_lock,
