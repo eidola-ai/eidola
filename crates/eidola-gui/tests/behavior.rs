@@ -1280,7 +1280,6 @@ fn settings_asks_the_account_pane_for_its_live_reads_on_every_visit(cx: &mut Tes
                 state: eidola_app_core::SubscriptionState::Active,
                 status: Some("active".into()),
                 current_period_end: None,
-                management_url: Some("https://billing.example/session".into()),
             }),
             cx,
         );

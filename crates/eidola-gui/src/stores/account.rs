@@ -164,6 +164,22 @@ impl AccountStore {
         cx.notify();
     }
 
+    /// Drop everything this store holds that describes *a particular
+    /// account*, so an identity switch can never leave one account's answer
+    /// on screen under another's name.
+    ///
+    /// The subscription is the whole set today: prices are a public catalog,
+    /// and balances are written from the verified account's own response
+    /// (or cleared beside this on reset). Clearing rather than refreshing is
+    /// deliberate — showing nothing while a surface re-reads is honest,
+    /// where showing the previous account's standing is not, and on a
+    /// billing surface that is the difference that matters.
+    pub fn forget_account_scoped_state(&mut self, cx: &mut Context<Self>) {
+        self.subscription = Loadable::NotLoaded;
+        self.subscription_task = None;
+        cx.notify();
+    }
+
     /// Test-only: put the subscription cell in an arbitrary state, so a
     /// behavior test or driver scene can render "checking" and "couldn't
     /// check" without a backend that stalls or fails on cue.
@@ -206,8 +222,12 @@ impl AccountStore {
     /// returned receiver inside its own task and refreshes config on success.
     /// `None` on a stub.
     pub fn request_account_create(
-        &self,
+        &mut self,
+        cx: &mut Context<Self>,
     ) -> Option<oneshot::Receiver<Result<AccountCreateResult, AppError>>> {
+        // A fresh account has no subscription; anything held now belongs to
+        // whoever this machine was linked to a moment ago.
+        self.forget_account_scoped_state(cx);
         let core = self.app_core.clone()?;
         let (tx, rx) = oneshot::channel();
         core.runtime().handle().clone().spawn(async move {
@@ -223,10 +243,19 @@ impl AccountStore {
     /// The caller (onboarding "existing account" slide) awaits the returned
     /// receiver in its own task slot. `None` on a stub.
     pub fn request_verify_account(
-        &self,
+        &mut self,
         id: String,
         secret: String,
+        cx: &mut Context<Self>,
     ) -> Option<oneshot::Receiver<Result<BalancesResult, AppError>>> {
+        // The account is changing identity as of now, so whatever this cell
+        // holds describes someone else. Cleared here rather than on the
+        // caller's success path: a stale *billing* answer attributed to the
+        // wrong account is worse than a blank, and clearing at the request
+        // covers the failure and cancellation exits too — a rollback leaves
+        // the original account current, whose standing an empty cell simply
+        // re-reads. See `forget_account_scoped_state`.
+        self.forget_account_scoped_state(cx);
         let core = self.app_core.clone()?;
         let (tx, rx) = oneshot::channel();
         core.runtime().handle().clone().spawn(async move {
@@ -248,19 +277,16 @@ impl AccountStore {
         Some(rx)
     }
 
-    /// Re-read the subscription standing for the sake of the billing-portal
-    /// link it carries. The link is a short-lived session the payment
-    /// processor mints on request, so "Manage subscription" asks for a fresh
-    /// one at the moment of the click rather than opening whatever the pane
-    /// fetched when it was opened — the same shape as `request_checkout`.
-    /// The caller awaits inside its own slot. `None` on a stub.
-    pub fn request_subscription(
-        &self,
-    ) -> Option<oneshot::Receiver<Result<SubscriptionInfo, AppError>>> {
+    /// Mint a billing-portal session for the click that is about to open it.
+    /// The link is short-lived, so it is asked for at the moment of use
+    /// rather than held from whenever the pane last read — the same shape as
+    /// `request_checkout`. The caller awaits inside its own slot. `None` on a
+    /// stub.
+    pub fn request_portal(&self) -> Option<oneshot::Receiver<Result<String, AppError>>> {
         let core = self.app_core.clone()?;
         let (tx, rx) = oneshot::channel();
         core.runtime().handle().clone().spawn(async move {
-            let _ = tx.send(core.account_subscription().await);
+            let _ = tx.send(core.account_portal().await);
         });
         Some(rx)
     }
@@ -349,8 +375,7 @@ impl AccountStore {
                 // The subscription belonged to the account whose keys were
                 // just forgotten; keeping it on screen would attribute
                 // someone's subscription to nobody.
-                self.subscription = Loadable::NotLoaded;
-                self.subscription_task = None;
+                self.forget_account_scoped_state(cx);
             }
             Err(e) => {
                 self.account_op_error = Some(e);

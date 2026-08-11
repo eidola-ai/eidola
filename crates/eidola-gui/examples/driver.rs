@@ -1933,8 +1933,6 @@ mod driver {
             status: (state == SubscriptionState::Active).then(|| "active".to_string()),
             current_period_end: (state == SubscriptionState::Active)
                 .then(|| eidola_app_core::now_ms() + 23 * 24 * 60 * 60 * 1000),
-            management_url: (state != SubscriptionState::NoCustomer)
-                .then(|| "https://billing.stripe.com/session/demo".to_string()),
         }
     }
 
