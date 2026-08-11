@@ -10017,14 +10017,27 @@ impl ReferenceEntry {
     /// asks a second question of the database at a second moment, and an edit
     /// landing in between makes the two disagree about one handle.
     ///
-    /// **The whole byline comes from whichever source answered.** A resolved
-    /// node is a post of the turn's own space, so its label is already that
-    /// space's effective one, read in the same round trip as the handle beside
-    /// it — taking the name from the edge row instead would reopen the same
-    /// race one field over, for a value that cannot differ except by drifting.
-    /// The row's label is for the unaddressable arm, where the snapshot has
-    /// nothing and the source space genuinely can name the author differently.
-    fn from_edge(row: &db::ReferenceEdgeRow, resolved: Option<&PostNode>) -> Self {
+    /// **Every name comes from the snapshot when the snapshot has one**, so a
+    /// rename committed between the two reads cannot give one passage two
+    /// attributions inside a turn:
+    ///
+    /// * *Addressable* — a resolved node is a post of the turn's own space, so
+    ///   its label is already that space's effective one, read in the same
+    ///   round trip as the handle beside it.
+    /// * *Elsewhere* — the snapshot cannot name the target directly (it does
+    ///   not have it), but when it holds the **referencing** post it holds that
+    ///   post's own copy of this edge, carrying the author as the source space
+    ///   named them at snapshot time; `captured` is that copy. `read_thread`
+    ///   and `read_post` render from it, so this is what makes the two agree.
+    ///   The edge row's label serves the case where even that is missing.
+    ///
+    /// Only the *name* moves: the passage stays the edge row's (see
+    /// [`reference_entries`]).
+    fn from_edge(
+        row: &db::ReferenceEdgeRow,
+        resolved: Option<&PostNode>,
+        captured: Option<&PostReference>,
+    ) -> Self {
         let target = match resolved {
             Some(n) => ReferenceTarget::Addressable {
                 item_id: n.item_id.clone(),
@@ -10033,7 +10046,11 @@ impl ReferenceEntry {
             // The author as the *source* space names them — the reading space
             // may never have met this participant.
             None => ReferenceTarget::Elsewhere {
-                label: non_blank(&row.antecedent_author_label),
+                label: non_blank(
+                    captured
+                        .map(|c| c.antecedent_author_label.as_str())
+                        .unwrap_or(&row.antecedent_author_label),
+                ),
             },
         };
         let body = match (row.has_range(), row.range_start, row.range_end) {
@@ -10198,13 +10215,20 @@ pub(crate) async fn reference_entries(
     thread: &ThreadSnapshot,
     action_id: &str,
 ) -> Result<std::collections::BTreeMap<u64, ReferenceEntry>, AppError> {
+    // The snapshot's own copy of this post, when it has it. A post's reference
+    // edges are written once with the post, so its captured copy and this read
+    // describe the same edges and can differ in one thing only: the author
+    // label each read joined. Preferring the captured one is what keeps the
+    // context and the navigation tools naming a passage identically.
+    let referrer = thread.node_for_action(action_id);
     let mut entries = std::collections::BTreeMap::new();
     for r in db::reference_antecedents(conn, action_id).await? {
         let Ok(ordinal) = u64::try_from(r.ordinal) else {
             continue;
         };
         let resolved = thread.node_for_action(&r.antecedent_action_id);
-        entries.insert(ordinal, ReferenceEntry::from_edge(&r, resolved));
+        let captured = referrer.and_then(|n| n.references.iter().find(|c| c.ordinal == r.ordinal));
+        entries.insert(ordinal, ReferenceEntry::from_edge(&r, resolved, captured));
     }
     Ok(entries)
 }
@@ -12911,7 +12935,7 @@ mod tests {
         // elsewhere carries the name it was written under, and the reading
         // space may never have met that participant.
         assert_eq!(
-            ReferenceEntry::from_edge(&row, None).render(),
+            ReferenceEntry::from_edge(&row, None, None).render(),
             format!("[1] Row Read {REFERENCE_ELSEWHERE}\n> passage")
         );
 
@@ -12921,8 +12945,60 @@ mod tests {
         // effective one; the row's copy could only differ by drifting.
         let node = tn("a1", "ia1", None, "Snapshot Read", "passage");
         assert_eq!(
-            ReferenceEntry::from_edge(&row, Some(&node)).render(),
+            ReferenceEntry::from_edge(&row, Some(&node), None).render(),
             format!("[1] {}\n> passage", message_header("ia1", "Snapshot Read"))
+        );
+    }
+
+    /// A [`PostReference`] as the snapshot captured it — the referencing post's
+    /// own copy of an edge, carrying the author the source space named at
+    /// snapshot time.
+    fn captured_reference(ordinal: i64, label: &str) -> PostReference {
+        PostReference {
+            antecedent_action_id: "a1".into(),
+            ordinal,
+            content_block_id: Some("cb1".into()),
+            range_start: Some(0),
+            range_end: Some(7),
+            annotation: None,
+            snippet: Some("passage".into()),
+            antecedent_author_label: label.into(),
+        }
+    }
+
+    /// The unaddressable arm names its author from the snapshot too. The
+    /// snapshot cannot hold the *target* — that is what unaddressable means —
+    /// but when it holds the **referencing** post it holds that post's own copy
+    /// of the edge, which is exactly what `read_thread` and `read_post` render
+    /// from. Reading the name from the fresh edge instead gave one cross-space
+    /// passage two attributions in one turn whenever a rename landed between
+    /// the two reads. The row still answers when even that is missing, and the
+    /// passage is the row's either way.
+    #[test]
+    fn an_unaddressable_reference_is_named_by_the_snapshots_copy_of_its_edge() {
+        let row = quoting_row("Row Read");
+        let captured = captured_reference(1, "Snapshot Read");
+
+        assert_eq!(
+            ReferenceEntry::from_edge(&row, None, Some(&captured)).render(),
+            format!("[1] Snapshot Read {REFERENCE_ELSEWHERE}\n> passage"),
+            "the snapshot's copy names the author"
+        );
+        assert_eq!(
+            ReferenceEntry::from_edge(&row, None, None).render(),
+            format!("[1] Row Read {REFERENCE_ELSEWHERE}\n> passage"),
+            "and the row answers when the snapshot never saw the referencing post"
+        );
+
+        // The passage is the edge row's on both paths — the snapshot's copy
+        // names the author and nothing else.
+        let stale = PostReference {
+            snippet: Some("a passage the snapshot captured earlier".into()),
+            ..captured_reference(1, "Snapshot Read")
+        };
+        assert_eq!(
+            ReferenceEntry::from_edge(&row, None, Some(&stale)).render(),
+            format!("[1] Snapshot Read {REFERENCE_ELSEWHERE}\n> passage")
         );
     }
 
@@ -12935,11 +13011,11 @@ mod tests {
         let row = quoting_row("  ");
         let node = tn("a1", "ia1", None, "  ", "passage");
         assert_eq!(
-            ReferenceEntry::from_edge(&row, Some(&node)).render(),
+            ReferenceEntry::from_edge(&row, Some(&node), None).render(),
             format!("[1] #{}\n> passage", post_handle("ia1"))
         );
         assert_eq!(
-            ReferenceEntry::from_edge(&row, None).render(),
+            ReferenceEntry::from_edge(&row, None, Some(&captured_reference(1, " "))).render(),
             format!("[1] {REFERENCE_ELSEWHERE}\n> passage")
         );
     }
