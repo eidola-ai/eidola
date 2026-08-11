@@ -860,6 +860,18 @@ mod driver {
                 },
             },
             Scene {
+                name: "settings_account_lapsed",
+                description: "Settings ▸ Account: a payment customer with nothing in force — billing and receipts, and every plan still offered",
+                default_size: size(px(620.), px(620.)),
+                build: |window, cx| {
+                    let stores =
+                        account_stores(cx, Some(subscription(SubscriptionState::Inactive)));
+                    let view = cx.new(|cx| SettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "settings_account_subscription_checking",
                 description: "Settings ▸ Account: the subscription read is still in flight",
                 default_size: size(px(620.), px(620.)),

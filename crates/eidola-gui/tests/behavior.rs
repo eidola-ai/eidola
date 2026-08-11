@@ -1212,6 +1212,98 @@ fn settings_account_pane_reachable_at_top_level(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn settings_asks_the_account_pane_for_its_live_reads_on_every_visit(cx: &mut TestAppContext) {
+    // The Account pane's balance and subscription are live server reads that
+    // **no `Change` can invalidate**: a webhook credits the account, or the
+    // reader cancels a subscription in a browser portal, and nothing local
+    // commits for the bus to announce. `SettingsView` builds all six panes
+    // when the *window* opens, so construction is not the moment to ask —
+    // selecting the pane is, and selecting it again is too.
+    //
+    // Only a real backend can answer "did the pane ask?": the stub stores'
+    // `refresh_*` are no-ops by design. Nothing here waits on the network —
+    // a refresh marks its cell before it spawns, which is the whole
+    // assertion.
+    use eidola_gui::loadable::Loadable;
+
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
+        .unwrap();
+    // A configured account is what makes the balance and subscription reads
+    // meaningful; the pane gates them on exactly this.
+    core.set_account_credentials("acct".into(), "secret".into())
+        .unwrap();
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    stores.config.update(cx, |s, cx| s.refresh(cx));
+
+    let (_w, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+
+    // Settings opens on General. Every pane exists; none of Account's live
+    // reads has been asked for.
+    stores.account.read_with(cx, |s, _| {
+        assert!(
+            matches!(s.subscription(), Loadable::NotLoaded),
+            "building the pane must not read the subscription"
+        );
+        assert!(
+            matches!(s.balances(), Loadable::NotLoaded),
+            "building the pane must not read the balance"
+        );
+    });
+
+    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+    stores.account.read_with(cx, |s, _| {
+        assert!(
+            !matches!(s.subscription(), Loadable::NotLoaded),
+            "selecting the pane must ask for the subscription"
+        );
+        assert!(
+            !matches!(s.balances(), Loadable::NotLoaded),
+            "selecting the pane must ask for the balance"
+        );
+    });
+
+    // Now the reader leaves, changes their subscription in a browser, and
+    // comes back. Standing in for "the answer we already have", so the
+    // second visit has something it could wrongly leave alone.
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            Loadable::loaded(eidola_app_core::SubscriptionInfo {
+                state: eidola_app_core::SubscriptionState::Active,
+                status: Some("active".into()),
+                current_period_end: None,
+                management_url: Some("https://billing.example/session".into()),
+            }),
+            cx,
+        );
+    });
+    view.update(cx, |v, cx| v.select(SettingsPane::General, cx));
+    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+    stores.account.read_with(cx, |s, _| {
+        assert!(
+            !matches!(s.subscription(), Loadable::Loaded { stale: false, .. }),
+            "coming back to the pane must re-ask rather than leave the \
+             previous answer standing as current"
+        );
+    });
+
+    // Deterministic teardown — join the in-flight bridge tasks before `cx`
+    // drops the last `Arc<AppCore>` (see `record_refresh_supersedes_in_flight_fetch`
+    // for why the runtime must be idle first).
+    while core.runtime().metrics().num_alive_tasks() > 0 {
+        std::thread::yield_now();
+    }
+}
+
+#[gpui::test]
 fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext) {
     // With stub stores, every local-model operation clears the standing
     // error and stops at the backend guard — an honest no-op, no phantom
