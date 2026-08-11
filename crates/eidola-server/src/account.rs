@@ -457,12 +457,10 @@ pub async fn get_subscription(
     // where a lapsed subscriber restarts and where receipts live. The two
     // calls are independent given the customer, so they run together
     // rather than stacking their latencies.
-    let (management_url, subscriptions) = tokio::try_join!(
+    let (management_url, in_force) = tokio::try_join!(
         stripe.create_portal_session(&customer_id, BILLING_PORTAL_RETURN_URL),
-        stripe.list_subscriptions(&customer_id),
+        stripe.in_force_subscription(&customer_id),
     )?;
-
-    let in_force = subscriptions.into_iter().find(|s| s.is_in_force());
 
     let Some(sub) = in_force else {
         return Ok(Json(SubscriptionResponse {
@@ -573,10 +571,12 @@ pub async fn create_checkout(
     let price = stripe.get_price(&checkout_req.price_id).await?;
 
     let mode = if price.recurring.is_some() {
-        let subs = stripe.list_subscriptions(&customer_id).await?;
-        // Same predicate `GET /v1/account/subscription` answers with, so a
-        // client shown "no subscription" is never refused here.
-        if subs.iter().any(|s| s.is_in_force()) {
+        // Literally the same question `GET /v1/account/subscription` asks —
+        // one call, one predicate, one walk of the whole list — so a client
+        // shown "no subscription" is never refused here, and a customer whose
+        // in-force subscription sits behind a page of newer attempts can
+        // never be sold a second one.
+        if stripe.in_force_subscription(&customer_id).await?.is_some() {
             return Err(ServerError::Conflict {
                 message: "account already has an active subscription".to_string(),
             });
