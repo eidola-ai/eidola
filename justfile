@@ -159,6 +159,11 @@ test-webhook-smoke:
 update-openapi:
     ./scripts/update-server-openapi.sh
 
+# Regenerate every identity asset from the brand geometry (macOS only —
+# the .icns needs iconutil). See brand/AGENTS.md.
+update-brand:
+    python3 brand/generate.py
+
 # --- CI / Release ---
 
 # Compute enclave measurements from tinfoil-config.yml and CVM artifacts

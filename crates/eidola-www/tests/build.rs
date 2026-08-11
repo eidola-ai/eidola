@@ -174,6 +174,7 @@ fn builds_the_real_site() {
     assert!(out.join("assets/fonts/newsreader-latin.woff2").exists());
     assert!(out.join("robots.txt").exists());
     assert!(out.join("favicon.svg").exists());
+    assert!(out.join("apple-touch-icon.png").exists());
 
     // Sitemap covers the key routes.
     let sitemap = read(&out, "sitemap.xml");

@@ -34,7 +34,10 @@ use serde::Deserialize;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// Static files that belong at the site root rather than under `/assets/`.
-const ROOT_STATIC: &[&str] = &["robots.txt", "favicon.svg", "CNAME"];
+///
+/// The two icons are generated from the brand master by `just update-brand`
+/// (see `brand/AGENTS.md`) — edit that, not the copies in `www/static/`.
+const ROOT_STATIC: &[&str] = &["robots.txt", "favicon.svg", "apple-touch-icon.png", "CNAME"];
 
 /// Docs (paths relative to `docs/`) whose exact source bytes are published
 /// at `<route>/source.md` with their SHA-256 in the page identity. These
