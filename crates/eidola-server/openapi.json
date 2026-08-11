@@ -353,6 +353,63 @@
         ]
       }
     },
+    "/v1/account/portal": {
+      "post": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "POST /v1/account/portal — mint a Stripe billing-portal session\n(authenticated).",
+        "description": "Separate from the subscription read on purpose. Minting is a write to\nStripe and the session expires quickly, so a link that rides a status\nresponse is one no client can responsibly hold — ours already discarded\nit and asked again at the moment of the click. Riding along, it made\nevery status read create-and-throw-away a Stripe session, and put that\nwrite's latency in front of an answer that did not need it.\n\nRefuses for an account with no payment relationship, on the same test\n`GET /v1/account/subscription` calls `none`: a portal minted for someone\nmoney has never moved for is a door onto an empty room.",
+        "operationId": "create_portal_session",
+        "responses": {
+          "200": {
+            "description": "A billing-portal session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No payment relationship to manage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Stripe not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
     "/v1/account/subscription": {
       "get": {
         "tags": [
@@ -1816,6 +1873,19 @@
           }
         }
       },
+      "PortalResponse": {
+        "type": "object",
+        "description": "A freshly minted Stripe billing-portal session.\n\nIts own endpoint rather than a field on the subscription standing:\nminting is a **write** to Stripe and the session expires quickly, so a\nlink handed out with a status read is one the client cannot responsibly\nkeep — and every status read was creating a portal session that was then\nthrown away.",
+        "required": [
+          "portal_url"
+        ],
+        "properties": {
+          "portal_url": {
+            "type": "string",
+            "description": "Open this in a browser now. Short-lived by construction; ask again\nrather than storing it."
+          }
+        }
+      },
       "PriceResponse": {
         "type": "object",
         "description": "A purchasable plan.",
@@ -2066,13 +2136,6 @@
               "null"
             ],
             "description": "The in-force subscription's Stripe id. Present exactly when `state`\nis `active`."
-          },
-          "management_url": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "A Stripe billing-portal session for this customer, when one could be\nminted.\n\n**Advisory, not a state signal.** It is always absent when `state` is\n`none`, but its presence otherwise is not guaranteed: minting can\nfail on its own (no portal configuration, a transient Stripe error)\nwithout that saying anything about the subscription. A client must\nread `state` for the standing and treat this purely as a link it may\nhave been handed — portal sessions are short-lived, so a client that\nopens one should ask for a fresh one at the moment of use rather than\nkeep this."
           },
           "state": {
             "type": "string",

@@ -7,7 +7,6 @@ use axum::response::IntoResponse;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -70,19 +69,20 @@ pub struct SubscriptionResponse {
     /// is `active` and Stripe reported one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_period_end: Option<String>,
-    /// A Stripe billing-portal session for this customer, when one could be
-    /// minted.
-    ///
-    /// **Advisory, not a state signal.** It is always absent when `state` is
-    /// `none`, but its presence otherwise is not guaranteed: minting can
-    /// fail on its own (no portal configuration, a transient Stripe error)
-    /// without that saying anything about the subscription. A client must
-    /// read `state` for the standing and treat this purely as a link it may
-    /// have been handed — portal sessions are short-lived, so a client that
-    /// opens one should ask for a fresh one at the moment of use rather than
-    /// keep this.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub management_url: Option<String>,
+}
+
+/// A freshly minted Stripe billing-portal session.
+///
+/// Its own endpoint rather than a field on the subscription standing:
+/// minting is a **write** to Stripe and the session expires quickly, so a
+/// link handed out with a status read is one the client cannot responsibly
+/// keep — and every status read was creating a portal session that was then
+/// thrown away.
+#[derive(Serialize, ToSchema)]
+pub struct PortalResponse {
+    /// Open this in a browser now. Short-lived by construction; ask again
+    /// rather than storing it.
+    pub portal_url: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -462,25 +462,14 @@ pub async fn get_subscription(
             id: None,
             status: None,
             current_period_end: None,
-            management_url: None,
         }));
     };
 
-    // The two calls are independent given the customer, so they run
-    // together rather than stacking their latencies — but with `join!`, not
-    // `try_join!`. They answer different questions and only one of them is
-    // load-bearing: if Stripe can list subscriptions but will not mint a
-    // portal session (no portal configuration on the account, or a
-    // transient failure), throwing away the standing would tell the app
-    // "unknown", which makes it offer recurring plans to a live subscriber
-    // whose checkout the guard then refuses.
-    let (portal, in_force) = tokio::join!(
-        stripe.create_portal_session(&customer_id, BILLING_PORTAL_RETURN_URL),
-        stripe.in_force_subscription(&customer_id),
-    );
-
-    // The standing is the answer; a failure here is a real failure.
-    let in_force = in_force?;
+    // Nothing but the standing is fetched here. The billing-portal session
+    // this used to mint alongside is its own endpoint now: it was a Stripe
+    // *write* on every status read, discarded unread, whose latency the
+    // answer had to wait for.
+    let in_force = stripe.in_force_subscription(&customer_id).await?;
 
     // A Stripe customer record is not a payment relationship, so the ledger
     // decides whether there is one (see `subscription_standing`). Only asked
@@ -491,62 +480,89 @@ pub async fn get_subscription(
         None => db::has_stripe_ledger_history(&state.db_pool, account_id).await?,
     };
 
-    Ok(Json(subscription_standing(
-        portal,
-        in_force,
-        has_payment_history,
-    )))
+    Ok(Json(subscription_standing(in_force, has_payment_history)))
+}
+
+/// POST /v1/account/portal — mint a Stripe billing-portal session
+/// (authenticated).
+///
+/// Separate from the subscription read on purpose. Minting is a write to
+/// Stripe and the session expires quickly, so a link that rides a status
+/// response is one no client can responsibly hold — ours already discarded
+/// it and asked again at the moment of the click. Riding along, it made
+/// every status read create-and-throw-away a Stripe session, and put that
+/// write's latency in front of an answer that did not need it.
+///
+/// Refuses for an account with no payment relationship, on the same test
+/// `GET /v1/account/subscription` calls `none`: a portal minted for someone
+/// money has never moved for is a door onto an empty room.
+#[utoipa::path(
+    post,
+    path = "/v1/account/portal",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 200, description = "A billing-portal session", body = PortalResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 404, description = "No payment relationship to manage", body = crate::types::ErrorResponse),
+        (status = 503, description = "Stripe not configured", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn create_portal_session(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+) -> Result<Json<PortalResponse>, ServerError> {
+    let stripe = require_stripe(&state.stripe)?;
+    let account = db::get_account_by_id(&state.db_pool, account_id).await?;
+
+    let no_portal = || ServerError::NotFound {
+        message: "no_payment_relationship".to_string(),
+    };
+
+    let customer_id = account.stripe_customer_id.ok_or_else(no_portal)?;
+
+    // An in-force subscription is a relationship by itself; otherwise it
+    // takes money that actually moved. Same predicate as the `none` state,
+    // so the app is never offered a door the server then refuses.
+    let entitled = stripe.in_force_subscription(&customer_id).await?.is_some()
+        || db::has_stripe_ledger_history(&state.db_pool, account_id).await?;
+    if !entitled {
+        return Err(no_portal());
+    }
+
+    let portal_url = stripe
+        .create_portal_session(&customer_id, BILLING_PORTAL_RETURN_URL)
+        .await?;
+
+    Ok(Json(PortalResponse { portal_url }))
 }
 
 /// Turn what Stripe and the ledger said into the account's standing.
 ///
-/// Split out from the handler because the two properties worth pinning are
-/// about exactly this decision, and both used to be wrong:
-///
-/// - **A failed portal mint does not cost the answer.** The two Stripe calls
-///   run concurrently, but they answer different questions and only the
-///   subscription one is load-bearing. Coupling them (a `try_join!`) meant a
-///   customer with no portal configuration, or one transient error, reported
-///   as *unknown* — which makes the app offer recurring plans to a live
-///   subscriber and lets the checkout guard refuse the purchase it just
-///   advertised. The link is dropped; `management_url` is advisory.
-/// - **A customer record is not a payment history.** `create_checkout`
-///   persists the Stripe customer *before* it validates the price or the
-///   reader finishes paying, so a rejected request or an abandoned first
-///   checkout leaves a customer id with nothing under it. Calling that
-///   `inactive` points the reader at a billing portal holding no card, no
-///   invoice and no receipt — so `none` keeps the meaning it always
-///   documented ("has never transacted") by being decided on money that
-///   actually moved.
+/// Split out from the handler because of the property worth pinning:
+/// **a customer record is not a payment history.** `create_checkout`
+/// persists the Stripe customer *before* it validates the price or the
+/// reader finishes paying, so a rejected request or an abandoned first
+/// checkout leaves a customer id with nothing under it. Calling that
+/// `inactive` points the reader at a billing portal holding no card, no
+/// invoice and no receipt — so `none` keeps the meaning it always
+/// documented ("has never transacted") by being decided on money that
+/// actually moved.
 fn subscription_standing(
-    portal: Result<String, ServerError>,
     in_force: Option<crate::stripe::Subscription>,
     has_payment_history: bool,
 ) -> SubscriptionResponse {
-    let management_url = match portal {
-        Ok(url) => Some(url),
-        Err(e) => {
-            warn!("billing portal session could not be created: {}", e);
-            None
-        }
-    };
-
     let Some(sub) = in_force else {
-        if !has_payment_history {
-            return SubscriptionResponse {
-                state: "none".to_string(),
-                id: None,
-                status: None,
-                current_period_end: None,
-                management_url: None,
-            };
-        }
+        let state = if has_payment_history {
+            "inactive"
+        } else {
+            "none"
+        };
         return SubscriptionResponse {
-            state: "inactive".to_string(),
+            state: state.to_string(),
             id: None,
             status: None,
             current_period_end: None,
-            management_url,
         };
     };
 
@@ -556,7 +572,6 @@ fn subscription_standing(
         id: Some(sub.id),
         status: Some(sub.status),
         current_period_end,
-        management_url,
     }
 }
 
@@ -645,9 +660,16 @@ pub async fn create_checkout(
         });
     }
 
-    let customer_id = ensure_stripe_customer(&state.db_pool, stripe, account_id).await?;
-
+    // Price first, customer second. Creating the customer is a durable act
+    // — it persists `stripe_customer_id` — and a rejected price left one
+    // behind with nothing under it, which is the residue `none` now has to
+    // detect through the ledger. Validating first means a refused request
+    // writes nothing at all. (It does not remove the need for that ledger
+    // test: an *abandoned* checkout still leaves a customer behind, and
+    // nothing server-side hears about it.)
     let price = stripe.get_price(&checkout_req.price_id).await?;
+
+    let customer_id = ensure_stripe_customer(&state.db_pool, stripe, account_id).await?;
 
     let mode = if price.recurring.is_some() {
         // Literally the same question `GET /v1/account/subscription` asks —
@@ -818,36 +840,54 @@ mod tests {
         }
     }
 
-    fn portal_failed() -> Result<String, ServerError> {
-        Err(ServerError::Network("stripe error: api_error".to_string()))
-    }
-
+    /// The subscription read must not mint a billing-portal session.
+    ///
+    /// This seam came back three times. Coupling the two calls with
+    /// `try_join!` made a failed portal mint destroy the answer; `join!`
+    /// fixed the error path and left the **latency** — both futures are
+    /// still awaited, so a slow (not failing) mint holds the standing, and
+    /// for that whole time the Account pane shows "unknown" and offers
+    /// recurring plans to a live subscriber. Only removing the call makes
+    /// the standing independent of the portal.
+    ///
+    /// A source scan because there is no other seam: the handler needs a
+    /// database, and what is being asserted is the *absence* of a call.
     #[test]
-    fn a_failed_portal_mint_does_not_cost_the_subscription_answer() {
-        // Coupled to the portal call, a subscriber with no portal
-        // configuration reads as unknown — and the app then offers them the
-        // recurring plans the checkout guard will refuse.
-        let answer =
-            subscription_standing(portal_failed(), Some(in_force_sub(1_900_000_000)), true);
-        assert_eq!(answer.state, "active");
-        assert_eq!(answer.status.as_deref(), Some("active"));
+    fn the_subscription_read_mints_no_portal_session() {
+        let source = include_str!("account.rs");
+        let start = source
+            .find("pub async fn get_subscription(")
+            .expect("the handler");
+        // Up to the next item at column 0 — the handler's whole body.
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
         assert!(
-            answer.management_url.is_none(),
-            "a link that could not be minted must not be invented"
+            !body.contains("create_portal_session"),
+            "get_subscription must not mint a portal session — minting is a \
+             Stripe write whose latency the standing would then wait on; it \
+             lives at POST /v1/account/portal"
+        );
+        assert!(
+            body.contains("in_force_subscription"),
+            "sanity: the scan found the right function body"
         );
     }
 
     #[test]
-    fn a_failed_portal_mint_does_not_cost_a_lapsed_answer_either() {
-        let answer = subscription_standing(portal_failed(), None, true);
-        assert_eq!(answer.state, "inactive");
-        assert!(answer.management_url.is_none());
+    fn the_standing_carries_the_subscription_and_nothing_else() {
+        let answer = subscription_standing(Some(in_force_sub(1_900_000_000)), true);
+        assert_eq!(answer.state, "active");
+        assert_eq!(answer.status.as_deref(), Some("active"));
     }
 
     #[test]
     fn the_billing_period_reaches_the_wire_from_the_subscriptions_items() {
-        let answer =
-            subscription_standing(Ok("https://portal".into()), Some(in_force_sub(0)), true);
+        let answer = subscription_standing(Some(in_force_sub(0)), true);
         assert_eq!(
             answer.current_period_end.as_deref(),
             Some("1970-01-01T00:00:00Z"),
@@ -861,19 +901,14 @@ mod tests {
         // taking payment, so an abandoned session leaves one with nothing
         // under it. "Billing and receipts" for that reader is a door onto an
         // empty room.
-        let answer = subscription_standing(Ok("https://portal".into()), None, false);
+        let answer = subscription_standing(None, false);
         assert_eq!(answer.state, "none");
-        assert!(
-            answer.management_url.is_none(),
-            "no relationship means no portal, even though one was minted"
-        );
     }
 
     #[test]
-    fn a_real_payment_history_keeps_its_billing_door() {
-        let answer = subscription_standing(Ok("https://portal".into()), None, true);
+    fn a_real_payment_history_reads_as_lapsed_rather_than_absent() {
+        let answer = subscription_standing(None, true);
         assert_eq!(answer.state, "inactive");
-        assert_eq!(answer.management_url.as_deref(), Some("https://portal"));
     }
 
     fn doc(document: &str, version: i64) -> db::RequiredDocumentRow {
