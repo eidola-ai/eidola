@@ -10016,14 +10016,22 @@ impl ReferenceEntry {
     /// `read_post` will answer from. Deriving it from the edge row instead
     /// asks a second question of the database at a second moment, and an edit
     /// landing in between makes the two disagree about one handle.
+    ///
+    /// **The whole byline comes from whichever source answered.** A resolved
+    /// node is a post of the turn's own space, so its label is already that
+    /// space's effective one, read in the same round trip as the handle beside
+    /// it — taking the name from the edge row instead would reopen the same
+    /// race one field over, for a value that cannot differ except by drifting.
+    /// The row's label is for the unaddressable arm, where the snapshot has
+    /// nothing and the source space genuinely can name the author differently.
     fn from_edge(row: &db::ReferenceEdgeRow, resolved: Option<&PostNode>) -> Self {
         let target = match resolved {
             Some(n) => ReferenceTarget::Addressable {
                 item_id: n.item_id.clone(),
-                // The author as the *source* space names them — the reading
-                // space may never have met this participant.
-                label: row.antecedent_author_label.clone(),
+                label: n.participant.label.clone(),
             },
+            // The author as the *source* space names them — the reading space
+            // may never have met this participant.
             None => ReferenceTarget::Elsewhere {
                 label: non_blank(&row.antecedent_author_label),
             },
@@ -10172,10 +10180,19 @@ fn reference_block(
 ///
 /// The edge row answers the rest: what the edge carries, by the quotable rule
 /// ([`db::ReferenceEdgeRow::is_quotable`]) plus whether it named a range at
-/// all, and the author's label as the source space writes it. The quotable rule
-/// is **re-applied** rather than assumed: this path needs no tool call and no
-/// membership, so whatever it resolves goes straight into the next reader's
-/// context.
+/// all, and — for an unaddressable target only — the author's label as the
+/// source space writes it. The quotable rule is **re-applied** rather than
+/// assumed: this path needs no tool call and no membership, so whatever it
+/// resolves goes straight into the next reader's context.
+///
+/// **The edges themselves stay a database read on purpose.** A snapshot node
+/// carries its own references, so reading them from `thread` would look like
+/// one fewer round trip — but the question here is what *this exact
+/// generation* quotes, and a context row naming a generation the snapshot no
+/// longer has (an edit landing between the two reads) would then contribute no
+/// references at all. Splitting it this way degrades in the safe direction
+/// instead: the passages always travel, and only their naming falls back to
+/// "elsewhere".
 pub(crate) async fn reference_entries(
     conn: &turso::Connection,
     thread: &ThreadSnapshot,
@@ -12885,22 +12902,27 @@ mod tests {
     /// handle whose `read_post` returns the edited text under the old excerpt.
     #[test]
     fn a_reference_is_named_by_handle_only_when_the_snapshot_renders_it() {
-        let row = quoting_row("Ada");
+        // The two reads disagree — which is what a rename or an edit landing
+        // between them produces.
+        let row = quoting_row("Row Read");
 
         // Not in the snapshot: named, never addressed — and named by the
-        // source space, which is the one thing the row does answer.
-        let named = ReferenceEntry::from_edge(&row, None);
+        // source space, which is what the row is *for*: a passage from
+        // elsewhere carries the name it was written under, and the reading
+        // space may never have met that participant.
         assert_eq!(
-            named.render(),
-            format!("[1] Ada {REFERENCE_ELSEWHERE}\n> passage")
+            ReferenceEntry::from_edge(&row, None).render(),
+            format!("[1] Row Read {REFERENCE_ELSEWHERE}\n> passage")
         );
 
-        // In the snapshot: the handle comes from the node the tools will
-        // resolve, never from the row.
-        let node = tn("a1", "ia1", None, "Ada", "passage");
+        // In the snapshot: **the whole byline** comes from the node the tools
+        // will resolve — handle and name together, from one read. A resolved
+        // node is a post of this space, so its label is already this space's
+        // effective one; the row's copy could only differ by drifting.
+        let node = tn("a1", "ia1", None, "Snapshot Read", "passage");
         assert_eq!(
             ReferenceEntry::from_edge(&row, Some(&node)).render(),
-            format!("[1] {}\n> passage", message_header("ia1", "Ada"))
+            format!("[1] {}\n> passage", message_header("ia1", "Snapshot Read"))
         );
     }
 
