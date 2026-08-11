@@ -58,25 +58,10 @@ impl AccountView {
             cx.observe(&account, |_, _, cx| cx.notify()),
         ];
 
-        // Initial data: prices always; balances only when an account exists.
-        // Each refresh owns its own task slot, so there is no debounce to
-        // dodge.
-        let has_account = config
-            .read(cx)
-            .state()
-            .map(|s| s.has_account)
-            .unwrap_or(false);
-        account.update(cx, |s, cx| {
-            s.refresh_prices(cx);
-            if has_account {
-                s.refresh_balances(cx);
-                // Nothing on the bus can invalidate this — it is a live read
-                // of the payment processor's state, held nowhere — so opening
-                // the pane is when it is asked for.
-                s.refresh_subscription(cx);
-            }
-        });
-
+        // Nothing is fetched here. `SettingsView` builds every pane when the
+        // *window* opens, so a constructor-time read is a read for a reader
+        // who may never come, and the only one they ever get if they do —
+        // see `pane_activated`.
         Self {
             config,
             account,
@@ -89,6 +74,37 @@ impl AccountView {
             manage_task: None,
             _subscriptions,
         }
+    }
+
+    /// The reader has selected this pane — ask for everything it shows.
+    ///
+    /// This is where the pane's remote reads live, not the constructor:
+    /// `SettingsView` eagerly builds all six panes at window creation, so
+    /// construction happens once, for whoever opened Settings, whatever pane
+    /// they then chose. Every one of these cells is a live server read that
+    /// **no `Change` can invalidate** — the balance moves when a webhook
+    /// credits the account and the subscription moves when the reader
+    /// cancels in the browser portal, and neither of those is a local commit
+    /// for the bus to announce. Selecting the pane is therefore the moment
+    /// it is honest to ask.
+    ///
+    /// Each cell owns its own supersede slot, so re-selecting the pane
+    /// quickly replaces an in-flight read rather than stacking on it, and a
+    /// re-read over a value renders `Loaded { stale }` — never a blank.
+    pub fn pane_activated(&mut self, cx: &mut Context<Self>) {
+        let has_account = self
+            .config
+            .read(cx)
+            .state()
+            .map(|s| s.has_account)
+            .unwrap_or(false);
+        self.account.update(cx, |s, cx| {
+            s.refresh_prices(cx);
+            if has_account {
+                s.refresh_balances(cx);
+                s.refresh_subscription(cx);
+            }
+        });
     }
 
     // --- Reset flow (public so behavior tests drive the same path) -------
@@ -466,9 +482,21 @@ impl Render for AccountView {
             // A failed read with nothing behind it is a blank the reader
             // can't get past — the panel says so and offers the way back.
             // A failed *re-read* over a known answer is not: that keeps its
-            // value on screen (below) with a quiet retry beside it, so the
+            // value on screen (below) with a quiet note beside it, so the
             // section never blanks over a refresh error.
             let failed_cold = subscription_error.is_some() && subscription.is_none();
+            // Which reading the section is written from. `NoCustomer` renders
+            // nothing at all: an account that has never transacted has no
+            // payment relationship to report on and no portal to be let into
+            // — a section saying so would be noise, and a door into a billing
+            // portal minted for someone who never paid would be a lie about
+            // what is behind it.
+            let standing = subscription.as_ref().map(|s| s.state);
+            let answered = matches!(
+                standing,
+                Some(SubscriptionState::Active) | Some(SubscriptionState::Inactive)
+            );
+
             if failed_cold {
                 let err = subscription_error.as_deref().unwrap_or_default();
                 col = col.child(div().pt_2().child(section_header("Subscription", cx)));
@@ -496,56 +524,92 @@ impl Render for AccountView {
                             .text_color(theme.muted_foreground)
                             .child("Checking your subscription…"),
                     );
-            } else if subscribed {
-                let info = subscription.as_ref().expect("subscribed implies a value");
-                let summary = subscription_summary(
-                    info.status.as_deref(),
-                    info.current_period_end,
-                    eidola_app_core::now_ms(),
-                );
-                col =
-                    col.child(div().pt_2().child(section_header("Subscription", cx)))
-                        .child(
-                            div()
-                                .id("subscription-summary")
-                                .probe_value(
-                                    "settings/account/subscription",
-                                    gpui::Role::Label,
-                                    "Subscription",
-                                    SharedString::from(summary.clone()),
-                                )
-                                .child(SharedString::from(summary)),
-                        )
+            } else if answered {
+                let info = subscription.as_ref().expect("answered implies a value");
+                // Two standings, two sentences, two doors — and the lapsed
+                // one is not offered "manage your subscription", because
+                // there isn't one. What it still has is a payment
+                // relationship: a card on file, invoices, receipts.
+                let (summary, portal_label, portal_probe, portal_note) = if subscribed {
+                    (
+                        subscription_summary(
+                            info.status.as_deref(),
+                            info.current_period_end,
+                            eidola_app_core::now_ms(),
+                        ),
+                        "Manage subscription",
+                        "settings/account/manage-subscription",
+                        "Opens our payment processor's billing portal in your browser.",
+                    )
+                } else {
+                    (
+                        "You don't have a subscription right now.".to_string(),
+                        "Billing and receipts",
+                        "settings/account/billing-portal",
+                        "Opens our payment processor's billing portal in your browser, \
+                         where your payment methods, invoices and past receipts live.",
+                    )
+                };
+
+                col = col
+                    .child(div().pt_2().child(section_header("Subscription", cx)))
+                    .child(
+                        div()
+                            .id("subscription-summary")
+                            .probe_value(
+                                "settings/account/subscription",
+                                gpui::Role::Label,
+                                "Subscription",
+                                SharedString::from(summary.clone()),
+                            )
+                            .child(SharedString::from(summary)),
+                    );
+
+                // The link itself is minted on the click, so the door is
+                // offered on the standing rather than on the link the pane
+                // happens to hold — but a read that carried none is telling
+                // us there is no customer behind it, and a button that could
+                // only report that is not an affordance.
+                if info.management_url.is_some() {
+                    col = col
                         .child(
                             h_flex().pt_1().child(
                                 // Probed wrapper for the a11y role/label —
                                 // shrink-wraps the button so its bounds are an
                                 // honest click target.
                                 div()
-                                    .id("manage-subscription-wrap")
-                                    .probe(
-                                        "settings/account/manage-subscription",
-                                        gpui::Role::Button,
-                                        "Manage subscription",
-                                    )
+                                    .id("billing-portal-wrap")
+                                    .probe(portal_probe, gpui::Role::Button, portal_label)
                                     .on_click(cx.listener(|this, _, _, cx| this.begin_manage(cx)))
-                                    .child(
-                                        Button::new("manage-subscription")
-                                            .role(None)
-                                            .primary()
-                                            .small()
+                                    .child({
+                                        // Solid while a subscription stands —
+                                        // managing it is the reason to be in
+                                        // this section. Lapsed, the same
+                                        // accent steps back to an outline: the
+                                        // plans below are what that reader
+                                        // most likely came for, and two solid
+                                        // buttons on one pane are two shouts.
+                                        let door =
+                                            Button::new("billing-portal").role(None).primary();
+                                        let door = if subscribed { door } else { door.outline() };
+                                        door.small()
                                             .label(if self.manage_pending {
                                                 "Opening…"
                                             } else {
-                                                "Manage subscription"
+                                                portal_label
                                             })
-                                            .tab_stop(false),
-                                    ),
+                                            .tab_stop(false)
+                                    }),
                             ),
                         )
-                        .child(div().text_sm().text_color(theme.muted_foreground).child(
-                            "Opens our payment processor's billing portal in your browser.",
-                        ));
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(portal_note),
+                        );
+                }
+
                 if let Some(err) = self.manage_error.as_deref() {
                     col = col.child(
                         div()
@@ -560,35 +624,48 @@ impl Render for AccountView {
                             .child(SharedString::from(err.to_string())),
                     );
                 }
-            }
 
-            // A re-read that failed over a known answer keeps that answer on
-            // screen — above, and in what the plans below offer — so all this
-            // owes the reader is that it may be out of date, and the way to
-            // ask again.
-            if subscription_error.is_some() && !failed_cold {
+                // A re-read that failed over a known answer keeps that answer
+                // on screen — above, and in what the plans below offer — so
+                // all it owes the reader is that it may be out of date.
+                if subscription_error.is_some() {
+                    col = col.child(
+                        div()
+                            .pt_1()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(
+                                "Couldn't re-check your subscription — showing the last answer.",
+                            ),
+                    );
+                }
+
+                // **The way to ask again, always.** Nothing on the bus can
+                // invalidate this cell, and the reader's own act of changing
+                // it happens in a browser window this app never hears about:
+                // they cancel in the portal, come back to a Settings window
+                // that never closed, and the pane has no reason to have
+                // asked since. Selecting the pane re-reads
+                // (`pane_activated`), but a reader who never left it needs a
+                // door, and one offered only after a failure is a door that
+                // opens only when it is already too late.
                 col = col.child(
-                    h_flex()
-                        .pt_1()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("Couldn't re-check your subscription — showing the last answer.")
-                        .child(
-                            div()
-                                .id("subscription-stale-retry")
-                                .probe(
-                                    "settings/account/subscription-retry",
-                                    gpui::Role::Button,
-                                    "Check again",
-                                )
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(theme.foreground))
-                                .child("Check again")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.account.update(cx, |s, cx| s.refresh_subscription(cx));
-                                })),
-                        ),
+                    h_flex().pt_1().text_xs().child(
+                        div()
+                            .id("subscription-recheck")
+                            .probe(
+                                "settings/account/subscription-retry",
+                                gpui::Role::Button,
+                                "Check again",
+                            )
+                            .cursor_pointer()
+                            .text_color(theme.muted_foreground)
+                            .hover(|s| s.text_color(theme.foreground))
+                            .child("Check again")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.account.update(cx, |s, cx| s.refresh_subscription(cx));
+                            })),
+                    ),
                 );
             }
         }
