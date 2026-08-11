@@ -340,7 +340,9 @@ fn scenario(core: &AppCore) -> Scenario {
 /// Rule 2. Copy-semantics is the whole privacy model: the excerpt was *copied*
 /// into this conversation, so everyone here reads it — including a participant
 /// that cannot follow the link back. Nothing about the permission model changed
-/// that, and this pins it.
+/// that, and this pins it — now with the attribution the passage travels under
+/// (task 63): a bare blockquote inside someone else's post reads as that
+/// someone's own words.
 #[test]
 fn a_quoted_passage_reaches_participants_who_cannot_follow_it() {
     run(|| {
@@ -367,8 +369,66 @@ fn a_quoted_passage_reaches_participants_who_cannot_follow_it() {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            sent.contains(&format!("> {}", s.quoted_text)),
-            "the quoted passage rides in the context as a blockquote: {sent}"
+            sent.contains(&format!(
+                "[1] You (a post outside this space, or an earlier version)\n> {}",
+                s.quoted_text
+            )),
+            "the quoted passage rides in the context attributed to its author, and says it \
+             came from elsewhere — this space cannot address it by handle: {sent}"
+        );
+    });
+}
+
+/// The subtle half of attribution. A per-space override is that space's name
+/// for a participant, so a passage quoted **out of** another space must carry
+/// the name it was written under — not the reading space's name for the same
+/// participant. Both are the shared "You" here, renamed on each side.
+#[test]
+fn a_cross_space_passage_is_attributed_by_the_space_it_was_written_in() {
+    run(|| {
+        let script = tool_script();
+        let (mock, core, _dir) = setup(script.clone());
+        let s = scenario(&core);
+
+        let rename = |space: &str, label: &str| {
+            core.runtime()
+                .block_on(core.set_space_participant_override(
+                    space.to_string(),
+                    eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                    eidola_app_core::ParticipantOverride {
+                        label: Some(Some(label.to_string())),
+                        model_ref: None,
+                        system_prompt: None,
+                        notify_policy: None,
+                    },
+                ))
+                .expect("override");
+        };
+        rename(&s.source_space, "Tide Watcher");
+        rename(&s.space, "Skipper");
+
+        turn(&core, "So — is it right?", Some(s.space.clone()));
+
+        let body = mock.chat_bodies().pop().expect("a request");
+        let sent = flat_messages(&body)
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            sent.contains(&format!(
+                "[1] Tide Watcher (a post outside this space, or an earlier version)\n> {}",
+                s.quoted_text
+            )),
+            "the byline is the source space's name for the author: {sent}"
+        );
+        assert!(
+            sent.contains("· Skipper\n\nSomeone said this:"),
+            "while this space's own header keeps this space's name for them: {sent}"
+        );
+        assert!(
+            !sent.contains("Skipper (a post outside"),
+            "the reading space's override must never reach a passage from elsewhere: {sent}"
         );
     });
 }
