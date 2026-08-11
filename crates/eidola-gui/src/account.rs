@@ -206,13 +206,16 @@ impl AccountView {
                     match res {
                         Ok(info) => match info.management_url {
                             Some(url) => cx.open_url(&url),
-                            // The server omits the link only for an account
-                            // with no payment customer at all — which is not
-                            // the state this button is offered in, so saying
-                            // so plainly beats inventing a reason.
+                            // The read succeeded and carried no link. Since
+                            // the door is only offered where a payment
+                            // relationship stands, that is the payment
+                            // processor declining to open the portal right
+                            // now — not a statement about the account. Say
+                            // the true, useful thing rather than either.
                             None => {
-                                this.manage_error =
-                                    Some("There is no billing portal for this account.".into());
+                                this.manage_error = Some(
+                                    "Couldn't open the billing portal just now. Try again.".into(),
+                                );
                             }
                         },
                         Err(e) => this.manage_error = Some(e.to_string()),
@@ -485,17 +488,15 @@ impl Render for AccountView {
             // value on screen (below) with a quiet note beside it, so the
             // section never blanks over a refresh error.
             let failed_cold = subscription_error.is_some() && subscription.is_none();
-            // Which reading the section is written from. `NoCustomer` renders
-            // nothing at all: an account that has never transacted has no
-            // payment relationship to report on and no portal to be let into
-            // — a section saying so would be noise, and a door into a billing
-            // portal minted for someone who never paid would be a lie about
-            // what is behind it.
-            let standing = subscription.as_ref().map(|s| s.state);
-            let answered = matches!(
-                standing,
-                Some(SubscriptionState::Active) | Some(SubscriptionState::Inactive)
-            );
+            // Any answered read draws the section — including `NoCustomer`.
+            // What that state withholds is the **billing door**, not the
+            // answer: an account money has never moved for has no payment
+            // relationship to be let into, and a portal session minted for
+            // it would be a door onto an empty room. It still needs the
+            // answer and the way to ask again, because the reader who
+            // completes their first checkout is in exactly this state with
+            // the pane already open in front of them.
+            let answered = subscription.is_some();
 
             if failed_cold {
                 let err = subscription_error.as_deref().unwrap_or_default();
@@ -526,29 +527,38 @@ impl Render for AccountView {
                     );
             } else if answered {
                 let info = subscription.as_ref().expect("answered implies a value");
-                // Two standings, two sentences, two doors — and the lapsed
-                // one is not offered "manage your subscription", because
-                // there isn't one. What it still has is a payment
-                // relationship: a card on file, invoices, receipts.
-                let (summary, portal_label, portal_probe, portal_note) = if subscribed {
-                    (
+                // Three standings, three sentences — and only two doors. The
+                // lapsed one is not offered "manage your subscription",
+                // because there isn't one; what it still has is a payment
+                // relationship, which the server now asserts only for an
+                // account money has actually moved for. `NoCustomer` gets
+                // the sentence and the re-check but no door at all.
+                let (summary, door) = match info.state {
+                    SubscriptionState::Active => (
                         subscription_summary(
                             info.status.as_deref(),
                             info.current_period_end,
                             eidola_app_core::now_ms(),
                         ),
-                        "Manage subscription",
-                        "settings/account/manage-subscription",
-                        "Opens our payment processor's billing portal in your browser.",
-                    )
-                } else {
-                    (
+                        Some((
+                            "Manage subscription",
+                            "settings/account/manage-subscription",
+                            "Opens our payment processor's billing portal in your browser.",
+                        )),
+                    ),
+                    SubscriptionState::Inactive => (
                         "You don't have a subscription right now.".to_string(),
-                        "Billing and receipts",
-                        "settings/account/billing-portal",
-                        "Opens our payment processor's billing portal in your browser, \
-                         where your payment methods, invoices and past receipts live.",
-                    )
+                        Some((
+                            "Billing and receipts",
+                            "settings/account/billing-portal",
+                            "Opens our payment processor's billing portal in your browser, \
+                             where your payment methods, invoices and past receipts live.",
+                        )),
+                    ),
+                    SubscriptionState::NoCustomer => (
+                        "You don't have a subscription on this account.".to_string(),
+                        None,
+                    ),
                 };
 
                 col = col
@@ -565,12 +575,13 @@ impl Render for AccountView {
                             .child(SharedString::from(summary)),
                     );
 
-                // The link itself is minted on the click, so the door is
-                // offered on the standing rather than on the link the pane
-                // happens to hold — but a read that carried none is telling
-                // us there is no customer behind it, and a button that could
-                // only report that is not an affordance.
-                if info.management_url.is_some() {
+                // The door is offered on the **standing**, never on the link
+                // the read happened to carry: that link is minted fresh on
+                // the click, and `management_url` is advisory — a portal
+                // session can fail to mint for reasons that say nothing
+                // about the subscription, and dropping the door for those
+                // would hide billing from a paying customer over a blip.
+                if let Some((portal_label, portal_probe, portal_note)) = door {
                     col = col
                         .child(
                             h_flex().pt_1().child(

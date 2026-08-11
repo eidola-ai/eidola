@@ -838,7 +838,7 @@ mod driver {
             },
             Scene {
                 name: "settings_account_unsubscribed",
-                description: "Settings ▸ Account: funded account with no subscription — the full plans list",
+                description: "Settings ▸ Account: an account that has never transacted — the answer and a re-check, no billing door, the full plans list",
                 default_size: size(px(620.), px(620.)),
                 build: |window, cx| {
                     let stores =

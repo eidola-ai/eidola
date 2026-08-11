@@ -1700,9 +1700,11 @@ fn a_lapsed_account_is_offered_its_billing_and_every_plan(cx: &mut TestAppContex
 fn an_account_that_never_transacted_is_shown_no_billing_door(cx: &mut TestAppContext) {
     use eidola_gui::account::AccountView;
 
-    // No payment customer means no relationship: no standing to report, and
-    // nothing to be let into. A portal session minted for someone who never
-    // paid would be a door onto an empty room.
+    // No payment customer means no relationship to be let into — a portal
+    // session minted for someone money has never moved for would be a door
+    // onto an empty room. The *answer* is still owed, and so is the way to
+    // ask again: a reader who completes their first checkout is in exactly
+    // this state with this pane already open in front of them.
     let _guard = probes_on();
 
     let stores = account_backends_stores(cx);
@@ -1722,11 +1724,21 @@ fn an_account_that_never_transacted_is_shown_no_billing_door(cx: &mut TestAppCon
     });
 
     let names = fresh_names(cx, window);
-    for absent in [
+    // The answer, and the door back to it.
+    for expected in [
         "settings/account/subscription",
+        "settings/account/subscription-retry",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "an account with no payment customer is still owed {expected:?}; \
+             recorded: {names:?}"
+        );
+    }
+    // But no billing door of either wording.
+    for absent in [
         "settings/account/billing-portal",
         "settings/account/manage-subscription",
-        "settings/account/subscription-retry",
     ] {
         assert!(
             !names.contains(&absent.to_string()),
