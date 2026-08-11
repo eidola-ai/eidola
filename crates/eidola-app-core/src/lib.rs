@@ -2908,7 +2908,7 @@ impl Inner {
     async fn expand_context_embeds(
         &self,
         conn: &turso::Connection,
-        space_id: &str,
+        thread: &ThreadSnapshot,
         mut rows: Vec<db::SpaceActionRow>,
     ) -> Result<Vec<db::SpaceActionRow>, AppError> {
         let mut start = 0;
@@ -2917,7 +2917,7 @@ impl Inner {
             while end < rows.len() && rows[end].action_id == rows[start].action_id {
                 end += 1;
             }
-            let entries = reference_entries(conn, space_id, &rows[start].action_id).await?;
+            let entries = reference_entries(conn, thread, &rows[start].action_id).await?;
             if !entries.is_empty() {
                 let mut expanded = std::collections::BTreeSet::new();
                 for row in &mut rows[start..end] {
@@ -4795,12 +4795,21 @@ impl Inner {
                 db::get_upstream_context(&db_conn, target_action_id, false).await?
             }
         };
+        // Built from exactly the materials the GUI renders, so threading and
+        // post rendering have one path each. Also the tools' data source: their
+        // results are this snapshot (stale-ok by contract) — and it is read
+        // **before** the references are rendered, because it is what decides
+        // which of them may be named by handle (see `reference_entries`).
+        let thread = ThreadSnapshot::new(
+            build_post_tree(db::get_space_tree_data(&db_conn, &space_id).await?),
+            now,
+        );
         // Render each post's references the way the human reads them: markers
         // expanded into their attributed passages, and the ones the body never
         // embedded listed in a trailing block. Charge estimation below runs on
         // the rendered array, so the hold covers those bytes.
         let context_rows = self
-            .expand_context_embeds(&db_conn, &space_id, context_rows)
+            .expand_context_embeds(&db_conn, &thread, context_rows)
             .await?;
 
         // ---- Thread map (task 21) -----------------------------------------
@@ -4822,13 +4831,6 @@ impl Inner {
                 }
             }
         }
-        // Built from exactly the materials the GUI renders, so threading and
-        // post rendering have one path each. Also the tools' data source: their
-        // results are this snapshot (stale-ok by contract).
-        let thread = ThreadSnapshot::new(
-            build_post_tree(db::get_space_tree_data(&db_conn, &space_id).await?),
-            now,
-        );
         // Branch summaries are **read** here and nowhere else in the turn path:
         // whatever the background summarizer has committed is rendered, and a
         // missing or lagging one costs the turn nothing (see [`summaries`]). A
@@ -10008,19 +10010,23 @@ pub(crate) struct ReferenceEntry {
 }
 
 impl ReferenceEntry {
-    /// The entry as a reader in `space_id` reads it (the turn's own space, even
-    /// when the post being rendered was followed into another one — only this
-    /// space's handles resolve).
-    fn from_edge(row: &db::ReferenceEdgeRow, space_id: &str) -> Self {
-        let target = if row.is_addressable_in(space_id) {
-            ReferenceTarget::Addressable {
-                item_id: row.antecedent_item_id.clone(),
+    /// The entry as this turn reads it. `resolved` is the snapshot node the
+    /// edge's concrete antecedent action is, when the turn's snapshot has it —
+    /// the **only** addressability oracle, because it is the very structure
+    /// `read_post` will answer from. Deriving it from the edge row instead
+    /// asks a second question of the database at a second moment, and an edit
+    /// landing in between makes the two disagree about one handle.
+    fn from_edge(row: &db::ReferenceEdgeRow, resolved: Option<&PostNode>) -> Self {
+        let target = match resolved {
+            Some(n) => ReferenceTarget::Addressable {
+                item_id: n.item_id.clone(),
+                // The author as the *source* space names them — the reading
+                // space may never have met this participant.
                 label: row.antecedent_author_label.clone(),
-            }
-        } else {
-            ReferenceTarget::Elsewhere {
+            },
+            None => ReferenceTarget::Elsewhere {
                 label: non_blank(&row.antecedent_author_label),
-            }
+            },
         };
         let body = match (row.has_range(), row.range_start, row.range_end) {
             (false, _, _) => ReferenceBody::Backlink,
@@ -10082,7 +10088,12 @@ impl ReferenceEntry {
     /// The entry's lines, without a trailing newline.
     fn render(&self) -> String {
         let byline = match &self.target {
-            ReferenceTarget::Addressable { item_id, label } => message_header(item_id, label),
+            // A label overridden to empty leaves the handle standing alone
+            // rather than a dangling separator.
+            ReferenceTarget::Addressable { item_id, label } => match non_blank(label) {
+                Some(l) => message_header(item_id, &l),
+                None => format!("#{}", post_handle(item_id)),
+            },
             ReferenceTarget::Elsewhere { label: Some(l) } => {
                 format!("{l} {REFERENCE_ELSEWHERE}")
             }
@@ -10154,19 +10165,20 @@ fn reference_block(
 }
 
 /// Every reference edge of `action_id`, keyed by ordinal, rendered for a reader
-/// whose addressable space is `space_id` — the space whose handles this turn's
-/// `ThreadSnapshot` can resolve, which is the turn's own space even when the
-/// post being rendered was followed into another one.
+/// holding `thread` — the turn's snapshot, which is what its navigation tools
+/// answer from and therefore the one authority on which references may be named
+/// by handle. That holds even when the post being rendered was followed into
+/// another space: only this snapshot's handles resolve.
 ///
-/// Both questions an entry answers are answered from the edge row here:
-/// addressability by [`db::ReferenceEdgeRow::is_addressable_in`], and what the
-/// edge carries by the quotable rule ([`db::ReferenceEdgeRow::is_quotable`])
-/// plus whether it named a range at all. The quotable rule is **re-applied**
-/// rather than assumed: this path needs no tool call and no membership, so
-/// whatever it resolves goes straight into the next reader's context.
+/// The edge row answers the rest: what the edge carries, by the quotable rule
+/// ([`db::ReferenceEdgeRow::is_quotable`]) plus whether it named a range at
+/// all, and the author's label as the source space writes it. The quotable rule
+/// is **re-applied** rather than assumed: this path needs no tool call and no
+/// membership, so whatever it resolves goes straight into the next reader's
+/// context.
 pub(crate) async fn reference_entries(
     conn: &turso::Connection,
-    space_id: &str,
+    thread: &ThreadSnapshot,
     action_id: &str,
 ) -> Result<std::collections::BTreeMap<u64, ReferenceEntry>, AppError> {
     let mut entries = std::collections::BTreeMap::new();
@@ -10174,7 +10186,8 @@ pub(crate) async fn reference_entries(
         let Ok(ordinal) = u64::try_from(r.ordinal) else {
             continue;
         };
-        entries.insert(ordinal, ReferenceEntry::from_edge(&r, space_id));
+        let resolved = thread.node_for_action(&r.antecedent_action_id);
+        entries.insert(ordinal, ReferenceEntry::from_edge(&r, resolved));
     }
     Ok(entries)
 }
@@ -11376,6 +11389,14 @@ impl ThreadSnapshot {
         out
     }
 
+    /// The node an action id names, if this snapshot renders that exact
+    /// generation — the addressability oracle. `by_action` holds precisely the
+    /// posts `get_space_tree_data` returned, which is precisely what
+    /// `read_post` can answer with, so "the snapshot has it" is the whole test.
+    fn node_for_action(&self, action_id: &str) -> Option<&PostNode> {
+        self.by_action.get(action_id).map(|&i| &self.nodes[i])
+    }
+
     /// The action a post handle names, if this snapshot knows it — how
     /// `remember` turns the model's `sources: ["#h"]` into real provenance
     /// edges. Same stale-ok contract as the navigation tools: a handle the
@@ -11478,12 +11499,7 @@ impl ThreadSnapshot {
             .references
             .iter()
             .filter_map(|r| {
-                // `by_action` is exactly the renderable current posts of this
-                // space, so a hit *is* the addressability test.
-                let resolved = self
-                    .by_action
-                    .get(&r.antecedent_action_id)
-                    .map(|&i| &self.nodes[i]);
+                let resolved = self.node_for_action(&r.antecedent_action_id);
                 Some((
                     u64::try_from(r.ordinal).ok()?,
                     ReferenceEntry::from_reference(r, resolved),
@@ -12843,6 +12859,67 @@ mod tests {
             assert_eq!(out, "a\n\n{{ embed 3 }}");
             assert!(expanded.is_empty());
         }
+    }
+
+    /// A reference edge quoting a post's text, as the query returns it.
+    fn quoting_row(label: &str) -> db::ReferenceEdgeRow {
+        db::ReferenceEdgeRow {
+            ordinal: 1,
+            antecedent_action_id: "a1".into(),
+            content_block_id: Some("cb1".into()),
+            range_start: Some(0),
+            range_end: Some(7),
+            annotation: None,
+            block_text: Some("passage".into()),
+            antecedent_action_type: "user_input".into(),
+            block_type: Some("text".into()),
+            antecedent_author_label: label.into(),
+        }
+    }
+
+    /// **The turn's snapshot is the only authority on addressability**, because
+    /// it is the structure `read_post` answers from. The edge row cannot say —
+    /// and no longer carries anything that could be mistaken for saying — that
+    /// the post it names is renderable here: the two are separate reads, and
+    /// another window committing an edit between them would otherwise print a
+    /// handle whose `read_post` returns the edited text under the old excerpt.
+    #[test]
+    fn a_reference_is_named_by_handle_only_when_the_snapshot_renders_it() {
+        let row = quoting_row("Ada");
+
+        // Not in the snapshot: named, never addressed — and named by the
+        // source space, which is the one thing the row does answer.
+        let named = ReferenceEntry::from_edge(&row, None);
+        assert_eq!(
+            named.render(),
+            format!("[1] Ada {REFERENCE_ELSEWHERE}\n> passage")
+        );
+
+        // In the snapshot: the handle comes from the node the tools will
+        // resolve, never from the row.
+        let node = tn("a1", "ia1", None, "Ada", "passage");
+        assert_eq!(
+            ReferenceEntry::from_edge(&row, Some(&node)).render(),
+            format!("[1] {}\n> passage", message_header("ia1", "Ada"))
+        );
+    }
+
+    /// A per-space label overridden to empty is a documented state (`NULL`
+    /// inherits, `''` overrides to empty), so every byline has to survive it:
+    /// the handle stands alone rather than trailing the header separator into
+    /// nothing.
+    #[test]
+    fn a_blank_label_never_leaves_a_dangling_separator() {
+        let row = quoting_row("  ");
+        let node = tn("a1", "ia1", None, "  ", "passage");
+        assert_eq!(
+            ReferenceEntry::from_edge(&row, Some(&node)).render(),
+            format!("[1] #{}\n> passage", post_handle("ia1"))
+        );
+        assert_eq!(
+            ReferenceEntry::from_edge(&row, None).render(),
+            format!("[1] {REFERENCE_ELSEWHERE}\n> passage")
+        );
     }
 
     /// The whole point of the three-path rendering: what the body embeds is
