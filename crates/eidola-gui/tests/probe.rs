@@ -3943,6 +3943,7 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
             annotation: None,
             snippet: Some("an earlier passage".into()),
             antecedent_author_label: "Ada".into(),
+            antecedent_author_kind: "agent".into(),
         },
         eidola_app_core::PostReference {
             antecedent_action_id: "x2".into(),
@@ -3953,6 +3954,7 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
             annotation: None,
             snippet: None, // the honest "quoted an earlier version" row
             antecedent_author_label: "Ada".into(),
+            antecedent_author_kind: "agent".into(),
         },
     ];
     cx.update(|cx| {
@@ -4053,6 +4055,225 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
             && names.contains(&"space/highlight/picker/1".to_string()),
         "each candidate is a probed choice: {names:?}"
     );
+}
+
+/// REGRESSION (task 68 + Codex review, PR #292): a footnote row's byline was
+/// resolved *only* against this space's posts, so a cross-space quote — the one
+/// case a reference exists for — lost its author the moment the post persisted.
+/// The draft rail had the name (the picker handed it over), and submitting
+/// replaced it with the literal "another space".
+///
+/// The rail reads the author from the first source that has one, and this
+/// asserts every arm at once on one post:
+///
+/// 1. the in-space post's own **gutter byline**, which is *not* the effective
+///    label the edge carries — a human participant labelled `user` reads "You"
+///    in the gutter, and two names for one person inside one window would be
+///    worse than the bug;
+/// 2. the edge's carried identity, **by name**, for a conversation this window
+///    never loaded;
+/// 3. the edge's carried identity where the label is blank (the schema's
+///    "override to empty"): the *kind* still names them — "You" for the one
+///    human, "Eidola" for an unnamed agent — which is the second half of the
+///    same defect. Composing that quote showed the source window's rendered
+///    byline, so a raw label would have flipped "You" to "another space" at the
+///    durability boundary, exactly as before, one layer down;
+/// 4. `ELSEWHERE` only where nothing names anyone at all.
+#[gpui::test]
+fn space_footnote_rail_names_a_cross_space_author(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let reference = |antecedent: &str, ordinal: i64, kind: &str, label: &str, snippet: &str| {
+        eidola_app_core::PostReference {
+            antecedent_action_id: antecedent.into(),
+            ordinal,
+            content_block_id: Some("bx".into()),
+            range_start: Some(0),
+            range_end: Some(4),
+            annotation: None,
+            snippet: Some(snippet.into()),
+            antecedent_author_label: label.into(),
+            antecedent_author_kind: kind.into(),
+        }
+    };
+
+    // The quoted post that *is* in this space — a human participant, so its
+    // gutter byline is "You" while the edge carries the label "user".
+    let quoted = probe_post("a1", "the sentence everything else hangs off");
+    let mut post = probe_post("a2", "one post, every way of naming a quoted author");
+    post.parent_action_id = Some("a1".into());
+    post.relation = Some("reply".into());
+    post.references = vec![
+        reference("a1", 1, "human", "user", "everything else hangs off"),
+        // Quoted out of a conversation this window never loaded: only the
+        // edge's own identity can name Sofia.
+        reference(
+            "x1",
+            2,
+            "agent",
+            "Sofia",
+            "a passage from another conversation",
+        ),
+        // …and from a space that overrode the label to empty. The kind is what
+        // is left, and it is enough: this is the reader's own passage.
+        reference("x2", 3, "human", "", "a passage of my own from elsewhere"),
+        // The same, for an agent nobody named.
+        reference("x3", 4, "agent", "  ", "a passage by an agent nobody named"),
+        // Nothing names anyone: no label, and a kind with no name of its own.
+        reference(
+            "x4",
+            5,
+            "tool",
+            "",
+            "a passage from a space that names no one",
+        ),
+    ];
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![quoted, post], cx));
+    });
+
+    let entries = fresh_entries(cx, window);
+    for (index, expected) in [
+        (1, "You — everything else hangs off"),
+        (2, "Sofia — a passage from another conversation"),
+        (3, "You — a passage of my own from elsewhere"),
+        (4, "Eidola — a passage by an agent nobody named"),
+        (
+            5,
+            "another space — a passage from a space that names no one",
+        ),
+    ] {
+        assert_probe(
+            &entries,
+            &format!("space/post/1/footnote/{index}"),
+            gpui::Role::Link,
+            &format!("Reference {index}: {expected}"),
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+/// REGRESSION (Codex review, PR #292, round 2): the rail's cross-space
+/// fallback renders the carried identity through the gutter's **whole**
+/// rendering, not only its first pass.
+///
+/// The gutter is two passes — `byline_for_participant` resolves the identity
+/// pair, then an assistant row's byline is resolved *again* through
+/// `SpaceView::model_display` — and both the post gutter and the **draft** rail
+/// read the same `PostData::byline`, so both already show the second pass. A
+/// participant label that parses as a model selector therefore composed as
+/// "Gemma 4 E4B" and persisted as `gemma-4-E4B_q4_0-it@local`: the attribution
+/// changing at the durability boundary, which is the defect this whole PR is
+/// about, one layer down. Nothing mints such a label — `db::default_agent_label`
+/// strips the `@backend` suffix and title-cases — but a reader can type one.
+#[gpui::test]
+fn space_footnote_rail_names_a_cross_space_author_the_way_the_gutter_would(
+    cx: &mut TestAppContext,
+) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.local_models = Some(eidola_app_core::LocalModelsState {
+            engine_path: Some("/opt/eidola/llama-server".into()),
+            external: Vec::new(),
+            models: vec![eidola_app_core::LocalModelInfo {
+                id: "gemma-4-E4B_q4_0-it@local".into(),
+                slug: "gemma-4-E4B_q4_0-it".into(),
+                display_name: "Gemma 4 E4B".into(),
+                file_name: "gemma-4-E4B_q4_0-it.gguf".into(),
+                size_bytes: Some(5_154_939_136),
+                source_url: None,
+                status: eidola_app_core::LocalModelStatus::Available,
+                last_error: None,
+                on_disk: true,
+            }],
+        });
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // A passage quoted out of a conversation this window never loaded, whose
+    // author a reader named after the model it answers with.
+    let mut post = probe_post("a1", "the post that carries the quote");
+    post.references = vec![eidola_app_core::PostReference {
+        antecedent_action_id: "x1".into(),
+        ordinal: 1,
+        content_block_id: Some("bx".into()),
+        range_start: Some(0),
+        range_end: Some(4),
+        annotation: None,
+        snippet: Some("a passage from another conversation".into()),
+        antecedent_author_label: "gemma-4-E4B_q4_0-it@local".into(),
+        antecedent_author_kind: "agent".into(),
+    }];
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/footnote/1",
+        gpui::Role::Link,
+        "Reference 1: Gemma 4 E4B — a passage from another conversation",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// REGRESSION (Codex review, PR #292): a participant label has no maximum
+/// length and the rail's byline sits `flex_none` beside the passage, so a long
+/// one could squeeze the quoted text out of the row it is there to attribute.
+/// It is now bounded — and the bound is **visual only**: the row's accessible
+/// name is built from the whole byline, so a screen reader still hears who
+/// wrote the passage. That is the half a test can see; the elision itself is
+/// the driver scene `space_cross_space_quote`.
+#[gpui::test]
+fn space_footnote_rail_speaks_a_long_byline_in_full(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let long = "Republic Book I Close-Reading Group (Tuesdays, in the long room)";
+    let mut post = probe_post("a1", "a quote from a very long-named colleague");
+    post.references = vec![eidola_app_core::PostReference {
+        antecedent_action_id: "x1".into(),
+        ordinal: 1,
+        content_block_id: Some("bx".into()),
+        range_start: Some(0),
+        range_end: Some(4),
+        annotation: None,
+        snippet: Some("the passage itself".into()),
+        antecedent_author_label: long.into(),
+        antecedent_author_kind: "agent".into(),
+    }];
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/footnote/1",
+        gpui::Role::Link,
+        &format!("Reference 1: {long} — the passage itself"),
+    );
+
+    probe::set_probes_enabled(false);
 }
 
 /// REGRESSION: the Settings window's drag band reserved 44px while every other

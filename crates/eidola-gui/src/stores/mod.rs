@@ -472,10 +472,19 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
         // a promotion adds a row, a retirement removes one, and an "edit
         // everywhere" moves what a row says. Two domains, one invalidation —
         // the dispatcher fans it out rather than either store polling.
+        // The **live transcripts** answer it too, and for the same reason one
+        // domain over: a post's byline and a reference edge's carried author
+        // identity are resolved by `get_space_tree`'s joins at read time and
+        // never re-derived, so a rename left every open window naming the
+        // author as they were when it loaded. See
+        // `SpacesStore::notify_participants_changed`.
         Change::Participants => {
             stores.participants.update(cx, |s, cx| s.refresh_all(cx));
             stores.templates.update(cx, |s, cx| s.refresh(cx));
             stores.agents.update(cx, |s, cx| s.refresh(cx));
+            stores
+                .spaces
+                .update(cx, |s, cx| s.notify_participants_changed(cx));
         }
     }
 }
@@ -492,7 +501,15 @@ fn refresh_everything(stores: &Stores, cx: &mut App) {
         s.refresh_prices(cx);
     });
     stores.wallet.update(cx, |s, cx| s.refresh(cx));
-    stores.spaces.update(cx, |s, cx| s.refresh(cx));
+    // The index *and* the live conversations. A store refresh re-reads only
+    // the Library listing, so before this a lag that swallowed a rename left
+    // every already-open transcript naming its authors as it did when it
+    // loaded — with the incoming-reference and trace caches stale beside it —
+    // while this function claimed to refresh all state (Codex review, PR #292).
+    stores.spaces.update(cx, |s, cx| {
+        s.refresh(cx);
+        s.notify_lagged(cx);
+    });
     stores.update.update(cx, |s, cx| s.refresh(cx));
     stores.templates.update(cx, |s, cx| s.refresh(cx));
     stores.participants.update(cx, |s, cx| s.refresh_all(cx));
