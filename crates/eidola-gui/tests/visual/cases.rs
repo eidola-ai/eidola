@@ -173,6 +173,25 @@ fn register_space(s: &mut Snapshots) {
         })
     });
 
+    // A persisted post quoting across conversations: the footnote rail naming
+    // an author this window holds, one only the edge can name, and one nobody
+    // can — three rows, three sources.
+    s.add(
+        "space_cross_space_quote",
+        size(px(860.), px(760.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let view =
+                    SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+                view.space().update(cx, |sp, cx| {
+                    sp.set_post_tree_for_test(super::fixtures::cross_space_reference_posts(), cx)
+                });
+                view
+            })
+        },
+    );
+
     // Trace visibility: an answered turn's tool rounds expanded under its own
     // reply, and three declines stacked in the gap under the post they
     // answered — one quiet line per turn, each naming its own agent.
@@ -912,9 +931,7 @@ fn settings_backends_stores(cx: &mut App) -> Stores {
             },
         ];
         s.local_models = Some(LocalModelsState {
-            engine_path: Some(
-                "/Applications/Eidola.app/Contents/Resources/bin/llama-server".into(),
-            ),
+            engine_path: Some("/Applications/Eidola.app/Contents/MacOS/llama-server".into()),
             external: vec![ExternalEngineBackend {
                 backend_id: "my-box".into(),
                 display_name: "My box".into(),
