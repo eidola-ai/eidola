@@ -29,8 +29,8 @@
 mod chat_harness;
 
 use chat_harness::{
-    ChatBehavior, HUMAN_LABEL, MODEL, MockConfig, RefundMode, flat_messages, headed,
-    system_message, tool_result_text, with_account,
+    ChatBehavior, HUMAN_LABEL, MODEL, MockConfig, RefundMode, Stamps, TRAILING_BLOCK_NOTE,
+    flat_messages, roster, system_message_with, tool_result_text, trailing, with_account,
 };
 use eidola_app_core::error::AppError;
 use eidola_app_core::tools::EchoTool;
@@ -241,6 +241,7 @@ fn explicit_participant_prepends_effective_system_prompt() {
             .expect("post");
         drive_as(&core, &space, &pirate, &posted.action_id).expect("turn");
 
+        let stamps = Stamps::of(&core, &space);
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 1);
         assert_eq!(
@@ -248,11 +249,28 @@ fn explicit_participant_prepends_effective_system_prompt() {
             vec![
                 (
                     "system".to_string(),
-                    system_message(Some("You are a pirate."))
+                    system_message_with(
+                        Some("You are a pirate."),
+                        "Pirate",
+                        &[TRAILING_BLOCK_NOTE]
+                    )
                 ),
                 (
                     "user".to_string(),
-                    headed(&posted.item_id, HUMAN_LABEL, "ahoy")
+                    stamps.headed(&posted.item_id, HUMAN_LABEL, "ahoy")
+                ),
+                // Three participants ⇒ the roster appears, even with no map.
+                (
+                    "user".to_string(),
+                    trailing(
+                        Some(&roster(&[
+                            (HUMAN_LABEL, "human", false),
+                            ("Gemma4 31b", "agent", false),
+                            ("Pirate", "agent", true),
+                        ])),
+                        None,
+                        &eidola_app_core::post_handle(&posted.item_id),
+                    )
                 ),
             ]
         );
@@ -314,7 +332,8 @@ fn another_participants_traces_never_reach_this_turn() {
         // Bo's turn: Ada's answer, none of Ada's working.
         assert_eq!(
             roles(&bodies[2]),
-            vec!["system", "user", "user"],
+            // …system, the human post, Ada's post, and the trailing roster.
+            vec!["system", "user", "user", "user"],
             "another participant's trace is invisible: {}",
             bodies[2]
         );
@@ -332,7 +351,16 @@ fn another_participants_traces_never_reach_this_turn() {
         // after the post she answered, before the answer it produced.
         assert_eq!(
             roles(&bodies[3]),
-            vec!["system", "user", "assistant", "tool", "assistant", "user"],
+            vec![
+                "system",
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "user",
+                // The trailing roster.
+                "user"
+            ],
         );
         assert_eq!(bodies[3]["messages"][3]["content"], tool_result_text(1));
     });
@@ -384,6 +412,19 @@ fn other_agents_posts_render_as_user_with_a_header() {
                 .clone()
         };
 
+        let stamps = Stamps::of(&core, &space);
+        // Four participants ⇒ the roster rides every turn's trailing block; the
+        // membership is the same, so only the `(you)` marker moves.
+        let members = |you: &str| {
+            roster(&[
+                (HUMAN_LABEL, "human", false),
+                ("Gemma4 31b", "agent", false),
+                ("Ada", "agent", you == "Ada"),
+                ("Bo", "agent", you == "Bo"),
+            ])
+        };
+        let bo_roster = members("Bo");
+        let ada_roster = members("Ada");
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 3, "ada, bo, ada");
 
@@ -392,14 +433,25 @@ fn other_agents_posts_render_as_user_with_a_header() {
         assert_eq!(
             flat_messages(&bodies[1]),
             vec![
-                ("system".to_string(), system_message(Some("I am Bo."))),
                 (
-                    "user".to_string(),
-                    headed(&posted.item_id, HUMAN_LABEL, "what say you both?")
+                    "system".to_string(),
+                    system_message_with(Some("I am Bo."), "Bo", &[TRAILING_BLOCK_NOTE])
                 ),
                 (
                     "user".to_string(),
-                    headed(&item_of(&ada_post), "Ada", "Hello from the stream.")
+                    stamps.headed(&posted.item_id, HUMAN_LABEL, "what say you both?")
+                ),
+                (
+                    "user".to_string(),
+                    stamps.headed(&item_of(&ada_post), "Ada", "Hello from the stream.")
+                ),
+                (
+                    "user".to_string(),
+                    trailing(
+                        Some(&bo_roster),
+                        None,
+                        &eidola_app_core::post_handle(&item_of(&ada_post))
+                    )
                 ),
             ],
             "another agent's post is `user`, never `assistant`"
@@ -410,18 +462,29 @@ fn other_agents_posts_render_as_user_with_a_header() {
         assert_eq!(
             flat_messages(&bodies[2]),
             vec![
-                ("system".to_string(), system_message(Some("I am Ada."))),
+                (
+                    "system".to_string(),
+                    system_message_with(Some("I am Ada."), "Ada", &[TRAILING_BLOCK_NOTE])
+                ),
                 (
                     "user".to_string(),
-                    headed(&posted.item_id, HUMAN_LABEL, "what say you both?")
+                    stamps.headed(&posted.item_id, HUMAN_LABEL, "what say you both?")
                 ),
                 (
                     "assistant".to_string(),
-                    headed(&item_of(&ada_post), "Ada", "Hello from the stream.")
+                    stamps.headed(&item_of(&ada_post), "Ada", "Hello from the stream.")
                 ),
                 (
                     "user".to_string(),
-                    headed(&item_of(&bo_post), "Bo", "Hello from the stream.")
+                    stamps.headed(&item_of(&bo_post), "Bo", "Hello from the stream.")
+                ),
+                (
+                    "user".to_string(),
+                    trailing(
+                        Some(&ada_roster),
+                        None,
+                        &eidola_app_core::post_handle(&item_of(&bo_post))
+                    )
                 ),
             ],
             "only the responder's own prior post is `assistant`"
@@ -479,11 +542,11 @@ fn effective_system_prompt_edit_is_honored_next_turn() {
         assert_eq!(bodies.len(), 2);
         assert_eq!(
             bodies[0]["messages"][0]["content"],
-            system_message(Some("First prompt."))
+            system_message_with(Some("First prompt."), "Bard", &[TRAILING_BLOCK_NOTE])
         );
         assert_eq!(
             bodies[1]["messages"][0]["content"],
-            system_message(Some("Second prompt."))
+            system_message_with(Some("Second prompt."), "Bard", &[TRAILING_BLOCK_NOTE])
         );
     });
 }
@@ -963,7 +1026,8 @@ fn submit_with_references_carries_the_quote_to_the_wire() {
             .iter()
             .map(|m| m["content"].as_str().unwrap_or_default().to_string())
             .collect();
-        let expected = headed(
+        let stamps = Stamps::of(&core, &source.space_id);
+        let expected = stamps.headed(
             &result.post.item_id,
             HUMAN_LABEL,
             &format!(

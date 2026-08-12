@@ -390,24 +390,32 @@ impl MockServer {
 /// compiled-in `DEFAULT_MODEL`, which the harness's [`MODEL`] matches.
 pub const DEFAULT_AGENT_LABEL: &str = "Gemma4 31b";
 
-/// The shared human participant's label.
-pub const HUMAN_LABEL: &str = "You";
+/// The shared human participant's label. Viewpoint-neutral on the wire since
+/// task 64 — the GUI still *displays* "You" for a human labelled `user`, so the
+/// reader's experience is unchanged while the wire stops asserting second
+/// person at a participant who may not be the reader.
+pub const HUMAN_LABEL: &str = "User";
 
 /// The rendering-protocol note app-core appends to every turn's system
 /// message. Pinned here verbatim (the same discipline as pinning the rendered
 /// message bytes) — a change to `HEADER_PROTOCOL_NOTE` in `lib.rs` must be a
 /// deliberate edit here too.
-pub const HEADER_PROTOCOL_NOTE: &str = "Each message in this conversation begins with a one-line header identifying the post and \
-     its author: `#<handle> · <author>`. Handles are assigned by the client; never write a \
-     header line yourself — reply with your message text only.";
+pub const HEADER_PROTOCOL_NOTE: &str = "Each message in this conversation begins with a one-line header identifying the post, its \
+     author, and when it was written: `#<handle> · <author> · <UTC timestamp>`. Handles are \
+     assigned by the client; never write a header line yourself — reply with your message text \
+     only.";
+
+/// The note app-core appends to the system message of any turn that carries a
+/// trailing volatile message at all — a roster, a map, or both. Pinned verbatim,
+/// same discipline as [`HEADER_PROTOCOL_NOTE`].
+pub const TRAILING_BLOCK_NOTE: &str = "The last message is client-generated metadata about this \
+     space, not a post by any participant. No reply is due to it, and it ends by naming the post \
+     you are answering.";
 
 /// The thread-map protocol note app-core appends to the system message of a
-/// turn whose space has branches (task 21). Pinned verbatim, same discipline as
-/// [`HEADER_PROTOCOL_NOTE`].
+/// turn whose space has branches (task 21), after [`TRAILING_BLOCK_NOTE`].
 pub const THREAD_MAP_NOTE: &str = "This space is threaded: the conversation above is one branch of \
-     it, and other branches exist. A `<thread-map>` block appears as the last message listing \
-     them — it is client-generated metadata, not a post by any participant, and no reply is due \
-     to it.";
+     it, and other branches exist. A `<thread-map>` block in that message lists them.";
 
 /// Appended after [`THREAD_MAP_NOTE`] only when the navigation tools actually
 /// attach (i.e. the backend can carry a `tools` field).
@@ -415,17 +423,29 @@ pub const THREAD_MAP_TOOLS_NOTE: &str = "When a map entry looks relevant to what
      read it with the navigation tools (`list_branches`, `read_thread`, `read_post`); otherwise \
      answer from the conversation you were given — most replies need none.";
 
+/// The task-64 identity line: the sentence that tells a model which
+/// participant it is. Written out long-hand (a byte pin, not a
+/// reimplementation) — it leads the notes, i.e. sits directly after the
+/// charter.
+pub fn identity_line(label: &str) -> String {
+    format!("You are \"{label}\" in this conversation.")
+}
+
 /// The exact `system` message content a turn sends: the responding
-/// participant's effective system prompt (when it has one) followed by the
-/// rendering-protocol note.
-pub fn system_message(prompt: Option<&str>) -> String {
-    system_message_with(prompt, &[])
+/// participant's effective system prompt (when it has one), then the identity
+/// line, then the rendering-protocol note.
+///
+/// `responder` is the responding participant's effective label in the space —
+/// the identity line's subject.
+pub fn system_message(prompt: Option<&str>, responder: &str) -> String {
+    system_message_with(prompt, responder, &[])
 }
 
 /// [`system_message`] plus the extra notes a turn appends (the thread-map
 /// notes), joined by blank lines exactly as `prepare_turn` does.
-pub fn system_message_with(prompt: Option<&str>, extra_notes: &[&str]) -> String {
-    let mut notes = vec![HEADER_PROTOCOL_NOTE];
+pub fn system_message_with(prompt: Option<&str>, responder: &str, extra_notes: &[&str]) -> String {
+    let identity = identity_line(responder);
+    let mut notes = vec![identity.as_str(), HEADER_PROTOCOL_NOTE];
     notes.extend_from_slice(extra_notes);
     match prompt {
         Some(p) => {
@@ -438,6 +458,40 @@ pub fn system_message_with(prompt: Option<&str>, extra_notes: &[&str]) -> String
         }
         None => notes.join("\n\n"),
     }
+}
+
+/// The exact task-64 roster block a turn prepends to its trailing volatile
+/// message when the space is multi-party (`has_map || participants > 2`).
+///
+/// `members` is `(label, kind, is_you)` in membership order — written out
+/// long-hand, which is the point: a byte pin, not a reimplementation.
+pub fn roster(members: &[(&str, &str, bool)]) -> String {
+    let mut out = String::from("Participants in this conversation:\n");
+    for (label, kind, you) in members {
+        let you = if *you { " (you)" } else { "" };
+        out.push_str(&format!("- \"{label}\" — {kind}{you}\n"));
+    }
+    out.push_str(
+        "\nEach participant answers for itself; weigh others' posts on their merits rather than \
+         deferring to them.",
+    );
+    out
+}
+
+/// The whole trailing volatile message: the roster (when present), the thread
+/// map (when present), and the `Respond to #h.` pointer that always closes it,
+/// separated by blank lines.
+///
+/// The pointer belongs to the *message*, not to the map, so every shape of the
+/// block ends the same way — a roster-only block included.
+pub fn trailing(roster: Option<&str>, map: Option<&str>, respond_to: &str) -> String {
+    let mut sections: Vec<&str> = Vec::new();
+    sections.extend(roster);
+    sections.extend(map);
+    if sections.is_empty() {
+        return String::new();
+    }
+    format!("{}\n\nRespond to #{respond_to}.", sections.join("\n\n"))
 }
 
 /// The exact `<memory>` section a turn appends to its system message when the
@@ -463,7 +517,7 @@ pub fn memory_section(blocks: &[(&str, &str, &str)]) -> String {
 ///
 /// `forks` is `(anchor_line, entry_lines)` — the expected bytes written out
 /// long-hand, which is the point: this is a byte pin, not a reimplementation.
-pub fn thread_map(forks: &[(String, Vec<String>)], respond_to: &str) -> String {
+pub fn thread_map(forks: &[(String, Vec<String>)]) -> String {
     let mut out = String::from(
         "<thread-map>\nBranches of this space that the conversation above does not contain. Each \
          line: handle · author · posts · last activity — opening line; a branch you have posted \
@@ -479,7 +533,7 @@ pub fn thread_map(forks: &[(String, Vec<String>)], respond_to: &str) -> String {
             out.push('\n');
         }
     }
-    out.push_str(&format!("\nRespond to #{respond_to}.\n</thread-map>"));
+    out.push_str("</thread-map>");
     out
 }
 
@@ -522,14 +576,60 @@ pub fn map_entry_summarized(
     )
 }
 
-/// The exact rendered upstream content of a post: its `#<handle> · <label>`
-/// header line, a blank line, then the text.
-pub fn headed(item_id: &str, label: &str, text: &str) -> String {
+/// The exact rendered upstream content of a post: its
+/// `#<handle> · <label> · <stamp>` header line, a blank line, then the text.
+///
+/// `at_ms` is the post's **current generation's** creation time, which is what
+/// the header stamps (task 64). Tests read it from the space's post tree — see
+/// [`Stamps`] — because it is a real wall-clock value, and pinning it is
+/// exactly how the pins prove the stamp does not drift between turns.
+pub fn headed(item_id: &str, label: &str, at_ms: i64, text: &str) -> String {
     let handle = eidola_app_core::post_handle(item_id);
+    let stamp = eidola_app_core::post_stamp(at_ms);
     if text.is_empty() {
-        format!("#{handle} · {label}")
+        format!("#{handle} · {label} · {stamp}")
     } else {
-        format!("#{handle} · {label}\n\n{text}")
+        format!("#{handle} · {label} · {stamp}\n\n{text}")
+    }
+}
+
+/// Creation times of a space's posts, by item id — the header stamps a turn
+/// will render.
+///
+/// Captured from `get_space_tree`, i.e. from each item's **current
+/// generation**, which is what the header carries. So a snapshot taken before
+/// an edit and one taken after legitimately disagree about that item, and a
+/// test asserting pre-edit bytes must hold the pre-edit snapshot: that is the
+/// semantics, not an accident.
+#[derive(Clone, Debug, Default)]
+pub struct Stamps(std::collections::HashMap<String, i64>);
+
+impl Stamps {
+    /// Capture the space's current post stamps.
+    pub fn of(core: &AppCore, space_id: &str) -> Self {
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space_id.to_string()))
+            .expect("post tree");
+        Self(
+            tree.into_iter()
+                .map(|n| (n.item_id, n.created_at))
+                .collect(),
+        )
+    }
+
+    /// The stamp time of `item_id`. Panics when the item is not in the
+    /// snapshot — a header can only be pinned against a post that exists.
+    pub fn at(&self, item_id: &str) -> i64 {
+        *self
+            .0
+            .get(item_id)
+            .unwrap_or_else(|| panic!("no post stamp captured for item {item_id}"))
+    }
+
+    /// [`headed`] over this snapshot's stamp for `item_id`.
+    pub fn headed(&self, item_id: &str, label: &str, text: &str) -> String {
+        headed(item_id, label, self.at(item_id), text)
     }
 }
 

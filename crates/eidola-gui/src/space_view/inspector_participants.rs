@@ -47,6 +47,7 @@ use crate::participants::{
     ghost_button, ghost_button_labeled, load_error_panel, mode_chip, model_display, model_field,
 };
 use crate::probe::Probe as _;
+use crate::space::display_name_for_participant;
 
 use super::SpaceView;
 
@@ -1431,6 +1432,11 @@ impl SpaceView {
         let is_human = p.kind == "human";
         let is_referenced = p.source == "referenced";
         let pid = p.id.clone();
+        // The reader's name for this participant, never the stored label: the
+        // wire label of the seeded human is `User` (task 64) and this surface's
+        // contract is that display is unchanged. Same rule the post gutter and
+        // the footnote rail read, so one window cannot name one person twice.
+        let display_name = display_name_for_participant(&p.kind, &p.label);
 
         // The identifying line under the name: for an agent, `model · backend`;
         // for the human it would be meaningless (people have no model), and its
@@ -1451,7 +1457,7 @@ impl SpaceView {
             .probe(
                 SharedString::from(format!("space/inspector/participants/{pid}")),
                 gpui::Role::Button,
-                SharedString::from(p.label.clone()),
+                SharedString::from(display_name.clone()),
             )
             .aria_expanded(expanded)
             .w_full()
@@ -1473,7 +1479,7 @@ impl SpaceView {
                                 div()
                                     .text_sm()
                                     .font_medium()
-                                    .child(SharedString::from(p.label.clone())),
+                                    .child(SharedString::from(display_name.clone())),
                             )
                             .when(is_referenced, |el| {
                                 el.child(
@@ -1539,7 +1545,7 @@ impl SpaceView {
         let can_remove = p.id != eidola_app_core::HUMAN_PARTICIPANT_ID
             && !self.inspector_participant_owns_this_notebook(&p.id, cx);
         let remove_id = p.id.clone();
-        let subject = p.label.clone();
+        let subject = display_name_for_participant(&p.kind, &p.label);
         // Only a **space-owned** agent can be shared: a referenced global
         // already is one, and promotion is one-way, so there is deliberately
         // nothing here that reads as "unshare".
@@ -1709,7 +1715,7 @@ impl SpaceView {
     ) -> AnyElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        let name = p.label.clone();
+        let name = display_name_for_participant(&p.kind, &p.label);
         let reassurance = format!(
             "{name} keeps this space's persona exactly as it is, and can then join other spaces. \
              You'll manage it in Settings → Agents. Sharing can't be undone."
@@ -2343,7 +2349,10 @@ impl SpaceView {
             .iter()
             .map(
                 |(pid, message)| match roster.iter().find(|p| &p.id == pid) {
-                    Some(p) => format!("{}: {message}", p.label),
+                    Some(p) => format!(
+                        "{}: {message}",
+                        display_name_for_participant(&p.kind, &p.label)
+                    ),
                     None => message.clone(),
                 },
             )

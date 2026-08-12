@@ -244,7 +244,7 @@ impl Tool for EchoTool {
 // one must get something it can act on, not a failed turn.
 //
 // Attachment is `prepare_turn`'s job, and it is gated: only when the space
-// actually has branches (so a linear space stays byte-identical to pre-task-21)
+// actually has branches (so the field appears with the affordance, once)
 // and only when the endpoint has not been observed to reject a `tools` field.
 // See the `backend_accepts_tools` comment there for why capability is learned
 // per (backend, model) rather than assumed from the backend's kind.
@@ -400,6 +400,7 @@ pub(crate) fn render_followed_post(
     let body = crate::with_header(
         &row.item_id,
         &row.participant_label,
+        row.created_at,
         &crate::render_post_for_model(&row.text, references),
     );
     if row.space_id == current_space_id {
@@ -678,6 +679,10 @@ mod tests {
         assert_eq!(reg.schemas().len(), 1);
     }
 
+    /// The creation time every synthetic followed post carries:
+    /// `2026-08-11T14:02:33Z`.
+    const FOLLOWED_AT: i64 = 1_786_456_953_000;
+
     fn referenced(space: &str, title: Option<&str>, text: &str) -> crate::db::ReferencedPostRow {
         crate::db::ReferencedPostRow {
             space_id: space.to_string(),
@@ -686,6 +691,7 @@ mod tests {
             participant_label: "Ada".to_string(),
             action_type: "inference".to_string(),
             text: text.to_string(),
+            created_at: FOLLOWED_AT,
         }
     }
 
@@ -697,7 +703,7 @@ mod tests {
             rendered,
             format!(
                 "From another conversation you take part in — Tides.\n\n{}",
-                crate::with_header("item-1", "Ada", "Spring tides at syzygy.")
+                crate::with_header("item-1", "Ada", FOLLOWED_AT, "Spring tides at syzygy.")
             )
         );
         // Same space ⇒ not another conversation, just a generation the current
@@ -742,7 +748,7 @@ mod tests {
         assert!(
             rendered.contains(&format!(
                 "As noted:\n\n[1] {}\n> syzygy",
-                crate::message_header("item-bo", "Bo")
+                crate::post_byline("item-bo", "Bo")
             )),
             "{rendered}"
         );
