@@ -4,7 +4,7 @@
 # the shell, icon, dock pinning).
 #
 # The Icon key names a themed icon shipped beside this file as
-# icons/hicolor/{scalable,48x48,128x128,256x256}/apps/tech.m6i.Eidola.{svg,png},
+# icons/hicolor/{scalable,48x48,128x128,256x256}/apps/ai.eidola.app.{svg,png},
 # installed to share/icons/ by the Nix artifact. Generated from the vector
 # master by `just update-brand` — see brand/AGENTS.md.
 [Desktop Entry]
@@ -12,7 +12,7 @@ Type=Application
 Name=Eidola
 Comment=A quiet page for thinking with a machine — private by construction
 Exec=eidola-gui %U
-Icon=tech.m6i.Eidola
+Icon=ai.eidola.app
 Terminal=false
 Categories=Utility;Network;
 Keywords=AI;chat;private;confidential;

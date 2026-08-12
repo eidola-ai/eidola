@@ -821,10 +821,10 @@ fn base_window_options(
 }
 
 /// Wayland application id — must equal the basename of the shipped
-/// `.desktop` file (`releases/linux/tech.m6i.Eidola.desktop`) for the shell
+/// `.desktop` file (`releases/linux/ai.eidola.app.desktop`) for the shell
 /// to resolve the window to its launcher entry (name, icon, pinning).
 #[cfg(not(target_os = "macos"))]
-const APP_ID: &str = "tech.m6i.Eidola";
+const APP_ID: &str = "ai.eidola.app";
 
 /// Open the About window — a small singleton (~360×420). Shows the wordmark,
 /// version, a quiet purpose copy (echoing the welcome page's voice), the
