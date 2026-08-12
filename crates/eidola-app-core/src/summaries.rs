@@ -40,6 +40,25 @@
 //! allowlist already collapse it out — a summary is invisible as a post and
 //! fully present in the Record.
 //!
+//! # What the summarizer reads
+//!
+//! [`ThreadSnapshot::branch_slice`] renders each post the way every model-facing
+//! path renders it (`render_post_for_model`): `{{ embed N }}` markers expand
+//! into their attributed passages and un-embedded references arrive in the
+//! trailing block. The map's own opening line *elides* markers instead, and the
+//! difference is deliberate — that line places a post's bytes under a byline
+//! it has just printed, while this is a model reading the branch in order to
+//! describe it. A post whose point is the passage it quotes would otherwise
+//! summarize to nothing, and unlike a turn's context a summary is **written
+//! down** and read for as long as the branch lives.
+//!
+//! That is also why the per-post budget is spent from both ends
+//! ([`clip_middle`]) rather than head-first: a passage is a range its author
+//! chose and nothing bounds it, so a quotation longer than
+//! [`POST_MAX_BYTES`] would otherwise take the author's own response to it
+//! with it — and the summary that follows would describe the source passage
+//! while omitting the disagreement the branch was opened to make.
+//!
 //! # Model and cost
 //!
 //! v1 shares the space's existing `router_model` as its utility model (one knob
@@ -74,7 +93,7 @@ use uuid::Uuid;
 
 use crate::db;
 use crate::error::AppError;
-use crate::utility::clip;
+use crate::utility::{clip, clip_middle};
 use crate::{Change, Inner, ThreadSnapshot, build_post_tree, now_ms};
 
 /// What this chore is called in diagnostics.
@@ -92,7 +111,10 @@ const BRANCH_HEAD_POSTS: usize = 4;
 /// which is the half a reader deciding whether to open it actually needs.
 const BRANCH_TAIL_POSTS: usize = 8;
 
-/// Per-post byte budget inside that slice.
+/// Per-post byte budget inside that slice. Spent from both ends
+/// ([`clip_middle`]), the same way the slice itself is: these are rendered
+/// post bodies, and an over-budget one is usually a quoted passage with the
+/// author's own response to it after.
 const POST_MAX_BYTES: usize = 600;
 
 /// Byte budget for the stored summary. Two sentences; the map's line format
@@ -162,7 +184,7 @@ pub(crate) fn build_summary_prompt(slice: &BranchSlice) -> String {
         out.push_str(&format!(
             "{}: {}\n",
             p.author,
-            clip(&p.text, POST_MAX_BYTES)
+            clip_middle(&p.text, POST_MAX_BYTES)
         ));
     }
     let mut out = String::from("BRANCH (oldest first):\n");
@@ -488,6 +510,36 @@ mod tests {
         assert!(first < second);
         assert!(prompt.contains('…'), "the long post is clipped");
         assert!(!prompt.contains("omitted"), "nothing was elided");
+    }
+
+    /// A branch post whose marker precedes its own prose expands into a
+    /// passage longer than the per-post budget, and clipping the tail would
+    /// summarize the source passage while dropping the branch author's
+    /// disagreement with it. That summary is written down and read for as
+    /// long as the branch lives, so it is the wrong half to lose.
+    #[test]
+    fn a_long_quote_does_not_evict_the_authors_own_words() {
+        let rendered = format!(
+            "[1] #q2m9zzr · Ada\n> {}\n\nI think that reading is backwards.",
+            "the quoted passage ".repeat(40)
+        );
+        assert!(
+            rendered.len() > POST_MAX_BYTES,
+            "the fixture is over budget"
+        );
+        let prompt = build_summary_prompt(&BranchSlice {
+            head: vec![post("You", &rendered)],
+            tail: Vec::new(),
+            omitted: 0,
+        });
+        assert!(
+            prompt.contains("I think that reading is backwards."),
+            "the author's own words reach the summarizer; got {prompt}"
+        );
+        assert!(
+            prompt.contains("[1] #q2m9zzr · Ada"),
+            "and so does the passage's attribution; got {prompt}"
+        );
     }
 
     #[test]

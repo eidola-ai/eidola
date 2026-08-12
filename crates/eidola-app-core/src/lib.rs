@@ -11570,11 +11570,20 @@ impl ThreadSnapshot {
     /// sends the same prompt twice (which under a billing utility model would
     /// be a charge for an answer that could not have changed). A branch that
     /// fits is entirely `head`, so short branches are unaffected.
+    ///
+    /// Each post arrives as [`Self::post_body`] — the one model-facing
+    /// rendering ([`render_post_for_model`]), not the preview elision the map's
+    /// own opening line uses. The summarizer **reads** the branch rather than
+    /// putting its bytes on a line that already names an author: a post whose
+    /// point is the passage it quotes ("{{ embed 1 }} — I disagree") elides to
+    /// nothing, and the summary it produces is written down and read for as
+    /// long as the branch lives. Attribution is what makes that safe to expand,
+    /// and it is the same attribution `read_thread` shows.
     fn branch_slice(&self, idx: usize, head: usize, tail: usize) -> summaries::BranchSlice {
         let sub = self.subtree(idx);
         let post = |i: usize| summaries::SummaryPost {
             author: self.nodes[i].participant.label.clone(),
-            text: self.texts[i].clone(),
+            text: self.post_body(i),
         };
         if sub.len() <= head + tail {
             return summaries::BranchSlice {
@@ -11844,6 +11853,18 @@ impl ThreadSnapshot {
             })
             .collect();
         render_post_for_model(&self.texts[idx], &entries)
+    }
+
+    /// A post's model-facing body looked up by its **concrete generation**, for
+    /// a reader holding an action id rather than a node index (the may-decline
+    /// router, whose slice comes from `db::get_upstream_context`).
+    ///
+    /// `None` means this snapshot does not have that exact generation — an edit
+    /// landing between the two reads — and the caller keeps the text it already
+    /// had. Degrading to the raw body is the safe direction: it is what that
+    /// path sent before there was a snapshot at all.
+    fn body_for_action(&self, action_id: &str) -> Option<String> {
+        self.by_action.get(action_id).map(|&i| self.post_body(i))
     }
 
     /// The honest answer to a handle this snapshot does not know — a *result*,
