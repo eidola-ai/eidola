@@ -3705,6 +3705,84 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
     );
 }
 
+/// REGRESSION (task 68): a footnote row's byline was resolved *only* against
+/// this space's posts, so a cross-space quote — the one case a reference exists
+/// for — lost its author the moment the post persisted. The draft rail had the
+/// name (the picker handed it over), and submitting replaced it with the
+/// literal "another space".
+///
+/// The rail now reads three sources in order, and this asserts all three at
+/// once on one post: the in-space post's own gutter byline (which is **not**
+/// the effective label the edge carries — a human participant labelled `user`
+/// reads "You" in the gutter, and two names for one person inside one window
+/// would be worse than the bug), then the edge's carried
+/// `antecedent_author_label` (the source space's effective label), and only
+/// then the fallback — for a label a space overrode to empty, where a blank
+/// byline would leave the row's gap standing over nothing.
+#[gpui::test]
+fn space_footnote_rail_names_a_cross_space_author(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let reference = |antecedent: &str, ordinal: i64, label: &str, snippet: &str| {
+        eidola_app_core::PostReference {
+            antecedent_action_id: antecedent.into(),
+            ordinal,
+            content_block_id: Some("bx".into()),
+            range_start: Some(0),
+            range_end: Some(4),
+            annotation: None,
+            snippet: Some(snippet.into()),
+            antecedent_author_label: label.into(),
+        }
+    };
+
+    // The quoted post that *is* in this space — a human participant, so its
+    // gutter byline is "You" while the edge carries the label "user".
+    let quoted = probe_post("a1", "the sentence everything else hangs off");
+    let mut post = probe_post("a2", "three quotes, three ways of naming their author");
+    post.parent_action_id = Some("a1".into());
+    post.relation = Some("reply".into());
+    post.references = vec![
+        reference("a1", 1, "user", "everything else hangs off"),
+        // Quoted out of a conversation this window never loaded: only the
+        // edge's own label can name Sofia.
+        reference("x1", 2, "Sofia", "a passage from another conversation"),
+        // …and the same, from a space that overrode her label to empty.
+        reference("x2", 3, "", "a passage from a space that names no one"),
+    ];
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![quoted, post], cx));
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/1/footnote/1",
+        gpui::Role::Link,
+        "Reference 1: You — everything else hangs off",
+    );
+    assert_probe(
+        &entries,
+        "space/post/1/footnote/2",
+        gpui::Role::Link,
+        "Reference 2: Sofia — a passage from another conversation",
+    );
+    assert_probe(
+        &entries,
+        "space/post/1/footnote/3",
+        gpui::Role::Link,
+        "Reference 3: another space — a passage from a space that names no one",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 /// REGRESSION: the Settings window's drag band reserved 44px while every other
 /// window used 36 — purely to fake the top padding the Backends pane lacked.
 /// Once the band began *blocking* the mouse (task 32), that extra strip sat

@@ -296,6 +296,90 @@ pub fn kitchen_sink_posts() -> Vec<PostNode> {
     ]
 }
 
+/// The cross-space quote scene: a persisted post quoting one passage from
+/// **this** conversation and two from conversations this window has never
+/// loaded — the state the footnote rail used to render as three rows all
+/// reading "another space" (task 68).
+///
+/// Each row exercises one of the rail's three naming sources:
+///
+/// 1. an author this window can see, named by the quoted post's own gutter
+///    byline (which is not the label the edge carries — the reader must not be
+///    shown two names for one person inside one window);
+/// 2. an author only the edge can name (`antecedent_author_label`, the *source*
+///    space's effective label);
+/// 3. an author nobody can name — a space that overrode the label to empty —
+///    where the rail says where the passage came from rather than nothing.
+pub fn cross_space_reference_posts() -> Vec<PostNode> {
+    let source = "Justice can't be whatever the strong declare, or the word does no work at \
+                  all — it just re-describes who won. The interesting version of Thrasymachus \
+                  is the one where the ruler is genuinely competent."
+        .to_string();
+    let quoted_here = "it just re-describes who won";
+    let (here_start, here_end) = byte_range(&source, quoted_here);
+
+    let block = "blk-here";
+    let mut here = fixture_post("c1", "agent", "kimi-k2", "inference", &source, 0, false, 1);
+    here.blocks[0].id = block.into();
+    here.created_at = 1;
+
+    let mut reply = fixture_post(
+        "c2",
+        "human",
+        "user",
+        "user_input",
+        "Three passages, and only one of them is from this conversation.\n\n\
+         {{ embed 1 }}\n\nSofia put it the other way round over in the seminar thread:\n\n\
+         {{ embed 2 }}\n\nThe third I'm still chewing on.",
+        0,
+        false,
+        1,
+    );
+    reply.parent_action_id = Some("c1".into());
+    reply.relation = Some("reply".into());
+    reply.created_at = 2;
+    reply.references = vec![
+        PostReference {
+            antecedent_action_id: "c1".into(),
+            ordinal: 1,
+            content_block_id: Some(block.into()),
+            range_start: Some(here_start),
+            range_end: Some(here_end),
+            annotation: None,
+            snippet: Some(quoted_here.into()),
+            // What this space calls the participant — carried on every edge,
+            // and deliberately *not* what the rail shows for a post it holds.
+            antecedent_author_label: "kimi-k2".into(),
+        },
+        PostReference {
+            antecedent_action_id: "x-seminar-1".into(),
+            ordinal: 2,
+            content_block_id: Some("blk-seminar".into()),
+            range_start: Some(0),
+            range_end: Some(74),
+            annotation: None,
+            snippet: Some(
+                "competence is exactly what makes the question sharp, not what dissolves it".into(),
+            ),
+            antecedent_author_label: "Sofia".into(),
+        },
+        PostReference {
+            antecedent_action_id: "x-anon-1".into(),
+            ordinal: 3,
+            content_block_id: Some("blk-anon".into()),
+            range_start: Some(0),
+            range_end: Some(58),
+            annotation: None,
+            snippet: Some("a craft that aims past its object is two crafts, badly joined".into()),
+            // A space that overrode this participant's label to empty: the
+            // schema's "override to empty", and the rail's fallback case.
+            antecedent_author_label: String::new(),
+        },
+    ];
+
+    vec![here, reply]
+}
+
 /// The quoted-references scene's source-post body — the text every range in
 /// [`quoted_reference_posts`] is measured against. A `fn`, not an inline
 /// literal, so a caller (the driver's composing scene) computes the same byte
@@ -391,7 +475,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
         range_end: Some(a_end),
         annotation: None,
         snippet: Some(quoted_a.into()),
-        antecedent_author_label: "Ada".into(),
+        antecedent_author_label: "kimi-k2".into(),
     }];
 
     // A branch quoting the overlapping span plus a second passage — two
@@ -421,7 +505,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
             snippet: src
                 .get(a_start as usize..a_long_end as usize)
                 .map(String::from),
-            antecedent_author_label: "Ada".into(),
+            antecedent_author_label: "kimi-k2".into(),
         },
         PostReference {
             antecedent_action_id: "q1".into(),
@@ -431,7 +515,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
             range_end: Some(b_end),
             annotation: None,
             snippet: Some(quoted_b.into()),
-            antecedent_author_label: "Ada".into(),
+            antecedent_author_label: "kimi-k2".into(),
         },
     ];
 
