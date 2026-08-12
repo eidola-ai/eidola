@@ -855,6 +855,19 @@ pub struct PostReference {
     /// a passage from elsewhere, on both the rail and the wire. Blank only if
     /// that space overrode the label to empty.
     pub antecedent_author_label: String,
+    /// The quoted post's author's **kind** (`human` | `agent` | `tool` |
+    /// `system`), joined exactly as the label is — on the antecedent's own
+    /// space.
+    ///
+    /// It travels beside the label because a *label alone cannot be rendered*:
+    /// every surface that names an author reads the pair, and the pair is what
+    /// says "You" for the one human, "Eidola" for an unnamed agent, and
+    /// "System" for the harness. A reader handed only the label has to invent
+    /// a rule for the blank case (the schema's non-NULL "override to empty" is
+    /// a state that really occurs), and any rule it invents will disagree with
+    /// the one its own gutter applies to a post it *can* see — which is the
+    /// same author, named twice, in one window.
+    pub antecedent_author_kind: String,
 }
 
 /// A reference to attach to a new post (the write-side twin of
@@ -11128,6 +11141,7 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
                     annotation: e.annotation,
                     snippet,
                     antecedent_author_label: e.antecedent_author_label,
+                    antecedent_author_kind: e.antecedent_author_kind,
                 });
         }
     }
@@ -12512,6 +12526,7 @@ mod tests {
             annotation: None,
             snippet: Some("Because of the moon.".into()),
             antecedent_author_label: "Ada".into(),
+            antecedent_author_kind: "agent".into(),
         }];
         ThreadSnapshot::new(
             vec![
@@ -12718,6 +12733,7 @@ mod tests {
                 annotation: None,
                 snippet: Some("Because of the moon.".into()),
                 antecedent_author_label: "Agent".into(),
+                antecedent_author_kind: "agent".into(),
             },
             PostReference {
                 antecedent_action_id: "elsewhere".into(),
@@ -12728,6 +12744,7 @@ mod tests {
                 annotation: Some("no marker for this one".into()),
                 snippet: Some("from another space".into()),
                 antecedent_author_label: "Cy".into(),
+                antecedent_author_kind: "agent".into(),
             },
         ];
         let snap = ThreadSnapshot::new(
@@ -12941,6 +12958,7 @@ mod tests {
             antecedent_action_type: "user_input".into(),
             block_type: None,
             antecedent_author_label: "You".into(),
+            antecedent_author_kind: "human".into(),
         }
     }
 
@@ -13144,6 +13162,7 @@ mod tests {
                     antecedent_action_type: "user_input".into(),
                     block_type: Some("text".into()),
                     antecedent_author_label: "You".into(),
+                    antecedent_author_kind: "human".into(),
                 },
             ],
         };
@@ -13340,6 +13359,7 @@ mod tests {
             annotation: None,
             snippet: Some("passage".into()),
             antecedent_author_label: label.into(),
+            antecedent_author_kind: "agent".into(),
         }
     }
 
