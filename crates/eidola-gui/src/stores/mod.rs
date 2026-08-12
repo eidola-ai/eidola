@@ -501,7 +501,15 @@ fn refresh_everything(stores: &Stores, cx: &mut App) {
         s.refresh_prices(cx);
     });
     stores.wallet.update(cx, |s, cx| s.refresh(cx));
-    stores.spaces.update(cx, |s, cx| s.refresh(cx));
+    // The index *and* the live conversations. A store refresh re-reads only
+    // the Library listing, so before this a lag that swallowed a rename left
+    // every already-open transcript naming its authors as it did when it
+    // loaded — with the incoming-reference and trace caches stale beside it —
+    // while this function claimed to refresh all state (Codex review, PR #292).
+    stores.spaces.update(cx, |s, cx| {
+        s.refresh(cx);
+        s.notify_lagged(cx);
+    });
     stores.update.update(cx, |s, cx| s.refresh(cx));
     stores.templates.update(cx, |s, cx| s.refresh(cx));
     stores.participants.update(cx, |s, cx| s.refresh_all(cx));

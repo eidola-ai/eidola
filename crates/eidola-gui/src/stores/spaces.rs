@@ -325,7 +325,39 @@ impl SpacesStore {
     pub fn notify_participants_changed(&mut self, cx: &mut Context<Self>) {
         for weak in self.registry.values() {
             if let Some(entity) = weak.upgrade() {
-                entity.update(cx, |space, cx| space.on_participants_changed(cx));
+                entity.update(cx, |space, cx| space.invalidate_transcript(cx));
+            }
+        }
+    }
+
+    /// The `Lagged` response for the live spaces: the bus dropped changes we
+    /// can no longer name, so every open conversation drops everything it
+    /// resolved at read time — its transcript (post gutters, minimap labels and
+    /// the footnote rails' carried author identities), its incoming-reference
+    /// index, and its trace rounds.
+    ///
+    /// **A store refresh does not reach any of it** (Codex review, PR #292).
+    /// `stores::refresh_everything` re-read `SpacesStore::refresh` — the
+    /// *Library index* — and nothing told the live `Space` entities anything,
+    /// so a lag that swallowed a rename left every already-open transcript
+    /// naming its authors as it did when it loaded, indefinitely, while the
+    /// recovery claimed to have refreshed all state. The other two caches are
+    /// the same gap in the same function: they are per-entity state whose only
+    /// invalidation route is [`Self::notify_space_changed`], which the lagged
+    /// path never called either.
+    ///
+    /// This is the whole of what `Change::Participants` + `Change::Space` do to
+    /// a live space, minus the id — which is right, since a lag knows nothing
+    /// about which space changed. Each entity's own busy gate still applies,
+    /// and now defers rather than discards.
+    pub fn notify_lagged(&mut self, cx: &mut Context<Self>) {
+        for weak in self.registry.values() {
+            if let Some(entity) = weak.upgrade() {
+                entity.update(cx, |space, cx| {
+                    space.invalidate_incoming_references(cx);
+                    space.invalidate_traces(cx);
+                    space.invalidate_transcript(cx);
+                });
             }
         }
     }
