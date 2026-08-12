@@ -9238,6 +9238,7 @@ fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
             range_end: Some(4),
             annotation: None,
             snippet: Some("some passage".into()),
+            antecedent_author_label: "Ada".into(),
         },
         eidola_app_core::PostReference {
             antecedent_action_id: "x2".into(),
@@ -9249,6 +9250,7 @@ fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
             // The stored range no longer maps — the rail says so rather than
             // guessing at a remap.
             snippet: None,
+            antecedent_author_label: "Ada".into(),
         },
     ];
     seed_quotable_space(&view, window, cx, vec![post]);

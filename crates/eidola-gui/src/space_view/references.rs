@@ -2355,6 +2355,7 @@ mod tests {
             range_end: Some(4),
             annotation: None,
             snippet: snippet.map(String::from),
+            antecedent_author_label: "Ada".into(),
         };
         // A mapped marker standing as its own paragraph is elided.
         let doc = "before\n\n{{ embed 1 }}\n\nafter";

@@ -342,7 +342,9 @@ fn scenario(core: &AppCore) -> Scenario {
 /// Rule 2. Copy-semantics is the whole privacy model: the excerpt was *copied*
 /// into this conversation, so everyone here reads it — including a participant
 /// that cannot follow the link back. Nothing about the permission model changed
-/// that, and this pins it.
+/// that, and this pins it — now with the attribution the passage travels under
+/// (task 63): a bare blockquote inside someone else's post reads as that
+/// someone's own words.
 #[test]
 fn a_quoted_passage_reaches_participants_who_cannot_follow_it() {
     run(|| {
@@ -369,8 +371,66 @@ fn a_quoted_passage_reaches_participants_who_cannot_follow_it() {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            sent.contains(&format!("> {}", s.quoted_text)),
-            "the quoted passage rides in the context as a blockquote: {sent}"
+            sent.contains(&format!(
+                "[1] You (a post outside this space, or an earlier version)\n> {}",
+                s.quoted_text
+            )),
+            "the quoted passage rides in the context attributed to its author, and says it \
+             came from elsewhere — this space cannot address it by handle: {sent}"
+        );
+    });
+}
+
+/// The subtle half of attribution. A per-space override is that space's name
+/// for a participant, so a passage quoted **out of** another space must carry
+/// the name it was written under — not the reading space's name for the same
+/// participant. Both are the shared "You" here, renamed on each side.
+#[test]
+fn a_cross_space_passage_is_attributed_by_the_space_it_was_written_in() {
+    run(|| {
+        let script = tool_script();
+        let (mock, core, _dir) = setup(script.clone());
+        let s = scenario(&core);
+
+        let rename = |space: &str, label: &str| {
+            core.runtime()
+                .block_on(core.set_space_participant_override(
+                    space.to_string(),
+                    eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                    eidola_app_core::ParticipantOverride {
+                        label: Some(Some(label.to_string())),
+                        model_ref: None,
+                        system_prompt: None,
+                        notify_policy: None,
+                    },
+                ))
+                .expect("override");
+        };
+        rename(&s.source_space, "Tide Watcher");
+        rename(&s.space, "Skipper");
+
+        turn(&core, "So — is it right?", Some(s.space.clone()));
+
+        let body = mock.chat_bodies().pop().expect("a request");
+        let sent = flat_messages(&body)
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            sent.contains(&format!(
+                "[1] Tide Watcher (a post outside this space, or an earlier version)\n> {}",
+                s.quoted_text
+            )),
+            "the byline is the source space's name for the author: {sent}"
+        );
+        assert!(
+            sent.contains("· Skipper\n\nSomeone said this:"),
+            "while this space's own header keeps this space's name for them: {sent}"
+        );
+        assert!(
+            !sent.contains("Skipper (a post outside"),
+            "the reading space's override must never reach a passage from elsewhere: {sent}"
         );
     });
 }
@@ -441,6 +501,172 @@ fn an_agent_follows_a_quote_only_once_it_is_granted_membership() {
         assert!(
             followed.contains("The sun and moon align to make spring tides at syzygy"),
             "the whole post, not just the excerpt: {followed}"
+        );
+    });
+}
+
+/// **A sibling branch is absent from the turn's context, so a tool result is
+/// the model's only view of a post there** — and the author of what that post
+/// quotes has to survive the trip. `read_thread` reads a snapshot, and only the
+/// source space can name a cross-space author, so the label travels on the
+/// reference row rather than being re-derived from the reading space (which has
+/// never met that participant, and whose own name for them would misattribute).
+#[test]
+fn a_sibling_branchs_cross_space_quote_keeps_its_author_through_read_thread() {
+    run(|| {
+        let script = tool_script();
+        let (mock, core, _dir) = setup(script.clone());
+        let s = scenario(&core);
+
+        // The same participant, named differently on each side.
+        let rename = |space: &str, label: &str| {
+            core.runtime()
+                .block_on(core.set_space_participant_override(
+                    space.to_string(),
+                    eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                    eidola_app_core::ParticipantOverride {
+                        label: Some(Some(label.to_string())),
+                        model_ref: None,
+                        system_prompt: None,
+                        notify_policy: None,
+                    },
+                ))
+                .expect("override");
+        };
+        rename(&s.source_space, "Tide Watcher");
+        rename(&s.space, "Skipper");
+
+        // Answer in the *other* branch, so the quoting post is a sibling: it is
+        // not in this turn's ancestry and reaches the model only if it asks.
+        let other_branch = core
+            .runtime()
+            .block_on(core.get_space_tree(s.space.clone()))
+            .expect("tree")
+            .into_iter()
+            .find(|n| {
+                n.blocks.iter().any(|b| {
+                    b.text
+                        .as_deref()
+                        .is_some_and(|t| t.contains("Another angle entirely"))
+                })
+            })
+            .expect("the other branch")
+            .action_id;
+        reply(&core, "Let's stay on this one.", &s.space, &other_branch);
+
+        *script.lock().unwrap() = vec![(
+            "read_thread".into(),
+            serde_json::json!({ "handle": s.quoting_handle }).to_string(),
+        )];
+        turn(&core, "What else is there?", Some(s.space.clone()));
+
+        // The premise, pinned: the sibling branch's post is nowhere in the
+        // context the turn was given.
+        let context = mock
+            .chat_bodies()
+            .iter()
+            .flat_map(|b| flat_messages(b).into_iter().map(|(_, c)| c))
+            .filter(|c| !c.starts_with("Thread from"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !context.contains(s.quoted_text),
+            "a sibling branch must not leak into the context: {context}"
+        );
+
+        let read = last_tool_result(&mock);
+        assert!(
+            read.contains(&format!(
+                "[1] Tide Watcher (a post outside this space, or an earlier version)\n> {}",
+                s.quoted_text
+            )),
+            "the only view of that passage keeps the name it was written under: {read}"
+        );
+        assert!(
+            !read.contains("Skipper (a post outside"),
+            "and never the reading space's name for the same participant: {read}"
+        );
+    });
+}
+
+/// A followed post is a post. It reaches the model through its own rendering
+/// path (`render_followed_post`), and that path renders references the way
+/// every other one does: the embedded quote expanded and attributed where the
+/// author put it, the un-embedded one footnoted, no literal marker anywhere.
+/// Its bylines are addressed from **this** turn's space, so a quote of a post
+/// in the followed conversation is named rather than given a handle that would
+/// open nothing here.
+#[test]
+fn a_followed_post_renders_its_own_quotes_like_every_other_post() {
+    run(|| {
+        let script = tool_script();
+        let (mock, core, _dir) = setup(script.clone());
+        let s = scenario(&core);
+
+        // In the source conversation, a post that itself quotes twice: once
+        // embedded, once with no marker at all.
+        let embedded = quote_of(&core, &s.source_space, &s.source_post, "sun and moon align");
+        let orphaned = quote_of(&core, &s.source_space, &s.source_post, "twice a month");
+        let quoting_there = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "As I said:\n\n{{ embed 1 }}\n\nAnd there is more.".into(),
+                Some(s.source_space.clone()),
+                None,
+                vec![embedded, orphaned],
+            ))
+            .expect("a post that quotes in its own space");
+
+        // Here, a post quoting *that* post — the one the model will follow.
+        let spec = quote_of(
+            &core,
+            &s.source_space,
+            &quoting_there.action_id,
+            "As I said",
+        );
+        let here = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "Look at this:\n\n{{ embed 1 }}".into(),
+                Some(s.space.clone()),
+                None,
+                vec![spec],
+            ))
+            .expect("the human quotes a space it belongs to");
+
+        core.runtime()
+            .block_on(core.grant_space_membership(
+                s.source_space.clone(),
+                s.agent.clone(),
+                eidola_app_core::MembershipRole::Observer,
+            ))
+            .expect("share and grant");
+
+        script_follow(&script, &post_handle(&here.item_id), 1);
+        turn(&core, "Where is that from?", Some(s.space.clone()));
+        let followed = last_tool_result(&mock);
+
+        assert!(
+            followed.starts_with("From another conversation you take part in — Tides.\n\n#"),
+            "{followed}"
+        );
+        assert!(
+            followed.contains(
+                "As I said:\n\n[1] You (a post outside this space, or an earlier version)\n\
+                 > sun and moon align\n\nAnd there is more."
+            ),
+            "the followed post's embedded quote expands in place, attributed: {followed}"
+        );
+        assert!(
+            followed.ends_with(
+                "Passages this post quotes:\n\
+                 [2] You (a post outside this space, or an earlier version)\n> twice a month"
+            ),
+            "and the one it never embedded is footnoted: {followed}"
+        );
+        assert!(
+            !followed.contains("{{ embed"),
+            "no literal marker survives a follow: {followed}"
         );
     });
 }
@@ -818,13 +1044,20 @@ fn an_unvalidated_reference_to_a_non_post_is_withheld_by_every_read() {
             serde_json::json!({ "block": "about-this-space", "text": SECRET }).to_string(),
         )];
         turn(&core, "Noted?", Some(space.clone()));
-        let memory_action = core
+        let agent_label = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.id == agent)
+            .expect("the agent")
+            .label;
+        let blocks = core
             .runtime()
             .block_on(core.memory_blocks(agent))
-            .expect("memory")[0]
-            .revisions[0]
-            .action_id
-            .clone();
+            .expect("memory");
+        let memory_action = blocks[0].revisions[0].action_id.clone();
+        let memory_item = blocks[0].item_id.clone();
 
         // A post carrying an embed marker, and — below the gate — the edge the
         // gate would have refused.
@@ -874,6 +1107,21 @@ fn an_unvalidated_reference_to_a_non_post_is_withheld_by_every_read() {
         assert!(
             !quoted_message.contains(SECRET),
             "a non-post reference must never expand into upstream context: {quoted_message}"
+        );
+        // The edge is still reported — existence is public — but it is *named*,
+        // never addressed: the action is current and lives in this space, yet
+        // the snapshot excludes it, so its item handle would resolve to
+        // nothing. Only a renderable post earns a handle.
+        assert!(
+            quoted_message.contains(&format!(
+                "Passages this post quotes:\n\
+                 [1] {agent_label} (a post outside this space, or an earlier version)"
+            )),
+            "an unaddressable target is named, not addressed: {quoted_message}"
+        );
+        assert!(
+            !quoted_message.contains(&format!("[1] #{}", post_handle(&memory_item))),
+            "no handle for a target read_post cannot return: {quoted_message}"
         );
 
         // (3) The follow refuses to render it, without saying what it is.
