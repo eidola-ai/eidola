@@ -1212,6 +1212,97 @@ fn settings_account_pane_reachable_at_top_level(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn settings_asks_the_account_pane_for_its_live_reads_on_every_visit(cx: &mut TestAppContext) {
+    // The Account pane's balance and subscription are live server reads that
+    // **no `Change` can invalidate**: a webhook credits the account, or the
+    // reader cancels a subscription in a browser portal, and nothing local
+    // commits for the bus to announce. `SettingsView` builds all six panes
+    // when the *window* opens, so construction is not the moment to ask —
+    // selecting the pane is, and selecting it again is too.
+    //
+    // Only a real backend can answer "did the pane ask?": the stub stores'
+    // `refresh_*` are no-ops by design. Nothing here waits on the network —
+    // a refresh marks its cell before it spawns, which is the whole
+    // assertion.
+    use eidola_gui::loadable::Loadable;
+
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
+        .unwrap();
+    // A configured account is what makes the balance and subscription reads
+    // meaningful; the pane gates them on exactly this.
+    core.set_account_credentials("acct".into(), "secret".into())
+        .unwrap();
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    stores.config.update(cx, |s, cx| s.refresh(cx));
+
+    let (_w, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+
+    // Settings opens on General. Every pane exists; none of Account's live
+    // reads has been asked for.
+    stores.account.read_with(cx, |s, _| {
+        assert!(
+            matches!(s.subscription(), Loadable::NotLoaded),
+            "building the pane must not read the subscription"
+        );
+        assert!(
+            matches!(s.balances(), Loadable::NotLoaded),
+            "building the pane must not read the balance"
+        );
+    });
+
+    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+    stores.account.read_with(cx, |s, _| {
+        assert!(
+            !matches!(s.subscription(), Loadable::NotLoaded),
+            "selecting the pane must ask for the subscription"
+        );
+        assert!(
+            !matches!(s.balances(), Loadable::NotLoaded),
+            "selecting the pane must ask for the balance"
+        );
+    });
+
+    // Now the reader leaves, changes their subscription in a browser, and
+    // comes back. Standing in for "the answer we already have", so the
+    // second visit has something it could wrongly leave alone.
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            Loadable::loaded(eidola_app_core::SubscriptionInfo {
+                state: eidola_app_core::SubscriptionState::Active,
+                status: Some("active".into()),
+                current_period_end: None,
+            }),
+            cx,
+        );
+    });
+    view.update(cx, |v, cx| v.select(SettingsPane::General, cx));
+    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+    stores.account.read_with(cx, |s, _| {
+        assert!(
+            !matches!(s.subscription(), Loadable::Loaded { stale: false, .. }),
+            "coming back to the pane must re-ask rather than leave the \
+             previous answer standing as current"
+        );
+    });
+
+    // Deterministic teardown — join the in-flight bridge tasks before `cx`
+    // drops the last `Arc<AppCore>` (see `record_refresh_supersedes_in_flight_fetch`
+    // for why the runtime must be idle first).
+    while core.runtime().metrics().num_alive_tasks() > 0 {
+        std::thread::yield_now();
+    }
+}
+
+#[gpui::test]
 fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext) {
     // With stub stores, every local-model operation clears the standing
     // error and stops at the backend guard — an honest no-op, no phantom
@@ -1616,6 +1707,308 @@ fn account_reset_requires_two_steps(cx: &mut TestAppContext) {
     view.read_with(cx, |v, _| assert!(!v.reset_armed()));
 }
 
+#[gpui::test]
+fn a_new_identity_inherits_no_state_from_the_one_it_replaced(cx: &mut TestAppContext) {
+    // Everything this pane holds about an account — a revealed secret, an
+    // armed reset, a checkout or portal in flight — describes the identity
+    // configured when it was set. None of it means anything about the next
+    // one, and a pending flag left standing is the worst of them: it renders
+    // as "Opening…" and the early return refuses every click until a request
+    // belonging to a forgotten account happens to land.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores.clone(), window, cx))
+    });
+    draw_window(cx, window);
+
+    // Put the pane into every account-scoped state at once.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_account_secret_revealed(window, cx));
+    })
+    .unwrap();
+    view.update(cx, |v, cx| {
+        v.request_reset(cx);
+        v.begin_manage(cx);
+        v.begin_checkout("price_month".into(), cx);
+    });
+    draw_window(cx, window);
+    view.read_with(cx, |v, _| {
+        assert!(v.account_secret_revealed(), "precondition: revealed");
+        assert!(v.reset_armed(), "precondition: reset armed");
+        assert!(v.manage_pending(), "precondition: portal in flight");
+        assert_eq!(
+            v.checkout_pending(),
+            Some("price_month"),
+            "precondition: checkout in flight"
+        );
+    });
+
+    // A different account is configured under it.
+    stores.config.update(cx, |c, _| {
+        let mut state = config_state(true);
+        state.account_id = Some("00000000-0000-7000-8000-000000000444".into());
+        state.account_secret = Some("the-next-accounts-secret".into());
+        c.set_state_for_test(Some(state));
+    });
+    draw_window(cx, window);
+
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.manage_pending(),
+            "the new account's billing door must not read as already opening"
+        );
+        assert_eq!(
+            v.checkout_pending(),
+            None,
+            "the new account's plans must be purchasable"
+        );
+        assert!(!v.account_secret_revealed(), "the new secret starts masked");
+        assert!(
+            !v.reset_armed(),
+            "an arming named the account it was armed over"
+        );
+    });
+}
+
+#[gpui::test]
+fn onboarding_linking_another_account_clears_the_checkout_it_started(cx: &mut TestAppContext) {
+    // Onboarding's half of the same rule. Its back-chevron reaches the
+    // existing-account slide, so a reader can press a plan and then link a
+    // different account; returning to Purchase must not find the row still
+    // in flight for the account they walked away from.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+    });
+    let (_w, view) = open_onboarding(cx, &stores);
+
+    view.update(cx, |v, cx| v.begin_checkout("price_month".into(), cx));
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.checkout_pending(), Some("price_month"));
+    });
+
+    // Linking a different account commits a new identity — driven through
+    // the same completion the request's own task runs.
+    view.update(cx, |v, cx| {
+        v.finish_verify(
+            Ok(eidola_app_core::BalancesResult {
+                available: 1_000_000,
+                pools: Vec::new(),
+            }),
+            cx,
+        )
+    });
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.checkout_pending(),
+            None,
+            "a checkout started for the previous account must not survive the link"
+        );
+    });
+}
+
+#[gpui::test]
+fn a_reset_disowns_a_pending_link_before_the_bus_catches_up(cx: &mut TestAppContext) {
+    // The guard has to read past `ConfigStore`. A reset commits to app-core's
+    // config synchronously and then emits `Change::Config`; the store's cached
+    // snapshot only catches up when the bus bridge delivers that on a later
+    // tick. A mint landing inside that window would be compared against a
+    // cached id that still names the account which has just been forgotten —
+    // the guard asking the stale copy about the very staleness it exists to
+    // detect, and passing. So no `run_until_parked` here between the reset and
+    // the mint: the gap is the test.
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
+        .unwrap();
+    core.set_account_credentials("acct-a".into(), "secret-a".into())
+        .unwrap();
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    stores.config.update(cx, |s, cx| s.refresh(cx));
+
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores.clone(), window, cx))
+    });
+    draw_window(cx, window);
+
+    let minted_for = Some(gpui::SharedString::from("acct-a"));
+
+    // The account is forgotten. Nothing is pumped, so the cache still says
+    // "acct-a" — which is precisely the state the old guard trusted.
+    core.reset_account().expect("reset");
+    stores.config.read_with(cx, |c, _| {
+        assert_eq!(
+            c.state().and_then(|s| s.account_id.as_deref()),
+            Some("acct-a"),
+            "the cache must still be stale here, or this test proves nothing"
+        );
+    });
+
+    view.update(cx, |v, cx| {
+        v.finish_manage(
+            minted_for,
+            Ok("https://billing.example/portal/disowned".into()),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url(),
+        None,
+        "a portal for the account just reset must not open, cache lag or not"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.manage_error()
+                .is_some_and(|e| e.contains("account changed"))
+        );
+    });
+}
+
+#[gpui::test]
+fn a_payment_link_minted_for_a_replaced_account_is_never_opened(cx: &mut TestAppContext) {
+    // Both billing doors mint against the credentials held at click time and
+    // then take a round trip. Reset or replace the account inside that window
+    // and the link that comes back belongs to the previous identity — opening
+    // it would show the old account's portal, or fund an account the reader no
+    // longer holds the secret for, under the new account's name.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores.clone(), window, cx))
+    });
+    draw_window(cx, window);
+
+    let minted_for = Some(gpui::SharedString::from(
+        config_state(true)
+            .account_id
+            .expect("fixture has an account"),
+    ));
+
+    // The account is unchanged: the link opens.
+    view.update(cx, |v, cx| {
+        v.finish_manage(
+            minted_for.clone(),
+            Ok("https://billing.example/portal/current".into()),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "the current account's portal must open"
+    );
+    view.read_with(cx, |v, _| assert!(v.manage_error().is_none()));
+
+    // A different account is configured while the next mint is in flight.
+    stores.config.update(cx, |c, _| {
+        let mut state = config_state(true);
+        state.account_id = Some("00000000-0000-7000-8000-000000000222".into());
+        state.account_secret = Some("a-different-accounts-secret".into());
+        c.set_state_for_test(Some(state));
+    });
+    draw_window(cx, window);
+
+    view.update(cx, |v, cx| {
+        v.finish_manage(
+            minted_for.clone(),
+            Ok("https://billing.example/portal/stale".into()),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "the replaced account's portal must not open"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.manage_error()
+                .is_some_and(|e| e.contains("account changed")),
+            "the refusal must be said out loud, not swallowed"
+        );
+    });
+
+    // Checkout is the same door with the same hazard — money, not a portal.
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            minted_for,
+            Ok("https://checkout.example/session/stale".into()),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "a checkout funding the replaced account must not open"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.checkout_error()
+                .is_some_and(|e| e.contains("account changed"))
+        );
+    });
+}
+
+#[gpui::test]
+fn a_revealed_secret_re_masks_when_the_account_changes_under_it(cx: &mut TestAppContext) {
+    // Revealing is consent to show one identity's secret. If the account is
+    // reset, created or linked while the pane stays open, the field now holds
+    // a credential nobody asked to see — so it must go back behind the mask
+    // rather than inherit the previous identity's reveal.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores.clone(), window, cx))
+    });
+    draw_window(cx, window);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_account_secret_revealed(window, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+    view.read_with(cx, |v, _| assert!(v.account_secret_revealed()));
+
+    // A different account is now configured.
+    stores.config.update(cx, |c, _| {
+        let mut state = config_state(true);
+        state.account_id = Some("00000000-0000-7000-8000-000000000222".into());
+        state.account_secret = Some("a-different-accounts-secret".into());
+        c.set_state_for_test(Some(state));
+    });
+    draw_window(cx, window);
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.account_secret_revealed(),
+            "the new identity's secret must start masked"
+        );
+    });
+
+    // Revealing again, then losing the account entirely (a reset), re-masks
+    // for the same reason.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_account_secret_revealed(window, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+    view.read_with(cx, |v, _| assert!(v.account_secret_revealed()));
+    stores.config.update(cx, |c, _| {
+        let mut state = config_state(false);
+        state.account_id = None;
+        state.account_secret = None;
+        c.set_state_for_test(Some(state));
+    });
+    draw_window(cx, window);
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.account_secret_revealed(),
+            "an account that went away leaves no reveal behind"
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Record window
 // ---------------------------------------------------------------------------
@@ -1988,6 +2381,8 @@ fn config_state(has_account: bool) -> ConfigState {
         default_template: "00000000-0000-7000-8000-000000000010".into(),
         has_account,
         has_account_secret: has_account,
+        account_id: has_account.then(|| "00000000-0000-7000-8000-000000000111".into()),
+        account_secret: has_account.then(|| "behavior-account-secret".into()),
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
         attestation_url: None,
         appearance: eidola_app_core::config::AppearanceSetting::System,
@@ -6392,6 +6787,61 @@ fn open_onboarding(
 /// same call each CTA's click handler makes).
 fn reveal(view: &Entity<OnboardingView>, cx: &mut TestAppContext, after: Slide, next: Slide) {
     view.update(cx, |v, cx| v.reveal(after, next, cx));
+}
+
+#[gpui::test]
+fn onboarding_checkout_will_not_fund_an_account_linked_over(cx: &mut TestAppContext) {
+    // The Purchase slide's checkout is the same money decision the Account
+    // pane's is, and onboarding's back-chevron is a documented way to reach
+    // the existing-account slide again: press a plan, go back, link a
+    // different account, and the link that lands would fund the one the
+    // reader has just walked away from.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+    });
+    let (_w, view) = open_onboarding(cx, &stores);
+
+    let minted_for = config_state(true).account_id;
+
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            minted_for.clone(),
+            Ok("https://checkout.example/session/current".into()),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://checkout.example/session/current"),
+        "the configured account's checkout must open"
+    );
+
+    // A different account is linked while the next request is in flight.
+    stores.config.update(cx, |c, _| {
+        let mut state = config_state(true);
+        state.account_id = Some("00000000-0000-7000-8000-000000000333".into());
+        state.account_secret = Some("a-linked-accounts-secret".into());
+        c.set_state_for_test(Some(state));
+    });
+
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            minted_for,
+            Ok("https://checkout.example/session/stale".into()),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://checkout.example/session/current"),
+        "a checkout funding the account that was linked over must not open"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.checkout_error()
+                .is_some_and(|e| e.contains("account changed"))
+        );
+    });
 }
 
 #[gpui::test]

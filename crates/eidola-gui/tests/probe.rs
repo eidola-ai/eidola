@@ -10,6 +10,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AttestationInfo, BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
     PriceInfo, RequestInfo, SpendTrailEntry,
@@ -885,6 +886,8 @@ fn probe_config_state() -> ConfigState {
         default_template: "00000000-0000-7000-8000-000000000010".into(),
         has_account: true,
         has_account_secret: true,
+        account_id: Some("00000000-0000-7000-8000-000000000111".into()),
+        account_secret: Some("probe-account-secret".into()),
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
         attestation_url: None,
         appearance: eidola_app_core::config::AppearanceSetting::System,
@@ -1643,6 +1646,353 @@ fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
             "account pane probe {expected:?} missing; recorded: {names:?}"
         );
     }
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn the_credential_fields_and_their_suffix_controls_are_each_one_node(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    // The two credential fields follow the focus-bearing-editor regime — the
+    // `Input` carries the label and is the node, its wrapper is bounds-only —
+    // and the controls sitting in the secret field's suffix follow the hoist:
+    // a probed wrapper is the control, so each is a named, reachable node
+    // rather than a presentational widget nobody can get to. `.role(None)` on
+    // the widgets alone would satisfy the source scan while deleting these
+    // from the tree, which is precisely what this test refuses.
+    let _guard = probes_on();
+
+    let stores = account_backends_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/account/id",
+        gpui::Role::TextInput,
+        "Account ID",
+    );
+    assert_probe(
+        &entries,
+        "settings/account/secret",
+        gpui::Role::TextInput,
+        "Account Secret",
+    );
+    assert_probe(
+        &entries,
+        "settings/account/id/copy",
+        gpui::Role::Button,
+        "Copy Account ID",
+    );
+    assert_probe(
+        &entries,
+        "settings/account/secret/copy",
+        gpui::Role::Button,
+        "Copy Account Secret",
+    );
+    assert_probe(
+        &entries,
+        "settings/account/secret/reveal",
+        gpui::Role::Button,
+        "Show account secret",
+    );
+    // The component paints twice and derives every name and element id from
+    // its prefix, so the two copies are distinct nodes — and only the secret
+    // has anything to reveal.
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "settings/account/id/reveal"),
+        "the account id is never masked; recorded: {:?}",
+        entries.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+
+    // Revealed, the control says what it would now do.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_account_secret_revealed(window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/account/secret/reveal",
+        gpui::Role::Button,
+        "Hide account secret",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_lapsed_account_is_offered_its_billing_and_every_plan(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    // A customer with nothing in force still has a payment relationship —
+    // a saved card, invoices, receipts — so the portal door stays, worded
+    // for what is actually behind it rather than for a subscription that
+    // does not exist. Every plan stays offered: there is nothing to
+    // double-subscribe over.
+    let _guard = probes_on();
+
+    let stores = account_backends_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            eidola_gui::loadable::Loadable::loaded(eidola_app_core::SubscriptionInfo {
+                state: eidola_app_core::SubscriptionState::Inactive,
+                status: None,
+                current_period_end: None,
+            }),
+            cx,
+        );
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/account/subscription",
+        "settings/account/billing-portal",
+        "settings/account/subscription-retry",
+        "settings/account/plan/0",
+        "settings/account/plan/1",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "lapsed account probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/account/manage-subscription".to_string()),
+        "there is no subscription to manage; recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn an_account_that_never_transacted_is_shown_no_billing_door(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    // No payment customer means no relationship to be let into — a portal
+    // session minted for someone money has never moved for would be a door
+    // onto an empty room. The *answer* is still owed, and so is the way to
+    // ask again: a reader who completes their first checkout is in exactly
+    // this state with this pane already open in front of them.
+    let _guard = probes_on();
+
+    let stores = account_backends_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            eidola_gui::loadable::Loadable::loaded(eidola_app_core::SubscriptionInfo {
+                state: eidola_app_core::SubscriptionState::NoCustomer,
+                status: None,
+                current_period_end: None,
+            }),
+            cx,
+        );
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    // The answer, and the door back to it.
+    for expected in [
+        "settings/account/subscription",
+        "settings/account/subscription-retry",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "an account with no payment customer is still owed {expected:?}; \
+             recorded: {names:?}"
+        );
+    }
+    // But no billing door of either wording.
+    for absent in [
+        "settings/account/billing-portal",
+        "settings/account/manage-subscription",
+    ] {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "an account with no payment customer must show no {absent:?}; \
+             recorded: {names:?}"
+        );
+    }
+    // The plans are the whole surface for someone who has never transacted.
+    for expected in ["settings/account/plan/0", "settings/account/plan/1"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "plan probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_known_subscription_can_always_be_re_checked(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    // The reader changes their subscription in a browser window this app
+    // never hears about and comes back to a Settings window that never
+    // closed. Nothing on the bus can invalidate the cell, so a re-check
+    // offered only after a *failed* read is a door that opens only once it
+    // is already too late.
+    let _guard = probes_on();
+
+    let stores = account_backends_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            eidola_gui::loadable::Loadable::loaded(eidola_app_core::SubscriptionInfo {
+                state: eidola_app_core::SubscriptionState::Active,
+                status: Some("active".into()),
+                current_period_end: None,
+            }),
+            cx,
+        );
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/account/subscription-retry".to_string()),
+        "a successfully read subscription must still offer a re-check; \
+         recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_subscribed_account_is_offered_management_and_only_one_time_plans(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    let _guard = probes_on();
+
+    let stores = account_backends_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            eidola_gui::loadable::Loadable::loaded(eidola_app_core::SubscriptionInfo {
+                state: eidola_app_core::SubscriptionState::Active,
+                status: Some("active".into()),
+                current_period_end: None,
+            }),
+            cx,
+        );
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/account/subscription",
+        "settings/account/manage-subscription",
+        // One-time top-ups stay purchasable alongside the subscription.
+        "settings/account/plan/0",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "subscribed account probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/account/plan/1".to_string()),
+        "the recurring plan should be gone — the server refuses a second \
+         subscription; recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_failed_subscription_read_offers_a_retry_and_withholds_no_plans(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    let _guard = probes_on();
+
+    let stores = account_backends_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            eidola_gui::loadable::Loadable::Failed {
+                error: AppError::Network {
+                    message: "connection reset".into(),
+                },
+                prior: None,
+            },
+            cx,
+        );
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/account/subscription-retry".to_string()),
+        "a failed read must offer its way back; recorded: {names:?}"
+    );
+    // Not knowing is not knowing: every plan stays offered, and the server
+    // refuses honestly if one of them is not allowed.
+    for expected in ["settings/account/plan/0", "settings/account/plan/1"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "plan probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_failed_re_read_keeps_the_subscription_it_already_knew(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    let _guard = probes_on();
+
+    let stores = account_backends_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            eidola_gui::loadable::Loadable::Failed {
+                error: AppError::Network {
+                    message: "connection reset".into(),
+                },
+                prior: Some(eidola_app_core::SubscriptionInfo {
+                    state: eidola_app_core::SubscriptionState::Active,
+                    status: Some("active".into()),
+                    current_period_end: None,
+                }),
+            },
+            cx,
+        );
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    // The known answer stays on screen — a failed refresh never blanks a
+    // cell that has data — with the quiet way to ask again beside it.
+    for expected in [
+        "settings/account/subscription",
+        "settings/account/manage-subscription",
+        "settings/account/subscription-retry",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "stale-subscription probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/account/plan/1".to_string()),
+        "the stale answer still governs what is offered; recorded: {names:?}"
+    );
 
     probe::set_probes_enabled(false);
 }

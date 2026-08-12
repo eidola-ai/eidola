@@ -1040,6 +1040,40 @@ pub struct LedgerEntryRow {
     pub credential_credits: Option<i64>,
 }
 
+/// Whether Stripe has ever moved money for this account.
+///
+/// A `stripe_event_id` is stamped on exactly the ledger rows a Stripe
+/// webhook wrote — purchases, subscription renewals, refunds, dispute
+/// adjustments — so its presence is the honest test for "this account has a
+/// payment history", as distinct from merely having a Stripe customer
+/// record. Internal rows (credential issuance and the like) carry no event
+/// id and correctly do not count.
+#[tracing::instrument(skip_all, name = "db.has_stripe_ledger_history", err)]
+pub async fn has_stripe_ledger_history(pool: &Pool, account_id: Uuid) -> Result<bool, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+
+    let row = client
+        .query_one(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM credit_ledger \
+                 WHERE account_id = $1 AND stripe_event_id IS NOT NULL\
+             )",
+            &[&account_id],
+        )
+        .await
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "stripe ledger history query failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
+
+    Ok(row.get(0))
+}
+
 /// Get all ledger entries for an account, sorted by created_at ASC, id ASC.
 pub async fn get_ledger_entries(
     pool: &Pool,

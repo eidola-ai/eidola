@@ -142,7 +142,8 @@ impl Stores {
             None => ModelsStore::stub(fixture.models),
         });
         let local_models = cx.new(|_| LocalModelsStore::stub(fixture.local_models));
-        let account = cx.new(|_| AccountStore::stub(fixture.balances, fixture.prices));
+        let account =
+            cx.new(|_| AccountStore::stub(fixture.balances, fixture.prices, fixture.subscription));
         let wallet =
             cx.new(|_| WalletStore::stub(fixture.credential_lifecycle, fixture.credentials));
         let spaces = cx.new(|_| SpacesStore::stub(fixture.spaces));
@@ -239,6 +240,9 @@ pub struct StoresStub {
     pub local_models: Option<eidola_app_core::LocalModelsState>,
     pub balances: Option<eidola_app_core::BalancesResult>,
     pub prices: Vec<eidola_app_core::PriceInfo>,
+    /// The account's subscription standing. `None` leaves the cell
+    /// `NotLoaded` — a surface that has not asked yet.
+    pub subscription: Option<eidola_app_core::SubscriptionInfo>,
     pub credentials: Vec<eidola_app_core::CredentialInfo>,
     pub credential_lifecycle: Vec<eidola_app_core::CredentialLifecycleInfo>,
     pub spaces: Vec<eidola_app_core::SpaceInfo>,

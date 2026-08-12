@@ -98,6 +98,7 @@ pub fn build_router() -> OpenApiRouter<AppState> {
         .routes(routes!(account::get_terms))
         .routes(routes!(account::accept_terms))
         .routes(routes!(account::get_subscription))
+        .routes(routes!(account::create_portal_session))
         .routes(routes!(account::create_checkout))
         .routes(routes!(account::get_balances))
         .routes(routes!(account::get_ledger))
