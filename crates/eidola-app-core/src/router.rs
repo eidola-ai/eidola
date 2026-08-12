@@ -47,6 +47,31 @@
 //! exactly what an `explicit`-policy participant experiences today, and that
 //! writes nothing; a row per participant per post would be pure noise.
 //!
+//! # What the router reads
+//!
+//! The thread slice is rendered through a [`ThreadSnapshot`] — the same
+//! `post_body` rendering `read_thread` and `read_post` answer with, so a
+//! quoted passage reaches the router attributed instead of as a literal
+//! `{{ embed N }}` marker. The router picks *who answers*, and a post whose
+//! meaning lives in what it quotes read as near-empty, which suppresses the
+//! participant that should have replied. Eliding the markers (the map's
+//! preview rule) would not have fixed that — it removes the noise and the
+//! meaning together.
+//!
+//! It costs one whole-space read per triggering post, taken only for a space
+//! that has a router model, and never on the writer's path: the post is
+//! committed and emitted before refinement starts. The prompt cost is
+//! unchanged in shape — every line was already clipped to
+//! [`POST_MAX_BYTES`], so expansion changes *which* bytes the router sees, not
+//! how many it may see.
+//!
+//! It changes *which end* they come from, though: a quoted passage is
+//! unbounded, so an over-budget line is spent from both ends
+//! ([`clip_middle`]) rather than head-first. A marker before the post's own
+//! words — `{{ embed 1 }}\n\nHave the legal reviewer assess this` — would
+//! otherwise expand into a quotation that fills the budget on its own, and the
+//! router would pick a participant without ever seeing the ask.
+//!
 //! # Cost
 //!
 //! The router model is an ordinary qualified `<model>@<backend>` reference, run
@@ -69,14 +94,16 @@
 
 use crate::db;
 use crate::error::AppError;
-use crate::utility::clip;
-use crate::{Inner, NotificationPlan};
+use crate::utility::{clip, clip_middle};
+use crate::{Inner, NotificationPlan, ThreadSnapshot, build_post_tree, now_ms};
 
 /// How many posts of the triggering post's upstream thread the router sees.
 /// Small on purpose — the router is a routing decision, not a reader.
 const THREAD_SLICE_POSTS: usize = 6;
 
-/// Per-post byte budget inside the thread slice.
+/// Per-post byte budget inside the thread slice. Spent from both ends
+/// ([`clip_middle`]): the lines are rendered post bodies, so an over-budget
+/// one is usually a quoted passage with the post's own routing cue after it.
 const POST_MAX_BYTES: usize = 480;
 
 /// Per-candidate byte budget for the persona digest (the head of the
@@ -161,7 +188,7 @@ pub(crate) fn build_router_prompt(
         out.push_str(&format!(
             "{marker}{}: {}\n",
             line.author,
-            clip(&line.text, POST_MAX_BYTES)
+            clip_middle(&line.text, POST_MAX_BYTES)
         ));
     }
     out.push_str("\nCANDIDATES:\n");
@@ -311,6 +338,10 @@ impl Inner {
 
     /// Gather the router's inputs: the triggering post's upstream thread slice
     /// and one card per planned participant.
+    ///
+    /// The slice is rendered through the snapshot, so the router reads a post
+    /// exactly as `read_thread` does — see [`ThreadSnapshot::body_for_action`]
+    /// and the note on the whole-space read below.
     async fn router_inputs(
         &self,
         conn: &turso::Connection,
@@ -321,15 +352,36 @@ impl Inner {
         // The same branch-scoped, item-tip-resolved ancestry a turn would send
         // upstream — inclusive of the triggering post — trimmed to its tail.
         let rows = db::get_upstream_context(conn, post_action_id, true).await?;
-        let skip = rows.len().saturating_sub(THREAD_SLICE_POSTS);
-        let thread: Vec<RouterThreadLine> = rows
+
+        // One row per (action, text block), so an action's blocks arrive as one
+        // consecutive run and are folded into the one post they are — which is
+        // what `THREAD_SLICE_POSTS` has always claimed to count.
+        let mut posts: Vec<(String, String, String)> = Vec::new();
+        for r in rows {
+            let text = r.text_content.unwrap_or_default();
+            match posts.last_mut() {
+                Some((action_id, _, body)) if *action_id == r.action_id => body.push_str(&text),
+                _ => posts.push((r.action_id, r.participant_label, text)),
+            }
+        }
+
+        // One whole-space read, off the writer's path (the post is committed
+        // and emitted before the router runs) and taken only for a space that
+        // has a router model at all. It buys the rendering rather than the
+        // structure: a post whose meaning lives in a quoted passage read as
+        // near-empty here, which suppresses the participant that should have
+        // answered it.
+        let snapshot = ThreadSnapshot::new(
+            build_post_tree(db::get_space_tree_data(conn, space_id).await?),
+            now_ms(),
+        );
+        let skip = posts.len().saturating_sub(THREAD_SLICE_POSTS);
+        let thread: Vec<RouterThreadLine> = posts
             .into_iter()
             .skip(skip)
-            .filter_map(|r| {
-                r.text_content.map(|text| RouterThreadLine {
-                    author: r.participant_label,
-                    text,
-                })
+            .filter_map(|(action_id, author, raw)| {
+                let text = snapshot.body_for_action(&action_id).unwrap_or(raw);
+                (!text.is_empty()).then_some(RouterThreadLine { author, text })
             })
             .collect();
 
@@ -457,6 +509,38 @@ mod tests {
         assert!(prompt.contains("1. Agent 1"));
         assert!(prompt.contains("2. Agent 2"));
         assert!(prompt.contains("[notify policy: all]"));
+    }
+
+    /// A marker standing **before** the post's own words expands into a
+    /// passage that can be longer than the whole per-post budget — a quote is
+    /// a range the author chose, and nothing bounds it. Clipping the tail
+    /// would then spend the budget on the quotation and drop the routing cue
+    /// the post was written to carry, so the router would pick a participant
+    /// from the quoted passage alone.
+    #[test]
+    fn a_long_quote_does_not_evict_the_posts_own_words() {
+        let rendered = format!(
+            "[1] #q2m9zzr · Ada\n> {}\n\nHave the legal reviewer assess this",
+            "the quoted passage ".repeat(40)
+        );
+        assert!(
+            rendered.len() > POST_MAX_BYTES,
+            "the fixture is over budget"
+        );
+        let thread = vec![RouterThreadLine {
+            author: "You".into(),
+            text: rendered,
+        }];
+        let prompt = build_router_prompt(&thread, &candidates(2));
+        assert!(
+            prompt.contains("Have the legal reviewer assess this"),
+            "the post's own ask reaches the router; got {prompt}"
+        );
+        assert!(
+            prompt.contains("[1] #q2m9zzr · Ada"),
+            "and so does the passage's attribution; got {prompt}"
+        );
+        assert!(prompt.contains('…'), "with the cut marked; got {prompt}");
     }
 
     #[test]

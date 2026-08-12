@@ -45,7 +45,7 @@ One gpui entity per domain, created at startup, held by `AppGlobal`, observed by
 | `BackendsStore` | the backend registry (configured inference destinations) | Refreshed at launch + on `Backends`; add/enable/remove ops with optimistic list edits |
 | `ModelsStore` | per-backend model catalogs (one `Loadable` + fetch slot per fetch-based backend) | Refreshed at launch + on demand; `refresh_backend(id)` re-fetches one — a dead server never blanks another's list (first-window list comes from here; fixes wave-2 bug 1 structurally) |
 | `LocalModelsStore` | engine-domain snapshot (managed models on disk / downloading, running engines, engine binary, each llamacpp backend's scanned directory) | Refreshed at launch + on `LocalModels`; ops are thin initiating calls — the downloads/engine supervisors are core-owned tasks that survive any window |
-| `AccountStore` | balances, prices, account lifecycle, checkout | The checkout *poll* is view-owned (see scoping); its result lands here via invalidation |
+| `AccountStore` | balances, prices, subscription standing, account lifecycle, checkout | The checkout *poll* is view-owned (see scoping); its result lands here via invalidation. The subscription cell is a live read that persists nothing, so no `Change` ever invalidates it — and the balance moves on a webhook nothing local commits for either, so **both are re-read when the Account pane is selected** (`SettingsView::sync_active_pane` → `AccountView::pane_activated`; the panes are all built at window creation, so construction is not activation) and by the section's own always-offered re-check. **An identity switch clears it**, via `account_identity_changed` (clear + re-read) called on the **commit**, never on the attempt: creating and linking both refuse outright when credentials already exist, so clearing when the request went out blanked the cell for an operation that never happened. Clear *and* refresh together — a bare refresh leaves the previous account's value visible as `Loaded { stale }`, which on a billing surface is the wrong account's answer under the right account's name |
 | `WalletStore` | credential lifecycle list, recovery | |
 | `SpacesStore` | the Library index **and** the space-entity registry (below) | Also owns rename/archive — the space inspector's title row writes through it; both edit the cached row optimistically and compose `write; re-list` in a **per-space** mutation slot, so a refusal stands in that space's `op_error` (`None` keys a create) and the index reconciles on every exit |
 | `SpaceSettingsStore` | per-space settings (cascade limit, router model) | Keyed per space; refreshed on `Change::Space` for **cached** spaces only (every post emits it); write-through with the ordered refresh/mutation slot split, each setter advancing the cached snapshot as its write leaves |
@@ -160,7 +160,7 @@ Any list that can exceed roughly one screen renders through gpui's virtualized p
 | Backend registry | global | `BackendsStore` |
 | Per-backend model catalogs | global | `ModelsStore` |
 | Local models + engines | global | `LocalModelsStore` (snapshots; the work itself is core-owned) |
-| Balances, prices, account lifecycle | global | `AccountStore` |
+| Balances, prices, subscription standing, account lifecycle | global | `AccountStore` |
 | Credential lifecycle | global | `WalletStore` |
 | Library index | global | `SpacesStore` |
 | Transcript, streaming turns (keyed fan-out), submit, failed-turn record | per-space, shared | `Space` entity (registry) |

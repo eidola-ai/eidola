@@ -66,6 +66,10 @@ pub struct ConfigState {
     pub default_template: String,
     pub has_account: bool,
     pub has_account_secret: bool,
+    /// Locally configured account id, shown by trusted clients for copy/audit.
+    pub account_id: Option<String>,
+    /// Locally configured account secret, shown by trusted clients for copy.
+    pub account_secret: Option<String>,
     pub domain_separator: String,
     pub attestation_url: Option<String>,
     /// The resolved circadian day/night axis (`appearance` override if set,
@@ -563,6 +567,40 @@ pub struct PriceInfo {
     pub amount_display: String,
     pub recurrence: String,
     pub credits: i64,
+}
+
+/// Whether the account has a subscription in force, as the server answers
+/// it. Three values rather than a present/absent subscription because
+/// "never transacted" and "has a payment relationship but nothing in
+/// force" lead to different surfaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionState {
+    /// No payment customer exists — this account has never transacted, so
+    /// there is nothing to manage.
+    NoCustomer,
+    /// A payment customer exists, but holds no subscription in force.
+    Inactive,
+    /// A subscription is in force (the server's definition: Stripe status
+    /// `active`, `trialing`, or `past_due` — the same set it refuses to
+    /// double-subscribe over).
+    Active,
+}
+
+/// The account's subscription standing. **Fetched live and never
+/// persisted** — it is the payment processor's fact, not ours, and it goes
+/// stale the moment the reader changes anything in a browser.
+///
+/// The subscription's own identifier is deliberately not carried: nothing
+/// in the client needs it, and it is a payment-side identifier.
+#[derive(Clone, Debug)]
+pub struct SubscriptionInfo {
+    pub state: SubscriptionState,
+    /// The in-force subscription's raw status, so a surface can say what
+    /// it actually is (`past_due` is in force and wants attention).
+    /// `Some` exactly when `state` is [`SubscriptionState::Active`].
+    pub status: Option<String>,
+    /// End of the current billing period, ms since the epoch.
+    pub current_period_end: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -2060,6 +2098,88 @@ impl Inner {
             })?;
 
         Ok(checkout.checkout_url)
+    }
+
+    /// The account's subscription standing, read live from the server.
+    ///
+    /// Persists nothing and emits no [`Change`]: there is no durable
+    /// commit to announce, and caching a billing-portal session link or a
+    /// subscription status would be caching someone else's truth. Callers
+    /// that want it fresh ask again.
+    async fn account_subscription(&self) -> Result<SubscriptionInfo, AppError> {
+        let cfg = self.load_config();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let (id, secret) = self.require_credentials(&cfg)?;
+
+        let client = self.build_client(&cfg, &eidola, None).await?;
+        let resp = client
+            .get(format!("{base_url}/v1/account/subscription"))
+            .basic_auth(id, Some(secret))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let sub: SubscriptionResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse response: {e}"),
+            })?;
+
+        // An unrecognized state is refused rather than guessed at. Both
+        // guesses are harmful — "active" hides the plans a paying reader
+        // wants, "inactive" offers a purchase the server will refuse — and
+        // the client and server ship together, so this can only mean the
+        // app is talking to something newer than it understands.
+        let state = match sub.state.as_str() {
+            "none" => SubscriptionState::NoCustomer,
+            "inactive" => SubscriptionState::Inactive,
+            "active" => SubscriptionState::Active,
+            _ => {
+                return Err(AppError::Network {
+                    message: "the server reported a subscription state this version of \
+                              Eidola does not understand — check for an update"
+                        .into(),
+                });
+            }
+        };
+
+        Ok(SubscriptionInfo {
+            state,
+            status: sub.status,
+            current_period_end: sub.current_period_end.map(|s| iso_to_ms(&s)).transpose()?,
+        })
+    }
+
+    /// Mint a billing-portal session and return its URL.
+    ///
+    /// Its own call, matching its own endpoint: the session is a write the
+    /// payment processor performs and it expires quickly, so it is asked
+    /// for at the moment the reader is about to open it and never held.
+    async fn account_portal(&self) -> Result<String, AppError> {
+        let cfg = self.load_config();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let (id, secret) = self.require_credentials(&cfg)?;
+
+        let client = self.build_client(&cfg, &eidola, None).await?;
+        let resp = client
+            .post(format!("{base_url}/v1/account/portal"))
+            .basic_auth(id, Some(secret))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let portal: PortalResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse response: {e}"),
+            })?;
+        Ok(portal.portal_url)
     }
 
     async fn account_balances(&self) -> Result<BalancesResult, AppError> {
@@ -7010,6 +7130,8 @@ impl AppCore {
             default_template: cfg.default_template().to_string(),
             has_account: cfg.account_id.is_some(),
             has_account_secret: cfg.account_secret.is_some(),
+            account_id: cfg.account_id.clone(),
+            account_secret: cfg.account_secret.clone(),
             domain_separator: cfg.domain_separator().to_string(),
             attestation_url: cfg.attestation_url.clone(),
             appearance: cfg.appearance(),
@@ -7427,6 +7549,26 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.account_checkout(&price_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The account's subscription standing. Live read, nothing persisted,
+    /// no [`Change`] emitted.
+    pub async fn account_subscription(&self) -> Result<SubscriptionInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.account_subscription().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// A billing-portal URL to open in a browser. Minted on demand and
+    /// never held — see [`Inner::account_portal`].
+    pub async fn account_portal(&self) -> Result<String, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.account_portal().await })
             .await
             .map_err(join_err)?
     }
@@ -8736,6 +8878,18 @@ struct RecurringResponse {
 #[derive(Deserialize)]
 struct CheckoutUrlResponse {
     checkout_url: String,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionResponse {
+    state: String,
+    status: Option<String>,
+    current_period_end: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PortalResponse {
+    portal_url: String,
 }
 
 #[derive(Deserialize)]
@@ -11430,11 +11584,20 @@ impl ThreadSnapshot {
     /// sends the same prompt twice (which under a billing utility model would
     /// be a charge for an answer that could not have changed). A branch that
     /// fits is entirely `head`, so short branches are unaffected.
+    ///
+    /// Each post arrives as [`Self::post_body`] — the one model-facing
+    /// rendering ([`render_post_for_model`]), not the preview elision the map's
+    /// own opening line uses. The summarizer **reads** the branch rather than
+    /// putting its bytes on a line that already names an author: a post whose
+    /// point is the passage it quotes ("{{ embed 1 }} — I disagree") elides to
+    /// nothing, and the summary it produces is written down and read for as
+    /// long as the branch lives. Attribution is what makes that safe to expand,
+    /// and it is the same attribution `read_thread` shows.
     fn branch_slice(&self, idx: usize, head: usize, tail: usize) -> summaries::BranchSlice {
         let sub = self.subtree(idx);
         let post = |i: usize| summaries::SummaryPost {
             author: self.nodes[i].participant.label.clone(),
-            text: self.texts[i].clone(),
+            text: self.post_body(i),
         };
         if sub.len() <= head + tail {
             return summaries::BranchSlice {
@@ -11704,6 +11867,18 @@ impl ThreadSnapshot {
             })
             .collect();
         render_post_for_model(&self.texts[idx], &entries)
+    }
+
+    /// A post's model-facing body looked up by its **concrete generation**, for
+    /// a reader holding an action id rather than a node index (the may-decline
+    /// router, whose slice comes from `db::get_upstream_context`).
+    ///
+    /// `None` means this snapshot does not have that exact generation — an edit
+    /// landing between the two reads — and the caller keeps the text it already
+    /// had. Degrading to the raw body is the safe direction: it is what that
+    /// path sent before there was a snapshot at all.
+    fn body_for_action(&self, action_id: &str) -> Option<String> {
+        self.by_action.get(action_id).map(|&i| self.post_body(i))
     }
 
     /// The honest answer to a handle this snapshot does not know — a *result*,
