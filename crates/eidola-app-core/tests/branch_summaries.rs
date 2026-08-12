@@ -244,12 +244,22 @@ fn branch_tail_action(core: &AppCore, space: &str, text: &str) -> String {
 }
 
 /// The trailing map of the most recent turn request.
+/// The `<thread-map>` block of the last request's trailing message.
+///
+/// The trailing block also carries the task-64 roster ahead of the map — pinned
+/// in `chat_path` and `participants_orchestration`, where it is the subject.
+/// Here the map is, so this trims to it.
 fn last_map(mock: &MockServer) -> String {
-    flat_messages(mock.chat_bodies().last().expect("a request"))
+    let trailing = flat_messages(mock.chat_bodies().last().expect("a request"))
         .last()
         .expect("a message")
         .1
-        .clone()
+        .clone();
+    let at = trailing
+        .find("<thread-map>")
+        .expect("a map in the trailing block");
+    let end = trailing.find("</thread-map>").expect("a closed map") + "</thread-map>".len();
+    trailing[at..end].to_string()
 }
 
 // ===========================================================================
@@ -345,25 +355,21 @@ fn a_generated_summary_renders_under_the_structural_entry() {
         );
 
         respond(&core, &fx.space, &fx.spine_post);
-        let answered = item_of_action(&core, &fx.space, &fx.spine_post);
 
         assert_eq!(
             last_map(&mock),
-            thread_map(
-                &[(
-                    format!("at #{}", post_handle(&fx.fork_item)),
-                    vec![map_entry_summarized(
-                        &fx.branch_item,
-                        HUMAN_LABEL,
-                        "2 posts",
-                        "just now",
-                        Some("1 post"),
-                        "What about spring tides?",
-                        SUMMARY,
-                    )],
+            thread_map(&[(
+                format!("at #{}", post_handle(&fx.fork_item)),
+                vec![map_entry_summarized(
+                    &fx.branch_item,
+                    HUMAN_LABEL,
+                    "2 posts",
+                    "just now",
+                    Some("1 post"),
+                    "What about spring tides?",
+                    SUMMARY,
                 )],
-                &post_handle(&answered),
-            ),
+            )],),
         );
     });
 }

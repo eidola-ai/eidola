@@ -372,7 +372,7 @@ fn a_quoted_passage_reaches_participants_who_cannot_follow_it() {
             .join("\n");
         assert!(
             sent.contains(&format!(
-                "[1] You (a post outside this space, or an earlier version)\n> {}",
+                "[1] User (a post outside this space, or an earlier version)\n> {}",
                 s.quoted_text
             )),
             "the quoted passage rides in the context attributed to its author, and says it \
@@ -425,7 +425,9 @@ fn a_cross_space_passage_is_attributed_by_the_space_it_was_written_in() {
             "the byline is the source space's name for the author: {sent}"
         );
         assert!(
-            sent.contains("· Skipper\n\nSomeone said this:"),
+            // The header is `#handle · Skipper · <stamp>`, so the label field
+            // is checked between its separators.
+            sent.contains("· Skipper · ") && sent.contains("Someone said this:"),
             "while this space's own header keeps this space's name for them: {sent}"
         );
         assert!(
@@ -652,7 +654,7 @@ fn a_followed_post_renders_its_own_quotes_like_every_other_post() {
         );
         assert!(
             followed.contains(
-                "As I said:\n\n[1] You (a post outside this space, or an earlier version)\n\
+                "As I said:\n\n[1] User (a post outside this space, or an earlier version)\n\
                  > sun and moon align\n\nAnd there is more."
             ),
             "the followed post's embedded quote expands in place, attributed: {followed}"
@@ -660,7 +662,7 @@ fn a_followed_post_renders_its_own_quotes_like_every_other_post() {
         assert!(
             followed.ends_with(
                 "Passages this post quotes:\n\
-                 [2] You (a post outside this space, or an earlier version)\n> twice a month"
+                 [2] User (a post outside this space, or an earlier version)\n> twice a month"
             ),
             "and the one it never embedded is footnoted: {followed}"
         );
