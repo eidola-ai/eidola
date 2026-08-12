@@ -882,6 +882,7 @@ mod tests {
             snippet: Some(snippet.to_string()),
             annotation: None,
             antecedent_author_label: "Ada".into(),
+            antecedent_author_kind: "agent".into(),
         }
     }
 

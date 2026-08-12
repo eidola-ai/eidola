@@ -225,7 +225,9 @@ impl ChatMessageView {
                 _ => {}
             }
         }
-        let byline = byline_for_participant(&node.participant.kind, &node.participant.label);
+        // The gutter's word for "this identity names nobody".
+        let byline = byline_for_participant(&node.participant.kind, &node.participant.label)
+            .unwrap_or_else(|| "—".to_string());
         Self {
             message: SpaceMessage { role, content },
             byline,
@@ -255,18 +257,34 @@ fn byline_for_role(role: &str) -> &'static str {
     }
 }
 
-/// The gutter byline for a post-tree row, from its participant identity. The
-/// *local* human (the generic "user" participant) reads as "You"; any other
-/// human reads by name (multi-party spaces); an agent's byline is its label.
-fn byline_for_participant(kind: &str, label: &str) -> String {
+/// How an author's identity — the `(kind, label)` pair every read carries
+/// together — becomes the name a reader sees. The *local* human (the generic
+/// "user" participant) reads as "You"; any other human reads by name
+/// (multi-party spaces); an agent's byline is its label, or "Eidola" where its
+/// space named none; the harness is "System".
+///
+/// **The pair is the unit, and this is the only place it is read.** A label
+/// alone is not renderable: the schema's non-NULL "override to empty" makes a
+/// blank effective label a real state, and what to say instead depends entirely
+/// on the kind. So the post gutter and the footnote rail
+/// ([`crate::space_view::references`], which sees only what a reference edge
+/// carries) both come through here — otherwise the rail invents a second rule
+/// and the same author is named twice inside one window, which is the defect
+/// task 68 is about.
+///
+/// `None` means *this identity names nobody* — a kind with no fallback of its
+/// own and no label to fall back on. Each caller has its own word for that (the
+/// gutter's dash, the rail's "another space"), so the rule declines to pick one.
+pub(crate) fn byline_for_participant(kind: &str, label: &str) -> Option<String> {
+    let label = label.trim();
     match kind {
-        "human" if label.is_empty() || label.eq_ignore_ascii_case("user") => "You".to_string(),
-        "human" => label.to_string(),
-        "agent" if !label.is_empty() => label.to_string(),
-        "agent" => "Eidola".to_string(),
-        "system" => "System".to_string(),
-        _ if !label.is_empty() => label.to_string(),
-        _ => "—".to_string(),
+        "human" if label.is_empty() || label.eq_ignore_ascii_case("user") => {
+            Some("You".to_string())
+        }
+        "agent" if label.is_empty() => Some("Eidola".to_string()),
+        "system" => Some("System".to_string()),
+        _ if !label.is_empty() => Some(label.to_string()),
+        _ => None,
     }
 }
 
@@ -984,6 +1002,17 @@ impl Space {
         if self.id.as_deref() != Some(changed_id) {
             return;
         }
+        if self.is_busy() {
+            return;
+        }
+        self.load_transcript(cx);
+    }
+
+    /// A participant was renamed, added, removed or re-shared somewhere. The
+    /// transcript resolved every author's name when it was read (see
+    /// [`crate::stores::SpacesStore::notify_participants_changed`]), so re-read
+    /// it — same supersede slot, same busy gate as any other invalidation.
+    pub fn on_participants_changed(&mut self, cx: &mut Context<Self>) {
         if self.is_busy() {
             return;
         }

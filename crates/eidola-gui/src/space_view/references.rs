@@ -227,15 +227,17 @@ pub(crate) enum FootnoteBody {
 /// gap standing over nothing.
 const ELSEWHERE: &str = "another space";
 
-/// A label to render, or `None` when there is none. The twin of app-core's
-/// `non_blank`, and blank for the same reason: a per-space override of `''` is
-/// "override to empty" under the schema's NULL-inherits rule, so an effective
-/// label really can be empty and every surface has to degrade rather than
-/// render it.
-fn non_blank(label: &str) -> Option<SharedString> {
-    let trimmed = label.trim();
-    (!trimmed.is_empty()).then(|| SharedString::from(trimmed.to_string()))
-}
+/// How much of a footnote row the attribution may claim.
+///
+/// A participant label has no maximum length, and the byline sits `flex_none`
+/// beside a `flex_1` passage — so an unbounded one squeezes the quoted text out
+/// of the row it is there to attribute (Codex review, PR #292). In `rems`, not
+/// px, because the rail is `text_xs` off the window's `rem_size` and a fixed
+/// pixel cap would tighten as the reader zooms in. A name shorter than the cap
+/// is unaffected; a longer one ellipsizes **visually only** — the row's
+/// accessible name is built from the whole byline before it is laid out, so
+/// what a screen reader says is never truncated.
+const BYLINE_MAX_W: f32 = 10.;
 
 /// A zero-height, zero-visual **in-flow** probe that records its own flow
 /// position into `cell`.
@@ -1784,6 +1786,10 @@ impl SpaceView {
                 theme.muted_foreground.opacity(0.75),
             ),
         };
+        // Built from the **whole** byline and the whole passage, before either
+        // is laid out: both are visually bounded below (`BYLINE_MAX_W`, the
+        // passage's `truncate`), and an ellipsis is a fact about this row's
+        // width, never about who wrote the passage.
         let aria = format!("Reference {}: {} — {}", row.index, row.byline, text);
         h_flex()
             .id(SharedString::from(element_id))
@@ -1812,6 +1818,8 @@ impl SpaceView {
             .child(
                 div()
                     .flex_none()
+                    .max_w(gpui::rems(BYLINE_MAX_W))
+                    .truncate()
                     .text_color(theme.muted_foreground)
                     .child(row.byline.clone()),
             )
@@ -1837,23 +1845,38 @@ impl SpaceView {
     /// through [`SpaceView::model_display`]. Two names for one person
     /// inside one window would be worse than the attribution this repairs.
     ///
-    /// **Otherwise the edge's own carried label** — `antecedent_author_label`,
-    /// the source space's effective label for that author, joined on the
-    /// *antecedent's* space rather than this one. It is the only thing that can
-    /// name a passage quoted out of a conversation this window never loaded,
-    /// and it is what the model-facing renderings say about the same edge.
+    /// **Otherwise the edge's own carried author identity**, read through the
+    /// very same rule: `(antecedent_author_kind, antecedent_author_label)` — the
+    /// source space's effective pair for that author, joined on the
+    /// *antecedent's* space rather than this one — handed to
+    /// [`crate::space::byline_for_participant`], which is what the gutter above
+    /// resolves a post's own identity with. It is the only thing that can name a
+    /// passage quoted out of a conversation this window never loaded, and going
+    /// through the shared rule is what makes the draft rail and the persisted
+    /// rail agree: the draft carries the *source window's rendered* byline, and
+    /// a raw label would have said "another space" where composing said
+    /// "Eidola", or "user" where it said "You" — the attribution changing at the
+    /// durability boundary, one layer down from the bug this repairs (Codex
+    /// review, PR #292).
     ///
-    /// **`ELSEWHERE` only when neither names anyone.** A per-space override of
+    /// **`ELSEWHERE` only when nothing names anyone.** A per-space override of
     /// `''` is "override to empty" under the schema's NULL-inherits rule, so an
-    /// effective label really can be blank — and a blank byline here would be a
-    /// row indented past a gap that says nothing.
+    /// effective label really can be blank — and where the kind supplies no
+    /// fallback either, a blank byline would be a row indented past a gap that
+    /// says nothing.
     fn reference_byline(&self, reference: &eidola_app_core::PostReference) -> SharedString {
         self.posts
             .iter()
             .find(|p| p.action_id.as_deref() == Some(reference.antecedent_action_id.as_str()))
             .map(|p| p.byline.clone())
             .filter(|byline| !byline.trim().is_empty())
-            .or_else(|| non_blank(&reference.antecedent_author_label))
+            .or_else(|| {
+                crate::space::byline_for_participant(
+                    &reference.antecedent_author_kind,
+                    &reference.antecedent_author_label,
+                )
+                .map(SharedString::from)
+            })
             .unwrap_or_else(|| SharedString::from(ELSEWHERE))
     }
 
@@ -2393,6 +2416,7 @@ mod tests {
             annotation: None,
             snippet: snippet.map(String::from),
             antecedent_author_label: "Ada".into(),
+            antecedent_author_kind: "agent".into(),
         };
         // A mapped marker standing as its own paragraph is elided.
         let doc = "before\n\n{{ embed 1 }}\n\nafter";

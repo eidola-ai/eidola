@@ -303,6 +303,33 @@ impl SpacesStore {
         }
     }
 
+    /// React to a `Change::Participants` by telling **every** live registered
+    /// `Space` to re-read its transcript. Routed here from
+    /// `stores::dispatch_change`.
+    ///
+    /// A transcript is where an author's *name* lives: `get_space_tree` resolves
+    /// every post's byline and every reference edge's carried author identity
+    /// through `COALESCE(space_participant.override_label, participant.label)`
+    /// at read time, and nothing re-derives them afterwards. So a rename — which
+    /// emits `Change::Participants` and nothing else — left every loaded window
+    /// showing the old name in its post gutters, its minimap labels and its
+    /// footnote rails, until an unrelated `Change::Space` or a reopen (Codex
+    /// review, PR #292). The signal carries no id (a global agent is renamed
+    /// everywhere at once, and an override is written per space), so the answer
+    /// is every live space rather than one.
+    ///
+    /// **Not routed through `notify_space_changed`**, whose other two effects
+    /// are about *posts*: nothing a participant edit does invalidates a cached
+    /// incoming-reference index or a trace round. Each entity's own
+    /// `is_busy` gate still applies, so this can never land under a mutation.
+    pub fn notify_participants_changed(&mut self, cx: &mut Context<Self>) {
+        for weak in self.registry.values() {
+            if let Some(entity) = weak.upgrade() {
+                entity.update(cx, |space, cx| space.on_participants_changed(cx));
+            }
+        }
+    }
+
     // -- Refused operations -------------------------------------------------
 
     /// The most recent refusal, whatever it was about — the Library's banner,

@@ -468,10 +468,19 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
         // a promotion adds a row, a retirement removes one, and an "edit
         // everywhere" moves what a row says. Two domains, one invalidation —
         // the dispatcher fans it out rather than either store polling.
+        // The **live transcripts** answer it too, and for the same reason one
+        // domain over: a post's byline and a reference edge's carried author
+        // identity are resolved by `get_space_tree`'s joins at read time and
+        // never re-derived, so a rename left every open window naming the
+        // author as they were when it loaded. See
+        // `SpacesStore::notify_participants_changed`.
         Change::Participants => {
             stores.participants.update(cx, |s, cx| s.refresh_all(cx));
             stores.templates.update(cx, |s, cx| s.refresh(cx));
             stores.agents.update(cx, |s, cx| s.refresh(cx));
+            stores
+                .spaces
+                .update(cx, |s, cx| s.notify_participants_changed(cx));
         }
     }
 }
