@@ -700,15 +700,15 @@ pub async fn create_checkout(
     let (submit_note, description) = if mode == "subscription" {
         (
             "Credits granted each billing period expire at the end of that period. \
-             Unused, unexpired credits are refundable on request. Details: eidola.ai/terms",
+             Unused, unexpired credits are refundable on request. Details: www.eidola.ai/terms",
             "Eidola subscription — each period's credits expire at the end of that \
-             billing period (see eidola.ai/terms)",
+             billing period (see www.eidola.ai/terms)",
         )
     } else {
         (
             "Credits expire one year after purchase. Unused, unexpired credits are \
-             refundable on request. Details: eidola.ai/terms",
-            "Eidola credits — expire one year after purchase (see eidola.ai/terms)",
+             refundable on request. Details: www.eidola.ai/terms",
+            "Eidola credits — expire one year after purchase (see www.eidola.ai/terms)",
         )
     };
 
