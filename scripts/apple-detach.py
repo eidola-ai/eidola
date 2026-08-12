@@ -40,11 +40,44 @@ from macho_facts import facts  # noqa: E402  (sibling script, not a package)
 ARCH_SUFFIX = {"arm64": "arm64", "arm64e": "arm64", "x86_64": "x86_64"}
 
 
+def clear_previous(out_dir, root):
+    """Remove what a previous detach into `out_dir` left behind.
+
+    Regenerating into a reused directory must not keep material the new
+    input no longer has. If a later build drops a slice, an executable, the
+    bundle seal or a stapled ticket, the old `.archsign` or `CodeResources`
+    would survive and `signapple apply` would consume stale material that no
+    placement record mentions. The documented fixture-regeneration command
+    reuses `detached/`, so this is the ordinary path, not the exotic one.
+
+    Only what this script writes is removed: the bundle tree it is about to
+    write, and the one a previous placement record names.
+    """
+    record = os.path.join(out_dir, "eidola-placement.json")
+    if os.path.isfile(record):
+        try:
+            with open(record) as f:
+                previous = json.load(f).get("bundle")
+        except (OSError, ValueError):
+            previous = None
+        # A basename and nothing else, so a damaged record cannot point the
+        # removal outside `out_dir`.
+        if isinstance(previous, str) and previous and os.path.basename(previous) == previous:
+            previous_root = os.path.join(out_dir, previous)
+            if os.path.isdir(previous_root):
+                shutil.rmtree(previous_root)
+        os.remove(record)
+    if os.path.isdir(root):
+        shutil.rmtree(root)
+
+
 def detach(bundle, out_dir, unsigned=None):
     bundle_name = os.path.basename(bundle.rstrip("/"))
     root = os.path.join(out_dir, bundle_name)
+    os.makedirs(out_dir, exist_ok=True)
+    clear_previous(out_dir, root)
     macos_out = os.path.join(root, "Contents", "MacOS")
-    os.makedirs(macos_out, exist_ok=True)
+    os.makedirs(macos_out)
 
     macos_dir = os.path.join(bundle, "Contents", "MacOS")
     placement = {"schema_version": 1, "bundle": bundle_name, "machos": {}, "files": {}}
