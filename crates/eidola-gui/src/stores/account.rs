@@ -197,6 +197,31 @@ impl AccountStore {
         self.refresh_subscription(cx);
     }
 
+    /// The account this machine speaks for **right now**, read straight from
+    /// app-core's config.
+    ///
+    /// Deliberately not `ConfigStore`: that snapshot is a *cache* refreshed
+    /// from the bus, and every write here commits to config synchronously and
+    /// then emits `Change::Config`, so between the commit and the next bus
+    /// tick the cached id still names the account that has just been replaced.
+    /// Anything deciding whether a credential-bearing round trip still belongs
+    /// to the configured account has to read past that lag, or it is asking
+    /// the stale copy about the staleness it exists to detect.
+    ///
+    /// `fallback` answers on a stub store, which has no config to read.
+    pub fn account_identity(&self, fallback: Option<&str>) -> Option<String> {
+        match self.app_core.as_ref() {
+            Some(core) => core.config_state().account_id,
+            None => fallback.map(str::to_string),
+        }
+    }
+
+    /// Whether a URL minted while `minted_for` was configured may still be
+    /// opened — that is, whether the configured account is still that one.
+    pub fn mint_is_current(&self, minted_for: Option<&str>, fallback: Option<&str>) -> bool {
+        self.account_identity(fallback).as_deref() == minted_for
+    }
+
     /// Test-only: put the subscription cell in an arbitrary state, so a
     /// behavior test or driver scene can render "checking" and "couldn't
     /// check" without a backend that stalls or fails on cue.

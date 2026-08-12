@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 use eidola_app_core::SubscriptionState;
 use eidola_app_core::error::AppError;
 use gpui::{
-    AnyElement, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, IsZero, ParentElement, Pixels, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Task, TouchPhase, Window, div, point, px,
 };
@@ -459,6 +459,7 @@ impl OnboardingView {
                     Ok(created) => {
                         this.created = Some((created.id.into(), created.secret.into()));
                         this.stores.config.update(cx, |c, cx| c.refresh(cx));
+                        this.forget_account_scoped_view_state();
                         this.stores.account.update(cx, |s, cx| {
                             s.refresh_prices(cx);
                             s.refresh_balances(cx);
@@ -509,31 +510,39 @@ impl OnboardingView {
                     message: "verification task cancelled".into(),
                 })
             });
-            let _ = this.update(cx, |this, cx| {
-                this.verifying = false;
-                this.verify_task = None;
-                match res {
-                    Ok(balances) => {
-                        let available = balances.available;
-                        this.stores.config.update(cx, |c, cx| c.refresh(cx));
-                        this.stores.account.update(cx, |s, cx| {
-                            s.set_balances(balances, cx);
-                            s.refresh_prices(cx);
-                            // Linking a *different* account changes whose
-                            // subscription this is, and an Account pane
-                            // already on screen has no other trigger to
-                            // re-read: nothing on the bus invalidates that
-                            // cell and activation only fires on a pane
-                            // change.
-                            s.account_identity_changed(cx);
-                        });
-                        this.verify_result = Some(Ok(available));
-                    }
-                    Err(e) => this.verify_result = Some(Err(verify_error_copy(&e))),
-                }
-                cx.notify();
-            });
+            let _ = this.update(cx, |this, cx| this.finish_verify(res, cx));
         }));
+    }
+
+    /// Land a credential check. Public so behavior tests drive the same path
+    /// the request's own task does.
+    pub fn finish_verify(
+        &mut self,
+        res: Result<eidola_app_core::BalancesResult, AppError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.verifying = false;
+        self.verify_task = None;
+        match res {
+            Ok(balances) => {
+                let available = balances.available;
+                self.stores.config.update(cx, |c, cx| c.refresh(cx));
+                self.forget_account_scoped_view_state();
+                self.stores.account.update(cx, |s, cx| {
+                    s.set_balances(balances, cx);
+                    s.refresh_prices(cx);
+                    // Linking a *different* account changes whose
+                    // subscription this is, and an Account pane already on
+                    // screen has no other trigger to re-read: nothing on the
+                    // bus invalidates that cell and activation only fires on
+                    // a pane change.
+                    s.account_identity_changed(cx);
+                });
+                self.verify_result = Some(Ok(available));
+            }
+            Err(e) => self.verify_result = Some(Err(verify_error_copy(&e))),
+        }
+        cx.notify();
     }
 
     /// Open a Stripe checkout for `price_id` in the browser (purchase slide).
@@ -545,6 +554,10 @@ impl OnboardingView {
         self.checkout_error = None;
         cx.notify();
 
+        // Which account this checkout would fund. The reader can go back from
+        // the Purchase slide and link a different account while the request is
+        // in flight, so the answer is re-asked when it lands.
+        let minted_for = self.account_identity(cx);
         let Some(rx) = self.stores.account.read(cx).request_checkout(price_id) else {
             return;
         };
@@ -554,16 +567,81 @@ impl OnboardingView {
                     message: "checkout task cancelled".into(),
                 })
             });
-            let _ = this.update(cx, |this, cx| {
-                this.checkout_pending = None;
-                this.checkout_task = None;
-                match res {
-                    Ok(url) => cx.open_url(&url),
-                    Err(e) => this.checkout_error = Some(e.to_string()),
-                }
-                cx.notify();
-            });
+            let _ = this.update(cx, |this, cx| this.finish_checkout(minted_for, res, cx));
         }));
+    }
+
+    /// Land a checkout mint. Public so behavior tests drive the same path the
+    /// request's own task does.
+    pub fn finish_checkout(
+        &mut self,
+        minted_for: Option<String>,
+        res: Result<String, AppError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.checkout_pending = None;
+        self.checkout_task = None;
+        match res {
+            Ok(url) => {
+                if self.mint_is_current(&minted_for, cx) {
+                    cx.open_url(&url);
+                } else {
+                    self.checkout_error = Some(crate::account::STALE_MINT.to_string());
+                }
+            }
+            Err(e) => self.checkout_error = Some(e.to_string()),
+        }
+        cx.notify();
+    }
+
+    pub fn checkout_error(&self) -> Option<&str> {
+        self.checkout_error.as_deref()
+    }
+
+    pub fn checkout_pending(&self) -> Option<&str> {
+        self.checkout_pending.as_deref()
+    }
+
+    /// Drop the checkout state started for the account being replaced — the
+    /// Account pane's rule (see `AccountView::forget_account_scoped_view_state`)
+    /// on the surface that owns the other half of it.
+    ///
+    /// Here the **event** hook is enough where the pane's could not be: this
+    /// view is the sole author of an identity change during onboarding (there
+    /// is no reset slide), so creating and linking are the whole set. A reader
+    /// who pressed a plan, went back, and linked a different account must not
+    /// return to a Purchase slide whose row still reads as in flight for the
+    /// account they walked away from.
+    fn forget_account_scoped_view_state(&mut self) {
+        self.checkout_pending = None;
+        self.checkout_task = None;
+        self.checkout_error = None;
+    }
+
+    /// The account a checkout started now would fund. Read past the
+    /// `ConfigStore` cache — see [`crate::stores::AccountStore::account_identity`].
+    fn account_identity(&self, cx: &App) -> Option<String> {
+        let fallback = self.cached_account_id(cx);
+        self.stores
+            .account
+            .read(cx)
+            .account_identity(fallback.as_deref())
+    }
+
+    fn cached_account_id(&self, cx: &App) -> Option<String> {
+        self.stores
+            .config
+            .read(cx)
+            .state()
+            .and_then(|s| s.account_id.clone())
+    }
+
+    fn mint_is_current(&self, minted_for: &Option<String>, cx: &App) -> bool {
+        let fallback = self.cached_account_id(cx);
+        self.stores
+            .account
+            .read(cx)
+            .mint_is_current(minted_for.as_deref(), fallback.as_deref())
     }
 }
 
