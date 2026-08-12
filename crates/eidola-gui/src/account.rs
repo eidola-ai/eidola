@@ -9,13 +9,15 @@
 use eidola_app_core::SubscriptionState;
 use eidola_app_core::error::AppError;
 use gpui::{
-    AsyncApp, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div,
+    App, AppContext, AsyncApp, ClipboardItem, Context, Entity, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    WeakEntity, Window, div, prelude::FluentBuilder,
 };
 use gpui_component::{
-    ActiveTheme, Sizable, StyledExt,
+    ActiveTheme, IconName, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
+    input::{Input, InputEvent, InputState},
     label::Label,
     v_flex,
 };
@@ -42,20 +44,41 @@ pub struct AccountView {
     manage_pending: bool,
     manage_error: Option<String>,
     manage_task: Option<gpui::Task<()>>,
+    account_id_input: Entity<InputState>,
+    account_secret_input: Entity<InputState>,
+    account_id_seed: Option<SharedString>,
+    account_secret_seed: Option<SharedString>,
+    account_secret_revealed: bool,
     _subscriptions: Vec<Subscription>,
 }
 
 impl AccountView {
-    pub fn new(
-        stores: crate::stores::Stores,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(stores: crate::stores::Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let config = stores.config.clone();
         let account = stores.account.clone();
+        let account_id_input = cx.new(|cx| InputState::new(window, cx));
+        let account_secret_input = cx.new(|cx| InputState::new(window, cx).masked(true));
         let _subscriptions = vec![
             cx.observe(&config, |_, _, cx| cx.notify()),
             cx.observe(&account, |_, _, cx| cx.notify()),
+            cx.subscribe_in(
+                &account_id_input,
+                window,
+                |this, _, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        this.sync_account_credential_inputs(window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &account_secret_input,
+                window,
+                |this, _, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        this.sync_account_credential_inputs(window, cx);
+                    }
+                },
+            ),
         ];
 
         // Nothing is fetched here. `SettingsView` builds every pane when the
@@ -72,6 +95,11 @@ impl AccountView {
             manage_pending: false,
             manage_error: None,
             manage_task: None,
+            account_id_input,
+            account_secret_input,
+            account_id_seed: None,
+            account_secret_seed: None,
+            account_secret_revealed: false,
             _subscriptions,
         }
     }
@@ -216,10 +244,53 @@ impl AccountView {
             },
         ));
     }
+
+    fn account_credentials(&self, cx: &App) -> (Option<SharedString>, Option<SharedString>) {
+        let config = self.config.read(cx);
+        let state = config.state();
+        (
+            state
+                .and_then(|s| s.account_id.as_ref())
+                .map(|s| SharedString::from(s.clone())),
+            state
+                .and_then(|s| s.account_secret.as_ref())
+                .map(|s| SharedString::from(s.clone())),
+        )
+    }
+
+    fn sync_account_credential_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (account_id, account_secret) = self.account_credentials(cx);
+        sync_readonly_input(
+            &self.account_id_input,
+            &mut self.account_id_seed,
+            account_id,
+            window,
+            cx,
+        );
+        sync_readonly_input(
+            &self.account_secret_input,
+            &mut self.account_secret_seed,
+            account_secret,
+            window,
+            cx,
+        );
+        self.account_secret_input.update(cx, |s, cx| {
+            s.set_masked(!self.account_secret_revealed, window, cx)
+        });
+    }
+
+    fn toggle_account_secret_revealed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.account_secret_revealed = !self.account_secret_revealed;
+        self.account_secret_input.update(cx, |s, cx| {
+            s.set_masked(!self.account_secret_revealed, window, cx)
+        });
+        cx.notify();
+    }
 }
 
 impl Render for AccountView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_account_credential_inputs(window, cx);
         let theme = cx.theme();
         let has_account = self
             .config
@@ -256,10 +327,34 @@ impl Render for AccountView {
         // --- Account ----------------------------------------------------
         col = col.child(section_header("Account", cx));
         if has_account {
-            let mut account_block =
-                v_flex().gap_1().child(div().child(
-                    "Anonymous account on this machine — the server holds only a random id.",
+            let (account_id, account_secret) = self.account_credentials(cx);
+            let mut account_block = v_flex().gap_3();
+            if let Some(account_id) = account_id {
+                account_block = account_block.child(account_credential_input(
+                    "Account ID",
+                    "settings/account/id",
+                    &self.account_id_input,
+                    account_id,
+                    false,
+                    self.account_secret_revealed,
+                    |_, _, _| {},
+                    cx,
                 ));
+            }
+            if let Some(account_secret) = account_secret {
+                account_block = account_block.child(account_credential_input(
+                    "Account Secret",
+                    "settings/account/secret",
+                    &self.account_secret_input,
+                    account_secret,
+                    true,
+                    self.account_secret_revealed,
+                    cx.listener(|this, _, window, cx| {
+                        this.toggle_account_secret_revealed(window, cx)
+                    }),
+                    cx,
+                ));
+            }
 
             if self.confirm_reset {
                 account_block = account_block.child(
@@ -675,10 +770,6 @@ impl Render for AccountView {
         // A subscription in force means the server refuses a second one, so
         // the recurring plans come out and the one-time top-ups stay.
         let offered = plans::offered_plans(&prices, subscribed);
-        col = col.child(div().pt_2().child(section_header(
-            if subscribed { "Add credit" } else { "Plans" },
-            cx,
-        )));
         if offered.is_empty() {
             col = col.child(div().text_color(theme.muted_foreground).child(if busy {
                 "Loading plans…"
@@ -693,20 +784,13 @@ impl Render for AccountView {
                 std::rc::Rc::new(move |price_id, _window, app| {
                     let _ = weak.update(app, |this, cx| this.begin_checkout(price_id, cx));
                 });
-            col = col
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("Checkout opens in your browser; credit lands on this account."),
-                )
-                .child(plans::plan_rows(
-                    &offered,
-                    self.checkout_pending.as_deref(),
-                    on_select,
-                    "settings/account",
-                    cx,
-                ));
+            col = col.child(plans::plan_rows(
+                &offered,
+                self.checkout_pending.as_deref(),
+                on_select,
+                "settings/account",
+                cx,
+            ));
         }
         if let Some(err) = self.checkout_error.as_deref() {
             col = col.child(
@@ -791,6 +875,92 @@ fn subscription_summary(status: Option<&str>, period_end_ms: Option<i64>, now_ms
         Some(when) => format!("{standing} The current billing period ends {when}."),
         None => format!("{standing} The current billing period has ended."),
     }
+}
+
+fn sync_readonly_input(
+    state: &Entity<InputState>,
+    seed: &mut Option<SharedString>,
+    value: Option<SharedString>,
+    window: &mut Window,
+    cx: &mut Context<AccountView>,
+) {
+    if seed != &value {
+        let text = value.clone().unwrap_or_default();
+        state.update(cx, |s, cx| s.set_value(text.to_string(), window, cx));
+        *seed = value;
+        return;
+    }
+
+    if let Some(value) = seed.as_ref() {
+        if state.read(cx).value().as_ref() != value.as_ref() {
+            let text = value.clone();
+            state.update(cx, |s, cx| s.set_value(text.to_string(), window, cx));
+        }
+    }
+}
+
+fn account_credential_input(
+    label: &'static str,
+    id_prefix: &'static str,
+    state: &Entity<InputState>,
+    value: SharedString,
+    show_secret_button: bool,
+    secret_revealed: bool,
+    on_toggle_secret: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    let copy_value = value.clone();
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(label),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("{id_prefix}-input")))
+                .probe_bounds(id_prefix, gpui::Role::TextInput, label)
+                .w_full()
+                .child(
+                    Input::new(state).aria_label(label).suffix(
+                        h_flex()
+                            .gap_0p5()
+                            .when(show_secret_button, |el| {
+                                el.child(
+                                    Button::new(SharedString::from(format!("{id_prefix}-show")))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(if secret_revealed {
+                                            IconName::EyeOff
+                                        } else {
+                                            IconName::Eye
+                                        })
+                                        .tooltip(if secret_revealed {
+                                            "Hide account secret"
+                                        } else {
+                                            "Show account secret"
+                                        })
+                                        .on_click(on_toggle_secret),
+                                )
+                            })
+                            .child(
+                                Button::new(SharedString::from(format!("{id_prefix}-copy")))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Copy)
+                                    .tooltip(format!("Copy {label}"))
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_value.to_string(),
+                                        ));
+                                    }),
+                            ),
+                    ),
+                ),
+        )
 }
 
 fn section_header(label: &str, cx: &gpui::App) -> impl IntoElement {

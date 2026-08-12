@@ -886,6 +886,8 @@ fn probe_config_state() -> ConfigState {
         default_template: "00000000-0000-7000-8000-000000000010".into(),
         has_account: true,
         has_account_secret: true,
+        account_id: Some("00000000-0000-7000-8000-000000000111".into()),
+        account_secret: Some("probe-account-secret".into()),
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
         attestation_url: None,
         appearance: eidola_app_core::config::AppearanceSetting::System,

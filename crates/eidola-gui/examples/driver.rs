@@ -1276,6 +1276,8 @@ mod driver {
             default_template: "00000000-0000-7000-8000-000000000010".into(),
             has_account,
             has_account_secret: has_account,
+            account_id: has_account.then(|| "00000000-0000-7000-8000-000000000111".into()),
+            account_secret: has_account.then(|| "driver-account-secret".into()),
             domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
             attestation_url: None,
             appearance: eidola_app_core::config::AppearanceSetting::System,
