@@ -31,6 +31,15 @@ CPU_NAMES = {
     (0x01000007, 3): "x86_64",
 }
 
+# A `fat_arch` is 20 bytes with 32-bit offset/size; a `fat_arch_64` is 32
+# bytes with 64-bit ones and a trailing reserved word. Both are big-endian.
+# The two are parsed rather than FAT_MAGIC_64 rejected because `fat_offset`
+# is load-bearing — apple-detach.py lifts each superblob from it — so
+# reading a 64-bit table with the 32-bit layout yields a plausible-looking
+# zero offset rather than an error.
+FAT_ARCH = struct.Struct(">iiIII")
+FAT_ARCH_64 = struct.Struct(">iiQQII")
+
 
 def cpu_name(cputype, cpusubtype):
     return CPU_NAMES.get((cputype, cpusubtype & 0x00FFFFFF), f"{cputype}/{cpusubtype}")
@@ -98,11 +107,12 @@ def facts(path):
     (be_magic,) = struct.unpack_from(">I", data, 0)
     if be_magic in (FAT_MAGIC, FAT_MAGIC_64):
         (nfat,) = struct.unpack_from(">I", data, 4)
+        fat_arch = FAT_ARCH_64 if be_magic == FAT_MAGIC_64 else FAT_ARCH
         slices = []
         for i in range(nfat):
-            cputype, cpusubtype, offset, size, align = struct.unpack_from(
-                ">iiIII", data, 8 + i * 20
-            )
+            cputype, cpusubtype, offset, size, align = fat_arch.unpack_from(
+                data, 8 + i * fat_arch.size
+            )[:5]
             s = slice_facts(data, offset)
             s["fat_offset"] = offset
             s["fat_size"] = size

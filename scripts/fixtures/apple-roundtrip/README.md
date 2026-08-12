@@ -44,6 +44,8 @@ codesign --force --sign - --options runtime --entitlements ent.plist signed/Fixt
 python3 ../../../apple-detach.py signed/Fixture.app detached settled/Fixture.app
 ```
 
+Re-running that is safe on an existing tree: `apple-detach.py` clears the bundle it is about to write (and the one a previous `eidola-placement.json` names) before regenerating, so a slice, executable, seal or ticket the new input no longer has cannot survive as a stale `.archsign` for `signapple apply` to consume.
+
 `facts.json` is `scripts/macho_facts.py` over the three Mach-Os, keyed by path.
 
 ## `llama-server/`

@@ -154,26 +154,33 @@ python3 "$REPO_ROOT/scripts/apple-detach.py" "$S1" "$WORK/detached" "$U" >/dev/n
 A="$(stage A)"
 "$SIGNAPPLE" apply --no-verify "$A" "$WORK/detached/$APP_NAME" >/dev/null
 
-# Upstream signapple diverges from codesign on exactly one field (see
-# apple_linkedit_diff.py). Report that state by name rather than as a bare
-# "differ": a diff that has grown beyond it is the regression worth failing.
-# Graded only on the settled artifact below: on the as-built one the
-# divergence is expected and is itself the finding, so it is reported
-# without failing the run.
-ROUNDTRIP_EXACT=1
-classify() { # classify <graded|info> <label> <a> <b>
+# Upstream signapple diverges from codesign on exactly one field of the
+# x86_64 slice (see apple_linkedit_diff.py). Report that state by name
+# rather than as a bare "differ": a diff that has grown beyond it is the
+# regression worth failing. Graded only on the settled artifact below: on
+# the as-built one the divergence is expected and is itself the finding, so
+# it is reported without failing the run.
+#
+# The verdict lands in CLASSIFY_KIND for the caller to fold into *its own*
+# artifact's exactness. Byte-exactness is a property of one bundle, not of
+# the run, and (d) below gates a real verification failure on it — so a
+# single shared flag would let one section's expected divergence excuse
+# another section's genuine break.
+CLASSIFY_KIND=""
+KNOWN_DIVERGENCE=0
+classify() { # classify <graded|info> <label> <signed> <applied>; sets CLASSIFY_KIND
   local grade="$1" label="$2" out kind
   out="$(python3 "$REPO_ROOT/scripts/apple_linkedit_diff.py" "$3" "$4" 2>&1)" || true
   kind="$(printf '%s\n' "$out" | head -1)"
+  CLASSIFY_KIND="$kind"
   case "$kind" in
     identical)
       printf '    PASS  %-52s (identical)\n' "$label" ;;
     linkedit-vmsize-only)
-      ROUNDTRIP_EXACT=0
+      KNOWN_DIVERGENCE=1
       printf '    KNOWN %-52s (documented signapple divergence)\n' "$label"
       printf '%s\n' "$out" | tail -n +2 | sed 's/^/        /' ;;
     *)
-      ROUNDTRIP_EXACT=0
       if [[ "$grade" == graded ]]; then
         printf '    FAIL  %-52s\n' "$label"; FAILURES=$((FAILURES + 1))
       else
@@ -207,13 +214,18 @@ chmod -R u+w "$SS" "$SA_"
 sign_adhoc "$SS"
 python3 "$REPO_ROOT/scripts/apple-detach.py" "$SS" "$WORK/detached-settled" "$SB" >/dev/null
 "$SIGNAPPLE" apply --no-verify "$SA_" "$WORK/detached-settled/$APP_NAME" >/dev/null
-ROUNDTRIP_EXACT=1
+# Exactness of the SA bundle specifically — this is what (d) may excuse a
+# verification failure with, and nothing else may set it.
+SETTLED_EXACT=1
 classify graded "main binary (both slices), apply == signed" "$SS/$MAIN" "$SA_/$MAIN"
+[[ "$CLASSIFY_KIND" == identical ]] || SETTLED_EXACT=0
 classify graded "sidecar (arm64-only), apply == signed"      "$SS/$SIDE" "$SA_/$SIDE"
+[[ "$CLASSIFY_KIND" == identical ]] || SETTLED_EXACT=0
 if diff -r "$SS" "$SA_" >/dev/null 2>&1; then
   printf '    PASS  %-52s (same)\n' "whole bundle tree"
 else
   printf '    FAIL  %-52s (differ)\n' "whole bundle tree"; FAILURES=$((FAILURES + 1))
+  SETTLED_EXACT=0
 fi
 
 echo
@@ -224,8 +236,30 @@ echo "=== (b++) the latent case: a replacing signature of a different size ==="
 # slice. A Developer ID signature will be a different size. Sweep padded
 # entitlements (keyless, so this runs anywhere) until the sum crosses a
 # 16 KiB boundary, and report what happens there.
-found=no
-for pad in 0 800 1600 2400 3200; do
+#
+# Whether a boundary was crossed is read off the signed artifact rather than
+# inferred from the classifier's verdict, so "we never exercised the case"
+# and "we exercised it and apply agreed" stay distinguishable. The sweep
+# spans more than 16 KiB of signature growth, so some size must cross; if
+# none does, the harness has stopped testing what it advertises and says so
+# instead of reporting an exact round trip. Nothing else here consumes
+# scripts/fixtures/apple-roundtrip/ — those are inputs for Wave 3's
+# eidola-apple test, not a substitute for exercising the case now.
+boundary_state() { # boundary_state <mach-o> -> crossed|aligned|absent
+  python3 "$FACTS" "$1" | python3 -c '
+import json, sys
+def round_up(v, p): return (v + p - 1) // p * p
+state = "absent"
+for s in json.load(sys.stdin)["slices"]:
+    if s["arch"] != "x86_64":
+        continue
+    f = s["linkedit"]["filesize"]
+    state = "crossed" if round_up(f, 0x4000) != round_up(f, 0x1000) else "aligned"
+print(state)'
+}
+
+BOUNDARY=unexercised
+for pad in 0 800 1600 2400 3200 4000 4800 5600 6400 7200 8000 8800 9600 10400; do
   PS="$WORK/P$pad/$APP_NAME"; rm -rf "$WORK/P$pad"; mkdir -p "$WORK/P$pad"
   cp -R "$SB" "$PS"; chmod -R u+w "$PS"
   PA="$WORK/Q$pad/$APP_NAME"; rm -rf "$WORK/Q$pad"; mkdir -p "$WORK/Q$pad"
@@ -245,44 +279,76 @@ open(sys.argv[1], 'w').write(
   python3 "$REPO_ROOT/scripts/apple-detach.py" "$PS" "$WORK/det$pad" "$SB" >/dev/null
   "$SIGNAPPLE" apply --no-verify "$PA" "$WORK/det$pad/$APP_NAME" >/dev/null 2>&1
   kind="$(python3 "$REPO_ROOT/scripts/apple_linkedit_diff.py" "$PS/$MAIN" "$PA/$MAIN" 2>&1 | head -1)" || true
-  printf '    entitlements pad %-5s main: %-24s -> %s\n' "$pad" "$(vmsizes "$PS/$MAIN")" "$kind"
-  if [[ "$kind" == "linkedit-vmsize-only" ]]; then
-    found=yes
-    classify graded "boundary case, apply == signed" "$PS/$MAIN" "$PA/$MAIN"
-    break
-  elif [[ "$kind" != "identical" ]]; then
-    classify graded "boundary case, apply == signed" "$PS/$MAIN" "$PA/$MAIN"
-    break
-  fi
+  crossed="$(boundary_state "$PS/$MAIN")"
+  printf '    entitlements pad %-5s main: %-24s %-8s -> %s\n' \
+    "$pad" "$(vmsizes "$PS/$MAIN")" "$crossed" "$kind"
+  case "$kind" in
+    identical)
+      # Agreeing while the two roundings land on the same value is the
+      # expected non-case; agreeing while they do not is a documented fact
+      # that has stopped being true, and must be re-measured, not skipped.
+      [[ "$crossed" != crossed ]] || { BOUNDARY=silent; break; } ;;
+    linkedit-vmsize-only)
+      BOUNDARY=crossed
+      classify graded "boundary case, apply == signed" "$PS/$MAIN" "$PA/$MAIN"
+      break ;;
+    *)
+      BOUNDARY=broken
+      classify graded "boundary case, apply == signed" "$PS/$MAIN" "$PA/$MAIN"
+      break ;;
+  esac
 done
-[[ "$found" == yes ]] || printf '    %s\n' "no boundary crossed at these sizes; the case is covered by scripts/fixtures/apple-roundtrip/"
+case "$BOUNDARY" in
+  # crossed: the case was exercised and graded above.
+  # broken:  graded above too, and already counted as a failure there.
+  crossed | broken) ;;
+  silent)
+    printf '    FAIL  %-52s\n' "boundary case exercised the documented divergence"
+    printf '        %s\n' "a 16 KiB boundary was crossed and apply matched anyway;" \
+      "round-trip.md §3.3 no longer describes signapple — re-measure"
+    FAILURES=$((FAILURES + 1)) ;;
+  *)
+    printf '    FAIL  %-52s\n' "boundary case reached"
+    printf '        %s\n' "no padded entitlement size crossed a 16 KiB boundary," \
+      "so the latent case went untested; widen the sweep"
+    FAILURES=$((FAILURES + 1)) ;;
+esac
 
 echo
 echo "=== (d) codesign --verify --deep --strict ==="
-verify_bundle() { # verify_bundle <stage> <required: yes|if-exact>
-  local name="$1" required="$2"
+# The second argument is *this bundle's* exactness, never the run's: a
+# signature seals the load commands, so a bundle that did not round-trip
+# byte-exactly is necessarily also a verification failure and that is not a
+# separate finding — but a bundle that did round-trip exactly has no such
+# excuse and any failure is real.
+verify_bundle() { # verify_bundle <stage> <round-tripped byte-exact: yes|no>
+  local name="$1" exact="$2"
   if codesign --verify --deep --strict --verbose=2 "$WORK/$name/$APP_NAME" >"$WORK/$name.verify" 2>&1; then
     printf '    PASS  %-52s\n' "$name verifies"
-  elif [[ "$required" == "if-exact" && "$ROUNDTRIP_EXACT" -eq 0 ]]; then
-    # A signature seals the load commands, so the vmsize divergence above is
-    # necessarily also a verification failure. Not a separate finding.
-    printf '    KNOWN %-52s (follows from the divergence above)\n' "$name verifies"
+  elif [[ "$exact" == no ]]; then
+    printf '    KNOWN %-52s (follows from that bundle'\''s divergence)\n' "$name verifies"
     sed 's/^/        /' "$WORK/$name.verify"
   else
     printf '    FAIL  %-52s\n' "$name verifies"; FAILURES=$((FAILURES + 1))
     sed 's/^/          /' "$WORK/$name.verify"
   fi
 }
+# S1 is signed by codesign itself, so it must verify unconditionally.
 verify_bundle S1 yes
-verify_bundle SA if-exact
+if [[ "$SETTLED_EXACT" -eq 1 ]]; then verify_bundle SA yes; else verify_bundle SA no; fi
 
 echo
 if [[ "$FAILURES" -ne 0 ]]; then
   echo "apple-roundtrip: $FAILURES check(s) failed"
-elif [[ "$ROUNDTRIP_EXACT" -eq 1 ]]; then
-  echo "apple-roundtrip: round trip is byte-exact"
+elif [[ "$SETTLED_EXACT" -eq 1 ]]; then
+  echo "apple-roundtrip: the settled round trip is byte-exact"
+  if [[ "$KNOWN_DIVERGENCE" -eq 1 ]]; then
+    echo "                 at a signature size crossing a 16 KiB boundary, upstream"
+    echo "                 signapple still writes the documented __LINKEDIT vmsize"
+    echo "                 (one line in the signapple fork)"
+  fi
 else
-  echo "apple-roundtrip: round trip is byte-exact except the documented"
-  echo "                 __LINKEDIT vmsize divergence (one line in the signapple fork)"
+  echo "apple-roundtrip: the settled round trip carries the documented __LINKEDIT"
+  echo "                 vmsize divergence (one line in the signapple fork)"
 fi
 exit "$FAILURES"
