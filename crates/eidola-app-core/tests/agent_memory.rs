@@ -31,8 +31,8 @@
 mod chat_harness;
 
 use chat_harness::{
-    ChatBehavior, MockConfig, MockServer, ToolScript, flat_messages, memory_section,
-    system_message, system_message_with, tool_script,
+    ChatBehavior, MockConfig, MockServer, TRAILING_BLOCK_NOTE, ToolScript, flat_messages,
+    memory_section, system_message_with, tool_script,
 };
 use eidola_app_core::AppCore;
 use eidola_app_core::changes::Change;
@@ -156,7 +156,7 @@ fn memory_off_by_default_leaves_the_request_byte_identical() {
         );
         assert_eq!(
             flat_messages(&body)[0].1,
-            system_message(None, AGENT_LABEL),
+            system_message_with(None, AGENT_LABEL, &[TRAILING_BLOCK_NOTE]),
             "the system message is untouched"
         );
     });
@@ -204,7 +204,7 @@ fn remember_writes_a_block_that_the_next_turn_loads_at_the_head() {
             msgs[0].1,
             format!(
                 "{}\n\n{}",
-                system_message_with(None, AGENT_LABEL, &[MEMORY_NOTE]),
+                system_message_with(None, AGENT_LABEL, &[TRAILING_BLOCK_NOTE, MEMORY_NOTE]),
                 memory_section(&[("about you", "core", "You prefer terse answers.")]),
             ),
             "memory renders at the head, after the charter and the notes"
@@ -279,7 +279,7 @@ fn a_second_write_of_a_name_supersedes_rather_than_accumulating() {
             flat_messages(&body)[0].1,
             format!(
                 "{}\n\n{}",
-                system_message_with(None, AGENT_LABEL, &[MEMORY_NOTE]),
+                system_message_with(None, AGENT_LABEL, &[TRAILING_BLOCK_NOTE, MEMORY_NOTE]),
                 memory_section(&[("plan", "this space", "Ship the renderer first.")]),
             ),
         );

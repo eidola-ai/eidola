@@ -1481,7 +1481,8 @@ fn inspector_participants() -> (String, Vec<eidola_app_core::ParticipantInfo>) {
         scope: "global".into(),
         source: "referenced".into(),
         kind: "human".into(),
-        label: "You".into(),
+        // The **wire** label (task 64); the row shows "You".
+        label: "User".into(),
         model_ref: None,
         system_prompt: None,
         notify_policy: "explicit".into(),

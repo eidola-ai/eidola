@@ -288,6 +288,26 @@ pub(crate) fn byline_for_participant(kind: &str, label: &str) -> Option<String> 
     }
 }
 
+/// [`byline_for_participant`] for a surface that is *naming a participant row*
+/// rather than attributing a post — a roster entry, a verb's accessible name,
+/// a confirmation sentence, an error line.
+///
+/// Same rule, one fallback: a roster row always has a row to name, so an
+/// identity the rule declines to name falls back to its own label rather than
+/// to a caller-chosen word. **The rule, not the raw label**, because the label
+/// is the *wire* representation — task 64 renamed the seeded human's to `User`
+/// so a model is never told the other participant is "you", and every surface
+/// that printed `p.label` directly would have shown that rename to the reader,
+/// contradicting the contract that display is unchanged (Codex review,
+/// PR #294).
+///
+/// **Not for an editor's field.** A Name input edits the stored label and its
+/// value is written back, so seeding it from the presentation rule would rename
+/// the participant to its own display name on the next Save.
+pub(crate) fn display_name_for_participant(kind: &str, label: &str) -> String {
+    byline_for_participant(kind, label).unwrap_or_else(|| label.trim().to_string())
+}
+
 /// Map a freshly-loaded post tree into render rows.
 fn views_from_nodes(nodes: Vec<PostNode>) -> Vec<ChatMessageView> {
     nodes.into_iter().map(ChatMessageView::from_post).collect()

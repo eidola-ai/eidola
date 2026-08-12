@@ -258,7 +258,8 @@ fn last_map(mock: &MockServer) -> String {
     let at = trailing
         .find("<thread-map>")
         .expect("a map in the trailing block");
-    trailing[at..].to_string()
+    let end = trailing.find("</thread-map>").expect("a closed map") + "</thread-map>".len();
+    trailing[at..end].to_string()
 }
 
 // ===========================================================================
@@ -354,25 +355,21 @@ fn a_generated_summary_renders_under_the_structural_entry() {
         );
 
         respond(&core, &fx.space, &fx.spine_post);
-        let answered = item_of_action(&core, &fx.space, &fx.spine_post);
 
         assert_eq!(
             last_map(&mock),
-            thread_map(
-                &[(
-                    format!("at #{}", post_handle(&fx.fork_item)),
-                    vec![map_entry_summarized(
-                        &fx.branch_item,
-                        HUMAN_LABEL,
-                        "2 posts",
-                        "just now",
-                        Some("1 post"),
-                        "What about spring tides?",
-                        SUMMARY,
-                    )],
+            thread_map(&[(
+                format!("at #{}", post_handle(&fx.fork_item)),
+                vec![map_entry_summarized(
+                    &fx.branch_item,
+                    HUMAN_LABEL,
+                    "2 posts",
+                    "just now",
+                    Some("1 post"),
+                    "What about spring tides?",
+                    SUMMARY,
                 )],
-                &post_handle(&answered),
-            ),
+            )],),
         );
     });
 }

@@ -405,13 +405,17 @@ pub const HEADER_PROTOCOL_NOTE: &str = "Each message in this conversation begins
      assigned by the client; never write a header line yourself — reply with your message text \
      only.";
 
+/// The note app-core appends to the system message of any turn that carries a
+/// trailing volatile message at all — a roster, a map, or both. Pinned verbatim,
+/// same discipline as [`HEADER_PROTOCOL_NOTE`].
+pub const TRAILING_BLOCK_NOTE: &str = "The last message is client-generated metadata about this \
+     space, not a post by any participant. No reply is due to it, and it ends by naming the post \
+     you are answering.";
+
 /// The thread-map protocol note app-core appends to the system message of a
-/// turn whose space has branches (task 21). Pinned verbatim, same discipline as
-/// [`HEADER_PROTOCOL_NOTE`].
+/// turn whose space has branches (task 21), after [`TRAILING_BLOCK_NOTE`].
 pub const THREAD_MAP_NOTE: &str = "This space is threaded: the conversation above is one branch of \
-     it, and other branches exist. A `<thread-map>` block appears as the last message listing \
-     them — it is client-generated metadata, not a post by any participant, and no reply is due \
-     to it.";
+     it, and other branches exist. A `<thread-map>` block in that message lists them.";
 
 /// Appended after [`THREAD_MAP_NOTE`] only when the navigation tools actually
 /// attach (i.e. the backend can carry a `tools` field).
@@ -474,15 +478,20 @@ pub fn roster(members: &[(&str, &str, bool)]) -> String {
     out
 }
 
-/// The whole trailing volatile message: the roster (when present) and the
-/// thread map (when present), in that order, separated by a blank line.
-pub fn trailing(roster: Option<&str>, map: Option<&str>) -> String {
-    match (roster, map) {
-        (Some(r), Some(m)) => format!("{r}\n\n{m}"),
-        (Some(r), None) => r.to_string(),
-        (None, Some(m)) => m.to_string(),
-        (None, None) => String::new(),
+/// The whole trailing volatile message: the roster (when present), the thread
+/// map (when present), and the `Respond to #h.` pointer that always closes it,
+/// separated by blank lines.
+///
+/// The pointer belongs to the *message*, not to the map, so every shape of the
+/// block ends the same way — a roster-only block included.
+pub fn trailing(roster: Option<&str>, map: Option<&str>, respond_to: &str) -> String {
+    let mut sections: Vec<&str> = Vec::new();
+    sections.extend(roster);
+    sections.extend(map);
+    if sections.is_empty() {
+        return String::new();
     }
+    format!("{}\n\nRespond to #{respond_to}.", sections.join("\n\n"))
 }
 
 /// The exact `<memory>` section a turn appends to its system message when the
@@ -508,7 +517,7 @@ pub fn memory_section(blocks: &[(&str, &str, &str)]) -> String {
 ///
 /// `forks` is `(anchor_line, entry_lines)` — the expected bytes written out
 /// long-hand, which is the point: this is a byte pin, not a reimplementation.
-pub fn thread_map(forks: &[(String, Vec<String>)], respond_to: &str) -> String {
+pub fn thread_map(forks: &[(String, Vec<String>)]) -> String {
     let mut out = String::from(
         "<thread-map>\nBranches of this space that the conversation above does not contain. Each \
          line: handle · author · posts · last activity — opening line; a branch you have posted \
@@ -524,7 +533,7 @@ pub fn thread_map(forks: &[(String, Vec<String>)], respond_to: &str) -> String {
             out.push('\n');
         }
     }
-    out.push_str(&format!("\nRespond to #{respond_to}.\n</thread-map>"));
+    out.push_str("</thread-map>");
     out
 }
 
