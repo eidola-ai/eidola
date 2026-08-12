@@ -73,6 +73,54 @@ pub(crate) fn clip(text: &str, max_bytes: usize) -> String {
     format!("{}…", &text[..end])
 }
 
+/// Share of an over-budget post kept from its **head**; the rest is kept from
+/// its tail. A post opens with its subject and closes with its ask, and the
+/// opening is the half that places it, so the head gets the larger share.
+const CLIP_HEAD_SHARE: (usize, usize) = (2, 3);
+
+/// Clip a **post body** to at most `max_bytes` by eliding its *middle* rather
+/// than its tail, on char boundaries, marking the cut. Shared by every chore
+/// that puts a whole post inside a fixed per-post budget.
+///
+/// A post body is not a digest — it is a *rendered* post ([`crate::
+/// render_post_for_model`]), and its `{{ embed N }}` markers have already
+/// expanded into the passages they name. A quoted passage is a range the
+/// author chose and nothing bounds its length, so a marker standing before the
+/// post's own words can push everything the author actually wrote past a
+/// head-only budget: `{{ embed 1 }}\n\nHave the legal reviewer assess this`
+/// spends the whole budget on the quotation and reaches the model without the
+/// cue it was written to carry. That is a *routing* decision made from someone
+/// else's words, and a branch summary — written down and read for as long as
+/// the branch lives — that describes the passage while dropping the author's
+/// disagreement with it.
+///
+/// Keeping both ends is the cure that needs no arithmetic about how a
+/// rendering will lay out: the expansion sits between the author's words in
+/// the shapes that matter (before them, after them, or between two of them),
+/// so eliding the middle spends the budget on the quotation only after both
+/// ends are paid for. It is also the rule the summarizer already applies one
+/// level up, where an over-cap *branch* is sliced head + tail rather than
+/// oldest-N. The case it cannot save is prose sandwiched between two long
+/// quotations, which loses the middle like any other over-budget text.
+pub(crate) fn clip_middle(text: &str, max_bytes: usize) -> String {
+    let text = text.trim();
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let (num, denom) = CLIP_HEAD_SHARE;
+    let mut head = max_bytes * num / denom;
+    while head > 0 && !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    // `text.len() > max_bytes >= max_bytes - head`, so the tail starts at or
+    // after the head's end and the two never overlap.
+    let mut tail = text.len() - (max_bytes - head);
+    while tail < text.len() && !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}…{}", &text[..head], &text[tail..])
+}
+
 impl Inner {
     /// Resolve a chore's model reference through the backend registry.
     ///
@@ -370,5 +418,32 @@ mod tests {
     #[test]
     fn clipping_leaves_short_text_alone() {
         assert_eq!(clip("  hello  ", 32), "hello");
+    }
+
+    #[test]
+    fn a_middle_clip_keeps_both_ends_within_budget() {
+        let text = format!("OPEN{}CLOSE", "x".repeat(500));
+        let clipped = clip_middle(&text, 60);
+        assert!(clipped.starts_with("OPEN"), "got {clipped:?}");
+        assert!(clipped.ends_with("CLOSE"), "got {clipped:?}");
+        assert!(clipped.contains('…'), "the cut is marked; got {clipped:?}");
+        // The ellipsis is the only thing over budget, as with `clip`.
+        assert!(clipped.len() <= 60 + '…'.len_utf8(), "got {clipped:?}");
+    }
+
+    #[test]
+    fn a_middle_clip_respects_char_boundaries_at_both_cuts() {
+        // Multi-byte chars straddling both the head cut and the tail cut.
+        let text = "★".repeat(40);
+        let clipped = clip_middle(&text, 8);
+        assert!(clipped.contains('…'));
+        assert!(clipped.chars().all(|c| c == '★' || c == '…'));
+    }
+
+    #[test]
+    fn a_middle_clip_leaves_text_that_fits_alone() {
+        assert_eq!(clip_middle("  hello  ", 32), "hello");
+        // Exactly at budget is not a cut.
+        assert_eq!(clip_middle("hello", 5), "hello");
     }
 }

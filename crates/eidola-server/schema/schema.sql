@@ -29,8 +29,10 @@ CREATE TABLE account (
 COMMENT ON TABLE account IS
     'A lightweight account record. No PII is stored here; identity is a '
     'bearer credential (id + secret). The Stripe Customer ID is the only '
-    'link to payment identity. Subscription state is denormalized from Stripe '
-    'webhooks for fast reads; Stripe remains the source of truth for billing.';
+    'link to payment identity. No subscription state is stored here: Stripe '
+    'is the source of truth and is read on demand. What webhooks durably '
+    'record is their effect on credits (see credit_ledger), not the '
+    'subscription itself.';
 
 COMMENT ON COLUMN account.id IS
     'Public account identifier, exposed in the API as account_id. '
