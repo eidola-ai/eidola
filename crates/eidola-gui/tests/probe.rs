@@ -2970,13 +2970,15 @@ fn probe_participants() -> (String, Vec<ParticipantInfo>) {
         scope: "global".into(),
         source: "referenced".into(),
         kind: "human".into(),
-        label: "You".into(),
+        // The **wire** label task 64 seeds — every surface that shows this row
+        // must map it back to "You" through the shared presentation rule.
+        label: "User".into(),
         model_ref: None,
         system_prompt: None,
         notify_policy: "explicit".into(),
         role: "member".into(),
         reference: Some(ParticipantReference {
-            base_label: "You".into(),
+            base_label: "User".into(),
             base_model_ref: None,
             base_system_prompt: None,
             base_notify_policy: "explicit".into(),
@@ -3105,6 +3107,18 @@ fn space_inspector_participants_probes_cover_rows_editor_and_add(cx: &mut TestAp
     assert!(
         !names.contains(&"space/inspector/participants/agent-1/remove".to_string()),
         "a resting row carries no verbs: {names:?}"
+    );
+
+    // **The roster names the human the way every other surface does.** Task 64
+    // renamed the seeded human's stored label to `User` so a model is never
+    // told the other participant is "you"; that is a wire representation, and
+    // a surface printing it raw would show the rename to the reader (Codex
+    // review, PR #294).
+    assert_probe(
+        &fresh_entries(cx, window),
+        &format!("space/inspector/participants/{you}"),
+        gpui::Role::Button,
+        "You",
     );
 
     // Opening You surfaces the edit-everywhere-vs-override-here fork, and the
@@ -3256,7 +3270,8 @@ fn probe_templates() -> Vec<SpaceTemplateInfo> {
             referenced: vec![eidola_app_core::TemplateReferencedParticipant {
                 id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
                 kind: "human".into(),
-                label: "You".into(),
+                // The wire label (task 64); the row must read "You".
+                label: "User".into(),
                 model_ref: None,
                 system_prompt: Some("Keep me honest.".into()),
                 notify_policy: "explicit".into(),

@@ -19,7 +19,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// stale databases are detected rather than silently limping.
 const LATEST_VERSION: i64 = 5;
 
-/// Well-known id of the shared human "You" participant — the single
+/// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
 /// instances; the human is the one shared identity). Seeded idempotently at
 /// every DB open; stable so `INSERT OR IGNORE` re-seeds are no-ops and human
@@ -32,7 +32,7 @@ pub const HUMAN_PARTICIPANT_ID: &str = "00000000-0000-7000-8000-000000000001";
 /// [`crate::summaries`]. It is deliberately never *referenced* into a space,
 /// so it is not a member anywhere: it never appears in a participant list,
 /// never gets planned a turn, never authors a post. Attributing these to the
-/// human "You" or to an agent participant would be a lie in the Record.
+/// human "User" or to an agent participant would be a lie in the Record.
 pub const SYSTEM_PARTICIPANT_ID: &str = "00000000-0000-7000-8000-000000000002";
 
 /// Well-known id of the seeded "Default" template's single agent participant
@@ -310,7 +310,7 @@ async fn initialize(conn: &Connection) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Seed the shared human "You" participant and the "Default" space template
+/// Seed the shared human "User" participant and the "Default" space template
 /// (with its single agent participant) if missing. Runs on every open.
 ///
 /// **A seed makes a *fresh* database usable; it never re-asserts state over a
@@ -343,12 +343,12 @@ async fn initialize(conn: &Connection) -> Result<(), AppError> {
 async fn ensure_default_participants(conn: &Connection) -> Result<(), AppError> {
     let now = crate::now_ms();
 
-    // The one shared human "You" — a GLOBAL participant, referenced into every
+    // The one shared human "User" — a GLOBAL participant, referenced into every
     // instantiated space (instantiate_template ensures the reference).
     conn.execute(
         "INSERT OR IGNORE INTO participant \
          (id, scope, kind, label, notify_policy, role, created_at) \
-         VALUES (?1, 'global', 'human', 'You', 'explicit', 'owner', ?2)",
+         VALUES (?1, 'global', 'human', 'User', 'explicit', 'owner', ?2)",
         (
             Value::Text(HUMAN_PARTICIPANT_ID.to_string()),
             Value::Integer(now),
@@ -1373,7 +1373,7 @@ pub async fn insert_space(
 // Layer 2 — Semantic: Participants (scope-owned) + space templates
 //
 // Every participant row has exactly one scope: 'global' (the shared library —
-// today "You"), 'space' (owned by one space), or 'template' (owned by one
+// today "User"), 'space' (owned by one space), or 'template' (owned by one
 // template). The config columns live ONLY on `participant`. Reference tables
 // (space_participant / space_template_participant) point at globals only (the
 // pinned `participant_scope='global'` echo + composite FK make that
@@ -1801,7 +1801,7 @@ pub struct Promotion<'a> {
 ///    referenced into by the agent itself, hidden from the Library listing.
 ///
 /// The caller has already validated *what* may be promoted (kind, scope, the
-/// shared "You", removal) and what the persona may say; this is the mechanics —
+/// shared "User", removal) and what the persona may say; this is the mechanics —
 /// **plus the one check that cannot be done ahead of the transaction**, below.
 pub async fn promote_participant_tx(
     conn: &Connection,
@@ -1960,7 +1960,7 @@ pub struct GlobalAgentRow {
 /// The live **global agents** — the shared agent library (task 36).
 ///
 /// `kind = 'agent'` is what keeps the two seeded non-agent globals out: the
-/// shared human ("You") and Eidola-the-system are global rows too, and neither
+/// shared human ("User") and Eidola-the-system are global rows too, and neither
 /// is a colleague anyone manages. The notebook is **joined here rather than
 /// looked up per row**, because the only consumer is a roster that offers the
 /// notebook door on every line.
@@ -2430,6 +2430,10 @@ pub struct ReferencedPostRow {
     /// The action's `text` blocks, concatenated in ordinal order (`thinking`
     /// and tool blocks are never part of the readable transcript).
     pub text: String,
+    /// This generation's creation time, epoch ms — the followed post's header
+    /// stamp. A follow names a *concrete* generation and is never remapped, so
+    /// this is that generation's own time.
+    pub created_at: i64,
 }
 
 /// Read one action as a referenced post. `None` when the action doesn't exist
@@ -2451,7 +2455,7 @@ pub async fn referenced_post(
     let mut stmt = conn
         .prepare(&format!(
             "SELECT a.space_id, s.title, a.item_id, \
-                    COALESCE(sp.override_label, p.label), a.action_type \
+                    COALESCE(sp.override_label, p.label), a.action_type, a.created_at \
              FROM action a \
              JOIN space s ON s.id = a.space_id \
              JOIN participant p ON p.id = a.participant_id \
@@ -2473,6 +2477,7 @@ pub async fn referenced_post(
     let item_id = row.get::<String>(2).map_err(AppError::db)?;
     let participant_label = row.get::<String>(3).map_err(AppError::db)?;
     let action_type = row.get::<String>(4).map_err(AppError::db)?;
+    let created_at = row.get::<i64>(5).map_err(AppError::db)?;
 
     // The readable transcript is `text` blocks only — the same rule both
     // context queries apply, so a persisted `thinking` block stays a
@@ -2503,6 +2508,7 @@ pub async fn referenced_post(
         participant_label,
         action_type,
         text,
+        created_at,
     }))
 }
 
@@ -2599,7 +2605,7 @@ pub async fn insert_space_participant(
 }
 
 /// Ensure a global is referenced into a space — **insert or revive**, on the
-/// space's primary key. Used to guarantee "You" joins every instantiated space
+/// space's primary key. Used to guarantee "User" joins every instantiated space
 /// even if a copied template reference already added it, and to let an agent
 /// that left be invited back.
 ///
@@ -2632,7 +2638,7 @@ pub async fn ensure_space_participant(
     //
     // The `WHERE left_at IS NOT NULL` on the update is what keeps this a
     // *revive* rather than an overwrite: a live membership is never rewritten,
-    // so the template instantiation's "You" (inserted a few lines earlier with
+    // so the template instantiation's "User" (inserted a few lines earlier with
     // the template's own role and overrides) survives the `ensure` that follows
     // it, exactly as `OR IGNORE` made it.
     let n = conn
@@ -2987,7 +2993,7 @@ async fn list_participant_refs(
 
 /// The effective participants of a space: owned rows ∪ referenced globals, with
 /// referenced config resolved via `COALESCE(override, global config)`. Human
-/// members (the referenced "You") sort first, then others by id.
+/// members (the referenced "User") sort first, then others by id.
 pub async fn space_participants(
     conn: &Connection,
     space_id: &str,
@@ -3405,7 +3411,7 @@ pub async fn soft_remove_space_template(
 /// Instantiate a template into a **new space**: create the space (copying
 /// `cascade_limit` and `router_model`); copy the template's OWNED participants into fresh
 /// SPACE-owned rows; copy its reference rows (with overrides) into space
-/// references; then ensure the shared human "You" is referenced (as owner).
+/// references; then ensure the shared human "User" is referenced (as owner).
 /// Errors if the template is missing or removed.
 pub async fn instantiate_template(
     conn: &Connection,
@@ -3475,13 +3481,13 @@ pub async fn instantiate_template(
             &r.role,
             now,
             &r,
-            true, // OR IGNORE — a template that already references "You" won't
+            true, // OR IGNORE — a template that already references "User" won't
                   // collide with the ensure below.
         )
         .await?;
     }
 
-    // The shared human "You" joins every instantiated space (idempotent).
+    // The shared human "User" joins every instantiated space (idempotent).
     ensure_space_participant(conn, new_space_id, HUMAN_PARTICIPANT_ID, "owner", now).await?;
     Ok(())
 }
@@ -5006,6 +5012,10 @@ pub struct SpaceActionRow {
     pub status: String,
     pub text_content: Option<String>,
     pub block_ordinal: Option<i64>,
+    /// Creation time of **this generation** (the item's current tip), epoch ms.
+    /// Rendered into the upstream message header's stamp field — see
+    /// `crate::post_stamp` for why the tip's time rather than the item's.
+    pub created_at: i64,
 }
 
 /// Returns every current-generation action in a space with its text content
@@ -5032,7 +5042,7 @@ pub async fn get_space_actions_for_context(
         .prepare(
             "SELECT a.id, a.item_id, a.action_type, a.participant_id, p.kind, \
                     COALESCE(sp.override_label, p.label), a.status, \
-                    cb.text_content, cb.ordinal \
+                    cb.text_content, cb.ordinal, a.created_at \
              FROM action a \
              JOIN item_current ic \
                ON ic.current_action_id = a.id \
@@ -5067,6 +5077,7 @@ pub async fn get_space_actions_for_context(
             status: row.get::<String>(6).map_err(AppError::db)?,
             text_content: row.get::<Option<String>>(7).map_err(AppError::db)?,
             block_ordinal: row.get::<Option<i64>>(8).map_err(AppError::db)?,
+            created_at: row.get::<i64>(9).map_err(AppError::db)?,
         });
     }
     Ok(results)
@@ -5123,7 +5134,7 @@ pub async fn get_upstream_context(
             .prepare(
                 "SELECT a.id, a.item_id, a.action_type, a.participant_id, p.kind, \
                         COALESCE(sp.override_label, p.label), a.status, \
-                        cb.text_content, cb.ordinal \
+                        cb.text_content, cb.ordinal, a.created_at \
                  FROM action a \
                  JOIN participant p ON p.id = a.participant_id \
                  LEFT JOIN space_participant sp \
@@ -5151,6 +5162,7 @@ pub async fn get_upstream_context(
                 status: row.get::<String>(6).map_err(AppError::db)?,
                 text_content: row.get::<Option<String>>(7).map_err(AppError::db)?,
                 block_ordinal: row.get::<Option<i64>>(8).map_err(AppError::db)?,
+                created_at: row.get::<i64>(9).map_err(AppError::db)?,
             });
         }
     }
@@ -7088,14 +7100,14 @@ mod tests {
         // error).
         ensure_default_participants(&conn).await.unwrap();
 
-        // "You" is a GLOBAL participant.
+        // The shared human is a GLOBAL participant.
         let you = get_participant(&conn, HUMAN_PARTICIPANT_ID)
             .await
             .unwrap()
-            .expect("You seeded");
+            .expect("the shared human is seeded");
         assert_eq!(you.scope, "global");
         assert_eq!(you.kind, "human");
-        assert_eq!(you.label, "You");
+        assert_eq!(you.label, "User");
         assert!(you.owner_space_id.is_none() && you.owner_template_id.is_none());
 
         let templates = list_space_templates(&conn).await.unwrap();
@@ -7518,9 +7530,9 @@ mod tests {
             .await
             .unwrap();
 
-        // No override → inherits the global's label "You".
+        // No override → inherits the global's label "User".
         let m = space_participants(&conn, "space-o").await.unwrap();
-        assert_eq!(m[0].label, "You");
+        assert_eq!(m[0].label, "User");
 
         // '' override → effective empty (override to empty, not inherit).
         update_space_participant_override(
@@ -7550,7 +7562,7 @@ mod tests {
         .await
         .unwrap();
         let m = space_participants(&conn, "space-o").await.unwrap();
-        assert_eq!(m[0].label, "You", "NULL override inherits again");
+        assert_eq!(m[0].label, "User", "NULL override inherits again");
     }
 
     #[tokio::test]
@@ -7941,7 +7953,7 @@ mod tests {
         insert_space(&conn, "s", Some("Home"), "unlinked", 1)
             .await
             .unwrap();
-        for (id, label) in [("g", "Ada"), ("r", "Cy"), ("t", "You")] {
+        for (id, label) in [("g", "Ada"), ("r", "Cy"), ("t", "User")] {
             insert_participant(
                 &conn, id, "global", None, None, "agent", label, None, None, "explicit", "member",
                 None, 1,
@@ -8002,7 +8014,7 @@ mod tests {
         );
 
         // And a **live** membership is not rewritten — what the template
-        // instantiation's copied "You" reference depends on (it is inserted
+        // instantiation's copied human reference depends on (it is inserted
         // with the template's own role and overrides, and the `ensure` that
         // follows must leave both standing).
         insert_participant_ref(
