@@ -220,6 +220,23 @@ pub(crate) enum FootnoteBody {
     Backlink,
 }
 
+/// What a footnote row says when nothing can name the quoted post's author:
+/// this window does not hold the post, and the edge carries no label either.
+/// It still tells the reader the one true thing left — the passage came from
+/// outside what is on screen — where a blank would leave the row's rule and its
+/// gap standing over nothing.
+const ELSEWHERE: &str = "another space";
+
+/// A label to render, or `None` when there is none. The twin of app-core's
+/// `non_blank`, and blank for the same reason: a per-space override of `''` is
+/// "override to empty" under the schema's NULL-inherits rule, so an effective
+/// label really can be empty and every surface has to degrade rather than
+/// render it.
+fn non_blank(label: &str) -> Option<SharedString> {
+    let trimmed = label.trim();
+    (!trimmed.is_empty()).then(|| SharedString::from(trimmed.to_string()))
+}
+
 /// A zero-height, zero-visual **in-flow** probe that records its own flow
 /// position into `cell`.
 ///
@@ -1490,7 +1507,7 @@ impl SpaceView {
             .map(|(idx, r)| FootnoteRow {
                 index: idx + 1,
                 ordinal: r.ordinal,
-                byline: self.reference_byline(&r.antecedent_action_id),
+                byline: self.reference_byline(r),
                 body: match (r.snippet.as_deref(), r.range_start) {
                     (Some(s), _) => FootnoteBody::Quote(footnote_snippet(s).into()),
                     (None, Some(_)) => FootnoteBody::Unresolvable,
@@ -1809,15 +1826,35 @@ impl SpaceView {
             )
     }
 
-    /// The byline to attribute a reference to: the quoted post's own, when it
-    /// lives in this space. A cross-space reference resolves to nothing local,
-    /// so it reads as what it is.
-    fn reference_byline(&self, action_id: &str) -> SharedString {
+    /// The byline to attribute a reference to, in the order the reader's own
+    /// window makes true.
+    ///
+    /// **The in-space post's gutter byline wins where there is one.** It is the
+    /// name this window already shows for that post a few inches up the page,
+    /// and it is not always the effective participant label the edge carries:
+    /// `space::byline_for_participant` answers "You"/"Eidola"/"System" for an
+    /// unnamed participant, and an assistant row's byline is resolved again
+    /// through [`SpaceView::model_display`]. Two names for one person
+    /// inside one window would be worse than the attribution this repairs.
+    ///
+    /// **Otherwise the edge's own carried label** — `antecedent_author_label`,
+    /// the source space's effective label for that author, joined on the
+    /// *antecedent's* space rather than this one. It is the only thing that can
+    /// name a passage quoted out of a conversation this window never loaded,
+    /// and it is what the model-facing renderings say about the same edge.
+    ///
+    /// **`ELSEWHERE` only when neither names anyone.** A per-space override of
+    /// `''` is "override to empty" under the schema's NULL-inherits rule, so an
+    /// effective label really can be blank — and a blank byline here would be a
+    /// row indented past a gap that says nothing.
+    fn reference_byline(&self, reference: &eidola_app_core::PostReference) -> SharedString {
         self.posts
             .iter()
-            .find(|p| p.action_id.as_deref() == Some(action_id))
+            .find(|p| p.action_id.as_deref() == Some(reference.antecedent_action_id.as_str()))
             .map(|p| p.byline.clone())
-            .unwrap_or_else(|| SharedString::from("another space"))
+            .filter(|byline| !byline.trim().is_empty())
+            .or_else(|| non_blank(&reference.antecedent_author_label))
+            .unwrap_or_else(|| SharedString::from(ELSEWHERE))
     }
 
     // -- Navigation ---------------------------------------------------------
