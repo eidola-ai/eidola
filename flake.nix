@@ -15,6 +15,17 @@
 
     # Efficient Rust builds with incremental caching
     crane.url = "github:ipetkov/crane";
+
+    # Apple code-signature tool (pure Python). Build-time and CI only: it
+    # produces the detached signature bundle on the signing runner. It never
+    # enters Cargo.lock, never ships in an artifact, and never runs on a
+    # user's machine — see .github/AGENTS.md ("Pinned build tools").
+    # flake.lock is the pin; if a patch is ever needed, fork per the
+    # fork-branch practice in crates/eidola-gui/AGENTS.md.
+    signapple = {
+      url = "github:achow101/signapple/3fab3bb57f227f0dd31007b417683035f5204838";
+      flake = false;
+    };
   };
 
   outputs =
@@ -24,6 +35,7 @@
       flake-utils,
       fenix,
       crane,
+      signapple,
       ...
     }:
     flake-utils.lib.eachSystem [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ] (
@@ -533,6 +545,91 @@
           '';
         });
 
+        # signapple — the Apple code-signature tool used to produce the
+        # detached signature bundle (task 55). Build-time/CI only; see the
+        # flake input comment above and .github/AGENTS.md.
+        #
+        # Two of its four Python dependencies are pinned to git revisions
+        # upstream and are not usable from nixpkgs as-is, so they are built
+        # here rather than taken from python3Packages:
+        #   - certvalidator: signapple calls ValidationContext with
+        #     `additional_critical_extensions=` (Apple's certs carry custom
+        #     critical extensions). Only achow101's fork accepts that keyword;
+        #     nixpkgs' vanilla 0.11.1 raises TypeError on every verify.
+        #   - elfesteem: not in nixpkgs at all.
+        # asn1crypto and oscrypto come from nixpkgs. nixpkgs' oscrypto is
+        # 1.3.0 plus the two post-1.3.0 patches that matter (OpenSSL 3.0.10
+        # version parsing, and the importlib-for-imp change), so it is
+        # equivalent to signapple's pinned revision for our purposes.
+        signappleElfesteem = pkgs.python3Packages.buildPythonPackage {
+          pname = "elf-esteem";
+          version = "0.1-unstable-2018-11-19";
+          src = pkgs.fetchFromGitHub {
+            owner = "LRGH";
+            repo = "elfesteem";
+            rev = "5800fcf150dec3ce524f14bc2f24dc037f4826e6";
+            hash = "sha256-qy48vJMDQcoxLUraCPQizgt8hcrTrPdH3v3LpLqM0sw=";
+          };
+          # setup.py predates Python 3.12's removal of distutils.
+          postPatch = ''
+            substituteInPlace setup.py \
+              --replace-fail "from distutils.core import setup" "from setuptools import setup"
+          '';
+          pyproject = true;
+          build-system = [ pkgs.python3Packages.setuptools ];
+          doCheck = false;
+          pythonImportsCheck = [ "elfesteem.macho" ];
+        };
+
+        signappleCertvalidator = pkgs.python3Packages.buildPythonPackage {
+          pname = "certvalidator";
+          version = "0.12.0.dev1-unstable-2020-12-14";
+          src = pkgs.fetchFromGitHub {
+            owner = "achow101";
+            repo = "certvalidator";
+            rev = "e5bdb4bfcaa09fa0af355eb8867d00dfeecba08c";
+            hash = "sha256-5TBCc94uz5FuZAM8fWHYzPV6i+kTbOrdfn+6effs+6I=";
+          };
+          pyproject = true;
+          build-system = [ pkgs.python3Packages.setuptools ];
+          dependencies = with pkgs.python3Packages; [
+            asn1crypto
+            oscrypto
+          ];
+          doCheck = false;
+          pythonImportsCheck = [ "certvalidator" ];
+        };
+
+        signappleTool = pkgs.python3Packages.buildPythonApplication {
+          pname = "signapple";
+          version = "0.2.0-unstable-2026-05-26";
+          src = signapple;
+          # Poetry records the three git dependencies as direct URL
+          # references, which no installed distribution can ever satisfy.
+          # Relax them to plain constraints; the pins live in this file.
+          postPatch = ''
+            substituteInPlace pyproject.toml \
+              --replace-fail 'oscrypto = { git = "https://github.com/wbond/oscrypto.git", rev = "1547f535001ba568b239b8797465536759c742a3" }' 'oscrypto = "*"' \
+              --replace-fail 'certvalidator = { git = "https://github.com/achow101/certvalidator.git", rev = "e5bdb4bfcaa09fa0af355eb8867d00dfeecba08c" }' 'certvalidator = "*"' \
+              --replace-fail 'elf-esteem = { git = "https://github.com/LRGH/elfesteem.git", rev = "5800fcf150dec3ce524f14bc2f24dc037f4826e6" }' 'elf-esteem = "*"'
+          '';
+          pyproject = true;
+          build-system = [ pkgs.python3Packages.poetry-core ];
+          dependencies = [
+            pkgs.python3Packages.asn1crypto
+            pkgs.python3Packages.oscrypto
+            signappleCertvalidator
+            signappleElfesteem
+          ];
+          doCheck = false;
+          pythonImportsCheck = [ "signapple" ];
+          meta = {
+            description = "Signing and verification tool for macOS code signatures";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "signapple";
+          };
+        };
+
         # Build the CLI as a macOS universal binary (Darwin only)
         eidolaCliMacosUniversal =
           if !pkgs.stdenv.isDarwin then
@@ -911,6 +1008,8 @@ with open(path, "wb") as f:
           # engine sidecar. Buildable on its own (`nix build .#llama-server`)
           # for the dev-path `just engine` recipe.
           llama-server = llamaServer;
+          # Apple detached-signature tool. Build-time/CI only — never shipped.
+          signapple = signappleTool;
         }
         // pkgs.lib.optionalAttrs (eidolaCliMacosUniversal != null) {
           eidola-cli-macos-universal = eidolaCliMacosUniversal;
