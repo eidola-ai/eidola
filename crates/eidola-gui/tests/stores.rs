@@ -1949,6 +1949,101 @@ fn a_participants_change_arriving_mid_operation_is_replayed(cx: &mut TestAppCont
     });
 }
 
+/// REGRESSION (Codex review, PR #292, round 3): the deferral above has to reach
+/// a space that is **not in the registry yet**.
+///
+/// A ⌘N blank lives only in `pending_blanks` until its first post earns an id
+/// (`SpacesStore::blank` deliberately keeps it there), and that pending window
+/// is exactly when its transcript is read: the save's own `get_space_tree` is
+/// several reads, so a rename committing while they run is captured by none of
+/// them. The `Change::Participants` announcing it then arrived while the space
+/// was still id-less — and a registry-only broadcast never reached that entity
+/// at all, so no debt was recorded, and the space was adopted into the registry
+/// carrying the pre-rename names with nothing left to correct them.
+///
+/// The two halves are both under test here: the store must *deliver* the
+/// invalidation to a pending blank, and the entity must *keep* it across the id
+/// adoption (adoption moves a weak handle between collections and touches no
+/// entity state, so the debt outlives it and the exit that assigns the id is
+/// the one that discharges it).
+#[gpui::test]
+fn a_participants_change_reaches_a_blank_space_still_earning_its_id(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    // The space this blank's first save is about to persist into.
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+
+    // A ⌘N blank: id-less, and held outside the registry until it earns one.
+    let space = stores.spaces.update(cx, |s, cx| s.blank(cx));
+    space.read_with(cx, |s, _| {
+        assert!(s.id().is_none(), "a blank has no id to be registered under")
+    });
+
+    // Stage what the save's own multi-read tree query captured — the tree as it
+    // read *before* the rename below commits.
+    let captured = core
+        .runtime()
+        .block_on(core.get_space_tree(posted.space_id.clone()))
+        .expect("tree");
+    space.update(cx, |s, cx| {
+        s.set_post_tree_for_test(captured, cx);
+        // Its first save owns the transcript's truth for the rest of the window.
+        s.arm_post_runner_for_test(cx);
+    });
+    let byline = |cx: &mut TestAppContext| {
+        space.read_with(cx, |s, _| s.messages().first().map(|m| m.byline.clone()))
+    };
+    assert_eq!(
+        byline(cx).as_deref(),
+        Some("You"),
+        "the names the in-flight read captured"
+    );
+
+    // The rename commits while the save runs, and its signal arrives while the
+    // space is still id-less.
+    core.runtime()
+        .block_on(core.set_space_participant_override(
+            posted.space_id.clone(),
+            eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            eidola_app_core::ParticipantOverride {
+                label: Some(Some("Skipper".into())),
+                model_ref: None,
+                system_prompt: None,
+                notify_policy: None,
+            },
+        ))
+        .expect("override");
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+    cx.run_until_parked();
+    assert_eq!(
+        byline(cx).as_deref(),
+        Some("You"),
+        "the busy gate still holds the reload off while the save runs"
+    );
+
+    // The save lands: the id is adopted (the registry takes the space on the
+    // `StreamEnded` this emits) and the debt is discharged with it.
+    space.update(cx, |s, cx| s.adopt_id_for_test(posted.space_id.clone(), cx));
+    wait_until(cx, "the deferred invalidation survives adoption", |cx| {
+        byline(cx).as_deref() == Some("Skipper")
+    });
+
+    // And the adoption really happened — the same entity is now what the
+    // registry hands back for that id, so it is no longer a pending blank.
+    let reopened = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+    assert_eq!(
+        reopened.entity_id(),
+        space.entity_id(),
+        "the blank was adopted rather than duplicated"
+    );
+}
+
 /// An identity switch must not leave the previous account's billing standing
 /// on screen — not even briefly, and not as a "stale" value.
 ///

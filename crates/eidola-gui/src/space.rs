@@ -2026,6 +2026,28 @@ impl Space {
         cx.notify();
     }
 
+    /// Test-only: complete a **blank** space's first save exactly as
+    /// [`Self::finish_reload`]'s success arm does — adopt the id the write
+    /// assigned, release the exclusive slot, announce the end (which is what
+    /// the registry's blank-space adoption keys off), and discharge the
+    /// deferred-invalidation debt.
+    ///
+    /// The DB reload the real arm performs between those steps is the caller's
+    /// to stage (a fixture tree stands in for the one the operation's own
+    /// multi-read query captured). What this seam exists to drive is the part
+    /// no other seam reaches: an invalidation recorded while the space was
+    /// still **id-less** has to survive the adoption that finally gives it
+    /// something to read. The failure arms need no equivalent —
+    /// [`Self::fail_mutation`] restarts the load unconditionally.
+    #[doc(hidden)]
+    pub fn adopt_id_for_test(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.id = Some(space_id);
+        self.post_runner = None;
+        cx.emit(SpaceEvent::StreamEnded);
+        self.settle_transcript_debt(cx);
+        cx.notify();
+    }
+
     /// Test-only: complete one streaming turn **successfully** — drop its stream
     /// entry and emit `MessagesChanged` + `StreamEnded`, as a real turn
     /// runner's success arm does (minus the DB reload a stub can't perform,
