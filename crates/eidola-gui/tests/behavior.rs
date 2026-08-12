@@ -8903,7 +8903,7 @@ fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &m
                 .unwrap_or(false)
         })
     });
-    assert_eq!(referenced_label(cx).as_deref(), Some("You"));
+    assert_eq!(referenced_label(cx).as_deref(), Some("User"));
 
     // Edit everywhere: the shared global's own config moves.
     stores.participants.update(cx, |s, cx| {
