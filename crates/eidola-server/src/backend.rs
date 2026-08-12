@@ -165,23 +165,36 @@ struct CatalogEntry {
 /// Hardcoded model catalog. Model identifiers and descriptions are bound to
 /// the image contents; only pricing can be overridden at runtime via
 /// `TINFOIL_PRICING_OVERRIDES`.
+///
+/// Prices are Tinfoil's list prices in USD per million tokens (per request for
+/// the per-request models), before `PRICING_MARKUP`.
+///
+/// **Cached input is not modeled.** Tinfoil quotes a discounted cached-input
+/// price for two of these models — `deepseek-v4-flash` at $0.125/M and
+/// `glm-5-2` at $0.375/M against their $0.70 and $1.50 full input prices — but
+/// the pricing contract (`eidola-common`, and the `ModelPricing` shape clients
+/// read from `/v1/models`) has a single prompt-token rate with no cache-hit
+/// term. Charging every prompt token at the full input price therefore
+/// over-covers a cached turn rather than under-covering it, which is the safe
+/// direction for both the client's hold and the server's charge; modeling the
+/// discount would be a wire-visible contract change on both sides.
 const MODEL_CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "glm-5-2",
         name: "GLM-5.2",
         description: "Advanced language model with strong reasoning and multilingual capabilities",
-        context_length: 200_000,
+        context_length: 393_216,
         input_per_m: 1.5,
         output_per_m: 5.25,
         per_request_usd: 0.0,
     },
     CatalogEntry {
-        id: "deepseek-v4-pro",
-        name: "DeepSeek V4 Pro",
-        description: "Long-context reasoning and tool-calling model with an 800K-token context window",
-        context_length: 800_000,
-        input_per_m: 1.5,
-        output_per_m: 5.25,
+        id: "deepseek-v4-flash",
+        name: "DeepSeek V4 Flash",
+        description: "Efficient mixture-of-experts model with a 1M-token context window, speculative decoding, and tool calling",
+        context_length: 1_048_576,
+        input_per_m: 0.70,
+        output_per_m: 1.90,
         per_request_usd: 0.0,
     },
     CatalogEntry {
@@ -194,12 +207,12 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         per_request_usd: 0.0,
     },
     CatalogEntry {
-        id: "kimi-k2-6",
-        name: "Kimi K2.6",
-        description: "Unified vision and language model for visual inputs, design-to-code, and multi-agent orchestration",
-        context_length: 256_000,
-        input_per_m: 1.5,
-        output_per_m: 5.25,
+        id: "kimi-k3",
+        name: "Kimi K3",
+        description: "Multimodal mixture-of-experts model with hybrid attention for long-context reasoning, coding, and agentic workflows",
+        context_length: 262_144,
+        input_per_m: 4.0,
+        output_per_m: 20.0,
         per_request_usd: 0.0,
     },
     CatalogEntry {
@@ -275,7 +288,7 @@ fn usd_per_req_to_scaled_credits(usd_per_request: f64, markup: f64) -> u64 {
 
 /// Runtime pricing override for a single model, parsed from `TINFOIL_PRICING_OVERRIDES`.
 ///
-/// Example JSON: `{"kimi-k2-6": {"input": 1.5, "output": 5.25}}`
+/// Example JSON: `{"kimi-k3": {"input": 4.0, "output": 20.0}}`
 #[derive(Debug, Deserialize)]
 struct PricingOverride {
     /// Override: USD per million input tokens.
@@ -633,7 +646,7 @@ mod tests {
 
     #[test]
     fn test_usd_per_m_to_scaled_credits() {
-        // kimi-k2-6 input: $1.5/M tokens with 1.5x markup
+        // glm-5-2 input: $1.5/M tokens with 1.5x markup
         // The 1e6 factors (USD→µ$ and /M→/token) cancel:
         // scaled = 1.5 * 1.5 * 1_000_000 = 2_250_000
         assert_eq!(usd_per_m_to_scaled_credits(1.5, 1.5), 2_250_000);
@@ -677,11 +690,57 @@ mod tests {
         }
     }
 
+    /// Every published price, pinned against Tinfoil's list prices at the
+    /// default markup. This is the only place the catalog's numbers are
+    /// checked against the source they were copied from, so a silent edit to
+    /// one row fails here rather than at a customer's balance. Values are the
+    /// exact `ceil(usd_per_m * 1.5 * 1e6)` in f64 — three of them land one
+    /// credit high because the price has no exact binary representation.
+    #[test]
+    fn catalog_prices_match_the_published_tinfoil_list() {
+        let models = TinfoilBackend::build_model_list(DEFAULT_PRICING_MARKUP, &HashMap::new());
+        let expected: &[(&str, u64, u64, Option<u64>)] = &[
+            ("glm-5-2", 2_250_000, 7_875_000, None),
+            ("deepseek-v4-flash", 1_050_000, 2_850_000, None),
+            ("gemma4-31b", 600_001, 1_500_000, None),
+            ("kimi-k3", 6_000_000, 30_000_000, None),
+            ("gpt-oss-120b", 225_000, 900_000, None),
+            ("gpt-oss-safeguard-120b", 225_000, 900_000, None),
+            ("nomic-embed-text", 75_001, 0, None),
+            ("voxtral-small-24b", 300_001, 900_000, None),
+            (
+                "whisper-large-v3-turbo",
+                0,
+                0,
+                Some(15_000_000_000), // $0.01/request
+            ),
+            ("llama3-3-70b", 2_625_000, 4_125_000, None),
+        ];
+
+        assert_eq!(models.len(), expected.len(), "catalog size");
+        for (id, prompt, completion, request) in expected {
+            let model = models
+                .iter()
+                .find(|m| &m.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the catalog"));
+            assert_eq!(model.pricing.per_prompt_token.value, *prompt, "{id} prompt");
+            assert_eq!(
+                model.pricing.per_completion_token.value, *completion,
+                "{id} completion"
+            );
+            assert_eq!(
+                model.pricing.per_request.as_ref().map(|p| p.value),
+                *request,
+                "{id} request"
+            );
+        }
+    }
+
     #[test]
     fn test_pricing_overrides() {
         let mut overrides = HashMap::new();
         overrides.insert(
-            "kimi-k2-6".to_string(),
+            "kimi-k3".to_string(),
             PricingOverride {
                 input: Some(2.0),
                 output: Some(6.0),
@@ -690,7 +749,7 @@ mod tests {
         );
 
         let models = TinfoilBackend::build_model_list(1.0, &overrides);
-        let kimi = models.iter().find(|m| m.id == "kimi-k2-6").unwrap();
+        let kimi = models.iter().find(|m| m.id == "kimi-k3").unwrap();
 
         // With 1.0x markup and $2.0/M input override
         assert_eq!(kimi.pricing.per_prompt_token.value, 2_000_000);
@@ -753,8 +812,12 @@ mod tests {
             Some(1.5),
         );
 
-        assert!(backend.lookup_model("kimi-k2-6").is_some());
+        assert!(backend.lookup_model("kimi-k3").is_some());
         assert!(backend.lookup_model("nonexistent").is_none());
+        // Retired upstream ids must not linger in the catalog: a client that
+        // still asks for one should get an honest 404 rather than a price.
+        assert!(backend.lookup_model("kimi-k2-6").is_none());
+        assert!(backend.lookup_model("deepseek-v4-pro").is_none());
     }
 
     #[test]
