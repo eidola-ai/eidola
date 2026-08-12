@@ -29,8 +29,8 @@
 mod chat_harness;
 
 use chat_harness::{
-    ChatBehavior, HUMAN_LABEL, MODEL, MockConfig, RefundMode, Stamps, flat_messages, roster,
-    system_message, tool_result_text, trailing, with_account,
+    ChatBehavior, HUMAN_LABEL, MODEL, MockConfig, RefundMode, Stamps, TRAILING_BLOCK_NOTE,
+    flat_messages, roster, system_message_with, tool_result_text, trailing, with_account,
 };
 use eidola_app_core::error::AppError;
 use eidola_app_core::tools::EchoTool;
@@ -249,7 +249,11 @@ fn explicit_participant_prepends_effective_system_prompt() {
             vec![
                 (
                     "system".to_string(),
-                    system_message(Some("You are a pirate."), "Pirate")
+                    system_message_with(
+                        Some("You are a pirate."),
+                        "Pirate",
+                        &[TRAILING_BLOCK_NOTE]
+                    )
                 ),
                 (
                     "user".to_string(),
@@ -265,6 +269,7 @@ fn explicit_participant_prepends_effective_system_prompt() {
                             ("Pirate", "agent", true),
                         ])),
                         None,
+                        &eidola_app_core::post_handle(&posted.item_id),
                     )
                 ),
             ]
@@ -428,7 +433,10 @@ fn other_agents_posts_render_as_user_with_a_header() {
         assert_eq!(
             flat_messages(&bodies[1]),
             vec![
-                ("system".to_string(), system_message(Some("I am Bo."), "Bo")),
+                (
+                    "system".to_string(),
+                    system_message_with(Some("I am Bo."), "Bo", &[TRAILING_BLOCK_NOTE])
+                ),
                 (
                     "user".to_string(),
                     stamps.headed(&posted.item_id, HUMAN_LABEL, "what say you both?")
@@ -437,7 +445,14 @@ fn other_agents_posts_render_as_user_with_a_header() {
                     "user".to_string(),
                     stamps.headed(&item_of(&ada_post), "Ada", "Hello from the stream.")
                 ),
-                ("user".to_string(), bo_roster.clone()),
+                (
+                    "user".to_string(),
+                    trailing(
+                        Some(&bo_roster),
+                        None,
+                        &eidola_app_core::post_handle(&item_of(&ada_post))
+                    )
+                ),
             ],
             "another agent's post is `user`, never `assistant`"
         );
@@ -449,7 +464,7 @@ fn other_agents_posts_render_as_user_with_a_header() {
             vec![
                 (
                     "system".to_string(),
-                    system_message(Some("I am Ada."), "Ada")
+                    system_message_with(Some("I am Ada."), "Ada", &[TRAILING_BLOCK_NOTE])
                 ),
                 (
                     "user".to_string(),
@@ -463,7 +478,14 @@ fn other_agents_posts_render_as_user_with_a_header() {
                     "user".to_string(),
                     stamps.headed(&item_of(&bo_post), "Bo", "Hello from the stream.")
                 ),
-                ("user".to_string(), ada_roster),
+                (
+                    "user".to_string(),
+                    trailing(
+                        Some(&ada_roster),
+                        None,
+                        &eidola_app_core::post_handle(&item_of(&bo_post))
+                    )
+                ),
             ],
             "only the responder's own prior post is `assistant`"
         );
@@ -520,11 +542,11 @@ fn effective_system_prompt_edit_is_honored_next_turn() {
         assert_eq!(bodies.len(), 2);
         assert_eq!(
             bodies[0]["messages"][0]["content"],
-            system_message(Some("First prompt."), "Bard")
+            system_message_with(Some("First prompt."), "Bard", &[TRAILING_BLOCK_NOTE])
         );
         assert_eq!(
             bodies[1]["messages"][0]["content"],
-            system_message(Some("Second prompt."), "Bard")
+            system_message_with(Some("Second prompt."), "Bard", &[TRAILING_BLOCK_NOTE])
         );
     });
 }

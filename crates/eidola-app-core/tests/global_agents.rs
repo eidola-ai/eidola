@@ -26,8 +26,8 @@
 mod chat_harness;
 
 use chat_harness::{
-    ChatBehavior, MockConfig, MockServer, ToolScript, flat_messages, memory_section,
-    system_message, system_message_with, tool_script,
+    ChatBehavior, MockConfig, MockServer, TRAILING_BLOCK_NOTE, ToolScript, flat_messages,
+    memory_section, system_message_with, tool_script,
 };
 use eidola_app_core::AppCore;
 use eidola_app_core::changes::Change;
@@ -380,7 +380,11 @@ fn a_promoted_agents_core_memory_loads_in_another_space() {
             flat_messages(&body)[0].1,
             format!(
                 "{}\n\n{}",
-                system_message_with(None, AGENT_LABEL, &[MEMORY_NOTE, GLOBAL_AGENT_NOTE]),
+                system_message_with(
+                    None,
+                    AGENT_LABEL,
+                    &[TRAILING_BLOCK_NOTE, MEMORY_NOTE, GLOBAL_AGENT_NOTE],
+                ),
                 memory_section(&[("about you", "core", "You prefer terse answers.")]),
             ),
             "core memory travels; the block about space A stays there"
@@ -393,7 +397,11 @@ fn a_promoted_agents_core_memory_loads_in_another_space() {
             flat_messages(&body)[0].1,
             format!(
                 "{}\n\n{}",
-                system_message_with(None, AGENT_LABEL, &[MEMORY_NOTE, GLOBAL_AGENT_NOTE]),
+                system_message_with(
+                    None,
+                    AGENT_LABEL,
+                    &[TRAILING_BLOCK_NOTE, MEMORY_NOTE, GLOBAL_AGENT_NOTE],
+                ),
                 memory_section(&[
                     ("about you", "core", "You prefer terse answers."),
                     ("plan", "this space", "Ship the parser first."),
@@ -540,7 +548,7 @@ fn list_my_spaces_reports_membership_and_nothing_else() {
         );
         assert_eq!(
             flat_messages(first)[0].1,
-            system_message_with(None, AGENT_LABEL, &[GLOBAL_AGENT_NOTE])
+            system_message_with(None, AGENT_LABEL, &[TRAILING_BLOCK_NOTE, GLOBAL_AGENT_NOTE])
         );
     });
 }
@@ -559,7 +567,10 @@ fn a_space_owned_agent_is_offered_no_cross_space_tool() {
             body.get("tools").is_none(),
             "no tools field before any promotion: {body}"
         );
-        assert_eq!(flat_messages(&body)[0].1, system_message(None, AGENT_LABEL));
+        assert_eq!(
+            flat_messages(&body)[0].1,
+            system_message_with(None, AGENT_LABEL, &[TRAILING_BLOCK_NOTE])
+        );
     });
 }
 

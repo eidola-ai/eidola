@@ -1097,13 +1097,14 @@ mod driver {
             scope: "global".into(),
             source: "referenced".into(),
             kind: "human".into(),
-            label: "You".into(),
+            // The **wire** label (task 64); every surface shows "You".
+            label: "User".into(),
             model_ref: None,
             system_prompt: None,
             notify_policy: "explicit".into(),
             role: "member".into(),
             reference: Some(ParticipantReference {
-                base_label: "You".into(),
+                base_label: "User".into(),
                 base_model_ref: None,
                 base_system_prompt: None,
                 base_notify_policy: "explicit".into(),
@@ -1184,7 +1185,7 @@ mod driver {
                 referenced: vec![eidola_app_core::TemplateReferencedParticipant {
                     id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
                     kind: "human".into(),
-                    label: "You".into(),
+                    label: "User".into(),
                     model_ref: None,
                     system_prompt: Some("Keep me honest and ask before assuming.".into()),
                     notify_policy: "explicit".into(),

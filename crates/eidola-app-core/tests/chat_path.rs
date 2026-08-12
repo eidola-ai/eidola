@@ -25,8 +25,8 @@ mod chat_harness;
 
 use chat_harness::{
     ChatBehavior, DEFAULT_AGENT_LABEL, HUMAN_LABEL, MODEL, MockConfig, MockServer, RefundMode,
-    Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, flat_messages, map_entry, roster,
-    system_message, system_message_with, thread_map, trailing, with_account,
+    Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, TRAILING_BLOCK_NOTE, flat_messages, map_entry,
+    roster, system_message, system_message_with, thread_map, trailing, with_account,
 };
 use eidola_app_core::changes::Change;
 use eidola_app_core::error::AppError;
@@ -1170,7 +1170,7 @@ fn branch_reply_sends_only_its_branch_context() {
                     system_message_with(
                         Some(SEEDED_SYSTEM_PROMPT),
                         DEFAULT_AGENT_LABEL,
-                        &[THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE]
+                        &[TRAILING_BLOCK_NOTE, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE]
                     )
                 ),
                 (
@@ -1192,20 +1192,18 @@ fn branch_reply_sends_only_its_branch_context() {
                             (HUMAN_LABEL, "human", false),
                             (DEFAULT_AGENT_LABEL, "agent", true),
                         ])),
-                        Some(&thread_map(
-                            &[(
-                                format!("at #{}", eidola_app_core::post_handle(&i1_item)),
-                                vec![map_entry(
-                                    &u2_item,
-                                    HUMAN_LABEL,
-                                    "2 posts",
-                                    "just now",
-                                    Some("1 post"),
-                                    "And why two per day?",
-                                )],
+                        Some(&thread_map(&[(
+                            format!("at #{}", eidola_app_core::post_handle(&i1_item)),
+                            vec![map_entry(
+                                &u2_item,
+                                HUMAN_LABEL,
+                                "2 posts",
+                                "just now",
+                                Some("1 post"),
+                                "And why two per day?",
                             )],
-                            &eidola_app_core::post_handle(&branch_item),
-                        )),
+                        )])),
+                        &eidola_app_core::post_handle(&branch_item),
                     )
                 ),
             ],
@@ -1329,22 +1327,20 @@ fn a_branched_space_appends_a_thread_map_as_the_last_message() {
                         (HUMAN_LABEL, "human", false),
                         (DEFAULT_AGENT_LABEL, "agent", true),
                     ])),
-                    Some(&thread_map(
-                        &[(
-                            format!("at #{}", eidola_app_core::post_handle(&i1_item)),
-                            vec![map_entry(
-                                &branch_item,
-                                HUMAN_LABEL,
-                                // The branch's own ask plus the answer it drew.
-                                "2 posts",
-                                "just now",
-                                // One of which is this responder's own.
-                                Some("1 post"),
-                                "What about spring tides?",
-                            )],
+                    Some(&thread_map(&[(
+                        format!("at #{}", eidola_app_core::post_handle(&i1_item)),
+                        vec![map_entry(
+                            &branch_item,
+                            HUMAN_LABEL,
+                            // The branch's own ask plus the answer it drew.
+                            "2 posts",
+                            "just now",
+                            // One of which is this responder's own.
+                            Some("1 post"),
+                            "What about spring tides?",
                         )],
-                        &eidola_app_core::post_handle(&last_item),
-                    )),
+                    )])),
+                    &eidola_app_core::post_handle(&last_item),
                 ),
             ),
         );
@@ -1353,7 +1349,7 @@ fn a_branched_space_appends_a_thread_map_as_the_last_message() {
             system_message_with(
                 Some(SEEDED_SYSTEM_PROMPT),
                 DEFAULT_AGENT_LABEL,
-                &[THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE]
+                &[TRAILING_BLOCK_NOTE, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE]
             ),
             "the map note and the tools note both join the system message"
         );
@@ -1483,31 +1479,29 @@ fn the_map_says_which_branches_the_responder_posted_in() {
                         (HUMAN_LABEL, "human", false),
                         (DEFAULT_AGENT_LABEL, "agent", true),
                     ])),
-                    Some(&thread_map(
-                        &[(
-                            format!("at #{}", eidola_app_core::post_handle(&i1_item)),
-                            vec![
-                                map_entry(
-                                    &answered_branch,
-                                    HUMAN_LABEL,
-                                    "2 posts",
-                                    "just now",
-                                    // The answer in that branch is the responder's.
-                                    Some("1 post"),
-                                    "What about spring tides?",
-                                ),
-                                map_entry(
-                                    &quiet_branch,
-                                    HUMAN_LABEL,
-                                    "1 post",
-                                    "just now",
-                                    None,
-                                    "And neap tides?",
-                                ),
-                            ],
-                        )],
-                        &eidola_app_core::post_handle(&last_item),
-                    )),
+                    Some(&thread_map(&[(
+                        format!("at #{}", eidola_app_core::post_handle(&i1_item)),
+                        vec![
+                            map_entry(
+                                &answered_branch,
+                                HUMAN_LABEL,
+                                "2 posts",
+                                "just now",
+                                // The answer in that branch is the responder's.
+                                Some("1 post"),
+                                "What about spring tides?",
+                            ),
+                            map_entry(
+                                &quiet_branch,
+                                HUMAN_LABEL,
+                                "1 post",
+                                "just now",
+                                None,
+                                "And neap tides?",
+                            ),
+                        ],
+                    )])),
+                    &eidola_app_core::post_handle(&last_item),
                 ),
             ),
         );
@@ -1604,16 +1598,21 @@ fn sibling_branch_turns_send_identical_trunk_bytes() {
             "branch A forked a linear space: no map yet"
         );
 
-        // And in both branched turns the map is the LAST message — all the
-        // volatility at the tail.
+        // And in both branched turns the map rides the LAST message — all the
+        // volatility at the tail — which closes with the response pointer.
         for msgs in [&b, &c] {
+            let last = &msgs.last().expect("a message").1;
             assert!(
-                msgs.last().expect("a message").1.ends_with("</thread-map>"),
-                "the map closes the last message: {msgs:#?}"
+                last.contains("</thread-map>"),
+                "the map rides the last message: {msgs:#?}"
+            );
+            assert!(
+                last.trim_end().ends_with('.') && last.contains("\n\nRespond to #"),
+                "which closes with the response pointer: {last}"
             );
             assert_eq!(
                 msgs.iter()
-                    .filter(|(_, c)| c.ends_with("</thread-map>"))
+                    .filter(|(_, c)| c.contains("</thread-map>"))
                     .count(),
                 1,
                 "exactly one map block"
@@ -1990,7 +1989,7 @@ fn a_backend_that_rejects_tools_degrades_to_a_toolless_retry() {
         for body in [&bodies[2], &bodies[3]] {
             let msgs = flat_messages(body);
             assert!(
-                msgs.last().expect("a message").1.ends_with("</thread-map>"),
+                msgs.last().expect("a message").1.contains("</thread-map>"),
                 "the map survives the degrade: {msgs:#?}"
             );
         }
@@ -2427,7 +2426,7 @@ fn a_backend_observed_to_reject_tools_is_not_offered_them_again() {
                 .last()
                 .expect("a message")
                 .1
-                .ends_with("</thread-map>"),
+                .contains("</thread-map>"),
             "…and still carries the map"
         );
     });
@@ -5039,26 +5038,54 @@ fn the_roster_appears_only_once_a_space_is_multi_party() {
             .expect("add agent");
 
         turn(&core, "And why two per day?", Some(space.clone()), None);
-        let expected = roster(&[
+        let asked = item_id_of(&core, &space, "And why two per day?");
+        let members = roster(&[
             (HUMAN_LABEL, "human", false),
             (DEFAULT_AGENT_LABEL, "agent", true),
             ("Ada", "agent", false),
         ]);
+        // The roster-only shape — a linear space with three participants — is
+        // still a trailing metadata message, so it closes with the same
+        // `Respond to #h.` pointer the map shape does. Without it the roster
+        // was the last thing the model read with nothing marking it as
+        // metadata, and models answered the roster instead of the post (Codex
+        // review, PR #294).
+        let expected = trailing(Some(&members), None, &eidola_app_core::post_handle(&asked));
         let after_join = flat_messages(mock.chat_bodies().last().expect("a request"));
         assert_eq!(
             after_join.last().expect("a message").clone(),
             ("user".to_string(), expected.clone()),
             "the third member flips the roster on, in the trailing block"
         );
+        assert_eq!(
+            after_join[0].1,
+            system_message_with(
+                Some(SEEDED_SYSTEM_PROMPT),
+                DEFAULT_AGENT_LABEL,
+                &[TRAILING_BLOCK_NOTE]
+            ),
+            "and the system message frames it as metadata — with no map note, \
+             because this space has no map"
+        );
 
-        // …and stays byte-identical while the membership does.
-        turn(&core, "Anything else?", Some(space), None);
+        // …and stays byte-identical while the membership does. (The pointer
+        // moves with the post being answered, which is the one part of the
+        // trailing message that is *supposed* to be volatile.)
+        turn(&core, "Anything else?", Some(space.clone()), None);
+        let asked_again = item_id_of(&core, &space, "Anything else?");
         assert_eq!(
             flat_messages(mock.chat_bodies().last().expect("a request"))
                 .last()
                 .expect("a message")
                 .clone(),
-            ("user".to_string(), expected),
+            (
+                "user".to_string(),
+                trailing(
+                    Some(&members),
+                    None,
+                    &eidola_app_core::post_handle(&asked_again)
+                )
+            ),
             "stable within a membership: the roster's bytes move only when it does"
         );
     });
@@ -5066,8 +5093,8 @@ fn the_roster_appears_only_once_a_space_is_multi_party() {
 
 /// The other arm of the gate: a **branched** two-party space is multi-party in
 /// the sense that matters — there is structure the model cannot see — so the
-/// roster rides beside the map. The map comes second, because it ends with the
-/// `Respond to #h.` pointer.
+/// roster rides beside the map, the map second. The `Respond to #h.` pointer
+/// closes the whole message, after both.
 #[test]
 fn a_branch_turns_the_roster_on_in_a_two_party_space() {
     run(|| {
@@ -5107,8 +5134,16 @@ fn a_branch_turns_the_roster_on_in_a_two_party_space() {
             "the roster opens the trailing block: {trailing_block}"
         );
         assert!(
-            trailing_block.ends_with("</thread-map>"),
-            "and the map closes it: {trailing_block}"
+            trailing_block.contains("</thread-map>"),
+            "the map follows it: {trailing_block}"
+        );
+        let branch_item = item_id_of(&core, &space, "What about spring tides?");
+        assert!(
+            trailing_block.ends_with(&format!(
+                "</thread-map>\n\nRespond to #{}.",
+                eidola_app_core::post_handle(&branch_item)
+            )),
+            "and the response pointer closes the message, after both: {trailing_block}"
         );
     });
 }
