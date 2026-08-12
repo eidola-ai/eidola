@@ -44,6 +44,7 @@ use crate::participants::{
     notify_label, picker_value, router_field,
 };
 use crate::probe::Probe as _;
+use crate::space::display_name_for_participant;
 use crate::stores::{ConfigStore, Stores, TemplatesStore};
 
 /// The mandatory cost copy under a router row holding a **remote** reference.
@@ -557,7 +558,15 @@ impl TemplatesSettingsView {
         let id_default = t.id.clone();
         let id_remove = t.id.clone();
         let subject = t.title.clone();
-        let mut names: Vec<String> = t.referenced.iter().map(|r| r.label.clone()).collect();
+        // Referenced rows carry the *wire* label, and a template references the
+        // seeded human, whose label is `User` (task 64). The reader's name for
+        // a participant comes from the shared presentation rule, here as
+        // everywhere else (Codex review, PR #294).
+        let mut names: Vec<String> = t
+            .referenced
+            .iter()
+            .map(|r| display_name_for_participant(&r.kind, &r.label))
+            .collect();
         names.extend(t.participants.iter().map(|p| p.label.clone()));
         // A router that bills per post shouldn't be hidden a click deep, so the
         // resting row names it — **model and backend**, in the same
@@ -864,6 +873,7 @@ impl TemplatesSettingsView {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
+        let display_name = display_name_for_participant(&r.kind, &r.label);
         let detail = match r.model_ref.as_deref() {
             Some(m) => {
                 let (name, backend) = model_display(&self.stores, m, cx);
@@ -895,7 +905,7 @@ impl TemplatesSettingsView {
             .probe_value(
                 format!("settings/templates/editor/referenced/{idx}"),
                 gpui::Role::Label,
-                format!("{} — shared participant", r.label),
+                format!("{display_name} — shared participant"),
                 spoken,
             )
             .w_full()
@@ -910,7 +920,11 @@ impl TemplatesSettingsView {
                 v_flex()
                     .gap_0p5()
                     .min_w_0()
-                    .child(div().text_sm().child(SharedString::from(r.label.clone())))
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(SharedString::from(display_name.clone())),
+                    )
                     .child(
                         div()
                             .text_xs()

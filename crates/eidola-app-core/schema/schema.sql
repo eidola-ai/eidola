@@ -263,7 +263,7 @@ CREATE TABLE space_template (
 -- Participant: an actor that can emit actions into a space.
 --
 -- SCOPE-OWNED (spec §0). Every row has exactly one `scope`:
---   global    the shared library — today just "You"; later the
+--   global    the shared library — today just "User"; later the
 --             agent library and other humans. Owns no space/template.
 --   space     a per-space instance, born by copying a template's
 --             owned rows (owner_space_id = the space).
@@ -423,7 +423,7 @@ CREATE TABLE action (
     id              TEXT PRIMARY KEY,          -- UUIDv7
     space_id        TEXT NOT NULL REFERENCES space(id),
     -- The acting participant, referenced by the pinned composite echo. An
-    -- action can only be authored by a GLOBAL (e.g. the shared "You") or a
+    -- action can only be authored by a GLOBAL (e.g. the shared "User") or a
     -- SPACE-owned participant — never a template-owned one — enforced by the
     -- CHECK + tuple FK, not convention.
     participant_id     TEXT NOT NULL,

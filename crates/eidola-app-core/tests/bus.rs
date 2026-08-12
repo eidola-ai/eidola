@@ -132,7 +132,7 @@
 //! `template_from_space`), and `set_default_template` emits **both**
 //! `Change::Config` (the config key) and `Change::Templates` (the default
 //! marker moved). New spaces are instantiated from the default template, so a
-//! fresh space already carries its participants (the human "You" + the
+//! fresh space already carries its participants (the human "User" + the
 //! template's agents) — creation still emits only `SpaceIndex` (the
 //! participants are part of the space's birth, not a separate mutation).
 //! Covered by the `*_emit_participants` / `*_emits_templates` /
@@ -1428,7 +1428,7 @@ fn late_subscriber_does_not_see_past_events() {
 #[test]
 fn space_born_with_template_participants() {
     // A fresh space is instantiated from the default template, so it has the
-    // shared human "You" plus the template's single agent from birth.
+    // shared human "User" plus the template's single agent from birth.
     run_in_thread(|| {
         let (core, _dir) = make_core();
         let space = core.runtime().block_on(core.create_space(None)).unwrap();
@@ -1441,7 +1441,7 @@ fn space_born_with_template_participants() {
             .iter()
             .find(|p| p.kind == "human")
             .expect("human present");
-        assert_eq!(human.label, "You");
+        assert_eq!(human.label, "User");
         assert_eq!(human.role, "owner");
         assert_eq!(human.scope, "global");
         assert_eq!(human.source, "referenced");
@@ -1706,7 +1706,7 @@ fn participant_labels_reject_control_characters() {
             );
 
             // set_space_participant_override (the per-membership override on a
-            // referenced global — the shared human "You").
+            // referenced global — the shared human "User").
             assert!(
                 core.runtime()
                     .block_on(core.set_space_participant_override(
@@ -1952,7 +1952,7 @@ fn template_from_space_carries_a_referenced_globals_system_prompt() {
         let space = core.runtime().block_on(core.create_space(None)).unwrap();
         let sid = space.id.clone();
 
-        // Override the shared "You"'s prompt in this space only.
+        // Override the shared human's prompt in this space only.
         core.runtime()
             .block_on(core.set_space_participant_override(
                 sid.clone(),

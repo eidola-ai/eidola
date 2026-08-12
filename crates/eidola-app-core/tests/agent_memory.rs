@@ -31,8 +31,8 @@
 mod chat_harness;
 
 use chat_harness::{
-    ChatBehavior, MockConfig, MockServer, ToolScript, flat_messages, memory_section,
-    system_message, system_message_with, tool_script,
+    ChatBehavior, MockConfig, MockServer, TRAILING_BLOCK_NOTE, ToolScript, flat_messages,
+    memory_section, system_message_with, tool_script,
 };
 use eidola_app_core::AppCore;
 use eidola_app_core::changes::Change;
@@ -42,6 +42,10 @@ use eidola_app_core::memory::{MAX_MEMORY_BLOCK_BYTES, MAX_MEMORY_BLOCKS, MEMORY_
 /// gate the navigation tools do, so any endpoint reaches it; these tests run
 /// over an `openai` backend to keep the credential spend out of the way.
 const MODEL: &str = "qwen3-8b@ext";
+
+/// The label the minted agent for [`MODEL`] carries (`db::default_agent_label`)
+/// — the subject of the task-64 identity line in every request below.
+const AGENT_LABEL: &str = "Qwen3 8b";
 
 fn run<F>(f: F)
 where
@@ -152,7 +156,7 @@ fn memory_off_by_default_leaves_the_request_byte_identical() {
         );
         assert_eq!(
             flat_messages(&body)[0].1,
-            system_message(None),
+            system_message_with(None, AGENT_LABEL, &[TRAILING_BLOCK_NOTE]),
             "the system message is untouched"
         );
     });
@@ -200,7 +204,7 @@ fn remember_writes_a_block_that_the_next_turn_loads_at_the_head() {
             msgs[0].1,
             format!(
                 "{}\n\n{}",
-                system_message_with(None, &[MEMORY_NOTE]),
+                system_message_with(None, AGENT_LABEL, &[TRAILING_BLOCK_NOTE, MEMORY_NOTE]),
                 memory_section(&[("about you", "core", "You prefer terse answers.")]),
             ),
             "memory renders at the head, after the charter and the notes"
@@ -275,7 +279,7 @@ fn a_second_write_of_a_name_supersedes_rather_than_accumulating() {
             flat_messages(&body)[0].1,
             format!(
                 "{}\n\n{}",
-                system_message_with(None, &[MEMORY_NOTE]),
+                system_message_with(None, AGENT_LABEL, &[TRAILING_BLOCK_NOTE, MEMORY_NOTE]),
                 memory_section(&[("plan", "this space", "Ship the renderer first.")]),
             ),
         );
