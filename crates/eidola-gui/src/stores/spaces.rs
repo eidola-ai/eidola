@@ -116,6 +116,11 @@ pub struct SpacesStore {
     /// registry. Each is held as a weak handle + the subscription that watches
     /// for its first id assignment. On `StreamEnded` the space's now-present
     /// id is read and the entity is moved into `registry`.
+    ///
+    /// **These are live spaces, and every store-wide broadcast must reach
+    /// them** — see [`SpacesStore::live_spaces`]. They are held here rather
+    /// than in `registry` only because they have no key yet, which is a fact
+    /// about addressing, not about liveness.
     pending_blanks: Vec<(WeakEntity<Space>, Subscription)>,
     /// In-flight "New Space from Template" ops, keyed by a monotonic id so each
     /// activation is **independent** and runs to completion (STATE.md "keyed
@@ -275,6 +280,33 @@ impl SpacesStore {
             .retain(|(weak, _)| weak.entity_id() != target.entity_id());
     }
 
+    /// **Every live `Space` this store knows of** — the keyed registry *and*
+    /// the blanks still waiting for an id.
+    ///
+    /// A broadcast that says "every live space" has to mean it, and
+    /// [`Self::blank`] deliberately keeps its entity **outside** the registry
+    /// until an id arrives. That pending window is not idle: it is exactly the
+    /// window in which the blank's first save reads the transcript. The
+    /// operation's own `get_space_tree` is several reads, so a rename
+    /// committing while they run is captured by none of them — and the
+    /// `Change::Participants` announcing it arrives while the space is still
+    /// id-less. A registry-only loop never reached that entity at all, so no
+    /// debt was recorded, and the space was adopted into the registry carrying
+    /// pre-rename names with nothing left to correct them (Codex review, PR
+    /// #292). The busy gate on the entity is what makes this safe *and*
+    /// sufficient: a blank with no id and nothing in flight simply has nothing
+    /// to re-read, and a busy one records the debt its adoption discharges.
+    ///
+    /// No entity is visited twice: [`Self::adopt_blank`] inserts into the
+    /// registry and drops the pending entry in one call, so the two
+    /// collections are disjoint by construction.
+    fn live_spaces(&self) -> impl Iterator<Item = Entity<Space>> + '_ {
+        self.registry
+            .values()
+            .chain(self.pending_blanks.iter().map(|(weak, _)| weak))
+            .filter_map(WeakEntity::upgrade)
+    }
+
     /// React to a `Change::Space(id)` from the bus by telling the live
     /// registered `Space` (if any) to refresh its transcript. Routed here from
     /// `stores::dispatch_change`.
@@ -283,12 +315,17 @@ impl SpacesStore {
     /// not just the changed one: a quote written in space B changes what space
     /// A's posts should highlight, and the bus event carries only the written
     /// space's id. The indexes are re-fetched lazily per rendered post, so
-    /// this costs a query per *visible* post at most.
+    /// this costs a query per *visible* post at most. That sweep goes through
+    /// [`Self::live_spaces`], since "every live space" includes a blank still
+    /// waiting for its id.
+    ///
+    /// **The keyed half stays registry-only, and that is not an omission**: a
+    /// pending blank has no id, which is the whole reason it is pending, so no
+    /// `Change::Space(id)` can name it. It joins the registry in the same
+    /// breath as it learns its id.
     pub fn notify_space_changed(&mut self, id: &str, cx: &mut Context<Self>) {
-        for weak in self.registry.values() {
-            if let Some(entity) = weak.upgrade() {
-                entity.update(cx, |space, cx| space.invalidate_incoming_references(cx));
-            }
+        for entity in self.live_spaces() {
+            entity.update(cx, |space, cx| space.invalidate_incoming_references(cx));
         }
         if let Some(weak) = self.registry.get(id)
             && let Some(entity) = weak.upgrade()
@@ -299,6 +336,71 @@ impl SpacesStore {
                 // space drops its index.
                 space.invalidate_traces(cx);
                 space.on_space_changed(id, cx);
+            });
+        }
+    }
+
+    /// React to a `Change::Participants` by telling **every** live registered
+    /// `Space` to re-read its transcript. Routed here from
+    /// `stores::dispatch_change`.
+    ///
+    /// A transcript is where an author's *name* lives: `get_space_tree` resolves
+    /// every post's byline and every reference edge's carried author identity
+    /// through `COALESCE(space_participant.override_label, participant.label)`
+    /// at read time, and nothing re-derives them afterwards. So a rename — which
+    /// emits `Change::Participants` and nothing else — left every loaded window
+    /// showing the old name in its post gutters, its minimap labels and its
+    /// footnote rails, until an unrelated `Change::Space` or a reopen (Codex
+    /// review, PR #292). The signal carries no id (a global agent is renamed
+    /// everywhere at once, and an override is written per space), so the answer
+    /// is every live space rather than one.
+    ///
+    /// **Not routed through `notify_space_changed`**, whose other two effects
+    /// are about *posts*: nothing a participant edit does invalidates a cached
+    /// incoming-reference index or a trace round. Each entity's own
+    /// `is_busy` gate still applies, and it **defers rather than discards**.
+    ///
+    /// **Every live space means the pending blanks too** ([`Self::live_spaces`]
+    /// — Codex review, PR #292): a ⌘N space persisting its first post lives
+    /// only in `pending_blanks`, and that is precisely when its transcript is
+    /// being read, so a registry-only loop dropped the invalidation for the
+    /// one space whose read was in flight.
+    pub fn notify_participants_changed(&mut self, cx: &mut Context<Self>) {
+        for entity in self.live_spaces() {
+            entity.update(cx, |space, cx| space.invalidate_transcript(cx));
+        }
+    }
+
+    /// The `Lagged` response for the live spaces: the bus dropped changes we
+    /// can no longer name, so every open conversation drops everything it
+    /// resolved at read time — its transcript (post gutters, minimap labels and
+    /// the footnote rails' carried author identities), its incoming-reference
+    /// index, and its trace rounds.
+    ///
+    /// **A store refresh does not reach any of it** (Codex review, PR #292).
+    /// `stores::refresh_everything` re-read `SpacesStore::refresh` — the
+    /// *Library index* — and nothing told the live `Space` entities anything,
+    /// so a lag that swallowed a rename left every already-open transcript
+    /// naming its authors as it did when it loaded, indefinitely, while the
+    /// recovery claimed to have refreshed all state. The other two caches are
+    /// the same gap in the same function: they are per-entity state whose only
+    /// invalidation route is [`Self::notify_space_changed`], which the lagged
+    /// path never called either.
+    ///
+    /// This is the whole of what `Change::Participants` + `Change::Space` do to
+    /// a live space, minus the id — which is right, since a lag knows nothing
+    /// about which space changed. Each entity's own busy gate still applies,
+    /// and now defers rather than discards. And "every live space" is
+    /// [`Self::live_spaces`], which is the registry **and** the blanks still
+    /// earning an id: a recovery whose whole contract is "we missed changes,
+    /// re-read everything" cannot quietly skip the one space whose first
+    /// transcript read is in flight.
+    pub fn notify_lagged(&mut self, cx: &mut Context<Self>) {
+        for entity in self.live_spaces() {
+            entity.update(cx, |space, cx| {
+                space.invalidate_incoming_references(cx);
+                space.invalidate_traces(cx);
+                space.invalidate_transcript(cx);
             });
         }
     }

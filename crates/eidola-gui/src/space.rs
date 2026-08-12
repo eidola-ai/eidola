@@ -225,7 +225,9 @@ impl ChatMessageView {
                 _ => {}
             }
         }
-        let byline = byline_for_participant(&node.participant.kind, &node.participant.label);
+        // The gutter's word for "this identity names nobody".
+        let byline = byline_for_participant(&node.participant.kind, &node.participant.label)
+            .unwrap_or_else(|| "—".to_string());
         Self {
             message: SpaceMessage { role, content },
             byline,
@@ -255,18 +257,34 @@ fn byline_for_role(role: &str) -> &'static str {
     }
 }
 
-/// The gutter byline for a post-tree row, from its participant identity. The
-/// *local* human (the generic "user" participant) reads as "You"; any other
-/// human reads by name (multi-party spaces); an agent's byline is its label.
-fn byline_for_participant(kind: &str, label: &str) -> String {
+/// How an author's identity — the `(kind, label)` pair every read carries
+/// together — becomes the name a reader sees. The *local* human (the generic
+/// "user" participant) reads as "You"; any other human reads by name
+/// (multi-party spaces); an agent's byline is its label, or "Eidola" where its
+/// space named none; the harness is "System".
+///
+/// **The pair is the unit, and this is the only place it is read.** A label
+/// alone is not renderable: the schema's non-NULL "override to empty" makes a
+/// blank effective label a real state, and what to say instead depends entirely
+/// on the kind. So the post gutter and the footnote rail
+/// ([`crate::space_view::references`], which sees only what a reference edge
+/// carries) both come through here — otherwise the rail invents a second rule
+/// and the same author is named twice inside one window, which is the defect
+/// task 68 is about.
+///
+/// `None` means *this identity names nobody* — a kind with no fallback of its
+/// own and no label to fall back on. Each caller has its own word for that (the
+/// gutter's dash, the rail's "another space"), so the rule declines to pick one.
+pub(crate) fn byline_for_participant(kind: &str, label: &str) -> Option<String> {
+    let label = label.trim();
     match kind {
-        "human" if label.is_empty() || label.eq_ignore_ascii_case("user") => "You".to_string(),
-        "human" => label.to_string(),
-        "agent" if !label.is_empty() => label.to_string(),
-        "agent" => "Eidola".to_string(),
-        "system" => "System".to_string(),
-        _ if !label.is_empty() => label.to_string(),
-        _ => "—".to_string(),
+        "human" if label.is_empty() || label.eq_ignore_ascii_case("user") => {
+            Some("You".to_string())
+        }
+        "agent" if label.is_empty() => Some("Eidola".to_string()),
+        "system" => Some("System".to_string()),
+        _ if !label.is_empty() => Some(label.to_string()),
+        _ => None,
     }
 }
 
@@ -379,6 +397,10 @@ pub struct Space {
     failed_turn: Option<FailedTurn>,
     /// Supersede slot for the reopened-space initial transcript load.
     load_task: Option<Task<()>>,
+    /// A transcript invalidation that arrived while this space owned the
+    /// transcript's truth, deferred rather than dropped — see
+    /// [`Self::invalidate_transcript`] and [`Self::settle_transcript_debt`].
+    pending_transcript_refresh: bool,
     /// **Incoming references**, keyed by the quoted post's action id: every
     /// current-generation post quoting a range of that post
     /// (`AppCore::references_to`). This is the data behind the source-post
@@ -493,6 +515,7 @@ impl Space {
             turn_runners: HashMap::new(),
             failed_turn: None,
             load_task: None,
+            pending_transcript_refresh: false,
             incoming_refs: HashMap::new(),
             incoming_ref_tasks: HashMap::new(),
             traces: Loadable::NotLoaded,
@@ -521,6 +544,7 @@ impl Space {
             turn_runners: HashMap::new(),
             failed_turn: None,
             load_task: None,
+            pending_transcript_refresh: false,
             incoming_refs: HashMap::new(),
             incoming_ref_tasks: HashMap::new(),
             traces: Loadable::NotLoaded,
@@ -550,6 +574,7 @@ impl Space {
             turn_runners: HashMap::new(),
             failed_turn: None,
             load_task: None,
+            pending_transcript_refresh: false,
             incoming_refs: HashMap::new(),
             incoming_ref_tasks: HashMap::new(),
             traces: Loadable::NotLoaded,
@@ -976,15 +1001,68 @@ impl Space {
 
     /// React to a `Change::Space(id)` for *this* space's id — refresh the
     /// transcript (this is how a CLI write to the same space appears, in
-    /// process). A no-op if the id doesn't match or an operation owning the
-    /// transcript's truth is in flight (each turn/mutation reloads on its own
-    /// completion, so nothing is lost). Routed through the bus-bridge dispatch
-    /// in `stores::dispatch_change`.
+    /// process). A no-op if the id doesn't match, or while an operation owning
+    /// the transcript's truth is in flight: each turn/mutation reloads at its
+    /// own completion. Routed through the bus-bridge dispatch in
+    /// `stores::dispatch_change`.
+    ///
+    /// **Residual, deliberately not deferred** like
+    /// [`Self::invalidate_transcript`]: that exit reload is several reads, so a
+    /// *foreign* write committing while they run is caught by none of them and
+    /// its signal was dropped here. Deferring it too is one line — but this
+    /// signal fires on every post, and almost every one of them is this space's
+    /// own write, already in the exit reload; recording every one would buy a
+    /// redundant whole-tree re-read at the end of every turn to close a window
+    /// only another window's or the CLI's concurrent post can open. Worth its
+    /// own task, with a way to tell our own writes from a stranger's.
     pub fn on_space_changed(&mut self, changed_id: &str, cx: &mut Context<Self>) {
         if self.id.as_deref() != Some(changed_id) {
             return;
         }
         if self.is_busy() {
+            return;
+        }
+        self.load_transcript(cx);
+    }
+
+    /// A participant was renamed, added, removed or re-shared somewhere — or a
+    /// lagged bus dropped changes we can no longer name. The transcript
+    /// resolved every author's name when it was read (see
+    /// [`crate::stores::SpacesStore::notify_participants_changed`]), so re-read
+    /// it — same supersede slot, same busy gate as any other invalidation.
+    ///
+    /// **Busy defers it; it does not discard it** (Codex review, PR #292). The
+    /// operation in flight does reload the transcript at its own exit, but that
+    /// is not synchronization: `get_space_tree` is several reads, so a rename
+    /// committing while they run is captured by none of them, and the event
+    /// announcing it arrives — and used to be dropped — while this space was
+    /// still busy. The reload then landed *after* the ignored event carrying
+    /// pre-rename labels, and nothing was left to correct it: every gutter,
+    /// minimap label and footnote rail in the window kept the old name until an
+    /// unrelated change or a reopen. So the invalidation is recorded and
+    /// replayed by [`Self::settle_transcript_debt`] once the last mutation or
+    /// turn settles.
+    pub fn invalidate_transcript(&mut self, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            self.pending_transcript_refresh = true;
+            return;
+        }
+        self.load_transcript(cx);
+    }
+
+    /// Replay a transcript invalidation that arrived while this space owned the
+    /// transcript's truth. Called from every exit that can clear
+    /// [`Self::is_busy`] — the same debt-at-every-exit rule the superseded load
+    /// obeys, one invalidation over.
+    ///
+    /// A no-op while anything is still in flight (a fan-out's sibling turn):
+    /// the debt stands, and the *last* runner to settle discharges it. The
+    /// failure exits need no call of their own — each already restarts the load
+    /// ([`Self::fail_mutation`] / [`Self::fail_turn`]), and a read issued while
+    /// nothing is in flight discharges the debt by construction, which is what
+    /// [`Self::load_transcript`] records.
+    fn settle_transcript_debt(&mut self, cx: &mut Context<Self>) {
+        if !self.pending_transcript_refresh || self.is_busy() {
             return;
         }
         self.load_transcript(cx);
@@ -996,7 +1074,17 @@ impl Space {
     /// re-enters the entity via [`Self::apply_loaded_transcript`], so even a
     /// slow load that finishes after a local submit cannot clobber it — the
     /// merge preserves what's already present by position.
+    ///
+    /// **A read issued while nothing is in flight discharges the deferred
+    /// invalidation** ([`Self::invalidate_transcript`]): the bus emits a
+    /// `Change` only after its commit is durable and delivers it on this
+    /// thread, so a read starting now observes every change already announced.
+    /// A read issued *mid-operation* promises nothing of the kind, which is
+    /// exactly why the debt exists.
     fn load_transcript(&mut self, cx: &mut Context<Self>) {
+        if !self.is_busy() {
+            self.pending_transcript_refresh = false;
+        }
         let Some(id) = self.id.clone() else {
             return;
         };
@@ -1370,6 +1458,7 @@ impl Space {
                                 });
                             }
                         }
+                        this.settle_transcript_debt(cx);
                         cx.notify();
                     });
                 }
@@ -1536,6 +1625,7 @@ impl Space {
                             cx.emit(SpaceEvent::Failed(e));
                         }
                     }
+                    this.settle_transcript_debt(cx);
                     cx.notify();
                 });
             }
@@ -1741,11 +1831,13 @@ impl Space {
                                 Err(_) => {}
                             }
                             this.turn_runners.remove(&seq);
+                            this.settle_transcript_debt(cx);
                             cx.notify();
                         });
                     } else {
                         let _ = this.update(cx, |this, cx| {
                             this.turn_runners.remove(&seq);
+                            this.settle_transcript_debt(cx);
                             cx.notify();
                         });
                     }
@@ -1924,10 +2016,35 @@ impl Space {
     }
 
     /// Test-only: release the exclusive mutation slot armed above, so the next
-    /// mutation is accepted.
+    /// mutation is accepted — the stand-in for a mutation's own exit, so it
+    /// discharges the deferred-invalidation debt exactly as the real exits do
+    /// ([`Self::settle_transcript_debt`]).
     #[doc(hidden)]
     pub fn clear_post_runner_for_test(&mut self, cx: &mut Context<Self>) {
         self.post_runner = None;
+        self.settle_transcript_debt(cx);
+        cx.notify();
+    }
+
+    /// Test-only: complete a **blank** space's first save exactly as
+    /// [`Self::finish_reload`]'s success arm does — adopt the id the write
+    /// assigned, release the exclusive slot, announce the end (which is what
+    /// the registry's blank-space adoption keys off), and discharge the
+    /// deferred-invalidation debt.
+    ///
+    /// The DB reload the real arm performs between those steps is the caller's
+    /// to stage (a fixture tree stands in for the one the operation's own
+    /// multi-read query captured). What this seam exists to drive is the part
+    /// no other seam reaches: an invalidation recorded while the space was
+    /// still **id-less** has to survive the adoption that finally gives it
+    /// something to read. The failure arms need no equivalent —
+    /// [`Self::fail_mutation`] restarts the load unconditionally.
+    #[doc(hidden)]
+    pub fn adopt_id_for_test(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.id = Some(space_id);
+        self.post_runner = None;
+        cx.emit(SpaceEvent::StreamEnded);
+        self.settle_transcript_debt(cx);
         cx.notify();
     }
 
@@ -1942,6 +2059,7 @@ impl Space {
     pub fn finish_streaming_turn_for_test(&mut self, seq: u64, cx: &mut Context<Self>) {
         self.streams.retain(|s| s.seq != seq);
         self.turn_runners.remove(&seq);
+        self.settle_transcript_debt(cx);
         cx.emit(SpaceEvent::MessagesChanged);
         cx.emit(SpaceEvent::StreamEnded);
         cx.notify();

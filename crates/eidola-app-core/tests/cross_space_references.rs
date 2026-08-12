@@ -1636,3 +1636,132 @@ fn a_human_following_a_quote_into_a_space_they_are_not_in_is_refused() {
         );
     });
 }
+
+/// REGRESSION (Codex review, PR #292): **an author is a pair, and the pair
+/// travels.** The reading space cannot name a participant it has never met, so
+/// a reference edge carries the author as the *source* space names them — but a
+/// label alone is not renderable. The schema's non-NULL "override to empty"
+/// makes a blank effective label a real state
+/// (`set_space_participant_override` deliberately permits `''`), and what to
+/// say instead depends entirely on the kind: the one human is "You", an unnamed
+/// agent is "Eidola".
+///
+/// So `get_space_tree` joins `participant.kind` beside the label, on the
+/// **antecedent's** space and the **antecedent's** participant — which is what
+/// the agent-quoted-by-a-human shape below pins, since the referencing post's
+/// own author is a human and a join that drifted onto it would say so. Without
+/// the pair the GUI's footnote rail had no second source for a blank label and
+/// fell back to "another space", which is the attribution changing at the
+/// durability boundary — the defect task 68 exists to fix, one layer down.
+#[test]
+fn a_cross_space_quote_carries_its_authors_kind_beside_its_label() {
+    run(|| {
+        let script = tool_script();
+        let (_mock, core, _dir) = setup(script);
+
+        // A conversation whose answer is an **agent's** post…
+        let opening = turn(&core, "How do tides work?", None);
+        let source_space = opening.space_id.clone();
+        let answer = core
+            .runtime()
+            .block_on(core.get_space_tree(source_space.clone()))
+            .expect("tree")
+            .into_iter()
+            .find(|n| n.participant.kind == "agent")
+            .expect("the agent's answer");
+        let answer_text = answer.blocks[0].text.clone().expect("text");
+        let passage: String = answer_text.chars().take(12).collect();
+
+        // …quoted from a second conversation, by the human.
+        let elsewhere = post(&core, "A different conversation entirely.", None);
+        let spec = quote_of(&core, &source_space, &answer.action_id, &passage);
+        core.runtime()
+            .block_on(core.post_with_references(
+                "Someone said this:\n\n{{ embed 1 }}".into(),
+                Some(elsewhere.space_id.clone()),
+                Some(elsewhere.action_id.clone()),
+                vec![spec],
+            ))
+            .expect("the human quotes a space it belongs to");
+
+        // The quoting space's own copy of the edge — what a reader renders from.
+        let quoting_edge = || {
+            core.runtime()
+                .block_on(core.get_space_tree(elsewhere.space_id.clone()))
+                .expect("tree")
+                .into_iter()
+                .flat_map(|n| n.references)
+                .find(|r| r.antecedent_action_id == answer.action_id)
+                .expect("the quoting edge")
+        };
+
+        let named = quoting_edge();
+        assert_eq!(
+            named.antecedent_author_label, answer.participant.label,
+            "the source space's effective label for the quoted author"
+        );
+        assert_eq!(
+            named.antecedent_author_kind, "agent",
+            "and the kind it is a label *of* — the antecedent's, not the \
+             referencing post's (whose author is the human)"
+        );
+
+        // Now the state where the label says nothing at all: the source space
+        // overrides its human's label to empty (the schema's "override to
+        // empty", which `set_space_participant_override` deliberately permits).
+        let mine = core
+            .runtime()
+            .block_on(core.get_space_tree(source_space.clone()))
+            .expect("tree")
+            .into_iter()
+            .find(|n| n.participant.kind == "human")
+            .expect("my own opening post");
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                source_space.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                eidola_app_core::ParticipantOverride {
+                    label: Some(Some(String::new())),
+                    model_ref: None,
+                    system_prompt: None,
+                    notify_policy: None,
+                },
+            ))
+            .expect("override to empty");
+
+        let my_passage: String = mine.blocks[0]
+            .text
+            .as_deref()
+            .expect("text")
+            .chars()
+            .take(8)
+            .collect();
+        let spec = quote_of(&core, &source_space, &mine.action_id, &my_passage);
+        core.runtime()
+            .block_on(core.post_with_references(
+                "And I had said:\n\n{{ embed 1 }}".into(),
+                Some(elsewhere.space_id.clone()),
+                Some(elsewhere.action_id.clone()),
+                vec![spec],
+            ))
+            .expect("quote my own earlier post");
+
+        let unnamed = core
+            .runtime()
+            .block_on(core.get_space_tree(elsewhere.space_id.clone()))
+            .expect("tree")
+            .into_iter()
+            .flat_map(|n| n.references)
+            .find(|r| r.antecedent_action_id == mine.action_id)
+            .expect("the second quoting edge");
+        assert!(
+            unnamed.antecedent_author_label.is_empty(),
+            "the source space named nobody: {:?}",
+            unnamed.antecedent_author_label
+        );
+        assert_eq!(
+            unnamed.antecedent_author_kind, "human",
+            "the kind is what is left to name them with, and it still arrives"
+        );
+    });
+}

@@ -118,12 +118,9 @@ pub fn state_from_status(raw: isize) -> LoginItemState {
 /// Whether `SMAppService` exists in this process at all.
 ///
 /// **This guard is load-bearing, not belt-and-braces.** `SMAppService` is
-/// macOS 13+, and our binaries declare a floor of **macOS 11** (`otool -l` on
-/// the packaged app: `LC_BUILD_VERSION … minos 11.0`) with no
-/// `LSMinimumSystemVersion` in `Support/Info.plist` and no documented product
-/// floor anywhere in the repo. `ServiceManagement.framework` itself exists on
-/// 11/12, so the process links and launches — only the *class* is absent, and
-/// objc2's class lookup **panics** on a miss (`objc2`'s `CachedClass::fetch`:
+/// macOS 13+. `ServiceManagement.framework` itself exists on 11/12, so the
+/// process links and launches — only the *class* is absent, and objc2's class
+/// lookup **panics** on a miss (`objc2`'s `CachedClass::fetch`:
 /// `panic!("class {name} could not be found")`). Without this check, opening
 /// Settings → General on Monterey would take the whole app down from inside a
 /// `Render`.
@@ -132,7 +129,13 @@ pub fn state_from_status(raw: isize) -> LoginItemState {
 /// table (`objc2::available!`) is needed. **Removal trigger:** delete this and
 /// call `SMAppService` unconditionally once the shipped floor is ≥ macOS 13 —
 /// i.e. once `LSMinimumSystemVersion` says so *and* the release build's
-/// `minos` agrees.
+/// `minos` agrees. `Support/Info.plist` now declares `LSMinimumSystemVersion
+/// 13.0`, so **half** the trigger is met; the binaries still carry
+/// `LC_BUILD_VERSION … minos 11.0` (`otool -l` on the packaged app), and
+/// LaunchServices enforces the plist floor only for *bundle* launches — a
+/// bare `cargo run -p eidola-gui`, or `Contents/MacOS/Eidola` run straight
+/// from a terminal, still starts on 11/12. Against a panic inside a `Render`,
+/// one class lookup is the cheap side of that trade.
 #[cfg(target_os = "macos")]
 fn service_management_is_available() -> bool {
     objc2::runtime::AnyClass::get(c"SMAppService").is_some()

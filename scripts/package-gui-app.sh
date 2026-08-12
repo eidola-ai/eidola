@@ -63,8 +63,10 @@ fi
 cp "$ICON" "$APP_DIR/Contents/Resources/"
 
 # Bundle the on-device inference engine sidecar, if one is available. This
-# is best-effort for dev: the `local` backend needs a `llama-server` at
-# Contents/Resources/bin/llama-server (app-core resolves it exe-relative).
+# is best-effort for dev: the `local` backend needs a `llama-server` next to
+# the main binary at Contents/MacOS/llama-server (app-core's one rule is a
+# sibling of the running executable) — the same layout the Nix release
+# bundle produces, so dev and release stay one shape.
 # Look for an explicit override first, then the `just engine` nix result
 # symlink. A dev without either just sees the honest missing-engine state in
 # the Local tab (or points `llama_server_path` at their own build).
@@ -76,9 +78,8 @@ elif [[ -x "$REPO_ROOT/crates/eidola-gui/build/llama-server/bin/llama-server" ]]
 fi
 
 if [[ -n "$SIDECAR" ]]; then
-  mkdir -p "$APP_DIR/Contents/Resources/bin"
-  cp "$SIDECAR" "$APP_DIR/Contents/Resources/bin/llama-server"
-  chmod u+w "$APP_DIR/Contents/Resources/bin/llama-server"
+  cp "$SIDECAR" "$APP_DIR/Contents/MacOS/llama-server"
+  chmod u+w "$APP_DIR/Contents/MacOS/llama-server"
   echo "Bundled inference engine: $SIDECAR"
 else
   echo "No inference engine bundled (run 'just engine' to add one)."

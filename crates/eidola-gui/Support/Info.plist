@@ -6,8 +6,18 @@
 	<string>en</string>
 	<key>CFBundleExecutable</key>
 	<string>Eidola</string>
+	<!--
+		The bundle identifier, and with it the app's permanent identity to
+		macOS: TCC grants, LaunchServices registration, the Developer ID App
+		ID, and `SMAppService` all key off this string. Convention:
+		`ai.eidola.<product>.<target>` — lowercase forever, Apple's
+		target-family names, and `app` is the flagship product slot. A child
+		process or login item appends a role (`ai.eidola.app.macos.launcher`);
+		none exist today. Changing it orphans every grant a user has made, so
+		it changes only by a deliberate decision.
+	-->
 	<key>CFBundleIdentifier</key>
-	<string>tech.m6i.eidola-gpui</string>
+	<string>ai.eidola.app.macos</string>
 	<!--
 		The app icon, resolved as Contents/Resources/AppIcon.icns. Generated
 		from the vector master by `just update-brand` — see brand/AGENTS.md.
@@ -34,6 +44,18 @@
 	-->
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<!--
+		The product floor. 13.0 (Ventura) is what `SMAppService` needs — the
+		"Open at login" toggle (crates/eidola-gui/src/login_item.rs) is
+		otherwise a feature that can only report Unavailable, and a floor
+		LaunchServices enforces is more honest than shipping to a system
+		where part of the app cannot work. Note this is the *bundle's*
+		declared floor: the binaries still carry `LC_BUILD_VERSION minos
+		11.0`, so a bare (unbundled) binary is not covered by it. See the
+		guard comment in `login_item.rs`.
+	-->
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
 	<!--
 		Don't auto-quit when the last window closes; the app stays alive and
 		can be reopened via the dock icon (see `Application::on_reopen` in

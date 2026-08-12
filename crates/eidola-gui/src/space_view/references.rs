@@ -220,6 +220,25 @@ pub(crate) enum FootnoteBody {
     Backlink,
 }
 
+/// What a footnote row says when nothing can name the quoted post's author:
+/// this window does not hold the post, and the edge carries no label either.
+/// It still tells the reader the one true thing left — the passage came from
+/// outside what is on screen — where a blank would leave the row's rule and its
+/// gap standing over nothing.
+const ELSEWHERE: &str = "another space";
+
+/// How much of a footnote row the attribution may claim.
+///
+/// A participant label has no maximum length, and the byline sits `flex_none`
+/// beside a `flex_1` passage — so an unbounded one squeezes the quoted text out
+/// of the row it is there to attribute (Codex review, PR #292). In `rems`, not
+/// px, because the rail is `text_xs` off the window's `rem_size` and a fixed
+/// pixel cap would tighten as the reader zooms in. A name shorter than the cap
+/// is unaffected; a longer one ellipsizes **visually only** — the row's
+/// accessible name is built from the whole byline before it is laid out, so
+/// what a screen reader says is never truncated.
+const BYLINE_MAX_W: f32 = 10.;
+
 /// A zero-height, zero-visual **in-flow** probe that records its own flow
 /// position into `cell`.
 ///
@@ -1490,7 +1509,7 @@ impl SpaceView {
             .map(|(idx, r)| FootnoteRow {
                 index: idx + 1,
                 ordinal: r.ordinal,
-                byline: self.reference_byline(&r.antecedent_action_id),
+                byline: self.reference_byline(r, cx),
                 body: match (r.snippet.as_deref(), r.range_start) {
                     (Some(s), _) => FootnoteBody::Quote(footnote_snippet(s).into()),
                     (None, Some(_)) => FootnoteBody::Unresolvable,
@@ -1767,6 +1786,10 @@ impl SpaceView {
                 theme.muted_foreground.opacity(0.75),
             ),
         };
+        // Built from the **whole** byline and the whole passage, before either
+        // is laid out: both are visually bounded below (`BYLINE_MAX_W`, the
+        // passage's `truncate`), and an ellipsis is a fact about this row's
+        // width, never about who wrote the passage.
         let aria = format!("Reference {}: {} — {}", row.index, row.byline, text);
         h_flex()
             .id(SharedString::from(element_id))
@@ -1795,6 +1818,8 @@ impl SpaceView {
             .child(
                 div()
                     .flex_none()
+                    .max_w(gpui::rems(BYLINE_MAX_W))
+                    .truncate()
                     .text_color(theme.muted_foreground)
                     .child(row.byline.clone()),
             )
@@ -1809,15 +1834,76 @@ impl SpaceView {
             )
     }
 
-    /// The byline to attribute a reference to: the quoted post's own, when it
-    /// lives in this space. A cross-space reference resolves to nothing local,
-    /// so it reads as what it is.
-    fn reference_byline(&self, action_id: &str) -> SharedString {
+    /// The byline to attribute a reference to, in the order the reader's own
+    /// window makes true.
+    ///
+    /// **The in-space post's gutter byline wins where there is one.** It is the
+    /// name this window already shows for that post a few inches up the page,
+    /// and it is not always the effective participant label the edge carries:
+    /// `space::byline_for_participant` answers "You"/"Eidola"/"System" for an
+    /// unnamed participant, and an assistant row's byline is resolved again
+    /// through [`SpaceView::model_display`]. Two names for one person
+    /// inside one window would be worse than the attribution this repairs.
+    ///
+    /// **Otherwise the edge's own carried author identity**, read through the
+    /// very same rule: `(antecedent_author_kind, antecedent_author_label)` — the
+    /// source space's effective pair for that author, joined on the
+    /// *antecedent's* space rather than this one — handed to
+    /// [`crate::space::byline_for_participant`], which is what the gutter above
+    /// resolves a post's own identity with. It is the only thing that can name a
+    /// passage quoted out of a conversation this window never loaded, and going
+    /// through the shared rule is what makes the draft rail and the persisted
+    /// rail agree: the draft carries the *source window's rendered* byline, and
+    /// a raw label would have said "another space" where composing said
+    /// "Eidola", or "user" where it said "You" — the attribution changing at the
+    /// durability boundary, one layer down from the bug this repairs (Codex
+    /// review, PR #292).
+    ///
+    /// **And the gutter's rendering is two passes, so this is too.** An agent's
+    /// resolved byline is handed on to [`SpaceView::model_display`] exactly as
+    /// [`SpaceView::rebuild`] hands an assistant row's — the *same function*,
+    /// not a second rule — because a participant label that parses as a model
+    /// selector renders as the model's display name in the gutter and the
+    /// draft rail (both come from `PostData::byline`) while the carried label
+    /// is the raw selector. Nothing *mints* such a label
+    /// (`db::default_agent_label` strips the `@backend` suffix and title-cases;
+    /// every other insert site takes a user-typed name), but a reader may type
+    /// one, and then the attribution changed at the durability boundary again —
+    /// "Gemma 4 E4B" while composing, `gemma-4-E4B_q4_0-it@local` once
+    /// persisted (Codex review, PR #292). For an ordinary name the pass is
+    /// identity, which is why it can be applied unconditionally to the kind
+    /// rather than guessed at per label. The kind is the rail's reading of the
+    /// gutter's `role == "assistant"`: an agent authors inferences.
+    ///
+    /// **`ELSEWHERE` only when nothing names anyone.** A per-space override of
+    /// `''` is "override to empty" under the schema's NULL-inherits rule, so an
+    /// effective label really can be blank — and where the kind supplies no
+    /// fallback either, a blank byline would be a row indented past a gap that
+    /// says nothing.
+    fn reference_byline(
+        &self,
+        reference: &eidola_app_core::PostReference,
+        cx: &gpui::App,
+    ) -> SharedString {
         self.posts
             .iter()
-            .find(|p| p.action_id.as_deref() == Some(action_id))
+            .find(|p| p.action_id.as_deref() == Some(reference.antecedent_action_id.as_str()))
             .map(|p| p.byline.clone())
-            .unwrap_or_else(|| SharedString::from("another space"))
+            .filter(|byline| !byline.trim().is_empty())
+            .or_else(|| {
+                crate::space::byline_for_participant(
+                    &reference.antecedent_author_kind,
+                    &reference.antecedent_author_label,
+                )
+                .map(|byline| {
+                    if reference.antecedent_author_kind == "agent" {
+                        self.model_display(&byline, cx).0
+                    } else {
+                        SharedString::from(byline)
+                    }
+                })
+            })
+            .unwrap_or_else(|| SharedString::from(ELSEWHERE))
     }
 
     // -- Navigation ---------------------------------------------------------
@@ -2356,6 +2442,7 @@ mod tests {
             annotation: None,
             snippet: snippet.map(String::from),
             antecedent_author_label: "Ada".into(),
+            antecedent_author_kind: "agent".into(),
         };
         // A mapped marker standing as its own paragraph is elided.
         let doc = "before\n\n{{ embed 1 }}\n\nafter";
