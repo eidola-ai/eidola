@@ -9239,6 +9239,7 @@ fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
             annotation: None,
             snippet: Some("some passage".into()),
             antecedent_author_label: "Ada".into(),
+            antecedent_author_kind: "agent".into(),
         },
         eidola_app_core::PostReference {
             antecedent_action_id: "x2".into(),
@@ -9251,6 +9252,7 @@ fn space_post_footnote_removal_rides_the_edit_session(cx: &mut TestAppContext) {
             // guessing at a remap.
             snippet: None,
             antecedent_author_label: "Ada".into(),
+            antecedent_author_kind: "agent".into(),
         },
     ];
     seed_quotable_space(&view, window, cx, vec![post]);

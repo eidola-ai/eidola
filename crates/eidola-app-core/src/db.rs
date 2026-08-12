@@ -5312,6 +5312,10 @@ pub struct AntecedentEdgeRow {
     /// mechanism: the reading space cannot name an author it has never met,
     /// and a sibling branch's quote is a model's *only* view of that passage.
     pub antecedent_author_label: String,
+    /// The quoted post's author's participant **kind**, from the same join.
+    /// The label is not renderable on its own — see
+    /// [`crate::PostReference::antecedent_author_kind`].
+    pub antecedent_author_kind: String,
 }
 
 /// The raw materials for one space's threaded-post render.
@@ -5414,7 +5418,7 @@ pub async fn get_space_tree_data(
                 aa.range_start, aa.range_end, aa.annotation, \
                 ic.current_action_id, aa.content_block_id, qcb.text_content, \
                 ant.action_type, qcb.block_type, \
-                COALESCE(asp.override_label, ap.label) \
+                COALESCE(asp.override_label, ap.label), ap.kind \
          FROM action_antecedent aa \
          JOIN action_resolved ar ON ar.action_id = aa.action_id \
          JOIN action ant ON ant.id = aa.antecedent_action_id \
@@ -5451,6 +5455,7 @@ pub async fn get_space_tree_data(
             antecedent_action_type: row.get::<String>(10).map_err(AppError::db)?,
             block_type: row.get::<Option<String>>(11).map_err(AppError::db)?,
             antecedent_author_label: row.get::<String>(12).map_err(AppError::db)?,
+            antecedent_author_kind: row.get::<String>(13).map_err(AppError::db)?,
         });
     }
 

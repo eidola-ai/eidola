@@ -1787,3 +1787,57 @@ fn two_saves_on_one_agent_are_sequenced(cx: &mut TestAppContext) {
     );
     assert_eq!(row.label, "Second", "and the later save is what stands");
 }
+
+/// REGRESSION (Codex review, PR #292): **a transcript is where an author's name
+/// lives.** `get_space_tree` resolves every post's byline — and every reference
+/// edge's carried author identity — through
+/// `COALESCE(space_participant.override_label, participant.label)` at read
+/// time, and nothing re-derives them afterwards. A rename emits
+/// `Change::Participants` and nothing else, so before this every open window
+/// went on showing the old name in its post gutters, its minimap labels and its
+/// footnote rails until an unrelated `Change::Space` or a reopen.
+///
+/// The signal carries no id (a global agent is renamed everywhere at once, and
+/// an override is written per space), so the answer is **every** live space.
+#[gpui::test]
+fn a_participants_change_re_reads_a_live_transcript(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+
+    let byline = |cx: &mut TestAppContext| {
+        space.read_with(cx, |s, _| s.messages().first().map(|m| m.byline.clone()))
+    };
+    wait_until(cx, "the transcript loads", |cx| byline(cx).is_some());
+    assert_eq!(
+        byline(cx).as_deref(),
+        Some("You"),
+        "the seeded human's own name for itself"
+    );
+
+    // Another window (or the CLI) renames that participant *in this space*.
+    core.runtime()
+        .block_on(core.set_space_participant_override(
+            posted.space_id.clone(),
+            eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            eidola_app_core::ParticipantOverride {
+                label: Some(Some("Skipper".into())),
+                model_ref: None,
+                system_prompt: None,
+                notify_policy: None,
+            },
+        ))
+        .expect("override");
+
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+    wait_until(cx, "the transcript re-reads", |cx| {
+        byline(cx).as_deref() == Some("Skipper")
+    });
+}
