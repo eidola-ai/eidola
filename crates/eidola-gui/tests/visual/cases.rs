@@ -931,9 +931,7 @@ fn settings_backends_stores(cx: &mut App) -> Stores {
             },
         ];
         s.local_models = Some(LocalModelsState {
-            engine_path: Some(
-                "/Applications/Eidola.app/Contents/Resources/bin/llama-server".into(),
-            ),
+            engine_path: Some("/Applications/Eidola.app/Contents/MacOS/llama-server".into()),
             external: vec![ExternalEngineBackend {
                 backend_id: "my-box".into(),
                 display_name: "My box".into(),
