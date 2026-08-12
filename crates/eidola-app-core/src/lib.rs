@@ -66,6 +66,10 @@ pub struct ConfigState {
     pub default_template: String,
     pub has_account: bool,
     pub has_account_secret: bool,
+    /// Locally configured account id, shown by trusted clients for copy/audit.
+    pub account_id: Option<String>,
+    /// Locally configured account secret, shown by trusted clients for copy.
+    pub account_secret: Option<String>,
     pub domain_separator: String,
     pub attestation_url: Option<String>,
     /// The resolved circadian day/night axis (`appearance` override if set,
@@ -7042,6 +7046,8 @@ impl AppCore {
             default_template: cfg.default_template().to_string(),
             has_account: cfg.account_id.is_some(),
             has_account_secret: cfg.account_secret.is_some(),
+            account_id: cfg.account_id.clone(),
+            account_secret: cfg.account_secret.clone(),
             domain_separator: cfg.domain_separator().to_string(),
             attestation_url: cfg.attestation_url.clone(),
             appearance: cfg.appearance(),
