@@ -1651,6 +1651,82 @@ fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_credential_fields_and_their_suffix_controls_are_each_one_node(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    // The two credential fields follow the focus-bearing-editor regime — the
+    // `Input` carries the label and is the node, its wrapper is bounds-only —
+    // and the controls sitting in the secret field's suffix follow the hoist:
+    // a probed wrapper is the control, so each is a named, reachable node
+    // rather than a presentational widget nobody can get to. `.role(None)` on
+    // the widgets alone would satisfy the source scan while deleting these
+    // from the tree, which is precisely what this test refuses.
+    let _guard = probes_on();
+
+    let stores = account_backends_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/account/id",
+        gpui::Role::TextInput,
+        "Account ID",
+    );
+    assert_probe(
+        &entries,
+        "settings/account/secret",
+        gpui::Role::TextInput,
+        "Account Secret",
+    );
+    assert_probe(
+        &entries,
+        "settings/account/id/copy",
+        gpui::Role::Button,
+        "Copy Account ID",
+    );
+    assert_probe(
+        &entries,
+        "settings/account/secret/copy",
+        gpui::Role::Button,
+        "Copy Account Secret",
+    );
+    assert_probe(
+        &entries,
+        "settings/account/secret/reveal",
+        gpui::Role::Button,
+        "Show account secret",
+    );
+    // The component paints twice and derives every name and element id from
+    // its prefix, so the two copies are distinct nodes — and only the secret
+    // has anything to reveal.
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "settings/account/id/reveal"),
+        "the account id is never masked; recorded: {:?}",
+        entries.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+
+    // Revealed, the control says what it would now do.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_account_secret_revealed(window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "settings/account/secret/reveal",
+        gpui::Role::Button,
+        "Hide account secret",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
 fn a_lapsed_account_is_offered_its_billing_and_every_plan(cx: &mut TestAppContext) {
     use eidola_gui::account::AccountView;
 
