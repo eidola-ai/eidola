@@ -3725,6 +3725,12 @@ pub struct ReferenceEdgeRow {
     /// replication that silently lost one would rewrite history.
     pub antecedent_action_type: String,
     pub block_type: Option<String>,
+    /// The quoted post's author, as its **own** space names it:
+    /// `COALESCE(space_participant.override_label, participant.label)` joined
+    /// on `ant.space_id`. A per-space override is that space's name for the
+    /// participant, so the reading space's override would misattribute a
+    /// cross-space passage.
+    pub antecedent_author_label: String,
 }
 
 impl ReferenceEdgeRow {
@@ -3735,11 +3741,20 @@ impl ReferenceEdgeRow {
         is_post_action_type(&self.antecedent_action_type)
             && self.block_type.as_deref() == Some(QUOTABLE_BLOCK_TYPE)
     }
+
+    /// Whether the edge names a range at all. A range-less reference is a
+    /// plain backlink — a pointer to a post, not a quote of one — which
+    /// [`crate::ReferenceSpec`] permits deliberately ("both present or both
+    /// absent"), so a reader must not describe it as a quote that failed.
+    pub fn has_range(&self) -> bool {
+        self.range_start.is_some() && self.range_end.is_some()
+    }
 }
 
 /// The `reference`-relation antecedents of an action, ordinal order. Used by
 /// `edit_post` to replicate references onto a new generation and by the
-/// upstream-context embed expansion.
+/// upstream-context embed expansion — which also renders each passage's
+/// byline, hence the author join (on the **antecedent's** space).
 pub async fn reference_antecedents(
     conn: &Connection,
     action_id: &str,
@@ -3748,9 +3763,13 @@ pub async fn reference_antecedents(
         .prepare(
             "SELECT aa.ordinal, aa.antecedent_action_id, aa.content_block_id, \
                     aa.range_start, aa.range_end, aa.annotation, cb.text_content, \
-                    ant.action_type, cb.block_type \
+                    ant.action_type, cb.block_type, \
+                    COALESCE(sp.override_label, p.label) \
              FROM action_antecedent aa \
              JOIN action ant ON ant.id = aa.antecedent_action_id \
+             JOIN participant p ON p.id = ant.participant_id \
+             LEFT JOIN space_participant sp \
+               ON sp.space_id = ant.space_id AND sp.participant_id = ant.participant_id \
              LEFT JOIN content_block cb ON cb.id = aa.content_block_id \
              WHERE aa.action_id = ?1 AND aa.relation = 'reference' \
              ORDER BY aa.ordinal ASC",
@@ -3773,6 +3792,7 @@ pub async fn reference_antecedents(
             block_text: row.get::<Option<String>>(6).map_err(AppError::db)?,
             antecedent_action_type: row.get::<String>(7).map_err(AppError::db)?,
             block_type: row.get::<Option<String>>(8).map_err(AppError::db)?,
+            antecedent_author_label: row.get::<String>(9).map_err(AppError::db)?,
         });
     }
     Ok(out)
@@ -5232,6 +5252,13 @@ pub struct PostActionRow {
     pub action_id: String,
     pub item_id: String,
     pub participant_kind: String,
+    /// The author as **this** space names them
+    /// (`COALESCE(space_participant.override_label, participant.label)`) — the
+    /// same effective label every other author-rendering read returns, so a
+    /// post carries one byline whether it is read through the tree, the
+    /// transcript, the navigation tools or the trace rail. Deliberately not
+    /// liveness-filtered: who wrote a post goes on being named after
+    /// retirement.
     pub participant_label: String,
     pub action_type: String,
     pub model: Option<String>,
@@ -5279,6 +5306,12 @@ pub struct AntecedentEdgeRow {
     /// renders (its existence is public); only the passage is withheld.
     pub antecedent_action_type: String,
     pub block_type: Option<String>,
+    /// The quoted post's author, as **its own** space names it
+    /// (`COALESCE(space_participant.override_label, participant.label)` joined
+    /// on `ant.space_id`). Carried because a reference is the cross-space
+    /// mechanism: the reading space cannot name an author it has never met,
+    /// and a sibling branch's quote is a model's *only* view of that passage.
+    pub antecedent_author_label: String,
 }
 
 /// The raw materials for one space's threaded-post render.
@@ -5301,10 +5334,13 @@ pub async fn get_space_tree_data(
     // here (render order → sibling/root order in the tree) and in the
     // upstream-context view (`get_space_actions_for_context`).
     let action_sql = format!(
-        "SELECT ar.action_id, ar.item_id, p.kind, p.label, ar.action_type, \
+        "SELECT ar.action_id, ar.item_id, p.kind, \
+                COALESCE(sp.override_label, p.label), ar.action_type, \
                 ar.model, ar.credits_consumed, ar.generation, ar.created_at \
          FROM action_resolved ar \
          JOIN participant p ON p.id = ar.participant_id \
+         LEFT JOIN space_participant sp \
+           ON sp.space_id = ar.space_id AND sp.participant_id = ar.participant_id \
          JOIN (SELECT space_id, item_id, \
                       MIN(created_at) AS born_at, MIN(id) AS first_action_id \
                FROM action GROUP BY space_id, item_id) origin \
@@ -5377,10 +5413,14 @@ pub async fn get_space_tree_data(
         "SELECT aa.action_id, aa.antecedent_action_id, aa.ordinal, aa.relation, \
                 aa.range_start, aa.range_end, aa.annotation, \
                 ic.current_action_id, aa.content_block_id, qcb.text_content, \
-                ant.action_type, qcb.block_type \
+                ant.action_type, qcb.block_type, \
+                COALESCE(asp.override_label, ap.label) \
          FROM action_antecedent aa \
          JOIN action_resolved ar ON ar.action_id = aa.action_id \
          JOIN action ant ON ant.id = aa.antecedent_action_id \
+         JOIN participant ap ON ap.id = ant.participant_id \
+         LEFT JOIN space_participant asp \
+           ON asp.space_id = ant.space_id AND asp.participant_id = ant.participant_id \
          LEFT JOIN item_current ic \
            ON ic.space_id = ant.space_id AND ic.item_id = ant.item_id \
          LEFT JOIN content_block qcb ON qcb.id = aa.content_block_id \
@@ -5410,6 +5450,7 @@ pub async fn get_space_tree_data(
             block_text: row.get::<Option<String>>(9).map_err(AppError::db)?,
             antecedent_action_type: row.get::<String>(10).map_err(AppError::db)?,
             block_type: row.get::<Option<String>>(11).map_err(AppError::db)?,
+            antecedent_author_label: row.get::<String>(12).map_err(AppError::db)?,
         });
     }
 
@@ -6016,6 +6057,63 @@ pub async fn list_credential_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reference edge quoting a post's text — what the two edge-level
+    /// predicates are asked about. *Whether the quoted post can be named by
+    /// handle* is not among them: that is the turn snapshot's answer alone
+    /// (`ThreadSnapshot::node_for_action`), so no second definition of it can
+    /// live here and drift.
+    fn quoting_edge() -> ReferenceEdgeRow {
+        ReferenceEdgeRow {
+            ordinal: 1,
+            antecedent_action_id: "a1".into(),
+            content_block_id: Some("cb1".into()),
+            range_start: Some(0),
+            range_end: Some(4),
+            annotation: None,
+            block_text: Some("text".into()),
+            antecedent_action_type: "user_input".into(),
+            block_type: Some("text".into()),
+            antecedent_author_label: "Ada".into(),
+        }
+    }
+
+    /// The quotable rule and the range test are separate questions and the
+    /// rendering needs both: a `thinking` block belongs to a post, so the post
+    /// stays readable while that passage is withheld; a range-less edge is a
+    /// backlink rather than a quote whose range broke.
+    #[test]
+    fn quotability_and_having_a_range_are_separate_questions() {
+        let quoting = quoting_edge();
+        assert!(quoting.is_quotable());
+        assert!(quoting.has_range());
+
+        let thinking = ReferenceEdgeRow {
+            block_type: Some("thinking".into()),
+            ..quoting_edge()
+        };
+        assert!(!thinking.is_quotable(), "only a post's text may be quoted");
+        assert!(thinking.has_range());
+
+        for action_type in ["tool_call", "decision", "memory", "checkpoint"] {
+            let non_post = ReferenceEdgeRow {
+                antecedent_action_type: action_type.into(),
+                ..quoting_edge()
+            };
+            assert!(!non_post.is_quotable(), "{action_type}");
+        }
+
+        let backlink = ReferenceEdgeRow {
+            content_block_id: None,
+            range_start: None,
+            range_end: None,
+            block_text: None,
+            block_type: None,
+            ..quoting_edge()
+        };
+        assert!(!backlink.has_range());
+        assert!(!backlink.is_quotable(), "no block, nothing to quote");
+    }
 
     async fn open_memory_fresh() -> Database {
         let db = Builder::new_local(":memory:").build().await.unwrap();

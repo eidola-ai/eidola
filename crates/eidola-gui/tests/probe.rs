@@ -3592,6 +3592,7 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
             range_end: Some(4),
             annotation: None,
             snippet: Some("an earlier passage".into()),
+            antecedent_author_label: "Ada".into(),
         },
         eidola_app_core::PostReference {
             antecedent_action_id: "x2".into(),
@@ -3601,6 +3602,7 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
             range_end: Some(4),
             annotation: None,
             snippet: None, // the honest "quoted an earlier version" row
+            antecedent_author_label: "Ada".into(),
         },
     ];
     cx.update(|cx| {

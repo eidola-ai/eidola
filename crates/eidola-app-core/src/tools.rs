@@ -386,14 +386,22 @@ pub const FOLLOW_DENIED: &str = "You do not take part in the conversation that p
 /// Render a post reached by following a quote (task 37). Pure over its inputs —
 /// these are wire bytes a model reads, so they are unit-tested.
 ///
-/// The body goes through [`crate::with_header`], the same rendering path every
-/// other post takes. The one added line is provenance: which conversation this
-/// came from, or that it is a superseded version of a post in this one.
+/// The body goes through [`crate::with_header`] over
+/// [`crate::render_post_for_model`], the same two rendering paths every other
+/// post takes: a followed post quotes things too, and a model that followed one
+/// quote must not be handed the next one as a literal `{{ embed N }}` marker.
+/// The one added line is provenance: which conversation this came from, or that
+/// it is a superseded version of a post in this one.
 pub(crate) fn render_followed_post(
     row: &crate::db::ReferencedPostRow,
     current_space_id: &str,
+    references: &std::collections::BTreeMap<u64, crate::ReferenceEntry>,
 ) -> String {
-    let body = crate::with_header(&row.item_id, &row.participant_label, &row.text);
+    let body = crate::with_header(
+        &row.item_id,
+        &row.participant_label,
+        &crate::render_post_for_model(&row.text, references),
+    );
     if row.space_id == current_space_id {
         // Same space, but not in the snapshot: the quote named a generation
         // that has since been edited or regenerated. References name concrete
@@ -497,7 +505,22 @@ impl ReadPostTool {
         };
         // Rule 4: follow requires membership, re-read per call.
         match crate::db::is_space_member(&conn, &row.space_id, &self.participant_id).await {
-            Ok(true) => render_followed_post(&row, &self.current_space_id),
+            Ok(true) => {
+                // The followed post's own references, addressed from *this*
+                // turn's space: its handles are the only ones the model can
+                // resolve, so a quote living anywhere else renders as an
+                // earlier version rather than an address that opens nothing.
+                let Ok(references) = crate::reference_entries(
+                    &conn,
+                    &self.snapshot,
+                    &reference.antecedent_action_id,
+                )
+                .await
+                else {
+                    return "That quoted post could not be read.".to_string();
+                };
+                render_followed_post(&row, &self.current_space_id, &references)
+            }
             Ok(false) => FOLLOW_DENIED.to_string(),
             Err(_) => "That quoted post could not be read.".to_string(),
         }
@@ -669,7 +692,7 @@ mod tests {
     #[test]
     fn a_followed_post_says_where_it_came_from_and_renders_as_a_post() {
         let row = referenced("other", Some("Tides"), "Spring tides at syzygy.");
-        let rendered = render_followed_post(&row, "here");
+        let rendered = render_followed_post(&row, "here", &Default::default());
         assert_eq!(
             rendered,
             format!(
@@ -679,11 +702,58 @@ mod tests {
         );
         // Same space ⇒ not another conversation, just a generation the current
         // view no longer shows.
-        let rendered = render_followed_post(&referenced("here", None, "Older wording."), "here");
+        let rendered = render_followed_post(
+            &referenced("here", None, "Older wording."),
+            "here",
+            &Default::default(),
+        );
         assert!(
             rendered.starts_with("An earlier version of a post in this conversation.\n\n#"),
             "{rendered}"
         );
+    }
+
+    /// A followed post is a post: its own quotes render exactly as they do
+    /// everywhere else — expanded and attributed at the marker, footnoted when
+    /// the body never embedded them. Following one quote must not hand the
+    /// model a literal marker for the next.
+    #[test]
+    fn a_followed_post_renders_its_own_quotes() {
+        let row = referenced("other", Some("Tides"), "As noted:\n\n{{ embed 1 }}");
+        let addressed = crate::ReferenceEntry {
+            ordinal: 1,
+            target: crate::ReferenceTarget::Addressable {
+                item_id: "item-bo".to_string(),
+                label: "Bo".to_string(),
+            },
+            annotation: None,
+            body: crate::ReferenceBody::Passage("syzygy".to_string()),
+        };
+        let elsewhere = crate::ReferenceEntry {
+            ordinal: 2,
+            target: crate::ReferenceTarget::Elsewhere {
+                label: Some("Cy".to_string()),
+            },
+            annotation: None,
+            body: crate::ReferenceBody::Passage("neap".to_string()),
+        };
+        let references = std::collections::BTreeMap::from([(1, addressed), (2, elsewhere)]);
+        let rendered = render_followed_post(&row, "here", &references);
+        assert!(
+            rendered.contains(&format!(
+                "As noted:\n\n[1] {}\n> syzygy",
+                crate::message_header("item-bo", "Bo")
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.ends_with(
+                "Passages this post quotes:\n[2] Cy (a post outside this space, or an earlier \
+                 version)\n> neap"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("{{ embed"), "{rendered}");
     }
 
     #[test]
@@ -693,7 +763,7 @@ mod tests {
             Some("   "),
             "# Why do tides lag the moon?\n\nBecause…",
         );
-        let rendered = render_followed_post(&row, "here");
+        let rendered = render_followed_post(&row, "here", &Default::default());
         assert!(
             rendered.starts_with(
                 "From another conversation you take part in — Why do tides lag \

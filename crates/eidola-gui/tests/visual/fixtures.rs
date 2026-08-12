@@ -122,6 +122,7 @@ pub fn kitchen_sink_posts() -> Vec<PostNode> {
         range_end: Some(end),
         annotation: None,
         snippet: None,
+        antecedent_author_label: "Ada".into(),
     };
 
     // (action_id, item_id, kind, label, type, depth, is_branch, parent, gen, refs, content)
@@ -390,6 +391,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
         range_end: Some(a_end),
         annotation: None,
         snippet: Some(quoted_a.into()),
+        antecedent_author_label: "Ada".into(),
     }];
 
     // A branch quoting the overlapping span plus a second passage — two
@@ -419,6 +421,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
             snippet: src
                 .get(a_start as usize..a_long_end as usize)
                 .map(String::from),
+            antecedent_author_label: "Ada".into(),
         },
         PostReference {
             antecedent_action_id: "q1".into(),
@@ -428,6 +431,7 @@ pub fn quoted_reference_posts() -> (Vec<PostNode>, Vec<(String, Vec<QuotedIncomi
             range_end: Some(b_end),
             annotation: None,
             snippet: Some(quoted_b.into()),
+            antecedent_author_label: "Ada".into(),
         },
     ];
 

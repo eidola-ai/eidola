@@ -966,11 +966,15 @@ fn submit_with_references_carries_the_quote_to_the_wire() {
         let expected = headed(
             &result.post.item_id,
             HUMAN_LABEL,
-            "What does this mean?\n\n> powerhouse",
+            &format!(
+                "What does this mean?\n\n[1] #{} · {HUMAN_LABEL}\n> powerhouse",
+                eidola_app_core::post_handle(&source.item_id)
+            ),
         );
         assert!(
             contents.contains(&expected),
-            "the marker expands into the quoted passage under the post's header; got {contents:?}"
+            "the marker expands into the quoted passage, attributed to the post it came from; \
+             got {contents:?}"
         );
     });
 }
