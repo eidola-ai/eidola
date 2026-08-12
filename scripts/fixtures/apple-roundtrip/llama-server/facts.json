@@ -1,0 +1,83 @@
+{
+  "as-built (autoSignDarwinBinariesHook / sigtool)": {
+    "file_sha256": "9389f0dbad27bbb450e177fef57ba3f999c5d1a2ea7e59d5466bd04e84046e72",
+    "file_size": 13459696,
+    "kind": "thin",
+    "slices": [
+      {
+        "arch": "arm64",
+        "code_signature": {
+          "dataoff": 13354096,
+          "datasize": 105600,
+          "lc_offset": 3008,
+          "superblob_sha256": "304e441b24ab6090288b4f231da0469fd413d2f7d5a1006ff3863a5357b368f2"
+        },
+        "header_offset": 0,
+        "linkedit": {
+          "fileoff": 9945088,
+          "fileoff_field_offset": 2040,
+          "filesize": 3514608,
+          "filesize_field_offset": 2048,
+          "vmaddr": 4305551360,
+          "vmsize": 3522560,
+          "vmsize_field_offset": 2032
+        },
+        "mh_flags": "0xa18085"
+      }
+    ]
+  },
+  "settled (one codesign ad-hoc cycle)": {
+    "file_sha256": "1dd40011e3156943657fae0972bc248f625e061fd6d31d959b3f7c6ccb12d3cf",
+    "file_size": 13398480,
+    "kind": "thin",
+    "slices": [
+      {
+        "arch": "arm64",
+        "code_signature": {
+          "dataoff": 13354096,
+          "datasize": 44384,
+          "lc_offset": 3008,
+          "superblob_sha256": "4a8f131a495dd7d256fa7287722860dd3236f41bb0040959f150c998f94dcec6"
+        },
+        "header_offset": 0,
+        "linkedit": {
+          "fileoff": 9945088,
+          "fileoff_field_offset": 2040,
+          "filesize": 3453392,
+          "filesize_field_offset": 2048,
+          "vmaddr": 4305551360,
+          "vmsize": 3457024,
+          "vmsize_field_offset": 2032
+        },
+        "mh_flags": "0xa18085"
+      }
+    ]
+  },
+  "signed (codesign ad-hoc, from settled)": {
+    "file_sha256": "1dd40011e3156943657fae0972bc248f625e061fd6d31d959b3f7c6ccb12d3cf",
+    "file_size": 13398480,
+    "kind": "thin",
+    "slices": [
+      {
+        "arch": "arm64",
+        "code_signature": {
+          "dataoff": 13354096,
+          "datasize": 44384,
+          "lc_offset": 3008,
+          "superblob_sha256": "4a8f131a495dd7d256fa7287722860dd3236f41bb0040959f150c998f94dcec6"
+        },
+        "header_offset": 0,
+        "linkedit": {
+          "fileoff": 9945088,
+          "fileoff_field_offset": 2040,
+          "filesize": 3453392,
+          "filesize_field_offset": 2048,
+          "vmaddr": 4305551360,
+          "vmsize": 3457024,
+          "vmsize_field_offset": 2032
+        },
+        "mh_flags": "0xa18085"
+      }
+    ]
+  }
+}

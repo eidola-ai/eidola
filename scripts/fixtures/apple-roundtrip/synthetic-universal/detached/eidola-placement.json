@@ -1,0 +1,14 @@
+{
+  "bundle": "Fixture.app",
+  "files": {
+    "Contents/_CodeSignature/CodeResources": "sha256:6686de10a28a2fe11b36cbb86dcbacc827cfc4ea116b4dabf1845e5aee629e9b"
+  },
+  "machos": {
+    "Contents/MacOS/Fixture": {
+      "input_sha256": "470c4ea8aefb5c736c110245d43043ccc477a724c3e96d763baa70a2f1d14903",
+      "output_len": 84480,
+      "output_sha256": "a248f0aebc03d7466463c1faa5a9a6a5f348a6688775e576bcf09095c6fa560d"
+    }
+  },
+  "schema_version": 1
+}
