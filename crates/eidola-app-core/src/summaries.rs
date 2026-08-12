@@ -40,6 +40,18 @@
 //! allowlist already collapse it out — a summary is invisible as a post and
 //! fully present in the Record.
 //!
+//! # What the summarizer reads
+//!
+//! [`ThreadSnapshot::branch_slice`] renders each post the way every model-facing
+//! path renders it (`render_post_for_model`): `{{ embed N }}` markers expand
+//! into their attributed passages and un-embedded references arrive in the
+//! trailing block. The map's own opening line *elides* markers instead, and the
+//! difference is deliberate — that line places a post's bytes under a byline
+//! it has just printed, while this is a model reading the branch in order to
+//! describe it. A post whose point is the passage it quotes would otherwise
+//! summarize to nothing, and unlike a turn's context a summary is **written
+//! down** and read for as long as the branch lives.
+//!
 //! # Model and cost
 //!
 //! v1 shares the space's existing `router_model` as its utility model (one knob

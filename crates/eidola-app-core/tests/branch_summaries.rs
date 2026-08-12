@@ -395,6 +395,82 @@ fn the_summarizer_reads_only_its_branch() {
     });
 }
 
+/// The summarizer **reads** the branch, so its posts arrive in the one
+/// model-facing rendering (`render_post_for_model`) — quoted passages
+/// attributed and spliced in at their markers — rather than as the literal
+/// `{{ embed N }}` the map's own opening line elides. A branch whose point is
+/// the passage it quotes would otherwise be summarized as though the passage
+/// were not there, and that summary is written down and read for as long as the
+/// branch lives.
+#[test]
+fn the_summarizer_reads_quoted_passages_not_their_markers() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            summary: SummaryBehavior::Reply(SUMMARY.into()),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let fx = branched_space(&core);
+        use_utility_model(&core, &mock, &fx.space, chat_harness::ROUTER_MODEL);
+
+        // Grow the summarized branch with a post that is nothing but a quote of
+        // the trunk's opening and a bare follow-up: elided, it says nothing.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(fx.space.clone()))
+            .expect("tree");
+        let trunk = tree
+            .iter()
+            .find(|n| {
+                n.blocks
+                    .iter()
+                    .any(|b| b.text.as_deref() == Some("How do tides work?"))
+            })
+            .expect("the trunk's opening post");
+        let quoting = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "{{ embed 1 }}\n\nStill true?".into(),
+                Some(fx.space.clone()),
+                Some(fx.branch_tail.clone()),
+                vec![eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: trunk.action_id.clone(),
+                    content_block_id: Some(trunk.blocks[0].id.clone()),
+                    range_start: Some(7),
+                    range_end: Some(12), // "tides"
+                    annotation: None,
+                }],
+            ))
+            .expect("post with a reference");
+        core.runtime()
+            .block_on(core.post_reply(
+                "Ask the tide agent.".into(),
+                Some(fx.space.clone()),
+                Some(quoting.action_id.clone()),
+            ))
+            .expect("grow the branch");
+
+        summarize(&core, &fx.space);
+        let prompts: Vec<String> = summary_calls(&mock)
+            .iter()
+            .map(|c| c["messages"][1]["content"].as_str().unwrap().to_string())
+            .collect();
+        let quoted = format!(
+            "[1] #{} · {HUMAN_LABEL}\n> tides",
+            post_handle(&trunk.item_id)
+        );
+        assert!(
+            prompts.iter().any(|p| p.contains(&quoted)),
+            "the passage reaches the summarizer attributed; got {prompts:?}"
+        );
+        assert!(
+            prompts.iter().all(|p| !p.contains("{{ embed")),
+            "no literal marker survives; got {prompts:?}"
+        );
+    });
+}
+
 // ===========================================================================
 // The cache: keyed on the branch tip
 // ===========================================================================

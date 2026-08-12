@@ -1320,6 +1320,85 @@ fn a_remote_routers_hold_is_settled_when_the_body_read_fails() {
     });
 }
 
+/// The router picks *who answers*, so a post whose meaning lives in a quoted
+/// passage has to reach it as that passage — the same `post_body` rendering
+/// `read_thread` gives a model, not the literal `{{ embed N }}` marker (which
+/// says nothing) and not the marker elided (which says nothing either, more
+/// quietly).
+#[test]
+fn the_router_reads_a_quoted_passage_not_its_marker() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            router: chat_harness::RouterBehavior::Reply(r#"{"notify": [1]}"#.into()),
+            ..MockConfig::default()
+        });
+        let space = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+        add_agent(&core, &space, "All-Agent", MODEL, "all", None);
+
+        let source = core
+            .runtime()
+            .block_on(core.post(
+                "The mitochondria is the powerhouse of the cell".into(),
+                Some(space.clone()),
+            ))
+            .expect("source post");
+        let block_id = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree")[0]
+            .blocks[0]
+            .id
+            .clone();
+        // A post that is nothing *but* the quote and a bare ask: without the
+        // rendering the router sees no subject at all.
+        let asked = core
+            .runtime()
+            .block_on(core.post_with_references(
+                "{{ embed 1 }}\n\nWho should take this?".into(),
+                Some(space.clone()),
+                Some(source.action_id.clone()),
+                vec![eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: source.action_id.clone(),
+                    content_block_id: Some(block_id),
+                    range_start: Some(24),
+                    range_end: Some(34), // "powerhouse"
+                    annotation: Some("the bit I mean".into()),
+                }],
+            ))
+            .expect("post with a reference");
+        enable_router(&core, &mock, &space);
+
+        let _ = planned(&core, &space, &asked.action_id);
+        let calls = router_calls(&mock);
+        assert_eq!(calls.len(), 1, "exactly one router call");
+        let prompt = calls[0]["messages"][1]["content"]
+            .as_str()
+            .expect("the router's user message")
+            .to_string();
+
+        let quoted = format!(
+            "[1] #{} · {HUMAN_LABEL} — the bit I mean\n> powerhouse",
+            eidola_app_core::post_handle(&source.item_id)
+        );
+        assert!(
+            prompt.contains(&quoted),
+            "the passage reaches the router attributed; got {prompt}"
+        );
+        assert!(
+            !prompt.contains("{{ embed"),
+            "no literal marker survives; got {prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("LATEST — {HUMAN_LABEL}: [1] #")),
+            "the expansion is spliced in where the marker stood; got {prompt}"
+        );
+    });
+}
+
 // ===========================================================================
 // Agent-side decline checkpoint (task 22)
 // ===========================================================================
