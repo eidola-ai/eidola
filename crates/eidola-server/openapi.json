@@ -353,20 +353,21 @@
         ]
       }
     },
-    "/v1/account/subscription": {
-      "get": {
+    "/v1/account/portal": {
+      "post": {
         "tags": [
           "Linked"
         ],
-        "summary": "GET /v1/account/subscription — get subscription details (authenticated).",
-        "operationId": "get_subscription",
+        "summary": "POST /v1/account/portal — mint a Stripe billing-portal session\n(authenticated).",
+        "description": "Separate from the subscription read on purpose. Minting is a write to\nStripe and the session expires quickly, so a link that rides a status\nresponse is one no client can responsibly hold — ours already discarded\nit and asked again at the moment of the click. Riding along, it made\nevery status read create-and-throw-away a Stripe session, and put that\nwrite's latency in front of an answer that did not need it.\n\nRefuses for an account with no payment relationship, on the same test\n`GET /v1/account/subscription` calls `none`: a portal minted for someone\nmoney has never moved for is a door onto an empty room.",
+        "operationId": "create_portal_session",
         "responses": {
           "200": {
-            "description": "Subscription details",
+            "description": "A billing-portal session",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SubscriptionResponse"
+                  "$ref": "#/components/schemas/PortalResponse"
                 }
               }
             }
@@ -382,7 +383,54 @@
             }
           },
           "404": {
-            "description": "No Stripe customer or no subscription",
+            "description": "No payment relationship to manage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Stripe not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
+    "/v1/account/subscription": {
+      "get": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "GET /v1/account/subscription — the account's subscription standing\n(authenticated).",
+        "description": "Always 200 on a reachable Stripe: having no subscription is an answer,\nnot a failure. The states are distinguished so a client can tell \"never\ntransacted\" from \"has a payment relationship but nothing in force\" —\nthe second has a billing portal worth offering, the first does not.",
+        "operationId": "get_subscription",
+        "responses": {
+          "200": {
+            "description": "Subscription standing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
             "content": {
               "application/json": {
                 "schema": {
@@ -1825,6 +1873,19 @@
           }
         }
       },
+      "PortalResponse": {
+        "type": "object",
+        "description": "A freshly minted Stripe billing-portal session.\n\nIts own endpoint rather than a field on the subscription standing:\nminting is a **write** to Stripe and the session expires quickly, so a\nlink handed out with a status read is one the client cannot responsibly\nkeep — and every status read was creating a portal session that was then\nthrown away.",
+        "required": [
+          "portal_url"
+        ],
+        "properties": {
+          "portal_url": {
+            "type": "string",
+            "description": "Open this in a browser now. Short-lived by construction; ask again\nrather than storing it."
+          }
+        }
+      },
       "PriceResponse": {
         "type": "object",
         "description": "A purchasable plan.",
@@ -2057,26 +2118,35 @@
       },
       "SubscriptionResponse": {
         "type": "object",
+        "description": "The account's subscription standing.\n\nThe `state` field is the answer; the rest is detail that exists only\nwhere it is meaningful. It is deliberately a three-value state rather\nthan a present/absent subscription, because \"this account has never\ntransacted\" and \"this account has a payment relationship but no live\nsubscription\" are different situations and lead to different UI.",
         "required": [
-          "id",
-          "status",
-          "management_url"
+          "state"
         ],
         "properties": {
           "current_period_end": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "End of the current billing period, ISO-8601. Present when `state`\nis `active` and Stripe reported one."
           },
           "id": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The in-force subscription's Stripe id. Present exactly when `state`\nis `active`."
           },
-          "management_url": {
-            "type": "string"
+          "state": {
+            "type": "string",
+            "description": "`none` — the account has never transacted, so it has no payment\nrelationship and nothing to manage. That means no Stripe customer\n*or* a customer record with no money ever moved under it, which\ncheckout can leave behind when a session is abandoned — a customer\nid alone buys nobody a card, an invoice or a receipt. `inactive` — a\nreal payment history, but no subscription in a status Eidola treats\nas in force. `active` — a subscription is in force.\n\n\"In force\" means Stripe status `active`, `trialing`, or `past_due`\n— the same set the checkout endpoint refuses to double-subscribe\nover, so the two answers cannot disagree."
           },
           "status": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The in-force subscription's raw Stripe status, so a client can show\nwhat it actually is (a `past_due` subscription is in force and\nwants attention). Present exactly when `state` is `active`."
           }
         }
       },

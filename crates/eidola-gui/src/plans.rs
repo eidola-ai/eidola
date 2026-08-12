@@ -18,6 +18,25 @@ use crate::probe::Probe;
 /// Handler invoked with the clicked plan's price id.
 pub type PlanSelectHandler = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
+/// The plans a surface may offer given whether a subscription is already in
+/// force.
+///
+/// With one in force the server refuses to start a second, so listing
+/// recurring plans would only sell a refusal — the subscription itself is
+/// managed through the billing portal instead. One-time top-ups are
+/// unaffected and stay offered, which is why this filters rather than
+/// hiding the list.
+///
+/// `recurrence` is empty exactly for one-time prices (`account_prices`
+/// derives it from the price's recurring interval), so it is the test.
+pub fn offered_plans(prices: &[PriceInfo], subscribed: bool) -> Vec<PriceInfo> {
+    prices
+        .iter()
+        .filter(|p| !subscribed || p.recurrence.is_empty())
+        .cloned()
+        .collect()
+}
+
 /// Render the plan rows themselves (no surrounding empty/error states —
 /// those belong to the caller, which knows why the list might be empty).
 /// `pending` marks the plan whose checkout request is currently in flight;
@@ -132,7 +151,34 @@ pub fn format_credits(credits: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_credits;
+    use super::{format_credits, offered_plans};
+    use eidola_app_core::PriceInfo;
+
+    fn price(id: &str, recurrence: &str) -> PriceInfo {
+        PriceInfo {
+            id: id.to_string(),
+            product_name: id.to_string(),
+            product_description: None,
+            amount_display: "10.00 USD".to_string(),
+            recurrence: recurrence.to_string(),
+            credits: 10_000_000,
+        }
+    }
+
+    #[test]
+    fn without_a_subscription_every_plan_is_offered() {
+        let prices = [price("topup", ""), price("monthly", "/month")];
+        let offered = offered_plans(&prices, false);
+        assert_eq!(offered.len(), 2);
+    }
+
+    #[test]
+    fn with_a_subscription_only_one_time_top_ups_are_offered() {
+        let prices = [price("topup", ""), price("monthly", "/month")];
+        let offered = offered_plans(&prices, true);
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].id, "topup");
+    }
 
     #[test]
     fn format_credits_separators() {

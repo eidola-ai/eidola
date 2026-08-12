@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AccountCreateResult, AppCore, BalancesResult, PriceInfo};
+use eidola_app_core::{AccountCreateResult, AppCore, BalancesResult, PriceInfo, SubscriptionInfo};
 use gpui::{Context, Task};
 use tokio::sync::oneshot;
 
@@ -26,10 +26,16 @@ pub struct AccountStore {
     app_core: Option<Arc<AppCore>>,
     balances: Loadable<BalancesResult>,
     prices: Loadable<Vec<PriceInfo>>,
+    /// The account's subscription standing. Core-side this is a live read
+    /// that persists nothing, so nothing on the bus ever invalidates it —
+    /// it is refreshed when a surface that shows it opens, and by that
+    /// surface's own retry.
+    subscription: Loadable<SubscriptionInfo>,
     /// Supersede slots — replacing cancels the predecessor. `Loading` on a
     /// cell implies its slot is `Some`.
     balances_task: Option<Task<()>>,
     prices_task: Option<Task<()>>,
+    subscription_task: Option<Task<()>>,
     /// Slot for the fire-and-notify `create_account` op (its own slot so it
     /// never cancels a balances/prices refresh).
     lifecycle_task: Option<Task<()>>,
@@ -45,15 +51,21 @@ impl AccountStore {
             app_core,
             balances: Loadable::NotLoaded,
             prices: Loadable::NotLoaded,
+            subscription: Loadable::NotLoaded,
             balances_task: None,
             prices_task: None,
+            subscription_task: None,
             lifecycle_task: None,
             account_op_error: None,
         }
     }
 
-    /// A stub store with fixture balances/prices (tests).
-    pub fn stub(balances: Option<BalancesResult>, prices: Vec<PriceInfo>) -> Self {
+    /// A stub store with fixture balances/prices/subscription (tests).
+    pub fn stub(
+        balances: Option<BalancesResult>,
+        prices: Vec<PriceInfo>,
+        subscription: Option<SubscriptionInfo>,
+    ) -> Self {
         Self {
             app_core: None,
             balances: match balances {
@@ -65,8 +77,13 @@ impl AccountStore {
             } else {
                 Loadable::loaded(prices)
             },
+            subscription: match subscription {
+                Some(s) => Loadable::loaded(s),
+                None => Loadable::NotLoaded,
+            },
             balances_task: None,
             prices_task: None,
+            subscription_task: None,
             lifecycle_task: None,
             account_op_error: None,
         }
@@ -80,6 +97,10 @@ impl AccountStore {
 
     pub fn prices(&self) -> &Loadable<Vec<PriceInfo>> {
         &self.prices
+    }
+
+    pub fn subscription(&self) -> &Loadable<SubscriptionInfo> {
+        &self.subscription
     }
 
     /// True while either cell is doing an initial load — the panes' "Loading…"
@@ -122,6 +143,95 @@ impl AccountStore {
                 cx.notify();
             });
         }));
+        cx.notify();
+    }
+
+    /// Re-read the account's subscription standing. Only meaningful with an
+    /// account configured; callers gate on that the way they gate balances.
+    pub fn refresh_subscription(&mut self, cx: &mut Context<Self>) {
+        let Some(core) = self.app_core.clone() else {
+            return;
+        };
+        self.subscription = std::mem::take(&mut self.subscription).to_loading();
+        self.subscription_task = Some(cx.spawn(async move |this, cx| {
+            let result = bridge(core, |c| async move { c.account_subscription().await }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.subscription = std::mem::take(&mut this.subscription).resolve(result);
+                this.subscription_task = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Drop everything this store holds that describes *a particular
+    /// account*, so an identity switch can never leave one account's answer
+    /// on screen under another's name.
+    ///
+    /// The subscription is the whole set today: prices are a public catalog,
+    /// and balances are written from the verified account's own response
+    /// (or cleared beside this on reset). Clearing rather than refreshing is
+    /// deliberate — showing nothing while a surface re-reads is honest,
+    /// where showing the previous account's standing is not, and on a
+    /// billing surface that is the difference that matters.
+    pub fn forget_account_scoped_state(&mut self, cx: &mut Context<Self>) {
+        self.subscription = Loadable::NotLoaded;
+        self.subscription_task = None;
+        cx.notify();
+    }
+
+    /// The configured account is now a *different* account: drop what the
+    /// old one owned and read the new one's standing.
+    ///
+    /// **Called on the commit, never on the attempt.** Creating and linking
+    /// both refuse outright when credentials already exist, so clearing when
+    /// the request went out blanked the cell for an operation that never
+    /// happened — an Account pane already open then lost its billing section
+    /// entirely, with no error branch to put it back. Clearing *and*
+    /// refreshing together is the point: a bare refresh would leave the
+    /// previous account's value on screen as `Loaded { stale }` while the
+    /// new read is in flight, which on a billing surface is the wrong
+    /// account's answer wearing the right account's name.
+    pub fn account_identity_changed(&mut self, cx: &mut Context<Self>) {
+        self.forget_account_scoped_state(cx);
+        self.refresh_subscription(cx);
+    }
+
+    /// The account this machine speaks for **right now**, read straight from
+    /// app-core's config.
+    ///
+    /// Deliberately not `ConfigStore`: that snapshot is a *cache* refreshed
+    /// from the bus, and every write here commits to config synchronously and
+    /// then emits `Change::Config`, so between the commit and the next bus
+    /// tick the cached id still names the account that has just been replaced.
+    /// Anything deciding whether a credential-bearing round trip still belongs
+    /// to the configured account has to read past that lag, or it is asking
+    /// the stale copy about the staleness it exists to detect.
+    ///
+    /// `fallback` answers on a stub store, which has no config to read.
+    pub fn account_identity(&self, fallback: Option<&str>) -> Option<String> {
+        match self.app_core.as_ref() {
+            Some(core) => core.config_state().account_id,
+            None => fallback.map(str::to_string),
+        }
+    }
+
+    /// Whether a URL minted while `minted_for` was configured may still be
+    /// opened — that is, whether the configured account is still that one.
+    pub fn mint_is_current(&self, minted_for: Option<&str>, fallback: Option<&str>) -> bool {
+        self.account_identity(fallback).as_deref() == minted_for
+    }
+
+    /// Test-only: put the subscription cell in an arbitrary state, so a
+    /// behavior test or driver scene can render "checking" and "couldn't
+    /// check" without a backend that stalls or fails on cue.
+    #[doc(hidden)]
+    pub fn set_subscription_for_test(
+        &mut self,
+        cell: Loadable<SubscriptionInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        self.subscription = cell;
         cx.notify();
     }
 
@@ -196,6 +306,20 @@ impl AccountStore {
         Some(rx)
     }
 
+    /// Mint a billing-portal session for the click that is about to open it.
+    /// The link is short-lived, so it is asked for at the moment of use
+    /// rather than held from whenever the pane last read — the same shape as
+    /// `request_checkout`. The caller awaits inside its own slot. `None` on a
+    /// stub.
+    pub fn request_portal(&self) -> Option<oneshot::Receiver<Result<String, AppError>>> {
+        let core = self.app_core.clone()?;
+        let (tx, rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let _ = tx.send(core.account_portal().await);
+        });
+        Some(rx)
+    }
+
     /// Fetch balances; the caller (checkout poll) awaits inside its own loop.
     /// `None` on a stub.
     pub fn request_balances(&self) -> Option<oneshot::Receiver<Result<BalancesResult, AppError>>> {
@@ -247,6 +371,7 @@ impl AccountStore {
                         this.account_op_error = None;
                         this.refresh_prices(cx);
                         this.refresh_balances(cx);
+                        this.refresh_subscription(cx);
                     }
                     Err(e) => {
                         // Surface the failure instead of dropping it.
@@ -276,6 +401,10 @@ impl AccountStore {
             Ok(()) => {
                 self.balances = Loadable::NotLoaded;
                 self.balances_task = None;
+                // The subscription belonged to the account whose keys were
+                // just forgotten; keeping it on screen would attribute
+                // someone's subscription to nobody.
+                self.forget_account_scoped_state(cx);
             }
             Err(e) => {
                 self.account_op_error = Some(e);

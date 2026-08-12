@@ -1787,3 +1787,97 @@ fn two_saves_on_one_agent_are_sequenced(cx: &mut TestAppContext) {
     );
     assert_eq!(row.label, "Second", "and the later save is what stands");
 }
+
+/// An identity switch must not leave the previous account's billing standing
+/// on screen — not even briefly, and not as a "stale" value.
+///
+/// Nothing on the bus can invalidate the subscription cell (it is a live
+/// server read that persists nothing), and the Account pane may already be
+/// open on the previous account's answer when the switch happens. A bare
+/// refresh is not enough: `to_loading()` on a `Loaded` cell keeps the value
+/// visible as `Loaded { stale }`, which here is the wrong account's answer
+/// wearing the right account's name.
+#[gpui::test]
+fn an_identity_switch_drops_the_previous_accounts_subscription(cx: &mut TestAppContext) {
+    use eidola_app_core::{SubscriptionInfo, SubscriptionState};
+    use eidola_gui::loadable::Loadable;
+
+    let (stores, _dir) = backed_stores(cx);
+
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            Loadable::loaded(SubscriptionInfo {
+                state: SubscriptionState::Active,
+                status: Some("active".into()),
+                current_period_end: None,
+            }),
+            cx,
+        );
+    });
+    stores.account.read_with(cx, |s, _| {
+        assert!(s.subscription().value().is_some(), "fixture is in place");
+    });
+
+    stores
+        .account
+        .update(cx, |s, cx| s.account_identity_changed(cx));
+
+    stores.account.read_with(cx, |s, _| {
+        assert!(
+            s.subscription().value().is_none(),
+            "the previous account's standing must be gone, not merely stale"
+        );
+        assert!(
+            s.subscription().is_loading(),
+            "and the new account's standing must already be on its way"
+        );
+    });
+}
+
+/// An account operation that *refuses* must leave the cell alone.
+///
+/// Creating and linking both reject outright when credentials already exist,
+/// so a linked reader who opens Get Started and picks "new account" gets a
+/// refusal — and clearing when the request went out blanked an already-open
+/// Account pane's billing section for an operation that never happened, with
+/// no error branch to put it back.
+#[gpui::test]
+fn a_refused_account_operation_leaves_the_subscription_alone(cx: &mut TestAppContext) {
+    use eidola_app_core::{SubscriptionInfo, SubscriptionState};
+    use eidola_gui::loadable::Loadable;
+
+    let (stores, _dir) = backed_stores(cx);
+
+    stores.account.update(cx, |s, cx| {
+        s.set_subscription_for_test(
+            Loadable::loaded(SubscriptionInfo {
+                state: SubscriptionState::Active,
+                status: Some("active".into()),
+                current_period_end: None,
+            }),
+            cx,
+        );
+    });
+
+    // Both doors an onboarding reader can take. Neither may touch the cell:
+    // whether they succeed is decided in app-core, and only the success path
+    // is an identity change.
+    let _create = stores
+        .account
+        .read_with(cx, |s, _| s.request_account_create());
+    let _verify = stores.account.read_with(cx, |s, _| {
+        s.request_verify_account("acct".into(), "secret".into())
+    });
+
+    stores.account.read_with(cx, |s, _| {
+        assert!(
+            matches!(s.subscription(), Loadable::Loaded { .. }),
+            "a request that may be refused must not blank the standing"
+        );
+        assert_eq!(
+            s.subscription().value().map(|v| v.state),
+            Some(SubscriptionState::Active),
+            "and it must be the same standing, untouched"
+        );
+    });
+}

@@ -35,13 +35,54 @@ pub struct GetAccountResponse {
     pub created_at: String,
 }
 
+/// The account's subscription standing.
+///
+/// The `state` field is the answer; the rest is detail that exists only
+/// where it is meaningful. It is deliberately a three-value state rather
+/// than a present/absent subscription, because "this account has never
+/// transacted" and "this account has a payment relationship but no live
+/// subscription" are different situations and lead to different UI.
 #[derive(Serialize, ToSchema)]
 pub struct SubscriptionResponse {
-    pub id: String,
-    pub status: String,
+    /// `none` — the account has never transacted, so it has no payment
+    /// relationship and nothing to manage. That means no Stripe customer
+    /// *or* a customer record with no money ever moved under it, which
+    /// checkout can leave behind when a session is abandoned — a customer
+    /// id alone buys nobody a card, an invoice or a receipt. `inactive` — a
+    /// real payment history, but no subscription in a status Eidola treats
+    /// as in force. `active` — a subscription is in force.
+    ///
+    /// "In force" means Stripe status `active`, `trialing`, or `past_due`
+    /// — the same set the checkout endpoint refuses to double-subscribe
+    /// over, so the two answers cannot disagree.
+    pub state: String,
+    /// The in-force subscription's Stripe id. Present exactly when `state`
+    /// is `active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The in-force subscription's raw Stripe status, so a client can show
+    /// what it actually is (a `past_due` subscription is in force and
+    /// wants attention). Present exactly when `state` is `active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// End of the current billing period, ISO-8601. Present when `state`
+    /// is `active` and Stripe reported one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_period_end: Option<String>,
-    pub management_url: String,
+}
+
+/// A freshly minted Stripe billing-portal session.
+///
+/// Its own endpoint rather than a field on the subscription standing:
+/// minting is a **write** to Stripe and the session expires quickly, so a
+/// link handed out with a status read is one the client cannot responsibly
+/// keep — and every status read was creating a portal session that was then
+/// thrown away.
+#[derive(Serialize, ToSchema)]
+pub struct PortalResponse {
+    /// Open this in a browser now. Short-lived by construction; ask again
+    /// rather than storing it.
+    pub portal_url: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -170,12 +211,21 @@ pub struct LedgerEntry {
     pub credential_credits: Option<i64>,
 }
 
+/// Where Stripe sends a browser when it is done with the user. All three
+/// are real routes on the published site (`www/pages/`), which generates
+/// flat routes only — a nested `/payment/success` would 404. `www.` is the
+/// canonical host the rest of the server already uses
+/// (`TERMS_FEED_BASE_URL`).
+const PAYMENT_COMPLETE_URL: &str = "https://www.eidola.ai/payment-complete/";
+const PAYMENT_CANCELED_URL: &str = "https://www.eidola.ai/payment-canceled/";
+const BILLING_PORTAL_RETURN_URL: &str = "https://www.eidola.ai/billing/";
+
 fn default_success_url() -> String {
-    "https://eidola.ai/payment/success".to_string()
+    PAYMENT_COMPLETE_URL.to_string()
 }
 
 fn default_cancel_url() -> String {
-    "https://eidola.ai/payment/cancel".to_string()
+    PAYMENT_CANCELED_URL.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -381,16 +431,21 @@ pub async fn get_account(
     }))
 }
 
-/// GET /v1/account/subscription — get subscription details (authenticated).
+/// GET /v1/account/subscription — the account's subscription standing
+/// (authenticated).
+///
+/// Always 200 on a reachable Stripe: having no subscription is an answer,
+/// not a failure. The states are distinguished so a client can tell "never
+/// transacted" from "has a payment relationship but nothing in force" —
+/// the second has a billing portal worth offering, the first does not.
 #[utoipa::path(
     get,
     path = "/v1/account/subscription",
     tag = "Linked",
     security(("basic" = [])),
     responses(
-        (status = 200, description = "Subscription details", body = SubscriptionResponse),
+        (status = 200, description = "Subscription standing", body = SubscriptionResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
-        (status = 404, description = "No Stripe customer or no subscription", body = crate::types::ErrorResponse),
         (status = 503, description = "Stripe not configured", body = crate::types::ErrorResponse)
     )
 )]
@@ -401,31 +456,128 @@ pub async fn get_subscription(
     let stripe = require_stripe(&state.stripe)?;
     let account = db::get_account_by_id(&state.db_pool, account_id).await?;
 
-    let customer_id = account
-        .stripe_customer_id
-        .ok_or_else(|| ServerError::NotFound {
-            message: "no_stripe_customer".to_string(),
-        })?;
+    let Some(customer_id) = account.stripe_customer_id else {
+        return Ok(Json(SubscriptionResponse {
+            state: "none".to_string(),
+            id: None,
+            status: None,
+            current_period_end: None,
+        }));
+    };
 
-    let subscriptions = stripe.list_subscriptions(&customer_id).await?;
+    // Nothing but the standing is fetched here. The billing-portal session
+    // this used to mint alongside is its own endpoint now: it was a Stripe
+    // *write* on every status read, discarded unread, whose latency the
+    // answer had to wait for.
+    let in_force = stripe.in_force_subscription(&customer_id).await?;
 
-    let sub = subscriptions
-        .into_iter()
-        .next()
-        .ok_or_else(|| ServerError::NotFound {
-            message: "no_subscription".to_string(),
-        })?;
+    // A Stripe customer record is not a payment relationship, so the ledger
+    // decides whether there is one (see `subscription_standing`). Only asked
+    // when nothing is in force — an in-force subscription is a relationship
+    // by itself, whatever it has been billed yet.
+    let has_payment_history = match in_force {
+        Some(_) => true,
+        None => db::has_stripe_ledger_history(&state.db_pool, account_id).await?,
+    };
 
-    let management_url = stripe
-        .create_portal_session(&customer_id, "https://eidola.ai")
+    Ok(Json(subscription_standing(in_force, has_payment_history)))
+}
+
+/// POST /v1/account/portal — mint a Stripe billing-portal session
+/// (authenticated).
+///
+/// Separate from the subscription read on purpose. Minting is a write to
+/// Stripe and the session expires quickly, so a link that rides a status
+/// response is one no client can responsibly hold — ours already discarded
+/// it and asked again at the moment of the click. Riding along, it made
+/// every status read create-and-throw-away a Stripe session, and put that
+/// write's latency in front of an answer that did not need it.
+///
+/// Refuses for an account with no payment relationship, on the same test
+/// `GET /v1/account/subscription` calls `none`: a portal minted for someone
+/// money has never moved for is a door onto an empty room.
+#[utoipa::path(
+    post,
+    path = "/v1/account/portal",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 200, description = "A billing-portal session", body = PortalResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 404, description = "No payment relationship to manage", body = crate::types::ErrorResponse),
+        (status = 503, description = "Stripe not configured", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn create_portal_session(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+) -> Result<Json<PortalResponse>, ServerError> {
+    let stripe = require_stripe(&state.stripe)?;
+    let account = db::get_account_by_id(&state.db_pool, account_id).await?;
+
+    let no_portal = || ServerError::NotFound {
+        message: "no_payment_relationship".to_string(),
+    };
+
+    let customer_id = account.stripe_customer_id.ok_or_else(no_portal)?;
+
+    // Same predicate as the `none` state, so the app is never offered a door
+    // the server then refuses — but asked local-first. A ledger row already
+    // settles the question, and evaluating the subscription walk ahead of it
+    // put a Stripe round trip in front of an answer we hold: every returning
+    // customer paid for it, and a slow or failing `/subscriptions` withheld
+    // their billing portal while the portal itself was perfectly healthy.
+    // Stripe is consulted only for the customer the ledger cannot vouch for
+    // — an unbilled trial.
+    let entitled = db::has_stripe_ledger_history(&state.db_pool, account_id).await?
+        || stripe.in_force_subscription(&customer_id).await?.is_some();
+    if !entitled {
+        return Err(no_portal());
+    }
+
+    let portal_url = stripe
+        .create_portal_session(&customer_id, BILLING_PORTAL_RETURN_URL)
         .await?;
 
-    Ok(Json(SubscriptionResponse {
-        id: sub.id,
-        status: sub.status,
-        current_period_end: sub.current_period_end.map(unix_to_iso),
-        management_url,
-    }))
+    Ok(Json(PortalResponse { portal_url }))
+}
+
+/// Turn what Stripe and the ledger said into the account's standing.
+///
+/// Split out from the handler because of the property worth pinning:
+/// **a customer record is not a payment history.** `create_checkout`
+/// persists the Stripe customer *before* it validates the price or the
+/// reader finishes paying, so a rejected request or an abandoned first
+/// checkout leaves a customer id with nothing under it. Calling that
+/// `inactive` points the reader at a billing portal holding no card, no
+/// invoice and no receipt — so `none` keeps the meaning it always
+/// documented ("has never transacted") by being decided on money that
+/// actually moved.
+fn subscription_standing(
+    in_force: Option<crate::stripe::Subscription>,
+    has_payment_history: bool,
+) -> SubscriptionResponse {
+    let Some(sub) = in_force else {
+        let state = if has_payment_history {
+            "inactive"
+        } else {
+            "none"
+        };
+        return SubscriptionResponse {
+            state: state.to_string(),
+            id: None,
+            status: None,
+            current_period_end: None,
+        };
+    };
+
+    let current_period_end = sub.current_period_end().map(unix_to_iso);
+    SubscriptionResponse {
+        state: "active".to_string(),
+        id: Some(sub.id),
+        status: Some(sub.status),
+        current_period_end,
+    }
 }
 
 /// GET /v1/prices — list available prices.
@@ -513,16 +665,24 @@ pub async fn create_checkout(
         });
     }
 
-    let customer_id = ensure_stripe_customer(&state.db_pool, stripe, account_id).await?;
-
+    // Price first, customer second. Creating the customer is a durable act
+    // — it persists `stripe_customer_id` — and a rejected price left one
+    // behind with nothing under it, which is the residue `none` now has to
+    // detect through the ledger. Validating first means a refused request
+    // writes nothing at all. (It does not remove the need for that ledger
+    // test: an *abandoned* checkout still leaves a customer behind, and
+    // nothing server-side hears about it.)
     let price = stripe.get_price(&checkout_req.price_id).await?;
 
+    let customer_id = ensure_stripe_customer(&state.db_pool, stripe, account_id).await?;
+
     let mode = if price.recurring.is_some() {
-        let subs = stripe.list_subscriptions(&customer_id).await?;
-        if subs
-            .iter()
-            .any(|s| s.status == "active" || s.status == "past_due" || s.status == "trialing")
-        {
+        // Literally the same question `GET /v1/account/subscription` asks —
+        // one call, one predicate, one walk of the whole list — so a client
+        // shown "no subscription" is never refused here, and a customer whose
+        // in-force subscription sits behind a page of newer attempts can
+        // never be sold a second one.
+        if stripe.in_force_subscription(&customer_id).await?.is_some() {
             return Err(ServerError::Conflict {
                 message: "account already has an active subscription".to_string(),
             });
@@ -540,15 +700,15 @@ pub async fn create_checkout(
     let (submit_note, description) = if mode == "subscription" {
         (
             "Credits granted each billing period expire at the end of that period. \
-             Unused, unexpired credits are refundable on request. Details: eidola.ai/terms",
+             Unused, unexpired credits are refundable on request. Details: www.eidola.ai/terms",
             "Eidola subscription — each period's credits expire at the end of that \
-             billing period (see eidola.ai/terms)",
+             billing period (see www.eidola.ai/terms)",
         )
     } else {
         (
             "Credits expire one year after purchase. Unused, unexpired credits are \
-             refundable on request. Details: eidola.ai/terms",
-            "Eidola credits — expire one year after purchase (see eidola.ai/terms)",
+             refundable on request. Details: www.eidola.ai/terms",
+            "Eidola credits — expire one year after purchase (see www.eidola.ai/terms)",
         )
     };
 
@@ -671,6 +831,120 @@ pub async fn get_ledger(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stripe::{Subscription, SubscriptionItem, SubscriptionItems};
+
+    /// One handler's source, from its signature to the next item at column
+    /// zero. The seam the two ordering/absence scans below share.
+    fn handler_body(signature: &str) -> &'static str {
+        let source = include_str!("account.rs");
+        let start = source.find(signature).expect("the handler");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        &body[..end]
+    }
+
+    fn in_force_sub(period_end: i64) -> Subscription {
+        Subscription {
+            id: "sub_1".to_string(),
+            status: "active".to_string(),
+            items: SubscriptionItems {
+                data: vec![SubscriptionItem {
+                    current_period_end: period_end,
+                }],
+            },
+        }
+    }
+
+    /// The subscription read must not mint a billing-portal session.
+    ///
+    /// This seam came back three times. Coupling the two calls with
+    /// `try_join!` made a failed portal mint destroy the answer; `join!`
+    /// fixed the error path and left the **latency** — both futures are
+    /// still awaited, so a slow (not failing) mint holds the standing, and
+    /// for that whole time the Account pane shows "unknown" and offers
+    /// recurring plans to a live subscriber. Only removing the call makes
+    /// the standing independent of the portal.
+    ///
+    /// A source scan because there is no other seam: the handler needs a
+    /// database, and what is being asserted is the *absence* of a call.
+    #[test]
+    fn the_subscription_read_mints_no_portal_session() {
+        let body = handler_body("pub async fn get_subscription(");
+        assert!(
+            !body.contains("create_portal_session"),
+            "get_subscription must not mint a portal session — minting is a \
+             Stripe write whose latency the standing would then wait on; it \
+             lives at POST /v1/account/portal"
+        );
+        assert!(
+            body.contains("in_force_subscription"),
+            "sanity: the scan found the right function body"
+        );
+    }
+
+    /// The portal must not put a Stripe round trip in front of an answer the
+    /// ledger already holds.
+    ///
+    /// `||` short-circuits left to right, so the *order* of the two operands
+    /// is the whole behavior: with the subscription walk first, every
+    /// returning customer paid for a remote call whose result could not
+    /// change the outcome, and a slow or failing `/subscriptions` withheld
+    /// their billing portal while the portal itself was healthy.
+    ///
+    /// A source scan for the same reason as the sibling below: the handler
+    /// needs a database, and what is asserted is an ordering, not a value.
+    #[test]
+    fn the_portal_asks_the_ledger_before_it_asks_stripe() {
+        let body = handler_body("pub async fn create_portal_session(");
+        let ledger = body
+            .find("has_stripe_ledger_history")
+            .expect("the ledger check");
+        let stripe = body
+            .find("in_force_subscription")
+            .expect("the subscription walk");
+        assert!(
+            ledger < stripe,
+            "the local answer must be evaluated first — `||` short-circuits, \
+             so putting the walk first spends a Stripe round trip on every \
+             customer whose ledger already settles it"
+        );
+    }
+
+    #[test]
+    fn the_standing_carries_the_subscription_and_nothing_else() {
+        let answer = subscription_standing(Some(in_force_sub(1_900_000_000)), true);
+        assert_eq!(answer.state, "active");
+        assert_eq!(answer.status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn the_billing_period_reaches_the_wire_from_the_subscriptions_items() {
+        let answer = subscription_standing(Some(in_force_sub(0)), true);
+        assert_eq!(
+            answer.current_period_end.as_deref(),
+            Some("1970-01-01T00:00:00Z"),
+            "the period must survive the trip from items.data onto the wire"
+        );
+    }
+
+    #[test]
+    fn a_customer_record_with_no_money_behind_it_is_not_a_relationship() {
+        // Checkout persists the customer before validating the price or
+        // taking payment, so an abandoned session leaves one with nothing
+        // under it. "Billing and receipts" for that reader is a door onto an
+        // empty room.
+        let answer = subscription_standing(None, false);
+        assert_eq!(answer.state, "none");
+    }
+
+    #[test]
+    fn a_real_payment_history_reads_as_lapsed_rather_than_absent() {
+        let answer = subscription_standing(None, true);
+        assert_eq!(answer.state, "inactive");
+    }
 
     fn doc(document: &str, version: i64) -> db::RequiredDocumentRow {
         db::RequiredDocumentRow {

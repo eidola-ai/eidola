@@ -73,6 +73,11 @@ impl SettingsPane {
 
 pub struct SettingsView {
     selected: SettingsPane,
+    /// The pane whose `pane_activated` hook has already run for the current
+    /// visit. All six panes are built at *window* creation, so construction
+    /// is not activation; this is what tells the two apart. See
+    /// `sync_active_pane`.
+    activated: Option<SettingsPane>,
     general: Entity<GeneralView>,
     backends: Entity<BackendsSettingsView>,
     templates: Entity<TemplatesSettingsView>,
@@ -106,9 +111,11 @@ impl SettingsView {
 
         // Observe the registry: an eidola enable/disable flip both re-renders
         // the nav (visibility) and reconciles a now-hidden selection back to
-        // Backends (see `effective_selected`).
+        // Backends (see `effective_selected`) — which is a pane change like
+        // any other, so it runs the activation hook too.
         cx.observe(&backends_store, |this, _, cx| {
             this.selected = this.effective_selected(cx);
+            this.sync_active_pane(cx);
             cx.notify();
         })
         .detach();
@@ -116,8 +123,9 @@ impl SettingsView {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
-        Self {
+        let mut this = Self {
             selected: SettingsPane::General,
+            activated: None,
             general,
             backends,
             templates,
@@ -127,6 +135,36 @@ impl SettingsView {
             backends_store,
             focus_handle,
             body_scroll: ScrollHandle::new(),
+        };
+        this.sync_active_pane(cx);
+        this
+    }
+
+    /// Run the shown pane's activation hook when the shown pane changes.
+    ///
+    /// **Construction is not activation.** All six panes are built in
+    /// `new`, at *window* creation, so a pane's constructor runs once for a
+    /// reader who may never select it — and never again for one who selects
+    /// it, leaves, and comes back. A pane whose data no `Change` can
+    /// invalidate (see `AccountView`) therefore has no other moment to ask.
+    ///
+    /// Called from every place the *shown* pane can change and nowhere else:
+    /// `new`, `select`, and the registry observer (the two inputs to
+    /// `effective_selected`). Panes not listed here need nothing — their
+    /// stores are refreshed by the invalidation bus.
+    fn sync_active_pane(&mut self, cx: &mut Context<Self>) {
+        let pane = self.effective_selected(cx);
+        if self.activated == Some(pane) {
+            return;
+        }
+        self.activated = Some(pane);
+        match pane {
+            SettingsPane::Account => self.account.update(cx, |v, cx| v.pane_activated(cx)),
+            SettingsPane::General
+            | SettingsPane::Backends
+            | SettingsPane::Templates
+            | SettingsPane::Agents
+            | SettingsPane::Wallet => {}
         }
     }
 
@@ -181,6 +219,7 @@ impl SettingsView {
     pub fn select(&mut self, pane: SettingsPane, cx: &mut Context<Self>) {
         if self.selected != pane {
             self.selected = pane;
+            self.sync_active_pane(cx);
             cx.notify();
         }
     }
