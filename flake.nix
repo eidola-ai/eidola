@@ -468,7 +468,7 @@
 
         # Statically-linked llama.cpp `llama-server`, shipped as the `local`
         # backend's on-device inference engine sidecar. Bundled inside the
-        # macOS .app (Contents/Resources/bin), next to the CLI binary, and in
+        # macOS .app (Contents/MacOS), next to the CLI binary, and in
         # the Linux GUI closure (exposed via EIDOLA_LLAMA_SERVER by the
         # wrapper). App-core resolves the engine without ever scanning $PATH,
         # so no system llama.cpp install is required.
@@ -738,8 +738,13 @@ with open(path, "wb") as f:
                   "$APP/Contents/Resources/AppIcon.icns"
                 chmod -w "$APP/Contents/Resources/AppIcon.icns"
 
-                # Bundle the on-device inference engine sidecar. app-core
-                # resolves …/Contents/MacOS/<x> → ../Resources/bin/llama-server.
+                # Bundle the on-device inference engine sidecar next to the
+                # main binary. app-core's rule is one line on every platform:
+                # a `llama-server` sibling of the running executable — and
+                # inside a bundle the executable's sibling is Contents/MacOS.
+                # Contents/MacOS is also where Apple expects a bundled
+                # executable to live, which is what keeps the signed bundle
+                # (task 55) and notarization straightforward.
                 #
                 # Deliberately arm64-only inside the universal app: the sidecar
                 # comes from the aarch64-darwin llamaServer derivation and is
@@ -756,9 +761,8 @@ with open(path, "wb") as f:
                 # autoSignDarwinBinariesHook's postFixup walks every Mach-O in
                 # $out, so this sidecar is (re-)signed with the same deterministic
                 # ad-hoc signature as the main binary; no explicit sign call.
-                mkdir -p "$APP/Contents/Resources/bin"
-                cp ${llamaServer}/bin/llama-server "$APP/Contents/Resources/bin/llama-server"
-                chmod u+w "$APP/Contents/Resources/bin/llama-server"
+                cp ${llamaServer}/bin/llama-server "$APP/Contents/MacOS/llama-server"
+                chmod u+w "$APP/Contents/MacOS/llama-server"
               '';
 
               installPhase = ''
