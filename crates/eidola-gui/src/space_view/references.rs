@@ -1509,7 +1509,7 @@ impl SpaceView {
             .map(|(idx, r)| FootnoteRow {
                 index: idx + 1,
                 ordinal: r.ordinal,
-                byline: self.reference_byline(r),
+                byline: self.reference_byline(r, cx),
                 body: match (r.snippet.as_deref(), r.range_start) {
                     (Some(s), _) => FootnoteBody::Quote(footnote_snippet(s).into()),
                     (None, Some(_)) => FootnoteBody::Unresolvable,
@@ -1859,12 +1859,32 @@ impl SpaceView {
     /// durability boundary, one layer down from the bug this repairs (Codex
     /// review, PR #292).
     ///
+    /// **And the gutter's rendering is two passes, so this is too.** An agent's
+    /// resolved byline is handed on to [`SpaceView::model_display`] exactly as
+    /// [`SpaceView::rebuild`] hands an assistant row's — the *same function*,
+    /// not a second rule — because a participant label that parses as a model
+    /// selector renders as the model's display name in the gutter and the
+    /// draft rail (both come from `PostData::byline`) while the carried label
+    /// is the raw selector. Nothing *mints* such a label
+    /// (`db::default_agent_label` strips the `@backend` suffix and title-cases;
+    /// every other insert site takes a user-typed name), but a reader may type
+    /// one, and then the attribution changed at the durability boundary again —
+    /// "Gemma 4 E4B" while composing, `gemma-4-E4B_q4_0-it@local` once
+    /// persisted (Codex review, PR #292). For an ordinary name the pass is
+    /// identity, which is why it can be applied unconditionally to the kind
+    /// rather than guessed at per label. The kind is the rail's reading of the
+    /// gutter's `role == "assistant"`: an agent authors inferences.
+    ///
     /// **`ELSEWHERE` only when nothing names anyone.** A per-space override of
     /// `''` is "override to empty" under the schema's NULL-inherits rule, so an
     /// effective label really can be blank — and where the kind supplies no
     /// fallback either, a blank byline would be a row indented past a gap that
     /// says nothing.
-    fn reference_byline(&self, reference: &eidola_app_core::PostReference) -> SharedString {
+    fn reference_byline(
+        &self,
+        reference: &eidola_app_core::PostReference,
+        cx: &gpui::App,
+    ) -> SharedString {
         self.posts
             .iter()
             .find(|p| p.action_id.as_deref() == Some(reference.antecedent_action_id.as_str()))
@@ -1875,7 +1895,13 @@ impl SpaceView {
                     &reference.antecedent_author_kind,
                     &reference.antecedent_author_label,
                 )
-                .map(SharedString::from)
+                .map(|byline| {
+                    if reference.antecedent_author_kind == "agent" {
+                        self.model_display(&byline, cx).0
+                    } else {
+                        SharedString::from(byline)
+                    }
+                })
             })
             .unwrap_or_else(|| SharedString::from(ELSEWHERE))
     }

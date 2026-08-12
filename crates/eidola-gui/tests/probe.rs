@@ -4160,6 +4160,77 @@ fn space_footnote_rail_names_a_cross_space_author(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// REGRESSION (Codex review, PR #292, round 2): the rail's cross-space
+/// fallback renders the carried identity through the gutter's **whole**
+/// rendering, not only its first pass.
+///
+/// The gutter is two passes — `byline_for_participant` resolves the identity
+/// pair, then an assistant row's byline is resolved *again* through
+/// `SpaceView::model_display` — and both the post gutter and the **draft** rail
+/// read the same `PostData::byline`, so both already show the second pass. A
+/// participant label that parses as a model selector therefore composed as
+/// "Gemma 4 E4B" and persisted as `gemma-4-E4B_q4_0-it@local`: the attribution
+/// changing at the durability boundary, which is the defect this whole PR is
+/// about, one layer down. Nothing mints such a label — `db::default_agent_label`
+/// strips the `@backend` suffix and title-cases — but a reader can type one.
+#[gpui::test]
+fn space_footnote_rail_names_a_cross_space_author_the_way_the_gutter_would(
+    cx: &mut TestAppContext,
+) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.local_models = Some(eidola_app_core::LocalModelsState {
+            engine_path: Some("/opt/eidola/llama-server".into()),
+            external: Vec::new(),
+            models: vec![eidola_app_core::LocalModelInfo {
+                id: "gemma-4-E4B_q4_0-it@local".into(),
+                slug: "gemma-4-E4B_q4_0-it".into(),
+                display_name: "Gemma 4 E4B".into(),
+                file_name: "gemma-4-E4B_q4_0-it.gguf".into(),
+                size_bytes: Some(5_154_939_136),
+                source_url: None,
+                status: eidola_app_core::LocalModelStatus::Available,
+                last_error: None,
+                on_disk: true,
+            }],
+        });
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // A passage quoted out of a conversation this window never loaded, whose
+    // author a reader named after the model it answers with.
+    let mut post = probe_post("a1", "the post that carries the quote");
+    post.references = vec![eidola_app_core::PostReference {
+        antecedent_action_id: "x1".into(),
+        ordinal: 1,
+        content_block_id: Some("bx".into()),
+        range_start: Some(0),
+        range_end: Some(4),
+        annotation: None,
+        snippet: Some("a passage from another conversation".into()),
+        antecedent_author_label: "gemma-4-E4B_q4_0-it@local".into(),
+        antecedent_author_kind: "agent".into(),
+    }];
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/footnote/1",
+        gpui::Role::Link,
+        "Reference 1: Gemma 4 E4B — a passage from another conversation",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 /// REGRESSION (Codex review, PR #292): a participant label has no maximum
 /// length and the rail's byline sits `flex_none` beside the passage, so a long
 /// one could squeeze the quoted text out of the row it is there to attribute.

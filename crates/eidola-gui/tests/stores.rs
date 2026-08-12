@@ -1842,6 +1842,113 @@ fn a_participants_change_re_reads_a_live_transcript(cx: &mut TestAppContext) {
     });
 }
 
+/// REGRESSION (Codex review, PR #292, round 2): the **lagged** recovery reaches
+/// the live conversations, not just the Library index.
+///
+/// `refresh_everything` is the doctrine's answer to a dropped change — we no
+/// longer know what we missed, so re-read everything. But `SpacesStore::refresh`
+/// re-reads the *index*; the transcripts belong to the registered `Space`
+/// entities, and nothing told them anything. So a lag that swallowed a rename
+/// left every already-open window naming its authors as it did when it loaded —
+/// post gutters, minimap labels and footnote rails alike — indefinitely, while
+/// the recovery claimed to have refreshed all state.
+#[gpui::test]
+fn a_lagged_bus_re_reads_a_live_transcript(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+
+    let byline = |cx: &mut TestAppContext| {
+        space.read_with(cx, |s, _| s.messages().first().map(|m| m.byline.clone()))
+    };
+    wait_until(cx, "the transcript loads", |cx| byline(cx).is_some());
+    assert_eq!(byline(cx).as_deref(), Some("You"));
+
+    core.runtime()
+        .block_on(core.set_space_participant_override(
+            posted.space_id.clone(),
+            eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            eidola_app_core::ParticipantOverride {
+                label: Some(Some("Skipper".into())),
+                model_ref: None,
+                system_prompt: None,
+                notify_policy: None,
+            },
+        ))
+        .expect("override");
+
+    // The bus dropped it: no `Change` names what changed, only that something
+    // did (`dispatch_change_for_test(None)` is `Lagged`).
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, None, cx));
+    wait_until(cx, "the lagged recovery re-reads the transcript", |cx| {
+        byline(cx).as_deref() == Some("Skipper")
+    });
+}
+
+/// REGRESSION (Codex review, PR #292, round 2): a participant change arriving
+/// while a space is posting or streaming is **deferred, not discarded**.
+///
+/// The operation's own exit reload is not synchronization: `get_space_tree` is
+/// several reads, so a rename committing while they run is captured by none of
+/// them — and the event announcing it was dropped on the busy gate, leaving
+/// nothing to correct the stale names afterwards. The invalidation is now
+/// recorded and replayed once the last mutation or turn settles.
+#[gpui::test]
+fn a_participants_change_arriving_mid_operation_is_replayed(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+
+    let byline = |cx: &mut TestAppContext| {
+        space.read_with(cx, |s, _| s.messages().first().map(|m| m.byline.clone()))
+    };
+    wait_until(cx, "the transcript loads", |cx| byline(cx).is_some());
+    assert_eq!(byline(cx).as_deref(), Some("You"));
+
+    // A mutation owns the transcript's truth.
+    space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+
+    core.runtime()
+        .block_on(core.set_space_participant_override(
+            posted.space_id.clone(),
+            eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            eidola_app_core::ParticipantOverride {
+                label: Some(Some("Skipper".into())),
+                model_ref: None,
+                system_prompt: None,
+                notify_policy: None,
+            },
+        ))
+        .expect("override");
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+    cx.run_until_parked();
+    assert_eq!(
+        byline(cx).as_deref(),
+        Some("You"),
+        "the busy gate still holds the reload off while the operation runs"
+    );
+
+    // The operation settles — and the debt it deferred is discharged.
+    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    wait_until(cx, "the deferred invalidation is replayed", |cx| {
+        byline(cx).as_deref() == Some("Skipper")
+    });
+}
+
 /// An identity switch must not leave the previous account's billing standing
 /// on screen — not even briefly, and not as a "stale" value.
 ///
