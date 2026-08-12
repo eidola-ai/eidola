@@ -813,21 +813,16 @@ fn prettify_stem(stem: &str) -> String {
 /// Candidate locations for the **bundled** `local` engine, exe-relative, in
 /// probe order. Pure over the executable path so it's unit-testable.
 ///
-/// - macOS `.app`: the main binary sits at `…/Contents/MacOS/<x>`; the
-///   sidecar is shipped at `…/Contents/Resources/bin/llama-server`.
-/// - Otherwise (CLI Nix output, `target/debug` dev builds): a `llama-server`
-///   sibling next to the executable.
+/// **One rule on every platform: a `llama-server` sibling of the running
+/// executable.** That covers the CLI's Nix output, `target/debug` dev
+/// builds, *and* the macOS `.app` — whose sidecar ships at
+/// `…/Contents/MacOS/llama-server`, next to the main binary. app-core
+/// therefore knows nothing about `.app` internals; the bundle layout is
+/// owned by `flake.nix` and `scripts/package-gui-app.sh`.
 fn bundled_engine_candidates(exe: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(dir) = exe.parent() {
-        if dir.file_name() == Some(std::ffi::OsStr::new("MacOS"))
-            && let Some(contents) = dir.parent()
-        {
-            candidates.push(contents.join("Resources").join("bin").join("llama-server"));
-        }
-        candidates.push(dir.join("llama-server"));
-    }
-    candidates
+    exe.parent()
+        .map(|dir| vec![dir.join("llama-server")])
+        .unwrap_or_default()
 }
 
 /// Resolve the **`local`** (bundled) engine, in order: the config override
@@ -2365,18 +2360,46 @@ mod tests {
                 == Path::new("/env/llama-server")),
             Some(PathBuf::from("/env/llama-server"))
         );
-        // Env missing → macOS .app sidecar under Contents/Resources/bin.
-        let sidecar = PathBuf::from("/app/Contents/Resources/bin/llama-server");
+        // Env missing → the macOS .app sidecar, a sibling of the main binary
+        // inside Contents/MacOS.
+        let sidecar = PathBuf::from("/app/Contents/MacOS/llama-server");
         assert_eq!(
             resolve_local_engine_path(None, Some("/env/missing"), Some(&exe), &|p| p == sidecar),
             Some(sidecar)
         );
-        // CLI/dev layout: a sibling next to the exe.
+        // CLI/dev layout: a sibling next to the exe — the same rule.
         let cli_exe = PathBuf::from("/nix/store/x/bin/eidola");
         let sibling = PathBuf::from("/nix/store/x/bin/llama-server");
         assert_eq!(
             resolve_local_engine_path(None, None, Some(&cli_exe), &|p| p == sibling),
             Some(sibling)
+        );
+    }
+
+    #[test]
+    fn the_bundled_engine_rule_is_a_sibling_and_nothing_else() {
+        // The sidecar moved from Contents/Resources/bin into Contents/MacOS
+        // (task 55: Apple expects a bundle's executables there, and it makes
+        // the resolver one rule on every platform). The old location must be
+        // gone, not merely deprioritized — a stale candidate would keep a
+        // half-migrated bundle silently working and let the two layouts drift.
+        let exe = PathBuf::from("/app/Contents/MacOS/Eidola");
+        assert_eq!(
+            bundled_engine_candidates(&exe),
+            vec![PathBuf::from("/app/Contents/MacOS/llama-server")],
+            "the bundle case is covered by the sibling rule alone"
+        );
+        assert!(
+            !bundled_engine_candidates(&exe)
+                .iter()
+                .any(|c| c.starts_with("/app/Contents/Resources")),
+            "no candidate may live under Contents/Resources"
+        );
+        // And a `.app`-shaped path gets no more candidates than any other.
+        assert_eq!(
+            bundled_engine_candidates(&exe).len(),
+            bundled_engine_candidates(Path::new("/nix/store/x/bin/eidola")).len(),
+            "macOS must not carry an extra bundle-layout candidate"
         );
     }
 

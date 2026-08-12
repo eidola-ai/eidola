@@ -134,7 +134,7 @@ Models on a configured backend are addressed as `<model>@<backend-id>`. Because 
 
 ### GUI
 
-Build, run, and test the gpui-based desktop app (macOS, or Linux under Wayland) from the command line:
+Build, run, and test the gpui-based desktop app (macOS 13 Ventura or later, or Linux under Wayland) from the command line:
 
 ```bash
 just build gui      # cargo build + package Eidola.app (on macOS)
@@ -144,7 +144,7 @@ just test           # cargo test
 
 On macOS, `just build gui` produces `crates/eidola-gui/build/Eidola.app`; on Linux, `just run gui` runs the binary directly (the Linux GUI is Wayland-only). See `crates/eidola-gui/AGENTS.md` for the architecture details.
 
-The `local` on-device backend runs a bundled, statically-linked llama.cpp `llama-server` — release desktop artifacts ship it, so no system llama.cpp install is needed. For dev, `just engine` (Nix) materializes the sidecar and `just build gui` copies it into the dev `Eidola.app`; without it the GUI's Local tab shows an honest missing-engine state (or point `llama_server_path` at your own build).
+The `local` on-device backend runs a bundled, statically-linked llama.cpp `llama-server` — release desktop artifacts ship it, so no system llama.cpp install is needed. For dev, `just engine` (Nix) materializes the sidecar and `just build gui` copies it into the dev `Eidola.app` at `Contents/MacOS/llama-server` — beside the main binary, the same place the release bundle puts it, since the engine is resolved as a sibling of the running executable. Without it the GUI's Local tab shows an honest missing-engine state (or point `llama_server_path` at your own build).
 
 ### Website
 
