@@ -374,10 +374,10 @@ def main():
 
         print("linux")
         icons = os.path.join(ROOT, "releases/linux/icons/hicolor")
-        scalable = os.path.join(icons, "scalable/apps/tech.m6i.Eidola.svg")
+        scalable = os.path.join(icons, "scalable/apps/ai.eidola.app.svg")
         write(scalable, masters["app-icon.svg"])
         for size in LINUX_PNG_SIZES:
-            out = os.path.join(icons, f"{size}x{size}/apps/tech.m6i.Eidola.png")
+            out = os.path.join(icons, f"{size}x{size}/apps/ai.eidola.app.png")
             os.makedirs(os.path.dirname(out), exist_ok=True)
             raster.png(os.path.join(HERE, "app-icon.svg"), out, size)
             print("  ", os.path.relpath(out, ROOT))
