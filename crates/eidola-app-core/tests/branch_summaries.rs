@@ -244,12 +244,21 @@ fn branch_tail_action(core: &AppCore, space: &str, text: &str) -> String {
 }
 
 /// The trailing map of the most recent turn request.
+/// The `<thread-map>` block of the last request's trailing message.
+///
+/// The trailing block also carries the task-64 roster ahead of the map — pinned
+/// in `chat_path` and `participants_orchestration`, where it is the subject.
+/// Here the map is, so this trims to it.
 fn last_map(mock: &MockServer) -> String {
-    flat_messages(mock.chat_bodies().last().expect("a request"))
+    let trailing = flat_messages(mock.chat_bodies().last().expect("a request"))
         .last()
         .expect("a message")
         .1
-        .clone()
+        .clone();
+    let at = trailing
+        .find("<thread-map>")
+        .expect("a map in the trailing block");
+    trailing[at..].to_string()
 }
 
 // ===========================================================================

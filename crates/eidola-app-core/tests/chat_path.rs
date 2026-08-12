@@ -25,8 +25,8 @@ mod chat_harness;
 
 use chat_harness::{
     ChatBehavior, DEFAULT_AGENT_LABEL, HUMAN_LABEL, MODEL, MockConfig, MockServer, RefundMode,
-    THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, flat_messages, headed, map_entry, system_message,
-    system_message_with, thread_map, with_account,
+    Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, flat_messages, map_entry, roster,
+    system_message, system_message_with, thread_map, trailing, with_account,
 };
 use eidola_app_core::changes::Change;
 use eidola_app_core::error::AppError;
@@ -156,13 +156,13 @@ fn blocking_chat_persists_and_emits() {
         assert_eq!(
             participants.len(),
             2,
-            "You + one agent; got {participants:?}"
+            "the shared human + one agent; got {participants:?}"
         );
         let human = participants
             .iter()
             .find(|p| p.kind == "human")
             .expect("human participant");
-        assert_eq!(human.label, "You");
+        assert_eq!(human.label, "User");
         let agent = participants
             .iter()
             .find(|p| p.kind == "agent")
@@ -180,7 +180,7 @@ fn blocking_chat_persists_and_emits() {
             .find(|n| n.action_type == "user_input")
             .expect("user post");
         assert_eq!(user_post.participant.kind, "human");
-        assert_eq!(user_post.participant.label, "You");
+        assert_eq!(user_post.participant.label, "User");
         let inference = tree
             .iter()
             .find(|n| n.action_type == "inference")
@@ -601,6 +601,10 @@ fn regenerate_sends_only_upstream_context_at_current_versions() {
         assert_eq!(tree[1].action_type, "inference");
         let i1 = tree[1].action_id.clone();
 
+        // The header stamp names the post's *current generation*, so the
+        // pre-edit bytes need the pre-edit snapshot.
+        let before = Stamps::of(&core, &first.space_id);
+
         // Edit the upstream question, then regenerate the FIRST answer.
         core.runtime()
             .block_on(core.edit_post(u1, "How do tides work? Explain it for a sailor.".into()))
@@ -614,6 +618,7 @@ fn regenerate_sends_only_upstream_context_at_current_versions() {
         // downstream turn (u2/i2) or its own prior output (i1). Rendered bytes
         // are pinned: system prompt + protocol note, then the edited post under
         // its human author's header.
+        let after = Stamps::of(&core, &first.space_id);
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 3, "two chats + one regenerate");
         assert_eq!(
@@ -621,11 +626,11 @@ fn regenerate_sends_only_upstream_context_at_current_versions() {
             vec![
                 (
                     "system".to_string(),
-                    system_message(Some(SEEDED_SYSTEM_PROMPT))
+                    system_message(Some(SEEDED_SYSTEM_PROMPT), DEFAULT_AGENT_LABEL)
                 ),
                 (
                     "user".to_string(),
-                    headed(
+                    after.headed(
                         &u1_item,
                         HUMAN_LABEL,
                         "How do tides work? Explain it for a sailor."
@@ -636,10 +641,13 @@ fn regenerate_sends_only_upstream_context_at_current_versions() {
         );
 
         // The handle is derived from the ITEM id, so the edit did not change
-        // it: the bytes the model already read keep naming the same post.
+        // it: the bytes the model already read keep naming the same post. The
+        // *stamp* does move, because an edit is a new generation and the stamp
+        // dates the text it heads — the honest answer, and still byte-stable:
+        // it moves only when the body it heads moves anyway.
         assert_eq!(
             flat_messages(&bodies[0])[1].1,
-            headed(&u1_item, HUMAN_LABEL, "How do tides work?"),
+            before.headed(&u1_item, HUMAN_LABEL, "How do tides work?"),
             "the pre-edit rendering carries the same handle"
         );
 
@@ -750,9 +758,10 @@ fn upstream_context_expands_embed_markers_into_quotes() {
             "#{} · {HUMAN_LABEL}",
             eidola_app_core::post_handle(&source.item_id)
         );
+        let stamps = Stamps::of(&core, &posted.space_id);
         assert_eq!(
             contents[2],
-            headed(
+            stamps.headed(
                 &posted.item_id,
                 HUMAN_LABEL,
                 &format!(
@@ -831,9 +840,10 @@ fn a_reference_whose_marker_an_edit_removed_still_reaches_the_model() {
 
         let bodies = mock.chat_bodies();
         let last = flat_messages(&bodies[0]).pop().expect("the edited post");
+        let stamps = Stamps::of(&core, &edited.space_id);
         assert_eq!(
             last.1,
-            headed(
+            stamps.headed(
                 &edited.item_id,
                 HUMAN_LABEL,
                 &format!(
@@ -898,9 +908,10 @@ fn a_reference_that_names_no_range_reads_as_a_backlink_not_a_broken_quote() {
         let last = flat_messages(&mock.chat_bodies()[0])
             .pop()
             .expect("the quoting post");
+        let stamps = Stamps::of(&core, &posted.space_id);
         assert_eq!(
             last.1,
-            headed(
+            stamps.headed(
                 &posted.item_id,
                 HUMAN_LABEL,
                 &format!(
@@ -1148,6 +1159,7 @@ fn branch_reply_sends_only_its_branch_context() {
         // the whole point — the model learns the branch exists without its
         // bytes entering the trunk.
         let u2_item = item_id_of(&core, &first.space_id, "And why two per day?");
+        let stamps = Stamps::of(&core, &first.space_id);
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 3, "two spine turns + one branch reply");
         assert_eq!(
@@ -1157,40 +1169,47 @@ fn branch_reply_sends_only_its_branch_context() {
                     "system".to_string(),
                     system_message_with(
                         Some(SEEDED_SYSTEM_PROMPT),
+                        DEFAULT_AGENT_LABEL,
                         &[THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE]
                     )
                 ),
                 (
                     "user".to_string(),
-                    headed(&u1_item, HUMAN_LABEL, "How do tides work?")
+                    stamps.headed(&u1_item, HUMAN_LABEL, "How do tides work?")
                 ),
                 (
                     "assistant".to_string(),
-                    headed(&i1_item, DEFAULT_AGENT_LABEL, "Hello from the stream.")
+                    stamps.headed(&i1_item, DEFAULT_AGENT_LABEL, "Hello from the stream.")
                 ),
                 (
                     "user".to_string(),
-                    headed(&branch_item, HUMAN_LABEL, "What about spring tides?")
+                    stamps.headed(&branch_item, HUMAN_LABEL, "What about spring tides?")
                 ),
                 (
                     "user".to_string(),
-                    thread_map(
-                        &[(
-                            format!("at #{}", eidola_app_core::post_handle(&i1_item)),
-                            vec![map_entry(
-                                &u2_item,
-                                HUMAN_LABEL,
-                                "2 posts",
-                                "just now",
-                                Some("1 post"),
-                                "And why two per day?",
+                    trailing(
+                        Some(&roster(&[
+                            (HUMAN_LABEL, "human", false),
+                            (DEFAULT_AGENT_LABEL, "agent", true),
+                        ])),
+                        Some(&thread_map(
+                            &[(
+                                format!("at #{}", eidola_app_core::post_handle(&i1_item)),
+                                vec![map_entry(
+                                    &u2_item,
+                                    HUMAN_LABEL,
+                                    "2 posts",
+                                    "just now",
+                                    Some("1 post"),
+                                    "And why two per day?",
+                                )],
                             )],
-                        )],
-                        &eidola_app_core::post_handle(&branch_item),
+                            &eidola_app_core::post_handle(&branch_item),
+                        )),
                     )
                 ),
             ],
-            "branch reply context = system prompt + the branch's ancestry + the trailing map"
+            "branch reply context = system prompt + the branch's ancestry + the trailing block"
         );
     });
 }
@@ -1213,10 +1232,13 @@ fn turn(
         .unwrap_or_else(|e| panic!("turn {prompt:?} failed: {e}"))
 }
 
-/// The linear common case sends **no** map, no map note, and no `tools` field —
-/// byte-identical to what it sent before task 21. This is the pin that keeps
-/// the overwhelming majority of turns (and their upstream prefix caches)
-/// untouched by the feature.
+/// The linear common case sends **no** map, no map note, and no `tools` field.
+/// This is the pin that keeps the overwhelming majority of turns (and their
+/// upstream prefix caches) untouched by the thread-map feature. (It is no
+/// longer a claim of byte-*identity* with pre-task-21: task 64 added the
+/// identity line to every space. The rule it still enforces is that a feature's
+/// bytes appear with the feature and are stable after — `AGENTS.md` → Thread
+/// map.)
 #[test]
 fn a_linear_space_sends_no_thread_map_and_no_tools() {
     run(|| {
@@ -1242,7 +1264,7 @@ fn a_linear_space_sends_no_thread_map_and_no_tools() {
             let msgs = flat_messages(&body);
             assert_eq!(
                 msgs[0].1,
-                system_message(Some(SEEDED_SYSTEM_PROMPT)),
+                system_message(Some(SEEDED_SYSTEM_PROMPT), DEFAULT_AGENT_LABEL),
                 "the system message is untouched without a map"
             );
             assert!(
@@ -1295,27 +1317,34 @@ fn a_branched_space_appends_a_thread_map_as_the_last_message() {
         let bodies = mock.chat_bodies();
         let msgs = flat_messages(&bodies[3]);
 
-        // The map is the LAST message — the placement decision. Everything
-        // above it is conversation.
+        // The trailing volatile block is the LAST message — the placement
+        // decision. Everything above it is conversation; inside it the map
+        // comes last, because it ends with the `Respond to #h.` pointer.
         assert_eq!(
             msgs.last().expect("a message").clone(),
             (
                 "user".to_string(),
-                thread_map(
-                    &[(
-                        format!("at #{}", eidola_app_core::post_handle(&i1_item)),
-                        vec![map_entry(
-                            &branch_item,
-                            HUMAN_LABEL,
-                            // The branch's own ask plus the answer it drew.
-                            "2 posts",
-                            "just now",
-                            // One of which is this responder's own.
-                            Some("1 post"),
-                            "What about spring tides?",
+                trailing(
+                    Some(&roster(&[
+                        (HUMAN_LABEL, "human", false),
+                        (DEFAULT_AGENT_LABEL, "agent", true),
+                    ])),
+                    Some(&thread_map(
+                        &[(
+                            format!("at #{}", eidola_app_core::post_handle(&i1_item)),
+                            vec![map_entry(
+                                &branch_item,
+                                HUMAN_LABEL,
+                                // The branch's own ask plus the answer it drew.
+                                "2 posts",
+                                "just now",
+                                // One of which is this responder's own.
+                                Some("1 post"),
+                                "What about spring tides?",
+                            )],
                         )],
-                    )],
-                    &eidola_app_core::post_handle(&last_item),
+                        &eidola_app_core::post_handle(&last_item),
+                    )),
                 ),
             ),
         );
@@ -1323,6 +1352,7 @@ fn a_branched_space_appends_a_thread_map_as_the_last_message() {
             msgs[0].1,
             system_message_with(
                 Some(SEEDED_SYSTEM_PROMPT),
+                DEFAULT_AGENT_LABEL,
                 &[THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE]
             ),
             "the map note and the tools note both join the system message"
@@ -1448,30 +1478,36 @@ fn the_map_says_which_branches_the_responder_posted_in() {
             msgs.last().expect("a message").clone(),
             (
                 "user".to_string(),
-                thread_map(
-                    &[(
-                        format!("at #{}", eidola_app_core::post_handle(&i1_item)),
-                        vec![
-                            map_entry(
-                                &answered_branch,
-                                HUMAN_LABEL,
-                                "2 posts",
-                                "just now",
-                                // The answer in that branch is the responder's.
-                                Some("1 post"),
-                                "What about spring tides?",
-                            ),
-                            map_entry(
-                                &quiet_branch,
-                                HUMAN_LABEL,
-                                "1 post",
-                                "just now",
-                                None,
-                                "And neap tides?",
-                            ),
-                        ],
-                    )],
-                    &eidola_app_core::post_handle(&last_item),
+                trailing(
+                    Some(&roster(&[
+                        (HUMAN_LABEL, "human", false),
+                        (DEFAULT_AGENT_LABEL, "agent", true),
+                    ])),
+                    Some(&thread_map(
+                        &[(
+                            format!("at #{}", eidola_app_core::post_handle(&i1_item)),
+                            vec![
+                                map_entry(
+                                    &answered_branch,
+                                    HUMAN_LABEL,
+                                    "2 posts",
+                                    "just now",
+                                    // The answer in that branch is the responder's.
+                                    Some("1 post"),
+                                    "What about spring tides?",
+                                ),
+                                map_entry(
+                                    &quiet_branch,
+                                    HUMAN_LABEL,
+                                    "1 post",
+                                    "just now",
+                                    None,
+                                    "And neap tides?",
+                                ),
+                            ],
+                        )],
+                        &eidola_app_core::post_handle(&last_item),
+                    )),
                 ),
             ),
         );
@@ -1560,7 +1596,7 @@ fn sibling_branch_turns_send_identical_trunk_bytes() {
         // neither the map note nor a map.
         assert_eq!(
             a[0].1,
-            system_message(Some(SEEDED_SYSTEM_PROMPT)),
+            system_message(Some(SEEDED_SYSTEM_PROMPT), DEFAULT_AGENT_LABEL),
             "the pre-branch turn's system message is the pre-task-21 one"
         );
         assert!(
@@ -1572,15 +1608,12 @@ fn sibling_branch_turns_send_identical_trunk_bytes() {
         // volatility at the tail.
         for msgs in [&b, &c] {
             assert!(
-                msgs.last()
-                    .expect("a message")
-                    .1
-                    .starts_with("<thread-map>"),
-                "the map is the last message: {msgs:#?}"
+                msgs.last().expect("a message").1.ends_with("</thread-map>"),
+                "the map closes the last message: {msgs:#?}"
             );
             assert_eq!(
                 msgs.iter()
-                    .filter(|(_, c)| c.starts_with("<thread-map>"))
+                    .filter(|(_, c)| c.ends_with("</thread-map>"))
                     .count(),
                 1,
                 "exactly one map block"
@@ -1729,6 +1762,7 @@ fn navigation_tools_round_trip_through_the_turn_loop() {
         );
 
         // Round 2 replays the results the model reads.
+        let stamps = Stamps::of(&core, &space);
         let results: Vec<String> = flat_messages(&bodies[3])
             .into_iter()
             .filter(|(role, _)| role == "tool")
@@ -1757,7 +1791,7 @@ fn navigation_tools_round_trip_through_the_turn_loop() {
             results[1]
         );
         assert!(
-            results[1].contains(&headed(&u2_item, HUMAN_LABEL, "And why two per day?")),
+            results[1].contains(&stamps.headed(&u2_item, HUMAN_LABEL, "And why two per day?")),
             "one rendering path — the exact wire header format: {}",
             results[1]
         );
@@ -1792,7 +1826,7 @@ fn navigation_tools_round_trip_through_the_turn_loop() {
         // read_thread renders a post's quotes exactly as read_post does —
         // attributed and in place, never a literal marker.
         assert!(
-            results[4].contains(&headed(
+            results[4].contains(&stamps.headed(
                 &branch.item_id,
                 HUMAN_LABEL,
                 &format!(
@@ -1849,13 +1883,18 @@ fn a_per_space_rename_reaches_the_tools_as_well_as_the_transcript() {
             serde_json::json!({ "handle": eidola_app_core::post_handle(&u1_item) }).to_string(),
         )];
         core.runtime()
-            .block_on(core.chat("Tell me more.".into(), "qwen3-8b@ext".into(), Some(space)))
+            .block_on(core.chat(
+                "Tell me more.".into(),
+                "qwen3-8b@ext".into(),
+                Some(space.clone()),
+            ))
             .expect("turn");
 
+        let stamps = Stamps::of(&core, &space);
         let bodies = mock.chat_bodies();
         let round1 = flat_messages(&bodies[bodies.len() - 2]);
         assert!(
-            round1.iter().any(|(_, c)| c.starts_with(&headed(
+            round1.iter().any(|(_, c)| c.starts_with(&stamps.headed(
                 &u1_item,
                 "Skipper",
                 "How do tides work?"
@@ -1868,7 +1907,7 @@ fn a_per_space_rename_reaches_the_tools_as_well_as_the_transcript() {
             .expect("a tool result")
             .1;
         assert!(
-            result.starts_with(&headed(&u1_item, "Skipper", "How do tides work?")),
+            result.starts_with(&stamps.headed(&u1_item, "Skipper", "How do tides work?")),
             "and so does read_post — one byline per post: {result}"
         );
     });
@@ -1951,10 +1990,7 @@ fn a_backend_that_rejects_tools_degrades_to_a_toolless_retry() {
         for body in [&bodies[2], &bodies[3]] {
             let msgs = flat_messages(body);
             assert!(
-                msgs.last()
-                    .expect("a message")
-                    .1
-                    .starts_with("<thread-map>"),
+                msgs.last().expect("a message").1.ends_with("</thread-map>"),
                 "the map survives the degrade: {msgs:#?}"
             );
         }
@@ -2391,7 +2427,7 @@ fn a_backend_observed_to_reject_tools_is_not_offered_them_again() {
                 .last()
                 .expect("a message")
                 .1
-                .starts_with("<thread-map>"),
+                .ends_with("</thread-map>"),
             "…and still carries the map"
         );
     });
@@ -2677,6 +2713,7 @@ fn single_agent_thread_renders_alternating_roles_with_headers() {
             .block_on(core.get_space_tree(first.space_id.clone()))
             .expect("tree");
         assert_eq!(tree.len(), 4, "u1, i1, u2, i2; got {tree:#?}");
+        let stamps = Stamps::of(&core, &first.space_id);
 
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 2);
@@ -2687,11 +2724,11 @@ fn single_agent_thread_renders_alternating_roles_with_headers() {
             vec![
                 (
                     "system".to_string(),
-                    system_message(Some(SEEDED_SYSTEM_PROMPT))
+                    system_message(Some(SEEDED_SYSTEM_PROMPT), DEFAULT_AGENT_LABEL)
                 ),
                 (
                     "user".to_string(),
-                    headed(&tree[0].item_id, HUMAN_LABEL, "How do tides work?")
+                    stamps.headed(&tree[0].item_id, HUMAN_LABEL, "How do tides work?")
                 ),
             ]
         );
@@ -2703,15 +2740,15 @@ fn single_agent_thread_renders_alternating_roles_with_headers() {
             vec![
                 (
                     "system".to_string(),
-                    system_message(Some(SEEDED_SYSTEM_PROMPT))
+                    system_message(Some(SEEDED_SYSTEM_PROMPT), DEFAULT_AGENT_LABEL)
                 ),
                 (
                     "user".to_string(),
-                    headed(&tree[0].item_id, HUMAN_LABEL, "How do tides work?")
+                    stamps.headed(&tree[0].item_id, HUMAN_LABEL, "How do tides work?")
                 ),
                 (
                     "assistant".to_string(),
-                    headed(
+                    stamps.headed(
                         &tree[1].item_id,
                         DEFAULT_AGENT_LABEL,
                         "Hello from the stream."
@@ -2719,7 +2756,7 @@ fn single_agent_thread_renders_alternating_roles_with_headers() {
                 ),
                 (
                     "user".to_string(),
-                    headed(&tree[2].item_id, HUMAN_LABEL, "And why two per day?")
+                    stamps.headed(&tree[2].item_id, HUMAN_LABEL, "And why two per day?")
                 ),
             ]
         );
@@ -4423,9 +4460,10 @@ fn a_later_turn_replays_its_own_tool_rounds_inline() {
 
         // The answer the round produced follows it, as an ordinary headed post.
         let answer_item = item_id_of(&core, &first.space_id, TOOL_FINAL_CONTENT);
+        let stamps = Stamps::of(&core, &first.space_id);
         assert_eq!(
             msgs[4]["content"],
-            headed(&answer_item, DEFAULT_AGENT_LABEL, TOOL_FINAL_CONTENT)
+            stamps.headed(&answer_item, DEFAULT_AGENT_LABEL, TOOL_FINAL_CONTENT)
         );
 
         // Exactly once — a trace is attributed to the turn that produced it,
@@ -4875,5 +4913,255 @@ fn space_traces_anchor_a_capped_turn_on_the_post_it_answered() {
             "every round it ran is listed: {:?}",
             traces[0].entries
         );
+    });
+}
+
+// ===========================================================================
+// Identity, roster, and post timestamps (task 64)
+//
+// A model was never told which participant it is, nor who else is present.
+// The two halves are split by volatility: identity is static per participant
+// and rides the system message, in every space; the roster changes with
+// membership and rides the trailing block, where recompute is free.
+// ===========================================================================
+
+/// The identity line is present in **every** space — a two-party linear one
+/// included — and sits between the charter and the notes. That position is the
+/// claim: identity governs what follows it.
+#[test]
+fn every_turn_states_which_participant_the_model_is() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        turn(&core, "How do tides work?", None, None);
+
+        let system = flat_messages(mock.chat_bodies().last().expect("a request"))[0]
+            .1
+            .clone();
+        assert_eq!(
+            system,
+            system_message(Some(SEEDED_SYSTEM_PROMPT), DEFAULT_AGENT_LABEL)
+        );
+        // Stated positionally, so a reordering fails here rather than silently:
+        // charter, then identity, then the protocol note.
+        assert_eq!(
+            system.split("\n\n").collect::<Vec<_>>(),
+            vec![
+                SEEDED_SYSTEM_PROMPT,
+                &format!("You are \"{DEFAULT_AGENT_LABEL}\" in this conversation."),
+                chat_harness::HEADER_PROTOCOL_NOTE,
+            ],
+            "the identity line sits after the charter and before the notes"
+        );
+    });
+}
+
+/// A per-space label override renames the participant, and the identity line
+/// follows it — the effective label is what the model's own posts are headed
+/// with, so the two cannot disagree.
+#[test]
+fn the_identity_line_names_the_participants_effective_label() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let first = turn(&core, "How do tides work?", None, None);
+
+        let agent = core
+            .runtime()
+            .block_on(core.list_space_participants(first.space_id.clone()))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.kind == "agent")
+            .expect("the seeded agent")
+            .id;
+        core.runtime()
+            .block_on(core.update_space_participant(
+                agent,
+                eidola_app_core::ParticipantUpdate {
+                    label: Some("Navigator".into()),
+                    ..Default::default()
+                },
+                eidola_app_core::ExpectedScope::Any,
+            ))
+            .expect("rename");
+
+        turn(&core, "And why two per day?", Some(first.space_id), None);
+        assert_eq!(
+            flat_messages(mock.chat_bodies().last().expect("a request"))[0].1,
+            system_message(Some(SEEDED_SYSTEM_PROMPT), "Navigator"),
+            "the identity line flips once, with the rename"
+        );
+    });
+}
+
+/// The roster gate, both ways. A two-participant linear space is not
+/// multi-party, so it carries **no** roster and its turn has no trailing
+/// message at all. Adding a third participant flips it on — and it stays
+/// byte-identical across the turns that follow, because membership order is
+/// stable and nothing else feeds it.
+#[test]
+fn the_roster_appears_only_once_a_space_is_multi_party() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+
+        // Two participants, no branches: no trailing message whatsoever.
+        let msgs = flat_messages(mock.chat_bodies().last().expect("a request"));
+        assert_eq!(msgs.len(), 2, "system + the one post: {msgs:#?}");
+        assert!(
+            msgs.iter()
+                .all(|(_, c)| !c.contains("Participants in this conversation:")),
+            "a two-party linear space carries no roster: {msgs:#?}"
+        );
+
+        // A third participant joins.
+        core.runtime()
+            .block_on(core.add_space_participant(
+                space.clone(),
+                eidola_app_core::NewParticipant {
+                    label: "Ada".into(),
+                    model_ref: Some(MODEL.into()),
+                    system_prompt: None,
+                    notify_policy: "explicit".into(),
+                },
+            ))
+            .expect("add agent");
+
+        turn(&core, "And why two per day?", Some(space.clone()), None);
+        let expected = roster(&[
+            (HUMAN_LABEL, "human", false),
+            (DEFAULT_AGENT_LABEL, "agent", true),
+            ("Ada", "agent", false),
+        ]);
+        let after_join = flat_messages(mock.chat_bodies().last().expect("a request"));
+        assert_eq!(
+            after_join.last().expect("a message").clone(),
+            ("user".to_string(), expected.clone()),
+            "the third member flips the roster on, in the trailing block"
+        );
+
+        // …and stays byte-identical while the membership does.
+        turn(&core, "Anything else?", Some(space), None);
+        assert_eq!(
+            flat_messages(mock.chat_bodies().last().expect("a request"))
+                .last()
+                .expect("a message")
+                .clone(),
+            ("user".to_string(), expected),
+            "stable within a membership: the roster's bytes move only when it does"
+        );
+    });
+}
+
+/// The other arm of the gate: a **branched** two-party space is multi-party in
+/// the sense that matters — there is structure the model cannot see — so the
+/// roster rides beside the map. The map comes second, because it ends with the
+/// `Respond to #h.` pointer.
+#[test]
+fn a_branch_turns_the_roster_on_in_a_two_party_space() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        let i1 = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree")[1]
+            .action_id
+            .clone();
+        turn(&core, "And why two per day?", Some(space.clone()), None);
+        turn(
+            &core,
+            "What about spring tides?",
+            Some(space.clone()),
+            Some(i1),
+        );
+
+        let trailing_block = flat_messages(mock.chat_bodies().last().expect("a request"))
+            .last()
+            .expect("a message")
+            .1
+            .clone();
+        let expected_roster = roster(&[
+            (HUMAN_LABEL, "human", false),
+            (DEFAULT_AGENT_LABEL, "agent", true),
+        ]);
+        assert!(
+            trailing_block.starts_with(&expected_roster),
+            "the roster opens the trailing block: {trailing_block}"
+        );
+        assert!(
+            trailing_block.ends_with("</thread-map>"),
+            "and the map closes it: {trailing_block}"
+        );
+    });
+}
+
+/// The header stamp is absolute, RFC 3339 UTC at seconds precision, and — the
+/// property that matters — **byte-stable for a given post**: the same post
+/// re-read on a later turn is the same header bytes, which is what lets the
+/// trunk stay identical across turns.
+#[test]
+fn post_headers_carry_a_stable_absolute_stamp() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        let u1 = item_id_of(&core, &space, "How do tides work?");
+
+        let stamps = Stamps::of(&core, &space);
+        let header = flat_messages(mock.chat_bodies().last().expect("a request"))[1]
+            .1
+            .lines()
+            .next()
+            .expect("a header line")
+            .to_string();
+        assert_eq!(
+            header,
+            format!(
+                "#{} · {HUMAN_LABEL} · {}",
+                eidola_app_core::post_handle(&u1),
+                eidola_app_core::post_stamp(stamps.at(&u1))
+            )
+        );
+        // Shape, spelled out rather than derived: 20 characters, `Z`-suffixed,
+        // seconds precision, no offset and no fractional part.
+        let stamp = header.rsplit(" · ").next().expect("a stamp");
+        assert_eq!(stamp.len(), 20, "{stamp}");
+        assert!(stamp.ends_with('Z') && stamp.contains('T'), "{stamp}");
+        assert!(!stamp.contains('.') && !stamp.contains('+'), "{stamp}");
+
+        // Two more turns re-read the same post. Its header must not drift —
+        // a relative stamp would move on every one of them.
+        turn(&core, "And why two per day?", Some(space.clone()), None);
+        turn(&core, "Anything else?", Some(space), None);
+        for body in mock.chat_bodies() {
+            for (_, content) in flat_messages(&body) {
+                let first_line = content.lines().next().unwrap_or_default();
+                if first_line.starts_with(&format!("#{}", eidola_app_core::post_handle(&u1))) {
+                    assert_eq!(first_line, header, "the stamp must not drift between turns");
+                }
+            }
+        }
     });
 }
