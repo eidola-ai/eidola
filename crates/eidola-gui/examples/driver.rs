@@ -492,6 +492,38 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_off_branch_composer",
+                description: "Space view: a long active composer floating over a sibling branch whose own tail draft remains compact",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let long = (0..36)
+                        .map(|i| {
+                            format!(
+                                "Paragraph {i} belongs only to the composer on the tangent branch."
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    view.update(cx, |view, cx| {
+                        view.space().update(cx, |space, cx| {
+                            space.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
+                        });
+                        view.seed_draft_quote_for_test(Some("a6"), &long, vec![], window, cx);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_quotes",
                 description: "Space view: quoted references — a source post with highlighted quoted passages (single + overlapping), two replies carrying embed quote blocks and their footnote rails",
                 default_size: size(px(860.), px(760.)),

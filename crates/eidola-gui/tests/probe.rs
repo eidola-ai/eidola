@@ -4606,6 +4606,65 @@ fn compact_actionable_post_keeps_its_height_when_actions_reveal(cx: &mut TestApp
 }
 
 #[gpui::test]
+fn compact_settled_post_keeps_its_action_height_while_another_turn_streams(
+    cx: &mut TestAppContext,
+) {
+    use gpui::{VisualTestContext, px};
+
+    let _guard = probes_on();
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the quick brown fox")], cx)
+        });
+    });
+    let vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let settled_height = fresh_entries(cx, window)
+        .iter()
+        .find(|(name, _)| name == "space/post/0")
+        .expect("settled post probe")
+        .1
+        .bounds
+        .size
+        .height;
+
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.push_streaming_turn_for_test(None, Some("a1".into()), Default::default(), cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let streaming_entries = fresh_entries(cx, window);
+    let streaming_height = streaming_entries
+        .iter()
+        .find(|(name, _)| name == "space/post/0")
+        .expect("settled post probe while its reply streams")
+        .1
+        .bounds
+        .size
+        .height;
+    assert!(
+        (settled_height - streaming_height).abs() < px(0.5),
+        "a settled actionable post must keep its compact action allocation while a reply streams \
+         ({settled_height:?} -> {streaming_height:?})"
+    );
+    assert!(
+        !streaming_entries
+            .iter()
+            .any(|(name, _)| name == "space/post/0/edit"),
+        "the unavailable verb stays hidden while streaming"
+    );
+}
+
+#[gpui::test]
 fn compact_post_metadata_stays_inside_its_row_at_large_type(cx: &mut TestAppContext) {
     use gpui::{VisualTestContext, px};
 
