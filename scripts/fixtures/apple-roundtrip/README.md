@@ -1,8 +1,8 @@
 # Apple round-trip fixtures
 
-Committed inputs for the golden `apply` test that `crates/eidola-apple` (task 55 Wave 3) codes against. They exist so that test runs in plain `cargo test` on **any** platform: reproducing them needs macOS and `codesign`, but consuming them needs neither. If `apply` ever starts requiring a macOS tool, the Linux `rust-checks` job goes red — which is the property the detached-signature design was chosen for.
+Committed inputs for the golden `apply` test that the planned `crates/eidola-apple` will code against. They exist so that test runs in plain `cargo test` on **any** platform: reproducing them needs macOS and `codesign`, but consuming them needs neither. If `apply` ever starts requiring a macOS tool, the Linux `rust-checks` job goes red — which is the property the detached-signature design was chosen for.
 
-`round-trip.md` beside them is the measurement they encode — the Wave 2 spike's result and verdict, and the document the harness and the classifier cite by section.
+`round-trip.md` beside them is the measurement they encode — its result and verdict, and the document the harness and the classifier cite by section.
 
 Measured and generated on macOS 26.5.2 (25F84), Xcode CLT 26.6.0.0.1781586589. Signature layout is a moving target across macOS releases; regenerate and re-measure rather than hand-edit, and record the new version here.
 
@@ -63,7 +63,7 @@ The sidecar is **arm64-only by decision** even inside the universal app (see `AG
 
 ## Note on signapple as the differential implementation
 
-`signapple apply` can only reach a *fat* Mach-O through the bundle path: given a bare universal binary and a single `.arch sign` file it refuses ("Cannot attach single architecture signature to universal binary"), and given a directory it derives the architecture from the directory's extension, which has none. So the differential check in Wave 3 has to hand signapple a bundle directory — which is why the synthetic fixture is one. `eidola-apple`'s own `apply` is under no such constraint and should accept a bare Mach-O too; `unsettled.macho` is there for that.
+`signapple apply` can only reach a *fat* Mach-O through the bundle path: given a bare universal binary and a single `.arch sign` file it refuses ("Cannot attach single architecture signature to universal binary"), and given a directory it derives the architecture from the directory's extension, which has none. So the differential check has to hand signapple a bundle directory — which is why the synthetic fixture is one. `eidola-apple`'s own `apply` is under no such constraint and should accept a bare Mach-O too; `unsettled.macho` is there for that.
 
 ## Note on the Nix build cache
 

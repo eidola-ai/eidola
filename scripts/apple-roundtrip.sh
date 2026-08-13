@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Task 55 Wave 2 — the universal round-trip spike, as a re-runnable check.
+# The Apple detached-signature round trip, as a re-runnable check.
 #
 # Answers, on a real `.#eidola-gui-macos-universal` bundle:
 #   (a) is whole-bundle ad-hoc signing byte-deterministic?
@@ -112,7 +112,8 @@ stage() { # stage <name> -> path to $WORK/<name>/<bundle>.app
 }
 
 # Sign inside-out, never --deep: the nested Mach-O first, then the bundle.
-# This is the order Wave 7's CI job uses, so it is the order measured here.
+# This is the order the CI signing job must use, so it is the order measured
+# here.
 sign_adhoc() {
   local app="$1"
   codesign --force --sign - "$app/$SIDE"
@@ -120,15 +121,17 @@ sign_adhoc() {
 }
 
 # One full codesign ad-hoc cycle, leaving no bundle-level seal. This is the
-# mitigation the spec designed and §4 of round-trip.md measures: as built,
-# the artifact carries sigtool's linker-signed signatures, whose 4 KiB code
-# pages make them ~2.4x larger than codesign's, so the first codesign
-# *shrinks* __LINKEDIT — the case signapple's apply does not handle.
+# mitigation §4 of round-trip.md measures: as built, the artifact carries
+# sigtool's linker-signed signatures, whose 4 KiB code pages make them ~2.4x
+# larger than codesign's, so the first codesign *shrinks* __LINKEDIT — the
+# case signapple's apply does not handle.
 #
 # Run here, not in the derivation: codesign is absent from the Nix build
 # sandbox (measured), and admitting it would tie the recorded narHash to the
-# host's macOS version. Whether the build settles or `apply` learns to land
-# on the unsettled artifact is an open decision — round-trip.md §4.2.
+# host's macOS version. The shipped pipeline therefore does not settle at all
+# — `apply` lands on the unsettled artifact from the placement record's
+# structural facts (round-trip.md §4.2). Settling is still measured, because
+# it is what lets signapple, the independent checker, reproduce the bundle.
 settle() {
   local app="$1"
   sign_adhoc "$app"
@@ -223,6 +226,9 @@ classify() { # classify <graded|info> <label> <signed> <applied>; sets CLASSIFY_
       printf '%s\n' "$out" | sed 's/^/          /' ;;
   esac
 }
+diff_kind() { # diff_kind <signed> <applied> -> identical|linkedit-vmsize-only|other
+  python3 "$REPO_ROOT/scripts/apple_linkedit_diff.py" "$1" "$2" 2>&1 | head -1 || true
+}
 classify info "main binary (both slices), apply == signed" "$S1/$MAIN" "$A/$MAIN"
 classify info "sidecar (arm64-only), apply == signed"      "$S1/$SIDE" "$A/$SIDE"
 check "_CodeSignature/CodeResources"               same \
@@ -238,7 +244,7 @@ check "apply is deterministic (sidecar)" same "$A/$SIDE" "$A2/$SIDE"
 echo
 echo "=== (b+) the same round trip on a settled artifact ==="
 # The mitigation, end to end: settle, then sign/detach/apply as above. This
-# is the configuration the design would actually ship.
+# is the configuration in which signapple reproduces the bundle exactly.
 SB="$(stage SB)"; settle "$SB"
 printf '    %-34s main: %s\n' "settled" "$(vmsizes "$SB/$MAIN")"
 printf '    %-34s side: %s\n' "" "$(vmsizes "$SB/$SIDE")"
@@ -248,24 +254,34 @@ chmod -R u+w "$SS" "$SA_"
 sign_adhoc "$SS"
 python3 "$REPO_ROOT/scripts/apple-detach.py" "$SS" "$WORK/detached-settled" "$SB" >/dev/null
 "$SIGNAPPLE" apply --no-verify "$SA_" "$WORK/detached-settled/$APP_NAME" >/dev/null
-# Exactness of the SA bundle specifically — this is what (d) may excuse a
-# verification failure with, and nothing else may set it. KNOWN_FILES carries
-# the classification forward to the tree comparison: only a file the
-# classifier named as the documented divergence may differ there.
-SETTLED_EXACT=1
-KNOWN_FILES=()
-grade() { # grade <relative path> <label>: classify, then fold into this bundle's verdict
-  classify graded "$2" "$SS/$1" "$SA_/$1"
+# Exactness of one applied bundle — this is what (d) may excuse a verification
+# failure with, and it is a property of that bundle alone. Two round trips are
+# graded this way (the settled one here, the boundary case in (b++)), so
+# neither can excuse the other. GRADE_KNOWN carries the classification forward
+# to the tree comparison: only a file the classifier named as the documented
+# divergence may differ there.
+GRADE_EXACT=1
+GRADE_KNOWN=()
+grade() { # grade <signed> <applied> <relative path> <label>
+  classify graded "$4" "$1/$3" "$2/$3"
   case "$CLASSIFY_KIND" in
     identical) return 0 ;;
-    linkedit-vmsize-only) KNOWN_FILES+=("$1") ;;
+    linkedit-vmsize-only) GRADE_KNOWN+=("$3") ;;
   esac
-  SETTLED_EXACT=0
+  GRADE_EXACT=0
 }
-grade "$MAIN" "main binary (both slices), apply == signed"
-grade "$SIDE" "sidecar (arm64-only), apply == signed"
-tree_check "whole bundle tree" "$SS" "$SA_" ${KNOWN_FILES[@]+"${KNOWN_FILES[@]}"}
-[[ "$TREE_KIND" == same ]] || SETTLED_EXACT=0
+# Both executables and then everything else, so a round trip that mishandles
+# only the sidecar cannot pass on the strength of an exact main binary.
+grade_bundle() { # grade_bundle <label prefix> <signed> <applied>; sets GRADE_EXACT
+  GRADE_EXACT=1
+  GRADE_KNOWN=()
+  grade "$2" "$3" "$MAIN" "$1main binary (both slices), apply == signed"
+  grade "$2" "$3" "$SIDE" "$1sidecar (arm64-only), apply == signed"
+  tree_check "$1whole bundle tree" "$2" "$3" ${GRADE_KNOWN[@]+"${GRADE_KNOWN[@]}"}
+  [[ "$TREE_KIND" == same ]] || GRADE_EXACT=0
+}
+grade_bundle "" "$SS" "$SA_"
+SETTLED_EXACT="$GRADE_EXACT"
 
 echo
 echo "=== (b++) the latent case: a replacing signature of a different size ==="
@@ -282,8 +298,8 @@ echo "=== (b++) the latent case: a replacing signature of a different size ==="
 # spans more than 16 KiB of signature growth, so some size must cross; if
 # none does, the harness has stopped testing what it advertises and says so
 # instead of reporting an exact round trip. Nothing else here consumes
-# scripts/fixtures/apple-roundtrip/ — those are inputs for Wave 3's
-# eidola-apple test, not a substitute for exercising the case now.
+# scripts/fixtures/apple-roundtrip/ — those are inputs for the planned
+# `eidola-apple` crate's test, not a substitute for exercising the case now.
 boundary_state() { # boundary_state <mach-o> -> crossed|aligned|absent
   python3 "$FACTS" "$1" | python3 -c '
 import json, sys
@@ -298,10 +314,14 @@ print(state)'
 }
 
 BOUNDARY=unexercised
+BOUNDARY_EXACT=1
+BOUNDARY_STAGE=""
 for pad in 0 800 1600 2400 3200 4000 4800 5600 6400 7200 8000 8800 9600 10400; do
-  PS="$WORK/P$pad/$APP_NAME"; rm -rf "$WORK/P$pad"; mkdir -p "$WORK/P$pad"
+  # One pair of stage directories, reused: each iteration is independent, and
+  # the bundle is 93 MB.
+  PS="$WORK/BS/$APP_NAME"; rm -rf "$WORK/BS"; mkdir -p "$WORK/BS"
   cp -R "$SB" "$PS"; chmod -R u+w "$PS"
-  PA="$WORK/Q$pad/$APP_NAME"; rm -rf "$WORK/Q$pad"; mkdir -p "$WORK/Q$pad"
+  PA="$WORK/BA/$APP_NAME"; rm -rf "$WORK/BA"; mkdir -p "$WORK/BA"
   cp -R "$SB" "$PA"; chmod -R u+w "$PA"
   python3 -c "
 import sys
@@ -315,27 +335,36 @@ open(sys.argv[1], 'w').write(
   '</dict></plist>\n')" "$WORK/ent.plist" "$pad"
   codesign --force --sign - --options runtime --entitlements "$WORK/ent.plist" "$PS/$SIDE" 2>/dev/null
   codesign --force --sign - --options runtime --entitlements "$WORK/ent.plist" "$PS" 2>/dev/null
-  python3 "$REPO_ROOT/scripts/apple-detach.py" "$PS" "$WORK/det$pad" "$SB" >/dev/null
-  "$SIGNAPPLE" apply --no-verify "$PA" "$WORK/det$pad/$APP_NAME" >/dev/null 2>&1
-  kind="$(python3 "$REPO_ROOT/scripts/apple_linkedit_diff.py" "$PS/$MAIN" "$PA/$MAIN" 2>&1 | head -1)" || true
+  python3 "$REPO_ROOT/scripts/apple-detach.py" "$PS" "$WORK/det-boundary" "$SB" >/dev/null
+  "$SIGNAPPLE" apply --no-verify "$PA" "$WORK/det-boundary/$APP_NAME" >/dev/null 2>&1
+  # The padding grows the sidecar's signature too, so every iteration is also
+  # a resized-signature case for it. The sidecar is arm64-only and both
+  # implementations round an arm64 __LINKEDIT to 16 KiB, so it has no
+  # legitimate divergence at any size: a sidecar that is not identical here is
+  # a failure, whatever the main binary did. The same goes for the rest of the
+  # tree, which is why an unclean one ends the sweep instead of being skipped.
+  main_kind="$(diff_kind "$PS/$MAIN" "$PA/$MAIN")"
+  side_kind="$(diff_kind "$PS/$SIDE" "$PA/$SIDE")"
   crossed="$(boundary_state "$PS/$MAIN")"
-  printf '    entitlements pad %-5s main: %-24s %-8s -> %s\n' \
-    "$pad" "$(vmsizes "$PS/$MAIN")" "$crossed" "$kind"
-  case "$kind" in
-    identical)
-      # Agreeing while the two roundings land on the same value is the
-      # expected non-case; agreeing while they do not is a documented fact
-      # that has stopped being true, and must be re-measured, not skipped.
-      [[ "$crossed" != crossed ]] || { BOUNDARY=silent; break; } ;;
-    linkedit-vmsize-only)
-      BOUNDARY=crossed
-      classify graded "boundary case, apply == signed" "$PS/$MAIN" "$PA/$MAIN"
-      break ;;
-    *)
-      BOUNDARY=broken
-      classify graded "boundary case, apply == signed" "$PS/$MAIN" "$PA/$MAIN"
-      break ;;
-  esac
+  tree=same; diff -rq "$PS" "$PA" >/dev/null 2>&1 || tree=differs
+  printf '    entitlements pad %-5s main: %-24s %-8s -> %s (sidecar %s)\n' \
+    "$pad" "$(vmsizes "$PS/$MAIN")" "$crossed" "$main_kind" "$side_kind"
+  if [[ "$main_kind" == identical && "$side_kind" == identical && "$tree" == same ]]; then
+    # Agreeing on everything while the two roundings land on the same value is
+    # the expected non-case; agreeing while they do not is a documented fact
+    # that has stopped being true, and must be re-measured, not skipped.
+    [[ "$crossed" != crossed ]] || { BOUNDARY=silent; break; }
+    continue
+  fi
+  # Something in the bundle moved: this iteration is the case, and the whole
+  # bundle gets graded on it — including the applied bundle's own
+  # verification, in (d) below.
+  BOUNDARY=crossed
+  [[ "$main_kind" == linkedit-vmsize-only && "$side_kind" == identical ]] || BOUNDARY=broken
+  grade_bundle "boundary " "$PS" "$PA"
+  BOUNDARY_EXACT="$GRADE_EXACT"
+  BOUNDARY_STAGE=BA
+  break
 done
 case "$BOUNDARY" in
   # crossed: the case was exercised and graded above.
@@ -375,6 +404,13 @@ verify_bundle() { # verify_bundle <stage> <round-tripped byte-exact: yes|no>
 # S1 is signed by codesign itself, so it must verify unconditionally.
 verify_bundle S1 yes
 if [[ "$SETTLED_EXACT" -eq 1 ]]; then verify_bundle SA yes; else verify_bundle SA no; fi
+# BA is the sweep's applied bundle, when the sweep reached a case to grade:
+# the round trip at a replacing signature of a different size has to survive
+# verification too, not just compare equal.
+if [[ -n "$BOUNDARY_STAGE" ]]; then
+  if [[ "$BOUNDARY_EXACT" -eq 1 ]]; then verify_bundle "$BOUNDARY_STAGE" yes
+  else verify_bundle "$BOUNDARY_STAGE" no; fi
+fi
 
 echo
 if [[ "$FAILURES" -ne 0 ]]; then
