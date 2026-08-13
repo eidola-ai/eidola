@@ -66,6 +66,19 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<serde_json::Value>,
 }
 
+/// Deserialize a real client body through the server's strict request type.
+///
+/// This test-only bridge lets app-core's HTTP harness compose its captured
+/// body with the same `ChatCompletionRequest` deserialization production uses,
+/// including strict nested `Message` fields.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn test_chat_completion_request_is_accepted(
+    body: serde_json::Value,
+) -> Result<(), serde_json::Error> {
+    serde_json::from_value::<ChatCompletionRequest>(body).map(|_| ())
+}
+
 /// OpenAI-compatible streaming options.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -721,6 +734,92 @@ mod tests {
         }"#;
         let err = serde_json::from_str::<ChatCompletionRequest>(json).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn app_core_request_shape_is_accepted() {
+        let plain_messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "Hello."
+        })];
+        let tool_messages = vec![
+            serde_json::json!({"role": "user", "content": "Use the calculator."}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "provider_extra": {"trace": "abc"},
+                    "function": {"name": "calc", "arguments": "{\"expr\":\"2+2\"}"}
+                }]
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "4"}),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "calc",
+                "description": "Evaluate arithmetic.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+
+        let bodies = [
+            eidola_common::chat_completion_request_body(
+                "test-model",
+                &plain_messages,
+                256,
+                &[],
+                false,
+                false,
+            ),
+            eidola_common::chat_completion_request_body(
+                "test-model",
+                &plain_messages,
+                256,
+                &[],
+                true,
+                false,
+            ),
+            eidola_common::chat_completion_request_body(
+                "test-model",
+                &plain_messages,
+                256,
+                &[],
+                true,
+                true,
+            ),
+            eidola_common::chat_completion_request_body(
+                "test-model",
+                &tool_messages,
+                256,
+                &tools,
+                false,
+                false,
+            ),
+            eidola_common::chat_completion_request_body(
+                "test-model",
+                &tool_messages,
+                256,
+                &tools,
+                true,
+                false,
+            ),
+            eidola_common::chat_completion_request_body(
+                "test-model",
+                &tool_messages,
+                256,
+                &tools,
+                true,
+                true,
+            ),
+        ];
+
+        for body in bodies {
+            serde_json::from_value::<ChatCompletionRequest>(body)
+                .expect("the body app-core sends must remain accepted by the strict server type");
+        }
     }
 
     // -----------------------------------------------------------------
