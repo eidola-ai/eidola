@@ -9246,25 +9246,18 @@ impl TurnPrep {
     /// sends exactly the bytes it sent before tool support existed, so
     /// upstream prefix caches — and every pinned-bytes test — are undisturbed.
     fn request_body(&self, stream: bool) -> serde_json::Value {
-        let mut body = serde_json::json!({
-            "model": self.wire_model,
-            "messages": self.messages,
-            "max_completion_tokens": self.max_completion_tokens,
-        });
-        if !self.tool_schemas.is_empty() {
-            body["tools"] = serde_json::Value::Array(self.tool_schemas.clone());
-        }
-        if stream {
-            body["stream"] = serde_json::Value::Bool(true);
-            // The Eidola server forces `include_usage` upstream regardless
-            // (accurate refunds depend on it), so the remote request stays
-            // minimal — but a local llama-server only reports usage when the
-            // client asks.
-            if self.spend.is_none() {
-                body["stream_options"] = serde_json::json!({ "include_usage": true });
-            }
-        }
-        body
+        // The Eidola server forces `include_usage` upstream regardless
+        // (accurate refunds depend on it), so the remote request stays
+        // minimal — but a local llama-server only reports usage when the
+        // client asks.
+        eidola_common::chat_completion_request_body(
+            &self.wire_model,
+            &self.messages,
+            self.max_completion_tokens,
+            &self.tool_schemas,
+            stream,
+            stream && self.spend.is_none(),
+        )
     }
 
     /// Flush attestations captured since the last flush (a fresh handshake
