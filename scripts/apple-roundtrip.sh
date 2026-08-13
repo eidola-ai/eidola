@@ -8,6 +8,8 @@
 #   (c) does the artifact's `__LINKEDIT` vmsize settle, or does the first
 #       transition out of sigtool's linker-signed state move it?
 #   (d) does the result survive `codesign --verify --deep --strict`?
+#   (e) does a placement-driven apply reach the signed bundle from the
+#       artifact *as built*, with nothing settled?
 #
 # Written result and verdict: scripts/fixtures/apple-roundtrip/round-trip.md.
 #
@@ -139,6 +141,22 @@ settle() {
   rm -rf "$app/Contents/_CodeSignature"
   sign_adhoc "$app"
   rm -rf "$app/Contents/_CodeSignature"
+}
+
+# Entitlements whose length is a knob: padding them grows every signature in
+# the bundle, which is how a replacing signature of a *different* size than
+# the one already there gets exercised without a signing identity.
+ent_plist() { # ent_plist <pad bytes> -> writes $WORK/ent.plist
+  python3 -c "
+import sys
+open(sys.argv[1], 'w').write(
+  '<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n'
+  '<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" '
+  '\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n'
+  '<plist version=\"1.0\"><dict>\n'
+  '<key>com.apple.security.cs.allow-jit</key><true/>\n'
+  '<key>com.apple.security.application-groups</key><string>' + 'A' * int(sys.argv[2]) + '</string>\n'
+  '</dict></plist>\n')" "$WORK/ent.plist" "$1"
 }
 
 vmsizes() { # vmsizes <mach-o> -> "arch=vmsize@field-offset" per slice
@@ -316,6 +334,7 @@ print(state)'
 BOUNDARY=unexercised
 BOUNDARY_EXACT=1
 BOUNDARY_STAGE=""
+BOUNDARY_PAD=""
 for pad in 0 800 1600 2400 3200 4000 4800 5600 6400 7200 8000 8800 9600 10400; do
   # One pair of stage directories, reused: each iteration is independent, and
   # the bundle is 93 MB.
@@ -323,16 +342,7 @@ for pad in 0 800 1600 2400 3200 4000 4800 5600 6400 7200 8000 8800 9600 10400; d
   cp -R "$SB" "$PS"; chmod -R u+w "$PS"
   PA="$WORK/BA/$APP_NAME"; rm -rf "$WORK/BA"; mkdir -p "$WORK/BA"
   cp -R "$SB" "$PA"; chmod -R u+w "$PA"
-  python3 -c "
-import sys
-open(sys.argv[1], 'w').write(
-  '<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n'
-  '<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" '
-  '\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n'
-  '<plist version=\"1.0\"><dict>\n'
-  '<key>com.apple.security.cs.allow-jit</key><true/>\n'
-  '<key>com.apple.security.application-groups</key><string>' + 'A' * int(sys.argv[2]) + '</string>\n'
-  '</dict></plist>\n')" "$WORK/ent.plist" "$pad"
+  ent_plist "$pad"
   codesign --force --sign - --options runtime --entitlements "$WORK/ent.plist" "$PS/$SIDE" 2>/dev/null
   codesign --force --sign - --options runtime --entitlements "$WORK/ent.plist" "$PS" 2>/dev/null
   python3 "$REPO_ROOT/scripts/apple-detach.py" "$PS" "$WORK/det-boundary" "$SB" >/dev/null
@@ -364,6 +374,7 @@ open(sys.argv[1], 'w').write(
   grade_bundle "boundary " "$PS" "$PA"
   BOUNDARY_EXACT="$GRADE_EXACT"
   BOUNDARY_STAGE=BA
+  BOUNDARY_PAD="$pad"
   break
 done
 case "$BOUNDARY" in
@@ -381,6 +392,50 @@ case "$BOUNDARY" in
       "so the latent case went untested; widen the sweep"
     FAILURES=$((FAILURES + 1)) ;;
 esac
+
+echo
+echo "=== (e) placement-driven apply on the artifact as built ==="
+# The design the round trip settled on (round-trip.md §4.2, Path B): nothing
+# settles inside the derivation, so `apply` receives the artifact carrying
+# sigtool's signatures, sigtool's fat alignment and sigtool's __LINKEDIT
+# sizing, and has to land on codesign's layout from the placement record
+# alone. scripts/apple-place.py is that apply, written as a measurement — the
+# shipping one is `eidola-apple::apply`.
+#
+# This is the same equation as (b), with the record standing in for the
+# settling, and it is graded the same way:
+#     place(as built, detached) == the codesign-signed bundle
+# $WORK/detached was taken from S1, which is the as-built artifact signed, so
+# U is exactly the input the record names.
+P="$(stage P)"
+python3 "$REPO_ROOT/scripts/apple-place.py" "$P" "$WORK/detached/$APP_NAME" >/dev/null
+grade_bundle "placement " "$S1" "$P"
+PLACEMENT_EXACT="$GRADE_EXACT"
+
+# Again at the replacing-signature size the sweep found, where signapple's
+# rounding diverges from codesign's. The record carries codesign's value
+# instead of deriving it, so signature size is not supposed to reach this
+# path at all; that is a claim about the design, so it is measured rather
+# than asserted. The pad comes from the sweep, so if the sweep stopped
+# finding a boundary this stops silently exercising a case it names.
+PLACEMENT_BOUNDARY_EXACT=1
+PLACEMENT_BOUNDARY_STAGE=""
+if [[ -n "$BOUNDARY_PAD" ]]; then
+  PBS="$(stage PBS)"
+  ent_plist "$BOUNDARY_PAD"
+  codesign --force --sign - --options runtime --entitlements "$WORK/ent.plist" "$PBS/$SIDE" 2>/dev/null
+  codesign --force --sign - --options runtime --entitlements "$WORK/ent.plist" "$PBS" 2>/dev/null
+  printf '    %-34s main: %s (%s)\n' "pad $BOUNDARY_PAD, signed as built" \
+    "$(vmsizes "$PBS/$MAIN")" "$(boundary_state "$PBS/$MAIN")"
+  python3 "$REPO_ROOT/scripts/apple-detach.py" "$PBS" "$WORK/det-placement" "$U" >/dev/null
+  PB="$(stage PB)"
+  python3 "$REPO_ROOT/scripts/apple-place.py" "$PB" "$WORK/det-placement/$APP_NAME" >/dev/null
+  grade_bundle "placement, resized signature " "$PBS" "$PB"
+  PLACEMENT_BOUNDARY_EXACT="$GRADE_EXACT"
+  PLACEMENT_BOUNDARY_STAGE=PB
+else
+  printf '    SKIP  %-52s (no size from the sweep)\n' "placement at a resized signature"
+fi
 
 echo
 echo "=== (d) codesign --verify --deep --strict ==="
@@ -411,11 +466,29 @@ if [[ -n "$BOUNDARY_STAGE" ]]; then
   if [[ "$BOUNDARY_EXACT" -eq 1 ]]; then verify_bundle "$BOUNDARY_STAGE" yes
   else verify_bundle "$BOUNDARY_STAGE" no; fi
 fi
+# P and PB are the placement-driven bundles: signed material written onto the
+# artifact as built. Comparing equal is most of the claim, but the signature
+# seals the load commands this path rewrites, so verification is the half that
+# would catch a record that happened to reproduce a hash the wrong way.
+if [[ "$PLACEMENT_EXACT" -eq 1 ]]; then verify_bundle P yes; else verify_bundle P no; fi
+if [[ -n "$PLACEMENT_BOUNDARY_STAGE" ]]; then
+  if [[ "$PLACEMENT_BOUNDARY_EXACT" -eq 1 ]]; then verify_bundle "$PLACEMENT_BOUNDARY_STAGE" yes
+  else verify_bundle "$PLACEMENT_BOUNDARY_STAGE" no; fi
+fi
 
 echo
+# Two verdicts, because they are two round trips: the shipped path is the
+# placement-driven one on the artifact as built, and the settled one is what
+# keeps signapple usable as an independent checker.
 if [[ "$FAILURES" -ne 0 ]]; then
   echo "apple-roundtrip: $FAILURES check(s) failed"
-elif [[ "$SETTLED_EXACT" -eq 1 ]]; then
+  exit "$FAILURES"
+fi
+if [[ "$PLACEMENT_EXACT" -eq 1 && "$PLACEMENT_BOUNDARY_EXACT" -eq 1 ]]; then
+  echo "apple-roundtrip: the placement-driven round trip is byte-exact on the"
+  echo "                 artifact as built — nothing settled, both signature sizes"
+fi
+if [[ "$SETTLED_EXACT" -eq 1 ]]; then
   echo "apple-roundtrip: the settled round trip is byte-exact"
   if [[ "$KNOWN_DIVERGENCE" -eq 1 ]]; then
     echo "                 at a signature size crossing a 16 KiB boundary, upstream"
@@ -426,4 +499,4 @@ else
   echo "apple-roundtrip: the settled round trip carries the documented __LINKEDIT"
   echo "                 vmsize divergence (one line in the signapple fork)"
 fi
-exit "$FAILURES"
+exit 0
