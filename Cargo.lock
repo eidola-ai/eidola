@@ -2740,6 +2740,7 @@ dependencies = [
  "eidola-app-core",
  "eidola-attestation",
  "eidola-common",
+ "eidola-server",
  "fs4",
  "futures-util",
  "hex",
