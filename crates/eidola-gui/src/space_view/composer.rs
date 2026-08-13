@@ -740,11 +740,11 @@ impl SpaceView {
     /// docking mid-scroll and unwinding afterwards.
     ///
     /// **Zone-gated.** The glide engages only while the dock threshold sits
-    /// *under* the floating bar: the draft's would-be dock top (`slot_top +
-    /// half_pad`, the same value the dock decision in
-    /// [`Self::render_active_draft`] compares against the float line) between
-    /// the float line and the window bottom — the last `float_bar_h` (at most
-    /// half a window) of page travel before docking. Outside that zone a page
+    /// *under* the floating bar: the draft's would-be dock top (its slot top —
+    /// the same value the dock decision in [`Self::render_active_draft`]
+    /// compares against the float line) between the float line and the window
+    /// bottom — the last `float_bar_h` (at most half a window) of page travel
+    /// before docking. Outside that zone a page
     /// scroll never moves the internal content ([`dock_runway`] saturates, so
     /// consecutive frames read equal runways and step nothing).
     ///
@@ -795,10 +795,8 @@ impl SpaceView {
         let win = window_h.as_f32();
         let float_bar_h = self.composer_float_bar_h(window_h);
         let float_top = win - float_bar_h;
-        let half_pad = POST_PAD_Y.as_f32() / 2.0;
-        let dock_top = self.placeholder_doc_top(roots, page_width, window_h)
-            + self.clamped_scroll_y()
-            + half_pad;
+        let dock_top =
+            self.placeholder_doc_top(roots, page_width, window_h) + self.clamped_scroll_y();
         let runway = dock_runway(dock_top, float_top, win);
         if let Some(prev) = self.composer_dock_runway {
             let off = self.composer_scroll.offset();
@@ -998,7 +996,6 @@ impl SpaceView {
         // caret's absolute document position and follows it with `page_scroll`.
         let page_slot_doc_top = self.placeholder_doc_top(roots, page_width, window_h);
         let chrome = Self::composer_chrome();
-        let half_pad = POST_PAD_Y.as_f32() / 2.0;
         // The top chrome's render split (see `composer_scroll_gap`): the thin
         // separator stays outside the scroll clip, the rest rides inside the
         // scroll content. Together they are exactly `chrome`, so all the
@@ -1016,8 +1013,15 @@ impl SpaceView {
         } else {
             None
         };
+        // Docked, the bar's top edge *is* its slot top — the surface abuts the
+        // separator band above it exactly as a post row abuts its band, and the
+        // bar starts moving with the page the moment its slot reaches the float
+        // line (an inset here would both open a band-to-surface gap no post
+        // seam has and let the floating bar overlap its own slot's first pixels
+        // before docking engaged). The whole `POST_PAD_Y` between slot top and
+        // editor content is the bar's top chrome.
         let top_y = match slot_top {
-            Some(s) => float_top.min(s + half_pad),
+            Some(s) => float_top.min(s),
             None => float_top,
         };
 
@@ -1034,7 +1038,7 @@ impl SpaceView {
             full_h,
             float_top,
             top_y,
-            self.doc_reserve() + half_pad,
+            self.doc_reserve(),
             docked,
         );
         let body_h = (bar_h - chrome).max(0.0);
@@ -1655,9 +1659,9 @@ fn kbd_hint(text: &'static str, color: gpui::Hsla) -> gpui::Div {
     div().text_xs().text_color(color).child(text)
 }
 
-/// The composer bar's **bottom breath** — the mirror of the `half_pad` chrome
-/// above the byline, so the last thing in the bar never sits flush against the
-/// window edge.
+/// The composer bar's **bottom breath** — a half-pad of room so the last thing
+/// in the bar never sits flush against the window edge ([`rail_breath`] widens
+/// it to a full pad under a footnote rail).
 ///
 /// It is **drawn exactly once**, by whichever element ends the composer body:
 /// the footnote rail's own bottom padding when a rail is present (see
@@ -1687,7 +1691,7 @@ pub fn rail_breath() -> f32 {
 /// scroll clip — the thin band between the bar's top edge (where the external
 /// drop shadow is cast) and the scroll fold (where scrolled content clips and
 /// the internal shadow paints). Deliberately thinner than the full top chrome
-/// ([`SpaceView::composer_chrome`], half the inter-post gap): on a scrolled
+/// ([`SpaceView::composer_chrome`], the whole inter-post pad): on a scrolled
 /// floating composer this band is dead space, and at the full chrome height it
 /// read as a blank strip where a familiar pane separator was expected.
 pub(crate) const COMPOSER_SEPARATOR_H: f32 = 12.0;
@@ -1697,7 +1701,7 @@ pub(crate) const COMPOSER_SEPARATOR_H: f32 = 12.0;
 /// [`COMPOSER_SEPARATOR_H`]. Unscrolled it sits right under the separator, so
 /// the text starts exactly `composer_chrome()` below the bar top — the same
 /// place as before the split (and the docked editor keeps its post-matching
-/// `2·half_pad` slot offset, see `caret_into_view`'s docked arm) — and it
+/// `POST_PAD_Y` slot offset, see `caret_into_view`'s docked arm) — and it
 /// scrolls away with the content, so a scrolled composer's dead band is only
 /// the separator. The split is a **render concern only**: every height / dock
 /// / runway computation keeps using the `composer_chrome()` total, so nothing
@@ -1848,11 +1852,15 @@ fn record_height(
 
 /// The composer bar's **virtual** height: `float_bar_h` while floating, and,
 /// once docked, a ramp from there up to `full_h` (the whole content, at least a
-/// window) as the bar's top rises from the float line toward `dock_floor` — the
-/// lowest `top_y` the page can reach, i.e. the fully-docked bar top (the
+/// window) as the bar's top rises from the float line toward `dock_floor` —
+/// the ramp's **completion anchor**: the *shallowest* resting bar top any
+/// configuration comes to (a blank notebook's standalone slot puts it at the
 /// document's top reserve plus the slot's own half-pad; see
-/// [`SpaceView::standalone_slot_h`], which is what makes that the resting
-/// position).
+/// [`SpaceView::standalone_slot_h`]). A deeper floor — a populated branch's
+/// full-window slot ([`SpaceView::runway_floor`]), or a content-tall draft —
+/// passes the anchor mid-descent, where `progress` clamps at 1: the bar is at
+/// full height *before* the page can reach its floor, which errs exactly the
+/// safe way (the internal scroll is clamped out early, never left resident).
 ///
 /// This is the *dock ramp*. It gives the docked composer its real geometry —
 /// `body_h = bar_h − chrome` is the scroll viewport, so as the bar grows
@@ -1886,9 +1894,9 @@ fn composer_bar_h(
 
 /// The dock-approach runway: how much page travel remains before the floating
 /// composer docks, saturated at the **approach zone**. `dock_top` is where the
-/// bar's top would sit if it docked to its slot this frame (`slot_top +
-/// half_pad`, window coordinates), `float_top` the float line (the floating
-/// bar's top), `win` the window bottom. The zone is `[float_top, win]` — the
+/// bar's top would sit if it docked to its slot this frame (the slot top, in
+/// window coordinates), `float_top` the float line (the floating bar's top),
+/// `win` the window bottom. The zone is `[float_top, win]` — the
 /// dock threshold sitting under the floating bar — so the runway saturates at
 /// the bar's height (`win − float_top`): any page position at or below the
 /// zone reads as a full runway, which is what gates the glide to the zone
@@ -2065,17 +2073,17 @@ fn caret_into_view(
                 //
                 // **The editor-top offset (`POST_PAD_Y`).** The composer's editor
                 // body does not begin at `page_slot_doc_top` (the slot block top):
-                // the docked composer's `top_y` sits `half_pad` below the slot top,
-                // and the bar's top chrome — the separator on the inner h_flex
-                // plus the body's in-content spacer, together `composer_chrome()
-                // = half_pad` (see `composer_scroll_gap`; docked, the internal
-                // scroll is zero so the spacer is fully in place) — precedes the
-                // editor, so the editor content (where `caret_content_y` measures
-                // from y=0) starts `2·half_pad = POST_PAD_Y` below the slot top
-                // (exactly aligning with where a post's body sits under its
-                // `POST_PAD_Y` top pad). Omitting this term put every docked caret
-                // target one pad-height too high — scrolling down never fully
-                // revealed the line, scrolling up over-revealed it.
+                // the docked composer's `top_y` *is* the slot top, and the bar's
+                // top chrome — the separator on the inner columns plus the body's
+                // in-content spacer, together `composer_chrome() = POST_PAD_Y`
+                // (see `composer_scroll_gap`; docked, the internal scroll is zero
+                // so the spacer is fully in place) — precedes the editor, so the
+                // editor content (where `caret_content_y` measures from y=0)
+                // starts `POST_PAD_Y` below the slot top (exactly aligning with
+                // where a post's body sits under its `POST_PAD_Y` top pad).
+                // Omitting this term put every docked caret target one pad-height
+                // too high — scrolling down never fully revealed the line,
+                // scrolling up over-revealed it.
                 let editor_top_offset = POST_PAD_Y.as_f32() + composer_gutters.top;
                 let caret_doc_top = page_slot_doc_top + editor_top_offset + caret_top;
                 let caret_doc_bot = page_slot_doc_top + editor_top_offset + caret_bot;
@@ -2084,17 +2092,29 @@ fn caret_into_view(
                 // derived (in `render`) from `composer_content_h`, which
                 // `record_height` records a frame *behind* — so on the edit frame
                 // it can still reflect the pre-edit height and clamp the caret
-                // target back to the current offset. The docked runway is
-                // `max(standalone_slot, chrome + content + half_pad)` and the doc ends
-                // at `page_slot_doc_top + runway` (the slot is the on-path leaf,
-                // no trailing band / floating pad), so this reproduces exactly the
-                // `scroll_min_y` the *next* frame will settle to — letting the
-                // scroll land in one frame, the way the floating branch uses the
-                // fresh `natural` height. See `runway_height` / `placeholder_doc_top`.
-                let half_pad = POST_PAD_Y.as_f32() / 2.0;
-                let standalone = view.read(cx).standalone_slot_h(px(window_h));
-                let runway = standalone.max(
-                    SpaceView::composer_chrome() + natural + composer_gutters.total() + half_pad,
+                // target back to the current offset. This rebuilds the runway by
+                // the same contract `runway_height` computes it — the shared
+                // `runway_floor` under `chrome + content + max(rail, breath) +
+                // gutters` (`record_height`'s formula, over the fresh content) —
+                // and the doc ends at `page_slot_doc_top + runway` (the slot is
+                // the on-path leaf, no trailing band / floating pad), so this
+                // reproduces exactly the `scroll_min_y` the *next* frame will
+                // settle to — letting the scroll land in one frame, the way the
+                // floating branch uses the fresh `natural` height. Reading the
+                // shared floor (never restating it) is load-bearing: a restated
+                // floor leaves the reveal short by the floors' difference
+                // wherever they diverge — a populated branch's floor is a full
+                // window where a standalone slot is a titlebar short of one.
+                let (floor, rail) = {
+                    let v = view.read(cx);
+                    let rail = (v.composer_rail_bottom.get() - v.composer_rail_top.get()).max(0.0);
+                    (v.runway_floor(px(window_h)), rail)
+                };
+                let runway = floor.max(
+                    SpaceView::composer_chrome()
+                        + natural
+                        + rail.max(bottom_breath())
+                        + composer_gutters.total(),
                 );
                 let scroll_max = (page_slot_doc_top + runway - window_h).max(0.0);
                 view.update(cx, |this, _cx| {
@@ -2404,9 +2424,9 @@ mod tests {
         // The separator (outside the scroll clip) plus the in-content scroll
         // gap must sum to the bar's total top chrome — the invariant that
         // keeps unscrolled text exactly where it sat before the split, keeps
-        // the docked editor at its post-matching `2·half_pad` slot offset
-        // (`caret_into_view`'s docked arm bakes that as `POST_PAD_Y`), and
-        // keeps every height/dock computation honest about using the total.
+        // the docked editor at its post-matching `POST_PAD_Y` slot offset
+        // (which `caret_into_view`'s docked arm bakes in), and keeps every
+        // height/dock computation honest about using the total.
         use super::{COMPOSER_SEPARATOR_H, SpaceView, composer_scroll_gap};
         assert!(
             COMPOSER_SEPARATOR_H > 0.0 && COMPOSER_SEPARATOR_H < SpaceView::composer_chrome(),

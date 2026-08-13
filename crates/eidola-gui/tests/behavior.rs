@@ -3158,14 +3158,20 @@ fn a_populated_composer_has_full_window_docking_runway(cx: &mut TestAppContext) 
         let runway = v.runway_height_for_test(WINDOW_H);
         let chrome = v.composer_chrome_for_test();
         assert_eq!(
-            runway,
-            WINDOW_H + chrome,
-            "the slot top plus the composer's half-pad chrome must land exactly at the window top"
+            runway, WINDOW_H,
+            "a populated branch's trailing slot claims exactly one window — no more, no less"
         );
         assert_eq!(
-            WINDOW_H - runway + chrome,
+            WINDOW_H - runway,
             0.0,
-            "the docked composer surface must begin at the window top"
+            "at the document floor the slot top — which is also the docked surface's \
+             top edge — lands exactly at the window top, the previous separator band \
+             just cleared above it"
+        );
+        assert_eq!(
+            chrome, 40.0,
+            "the bar's top chrome is the full post pad, so the docked editor's text \
+             sits POST_PAD_Y below the slot top exactly as a post's body does"
         );
     });
     cx.update_window(window, |_, _, _| {}).unwrap();

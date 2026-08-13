@@ -2359,7 +2359,15 @@ impl Render for SpaceView {
 
         self.composer_prev_off_y = self.composer_scroll.offset().y.as_f32();
 
-        let body = self.render_forest(&tree, doc_reserve, page_width, window_h, streaming, cx);
+        let body = self.render_forest(
+            &tree,
+            doc_reserve,
+            page_width,
+            window_h,
+            window.rem_size(),
+            streaming,
+            cx,
+        );
 
         // The window is a row: the conversation pane, then (when open and wide
         // enough) the inspector's column. The pane is `relative` and clipped,
@@ -2689,19 +2697,23 @@ impl SpaceView {
 
     /// Render the top of the forest: a single root is rendered directly; a
     /// multi-root forest gets the implicit top-level branch scroller.
+    #[allow(clippy::too_many_arguments)]
     fn render_forest(
         &self,
         roots: &[TreeNode],
         doc_y: f32,
         page_width: Pixels,
         window_h: Pixels,
+        rem_size: Pixels,
         streaming: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         match roots.len() {
             0 => div().into_any_element(),
             1 => self
-                .render_subtree(&roots[0], doc_y, page_width, window_h, streaming, cx)
+                .render_subtree(
+                    &roots[0], doc_y, page_width, window_h, rem_size, streaming, cx,
+                )
                 .into_any_element(),
             _ => self
                 .render_strip(
@@ -2710,6 +2722,7 @@ impl SpaceView {
                     doc_y,
                     page_width,
                     window_h,
+                    rem_size,
                     streaming,
                     cx,
                 )
@@ -2720,12 +2733,14 @@ impl SpaceView {
     /// Render a node's whole subtree: its post, then (if it has replies) a
     /// separator band and the horizontal branch scroller whose pages are each
     /// child's entire subtree. Off-screen posts render as sized placeholders.
+    #[allow(clippy::too_many_arguments)]
     fn render_subtree(
         &self,
         node: &TreeNode,
         doc_y: f32,
         page_width: Pixels,
         window_h: Pixels,
+        rem_size: Pixels,
         streaming: bool,
         cx: &Context<Self>,
     ) -> gpui::Div {
@@ -2750,8 +2765,9 @@ impl SpaceView {
             NodeSrc::Draft => {
                 // Inactive draft: render inline (an editable "Draft" post that
                 // takes real vertical space); clicking it re-activates it.
-                column =
-                    column.child(self.render_inactive_draft(node, doc_y, page_width, window_h, cx));
+                column = column.child(
+                    self.render_inactive_draft(node, doc_y, page_width, window_h, rem_size, cx),
+                );
             }
             _ => {
                 column = column
@@ -2778,6 +2794,7 @@ impl SpaceView {
                 child_doc_y,
                 page_width,
                 window_h,
+                rem_size,
                 streaming,
                 cx,
             ))
@@ -2796,6 +2813,7 @@ impl SpaceView {
         doc_y: f32,
         page_width: Pixels,
         window_h: Pixels,
+        rem_size: Pixels,
         streaming: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -2910,7 +2928,7 @@ impl SpaceView {
             }
             let near = (i as i64 - active as i64).abs() <= 1;
             let page = if near {
-                self.render_subtree(child, doc_y, page_width, window_h, streaming, cx)
+                self.render_subtree(child, doc_y, page_width, window_h, rem_size, streaming, cx)
                     .into_any_element()
             } else {
                 let h = self.selected_subtree_height(child, page_width, window_h);
