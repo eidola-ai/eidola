@@ -380,7 +380,10 @@ impl SpaceView {
             return empty();
         }
         if self.space.read(cx).is_streaming() {
-            return empty();
+            // This settled row remains actionable once the turn finishes, so
+            // compact layout keeps its latent action line stable while the
+            // temporarily disabled verbs stay hidden.
+            return action_gutter(page_layout, true).gap_0p5();
         }
 
         // The shared quiet-verb look (see `verb_button`) — the same family the
@@ -663,7 +666,7 @@ impl SpaceView {
         // below the text lands inside the editor and resolves to document end —
         // the same notes-editor affordance as the active composer, owned by the
         // editor.
-        let slot_h = self.runway_height(window_h);
+        let slot_h = self.runway_floor(window_h);
         let compact_top = match page_layout.gutters {
             GutterPlacement::Sides => 0.0,
             GutterPlacement::Stacked => super::layout::compact_gutter_occupancy(px(
@@ -681,9 +684,8 @@ impl SpaceView {
         .relative()
         .w(page_width)
         // A draft is always the end of its branch, so reserve at least a
-        // standalone slot — the same `max(natural, standalone)` runway the
-        // active composer docks into — so activating/deactivating it never
-        // shifts the layout (`node_height` reports the same height).
+        // trailing runway floor. Its own content can grow the row beyond this
+        // through normal layout measurement; another draft's content cannot.
         .min_h(px(slot_h))
         .py(POST_PAD_Y)
         .id(SharedString::from(format!(

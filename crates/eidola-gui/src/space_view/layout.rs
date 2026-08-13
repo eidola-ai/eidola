@@ -334,17 +334,33 @@ impl SpaceView {
         (window_h.as_f32() - self.doc_reserve()).max(0.0)
     }
 
-    /// A branch's trailing runway. A populated conversation claims a full
-    /// window so its document floor can carry the docked surface all the way
-    /// to the top edge. A blank notebook keeps the titlebar-adjusted standalone
-    /// slot, making its reserve plus composer exactly one no-scroll window.
-    pub(crate) fn runway_height(&self, window_h: Pixels) -> f32 {
-        let floor = if self.posts.is_empty() {
+    /// The minimum runway for a trailing draft, independent of any draft's
+    /// content. Populated conversations claim a full window so their document
+    /// floor can carry a docked surface all the way to the top edge; a blank
+    /// notebook keeps its titlebar-adjusted no-scroll slot.
+    pub(crate) fn runway_floor(&self, window_h: Pixels) -> f32 {
+        if self.posts.is_empty() {
             self.standalone_slot_h(window_h)
         } else {
             window_h.as_f32() + Self::composer_chrome()
-        };
-        floor.max(self.composer_natural_height())
+        }
+    }
+
+    /// The active composer's runway combines the shared floor with that
+    /// composer's own measured natural height.
+    pub(crate) fn runway_height(&self, window_h: Pixels) -> f32 {
+        self.runway_floor(window_h)
+            .max(self.composer_natural_height())
+    }
+
+    /// An inactive draft is an inline row, so its own recorded layout — never
+    /// the active composer's natural height — decides whether it exceeds the
+    /// same trailing runway floor.
+    pub(crate) fn inactive_draft_height(&self, id: &str, window_h: Pixels) -> f32 {
+        self.layout
+            .measured(id)
+            .unwrap_or(0.0)
+            .max(self.runway_floor(window_h))
     }
 
     /// The in-flow slot height the draft reserves — the runway (the composer
@@ -366,16 +382,12 @@ impl SpaceView {
             NodeSrc::Draft if self.active_draft.as_deref() == Some(&node.id) => {
                 self.draft_slot_height(node, page_width, window_h)
             }
-            // An inactive draft renders inline as an editable post, but reserves
-            // at least a standalone slot (it's always the end of its branch), so
-            // there's perfect continuity with the active draft's runway slot —
-            // activating/deactivating it never resizes the layout. `min_h` on
-            // the inline frame makes the measured height honour the same floor.
-            NodeSrc::Draft => self
-                .layout
-                .measured(&node.id)
-                .unwrap_or(0.0)
-                .max(self.runway_height(window_h)),
+            // An inactive draft renders inline as an editable post and claims
+            // its own measured height over the shared runway floor. That keeps
+            // one draft continuous across activation without letting another
+            // active draft inflate it. `min_h` on the inline frame makes the
+            // measurement honour the same floor.
+            NodeSrc::Draft => self.inactive_draft_height(&node.id, window_h),
             NodeSrc::Streaming(_) => self
                 .layout
                 .measured(&node.id)

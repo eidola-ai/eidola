@@ -1273,6 +1273,15 @@ impl SpaceView {
         self.runway_height(px(window_h))
     }
 
+    /// The inline slot height for one inactive draft. This reads the same
+    /// measured-height-plus-runway-floor contract as document layout.
+    #[doc(hidden)]
+    pub fn inactive_draft_height_for_test(&self, index: usize, window_h: f32) -> Option<f32> {
+        let draft = self.drafts.get(index)?;
+        (self.active_draft.as_ref() != Some(&draft.id))
+            .then(|| self.inactive_draft_height(&draft.id, px(window_h)))
+    }
+
     #[doc(hidden)]
     pub fn composer_chrome_for_test(&self) -> f32 {
         Self::composer_chrome()

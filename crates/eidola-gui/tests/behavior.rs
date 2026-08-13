@@ -3172,6 +3172,70 @@ fn a_populated_composer_has_full_window_docking_runway(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+fn an_inactive_tail_draft_does_not_borrow_an_off_branch_composers_height(cx: &mut TestAppContext) {
+    const WINDOW_H: f32 = 560.0;
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("draft-heights".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut left = fixture_assistant_post("a2", "left branch");
+    left.parent_action_id = Some("a1".into());
+    let mut right = fixture_assistant_post("a3", "right branch");
+    right.parent_action_id = Some("a1".into());
+    space.update(cx, |s, cx| {
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", "root"), left, right], cx)
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(WINDOW_H)));
+    vcx.run_until_parked();
+    let parents = view.read_with(&vcx, |v, _| v.draft_parents_for_test());
+    let left_index = parents
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a2"))
+        .expect("left branch tail draft");
+    let right_index = parents
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a3"))
+        .expect("right branch tail draft");
+
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(right_index, cx));
+    vcx.run_until_parked();
+    let left_before = view
+        .read_with(&vcx, |v, _| {
+            v.inactive_draft_height_for_test(left_index, WINDOW_H)
+        })
+        .expect("left draft remains inactive");
+
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("right draft is active");
+    let long = (0..80)
+        .map(|i| format!("Paragraph {i} fills the off-branch composer with its own content."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    editor.update(&mut vcx, |editor, cx| editor.set_value(long, cx));
+    vcx.run_until_parked();
+
+    let (left_after, active_runway) = view.read_with(&vcx, |v, _| {
+        (
+            v.inactive_draft_height_for_test(left_index, WINDOW_H)
+                .expect("left draft remains inactive"),
+            v.runway_height_for_test(WINDOW_H),
+        )
+    });
+    assert!(
+        active_runway > left_after + 1.0,
+        "the long active composer must exceed the inactive draft's own slot \
+         ({active_runway} vs {left_after})"
+    );
+    assert!(
+        (left_before - left_after).abs() < 0.5,
+        "off-branch composer growth must not inflate an inactive tail draft \
+         ({left_before} -> {left_after})"
+    );
+}
+
+#[gpui::test]
 fn space_composer_text_sits_where_its_post_will_land(cx: &mut TestAppContext) {
     // REGRESSION (task 40): the composer *becomes* the post, so the words in it
     // must already sit where the post will render them — submitting must not
