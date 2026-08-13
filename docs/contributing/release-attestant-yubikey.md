@@ -4,6 +4,8 @@ This guide is for a release officer setting up a fresh YubiKey 5 (e.g. a 5C) as 
 
 For the conceptual model of what the attestant key is and how it fits the trust root, see [`../trust-root.md`](../trust-root.md). For the rotation procedure once a key is already in service, see [`../../releases/README.md`](../../releases/README.md#rotating-an-attestant-key). This document covers the one-time hardware provisioning that those assume has already happened.
 
+This is the human-presence key and must require touch. The distinct [Apple CI signing YubiKey](release-apple-signing-yubikey.md) must not require touch, because it signs unattended workflows.
+
 ## Why a YubiKey, and the key decisions
 
 The attestant key authorizes software updates for every client. Holding it on a purpose-built device — where the private key is generated on-chip, is non-exportable, and requires a PIN (and a physical touch) for each signature — is materially stronger than a `cosign generate-key-pair` key derived on a general-purpose computer, where the private key exists in memory and on disk and can be exfiltrated by any process that compromises the machine.
