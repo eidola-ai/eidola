@@ -638,6 +638,7 @@ impl SpaceView {
         doc_y: f32,
         page_width: gpui::Pixels,
         window_h: gpui::Pixels,
+        rem_size: gpui::Pixels,
         cx: &Context<Self>,
     ) -> AnyElement {
         let h = self.node_height(node, page_width, window_h);
@@ -667,11 +668,14 @@ impl SpaceView {
         // the same notes-editor affordance as the active composer, owned by the
         // editor.
         let slot_h = self.runway_floor(window_h);
+        // The occupancy must resolve against the same rem the painted gutter
+        // rows resolve their `rems(..)` heights against — the window's rem
+        // size, threaded down from `render` (a second derivation from the
+        // theme constants would silently break the inactive/active slot
+        // continuity the day the two diverge).
         let compact_top = match page_layout.gutters {
             GutterPlacement::Sides => 0.0,
-            GutterPlacement::Stacked => super::layout::compact_gutter_occupancy(px(
-                crate::theme::UI_FONT_SIZE * self.layout.scale(),
-            )),
+            GutterPlacement::Stacked => super::layout::compact_gutter_occupancy(rem_size),
         };
         let editor_fill = px((slot_h - 2.0 * POST_PAD_Y.as_f32() - compact_top).max(0.0));
 
@@ -692,8 +696,11 @@ impl SpaceView {
             "space-draft-inactive-{}",
             node.id
         )))
+        // Indexed by the draft's node id: several branches' inactive tail
+        // drafts paint at once, and probe names must be unique per painted
+        // element (a shared name collapses them in the driver's registry).
         .probe(
-            "space/draft/inactive",
+            format!("space/draft/inactive/{}", node.id),
             gpui::Role::Button,
             "Draft — open to edit",
         )

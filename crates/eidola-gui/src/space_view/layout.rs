@@ -293,15 +293,20 @@ impl SpaceView {
         ((scrolled / stride).round() as i64).clamp(0, count as i64 - 1) as usize
     }
 
-    /// Half the document's inter-post spacing — the composer bar's **total**
-    /// fixed top chrome (bar top edge → editor content). Every height / dock /
-    /// runway computation uses this total; the render alone splits it at the
-    /// scroll clip — a thin pane-separator band outside
+    /// The document's full inter-post pad — the composer bar's **total** fixed
+    /// top chrome (bar top edge → editor content). It is the whole
+    /// [`POST_PAD_Y`] because the docked bar's top edge sits exactly at its
+    /// slot top, where a post row begins: the editor content then starts
+    /// `POST_PAD_Y` below the slot top, exactly where a post's body sits under
+    /// its own top pad, and the bar's surface abuts the separator band above
+    /// it the way every post row does. Every height / dock / runway
+    /// computation uses this total; the render alone splits it at the scroll
+    /// clip — a thin pane-separator band outside
     /// ([`super::composer::COMPOSER_SEPARATOR_H`]) and the remainder as an
     /// in-content spacer ([`super::composer::composer_scroll_gap`]) — so the
     /// split is invisible until the composer scrolls internally.
     pub(crate) fn composer_chrome() -> f32 {
-        POST_PAD_Y.as_f32() / 2.0
+        POST_PAD_Y.as_f32()
     }
 
     /// The document's top reserve: headroom that holds whatever leads the
@@ -335,14 +340,18 @@ impl SpaceView {
     }
 
     /// The minimum runway for a trailing draft, independent of any draft's
-    /// content. Populated conversations claim a full window so their document
-    /// floor can carry a docked surface all the way to the top edge; a blank
+    /// content. Populated conversations claim **exactly one window**, and the
+    /// docked bar's top edge is its slot top ([`Self::composer_chrome`]), so
+    /// at the document floor the two readings coincide: the slot — the
+    /// composer's minimum height, and the runway a reader scrolls through —
+    /// fills the window, and the painted surface is flush with the window's
+    /// top edge, the previous separator band just cleared above it. A blank
     /// notebook keeps its titlebar-adjusted no-scroll slot.
     pub(crate) fn runway_floor(&self, window_h: Pixels) -> f32 {
         if self.posts.is_empty() {
             self.standalone_slot_h(window_h)
         } else {
-            window_h.as_f32() + Self::composer_chrome()
+            window_h.as_f32()
         }
     }
 
