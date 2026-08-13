@@ -34,6 +34,8 @@ pub struct Layout {
     /// The **reading-column** width (`body_width`) the cached heights were
     /// measured at — a post's height depends only on this, not the window width.
     width: Rc<Cell<f32>>,
+    /// Whether the cached row heights include compact metadata/action lines.
+    stacked: Rc<Cell<bool>>,
     /// The type-scale factor the cached heights were measured at. A post's
     /// shaped height scales with the prose font size, so a zoom must invalidate
     /// the cache exactly like a column change (the same estimate→real re-measure
@@ -50,6 +52,7 @@ impl Default for Layout {
     fn default() -> Self {
         Self {
             width: Rc::new(Cell::new(0.0)),
+            stacked: Rc::new(Cell::new(false)),
             scale: Rc::new(Cell::new(1.0)),
             heights: Rc::new(RefCell::new(HashMap::new())),
             clears: Rc::new(Cell::new(0)),
@@ -69,10 +72,15 @@ impl Layout {
     /// the measured heights survive, so the document height and scroll offset
     /// stay stable across the resize. A zoom, by contrast, reshapes every post,
     /// so a scale change *does* clear.
-    pub fn ensure_width(&self, width: f32, scale: f32) {
-        if (self.width.get() - width).abs() > 0.5 || (self.scale.get() - scale).abs() > 1e-3 {
+    pub(crate) fn ensure_width(&self, width: f32, scale: f32, gutters: GutterPlacement) {
+        let stacked = gutters == GutterPlacement::Stacked;
+        if (self.width.get() - width).abs() > 0.5
+            || (self.scale.get() - scale).abs() > 1e-3
+            || self.stacked.get() != stacked
+        {
             self.width.set(width);
             self.scale.set(scale);
+            self.stacked.set(stacked);
             self.heights.borrow_mut().clear();
             self.clears.set(self.clears.get().wrapping_add(1));
         }
@@ -166,22 +174,61 @@ use super::{
 };
 use gpui::Pixels;
 
-/// The reading-column width for a post body at a given page width — the
-/// centered measure between the two symmetric gutters (byline on the left,
-/// actions on the right), capped at [`BODY_MAX_WIDTH`].
-pub(crate) fn body_width(page_width: Pixels) -> f32 {
-    (page_width - (GUTTER_WIDTH + GUTTER_GAP) * 2.)
-        .min(BODY_MAX_WIDTH)
-        .max(gpui::px(240.))
-        .as_f32()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GutterPlacement {
+    Sides,
+    Stacked,
 }
 
-/// The narrowest page whose [`body_width`] is the full [`BODY_MAX_WIDTH`]
-/// measure. Below it the reading column compresses (prose wraps short); above
-/// it only the gutters grow. `lib.rs::writing_surface_size` derives the default
-/// space-window width from this, so a fresh window opens at full measure.
+/// The shared horizontal contract for every conversation row. Side gutters
+/// stay in place while they leave the prose at its full measure. Once they
+/// would squeeze it, metadata and actions stack around the prose instead.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PageLayout {
+    pub(crate) body_width: f32,
+    pub(crate) gutters: GutterPlacement,
+}
+
+pub(crate) const COMPACT_GUTTER_LINE_REMS: f32 = 1.5;
+pub(crate) const COMPACT_GUTTER_GAP_REMS: f32 = 0.5;
+pub(crate) const COMPACT_PAGE_INSET: Pixels = POST_PAD_Y;
+
+pub(crate) fn compact_gutter_occupancy(rem_size: Pixels) -> f32 {
+    rem_size.as_f32() * (COMPACT_GUTTER_LINE_REMS + COMPACT_GUTTER_GAP_REMS)
+}
+
+pub(crate) fn page_layout(page_width: Pixels) -> PageLayout {
+    if page_width >= full_measure_page_width() {
+        PageLayout {
+            body_width: BODY_MAX_WIDTH.as_f32(),
+            gutters: GutterPlacement::Sides,
+        }
+    } else {
+        PageLayout {
+            body_width: (page_width.min(compact_full_measure_page_width())
+                - COMPACT_PAGE_INSET * 2.0)
+                .max(gpui::px(0.))
+                .as_f32(),
+            gutters: GutterPlacement::Stacked,
+        }
+    }
+}
+
+/// The reading-column width for a post body at a given page width.
+pub(crate) fn body_width(page_width: Pixels) -> f32 {
+    page_layout(page_width).body_width
+}
+
+/// The narrowest page that fits the full reading measure between side gutters.
+/// Below it the gutters stack; `lib.rs::writing_surface_size` derives the
+/// default space-window width from this so a fresh window opens in side mode.
 pub(crate) fn full_measure_page_width() -> Pixels {
     BODY_MAX_WIDTH + (GUTTER_WIDTH + GUTTER_GAP) * 2.
+}
+
+/// The narrowest stacked page that preserves the full reading measure.
+pub(crate) fn compact_full_measure_page_width() -> Pixels {
+    BODY_MAX_WIDTH + COMPACT_PAGE_INSET * 2.0
 }
 
 /// The selected branch's two ends as page-scroll `y`s (both ≤ 0). See
@@ -258,13 +305,18 @@ impl SpaceView {
         (window_h.as_f32() - self.doc_reserve()).max(0.0)
     }
 
-    /// A branch's trailing runway: at least a standalone slot (so the docked
-    /// composer can stand alone below the reserve), or as tall as the
-    /// composer's content if more.
+    /// A branch's trailing runway. A populated conversation claims a full
+    /// window so its document floor can carry the docked surface all the way
+    /// to the top edge. A blank notebook keeps the titlebar-adjusted standalone
+    /// slot, making its reserve plus composer exactly one no-scroll window.
     pub(crate) fn runway_height(&self, window_h: Pixels) -> f32 {
         let content = self.composer_content_h.borrow().as_f32();
-        self.standalone_slot_h(window_h)
-            .max(Self::composer_chrome() + content)
+        let floor = if self.posts.is_empty() {
+            self.standalone_slot_h(window_h)
+        } else {
+            window_h.as_f32() + Self::composer_chrome()
+        };
+        floor.max(Self::composer_chrome() + content)
     }
 
     /// The in-flow slot height the draft reserves — the runway (the composer
@@ -272,10 +324,18 @@ impl SpaceView {
     pub(crate) fn draft_slot_height(
         &self,
         _node: &TreeNode,
-        _page_width: Pixels,
+        page_width: Pixels,
         window_h: Pixels,
     ) -> f32 {
+        let compact = match page_layout(page_width).gutters {
+            GutterPlacement::Sides => 0.0,
+            GutterPlacement::Stacked => {
+                compact_gutter_occupancy(gpui::px(crate::theme::UI_FONT_SIZE * self.layout.scale()))
+                    * 2.0
+            }
+        };
         self.runway_height(window_h)
+            .max(Self::composer_chrome() + self.composer_content_h.borrow().as_f32() + compact)
     }
 
     /// The node's own in-flow block height: a post's measured (or estimated)
@@ -295,7 +355,7 @@ impl SpaceView {
                 .layout
                 .measured(&node.id)
                 .unwrap_or(0.0)
-                .max(self.standalone_slot_h(window_h)),
+                .max(self.runway_height(window_h)),
             NodeSrc::Streaming(_) => self
                 .layout
                 .measured(&node.id)
@@ -647,24 +707,24 @@ mod tests {
     #[test]
     fn width_change_invalidates() {
         let l = Layout::new();
-        l.ensure_width(600.0, 1.0);
+        l.ensure_width(600.0, 1.0, GutterPlacement::Sides);
         let id = SharedString::from("a1");
         assert!(l.record(&id, 200.0));
         assert_eq!(l.measured("a1"), Some(200.0));
         // Same width + scale, same value → no change reported, value retained.
         assert!(!l.record(&id, 200.3));
         // Same width and scale re-asserted → cache survives (no phantom clear).
-        l.ensure_width(600.0, 1.0);
+        l.ensure_width(600.0, 1.0, GutterPlacement::Sides);
         assert_eq!(l.measured("a1"), Some(200.0));
         // Width change clears.
-        l.ensure_width(480.0, 1.0);
+        l.ensure_width(480.0, 1.0, GutterPlacement::Sides);
         assert_eq!(l.measured("a1"), None);
     }
 
     #[test]
     fn scale_change_invalidates() {
         let l = Layout::new();
-        l.ensure_width(600.0, 1.0);
+        l.ensure_width(600.0, 1.0, GutterPlacement::Sides);
         let id = SharedString::from("a1");
         l.record(&id, 200.0);
         assert_eq!(l.measured("a1"), Some(200.0));
@@ -672,9 +732,20 @@ mod tests {
         // A zoom reshapes every post, so a scale change clears at the same
         // width and updates the reported scale (which the estimate reads).
         let before = l.clears();
-        l.ensure_width(600.0, 1.25);
+        l.ensure_width(600.0, 1.25, GutterPlacement::Sides);
         assert_eq!(l.measured("a1"), None);
         assert_eq!(l.scale(), 1.25);
+        assert_eq!(l.clears(), before + 1);
+    }
+
+    #[test]
+    fn gutter_placement_change_invalidates() {
+        let l = Layout::new();
+        l.ensure_width(600.0, 1.0, GutterPlacement::Sides);
+        l.record(&SharedString::from("a1"), 200.0);
+        let before = l.clears();
+        l.ensure_width(600.0, 1.0, GutterPlacement::Stacked);
+        assert_eq!(l.measured("a1"), None);
         assert_eq!(l.clears(), before + 1);
     }
 
@@ -702,16 +773,36 @@ mod tests {
     }
 
     #[test]
-    fn full_measure_page_width_is_the_narrowest_full_column() {
+    fn page_layout_preserves_measure_across_gutter_breakpoint() {
         let full = full_measure_page_width();
-        assert_eq!(body_width(full), BODY_MAX_WIDTH.as_f32());
-        assert!(body_width(full - gpui::px(1.)) < BODY_MAX_WIDTH.as_f32());
+        assert_eq!(
+            page_layout(full),
+            PageLayout {
+                body_width: BODY_MAX_WIDTH.as_f32(),
+                gutters: GutterPlacement::Sides,
+            }
+        );
+        assert_eq!(
+            page_layout(full - gpui::px(1.)),
+            PageLayout {
+                body_width: BODY_MAX_WIDTH.as_f32(),
+                gutters: GutterPlacement::Stacked,
+            }
+        );
+        assert_eq!(
+            body_width(compact_full_measure_page_width()),
+            BODY_MAX_WIDTH.as_f32()
+        );
+        assert_eq!(
+            body_width(compact_full_measure_page_width() - gpui::px(1.)),
+            BODY_MAX_WIDTH.as_f32() - 1.0
+        );
     }
 
     #[test]
     fn retain_prunes_dead_ids() {
         let l = Layout::new();
-        l.ensure_width(600.0, 1.0);
+        l.ensure_width(600.0, 1.0, GutterPlacement::Sides);
         l.record(&SharedString::from("a1"), 100.0);
         l.record(&SharedString::from("a2"), 100.0);
         l.retain(&|id| id == "a1");

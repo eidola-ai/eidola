@@ -263,6 +263,37 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_docked_composer",
+                description: "Space view: a populated conversation settled at the document floor with its active composer fully docked",
+                default_size: size(px(900.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    view.update(cx, |view, cx| {
+                        view.space().update(cx, |space, cx| {
+                            space.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
+                        });
+                        view.seed_draft_quote_for_test(
+                            Some("a9"),
+                            "I want to preserve that distinction in the final paragraph.",
+                            vec![],
+                            window,
+                            cx,
+                        );
+                        view.set_page_scroll_for_test(-100_000.0);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_long_post",
                 description: "Space view: a conversation whose assistant reply is far taller than the window (selection repro)",
                 default_size: size(px(760.), px(680.)),

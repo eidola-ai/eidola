@@ -715,7 +715,7 @@ fn circadian_day(character: LightCharacter, font_scale: f32) -> ThemeConfig {
 /// The designed UI (chrome/component) font size at Actual Size — the value
 /// gpui-component installs as the window `rem_size`. The type-scale factor
 /// multiplies it.
-const UI_FONT_SIZE: f32 = 14.;
+pub(crate) const UI_FONT_SIZE: f32 = 14.;
 
 fn day_colors() -> ThemeConfigColors {
     let mut c = ThemeConfigColors::default();
