@@ -1,0 +1,156 @@
+{
+  "settled/Fixture.app/Contents/MacOS/Fixture": {
+    "file_sha256": "470c4ea8aefb5c736c110245d43043ccc477a724c3e96d763baa70a2f1d14903",
+    "file_size": 84048,
+    "kind": "fat",
+    "slices": [
+      {
+        "arch": "x86_64",
+        "code_signature": {
+          "dataoff": 4272,
+          "datasize": 18336,
+          "lc_offset": 17144,
+          "superblob_sha256": "d1e214a96ac55f530a313fd6a7853f562096393ebcb1b2da943206c9b6fa5d2f"
+        },
+        "fat_align": 14,
+        "fat_offset": 16384,
+        "fat_size": 22608,
+        "header_offset": 16384,
+        "linkedit": {
+          "fileoff": 4096,
+          "fileoff_field_offset": 16760,
+          "filesize": 18512,
+          "filesize_field_offset": 16768,
+          "vmaddr": 4294971392,
+          "vmsize": 32768,
+          "vmsize_field_offset": 16752
+        },
+        "mh_flags": "0x200085"
+      },
+      {
+        "arch": "arm64",
+        "code_signature": {
+          "dataoff": 16560,
+          "datasize": 18336,
+          "lc_offset": 49912,
+          "superblob_sha256": "32fd2063c2c0fd662e414095e19088b16585a77faff74fb49437f938f0aaf9d3"
+        },
+        "fat_align": 14,
+        "fat_offset": 49152,
+        "fat_size": 34896,
+        "header_offset": 49152,
+        "linkedit": {
+          "fileoff": 16384,
+          "fileoff_field_offset": 49528,
+          "filesize": 18512,
+          "filesize_field_offset": 49536,
+          "vmaddr": 4294983680,
+          "vmsize": 32768,
+          "vmsize_field_offset": 49520
+        },
+        "mh_flags": "0x200085"
+      }
+    ]
+  },
+  "signed/Fixture.app/Contents/MacOS/Fixture": {
+    "file_sha256": "a248f0aebc03d7466463c1faa5a9a6a5f348a6688775e576bcf09095c6fa560d",
+    "file_size": 84480,
+    "kind": "fat",
+    "slices": [
+      {
+        "arch": "x86_64",
+        "code_signature": {
+          "dataoff": 4272,
+          "datasize": 18768,
+          "lc_offset": 17144,
+          "superblob_sha256": "b26ed77ec09e9122e144c418c8caccad8471152a2af8865126f25df3edab5a27"
+        },
+        "fat_align": 14,
+        "fat_offset": 16384,
+        "fat_size": 23040,
+        "header_offset": 16384,
+        "linkedit": {
+          "fileoff": 4096,
+          "fileoff_field_offset": 16760,
+          "filesize": 18944,
+          "filesize_field_offset": 16768,
+          "vmaddr": 4294971392,
+          "vmsize": 32768,
+          "vmsize_field_offset": 16752
+        },
+        "mh_flags": "0x200085"
+      },
+      {
+        "arch": "arm64",
+        "code_signature": {
+          "dataoff": 16560,
+          "datasize": 18768,
+          "lc_offset": 49912,
+          "superblob_sha256": "38443abd277d01df774115078b7b0b2b49e11fb3af39236533aede754a0db442"
+        },
+        "fat_align": 14,
+        "fat_offset": 49152,
+        "fat_size": 35328,
+        "header_offset": 49152,
+        "linkedit": {
+          "fileoff": 16384,
+          "fileoff_field_offset": 49528,
+          "filesize": 18944,
+          "filesize_field_offset": 49536,
+          "vmaddr": 4294983680,
+          "vmsize": 32768,
+          "vmsize_field_offset": 49520
+        },
+        "mh_flags": "0x200085"
+      }
+    ]
+  },
+  "unsettled.macho": {
+    "file_sha256": "8f53d3784963c12a9c6a7771823d04ddc5851787353fb722cc09be6987eee1eb",
+    "file_size": 33216,
+    "kind": "fat",
+    "slices": [
+      {
+        "arch": "x86_64",
+        "code_signature": null,
+        "fat_align": 12,
+        "fat_offset": 4096,
+        "fat_size": 4272,
+        "header_offset": 4096,
+        "linkedit": {
+          "fileoff": 4096,
+          "fileoff_field_offset": 4472,
+          "filesize": 176,
+          "filesize_field_offset": 4480,
+          "vmaddr": 4294971392,
+          "vmsize": 4096,
+          "vmsize_field_offset": 4464
+        },
+        "mh_flags": "0x200085"
+      },
+      {
+        "arch": "arm64",
+        "code_signature": {
+          "dataoff": 16560,
+          "datasize": 272,
+          "lc_offset": 17144,
+          "superblob_sha256": "fed1aaffaf89a2ab80a619c7e1839b5bfc806610087e9b9efac7413a7eeffdf0"
+        },
+        "fat_align": 14,
+        "fat_offset": 16384,
+        "fat_size": 16832,
+        "header_offset": 16384,
+        "linkedit": {
+          "fileoff": 16384,
+          "fileoff_field_offset": 16760,
+          "filesize": 448,
+          "filesize_field_offset": 16768,
+          "vmaddr": 4294983680,
+          "vmsize": 16384,
+          "vmsize_field_offset": 16752
+        },
+        "mh_flags": "0x200085"
+      }
+    ]
+  }
+}
