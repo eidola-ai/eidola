@@ -85,7 +85,7 @@ fn setup(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) {
 /// The shared constructor is the only outer request shape app-core may send.
 /// Read every input from the harness-captured body, so a field added at either
 /// dispatch call site makes this exact-body comparison fail.
-fn assert_shared_request_body(body: &serde_json::Value) {
+fn assert_shared_request_body(body: &serde_json::Value, expected_stream: bool) {
     let model = body["model"].as_str().expect("wire model");
     let messages = body["messages"].as_array().expect("messages array");
     let max_completion_tokens = u32::try_from(
@@ -99,7 +99,18 @@ fn assert_shared_request_body(body: &serde_json::Value) {
         .and_then(|tools| tools.as_array())
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let stream = body.get("stream").and_then(|stream| stream.as_bool()) == Some(true);
+    if expected_stream {
+        assert_eq!(
+            body.get("stream").and_then(|stream| stream.as_bool()),
+            Some(true),
+            "streaming dispatch must set `stream: true`"
+        );
+    } else {
+        assert!(
+            body.get("stream").is_none(),
+            "blocking dispatch must omit `stream`"
+        );
+    }
     let include_usage = body
         .get("stream_options")
         .and_then(|options| options.get("include_usage"))
@@ -113,7 +124,7 @@ fn assert_shared_request_body(body: &serde_json::Value) {
             messages,
             max_completion_tokens,
             tools,
-            stream,
+            expected_stream,
             include_usage,
         ),
         "dispatch must send exactly the shared chat request body"
@@ -375,7 +386,7 @@ fn blocking_and_streaming_dispatch_use_the_shared_request_body() {
                 .expect("blocking chat succeeds");
 
             let body = mock.chat_bodies().pop().expect("blocking request");
-            assert_shared_request_body(&body);
+            assert_shared_request_body(&body, false);
         }
 
         {
@@ -397,7 +408,52 @@ fn blocking_and_streaming_dispatch_use_the_shared_request_body() {
             result.expect("streaming chat succeeds");
 
             let body = mock.chat_bodies().pop().expect("streaming request");
-            assert_shared_request_body(&body);
+            assert_shared_request_body(&body, true);
+        }
+
+        {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::ToolRoundsBlocking(1),
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            with_echo_tool(&core);
+
+            core.runtime()
+                .block_on(core.chat("blocking tool body".into(), MODEL.into(), None))
+                .expect("blocking tool chat succeeds");
+
+            let body = mock
+                .chat_bodies()
+                .pop()
+                .expect("blocking tool follow-up request");
+            assert_shared_request_body(&body, false);
+        }
+
+        {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::ToolRoundsStreaming(1),
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            with_echo_tool(&core);
+            let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            let result = core.runtime().block_on(async {
+                let drain = async { while events_rx.recv().await.is_some() {} };
+                let (result, ()) = tokio::join!(
+                    core.chat_stream("streaming tool body".into(), MODEL.into(), None, tx),
+                    drain,
+                );
+                result
+            });
+            result.expect("streaming tool chat succeeds");
+
+            let body = mock
+                .chat_bodies()
+                .pop()
+                .expect("streaming tool follow-up request");
+            assert_shared_request_body(&body, true);
         }
     });
 }
