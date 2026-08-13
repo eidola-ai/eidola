@@ -1,0 +1,63 @@
+{
+  "bundle": "Fixture.app",
+  "files": {
+    "Contents/_CodeSignature/CodeResources": "sha256:6686de10a28a2fe11b36cbb86dcbacc827cfc4ea116b4dabf1845e5aee629e9b"
+  },
+  "machos": {
+    "Contents/MacOS/Fixture": {
+      "input_sha256": "470c4ea8aefb5c736c110245d43043ccc477a724c3e96d763baa70a2f1d14903",
+      "kind": "fat",
+      "output_len": 84480,
+      "output_sha256": "a248f0aebc03d7466463c1faa5a9a6a5f348a6688775e576bcf09095c6fa560d",
+      "slices": [
+        {
+          "arch": "x86_64",
+          "code_signature": {
+            "dataoff": 4272,
+            "datasize": 18768,
+            "lc_offset": 17144,
+            "superblob_sha256": "b26ed77ec09e9122e144c418c8caccad8471152a2af8865126f25df3edab5a27"
+          },
+          "fat_align": 14,
+          "fat_offset": 16384,
+          "fat_size": 23040,
+          "header_offset": 16384,
+          "linkedit": {
+            "fileoff": 4096,
+            "fileoff_field_offset": 16760,
+            "filesize": 18944,
+            "filesize_field_offset": 16768,
+            "vmaddr": 4294971392,
+            "vmsize": 32768,
+            "vmsize_field_offset": 16752
+          },
+          "mh_flags": "0x200085"
+        },
+        {
+          "arch": "arm64",
+          "code_signature": {
+            "dataoff": 16560,
+            "datasize": 18768,
+            "lc_offset": 49912,
+            "superblob_sha256": "38443abd277d01df774115078b7b0b2b49e11fb3af39236533aede754a0db442"
+          },
+          "fat_align": 14,
+          "fat_offset": 49152,
+          "fat_size": 35328,
+          "header_offset": 49152,
+          "linkedit": {
+            "fileoff": 16384,
+            "fileoff_field_offset": 49528,
+            "filesize": 18944,
+            "filesize_field_offset": 49536,
+            "vmaddr": 4294983680,
+            "vmsize": 32768,
+            "vmsize_field_offset": 49520
+          },
+          "mh_flags": "0x200085"
+        }
+      ]
+    }
+  },
+  "schema_version": 1
+}

@@ -75,7 +75,8 @@
         "crane": "crane",
         "fenix": "fenix",
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "signapple": "signapple"
       }
     },
     "rust-analyzer-src": {
@@ -92,6 +93,23 @@
         "owner": "rust-lang",
         "ref": "nightly",
         "repo": "rust-analyzer",
+        "type": "github"
+      }
+    },
+    "signapple": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1779818594,
+        "narHash": "sha256-97hfo4teriyaTPYWGFNAxqeApYspw7haOjyDohc6+WI=",
+        "owner": "achow101",
+        "repo": "signapple",
+        "rev": "3fab3bb57f227f0dd31007b417683035f5204838",
+        "type": "github"
+      },
+      "original": {
+        "owner": "achow101",
+        "repo": "signapple",
+        "rev": "3fab3bb57f227f0dd31007b417683035f5204838",
         "type": "github"
       }
     },

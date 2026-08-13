@@ -48,6 +48,7 @@ Eidola is a privacy-preserving AI chat system: an OpenAI-compatible proxy server
 - `just update-brand` — regenerate every identity asset (macOS `.icns`, website favicon + touch icon, Linux themed icons) from the geometry in `brand/generate.py`. macOS-only; the outputs are committed, so nothing builds them. See `brand/AGENTS.md`.
 - `just update-manifest` — regenerate `artifact-manifest.json` + `releases/trust/server-enclave.json`. **Release-time only; do not run as part of a feature change** (the desktop narHashes move with any sidecar/toolchain change).
 - `just engine` — materialize the bundled llama.cpp sidecar via Nix for the dev `.app` (optional; `just build gui` does not depend on Nix).
+- `just apple-roundtrip [path/to/Eidola.app]` — re-run the Apple detached-signature round-trip checks on a built universal `.app` (macOS-only; with no path it builds `.#eidola-gui-macos-universal` first, which is slow). Measurement and verdict: `scripts/fixtures/apple-roundtrip/round-trip.md`.
 
 **Dev profile:** dependencies build at `opt-level = 2` in dev (`[profile.dev.package."*"]`) while our crates stay unoptimized — 8-17× faster GUI frames for ~90 s one-time cost. The cost is debugging *inside* a dependency (locals read "optimized out"); backtraces are unaffected. Measurements in the comment above the profile in the root `Cargo.toml`.
 

@@ -164,6 +164,17 @@ update-openapi:
 update-brand:
     python3 brand/generate.py
 
+# Re-run the Apple detached-signature round-trip checks (macOS only) against
+# a built universal .app: ad-hoc signing determinism, detach -> apply byte
+# equality on both slices and the arm64-only sidecar, the __LINKEDIT vmsize
+# transitions, the placement-driven apply onto the artifact as built, and
+# codesign --verify --deep --strict. With no argument it
+# builds .#eidola-gui-macos-universal first, which is slow; pass a path to
+# an already-built Eidola.app to skip that. Result and verdict:
+# scripts/fixtures/apple-roundtrip/round-trip.md.
+apple-roundtrip *args:
+    ./scripts/apple-roundtrip.sh {{ args }}
+
 # --- CI / Release ---
 
 # Compute enclave measurements from tinfoil-config.yml and CVM artifacts
