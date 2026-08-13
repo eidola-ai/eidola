@@ -132,19 +132,61 @@ impl SpaceView {
         // The gutter stack: author (bold), the serving backend (quiet,
         // assistant rows only — suppressed when it would just repeat the
         // author line), then the time.
-        let mut byline_el = byline_gutter(page_layout, byline.clone(), theme.foreground, None);
+        let probe_base = format!("space/post/{}/metadata", node.id);
+        let mut byline_el = byline_gutter_frame(page_layout)
+            .id(SharedString::from(format!(
+                "space-post-{}-metadata",
+                node.id
+            )))
+            .probe_bounds(probe_base.clone(), gpui::Role::Label, "Post metadata row")
+            .child(
+                byline_label(page_layout, byline.clone(), theme.foreground, None, true)
+                    .id(SharedString::from(format!(
+                        "space-post-{}-metadata-author",
+                        node.id
+                    )))
+                    .probe_bounds(
+                        format!("{probe_base}/author"),
+                        gpui::Role::Label,
+                        "Post author metadata",
+                    ),
+            );
         if let Some(backend) = byline_backend.filter(|b| *b != byline) {
             byline_el = byline_el.child(
                 div()
+                    .id(SharedString::from(format!(
+                        "space-post-{}-metadata-backend",
+                        node.id
+                    )))
+                    .probe_bounds(
+                        format!("{probe_base}/backend"),
+                        gpui::Role::Label,
+                        "Post backend metadata",
+                    )
                     .text_xs()
                     .text_color(theme.muted_foreground)
+                    .when(page_layout.gutters == GutterPlacement::Stacked, |d| {
+                        d.flex_shrink_1().min_w_0().truncate()
+                    })
                     .child(backend),
             );
         }
         let byline_el = byline_el.child(
             div()
+                .id(SharedString::from(format!(
+                    "space-post-{}-metadata-time",
+                    node.id
+                )))
+                .probe_bounds(
+                    format!("{probe_base}/time"),
+                    gpui::Role::Label,
+                    "Post time metadata",
+                )
                 .text_xs()
                 .text_color(theme.muted_foreground)
+                .when(page_layout.gutters == GutterPlacement::Stacked, |d| {
+                    d.flex_shrink_0().truncate()
+                })
                 .child(time),
         );
 
@@ -1116,24 +1158,42 @@ pub(crate) fn byline_gutter(
     color: gpui::Hsla,
     label_opacity: Option<f32>,
 ) -> gpui::Div {
-    use gpui::prelude::FluentBuilder as _;
-    let gutter = match layout.gutters {
+    byline_gutter_frame(layout).child(byline_label(layout, label, color, label_opacity, false))
+}
+
+fn byline_gutter_frame(layout: PageLayout) -> gpui::Div {
+    match layout.gutters {
         GutterPlacement::Sides => v_flex().w(GUTTER_WIDTH).items_end().pt_4(),
         GutterPlacement::Stacked => h_flex()
             .w(px(layout.body_width))
+            .min_w_0()
+            .overflow_hidden()
             .items_center()
             .gap_2()
             .h(rems(COMPACT_GUTTER_LINE_REMS))
             .mb(rems(COMPACT_GUTTER_GAP_REMS)),
-    };
-    gutter.flex_none().child(
-        div()
-            .text_sm()
-            .font_weight(FontWeight::BOLD)
-            .when_some(label_opacity, |d, o| d.opacity(o))
-            .text_color(color)
-            .child(label.into()),
-    )
+    }
+    .flex_none()
+}
+
+fn byline_label(
+    layout: PageLayout,
+    label: impl Into<SharedString>,
+    color: gpui::Hsla,
+    label_opacity: Option<f32>,
+    compact_flexible: bool,
+) -> gpui::Div {
+    use gpui::prelude::FluentBuilder as _;
+    div()
+        .text_sm()
+        .font_weight(FontWeight::BOLD)
+        .when_some(label_opacity, |d, o| d.opacity(o))
+        .text_color(color)
+        .when(
+            compact_flexible && layout.gutters == GutterPlacement::Stacked,
+            |d| d.flex_shrink_1().min_w_0().truncate(),
+        )
+        .child(label.into())
 }
 
 /// An invisible, zero-layout-impact overlay that records its own painted height

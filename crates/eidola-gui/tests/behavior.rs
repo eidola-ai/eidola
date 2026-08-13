@@ -5576,7 +5576,7 @@ fn space_docked_composer_edit_scrolls_page_into_view(cx: &mut TestAppContext) {
         );
     });
 
-    // Full-reveal assertion (the off-by-one regression, Task C). The docked
+    // Full-reveal assertion. The docked
     // branch computes the caret's DOCUMENT position as `page_slot_doc_top +
     // editor_top_offset + caret_content_bottom`, then scrolls the page to reveal
     // it. The final page-scroll value is gpui-clamped against a frame-lagged
@@ -5585,24 +5585,31 @@ fn space_docked_composer_edit_scrolls_page_into_view(cx: &mut TestAppContext) {
     // folded in (`caret_doc_bottom − caret_content_bottom` = `page_slot_doc_top +
     // editor_top_offset`). For a blank ⌘N space the sole node is the draft leaf,
     // so `page_slot_doc_top` is just the document's top reserve and this must
-    // equal `reserve + POST_PAD_Y` (= 2·half_pad = 40px) — the editor's
-    // content-top offset within the slot. Before the fix the offset term was
-    // dropped, so the docked reveal aimed a pad-height too high and never fully
-    // revealed the line.
-    let (slot_offset, reserve) = view.read_with(&vcx, |v, _| {
+    // equal `reserve + POST_PAD_Y + compact_top` — the editor's content-top
+    // offset within the slot. The top metadata line precedes the editor in
+    // compact layout, while total top+bottom occupancy still sizes the runway.
+    let (slot_offset, reserve, compact_top, compact_total) = view.read_with(&vcx, |v, _| {
+        let (top, total) = v.composer_gutter_contract_for_test();
         (
             v.docked_caret_slot_offset_for_test(),
             v.doc_reserve_for_test(),
+            top,
+            total,
         )
     });
     let post_pad_y = 40.0_f32;
+    assert!(compact_top > 0.0, "the compact composer has top metadata");
     assert!(
-        (slot_offset - (reserve + post_pad_y)).abs() < 1.0,
-        "the docked reveal must fold the editor's {post_pad_y}px content-top \
-         offset into the caret's document position (slot-relative offset was \
-         {slot_offset}, expected the {reserve}px top reserve plus that pad; \
-         omitting the pad — a value near {reserve} — under-scrolls the line \
-         out of view)",
+        compact_total > compact_top,
+        "the nonempty compact composer also has bottom actions"
+    );
+    let expected = reserve + post_pad_y + compact_top;
+    assert!(
+        (slot_offset - expected).abs() < 1.0,
+        "the docked reveal must fold the {compact_top}px compact metadata line \
+         into the editor's document position (slot-relative offset {slot_offset}, \
+         expected {expected}); omitting it under-scrolls the lower-fold caret \
+         by exactly that occupancy",
     );
 }
 
@@ -6205,8 +6212,10 @@ fn space_post_parks_the_reader_at_the_tail_and_holds_it_there(cx: &mut TestAppCo
     vcx.run_until_parked();
     // The headless dispatcher does not advance `on_next_frame`; draw the
     // settled extent the production tail pin reasserts against.
-    vcx.update(|window, _| window.refresh());
-    vcx.run_until_parked();
+    for _ in 0..3 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
 
     let (parked, end) = view.read_with(&vcx, |v, _| {
         assert!(v.tail_pin_for_test(), "the post arms the tail pin");
@@ -6222,11 +6231,41 @@ fn space_post_parks_the_reader_at_the_tail_and_holds_it_there(cx: &mut TestAppCo
          (offset {parked} should be the document end {end})"
     );
 
+    // Once the optimistic post has measured and the initial landing has
+    // converged, the pin keeps the pre-stream gap eligible for following but
+    // no longer overrides the reader's observed position. Re-reading during
+    // the live exchange must therefore remain possible.
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.tail_pin_for_test(),
+            "the exchange still owns the follow gate"
+        );
+        assert!(
+            !v.tail_pin_forced_for_test(),
+            "initial measured-floor convergence releases forced authority"
+        );
+        v.scroll_page_by_for_test(180.0);
+    });
+    vcx.run_until_parked();
+    let reader_offset = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    let seq = view.read_with(&vcx, |v, cx| v.space().read(cx).streams()[0].seq);
+    space.update(&mut vcx, |s, cx| {
+        s.push_content_delta_for_test(seq, &"a growing answer\n".repeat(20), cx)
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            (v.page_scroll_offset_y_for_test() - reader_offset).abs() < 2.0,
+            "stream growth leaves a reader who moved away where they chose to read"
+        );
+        v.scroll_page_to_end_for_test();
+    });
+    vcx.run_until_parked();
+
     // Now the production gap the pin exists for: the save is in flight and
     // nothing is streaming yet (the stub's synthetic turn stands in for the
     // real one, which only starts once the post has persisted). Both steps run
     // in one update so no frame observes a settled space and retires the pin.
-    let seq = view.read_with(&vcx, |v, cx| v.space().read(cx).streams()[0].seq);
     space.update(&mut vcx, |s, cx| {
         s.finish_streaming_turn_for_test(seq, cx);
         s.arm_post_runner_for_test(cx);

@@ -4606,6 +4606,77 @@ fn compact_actionable_post_keeps_its_height_when_actions_reveal(cx: &mut TestApp
 }
 
 #[gpui::test]
+fn compact_post_metadata_stays_inside_its_row_at_large_type(cx: &mut TestAppContext) {
+    use gpui::{VisualTestContext, px};
+
+    let _guard = probes_on();
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let author = "A deliberately descriptive participant identity that remains recognizable";
+    let backend = "private-inference-workstation-in-the-west-studio";
+    let selection = format!("{author}@{backend}");
+    let mut post = probe_post("a1", "the metadata must not paint into this prose");
+    post.participant = PostParticipant {
+        kind: "agent".into(),
+        label: selection.clone(),
+    };
+    post.action_type = "inference".into();
+    post.model = Some(selection);
+    post.created_at = 1_700_000_000;
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+    cx.update(|cx| gpui_component::Theme::global_mut(cx).font_size = px(24.));
+    let vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let entries = fresh_entries(cx, window);
+    let entry = |name: &str| {
+        &entries
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .1
+    };
+    let row = entry("space/post/a1/metadata");
+    assert!(
+        row.bounds.size.height > px(25.),
+        "the probe exercises increased type scale"
+    );
+    for name in [
+        "space/post/a1/metadata/author",
+        "space/post/a1/metadata/backend",
+        "space/post/a1/metadata/time",
+    ] {
+        let segment = entry(name);
+        assert!(
+            segment.bounds.left() >= row.bounds.left()
+                && segment.bounds.right() <= row.bounds.right(),
+            "{name} must stay inside the compact metadata row: {:?} vs {:?}",
+            segment.bounds,
+            row.bounds
+        );
+        assert!(
+            segment.bounds.size.width > px(0.),
+            "{name} retains a visible allocation"
+        );
+    }
+
+    let article = entry("space/post/0");
+    assert!(
+        article.label.contains(author) && article.label.contains(backend),
+        "visual truncation must not shorten the accessible byline: {:?}",
+        article.label
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
 fn entering_compact_affordances_reveals_an_oversized_posts_action(cx: &mut TestAppContext) {
     use gpui::{VisualTestContext, px};
 

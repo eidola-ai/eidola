@@ -34,7 +34,9 @@ use std::collections::HashSet;
 use crate::overlay::{Contain as _, Overlay};
 
 use super::context_menu::ContextTarget;
-use super::layout::{GutterPlacement, PageLayout, composer_gutter_heights, page_layout};
+use super::layout::{
+    ComposerGutterHeights, GutterPlacement, PageLayout, composer_gutter_heights, page_layout,
+};
 use super::model::{self, TreeNode};
 
 /// Vertical offset of the floating composer's drop shadow (negative = cast
@@ -283,7 +285,7 @@ impl SpaceView {
         // A reader who has started composing again owns the viewport: from here
         // the composer's own caret-into-view path drives the page, and the
         // post-submit pin must not race it (see `follow_streaming_tail`).
-        self.tail_pin = false;
+        self.tail_pin = super::TailPin::Inactive;
         // An editing session is beginning: seed the accessible value from the
         // draft as it stands. This is the seam every session passes through —
         // the band's Reply, a click on an inactive draft, the editor's own
@@ -488,7 +490,7 @@ impl SpaceView {
             }
         }
         self.scroll_to_tail(window, cx);
-        self.tail_pin = true;
+        self.tail_pin = super::TailPin::Converging;
     }
 
     // -- Asks --------------------------------------------------------------
@@ -1271,7 +1273,7 @@ impl SpaceView {
                 docked,
                 page_slot_doc_top,
                 win,
-                compact_gutters.total(),
+                compact_gutters,
             ));
         body.style().restrict_scroll_to_axis = Some(true);
 
@@ -1989,7 +1991,7 @@ fn caret_into_view(
     docked: bool,
     page_slot_doc_top: f32,
     window_h: f32,
-    composer_gutter_h: f32,
+    composer_gutters: ComposerGutterHeights,
 ) -> impl IntoElement {
     gpui::canvas(
         |_, _, _| {},
@@ -2074,7 +2076,7 @@ fn caret_into_view(
                 // `POST_PAD_Y` top pad). Omitting this term put every docked caret
                 // target one pad-height too high — scrolling down never fully
                 // revealed the line, scrolling up over-revealed it.
-                let editor_top_offset = POST_PAD_Y.as_f32();
+                let editor_top_offset = POST_PAD_Y.as_f32() + composer_gutters.top;
                 let caret_doc_top = page_slot_doc_top + editor_top_offset + caret_top;
                 let caret_doc_bot = page_slot_doc_top + editor_top_offset + caret_bot;
                 // The page's scroll depth, computed from the editor's **fresh**
@@ -2091,8 +2093,9 @@ fn caret_into_view(
                 // fresh `natural` height. See `runway_height` / `placeholder_doc_top`.
                 let half_pad = POST_PAD_Y.as_f32() / 2.0;
                 let standalone = view.read(cx).standalone_slot_h(px(window_h));
-                let runway = standalone
-                    .max(SpaceView::composer_chrome() + natural + composer_gutter_h + half_pad);
+                let runway = standalone.max(
+                    SpaceView::composer_chrome() + natural + composer_gutters.total() + half_pad,
+                );
                 let scroll_max = (page_slot_doc_top + runway - window_h).max(0.0);
                 view.update(cx, |this, _cx| {
                     this.composer_caret_scroll_pending.set(false);
