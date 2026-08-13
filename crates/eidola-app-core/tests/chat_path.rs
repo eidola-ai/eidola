@@ -82,6 +82,46 @@ fn setup(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) {
     chat_harness::core_for(config)
 }
 
+/// The shared constructor is the only outer request shape app-core may send.
+/// Read every input from the harness-captured body, so a field added at either
+/// dispatch call site makes this exact-body comparison fail.
+fn assert_shared_request_body(body: &serde_json::Value) {
+    let model = body["model"].as_str().expect("wire model");
+    let messages = body["messages"].as_array().expect("messages array");
+    let max_completion_tokens = u32::try_from(
+        body["max_completion_tokens"]
+            .as_u64()
+            .expect("completion-token limit"),
+    )
+    .expect("completion-token limit fits u32");
+    let tools = body
+        .get("tools")
+        .and_then(|tools| tools.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let stream = body.get("stream").and_then(|stream| stream.as_bool()) == Some(true);
+    let include_usage = body
+        .get("stream_options")
+        .and_then(|options| options.get("include_usage"))
+        .and_then(|include_usage| include_usage.as_bool())
+        == Some(true);
+
+    assert_eq!(
+        body,
+        &eidola_common::chat_completion_request_body(
+            model,
+            messages,
+            max_completion_tokens,
+            tools,
+            stream,
+            include_usage,
+        ),
+        "dispatch must send exactly the shared chat request body"
+    );
+    eidola_server::types::test_chat_completion_request_is_accepted(body.clone())
+        .expect("captured body must satisfy the server's strict request type");
+}
+
 // ===========================================================================
 // Happy path — blocking chat
 // ===========================================================================
@@ -320,6 +360,45 @@ fn streaming_chat_delivers_deltas_and_persists() {
             .expect("messages");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content, "Hello from the stream.");
+    });
+}
+
+#[test]
+fn blocking_and_streaming_dispatch_use_the_shared_request_body() {
+    run(|| {
+        {
+            let (mock, core, _dir) = setup(MockConfig::default());
+            with_account(&core);
+
+            core.runtime()
+                .block_on(core.chat("blocking body".into(), MODEL.into(), None))
+                .expect("blocking chat succeeds");
+
+            let body = mock.chat_bodies().pop().expect("blocking request");
+            assert_shared_request_body(&body);
+        }
+
+        {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::OkStreaming,
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            let result = core.runtime().block_on(async {
+                let drain = async { while events_rx.recv().await.is_some() {} };
+                let (result, ()) = tokio::join!(
+                    core.chat_stream("streaming body".into(), MODEL.into(), None, tx),
+                    drain,
+                );
+                result
+            });
+            result.expect("streaming chat succeeds");
+
+            let body = mock.chat_bodies().pop().expect("streaming request");
+            assert_shared_request_body(&body);
+        }
     });
 }
 
