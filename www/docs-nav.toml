@@ -30,6 +30,7 @@ title = "Release flow"
 pages = [
     ["releases.md", "Releases"],
     ["trust-root.md", "Trust root"],
+    ["apple-distribution.md", "Apple distribution"],
 ]
 
 [[sections]]
@@ -45,4 +46,5 @@ title = "Contributing"
 pages = [
     ["contributing/README.md", "Runbooks"],
     ["contributing/release-attestant-yubikey.md", "Attestant YubiKey"],
+    ["contributing/release-apple-signing-yubikey.md", "Apple CI YubiKey"],
 ]

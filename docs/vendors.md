@@ -24,6 +24,7 @@ The list is short because the architecture makes it short: inference content nev
 
 | Platform | Role | Notes |
 | --- | --- | --- |
+| **Apple** | Developer ID code signing and notarization for direct macOS distribution | Receives each notarized release binary and the Apple developer-team identity attached to it. Apple can revoke the certificate or notarization trust used by Gatekeeper; see [Apple distribution](apple-distribution.md). It does not process Eidola inference content or ordinary account data. |
 | **Matrix.org Foundation** | Homeserver hosting our public community rooms | An independent controller under its own privacy policy. Room content is public and federates to servers nobody controls; see the privacy policy's community section. |
 
 ## What is deliberately absent
