@@ -3130,6 +3130,48 @@ fn space_blank_composer_does_not_scroll(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_populated_composer_has_full_window_docking_runway(cx: &mut TestAppContext) {
+    const WINDOW_H: f32 = 560.0;
+    let stores = stub_stores_with_config(cx);
+    let (blank_window, blank) = open_space(cx, &stores, None);
+    let reserve = blank.read_with(cx, |v, _| v.doc_reserve_for_test());
+    blank.read_with(cx, |v, _| {
+        assert_eq!(
+            v.runway_height_for_test(WINDOW_H),
+            WINDOW_H - reserve,
+            "a blank notebook keeps its titlebar-adjusted no-scroll slot"
+        );
+    });
+    cx.update_window(blank_window, |_, _, _| {}).unwrap();
+
+    let (window, populated) = open_space(cx, &stores, Some("runway".into()));
+    populated.update(cx, |v, cx| {
+        v.space().update(cx, |space, cx| {
+            space.set_post_tree_for_test(
+                vec![fixture_post_with_block("a1", "b1", "A settled post.")],
+                cx,
+            )
+        });
+    });
+    cx.run_until_parked();
+    populated.read_with(cx, |v, _| {
+        let runway = v.runway_height_for_test(WINDOW_H);
+        let chrome = v.composer_chrome_for_test();
+        assert_eq!(
+            runway,
+            WINDOW_H + chrome,
+            "the slot top plus the composer's half-pad chrome must land exactly at the window top"
+        );
+        assert_eq!(
+            WINDOW_H - runway + chrome,
+            0.0,
+            "the docked composer surface must begin at the window top"
+        );
+    });
+    cx.update_window(window, |_, _, _| {}).unwrap();
+}
+
+#[gpui::test]
 fn space_composer_text_sits_where_its_post_will_land(cx: &mut TestAppContext) {
     // REGRESSION (task 40): the composer *becomes* the post, so the words in it
     // must already sit where the post will render them — submitting must not
@@ -10431,9 +10473,10 @@ fn space_composer_counts_the_bottom_breath_once(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppContext) {
-    // The rail is the composer bar's **footer**, so it must land on the bar's
-    // *visible* bottom edge in every configuration — floating, docked at the
-    // end of the document, and docked mid-ramp.
+    // The rail is the editor body's footer, so it must land on that body's
+    // visible bottom edge in every configuration — floating, docked at the
+    // end of the document, and docked mid-ramp. In compact layout the action
+    // line follows it; side layout has no vertical action occupancy.
     //
     // Mid-ramp is where it used to fall off. `bar_h` is deliberately virtual
     // (the dock ramp grows it toward `full_h ≥ window` so the internal scroll
@@ -10479,8 +10522,13 @@ fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppConte
     vcx.run_until_parked();
 
     // The test window has no CSD insets, so its content box is the size it
-    // was resized to.
+    // was resized to. This width is compact, and the action line after the
+    // editor occupies its exact rem-derived line-plus-gap allocation.
     let win = 560.0;
+    let rem_size = vcx.update(|window, _| window.rem_size().as_f32());
+    let action_occupancy = view.read_with(&vcx, |v, _| {
+        v.compact_action_occupancy_for_test(760.0, rem_size)
+    });
     view.read_with(&vcx, |v, cx| {
         assert!(
             !v.composer_overlayed_for_test(),
@@ -10491,11 +10539,13 @@ fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppConte
             .expect("the quoting draft is the active composer");
         assert!(rail > 0.5, "the seeded quote renders a rail (was {rail})");
         let bottom = v.composer_rail_bottom_for_test();
+        let action_top = win - action_occupancy;
         assert!(
-            (bottom - win).abs() < 0.5,
-            "the docked rail lands on the bar's *visible* bottom edge — not \
-             clipped off below it (the bug), and not floated up above it \
-             (an over-correction): rail bottom {bottom}, window {win}"
+            bottom >= action_top - 0.5 && bottom <= win + 0.5,
+            "the docked rail stays on screen immediately before the compact action \
+             line — not clipped below the window (the bug), and not floated above \
+             the action allocation (an over-correction): rail bottom {bottom}, \
+             action allocation {action_top}..{win}"
         );
     });
 }

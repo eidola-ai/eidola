@@ -26,7 +26,7 @@ use gpui::{
     TouchPhase, Window, div, hsla, linear_color_stop, linear_gradient, point,
     prelude::FluentBuilder as _, px, size,
 };
-use gpui_component::{ActiveTheme, h_flex};
+use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorEvent, MarkdownEditorState};
 
 use std::collections::HashSet;
@@ -34,7 +34,7 @@ use std::collections::HashSet;
 use crate::overlay::{Contain as _, Overlay};
 
 use super::context_menu::ContextTarget;
-use super::layout::body_width;
+use super::layout::{GutterPlacement, compact_gutter_occupancy, page_layout};
 use super::model::{self, TreeNode};
 
 /// Vertical offset of the floating composer's drop shadow (negative = cast
@@ -954,7 +954,8 @@ impl SpaceView {
         let draft_rail_h =
             (self.composer_rail_bottom.get() - self.composer_rail_top.get()).max(0.0);
         let theme = cx.theme();
-        let bw = px(body_width(page_width));
+        let page_layout = page_layout(page_width);
+        let bw = px(page_layout.body_width);
 
         // On its own branch the overlay docks to its placeholder; off it (swiped
         // to a sibling while editing) it always floats.
@@ -967,7 +968,7 @@ impl SpaceView {
         // caret's absolute document position and follows it with `page_scroll`.
         let page_slot_doc_top = self.placeholder_doc_top(roots, page_width, window_h);
         let chrome = Self::composer_chrome();
-        let content = self.composer_content_h.borrow().as_f32();
+        let editor_content = self.composer_content_h.borrow().as_f32();
         let half_pad = POST_PAD_Y.as_f32() / 2.0;
         // The top chrome's render split (see `composer_scroll_gap`): the thin
         // separator stays outside the scroll clip, the rest rides inside the
@@ -995,6 +996,17 @@ impl SpaceView {
         let docked = !overlayed;
         self.composer_overlayed.set(overlayed);
 
+        let actions_revealed = !editor.read(cx).is_empty() || self.window_input.read(cx).alt_held();
+        let compact_line_h = compact_gutter_occupancy(window.rem_size());
+        let compact_top_h = match page_layout.gutters {
+            GutterPlacement::Sides => 0.0,
+            GutterPlacement::Stacked => compact_line_h,
+        };
+        let compact_bottom_h = match (page_layout.gutters, actions_revealed) {
+            (GutterPlacement::Stacked, true) => compact_line_h,
+            _ => 0.0,
+        };
+        let content = editor_content + compact_top_h + compact_bottom_h;
         let full_h = (content + chrome).max(win);
         let bar_h = composer_bar_h(
             float_bar_h,
@@ -1005,6 +1017,7 @@ impl SpaceView {
             docked,
         );
         let body_h = (bar_h - chrome).max(0.0);
+        let editor_body_h = (body_h - compact_top_h - compact_bottom_h).max(0.0);
         // **The visible quad is not the bar.** `bar_h` above is the composer's
         // *virtual* geometry — the scroll viewport the ramp grows so a scrolled
         // composer's internal offset eases to its top by the time it docks. The
@@ -1069,30 +1082,36 @@ impl SpaceView {
         // pads only the separator, so without it the byline and the action
         // verbs would ride up by the gap — they must stay aligned with the
         // (unscrolled) first text line, exactly where a post's gutter sits.
-        let mut byline =
-            super::post::byline_gutter("You", theme.info, Some(super::post::DRAFT_BYLINE_OPACITY))
-                .mt(px(scroll_gap));
+        let mut byline = super::post::byline_gutter(
+            page_layout,
+            "You",
+            theme.info,
+            Some(super::post::DRAFT_BYLINE_OPACITY),
+        )
+        .when(page_layout.gutters == GutterPlacement::Sides, |d| {
+            d.mt(px(scroll_gap))
+        });
         if overlayed {
             let home_fg = theme.muted_foreground;
             let home_fg_hover = theme.foreground;
             let home_bg_hover = theme.muted;
-            byline = byline.child(
-                div()
-                    .id("space-draft-home")
-                    .probe("space/composer/home", gpui::Role::Button, "See in context")
-                    .mt_1()
-                    .px_1()
-                    .rounded_md()
-                    .text_sm()
-                    .text_color(home_fg)
-                    .top_neg_2()
-                    .cursor_pointer()
-                    .text_align(gpui::TextAlign::Right)
-                    .pr_neg_0p5()
-                    .hover(move |s| s.text_color(home_fg_hover).bg(home_bg_hover))
-                    .child("See in context")
-                    .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx))),
-            );
+            let home = div()
+                .id("space-draft-home")
+                .probe("space/composer/home", gpui::Role::Button, "See in context")
+                .when(page_layout.gutters == GutterPlacement::Sides, |d| d.mt_1())
+                .px_1()
+                .rounded_md()
+                .text_sm()
+                .text_color(home_fg)
+                .top_neg_2()
+                .cursor_pointer()
+                .when(page_layout.gutters == GutterPlacement::Sides, |d| {
+                    d.text_align(gpui::TextAlign::Right).pr_neg_0p5()
+                })
+                .hover(move |s| s.text_color(home_fg_hover).bg(home_bg_hover))
+                .child("See in context")
+                .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx)));
+            byline = byline.child(home);
         }
 
         let mut body = div()
@@ -1103,7 +1122,7 @@ impl SpaceView {
             // its content is the spacer below. Viewport and content both grow
             // by the same `scroll_gap`, so `scroll_max` — and with it the
             // glide, the dock ramp, and the caret math — is untouched.
-            .h(px(body_h + scroll_gap))
+            .h(px(editor_body_h + scroll_gap))
             // Scroll tracking stays on **unconditionally**, even when the composer
             // owns no scroll session — the dock transition depends on it. A
             // scrolled floating composer's offset is walked to its top *before*
@@ -1175,7 +1194,7 @@ impl SpaceView {
                     // (`clipped_tail`), so the rail lands on the *visible*
                     // edge instead of below it.
                     .style(prose_style(cx))
-                    .min_height(px((body_h - draft_rail_h - clipped_tail).max(0.0)))
+                    .min_height(px((editor_body_h - draft_rail_h - clipped_tail).max(0.0)))
                     // The editable context menu (Cut / Copy / Paste / Select All).
                     .on_context_menu(cx.listener(
                         move |this, at: &gpui::Point<gpui::Pixels>, _, cx| {
@@ -1229,7 +1248,7 @@ impl SpaceView {
             .child(caret_into_view(
                 cx.entity().downgrade(),
                 editor.downgrade(),
-                body_h,
+                editor_body_h,
                 docked,
                 page_slot_doc_top,
                 win,
@@ -1289,8 +1308,14 @@ impl SpaceView {
                     }
                 }
             }))
-            .child(
-                h_flex()
+            .child({
+                let columns = match page_layout.gutters {
+                    GutterPlacement::Sides => {
+                        h_flex().justify_center().items_start().gap(GUTTER_GAP)
+                    }
+                    GutterPlacement::Stacked => v_flex().items_center(),
+                };
+                columns
                     .w(page_width)
                     .mt(px(content_shift))
                     .h(px(bar_h))
@@ -1300,13 +1325,15 @@ impl SpaceView {
                     // scroll fold sits a thin, pane-separator band below the
                     // bar's edge while nothing else moves.
                     .pt(px(COMPOSER_SEPARATOR_H))
-                    .justify_center()
-                    .items_start()
-                    .gap(GUTTER_GAP)
                     .child(byline)
                     .child(body)
-                    .child(self.render_composer_actions(&editor, cx).mt(px(scroll_gap))),
-            );
+                    .child(
+                        self.render_composer_actions(&editor, page_layout, cx)
+                            .when(page_layout.gutters == GutterPlacement::Sides, |d| {
+                                d.mt(px(scroll_gap))
+                            }),
+                    )
+            });
         if scrolled_down {
             composer = composer.child(
                 div()
@@ -1485,13 +1512,14 @@ impl SpaceView {
     pub(crate) fn render_composer_actions(
         &self,
         editor: &gpui::Entity<MarkdownEditorState>,
+        page_layout: super::layout::PageLayout,
         cx: &Context<Self>,
     ) -> gpui::Div {
         let theme = cx.theme();
         let alt = self.window_input.read(cx).alt_held();
         let revealed = !editor.read(cx).is_empty() || alt;
 
-        let mut col = super::post::action_gutter().gap_0p5();
+        let mut col = super::post::action_gutter(page_layout, revealed).gap_0p5();
         if !revealed {
             return col;
         }

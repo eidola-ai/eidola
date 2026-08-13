@@ -1062,6 +1062,11 @@ impl SpaceView {
         self.page_scroll.offset().y.as_f32()
     }
 
+    #[doc(hidden)]
+    pub fn set_page_scroll_for_test(&self, y: f32) {
+        self.set_page_scroll_y(y);
+    }
+
     /// The window-local floating-composer fraction and whether the sizing mode
     /// is pinned (`Exact`) — the resize-drag state machine's observables.
     #[doc(hidden)]
@@ -1215,6 +1220,24 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn doc_reserve_for_test(&self) -> f32 {
         self.doc_reserve()
+    }
+
+    #[doc(hidden)]
+    pub fn runway_height_for_test(&self, window_h: f32) -> f32 {
+        self.runway_height(px(window_h))
+    }
+
+    #[doc(hidden)]
+    pub fn composer_chrome_for_test(&self) -> f32 {
+        Self::composer_chrome()
+    }
+
+    #[doc(hidden)]
+    pub fn compact_action_occupancy_for_test(&self, page_width: f32, rem_size: f32) -> f32 {
+        match layout::page_layout(px(page_width)).gutters {
+            layout::GutterPlacement::Sides => 0.0,
+            layout::GutterPlacement::Stacked => layout::compact_gutter_occupancy(px(rem_size)),
+        }
     }
 
     /// How many posts currently have a *measured* (not estimated) height in the
@@ -2087,8 +2110,12 @@ impl Render for SpaceView {
         // every post back to a rough estimate and jittering the page (and the
         // minimap) as the near-viewport posts re-measured estimate→real — even
         // where no text reflows. See `layout::body_width`.
-        self.layout
-            .ensure_width(layout::body_width(page_width), theme::font_scale(cx));
+        let page_layout = layout::page_layout(page_width);
+        self.layout.ensure_width(
+            page_layout.body_width,
+            theme::font_scale(cx),
+            page_layout.gutters,
+        );
         self.sync_bodies(window, cx);
         // Keep each post's embed map + highlight set current, and request the
         // incoming-reference index for the posts that rendered last frame.
