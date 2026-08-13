@@ -5469,6 +5469,25 @@ fn space_composer_resize_drag_pins_exact_height_and_reverts_on_deactivate(cx: &m
 }
 
 #[gpui::test]
+fn compact_floating_composer_uses_complete_natural_height(cx: &mut TestAppContext) {
+    let (_window, view, vcx) = open_floating_composer_scene(cx, "compact-natural-height");
+    const WIN: f32 = 620.0;
+
+    view.read_with(&vcx, |v, _| {
+        let (natural, base, gutters) = v.composer_height_contract_for_test();
+        assert!(gutters > 0.0, "compact composer reserves its metadata line");
+        assert!(
+            (natural - base - gutters).abs() < 0.01,
+            "natural height {natural} includes base {base} and gutters {gutters}"
+        );
+        assert!(
+            (v.composer_float_bar_h_for_test(WIN) - natural).abs() < 0.5,
+            "the uncapped floating bar uses the complete natural height"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_composer_resize_reverts_to_max_when_the_draft_posts(cx: &mut TestAppContext) {
     // Posting consumes the draft — a deactivation — so an exact-height resize
     // reverts to Max with it (the `send_active_draft` reset path, distinct
@@ -6084,9 +6103,11 @@ fn space_following_reader_stops_at_the_end_of_the_streamed_content(cx: &mut Test
     });
     vcx.run_until_parked();
     view.read_with(&vcx, |v, _| {
+        let offset = v.page_scroll_offset_y_for_test();
+        let end = v.scroll_min_y_for_test();
         assert!(
-            (v.page_scroll_offset_y_for_test() - v.scroll_min_y_for_test()).abs() < 2.0,
-            "while streaming, the end of content *is* the end of the document"
+            (offset - end).abs() < 2.0,
+            "while streaming, the end of content *is* the end of the document ({offset} vs {end})"
         );
     });
 
@@ -6181,6 +6202,10 @@ fn space_post_parks_the_reader_at_the_tail_and_holds_it_there(cx: &mut TestAppCo
     editor.update(&mut vcx, |e, cx| e.set_value("a new post", cx));
     let focus = view.read_with(&vcx, |v, _| v.focus_handle());
     vcx.update(|window, cx| focus.dispatch_action(&Send, window, cx));
+    vcx.run_until_parked();
+    // The headless dispatcher does not advance `on_next_frame`; draw the
+    // settled extent the production tail pin reasserts against.
+    vcx.update(|window, _| window.refresh());
     vcx.run_until_parked();
 
     let (parked, end) = view.read_with(&vcx, |v, _| {
@@ -10517,6 +10542,7 @@ fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppConte
     // strictly between 0 and 1): the bar's virtual bottom is past the window
     // edge while its painted quad stops at it.
     vcx.update(|window, cx| view.update(cx, |v, cx| v.dock_active_draft_for_test(window, cx)));
+    view.update(&mut vcx, |v, _| v.drive_page_glide_for_test(1.0));
     vcx.run_until_parked();
     vcx.update(|window, _| window.refresh());
     vcx.run_until_parked();

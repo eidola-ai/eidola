@@ -4548,6 +4548,121 @@ fn keyboard_focus_reveals_a_posts_hover_gated_verbs(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn compact_actionable_post_keeps_its_height_when_actions_reveal(cx: &mut TestAppContext) {
+    use gpui::{VisualTestContext, px};
+
+    let _guard = probes_on();
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the quick brown fox")], cx)
+        });
+    });
+    let vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let resting = fresh_entries(cx, window);
+    let resting_height = resting
+        .iter()
+        .find(|(name, _)| name == "space/post/0")
+        .expect("post probe at rest")
+        .1
+        .bounds
+        .size
+        .height;
+    assert!(
+        !resting.iter().any(|(name, _)| name == "space/post/0/edit"),
+        "the reserved row remains visually empty at rest"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.focus_post("a1".into(), window, cx));
+    })
+    .unwrap();
+    let focused = fresh_entries(cx, window);
+    let focused_height = focused
+        .iter()
+        .find(|(name, _)| name == "space/post/0")
+        .expect("focused post probe")
+        .1
+        .bounds
+        .size
+        .height;
+    assert!(
+        (resting_height - focused_height).abs() < px(0.5),
+        "revealing compact actions must not resize the post ({resting_height:?} -> {focused_height:?})"
+    );
+    assert_probe(
+        &focused,
+        "space/post/0/edit",
+        gpui::Role::Button,
+        "Edit this post",
+    );
+}
+
+#[gpui::test]
+fn entering_compact_affordances_reveals_an_oversized_posts_action(cx: &mut TestAppContext) {
+    use gpui::{VisualTestContext, px};
+
+    let _guard = probes_on();
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let body =
+        "A long paragraph that keeps wrapping through the compact reading column. ".repeat(90);
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", &body)], cx)
+        });
+    });
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    let before = fresh_entries(cx, window);
+    let action = before
+        .iter()
+        .find(|(name, _)| name == "space/post/0/edit")
+        .expect("focus reveals Edit on the oversized post")
+        .1
+        .bounds;
+    assert!(
+        action.origin.y + action.size.height > px(560.),
+        "precondition: post-level focus aligns the oversized post's top and leaves its action below the window"
+    );
+    let before_offset = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let after = fresh_entries(cx, window);
+    let action = after
+        .iter()
+        .find(|(name, _)| name == "space/post/0/edit")
+        .expect("entered Edit affordance remains rendered")
+        .1
+        .bounds;
+    assert!(
+        action.origin.y >= px(0.) && action.origin.y + action.size.height <= px(560.),
+        "the focused compact action is inside the window: {action:?}"
+    );
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_scroll_offset_y_for_test() < before_offset,
+            "entering the action row minimally advances the page"
+        );
+    });
+}
+
+#[gpui::test]
 fn keyboard_focus_reveals_a_library_rows_verbs(cx: &mut TestAppContext) {
     // The Library's half of audit S7 — the same rule as a post's action gutter:
     // hover-gated verbs must also answer to keyboard focus, because gpui

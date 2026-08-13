@@ -189,12 +189,41 @@ pub(crate) struct PageLayout {
     pub(crate) gutters: GutterPlacement,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ComposerGutterHeights {
+    pub(crate) top: f32,
+    pub(crate) bottom: f32,
+}
+
+impl ComposerGutterHeights {
+    pub(crate) fn total(self) -> f32 {
+        self.top + self.bottom
+    }
+}
+
 pub(crate) const COMPACT_GUTTER_LINE_REMS: f32 = 1.5;
 pub(crate) const COMPACT_GUTTER_GAP_REMS: f32 = 0.5;
 pub(crate) const COMPACT_PAGE_INSET: Pixels = POST_PAD_Y;
 
 pub(crate) fn compact_gutter_occupancy(rem_size: Pixels) -> f32 {
     rem_size.as_f32() * (COMPACT_GUTTER_LINE_REMS + COMPACT_GUTTER_GAP_REMS)
+}
+
+pub(crate) fn composer_gutter_heights(
+    page_layout: PageLayout,
+    rem_size: Pixels,
+    actions_revealed: bool,
+) -> ComposerGutterHeights {
+    match page_layout.gutters {
+        GutterPlacement::Sides => ComposerGutterHeights::default(),
+        GutterPlacement::Stacked => {
+            let line = compact_gutter_occupancy(rem_size);
+            ComposerGutterHeights {
+                top: line,
+                bottom: if actions_revealed { line } else { 0.0 },
+            }
+        }
+    }
 }
 
 pub(crate) fn page_layout(page_width: Pixels) -> PageLayout {
@@ -310,13 +339,12 @@ impl SpaceView {
     /// to the top edge. A blank notebook keeps the titlebar-adjusted standalone
     /// slot, making its reserve plus composer exactly one no-scroll window.
     pub(crate) fn runway_height(&self, window_h: Pixels) -> f32 {
-        let content = self.composer_content_h.borrow().as_f32();
         let floor = if self.posts.is_empty() {
             self.standalone_slot_h(window_h)
         } else {
             window_h.as_f32() + Self::composer_chrome()
         };
-        floor.max(Self::composer_chrome() + content)
+        floor.max(self.composer_natural_height())
     }
 
     /// The in-flow slot height the draft reserves — the runway (the composer
@@ -324,18 +352,10 @@ impl SpaceView {
     pub(crate) fn draft_slot_height(
         &self,
         _node: &TreeNode,
-        page_width: Pixels,
+        _page_width: Pixels,
         window_h: Pixels,
     ) -> f32 {
-        let compact = match page_layout(page_width).gutters {
-            GutterPlacement::Sides => 0.0,
-            GutterPlacement::Stacked => {
-                compact_gutter_occupancy(gpui::px(crate::theme::UI_FONT_SIZE * self.layout.scale()))
-                    * 2.0
-            }
-        };
         self.runway_height(window_h)
-            .max(Self::composer_chrome() + self.composer_content_h.borrow().as_f32() + compact)
     }
 
     /// The node's own in-flow block height: a post's measured (or estimated)
@@ -668,9 +688,8 @@ impl SpaceView {
     /// can never disagree on the bar. Pure core:
     /// [`super::composer::float_bar_height`], unit-tested.
     pub(crate) fn composer_float_bar_h(&self, window_h: Pixels) -> f32 {
-        let natural = Self::composer_chrome() + self.composer_content_h.borrow().as_f32();
         super::composer::float_bar_height(
-            natural,
+            self.composer_natural_height(),
             self.composer_fraction,
             window_h.as_f32(),
             self.composer_sizing,
@@ -796,6 +815,40 @@ mod tests {
         assert_eq!(
             body_width(compact_full_measure_page_width() - gpui::px(1.)),
             BODY_MAX_WIDTH.as_f32() - 1.0
+        );
+    }
+
+    #[test]
+    fn composer_gutters_share_compact_occupancy() {
+        let compact = PageLayout {
+            body_width: BODY_MAX_WIDTH.as_f32(),
+            gutters: GutterPlacement::Stacked,
+        };
+        let line = compact_gutter_occupancy(gpui::px(16.));
+        assert_eq!(
+            composer_gutter_heights(compact, gpui::px(16.), false),
+            ComposerGutterHeights {
+                top: line,
+                bottom: 0.0,
+            }
+        );
+        assert_eq!(
+            composer_gutter_heights(compact, gpui::px(16.), true),
+            ComposerGutterHeights {
+                top: line,
+                bottom: line,
+            }
+        );
+        assert_eq!(
+            composer_gutter_heights(
+                PageLayout {
+                    body_width: BODY_MAX_WIDTH.as_f32(),
+                    gutters: GutterPlacement::Sides,
+                },
+                gpui::px(16.),
+                true,
+            ),
+            ComposerGutterHeights::default()
         );
     }
 
