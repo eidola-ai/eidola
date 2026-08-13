@@ -34,7 +34,7 @@ use std::collections::HashSet;
 use crate::overlay::{Contain as _, Overlay};
 
 use super::context_menu::ContextTarget;
-use super::layout::{GutterPlacement, compact_gutter_occupancy, page_layout};
+use super::layout::{GutterPlacement, PageLayout, composer_gutter_heights, page_layout};
 use super::model::{self, TreeNode};
 
 /// Vertical offset of the floating composer's drop shadow (negative = cast
@@ -50,6 +50,34 @@ use super::{
 };
 
 impl SpaceView {
+    pub(crate) fn sync_composer_gutters(
+        &self,
+        page_layout: PageLayout,
+        rem_size: Pixels,
+        cx: &App,
+    ) {
+        let actions_revealed = self.active_draft.as_ref().is_some_and(|active| {
+            self.drafts
+                .iter()
+                .find(|draft| &draft.id == active)
+                .is_some_and(|draft| {
+                    !draft.editor.read(cx).is_empty() || self.window_input.read(cx).alt_held()
+                })
+        });
+        let heights = if self.active_draft.is_some() {
+            composer_gutter_heights(page_layout, rem_size, actions_revealed)
+        } else {
+            Default::default()
+        };
+        self.composer_gutters.set(heights);
+    }
+
+    pub(crate) fn composer_natural_height(&self) -> f32 {
+        Self::composer_chrome()
+            + self.composer_content_h.borrow().as_f32()
+            + self.composer_gutters.get().total()
+    }
+
     // -- Draft lifecycle ---------------------------------------------------
 
     /// Mint a draft node replying to `parent`: a fresh editor wired to activate
@@ -968,7 +996,6 @@ impl SpaceView {
         // caret's absolute document position and follows it with `page_scroll`.
         let page_slot_doc_top = self.placeholder_doc_top(roots, page_width, window_h);
         let chrome = Self::composer_chrome();
-        let editor_content = self.composer_content_h.borrow().as_f32();
         let half_pad = POST_PAD_Y.as_f32() / 2.0;
         // The top chrome's render split (see `composer_scroll_gap`): the thin
         // separator stays outside the scroll clip, the rest rides inside the
@@ -996,18 +1023,10 @@ impl SpaceView {
         let docked = !overlayed;
         self.composer_overlayed.set(overlayed);
 
-        let actions_revealed = !editor.read(cx).is_empty() || self.window_input.read(cx).alt_held();
-        let compact_line_h = compact_gutter_occupancy(window.rem_size());
-        let compact_top_h = match page_layout.gutters {
-            GutterPlacement::Sides => 0.0,
-            GutterPlacement::Stacked => compact_line_h,
-        };
-        let compact_bottom_h = match (page_layout.gutters, actions_revealed) {
-            (GutterPlacement::Stacked, true) => compact_line_h,
-            _ => 0.0,
-        };
-        let content = editor_content + compact_top_h + compact_bottom_h;
-        let full_h = (content + chrome).max(win);
+        let compact_gutters = self.composer_gutters.get();
+        let compact_top_h = compact_gutters.top;
+        let compact_bottom_h = compact_gutters.bottom;
+        let full_h = self.composer_natural_height().max(win);
         let bar_h = composer_bar_h(
             float_bar_h,
             full_h,
@@ -1070,7 +1089,7 @@ impl SpaceView {
         // nothing to scroll; letting the wheel fall through to the page (below)
         // scrolls the conversation underneath instead of trapping it. When docked
         // the page owns the scroll regardless.
-        let composer_scrollable = overlayed && (chrome + content > bar_h + 0.5);
+        let composer_scrollable = overlayed && (self.composer_natural_height() > bar_h + 0.5);
         self.composer_scrollable.set(composer_scrollable);
         // The internal fold shadow appears once actual *text* is cut at the
         // fold — the first `scroll_gap` of internal scroll only consumes the
@@ -1252,6 +1271,7 @@ impl SpaceView {
                 docked,
                 page_slot_doc_top,
                 win,
+                compact_gutters.total(),
             ));
         body.style().restrict_scroll_to_axis = Some(true);
 
@@ -1969,6 +1989,7 @@ fn caret_into_view(
     docked: bool,
     page_slot_doc_top: f32,
     window_h: f32,
+    composer_gutter_h: f32,
 ) -> impl IntoElement {
     gpui::canvas(
         |_, _, _| {},
@@ -2070,7 +2091,8 @@ fn caret_into_view(
                 // fresh `natural` height. See `runway_height` / `placeholder_doc_top`.
                 let half_pad = POST_PAD_Y.as_f32() / 2.0;
                 let standalone = view.read(cx).standalone_slot_h(px(window_h));
-                let runway = standalone.max(SpaceView::composer_chrome() + natural + half_pad);
+                let runway = standalone
+                    .max(SpaceView::composer_chrome() + natural + composer_gutter_h + half_pad);
                 let scroll_max = (page_slot_doc_top + runway - window_h).max(0.0);
                 view.update(cx, |this, _cx| {
                     this.composer_caret_scroll_pending.set(false);

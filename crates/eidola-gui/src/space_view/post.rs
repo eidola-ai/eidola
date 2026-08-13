@@ -334,6 +334,9 @@ impl SpaceView {
         let Some(action_id) = post.action_id.clone() else {
             return empty(); // optimistic/synthetic rows aren't actionable yet
         };
+        if !matches!(post.role.as_ref(), "user" | "assistant") {
+            return empty();
+        }
         if self.space.read(cx).is_streaming() {
             return empty();
         }
@@ -390,7 +393,7 @@ impl SpaceView {
         // hover-only gate would hide these verbs from exactly the user the
         // keyboard model exists for.
         if !self.post_affordances_revealed(&node.id) || self.editing.is_some() {
-            return empty();
+            return action_gutter(page_layout, true).gap_0p5();
         }
 
         let col = action_gutter(page_layout, true).gap_0p5();
