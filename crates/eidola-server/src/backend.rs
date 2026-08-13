@@ -201,7 +201,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "gemma4-31b",
         name: "Gemma 4 31B",
         description: "Lightweight and efficient language model from Google for versatile use cases",
-        context_length: 256_000,
+        context_length: 262_144,
         input_per_m: 0.40,
         output_per_m: 1.0,
         per_request_usd: 0.0,
@@ -219,7 +219,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "gpt-oss-120b",
         name: "GPT-OSS 120B",
         description: "Open-weight model designed for powerful reasoning, agentic tasks, and versatile use cases",
-        context_length: 131_000,
+        context_length: 131_072,
         input_per_m: 0.15,
         output_per_m: 0.60,
         per_request_usd: 0.0,
@@ -228,7 +228,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "gpt-oss-safeguard-120b",
         name: "GPT-OSS Safeguard 120B",
         description: "Safety reasoning model for content classification and trust & safety applications",
-        context_length: 131_000,
+        context_length: 131_072,
         input_per_m: 0.15,
         output_per_m: 0.60,
         per_request_usd: 0.0,
@@ -246,7 +246,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "voxtral-small-24b",
         name: "Voxtral Small 24B",
         description: "Audio-capable model built on Mistral Small 3 for transcription, translation, and spoken queries",
-        context_length: 32_000,
+        context_length: 32_768,
         input_per_m: 0.20,
         output_per_m: 0.60,
         per_request_usd: 0.0,
@@ -264,7 +264,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "llama3-3-70b",
         name: "Llama 3.3 70B",
         description: "High-performance multilingual language model optimized for speed",
-        context_length: 128_000,
+        context_length: 131_072,
         input_per_m: 1.75,
         output_per_m: 2.75,
         per_request_usd: 0.0,
@@ -690,47 +690,119 @@ mod tests {
         }
     }
 
-    /// Every published price, pinned against Tinfoil's list prices at the
-    /// default markup. This is the only place the catalog's numbers are
-    /// checked against the source they were copied from, so a silent edit to
-    /// one row fails here rather than at a customer's balance. Values are the
-    /// exact `ceil(usd_per_m * 1.5 * 1e6)` in f64 — three of them land one
-    /// credit high because the price has no exact binary representation.
+    /// One row per model as Tinfoil publishes it: the `context_window` the
+    /// live list reports, and the list prices carried through the default
+    /// markup. This is the only place the catalog's numbers are checked
+    /// against the source they were copied from, so a silent edit to one row —
+    /// or upstream moving a value out from under us — fails here rather than
+    /// at a customer's balance or in a truncated prompt. Prices are the exact
+    /// `ceil(usd_per_m * 1.5 * 1e6)` in f64 — three of them land one credit
+    /// high because the price has no exact binary representation. Context
+    /// lengths are the API's exact figures, never the documentation's
+    /// roundings; models the list gives no `context_window` for pin to 0.
     #[test]
-    fn catalog_prices_match_the_published_tinfoil_list() {
+    fn catalog_matches_the_published_tinfoil_list() {
+        struct Published {
+            id: &'static str,
+            context_length: u64,
+            prompt: u64,
+            completion: u64,
+            request: Option<u64>,
+        }
+
         let models = TinfoilBackend::build_model_list(DEFAULT_PRICING_MARKUP, &HashMap::new());
-        let expected: &[(&str, u64, u64, Option<u64>)] = &[
-            ("glm-5-2", 2_250_000, 7_875_000, None),
-            ("deepseek-v4-flash", 1_050_000, 2_850_000, None),
-            ("gemma4-31b", 600_001, 1_500_000, None),
-            ("kimi-k3", 6_000_000, 30_000_000, None),
-            ("gpt-oss-120b", 225_000, 900_000, None),
-            ("gpt-oss-safeguard-120b", 225_000, 900_000, None),
-            ("nomic-embed-text", 75_001, 0, None),
-            ("voxtral-small-24b", 300_001, 900_000, None),
-            (
-                "whisper-large-v3-turbo",
-                0,
-                0,
-                Some(15_000_000_000), // $0.01/request
-            ),
-            ("llama3-3-70b", 2_625_000, 4_125_000, None),
+        let expected = &[
+            Published {
+                id: "glm-5-2",
+                context_length: 393_216,
+                prompt: 2_250_000,
+                completion: 7_875_000,
+                request: None,
+            },
+            Published {
+                id: "deepseek-v4-flash",
+                context_length: 1_048_576,
+                prompt: 1_050_000,
+                completion: 2_850_000,
+                request: None,
+            },
+            Published {
+                id: "gemma4-31b",
+                context_length: 262_144,
+                prompt: 600_001,
+                completion: 1_500_000,
+                request: None,
+            },
+            Published {
+                id: "kimi-k3",
+                context_length: 262_144,
+                prompt: 6_000_000,
+                completion: 30_000_000,
+                request: None,
+            },
+            Published {
+                id: "gpt-oss-120b",
+                context_length: 131_072,
+                prompt: 225_000,
+                completion: 900_000,
+                request: None,
+            },
+            Published {
+                id: "gpt-oss-safeguard-120b",
+                context_length: 131_072,
+                prompt: 225_000,
+                completion: 900_000,
+                request: None,
+            },
+            Published {
+                id: "nomic-embed-text",
+                context_length: 8_192,
+                prompt: 75_001,
+                completion: 0,
+                request: None,
+            },
+            Published {
+                id: "voxtral-small-24b",
+                context_length: 32_768,
+                prompt: 300_001,
+                completion: 900_000,
+                request: None,
+            },
+            Published {
+                id: "whisper-large-v3-turbo",
+                context_length: 0,
+                prompt: 0,
+                completion: 0,
+                request: Some(15_000_000_000), // $0.01/request
+            },
+            Published {
+                id: "llama3-3-70b",
+                context_length: 131_072,
+                prompt: 2_625_000,
+                completion: 4_125_000,
+                request: None,
+            },
         ];
 
         assert_eq!(models.len(), expected.len(), "catalog size");
-        for (id, prompt, completion, request) in expected {
+        for row in expected {
+            let id = row.id;
             let model = models
                 .iter()
-                .find(|m| &m.id == id)
+                .find(|m| m.id == id)
                 .unwrap_or_else(|| panic!("{id} missing from the catalog"));
-            assert_eq!(model.pricing.per_prompt_token.value, *prompt, "{id} prompt");
+            assert_eq!(model.context_length, row.context_length, "{id} context");
             assert_eq!(
-                model.pricing.per_completion_token.value, *completion,
+                model.pricing.per_prompt_token.value, row.prompt,
+                "{id} prompt"
+            );
+            assert_eq!(
+                model.pricing.per_completion_token.value, row.completion,
                 "{id} completion"
             );
             assert_eq!(
                 model.pricing.per_request.as_ref().map(|p| p.value),
-                *request,
+                row.request,
                 "{id} request"
             );
         }
