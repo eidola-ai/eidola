@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Dump the structural facts a code signature moves, per Mach-O slice.
 
-Written for task 55 (Apple signing). The round-trip spike and, later, the
-differential test against `eidola-apple` both need to name *which field at
-which offset* differs when a signature is added, replaced, or detached —
-`cmp` alone only says "byte 4183 differs".
+Written for the Apple signing work. The round-trip harness and, later, the
+differential test against the planned `eidola-apple` crate both need to name
+*which field at which offset* differs when a signature is added, replaced,
+or detached — `cmp` alone only says "byte 4183 differs".
 
 Emits JSON on stdout: one record per slice with the fat-header placement,
 `__LINKEDIT`'s sizing (plus the absolute file offset of each field, so a

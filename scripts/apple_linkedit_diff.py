@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Classify a byte difference between two Mach-Os as the known one, or not.
 
-Task 55. `codesign` rounds `__LINKEDIT`'s `vmsize` up to 16 KiB on every
+`codesign` rounds `__LINKEDIT`'s `vmsize` up to 16 KiB on every
 slice; signapple rounds it to the slice's own code-hash page size
 (`sign.py:706`), and its `PAGE_SIZES` table is keyed by cputype: 4 KiB for
 x86_64, 16 KiB for arm64/arm64e. So `signapple apply` reproduces a

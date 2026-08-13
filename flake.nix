@@ -546,7 +546,7 @@
         });
 
         # signapple — the Apple code-signature tool used to produce the
-        # detached signature bundle (task 55). Build-time/CI only; see the
+        # detached signature bundle. Build-time/CI only; see the
         # flake input comment above and .github/AGENTS.md.
         #
         # Two of its four Python dependencies are pinned to git revisions
@@ -841,7 +841,7 @@ with open(path, "wb") as f:
                 # inside a bundle the executable's sibling is Contents/MacOS.
                 # Contents/MacOS is also where Apple expects a bundled
                 # executable to live, which is what keeps the signed bundle
-                # (task 55) and notarization straightforward.
+                # and notarization straightforward.
                 #
                 # Deliberately arm64-only inside the universal app: the sidecar
                 # comes from the aarch64-darwin llamaServer derivation and is

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Detach a bundle's code signatures into signapple's on-disk layout.
 
-Task 55. signapple has no keyless detach: `signapple sign --detach` is the
-only path that emits a detached bundle, and it takes a PKCS#12 archive — a
+signapple has no keyless detach: `signapple sign --detach` is the only path
+that emits a detached bundle, and it takes a PKCS#12 archive — a
 non-exportable Developer ID key on a hardware token can never feed it. So
 the signing side detaches from a `codesign`-produced bundle instead, and
 signapple's `apply` stays the independent implementation that checks us.
@@ -17,9 +17,9 @@ A detached signature file is exactly the bytes `LC_CODE_SIGNATURE` points
 at — `[dataoff, dataoff + datasize)` within the slice — which is what
 signapple writes and what it reads back.
 
-Plus one file signapple ignores, `eidola-placement.json`, holding the input
-and output hashes per Mach-O (spec §2.2): applying to the wrong build
-should be a refusal, not a corruption.
+Plus one file signapple ignores, `eidola-placement.json`, the placement
+record: it holds the input and output hashes per Mach-O, so applying to the
+wrong build is a refusal rather than a corruption.
 
 Usage: apple-detach.py <signed bundle> <output dir> [unsigned bundle]
 
