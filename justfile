@@ -170,7 +170,7 @@ update-brand:
 # transitions, and codesign --verify --deep --strict. With no argument it
 # builds .#eidola-gui-macos-universal first, which is slow; pass a path to
 # an already-built Eidola.app to skip that. Result and verdict:
-# work/reference/55-apple-signing/round-trip.md.
+# scripts/fixtures/apple-roundtrip/round-trip.md.
 apple-roundtrip *args:
     ./scripts/apple-roundtrip.sh {{ args }}
 

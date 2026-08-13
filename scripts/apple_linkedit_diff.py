@@ -7,7 +7,7 @@ slice; signapple rounds it to the slice's own code-hash page size
 x86_64, 16 KiB for arm64/arm64e. So `signapple apply` reproduces a
 `codesign`-signed universal binary exactly except, sometimes, for that one
 field **on the x86_64 slice**. The divergence is documented in
-work/reference/55-apple-signing/round-trip.md and fixed by one line in the
+scripts/fixtures/apple-roundtrip/round-trip.md and fixed by one line in the
 signapple fork.
 
 This says which case a given diff is, so the round-trip harness can treat
