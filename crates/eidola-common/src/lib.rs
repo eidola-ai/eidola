@@ -3,11 +3,12 @@
 //! This crate holds the small pieces of pure logic that MUST be bit-identical
 //! on both sides of a contract boundary — the anonymous-credit pricing
 //! contract for chat-completion prompt holds ([`chargeable_prompt_tokens`]),
-//! and the embed-marker recognition rule shared between the markdown
-//! editor's embed plugin and app-core's upstream quote expansion
-//! ([`embed`]). It is intentionally lib-only, pure Rust, and float-free so
-//! `eidola-app-core`, `eidola-server`, and tests can depend on it and
-//! compute identical results on any platform.
+//! outer chat-request construction ([`chat_completion_request_body`]), and
+//! the embed-marker recognition rule shared between the markdown editor's
+//! embed plugin and app-core's upstream quote expansion ([`embed`]). It is
+//! intentionally lib-only, pure Rust, and float-free so `eidola-app-core`,
+//! `eidola-server`, and tests can depend on it and compute identical results
+//! on any platform.
 //!
 //! # The dependency rule
 //!
@@ -101,6 +102,41 @@
 pub mod embed;
 
 use serde_json::Value;
+
+/// Build the OpenAI-compatible chat-completion request body Eidola sends.
+///
+/// The client keeps messages and tool schemas as raw JSON because tool
+/// payloads must pass through unchanged. Keeping this small outer shape here
+/// makes the server's strict request deserialization directly testable against
+/// the body app-core actually sends, without making the whole request a shared
+/// runtime type.
+///
+/// An empty `tools` slice omits the field. `include_usage` only matters for a
+/// streaming request; it adds the local-engine `stream_options` request.
+pub fn chat_completion_request_body(
+    model: &str,
+    messages: &[Value],
+    max_completion_tokens: u32,
+    tools: &[Value],
+    stream: bool,
+    include_usage: bool,
+) -> Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_completion_tokens": max_completion_tokens,
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools.to_vec());
+    }
+    if stream {
+        body["stream"] = Value::Bool(true);
+        if include_usage {
+            body["stream_options"] = serde_json::json!({ "include_usage": true });
+        }
+    }
+    body
+}
 
 /// Numerator of the safe cost factor `N = NUM/DEN = 1.5`.
 ///

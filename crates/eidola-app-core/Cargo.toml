@@ -70,6 +70,9 @@ sha2 = "0.11"
 # Self-reference: turns the `test-support` feature on for this crate's own
 # test builds (unit + `tests/`) without exposing it to downstream consumers.
 eidola-app-core = { path = ".", features = ["test-support"] }
+# Strict chat-request acceptance bridge for the real HTTP harness captures.
+# Test-only: app-core's production dependency graph must not include server.
+eidola-server = { path = "../eidola-server", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
 wiremock = "0.6"
