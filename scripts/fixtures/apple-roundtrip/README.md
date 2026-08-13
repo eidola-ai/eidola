@@ -12,17 +12,28 @@ A two-slice (x86_64 + arm64) universal Mach-O, small enough to commit whole, car
 
 | Path | What it is |
 |---|---|
-| `unsettled.macho` | as `lipo` emits it: x86_64 slice aligned 2^12, `__LINKEDIT` vmsize unrounded, no signature on that slice. Present so the "`__LINKEDIT` case" can be a one-field assertion against a pre-settling input |
+| `unsettled.macho` | as `lipo` emits it: x86_64 slice aligned 2^12, `__LINKEDIT` vmsize unrounded, and **no `LC_CODE_SIGNATURE` at all on that slice**. Present so the "`__LINKEDIT` case" can be a one-field assertion against a pre-settling input — and so the one input a placement-driven `apply` cannot reach is committed too (see the last section) |
 | `settled/Fixture.app/` | after one full `codesign` ad-hoc cycle: slice alignment normalized to 2^14, vmsize 16 KiB-rounded, no bundle-level seal. This is `apply`'s input |
 | `signed/Fixture.app/` | the golden: `settled` re-signed ad-hoc with `--options runtime --entitlements`, so the replacing signature is a **different size** than the settled one. That size change is what exposes the vmsize divergence; a same-size replacement hides it |
 | `detached/Fixture.app/` | the per-slice superblobs and the sealed `CodeResources`, in signapple's layout |
-| `detached/eidola-placement.json` | the placement record — input/output hashes per Mach-O |
+| `detached/eidola-placement.json` | the placement record — input/output hashes per Mach-O, plus the signed artifact's per-slice structural facts (fat offset/size/align, `__LINKEDIT` sizing and field offsets, superblob placement and hash), which are what let `apply` land on `codesign`'s layout without deriving it |
 | `facts.json` | `scripts/macho_facts.py` output for all three Mach-Os, so a test can assert one named field rather than diff whole files |
 | `Info.plist`, `ent.plist` | the bundle identity and the entitlements used to grow the signature; kept so the fixture can be regenerated |
 
-The test is `apply(settled/Fixture.app, detached/Fixture.app) == signed/Fixture.app`, byte for byte.
+The test is `apply(settled/Fixture.app, detached/Fixture.app) == signed/Fixture.app`, byte for byte. `scripts/apple-place.py` already satisfies it from the placement record alone, so the fixture is a golden the implementation can be held to rather than a hope.
 
 It is a `.app` rather than a bare Mach-O for one reason: `signapple apply` can only reach a fat Mach-O through the bundle path (see the last section), so the differential half of the test needs a bundle. `unsettled.macho` is the one bare file, and it is only ever read, never applied to.
+
+## Note on the one input placement cannot reach
+
+Placing a recorded layout *rewrites* load commands; it never inserts one. So the input must already carry an `LC_CODE_SIGNATURE` per slice, at the same offset the record names — which is exactly what the real artifact has, because `autoSignDarwinBinariesHook` ad-hoc signs every slice during the Nix build. `unsettled.macho`'s x86_64 slice has never been signed at all, and `apple-place.py` refuses it by name rather than producing a wrong file:
+
+```text
+x86_64: input slice carries no LC_CODE_SIGNATURE; placement rewrites that
+load command, it does not insert one
+```
+
+Keep that case in the tree: it is the boundary of the shipped design, and `eidola-apple` should either refuse it the same way or handle it deliberately.
 
 Regenerate (macOS, no signing identity needed):
 
@@ -44,11 +55,24 @@ rm -rf settled/Fixture.app/Contents/_CodeSignature
 cp -R settled/Fixture.app/. signed/Fixture.app/
 codesign --force --sign - --options runtime --entitlements ent.plist signed/Fixture.app
 python3 ../../../apple-detach.py signed/Fixture.app detached settled/Fixture.app
+
+python3 -c '
+import json, sys
+sys.path.insert(0, "../../..")
+from macho_facts import facts
+out = {}
+for p in ["unsettled.macho",
+          "settled/Fixture.app/Contents/MacOS/Fixture",
+          "signed/Fixture.app/Contents/MacOS/Fixture"]:
+    f = facts(p)
+    del f["path"]
+    out[p] = f
+print(json.dumps(out, indent=2, sort_keys=True))' > facts.json
 ```
 
-Re-running that is safe on an existing tree: `apple-detach.py` clears the bundle it is about to write (and the one a previous `eidola-placement.json` names) before regenerating, so a slice, executable, seal or ticket the new input no longer has cannot survive as a stale `.archsign` for `signapple apply` to consume.
+The last step is not optional. `facts.json` records hashes, sizes, offsets and signature metadata for **these exact three Mach-Os**, and the golden test reads it as the description of the binaries beside it. A compiler or `codesign` change moves the binaries, so regenerating without rebuilding `facts.json` commits a fixture tree that disagrees with itself — and the disagreement is silent, because the stale file still parses.
 
-`facts.json` is `scripts/macho_facts.py` over the three Mach-Os, keyed by path.
+Re-running the recipe is otherwise safe on an existing tree: `apple-detach.py` clears the bundle it is about to write (and the one a previous `eidola-placement.json` names) before regenerating, so a slice, executable, seal or ticket the new input no longer has cannot survive as a stale `.archsign` for `signapple apply` to consume.
 
 ## `llama-server/`
 

@@ -16,11 +16,16 @@
     # Efficient Rust builds with incremental caching
     crane.url = "github:ipetkov/crane";
 
-    # Apple code-signature tool (pure Python). Build-time and CI only: it
-    # produces the detached signature bundle on the signing runner. It never
-    # enters Cargo.lock, never ships in an artifact, and never runs on a
-    # user's machine — see .github/AGENTS.md ("Pinned build tools").
-    # flake.lock is the pin; if a patch is ever needed, fork per the
+    # Apple code-signature tool (pure Python). Build-time and CI only, and
+    # only as an *independent check*: its `apply` reattaches a detached
+    # signature, which is what we differentially test our own apply against.
+    # It is not the signer and not the detacher — it cannot detach a
+    # signature it did not create, and its only detach path wants a PKCS#12
+    # archive, which a non-exportable token key can never supply (measured:
+    # scripts/fixtures/apple-roundtrip/round-trip.md §1.1). Detaching is
+    # ours. It never enters Cargo.lock, never ships in an artifact, and never
+    # runs on a user's machine — see .github/AGENTS.md ("Pinned build
+    # tools"). flake.lock is the pin; if a patch is ever needed, fork per the
     # fork-branch practice in crates/eidola-gui/AGENTS.md.
     signapple = {
       url = "github:achow101/signapple/3fab3bb57f227f0dd31007b417683035f5204838";
@@ -545,9 +550,9 @@
           '';
         });
 
-        # signapple — the Apple code-signature tool used to produce the
-        # detached signature bundle. Build-time/CI only; see the
-        # flake input comment above and .github/AGENTS.md.
+        # signapple — the independent `apply` our own reattach is checked
+        # against, not the signer and not the detacher. Build-time/CI only;
+        # see the flake input comment above and .github/AGENTS.md.
         #
         # Two of its four Python dependencies are pinned to git revisions
         # upstream and are not usable from nixpkgs as-is, so they are built

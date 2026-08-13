@@ -18,8 +18,14 @@ at — `[dataoff, dataoff + datasize)` within the slice — which is what
 signapple writes and what it reads back.
 
 Plus one file signapple ignores, `eidola-placement.json`, the placement
-record: it holds the input and output hashes per Mach-O, so applying to the
-wrong build is a refusal rather than a corruption.
+record. It holds the input and output hashes per Mach-O, so applying to the
+wrong build is a refusal rather than a corruption, and the signed artifact's
+**per-slice structural facts** — the fat-header placement, `__LINKEDIT`'s
+sizing, and where each superblob lands. Those facts are what let `apply`
+reproduce the signed bundle from the artifact *as built*, without settling it
+first and without reimplementing `codesign`'s arithmetic: it writes the
+recorded values rather than deriving them. `scripts/apple-place.py` is the
+apply side, and the round-trip harness grades it.
 
 Usage: apple-detach.py <signed bundle> <output dir> [unsigned bundle]
 
@@ -100,6 +106,12 @@ def detach(bundle, out_dir, unsigned=None):
             with open(os.path.join(macos_out, f"{name}.{suffix}sign"), "wb") as f:
                 f.write(blob)
         record = {
+            # The structural facts `apply` writes onto the unsigned build,
+            # verbatim as macho_facts.py reports them for the signed one:
+            # fat offset/size/align, __LINKEDIT's sizing and the file offset
+            # of each of its fields, and the superblob's placement and hash.
+            "kind": info["kind"],
+            "slices": info["slices"],
             "output_sha256": info["file_sha256"],
             "output_len": info["file_size"],
         }

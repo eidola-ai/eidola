@@ -2,7 +2,7 @@
 
 Status: **measured**. Written 2026-08-12 on branch `apple-roundtrip` (cut from `origin/next` at `e4ee69f8`, which carries the bundle-shape change that put the sidecar at `Contents/MacOS/llama-server` — PR #293 — and `CFBundleIdentifier = ai.eidola.app.macos`).
 
-This is the go/no-go gate for the detached-signature design: does a signature lifted off a `codesign`-signed universal bundle reattach, byte for byte, to the unsigned build? It answers the four questions below on the real `nix build .#eidola-gui-macos-universal` artifact, tests the designed mitigation, and states a verdict. Everything here is measured on this repository's own artifacts and is self-contained.
+This is the go/no-go gate for the detached-signature design: does a signature lifted off a `codesign`-signed universal bundle reattach, byte for byte, to the unsigned build? It answers the questions below on the real `nix build .#eidola-gui-macos-universal` artifact, measures both candidate paths to byte-exactness, and states a verdict. Everything here is measured on this repository's own artifacts and is self-contained.
 
 **Measurement environment** — signature formats move, so these facts are dated:
 
@@ -15,23 +15,32 @@ This is the go/no-go gate for the detached-signature design: does a signature li
 | signapple | `achow101/signapple@3fab3bb5`, packaged as `packages.signapple` |
 | Identity for the larger-signature case | `Apple Development: Michael Marcacci (8AMGFBK943)` — no Developer ID certificate exists yet |
 
-Reproduce with `just apple-roundtrip [path/to/Eidola.app]` — `scripts/apple-roundtrip.sh`, plus `scripts/apple-detach.py` and `scripts/macho_facts.py`, all committed in this repository (paths here are relative to the repository root).
+Reproduce with `just apple-roundtrip [path/to/Eidola.app]` — `scripts/apple-roundtrip.sh`, plus `scripts/apple-detach.py`, `scripts/apple-place.py` and `scripts/macho_facts.py`, all committed in this repository (paths here are relative to the repository root).
 
 ---
 
 ## Verdict
 
-**GO** — the round trip is byte-exact, on both slices and the sidecar, and survives `codesign --verify --deep --strict`.
+**GO** — the round trip is byte-exact, on both slices and the sidecar, and survives `codesign --verify --deep --strict`. It is byte-exact by **two independent routes**, and the one the design selected is the one measured on the artifact *as built*.
 
-On the artifact **as built today**, `apply` does *not* reconstruct the signed bundle: the diff is large and structural, not one byte. Put it through one full `codesign` ad-hoc cycle first and the round trip becomes **byte-exact on both slices of the main binary, on the arm64-only sidecar, and across the whole bundle tree**, with `codesign --verify --deep --strict` passing. Measured end to end on the real 80 MB universal `.app`, with an ad-hoc signature and again with a real Apple identity.
+Both routes are run end to end by `scripts/apple-roundtrip.sh` on the real 80 MB universal `.app`:
 
-Three conditions. Two are corrections of mechanism; the third was a genuine choice, now decided.
+| Route | What `apply` receives | Result |
+|---|---|---|
+| **Placement-driven** (§4.2, **selected**) | the artifact **as built** — sigtool's signatures, sigtool's fat alignment, sigtool's `__LINKEDIT` sizing | **byte-exact** on both slices, the sidecar and the whole tree; `--verify --deep --strict` passes. Holds at two different replacing-signature sizes, including one that crosses the 16 KiB boundary of §3.3 |
+| **Settling** (§4) | the artifact after one full `codesign` ad-hoc cycle | **byte-exact** on both slices, the sidecar and the whole tree; `--verify --deep --strict` passes. Measured with an ad-hoc signature and again with a real Apple identity |
+
+What does *not* work is handing `apply` the as-built artifact and expecting it to derive `codesign`'s layout: signapple does exactly that and the diff is large and structural, not one byte (§2(b)). The placement record is what removes the deriving.
+
+Three conditions. Two are corrections of mechanism; the third was a genuine choice, now decided *and* demonstrated.
 
 1. **Two mechanisms the design assumed need correcting** (§1, §5.1): signapple cannot detach a signature it did not create (so `detach` is ours, not signapple's), and signapple's `apply` needs a **one-line fork** to stay byte-equal to `codesign` at signature sizes other than the one measured (§3.3). `eidola-apple::apply` — the implementation that actually ships — is unaffected: it must match `codesign`, and `codesign`'s output is deterministic.
-2. **The artifact must reach `apply` in a state `apply` can hit exactly** — either settled in the build, or handled by a placement-record-driven `apply`. Both work; the second is the one we do — see (3).
-3. **Settling inside the derivation has an obstacle**: `codesign` is **not available in the Nix build sandbox** (measured, §4.1), and admitting it would make the recorded `narHash` a function of the host's macOS version — a reproducibility regression. The only closure-resident alternative, `rcodesign` 0.29.0, produces a third layout that matches neither. **Decided: the build does not settle.** The detached bundle publishes the per-slice structural facts and `apply` lands on the unsettled artifact from them (§4.2), which keeps the `narHash` a pure function of source at the price of part of the independent-checker property.
+2. **The artifact must reach `apply` in a state `apply` can hit exactly** — either settled in the build, or handled by a placement-record-driven `apply`. Both are measured byte-exact; the second is the one we do — see (3).
+3. **Settling inside the derivation has an obstacle**: `codesign` is **not available in the Nix build sandbox** (measured, §4.1), and admitting it would make the recorded `narHash` a function of the host's macOS version — a reproducibility regression. The only closure-resident alternative, `rcodesign` 0.29.0, produces a third layout that matches neither. **Decided: the build does not settle.** The detached bundle publishes the per-slice structural facts and `apply` lands on the unsettled artifact from them — **measured, not projected** (§4.2) — which keeps the `narHash` a pure function of source at the price of part of the independent-checker property.
 
-**Nothing here is a NO-GO.** Every divergence found is in signapple's arithmetic, is one named field or one named behaviour, is deterministic, and is reproduced by committed fixtures. The property the design rests on — that `apply(unsigned, detached)` equals the shipped artifact byte-for-byte — holds.
+**Nothing here is a NO-GO.** Every divergence found is in signapple's arithmetic, is one named field or one named behaviour, is deterministic, and is reproduced by committed fixtures. The property the design rests on — that `apply(unsigned, detached)` equals the shipped artifact byte-for-byte — holds, on the unsettled artifact the pipeline will actually produce.
+
+**One precondition the placement route carries, found by measuring it** (§4.2): placement *rewrites* load commands, it never inserts one, so every slice of the input must already carry an `LC_CODE_SIGNATURE` at the offset the record names. The Nix build satisfies this — `autoSignDarwinBinariesHook` ad-hoc signs every slice — and a slice that does not is refused by name rather than mis-placed. It is a condition on the input, not a limit on the design.
 
 **One residue the settling does not remove:** at signature sizes where `round_up(filesize, 4096) != round_up(filesize, 16384)`, upstream signapple writes `__LINKEDIT` `vmsize` **`0x75000` where `codesign` writes `0x78000`, at file offset `0x47f0`, on the x86_64 slice only** (measured on the real artifact with padded entitlements; see §3.3). It does not appear at the ad-hoc size or at the Apple Development size — which is luck, not a guarantee, and exactly why it is written down here. It is a defect in the *independent checker*, not in the shipped `apply`, and the fix is one line. **No normalizer was written.**
 
@@ -79,7 +88,7 @@ This is **not** an argument against that layout, because signapple is not the si
 
 The artifact: `/nix/store/04gsmkyblbhn2b4djy1rh8dhw8zg1ggr-eidola-gui-macos-universal-1.0`, `narHash sha256-rYyjQOiLaiQNML7b14QECTbRtl3SOagqlkKzFgdGmeo=`. `Contents/MacOS/Eidola` is 80,403,904 bytes, x86_64 + arm64. `Contents/MacOS/llama-server` is 13,459,696 bytes, **thin arm64** — deliberate, and measured as found.
 
-Questions (a), (b) and (d) are below; question (c), the central one, gets §3 to itself.
+Questions (a), (b) and (d) are below; question (c), the central one, gets §3 to itself, and (e) — the placement-driven route on the artifact as built — is §4.2.
 
 ### (a) Is whole-bundle ad-hoc signing byte-deterministic? — **yes**
 
@@ -113,7 +122,7 @@ Three distinct causes, all in signapple:
 2. **Shrinking signatures.** `sign.py:704` only adjusts `__LINKEDIT` `if end_diff > 0`. When the replacing signature is *smaller* than the one already there, signapple writes the new blob and the new file length but leaves `filesize`/`vmsize` describing the old, larger segment. Since the CodeDirectory hashes the load commands, that alone invalidates the seal. This is why the sidecar fails: sigtool's signature is 105,600 bytes and `codesign`'s is 44,384.
 3. **vmsize rounding granularity** — §3.3, latent here, masked by (2).
 
-**On the settled artifact: yes, exactly** — see §4.
+**On the settled artifact: yes, exactly** — see §4. And the as-built artifact is not out of reach either; it is out of reach *for an `apply` that derives the layout*. Driven by the placement record it is byte-exact as built — §4.2.
 
 `apply` is at least **deterministic**: two runs from the same detached bundle produced identical output, main binary and sidecar.
 
@@ -239,11 +248,34 @@ Both reach byte-exactness; they differ in what they cost and in how much indepen
 
 **Path A — settle in the build.** Needs a closure-resident signer whose output is `codesign`-identical. None exists today; the candidates are impurely admitting `codesign` (reproducibility regression, above) or writing the ad-hoc signer into `eidola-apple` and calling it from the derivation. Moves the `narHash` once. Its payoff: on a settled artifact, signapple — with the one-line fix — reproduces the shipped bundle exactly, so the independent check the detached-signature design was chosen for stays intact.
 
-**Path B — make `apply` handle the unsettled artifact.** No build change, no `narHash` move, no new host dependency. `eidola-apple::apply` does not have to *derive* `codesign`'s arithmetic: `detach` already walks the signed bundle, so `eidola-placement.json` can carry the **target structural facts** — per slice, the fat offset and align, and `__LINKEDIT`'s `fileoff`/`filesize`/`vmsize` — and `apply` writes what the record says and then checks `output_sha256`. That is robust to any future `codesign` behaviour change by construction, because the facts are published data rather than reimplemented policy. Its cost: signapple can no longer reproduce the shipped bundle at all (it would need the same record), so the differential test degrades to "signapple agrees on the arm64 slice and on settled inputs".
+**Path B — make `apply` handle the unsettled artifact.** No build change, no `narHash` move, no new host dependency. `eidola-apple::apply` does not have to *derive* `codesign`'s arithmetic: `detach` already walks the signed bundle, so `eidola-placement.json` carries the **target structural facts** — per slice, the fat offset/size/align, `__LINKEDIT`'s `fileoff`/`filesize`/`vmsize` with the file offset of each field, and the superblob's `dataoff`/`datasize`/hash — and `apply` writes what the record says and then checks `output_sha256`. That is robust to any future `codesign` behaviour change by construction, because the facts are published data rather than reimplemented policy. Its cost: signapple can no longer reproduce the shipped bundle at all (it would need the same record), so the differential test degrades to "signapple agrees on the arm64 slice and on settled inputs".
 
 **Decided: Path B.** Nothing settles inside the derivation, so the recorded `narHash` stays a pure function of source — the property everything else in this repository is arranged around — and `apply` is driven by the placement record. The cost is taken knowingly: part of the "anyone can check us with an independent implementation" argument that motivated publishing a detached signature at all goes with it. Path A remains available later if that property is judged worth a closure-resident signer, and §4.3 is what it would cost.
 
-Either way the GO stands: byte-exactness is demonstrated, and neither path requires inventing anything.
+Either way the GO stands. Both paths are measured, and neither requires inventing anything.
+
+#### Path B, measured
+
+`scripts/apple-place.py` is the placement-driven `apply`, written as a measurement so the selected path is demonstrated rather than projected. It is not the shipping implementation — `eidola-apple::apply` is — but it consumes the same record `apple-detach.py` emits and it works on the artifact **as built**, with nothing settled. Section (e) of `scripts/apple-roundtrip.sh` grades it.
+
+What it writes, and nothing else: the fat header rebuilt at the recorded per-slice offset/size/align (cputype and cpusubtype come from the input, which signing never moves); `__LINKEDIT`'s `vmsize`/`fileoff`/`filesize` at the recorded field offsets; `LC_CODE_SIGNATURE`'s `dataoff`/`datasize`; the mach header's flags; and the superblob at `dataoff`. Everything below `dataoff` is copied from the input slice untouched. **Nothing is rounded**, so the 16 KiB-vs-4 KiB question of §3.3 never reaches this path — that is Path B's whole claim, and it is the reason the second row below exists.
+
+Measured on the real universal artifact, as built, signed → detached → placed:
+
+| Replacing signature | main binary | sidecar | whole tree | `--verify --deep --strict` |
+|---|---|---|---|---|
+| `codesign` ad-hoc | **identical** | **identical** | **identical** | **passes** |
+| ad-hoc + padded entitlements + `--options runtime`, at a size where `round_up(filesize, 4096) != round_up(filesize, 16384)` on **both** slices | **identical** | **identical** | **identical** | **passes** |
+
+The second row is the size at which upstream signapple gets `__LINKEDIT` `vmsize` wrong (§3.3). Placement is unaffected, as designed — it copies `0x78000` out of the record instead of computing it.
+
+**The precondition, and it is a real one.** Placement rewrites load commands; it never inserts one. So each input slice must already carry an `LC_CODE_SIGNATURE`, at the same in-slice offset the record names, with the same `dataoff`. Three things were checked rather than assumed:
+
+- the real artifact satisfies it — `autoSignDarwinBinariesHook` ad-hoc signs **every** slice during the Nix build, and signing moves neither the load-command layout nor `dataoff` (measured: `LC_CODE_SIGNATURE` at `+0x10e8` on x86_64 and `+0x1098` on arm64, `dataoff` `0x2799590` and `0x24789c0`, identical before and after `codesign` — only `datasize` moves, `325664 → 342688` and `300032 → 92992`);
+- a slice that does **not** satisfy it is refused by name, not mis-placed. `synthetic-universal/unsettled.macho`'s x86_64 slice has never been signed at all — `lipo` output straight from `clang`, no `LC_CODE_SIGNATURE` on that slice — and `apple-place.py` stops with `input slice carries no LC_CODE_SIGNATURE; placement rewrites that load command, it does not insert one`;
+- the committed synthetic fixture is a passing golden for the same code path: `place(settled/Fixture.app, detached/Fixture.app)` equals `signed/Fixture.app` byte for byte, on a two-slice universal bundle whose replacing signature is a different size than the one it replaces.
+
+So `eidola-apple::apply` inherits a bounded job — write recorded integers into known offsets and append a blob — plus one precondition it must state and check. It does **not** inherit any of `codesign`'s policy.
 
 ### 4.3 What settling costs, measured
 
@@ -262,7 +294,7 @@ These are corrections to mechanism, not to any decision.
 - **Signing order:** the planned sequence `codesign` → `notarytool` → `stapler` → "`signapple ... --detach`" must become `codesign` → `notarytool` → `stapler` → `release-tool apple detach` (ours). signapple cannot detach a signature it did not create, and it cannot use a non-exportable token key. Nothing about the key-custody decision changes.
 - **`release-tool apple detach` cannot shell out to signapple.** `detach` is ours, in `eidola-apple`, alongside `apply` and `inspect`. It is the easier half — a read of `LC_CODE_SIGNATURE` per slice plus two file copies — and making it ours also makes `detach` runnable on Linux, which `codesign`-based detaching never would be.
 - **Keeping signapple's on-disk layout verbatim, so `signapple apply` remains an *independent* implementation:** still the right goal, and the layout is unchanged. But see §5.2 — as of `3fab3bb5` signapple's `apply` is not byte-equal to `codesign` on a universal binary, so the differential test needs the fork.
-- **`eidola-placement.json`** must carry the **target structural facts** per slice — fat offset and align, and `__LINKEDIT`'s `fileoff`/`filesize`/`vmsize` — not just the input and output hashes. That is what makes `apply` exact on the unsettled artifact without reimplementing `codesign`'s policy (§4.2). `scripts/apple-detach.py` already emits the record; extending it is a few lines.
+- **`eidola-placement.json`** carries the **target structural facts** per slice — fat offset/size/align, `__LINKEDIT`'s `fileoff`/`filesize`/`vmsize` with the file offset of each field, and the superblob's `dataoff`/`datasize`/hash — not just the input and output hashes. That is what makes `apply` exact on the unsettled artifact without reimplementing `codesign`'s policy (§4.2). `scripts/apple-detach.py` emits it and `scripts/apple-place.py` consumes it, both measured; `eidola-apple` must keep the same record contents, and must check the `LC_CODE_SIGNATURE` precondition §4.2 names.
 - **The differential test against signapple** must run against a **bundle directory**. `signapple apply` cannot reach a fat Mach-O any other way (it refuses a single `.arch sign` against a universal binary, and derives the architecture from the *directory's* extension when the target is a bare file, which yields `KeyError: ''`).
 
 ### 5.2 The signapple fork, and its one carried commit
@@ -286,9 +318,10 @@ Removal trigger for the carried commit: upstream accepting the same change, or A
 
 Committed beside this document (see `README.md`):
 
-- `synthetic-universal/` — a two-slice universal `.app`, `settled` + `signed` + `detached`, sized so the replacing signature differs from the settled one. That size change is what exposes the vmsize divergence; a same-size replacement hides it, which is exactly the trap §4 describes.
+- `synthetic-universal/` — a two-slice universal `.app`, `settled` + `signed` + `detached`, sized so the replacing signature differs from the settled one. That size change is what exposes the vmsize divergence; a same-size replacement hides it, which is exactly the trap §4 describes. `detached/eidola-placement.json` carries the structural facts, so this doubles as the golden for the placement-driven `apply` — `apple-place.py` already passes it.
+- `unsettled.macho` inside it — the input placement **cannot** reach, because its x86_64 slice carries no `LC_CODE_SIGNATURE` to rewrite. Committed so the precondition of §4.2 has a test case and not just a sentence.
 - `llama-server/` — the real sidecar's superblob plus placement facts, not the 13 MB binary.
-- `facts.json` beside each, so the `__LINKEDIT` case is a one-field assertion and not a whole-file diff.
+- `facts.json` beside each, so the `__LINKEDIT` case is a one-field assertion and not a whole-file diff. Regenerating the Mach-Os without regenerating `facts.json` commits a fixture tree that disagrees with itself, so the README's recipe rebuilds it in the same block.
 
 ### 5.4 A trap found while committing the fixtures: new directories bust the macOS build cache
 
