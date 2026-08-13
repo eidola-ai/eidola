@@ -7,3 +7,4 @@ If you are looking for conceptual or architectural docs, move one level up in [`
 ## Index
 
 - [`release-attestant-yubikey.md`](release-attestant-yubikey.md) — one-time provisioning of a fresh YubiKey 5 as the release attestation signing key.
+- [`release-apple-signing-yubikey.md`](release-apple-signing-yubikey.md) — policy and hand-off procedure for the distinct unattended Apple CI signing key.
