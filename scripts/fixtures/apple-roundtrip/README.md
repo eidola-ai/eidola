@@ -2,11 +2,13 @@
 
 Committed inputs for the golden `apply` test that `crates/eidola-apple` (task 55 Wave 3) codes against. They exist so that test runs in plain `cargo test` on **any** platform: reproducing them needs macOS and `codesign`, but consuming them needs neither. If `apply` ever starts requiring a macOS tool, the Linux `rust-checks` job goes red — which is the property the detached-signature design was chosen for.
 
+`round-trip.md` beside them is the measurement they encode — the Wave 2 spike's result and verdict, and the document the harness and the classifier cite by section.
+
 Measured and generated on macOS 26.5.2 (25F84), Xcode CLT 26.6.0.0.1781586589. Signature layout is a moving target across macOS releases; regenerate and re-measure rather than hand-edit, and record the new version here.
 
 ## `synthetic-universal/`
 
-A two-slice (x86_64 + arm64) universal Mach-O, small enough to commit whole, carrying the one structural case the real artifact also exhibits: `codesign` rounds `__LINKEDIT`'s `vmsize` up to **16 KiB on every slice**, while signapple rounds to the slice's own page size (4 KiB on x86_64). See `../../../work/reference/55-apple-signing/round-trip.md` for the measurement.
+A two-slice (x86_64 + arm64) universal Mach-O, small enough to commit whole, carrying the one structural case the real artifact also exhibits: `codesign` rounds `__LINKEDIT`'s `vmsize` up to **16 KiB on every slice**, while signapple rounds to the slice's own page size (4 KiB on x86_64). See `round-trip.md` beside this file for the measurement.
 
 | Path | What it is |
 |---|---|
@@ -65,4 +67,4 @@ The sidecar is **arm64-only by decision** even inside the universal app (see `AG
 
 ## Note on the Nix build cache
 
-`flake.nix`'s `filteredSrc` drops non-Rust *files* but keeps *directories* (crane's filter has to, in order to descend). So this directory tree perturbs the filtered source hash even though none of its files survive the filter, and adding it cost one full rebuild of the macOS artifacts. It does **not** move `artifact-manifest.json` — that records the output's `narHash`, and an empty source directory cannot reach the output. Measured in `work/reference/55-apple-signing/round-trip.md` §5.4, which also names the durable fix.
+`flake.nix`'s `filteredSrc` drops non-Rust *files* but keeps *directories* (crane's filter has to, in order to descend). So this directory tree perturbs the filtered source hash even though none of its files survive the filter, and adding it cost one full rebuild of the macOS artifacts. It does **not** move `artifact-manifest.json` — that records the output's `narHash`, and an empty source directory cannot reach the output. Measured in `round-trip.md` §5.4, which also names the durable fix.

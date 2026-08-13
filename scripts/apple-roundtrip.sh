@@ -9,7 +9,7 @@
 #       transition out of sigtool's linker-signed state move it?
 #   (d) does the result survive `codesign --verify --deep --strict`?
 #
-# Written result and verdict: work/reference/55-apple-signing/round-trip.md.
+# Written result and verdict: scripts/fixtures/apple-roundtrip/round-trip.md.
 #
 # Usage:  scripts/apple-roundtrip.sh [path/to/Eidola.app]
 # With no argument it runs `nix build .#eidola-gui-macos-universal` first,
@@ -55,6 +55,44 @@ check() { # check <name> <expected: same|differ> <a> <b>
   else
     printf '    FAIL  %-52s (want %s, got %s)\n' "$name" "$want" "$got"
     FAILURES=$((FAILURES + 1))
+  fi
+}
+
+# Whole-tree comparison that composes with classify() below. A file whose
+# byte difference classify() already graded as the documented divergence is
+# named here as permitted, so the same bytes are not counted a second time as
+# an unrecognized regression — otherwise a bundle carrying only the known
+# divergence could never report it, because the tree would fail for it.
+# Everything else still fails: a differing file that was not classified, a
+# file present on one side only, a permitted file that differs in the *other*
+# bundle's copy. The verdict lands in TREE_KIND (same|known|differ) rather
+# than a return code, so a `set -e` caller can read it without guarding.
+TREE_KIND=""
+tree_check() { # tree_check <label> <a> <b> [<permitted relative path>...]
+  local label="$1" a="$2" b="$3"; shift 3
+  local out line rel permitted=0 unexpected=""
+  out="$(diff -rq "$a" "$b" 2>&1)" || true
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    for rel in "$@"; do
+      if [[ "$line" == "Files $a/$rel and $b/$rel differ" ]]; then
+        permitted=$((permitted + 1))
+        continue 2
+      fi
+    done
+    unexpected+="$line"$'\n'
+  done <<<"$out"
+  if [[ -n "$unexpected" ]]; then
+    TREE_KIND=differ
+    printf '    FAIL  %-52s (differ)\n' "$label"
+    printf '%s' "$unexpected" | sed 's/^/          /'
+    FAILURES=$((FAILURES + 1))
+  elif [[ "$permitted" -gt 0 ]]; then
+    TREE_KIND=known
+    printf '    KNOWN %-52s (only the classified divergence)\n' "$label"
+  else
+    TREE_KIND=same
+    printf '    PASS  %-52s (same)\n' "$label"
   fi
 }
 
@@ -118,11 +156,7 @@ check "main binary, two independent signings" same "$S1/$MAIN" "$S2/$MAIN"
 check "sidecar, two independent signings"     same "$S1/$SIDE" "$S2/$SIDE"
 check "CodeResources, two independent signings" same \
   "$S1/Contents/_CodeSignature/CodeResources" "$S2/Contents/_CodeSignature/CodeResources"
-if diff -r "$S1" "$S2" >/dev/null 2>&1; then
-  printf '    PASS  %-52s (same)\n' "whole bundle tree"
-else
-  printf '    FAIL  %-52s (differ)\n' "whole bundle tree"; FAILURES=$((FAILURES + 1))
-fi
+tree_check "whole bundle tree" "$S1" "$S2"
 
 echo
 echo "=== (c) __LINKEDIT vmsize across signing transitions ==="
@@ -215,18 +249,23 @@ sign_adhoc "$SS"
 python3 "$REPO_ROOT/scripts/apple-detach.py" "$SS" "$WORK/detached-settled" "$SB" >/dev/null
 "$SIGNAPPLE" apply --no-verify "$SA_" "$WORK/detached-settled/$APP_NAME" >/dev/null
 # Exactness of the SA bundle specifically — this is what (d) may excuse a
-# verification failure with, and nothing else may set it.
+# verification failure with, and nothing else may set it. KNOWN_FILES carries
+# the classification forward to the tree comparison: only a file the
+# classifier named as the documented divergence may differ there.
 SETTLED_EXACT=1
-classify graded "main binary (both slices), apply == signed" "$SS/$MAIN" "$SA_/$MAIN"
-[[ "$CLASSIFY_KIND" == identical ]] || SETTLED_EXACT=0
-classify graded "sidecar (arm64-only), apply == signed"      "$SS/$SIDE" "$SA_/$SIDE"
-[[ "$CLASSIFY_KIND" == identical ]] || SETTLED_EXACT=0
-if diff -r "$SS" "$SA_" >/dev/null 2>&1; then
-  printf '    PASS  %-52s (same)\n' "whole bundle tree"
-else
-  printf '    FAIL  %-52s (differ)\n' "whole bundle tree"; FAILURES=$((FAILURES + 1))
+KNOWN_FILES=()
+grade() { # grade <relative path> <label>: classify, then fold into this bundle's verdict
+  classify graded "$2" "$SS/$1" "$SA_/$1"
+  case "$CLASSIFY_KIND" in
+    identical) return 0 ;;
+    linkedit-vmsize-only) KNOWN_FILES+=("$1") ;;
+  esac
   SETTLED_EXACT=0
-fi
+}
+grade "$MAIN" "main binary (both slices), apply == signed"
+grade "$SIDE" "sidecar (arm64-only), apply == signed"
+tree_check "whole bundle tree" "$SS" "$SA_" ${KNOWN_FILES[@]+"${KNOWN_FILES[@]}"}
+[[ "$TREE_KIND" == same ]] || SETTLED_EXACT=0
 
 echo
 echo "=== (b++) the latent case: a replacing signature of a different size ==="
