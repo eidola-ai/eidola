@@ -334,6 +334,28 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_long_metadata",
+                description: "Space view: compact post metadata with long author and backend labels",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(long_metadata_posts(), cx)
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "markdown_table",
                 description: "Space view: an assistant reply carrying GFM tables (aligned columns, styled cells, a wide table whose cells wrap) — the table display-mode QA scene; the tail composer is live for edit-mode QA",
                 default_size: size(px(760.), px(680.)),
@@ -1906,6 +1928,18 @@ mod driver {
                 6,
             ),
         ]
+    }
+
+    fn long_metadata_posts() -> Vec<eidola_app_core::PostNode> {
+        let mut posts = fixtures::kitchen_sink_posts();
+        let post = posts
+            .iter_mut()
+            .find(|post| post.action_id == "a2")
+            .expect("the fixture includes its first assistant reply");
+        let selection = "A deliberately descriptive participant identity that remains recognizable@private-inference-workstation-in-the-west-studio";
+        post.participant.label = selection.into();
+        post.model = Some(selection.into());
+        posts
     }
 
     fn library_spaces() -> Vec<SpaceInfo> {

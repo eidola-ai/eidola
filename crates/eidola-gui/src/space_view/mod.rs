@@ -132,6 +132,24 @@ pub(crate) const VIRT_MARGIN: f32 = 600.0;
 /// away from the tail for "still at the end".
 pub(crate) const TAIL_FOLLOW_EPSILON: f32 = 2.0;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TailPin {
+    #[default]
+    Inactive,
+    Converging,
+    Observing,
+}
+
+impl TailPin {
+    fn active(self) -> bool {
+        self != Self::Inactive
+    }
+
+    fn forced(self) -> bool {
+        self == Self::Converging
+    }
+}
+
 /// Vertical band (px) at the top and bottom of the viewport within which an
 /// active readonly-post selection drag autoscrolls the page.
 pub(crate) const SELECTION_AUTOSCROLL_MARGIN: f32 = 56.0;
@@ -630,7 +648,7 @@ pub struct SpaceView {
     /// is neither producing nor busy — and by [`Self::activate_draft`], since a
     /// reader who has started composing again owns the viewport. See
     /// [`Self::follow_streaming_tail`] for why the pin is needed at all.
-    pub(crate) tail_pin: bool,
+    pub(crate) tail_pin: TailPin,
     /// Test-only record of the slot-relative offset the **docked**
     /// `caret_into_view` branch folded into the caret's document position —
     /// `page_slot_doc_top + editor_top_offset` (`caret_doc_bot - caret_bot`).
@@ -900,7 +918,7 @@ impl SpaceView {
             scroll_min_y: Cell::new(0.0),
             follow_anchor: Cell::new(0.0),
             selected_turn: Cell::new(None),
-            tail_pin: false,
+            tail_pin: TailPin::Inactive,
             docked_caret_slot_offset: Cell::new(0.0),
             scrolls: HashMap::new(),
             scroller_counts: HashMap::new(),
@@ -1101,6 +1119,13 @@ impl SpaceView {
         (self.composer_natural_height(), base, gutters)
     }
 
+    /// Compact composer occupancy split around the editor.
+    #[doc(hidden)]
+    pub fn composer_gutter_contract_for_test(&self) -> (f32, f32) {
+        let gutters = self.composer_gutters.get();
+        (gutters.top, gutters.total())
+    }
+
     /// Drive the separator-handle resize drag without synthesizing mouse
     /// events (the Library-archive precedent: tests call the same methods the
     /// element listeners route to). `begin` grabs the bar at its current
@@ -1163,7 +1188,14 @@ impl SpaceView {
     /// [`Self::follow_streaming_tail`]).
     #[doc(hidden)]
     pub fn tail_pin_for_test(&self) -> bool {
-        self.tail_pin
+        self.tail_pin.active()
+    }
+
+    /// Whether the post-submit pin is still allowed to override the reader's
+    /// observed position while initial measured layout converges.
+    #[doc(hidden)]
+    pub fn tail_pin_forced_for_test(&self) -> bool {
+        self.tail_pin.forced()
     }
 
     /// Whether the minimap is currently shown (tests assert scroll reveals it).
@@ -2260,17 +2292,24 @@ impl Render for SpaceView {
             self.selected_turn.set(selected_turn);
         }
         let producing = selected_turn.is_some();
-        if self.tail_pin && !producing && !self.space.read(cx).is_busy() {
-            self.tail_pin = false;
+        if self.tail_pin.active() && !producing && !self.space.read(cx).is_busy() {
+            self.tail_pin = TailPin::Inactive;
         }
+        let pin_forced = self.tail_pin.forced();
         if self.follow_streaming_tail(
-            producing || self.tail_pin,
-            self.tail_pin,
+            producing || self.tail_pin.active(),
+            pin_forced,
             prev_content_end,
             content_end,
         ) {
             let entity = cx.entity();
             window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
+        } else if pin_forced
+            && !self.path_has_unmeasured(&tree, page_width)
+            && self.page_glide.get().is_none()
+            && (self.page_scroll.offset().y.as_f32() - content_end).abs() <= 0.5
+        {
+            self.tail_pin = TailPin::Observing;
         }
 
         // While a readonly post is being drag-selected, autoscroll the page when
