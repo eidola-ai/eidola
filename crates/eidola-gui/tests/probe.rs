@@ -4877,6 +4877,45 @@ fn compact_composer_gutters_hold_post_parity_and_the_bottom_bar(cx: &mut TestApp
         gpui::Role::Button,
         "See in context",
     );
+
+    // Large type: the settled byline anchor derives from the editor's offset,
+    // not the separator height, so post parity (POST_PAD_Y under the slot
+    // top) holds at every scale — and the taller action bar still keeps its
+    // verbs inside the window with clearance.
+    cx.update(|cx| gpui_component::Theme::global_mut(cx).font_size = px(24.));
+    for _ in 0..4 {
+        view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    let rem_size = vcx.update(|window, _| window.rem_size().as_f32());
+    assert!(
+        rem_size > 20.0,
+        "precondition: the window rem follows the enlarged theme ({rem_size})"
+    );
+    let bar_h = view.read_with(&vcx, |v, _| {
+        v.compact_action_occupancy_for_test(760.0, rem_size)
+    });
+    let entries = fresh_entries(cx, window);
+    let entry = |name: &str| {
+        &entries
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .1
+    };
+    let quad = entry("space/composer").bounds;
+    let byline = entry("space/composer/byline").bounds;
+    assert!(
+        (byline.origin.y - quad.origin.y - px(40.)).abs() < px(1.0),
+        "at 24px rem the docked byline still tops out POST_PAD_Y under the \
+         slot top (byline {byline:?}, quad {quad:?})"
+    );
+    let post = entry("space/composer/post").bounds;
+    assert!(
+        post.origin.y >= px(WIN - bar_h) && post.origin.y + post.size.height <= px(WIN - 8.),
+        "the scaled bar still holds its verbs clear of the edge (post {post:?})"
+    );
 }
 
 #[gpui::test]

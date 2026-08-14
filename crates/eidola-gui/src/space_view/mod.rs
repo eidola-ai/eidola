@@ -2445,6 +2445,7 @@ impl Render for SpaceView {
                 page_width,
                 window_h,
                 window.rem_size(),
+                window,
                 cx,
             ))
             // The source-highlight picker: which of several posts that quoted
