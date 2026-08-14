@@ -33,7 +33,7 @@ spki = "0.7"
 sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
 
 # Mock attestation report (ECDSA P-384)
-p384 = { version = "0.13", features = ["ecdsa", "arithmetic", "pkcs8"] }
+p384 = { version = "0.14", features = ["ecdsa", "arithmetic", "pkcs8"] }
 
 # Connection handling
 hyper = { version = "1", features = ["server", "http1", "http2"] }
