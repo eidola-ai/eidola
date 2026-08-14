@@ -1650,7 +1650,7 @@ impl SpaceView {
 
         col = col.child(self.post_verb(alt, None, false, cx));
         if alt {
-            col = col.child(self.post_quiet_verb(None, false, cx));
+            col = col.child(self.post_quiet_verb(true, None, false, cx));
         }
         // "See in context" — the floating composer's way home — belongs with
         // the other verbs, not beside the byline (attribution says who wrote
@@ -1669,7 +1669,7 @@ impl SpaceView {
     /// muted, a muted chip on paper).
     fn post_verb(
         &self,
-        alt: bool,
+        hint: bool,
         activate: Option<SharedString>,
         on_muted: bool,
         cx: &Context<Self>,
@@ -1697,7 +1697,7 @@ impl SpaceView {
             .text_color(fg)
             .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
             .child("Post")
-            .when(alt, |d| d.child(kbd_hint("⌘↩", hint_fg)))
+            .when(hint, |d| d.child(kbd_hint("⌘↩", hint_fg)))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if let Some(id) = activate.clone() {
                     this.activate_draft(id, cx);
@@ -1711,6 +1711,7 @@ impl SpaceView {
     /// [`Self::post_verb`].
     fn post_quiet_verb(
         &self,
+        hint: bool,
         activate: Option<SharedString>,
         on_muted: bool,
         cx: &Context<Self>,
@@ -1741,7 +1742,7 @@ impl SpaceView {
             .text_color(fg)
             .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
             .child("Post quietly")
-            .child(kbd_hint("⇧⌘↩", hint_fg))
+            .when(hint, |d| d.child(kbd_hint("⇧⌘↩", hint_fg)))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if let Some(id) = activate.clone() {
                     this.activate_draft(id, cx);
@@ -1770,6 +1771,8 @@ impl SpaceView {
             .text_color(home_fg)
             .cursor_pointer()
             .hover(move |s| s.text_color(home_fg_hover).bg(home_bg_hover))
+            .overflow_hidden()
+            .text_ellipsis()
             .child("See in context")
             .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx)))
     }
@@ -1791,11 +1794,16 @@ impl SpaceView {
     ) -> gpui::Div {
         let theme = cx.theme();
         let alt = self.window_input.read(cx).alt_held();
-        let mut right = h_flex().items_baseline().gap_3();
+        // No keyboard hints on the bar: at the supported extremes (2.0 type
+        // scale in a 480px window) the reading column is ~400px, and the
+        // intrinsic-width verb groups must still fit — the hints stay in the
+        // Sides gutter. The Post group keeps its width; "See in context"
+        // yields, shrinking and truncating first.
+        let mut right = h_flex().items_baseline().gap_3().flex_none();
         if alt {
-            right = right.child(self.post_quiet_verb(activate.clone(), true, cx));
+            right = right.child(self.post_quiet_verb(false, activate.clone(), true, cx));
         }
-        right = right.child(self.post_verb(alt, activate, true, cx));
+        right = right.child(self.post_verb(false, activate, true, cx));
         div()
             .absolute()
             .bottom_0()
@@ -1813,8 +1821,14 @@ impl SpaceView {
                     .h_full()
                     .items_center()
                     .justify_between()
+                    .gap_2()
                     .child(if overlayed {
-                        self.home_verb(true, cx).into_any_element()
+                        div()
+                            .flex_shrink_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(self.home_verb(true, cx))
+                            .into_any_element()
                     } else {
                         div().into_any_element()
                     })
@@ -1858,10 +1872,16 @@ impl SpaceView {
         let slot_top =
             self.placeholder_doc_top(roots, page_width, window_h) + self.clamped_scroll_y();
         let reveal = super::layout::dock_reveal_progress(window_h.as_f32(), slot_top);
-        if reveal <= 0.01 {
+        let bar_h = super::layout::compact_action_bar_h(rem_size);
+        // Mount only once the bar covers no more than its own slot — until the
+        // slot's top has cleared the bar's allocation, the strip would sit
+        // over the post above it as a nearly-invisible surface that eats
+        // clicks and contributes a phantom tab stop. The gate also floors the
+        // mount opacity (`bar_h / DOCK_REVEAL_SPAN` of the reveal), so the bar
+        // is plainly visible from its first interactive frame.
+        if reveal <= 0.01 || slot_top > window_h.as_f32() - bar_h {
             return div().into_any_element();
         }
-        let bar_h = super::layout::compact_action_bar_h(rem_size);
         // `Fade` containment: the bar owns clicks over the strip it covers
         // (the draft row's click-to-focus tail sits beneath it), while the
         // wheel keeps scrolling the page.

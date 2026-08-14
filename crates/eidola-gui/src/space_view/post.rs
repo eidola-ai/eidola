@@ -677,7 +677,21 @@ impl SpaceView {
             GutterPlacement::Sides => 0.0,
             GutterPlacement::Stacked => super::layout::compact_gutter_occupancy(rem_size),
         };
-        let editor_fill = px((slot_h - 2.0 * POST_PAD_Y.as_f32() - compact_top).max(0.0));
+        // The bottom action bar overlays the window's bottom edge whenever
+        // this draft has something to post (see
+        // `SpaceView::render_inactive_tail_action_bar`), so the row reserves
+        // its occupancy — the inactive twin of the active composer's
+        // `composer_gutters.bottom` — as an in-flow tail spacer. Without it a
+        // draft tall enough to fill its runway ends its last lines under the
+        // bar with no scroll left to reveal them.
+        let bar_reserve = match page_layout.gutters {
+            GutterPlacement::Stacked if !editor.read(cx).is_empty() => {
+                super::layout::compact_action_bar_h(rem_size)
+            }
+            _ => 0.0,
+        };
+        let editor_fill =
+            px((slot_h - 2.0 * POST_PAD_Y.as_f32() - compact_top - bar_reserve).max(0.0));
 
         let byline_el = byline_gutter(page_layout, "You", theme.info, Some(DRAFT_BYLINE_OPACITY));
 
@@ -726,7 +740,12 @@ impl SpaceView {
                 // The draft's pending quotes, as footnotes — the same rail
                 // a posted exchange carries, so composing looks like what
                 // it will become.
-                .children(self.render_draft_footnotes(&node.id, false, cx)),
+                .children(self.render_draft_footnotes(&node.id, false, cx))
+                // The bottom action bar's reservation (zero in the Sides
+                // scheme and for an empty draft) — in flow, so a long draft's
+                // measured height carries it and the page can scroll the last
+                // lines clear of the bar.
+                .child(div().h(px(bar_reserve)).w_full().flex_none()),
         )
         .child(action_gutter(page_layout, false))
         .child(record_height(

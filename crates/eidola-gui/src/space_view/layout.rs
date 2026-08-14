@@ -747,12 +747,20 @@ impl SpaceView {
     /// can never disagree on the bar. Pure core:
     /// [`super::composer::float_bar_height`], unit-tested.
     pub(crate) fn composer_float_bar_h(&self, window_h: Pixels) -> f32 {
+        // Exact sizing pins the bar to the window fraction regardless of
+        // content, and at the minimum fraction in a short window that can
+        // dip below the bar's *fixed* surfaces (the top chrome and the
+        // compact action bar). Clamp so the chrome always fits — the editor
+        // is what compresses, never the fixed surfaces.
+        let fixed =
+            (Self::composer_chrome() + self.composer_gutters.get().bottom).min(window_h.as_f32());
         super::composer::float_bar_height(
             self.composer_floating_natural_height(),
             self.composer_fraction,
             window_h.as_f32(),
             self.composer_sizing,
         )
+        .max(fixed)
     }
 
     /// Bottom padding the page needs so the selected branch's tail can scroll
