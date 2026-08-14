@@ -2732,6 +2732,10 @@ impl SpaceView {
         let new_y = (off.y.as_f32() + dy).clamp(self.scroll_min_y.get(), 0.0);
         let scrolled = (new_y - off.y.as_f32()).abs() > 0.01;
         if scrolled {
+            // A selection drag pulling the page is the reader's own motion —
+            // it takes the viewport from the post-submit pin's forcing phase
+            // like every other reader-driven scroll writer.
+            self.demote_tail_pin_for_reader();
             self.set_page_scroll_y(new_y);
         }
         // Re-extend the selection to the row now under the (unmoved) pointer.
