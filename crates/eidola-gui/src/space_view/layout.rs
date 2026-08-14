@@ -189,6 +189,17 @@ pub(crate) struct PageLayout {
     pub(crate) gutters: GutterPlacement,
 }
 
+/// The compact composer's vertical occupancy around the editor — both parts
+/// exist only in the Stacked scheme, and they live in *different states*:
+///
+/// - `top` is the **docked byline row** — the "You" line the docked bar shows
+///   at a post's metadata position. It is docked-only chrome (the floating bar
+///   carries no byline; see the dock-reveal machinery in `composer.rs`), so it
+///   counts toward the docked natural height and the runway but **not** toward
+///   the floating bar.
+/// - `bottom` is the **bottom action bar** — Post and its siblings on their
+///   own surface anchored to the window's bottom edge, present (and reserved)
+///   whenever the actions are revealed, floating and docked alike.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ComposerGutterHeights {
     pub(crate) top: f32,
@@ -203,10 +214,21 @@ impl ComposerGutterHeights {
 
 pub(crate) const COMPACT_GUTTER_LINE_REMS: f32 = 1.5;
 pub(crate) const COMPACT_GUTTER_GAP_REMS: f32 = 0.5;
+/// The bottom action bar's clearance under its verb line — what keeps Post
+/// off the very edge of the screen.
+pub(crate) const COMPACT_ACTION_BAR_CLEARANCE_REMS: f32 = 1.0;
 pub(crate) const COMPACT_PAGE_INSET: Pixels = POST_PAD_Y;
 
 pub(crate) fn compact_gutter_occupancy(rem_size: Pixels) -> f32 {
     rem_size.as_f32() * (COMPACT_GUTTER_LINE_REMS + COMPACT_GUTTER_GAP_REMS)
+}
+
+/// The compact bottom action bar's total height: the verb line with a gutter
+/// gap above it and a full clearance below, so the verbs never crowd the
+/// window edge.
+pub(crate) fn compact_action_bar_h(rem_size: Pixels) -> f32 {
+    rem_size.as_f32()
+        * (COMPACT_GUTTER_GAP_REMS + COMPACT_GUTTER_LINE_REMS + COMPACT_ACTION_BAR_CLEARANCE_REMS)
 }
 
 pub(crate) fn composer_gutter_heights(
@@ -216,14 +238,30 @@ pub(crate) fn composer_gutter_heights(
 ) -> ComposerGutterHeights {
     match page_layout.gutters {
         GutterPlacement::Sides => ComposerGutterHeights::default(),
-        GutterPlacement::Stacked => {
-            let line = compact_gutter_occupancy(rem_size);
-            ComposerGutterHeights {
-                top: line,
-                bottom: if actions_revealed { line } else { 0.0 },
-            }
-        }
+        GutterPlacement::Stacked => ComposerGutterHeights {
+            top: compact_gutter_occupancy(rem_size),
+            bottom: if actions_revealed {
+                compact_action_bar_h(rem_size)
+            } else {
+                0.0
+            },
+        },
     }
+}
+
+/// How much page travel past the dock threshold completes the compact
+/// byline's reveal (and the matching content slide) — short enough that any
+/// deliberately docked position shows the settled, post-parity layout, long
+/// enough that the transition reads as a slide rather than a pop.
+pub(crate) const DOCK_REVEAL_SPAN: f32 = 56.0;
+
+/// The compact docked byline's reveal progress: `0` at (or above) the float
+/// line — the floating bar carries no byline — ramping to `1` over the first
+/// [`DOCK_REVEAL_SPAN`] of page travel past the dock threshold. Drives both
+/// the byline's opacity and the dead-space inset that slides the editor down
+/// to its post-parity offset, so the two can never disagree.
+pub(crate) fn dock_reveal_progress(float_top: f32, top_y: f32) -> f32 {
+    ((float_top - top_y) / DOCK_REVEAL_SPAN).clamp(0.0, 1.0)
 }
 
 pub(crate) fn page_layout(page_width: Pixels) -> PageLayout {
@@ -710,7 +748,7 @@ impl SpaceView {
     /// [`super::composer::float_bar_height`], unit-tested.
     pub(crate) fn composer_float_bar_h(&self, window_h: Pixels) -> f32 {
         super::composer::float_bar_height(
-            self.composer_natural_height(),
+            self.composer_floating_natural_height(),
             self.composer_fraction,
             window_h.as_f32(),
             self.composer_sizing,
@@ -845,7 +883,11 @@ mod tests {
             body_width: BODY_MAX_WIDTH.as_f32(),
             gutters: GutterPlacement::Stacked,
         };
+        // The docked byline row is unconditional — a docked composer always
+        // shows "You", exactly as a post always shows its metadata; only the
+        // bottom action bar waits for the actions to reveal.
         let line = compact_gutter_occupancy(gpui::px(16.));
+        let bar = compact_action_bar_h(gpui::px(16.));
         assert_eq!(
             composer_gutter_heights(compact, gpui::px(16.), false),
             ComposerGutterHeights {
@@ -857,8 +899,13 @@ mod tests {
             composer_gutter_heights(compact, gpui::px(16.), true),
             ComposerGutterHeights {
                 top: line,
-                bottom: line,
+                bottom: bar,
             }
+        );
+        assert!(
+            bar > line,
+            "the action bar carries clearance beyond a bare gutter line, \
+             keeping Post off the window edge"
         );
         assert_eq!(
             composer_gutter_heights(
@@ -871,6 +918,21 @@ mod tests {
             ),
             ComposerGutterHeights::default()
         );
+    }
+
+    #[test]
+    fn dock_reveal_ramps_over_the_first_travel_past_the_threshold() {
+        // Floating (at or above the float line): no byline.
+        assert_eq!(dock_reveal_progress(500.0, 500.0), 0.0);
+        assert_eq!(dock_reveal_progress(500.0, 520.0), 0.0);
+        // Half the span in: half revealed.
+        assert_eq!(
+            dock_reveal_progress(500.0, 500.0 - DOCK_REVEAL_SPAN / 2.0),
+            0.5
+        );
+        // Anywhere deeper than the span: fully settled, post-parity layout.
+        assert_eq!(dock_reveal_progress(500.0, 500.0 - DOCK_REVEAL_SPAN), 1.0);
+        assert_eq!(dock_reveal_progress(500.0, 0.0), 1.0);
     }
 
     #[test]

@@ -5540,19 +5540,44 @@ fn space_composer_resize_drag_pins_exact_height_and_reverts_on_deactivate(cx: &m
 
 #[gpui::test]
 fn compact_floating_composer_uses_complete_natural_height(cx: &mut TestAppContext) {
-    let (_window, view, vcx) = open_floating_composer_scene(cx, "compact-natural-height");
+    let (_window, view, mut vcx) = open_floating_composer_scene(cx, "compact-natural-height");
     const WIN: f32 = 620.0;
+
+    // A non-empty draft, so the actions reveal and the bottom bar holds its
+    // reservation alongside the docked byline row.
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the scene's draft is active");
+    editor.update(&mut vcx, |editor, cx| {
+        editor.set_value("a line of draft", cx)
+    });
+    vcx.run_until_parked();
+    for _ in 0..2 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
 
     view.read_with(&vcx, |v, _| {
         let (natural, base, gutters) = v.composer_height_contract_for_test();
-        assert!(gutters > 0.0, "compact composer reserves its metadata line");
+        let (byline_row, total) = v.composer_gutter_contract_for_test();
+        let action_bar = total - byline_row;
         assert!(
-            (natural - base - gutters).abs() < 0.01,
-            "natural height {natural} includes base {base} and gutters {gutters}"
+            byline_row > 0.0 && action_bar > 0.0,
+            "the compact composer reserves its docked byline row and its bottom action bar"
         );
         assert!(
-            (v.composer_float_bar_h_for_test(WIN) - natural).abs() < 0.5,
-            "the uncapped floating bar uses the complete natural height"
+            (natural - base - gutters).abs() < 0.01,
+            "docked natural height {natural} includes base {base} and both gutters {gutters}"
+        );
+        let floating = v.composer_floating_natural_height_for_test();
+        assert!(
+            (floating - base - action_bar).abs() < 0.01,
+            "the floating bar carries the action bar but never the byline row \
+             (floating {floating}, base {base}, action bar {action_bar})"
+        );
+        assert!(
+            (v.composer_float_bar_h_for_test(WIN) - floating).abs() < 0.5,
+            "the uncapped floating bar uses the complete floating natural height"
         );
     });
 }
@@ -10522,18 +10547,18 @@ fn space_quote_survives_the_round_trip_into_the_ask_path(cx: &mut TestAppContext
 #[gpui::test]
 fn space_composer_counts_the_bottom_breath_once(cx: &mut TestAppContext) {
     // The composer bar sizes itself to what its body draws — the editor's
-    // laid-out text plus the *tail* below it — and the bar's bottom breath is
-    // part of that tail exactly once.
+    // laid-out text, the footnote rail's measured span, and the trailing
+    // breath spacer — a straight sum of rendered elements, each counted
+    // exactly once.
     //
-    // Which element draws the breath depends on what ends the body. With no
-    // rail it is the editor's own runway (its `min_height` fills the bar, so
-    // the breath is live notes space, not a dead strip). With a footnote rail
-    // it is the rail's own bottom padding — *inside* the span the two flow
-    // marks measure. Counting both (a measured rail whose padding is the
-    // breath, plus the breath again as a separate term) inflates the bar, and
-    // the whole floating/docking runway with it, by a pad-height: the editor's
-    // floor (`body_h − rail`) grows to swallow the surplus, opening a gap
-    // between the last line of text and the footnote rule.
+    // The breath is one in-flow spacer, always the last thing in the body,
+    // so a scrolled draft's last line stops a breath above the fold. The
+    // rail's own bottom padding (`rail_pad`) stays *inside* the measured
+    // flow-mark span, sized so pad-plus-breath totals a post's full bottom
+    // pad — double-counting either term inflates the bar, and the whole
+    // floating/docking runway with it: the editor's floor grows to swallow
+    // the surplus, opening a gap between the last line of text and the
+    // footnote rule.
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, Some("s".into()));
     seed_quotable_space(
@@ -10569,8 +10594,9 @@ fn space_composer_counts_the_bottom_breath_once(cx: &mut TestAppContext) {
          (reserved {reserved}, text {text}, breath {breath})"
     );
 
-    // Phase 2 — a populated rail. The tail is the measured rail, which carries
-    // the breath as its own bottom padding.
+    // Phase 2 — a populated rail. The reservation is the same sum with the
+    // rail's measured span in the middle; the breath still follows outside
+    // it, and the rail's own `rail_pad` tops the pair up to a full post pad.
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
             v.seed_draft_quote_for_test(
@@ -10592,16 +10618,14 @@ fn space_composer_counts_the_bottom_breath_once(cx: &mut TestAppContext) {
         .read_with(cx, |v, cx| v.composer_geometry_for_test(cx))
         .expect("the quoting draft is the active composer");
     assert!(
-        rail > breath,
-        "the rail measures its rule, its row, and the breath it pads with \
-         (rail {rail}, breath {breath})"
+        rail > 0.5,
+        "the rail measures its rule, its row, and its own pad (rail {rail})"
     );
     assert!(
-        (reserved - (text + rail)).abs() < 0.5,
-        "with a rail the bar reserves the editor's text plus the rail's measured \
-         occupancy — the breath rides inside that span, so adding it again would \
-         reserve {breath}px the body never draws (reserved {reserved}, text {text}, \
-         rail {rail})"
+        (reserved - (text + rail + breath)).abs() < 0.5,
+        "the bar reserves exactly what the body draws — text, the rail's \
+         measured span, and one trailing breath (reserved {reserved}, \
+         text {text}, rail {rail}, breath {breath})"
     );
 }
 
@@ -10657,13 +10681,15 @@ fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppConte
     vcx.run_until_parked();
 
     // The test window has no CSD insets, so its content box is the size it
-    // was resized to. This width is compact, and the action line after the
-    // editor occupies its exact rem-derived line-plus-gap allocation.
+    // was resized to. This width is compact, so the editor's visible clip
+    // ends above the bottom action bar, and the body's trailing breath
+    // spacer separates the rail's lower mark from that clip edge.
     let win = 560.0;
     let rem_size = vcx.update(|window, _| window.rem_size().as_f32());
     let action_occupancy = view.read_with(&vcx, |v, _| {
         v.compact_action_occupancy_for_test(760.0, rem_size)
     });
+    let breath = eidola_gui::space_view::composer::bottom_breath();
     view.read_with(&vcx, |v, cx| {
         assert!(
             !v.composer_overlayed_for_test(),
@@ -10674,13 +10700,14 @@ fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppConte
             .expect("the quoting draft is the active composer");
         assert!(rail > 0.5, "the seeded quote renders a rail (was {rail})");
         let bottom = v.composer_rail_bottom_for_test();
-        let action_top = win - action_occupancy;
+        let clip_bottom = win - action_occupancy;
+        let expected = clip_bottom - breath;
         assert!(
-            bottom >= action_top - 0.5 && bottom <= win + 0.5,
-            "the docked rail stays on screen immediately before the compact action \
-             line — not clipped below the window (the bug), and not floated above \
-             the action allocation (an over-correction): rail bottom {bottom}, \
-             action allocation {action_top}..{win}"
+            bottom >= expected - 0.5 && bottom <= clip_bottom + 0.5,
+            "the docked rail stays on screen, its lower mark one breath above \
+             the clip edge the action bar owns — not clipped below the window \
+             (the bug), and not floated higher (an over-correction): rail \
+             bottom {bottom}, expected {expected}..{clip_bottom}"
         );
     });
 }

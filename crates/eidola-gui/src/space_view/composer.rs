@@ -74,10 +74,23 @@ impl SpaceView {
         self.composer_gutters.set(heights);
     }
 
+    /// The **docked** bar's natural height: chrome, content, and both compact
+    /// gutters — the byline row the docked bar shows and the bottom action
+    /// bar. This is what the runway and the dock ramp's `full_h` size against.
     pub(crate) fn composer_natural_height(&self) -> f32 {
         Self::composer_chrome()
             + self.composer_content_h.borrow().as_f32()
             + self.composer_gutters.get().total()
+    }
+
+    /// The **floating** bar's natural height: the docked one less the byline
+    /// row, which never floats (the compact byline is docked-only — see the
+    /// dock-reveal machinery in `render_active_draft`). In the Sides scheme
+    /// the two are identical.
+    pub(crate) fn composer_floating_natural_height(&self) -> f32 {
+        Self::composer_chrome()
+            + self.composer_content_h.borrow().as_f32()
+            + self.composer_gutters.get().bottom
     }
 
     // -- Draft lifecycle ---------------------------------------------------
@@ -1030,8 +1043,17 @@ impl SpaceView {
         self.composer_overlayed.set(overlayed);
 
         let compact_gutters = self.composer_gutters.get();
-        let compact_top_h = compact_gutters.top;
         let compact_bottom_h = compact_gutters.bottom;
+        // The compact byline is **docked-only**: the floating bar carries no
+        // attribution (matching the Sides bar, whose byline sits beside it),
+        // and the docked bar shows "You" at a post's metadata position. The
+        // reveal ramps over the first stretch of page travel past the dock
+        // threshold, driving an equal dead-space inset (outside the scroll
+        // clip, between separator and body) and the byline's opacity — the
+        // editor slides down to its post-parity offset as the byline fades in
+        // over it, the two locked a constant metadata-gap apart.
+        let reveal = super::layout::dock_reveal_progress(float_top, top_y);
+        let compact_inset = compact_gutters.top * reveal;
         let full_h = self.composer_natural_height().max(win);
         let bar_h = composer_bar_h(
             float_bar_h,
@@ -1042,7 +1064,7 @@ impl SpaceView {
             docked,
         );
         let body_h = (bar_h - chrome).max(0.0);
-        let editor_body_h = (body_h - compact_top_h - compact_bottom_h).max(0.0);
+        let editor_body_h = (body_h - compact_inset - compact_bottom_h).max(0.0);
         // **The visible quad is not the bar.** `bar_h` above is the composer's
         // *virtual* geometry — the scroll viewport the ramp grows so a scrolled
         // composer's internal offset eases to its top by the time it docks. The
@@ -1095,49 +1117,40 @@ impl SpaceView {
         // nothing to scroll; letting the wheel fall through to the page (below)
         // scrolls the conversation underneath instead of trapping it. When docked
         // the page owns the scroll regardless.
-        let composer_scrollable = overlayed && (self.composer_natural_height() > bar_h + 0.5);
+        let composer_scrollable =
+            overlayed && (self.composer_floating_natural_height() > bar_h + 0.5);
         self.composer_scrollable.set(composer_scrollable);
         // The internal fold shadow appears once actual *text* is cut at the
         // fold — the first `scroll_gap` of internal scroll only consumes the
         // in-content spacer, and a shadow over that still-blank strip would
         // announce a cut that hasn't happened.
         let scrolled_down = self.composer_scroll.offset().y.as_f32() < -(scroll_gap + 0.5);
+        // The same reveal condition `sync_composer_gutters` reserved heights
+        // from, so the bottom action bar renders exactly when
+        // `compact_bottom_h` holds its room.
+        let actions_revealed = !editor.read(cx).is_empty() || self.window_input.read(cx).alt_held();
+        // Whether the internal scroll still has content below the fold — the
+        // condition for the bottom bar's upward fold shadow. `scroll_max` is
+        // the floating natural height less the bar (the same overflow
+        // `composer_scrollable` reads).
+        let more_below = composer_scrollable
+            && self.composer_scroll.offset().y.as_f32()
+                > -((self.composer_floating_natural_height() - bar_h).max(0.0)) + 0.5;
 
-        // Both gutters take the scroll gap as a top margin: the h_flex below
-        // pads only the separator, so without it the byline and the action
-        // verbs would ride up by the gap — they must stay aligned with the
-        // (unscrolled) first text line, exactly where a post's gutter sits.
-        let mut byline = super::post::byline_gutter(
+        // The Sides byline takes the scroll gap as a top margin: the h_flex
+        // below pads only the separator, so without it the byline would ride
+        // up by the gap — it must stay aligned with the (unscrolled) first
+        // text line, exactly where a post's gutter sits. ("See in context"
+        // lives with the other verbs on the action side, not here.) The
+        // compact byline is not a flex child at all — see the dock-reveal
+        // overlay below.
+        let byline = super::post::byline_gutter(
             page_layout,
             "You",
             theme.info,
             Some(super::post::DRAFT_BYLINE_OPACITY),
         )
-        .when(page_layout.gutters == GutterPlacement::Sides, |d| {
-            d.mt(px(scroll_gap))
-        });
-        if overlayed {
-            let home_fg = theme.muted_foreground;
-            let home_fg_hover = theme.foreground;
-            let home_bg_hover = theme.muted;
-            let home = div()
-                .id("space-draft-home")
-                .probe("space/composer/home", gpui::Role::Button, "See in context")
-                .when(page_layout.gutters == GutterPlacement::Sides, |d| d.mt_1())
-                .px_1()
-                .rounded_md()
-                .text_sm()
-                .text_color(home_fg)
-                .top_neg_2()
-                .cursor_pointer()
-                .when(page_layout.gutters == GutterPlacement::Sides, |d| {
-                    d.text_align(gpui::TextAlign::Right).pr_neg_0p5()
-                })
-                .hover(move |s| s.text_color(home_fg_hover).bg(home_bg_hover))
-                .child("See in context")
-                .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx)));
-            byline = byline.child(home);
-        }
+        .mt(px(scroll_gap));
 
         let mut body = div()
             .id("space-composer-body")
@@ -1219,7 +1232,11 @@ impl SpaceView {
                     // (`clipped_tail`), so the rail lands on the *visible*
                     // edge instead of below it.
                     .style(prose_style(cx))
-                    .min_height(px((editor_body_h - draft_rail_h - clipped_tail).max(0.0)))
+                    .min_height(px((editor_body_h
+                        - draft_rail_h
+                        - bottom_breath()
+                        - clipped_tail)
+                        .max(0.0)))
                     // The editable context menu (Cut / Copy / Paste / Select All).
                     .on_context_menu(cx.listener(
                         move |this, at: &gpui::Point<gpui::Pixels>, _, cx| {
@@ -1243,14 +1260,19 @@ impl SpaceView {
             .child(super::references::flow_mark(
                 self.composer_rail_bottom.clone(),
             ))
+            // The bottom breath — the mirror of the top `scroll_gap` spacer, a
+            // real in-flow child so a scrolled composer's content stops a
+            // breath above the fold instead of pinning its last line (or the
+            // rail) against it. See `bottom_breath` for how it composes with
+            // the rail's own padding.
+            .child(div().h(px(bottom_breath())))
             // Measure the composer body's *natural* content height — the
             // editor's own laid-out text (decoupled from the `min_height`
             // floor, so growing the editor to fill the runway doesn't feed
-            // back into the height that sizes it) plus its tail: the rail's
-            // measured occupancy, or a bare breath when there is no rail. The
-            // rail carries the breath as its own padding, so the two are a
-            // `max`, never a sum — the bar reserves exactly what the body
-            // draws, in both rail states.
+            // back into the height that sizes it) plus the rail's measured
+            // occupancy plus the breath spacer above — a straight sum of
+            // rendered elements, so the bar reserves exactly what the body
+            // draws.
             .child(record_height(
                 self.composer_content_h.clone(),
                 self.composer_rail_top.clone(),
@@ -1278,6 +1300,7 @@ impl SpaceView {
                 page_slot_doc_top,
                 win,
                 compact_gutters,
+                compact_inset,
             ));
         body.style().restrict_scroll_to_axis = Some(true);
 
@@ -1340,26 +1363,100 @@ impl SpaceView {
                         h_flex().justify_center().items_start().gap(GUTTER_GAP)
                     }
                     GutterPlacement::Stacked => v_flex().items_center(),
-                };
-                columns
-                    .w(page_width)
-                    .mt(px(content_shift))
-                    .h(px(bar_h))
-                    // Only the separator slice of the top chrome lives outside
-                    // the columns; the rest is the body's in-content spacer
-                    // (and the gutters' compensating top margins), so the
-                    // scroll fold sits a thin, pane-separator band below the
-                    // bar's edge while nothing else moves.
-                    .pt(px(COMPOSER_SEPARATOR_H))
-                    .child(byline)
-                    .child(body)
-                    .child(
-                        self.render_composer_actions(&editor, page_layout, cx)
-                            .when(page_layout.gutters == GutterPlacement::Sides, |d| {
-                                d.mt(px(scroll_gap))
-                            }),
-                    )
+                }
+                .w(page_width)
+                .mt(px(content_shift))
+                .h(px(bar_h))
+                // Only the separator slice of the top chrome lives outside
+                // the columns; the rest is the body's in-content spacer
+                // (and, in the Sides scheme, the gutters' compensating top
+                // margins), so the scroll fold sits a thin, pane-separator
+                // band below the bar's edge while nothing else moves.
+                .pt(px(COMPOSER_SEPARATOR_H));
+                match page_layout.gutters {
+                    GutterPlacement::Sides => columns.child(byline).child(body).child(
+                        self.render_composer_actions(&editor, page_layout, overlayed, cx)
+                            .mt(px(scroll_gap)),
+                    ),
+                    // Compact carries neither gutter as a column: the byline
+                    // is the dock-reveal overlay below and the verbs live on
+                    // the bottom action bar. The in-flow inset is the dead
+                    // space the reveal opens between the separator and the
+                    // scroll clip — what slides the editor down to its
+                    // post-parity offset as the byline fades in over it.
+                    GutterPlacement::Stacked => columns
+                        .child(div().h(px(compact_inset)).w_full().flex_none())
+                        .child(body),
+                }
             });
+        if page_layout.gutters == GutterPlacement::Stacked {
+            // The docked byline: "You" at a post's metadata position —
+            // `POST_PAD_Y` under the slot top, a metadata-gap above the first
+            // text line — fading in over the dock-reveal ramp. Absolute and
+            // composer-relative, so it is never part of the floating bar's
+            // layout; it rides the same inset the editor slides down by, so
+            // the pair stay locked a post's metadata gap apart throughout the
+            // transition.
+            if reveal > 0.01 {
+                composer = composer.child(
+                    div()
+                        .absolute()
+                        .top(px(content_shift + COMPOSER_SEPARATOR_H + compact_inset))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .opacity(reveal)
+                        .child(
+                            div()
+                                .id("space-composer-byline")
+                                .probe_bounds(
+                                    "space/composer/byline",
+                                    gpui::Role::Label,
+                                    "Draft byline",
+                                )
+                                .child(super::post::byline_gutter(
+                                    page_layout,
+                                    "You",
+                                    theme.info,
+                                    Some(super::post::DRAFT_BYLINE_OPACITY),
+                                )),
+                        ),
+                );
+            }
+            // The bottom action bar (its own surface, anchored to the
+            // window's bottom edge — the composer's quad bottom is always the
+            // window bottom, floating and docked alike). Present exactly when
+            // the actions are revealed, which is also when `compact_bottom_h`
+            // reserves its height out of the editor's viewport.
+            if actions_revealed {
+                // When the internally-scrolled composer has content clipped
+                // *behind* the bar, an upward fold shadow above it says so —
+                // without it the cut text read as a bug (the bar's ground is
+                // the same paper as the body, so the fold was invisible).
+                if more_below {
+                    composer = composer.child(
+                        div()
+                            .absolute()
+                            .bottom(px(compact_bottom_h))
+                            .left_0()
+                            .right_0()
+                            .h(px(8.))
+                            .bg(linear_gradient(
+                                0.,
+                                linear_color_stop(hsla(0., 0., 0., 0.08), 0.),
+                                linear_color_stop(hsla(0., 0., 0., 0.), 1.),
+                            )),
+                    );
+                }
+                composer = composer.child(self.render_compact_action_bar(
+                    bw,
+                    compact_bottom_h,
+                    overlayed,
+                    cx,
+                ));
+            }
+        }
         if scrolled_down {
             composer = composer.child(
                 div()
@@ -1539,9 +1636,9 @@ impl SpaceView {
         &self,
         editor: &gpui::Entity<MarkdownEditorState>,
         page_layout: super::layout::PageLayout,
+        overlayed: bool,
         cx: &Context<Self>,
     ) -> gpui::Div {
-        let theme = cx.theme();
         let alt = self.window_input.read(cx).alt_held();
         let revealed = !editor.read(cx).is_empty() || alt;
 
@@ -1550,60 +1647,137 @@ impl SpaceView {
             return col;
         }
 
+        col = col.child(self.post_verb(alt, cx));
+        if alt {
+            col = col.child(self.post_quiet_verb(cx));
+        }
+        // "See in context" — the floating composer's way home — belongs with
+        // the other verbs, not beside the byline (attribution says who wrote
+        // this; the action gutter is where you act on it).
+        if overlayed {
+            col = col.child(self.home_verb(cx));
+        }
+        col
+    }
+
+    /// Post — save the thought; notify policies drive who responds.
+    fn post_verb(&self, alt: bool, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = cx.theme();
         let fg = theme.muted_foreground;
         let fg_hover = theme.foreground;
         let bg_hover = theme.muted;
         let hint_fg = theme.muted_foreground.opacity(0.7);
+        h_flex()
+            .id("space-post")
+            .probe("space/composer/post", gpui::Role::Button, "Post")
+            .px_1()
+            .ml_neg_1()
+            .rounded_md()
+            .cursor_pointer()
+            .items_baseline()
+            .gap_1p5()
+            .text_sm()
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(fg)
+            .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
+            .child("Post")
+            .when(alt, |d| d.child(kbd_hint("⌘↩", hint_fg)))
+            .on_click(cx.listener(|this, _, window, cx| this.submit(&Send, window, cx)))
+    }
 
-        // Post — save the thought; notify policies drive who responds.
-        col = col.child(
-            h_flex()
-                .id("space-post")
-                .probe("space/composer/post", gpui::Role::Button, "Post")
-                .px_1()
-                .ml_neg_1()
-                .rounded_md()
-                .cursor_pointer()
-                .items_baseline()
-                .gap_1p5()
-                .text_sm()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(fg)
-                .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
-                .child("Post")
-                .when(alt, |d| d.child(kbd_hint("⌘↩", hint_fg)))
-                .on_click(cx.listener(|this, _, window, cx| this.submit(&Send, window, cx))),
-        );
+    /// Post quietly — save without notifying anyone. ⌥-revealed: present when
+    /// reached for, invisible in the common case.
+    fn post_quiet_verb(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = cx.theme();
+        let fg = theme.muted_foreground;
+        let fg_hover = theme.foreground;
+        let bg_hover = theme.muted;
+        let hint_fg = theme.muted_foreground.opacity(0.7);
+        h_flex()
+            .id("space-post-quiet")
+            .probe(
+                "space/composer/post-quiet",
+                gpui::Role::Button,
+                "Post quietly — notify no one",
+            )
+            .px_1()
+            .ml_neg_1()
+            .rounded_md()
+            .cursor_pointer()
+            .items_baseline()
+            .gap_1p5()
+            .text_sm()
+            .text_color(fg)
+            .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
+            .child("Post quietly")
+            .child(kbd_hint("⇧⌘↩", hint_fg))
+            .on_click(cx.listener(|this, _, window, cx| this.post_only(&PostOnly, window, cx)))
+    }
 
-        // Post quietly — save without notifying anyone. ⌥-revealed: present
-        // when reached for, invisible in the common case.
+    /// "See in context" — dock the floating composer at its own slot.
+    fn home_verb(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = cx.theme();
+        let home_fg = theme.muted_foreground;
+        let home_fg_hover = theme.foreground;
+        let home_bg_hover = theme.muted;
+        div()
+            .id("space-draft-home")
+            .probe("space/composer/home", gpui::Role::Button, "See in context")
+            .px_1()
+            .ml_neg_1()
+            .rounded_md()
+            .text_sm()
+            .text_color(home_fg)
+            .cursor_pointer()
+            .hover(move |s| s.text_color(home_fg_hover).bg(home_bg_hover))
+            .child("See in context")
+            .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx)))
+    }
+
+    /// The compact scheme's bottom action bar: the composer's verbs on their
+    /// own surface, anchored to the window's bottom edge (the composer quad's
+    /// bottom — always the window bottom, floating and docked alike). Post
+    /// keeps the right edge, its ⌥ siblings beside it; "See in context" takes
+    /// the left while floating. The bar's ground is the same paper as the
+    /// body — it reads as in-flow until content scrolls behind it, where the
+    /// fold shadow (drawn by the caller) marks the cut.
+    fn render_compact_action_bar(
+        &self,
+        body_width: gpui::Pixels,
+        bar_h: f32,
+        overlayed: bool,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let theme = cx.theme();
+        let alt = self.window_input.read(cx).alt_held();
+        let mut right = h_flex().items_baseline().gap_3();
         if alt {
-            col = col.child(
-                h_flex()
-                    .id("space-post-quiet")
-                    .probe(
-                        "space/composer/post-quiet",
-                        gpui::Role::Button,
-                        "Post quietly — notify no one",
-                    )
-                    .px_1()
-                    .ml_neg_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .items_baseline()
-                    .gap_1p5()
-                    .text_sm()
-                    .text_color(fg)
-                    .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
-                    .child("Post quietly")
-                    .child(kbd_hint("⇧⌘↩", hint_fg))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.post_only(&PostOnly, window, cx)),
-                    ),
-            );
+            right = right.child(self.post_quiet_verb(cx));
         }
-
-        col
+        right = right.child(self.post_verb(alt, cx));
+        div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .h(px(bar_h))
+            .bg(theme.background)
+            .flex()
+            .justify_center()
+            .child(
+                h_flex()
+                    .w(body_width)
+                    .h_full()
+                    .items_start()
+                    .pt(gpui::rems(super::layout::COMPACT_GUTTER_GAP_REMS))
+                    .justify_between()
+                    .child(if overlayed {
+                        self.home_verb(cx).into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    .child(right),
+            )
     }
 
     /// The active composer's measured geometry: `(reserved, rail, text)` — the
@@ -1659,30 +1833,34 @@ fn kbd_hint(text: &'static str, color: gpui::Hsla) -> gpui::Div {
     div().text_xs().text_color(color).child(text)
 }
 
-/// The composer bar's **bottom breath** — a half-pad of room so the last thing
-/// in the bar never sits flush against the window edge ([`rail_breath`] widens
-/// it to a full pad under a footnote rail).
+/// The composer bar's **bottom breath** — the mirror of the editor's top
+/// spacer ([`composer_scroll_gap`]), so the last typed line keeps the same
+/// distance from the bar's bottom edge that the first keeps from its top.
+/// Derived, not chosen, so the symmetry holds by construction.
 ///
-/// It is **drawn exactly once**, by whichever element ends the composer body:
-/// the footnote rail's own bottom padding when a rail is present (see
-/// [`SpaceView::render_draft_footnotes`](super::SpaceView::render_draft_footnotes)),
-/// and the editor's runway when it isn't — the editor's `min_height` fills the
-/// bar, so with no rail the breath is live, clickable notes space rather than a
-/// dead strip. One function, both call sites, so the two can't drift.
+/// It is a **real in-flow spacer at the end of the scroll content** (after
+/// the rail's flow marks), so a scrolled composer's content stops a breath
+/// above the fold instead of pinning its last line against it, and
+/// `record_height`'s sum — text + rail + breath — is exactly what the body
+/// lays out. Under a footnote rail, [`rail_pad`] tops it up to a post's full
+/// bottom pad.
 pub fn bottom_breath() -> f32 {
-    POST_PAD_Y.as_f32() / 2.0
+    composer_scroll_gap()
 }
 
-/// The breath kept **below the footnote rail** — a post's full bottom pad
-/// rather than the bar's half-pad [`bottom_breath`].
-///
-/// The rail is a ruled, text-bearing footer, not the tail of the writing
-/// surface: at the half-pad the last footnote row read as crowded against the
-/// window edge, where the same half-pad under a bare runway reads as open notes
-/// space. So the rail keeps the page's own vertical rhythm (`POST_PAD_Y`, what
-/// a post pads with) beneath it. It rides *inside* the span the two flow marks
-/// measure, so `record_height`'s `max(rail, breath)` still counts the bar's
-/// bottom breath exactly once.
+/// The footnote rail's **own** bottom padding: what tops the shared
+/// [`bottom_breath`] spacer below it up to [`rail_breath`] — a post's full
+/// bottom pad. Split this way so the breath is drawn exactly once (the
+/// trailing spacer exists in both rail states) while a ruled, text-bearing
+/// footer still gets the page's own vertical rhythm beneath it, which the
+/// bare breath alone reads as crowding.
+pub(crate) fn rail_pad() -> f32 {
+    (rail_breath() - bottom_breath()).max(0.0)
+}
+
+/// The total room kept below the footnote rail's rows — a post's full bottom
+/// pad (`POST_PAD_Y`): the rail's own [`rail_pad`] plus the shared
+/// [`bottom_breath`] spacer that follows it.
 pub fn rail_breath() -> f32 {
     POST_PAD_Y.as_f32()
 }
@@ -1789,27 +1967,21 @@ use std::rc::Rc;
 /// Record the composer body's natural content height into `cell`, scheduling a
 /// catch-up frame when it changes so the bar resizes as the content settles.
 ///
-/// The height is the sum of what the body actually draws: the editor's own
-/// laid-out text (`content_height`, read in the **paint** phase — a later
-/// sibling, so the editor's blocks have painted and updated their bounds this
-/// frame — and decoupled from the editor's `min_height`, so growing the editor
-/// to fill the runway doesn't feed back into the height that sizes the runway),
-/// plus the **tail** below that text: the footnote rail's measured height
-/// (`rail`, the distance between the two flow marks bracketing it — see
-/// [`references::flow_mark`](super::references::flow_mark)), or a bare `breath`
-/// when there is no rail.
-///
-/// **The tail is a `max`, not a sum, because the breath is drawn once.** A
-/// populated rail already carries it as its own bottom padding — inside the
-/// bracketed span — so adding [`bottom_breath`] on top would reserve it twice
-/// and inflate the bar by a pad-height (visible as a gap between the last line
-/// of text and the footnote rule, since the editor's `min_height` floor —
-/// `body_h − rail` — grows to swallow the surplus). With no rail the marks
-/// coincide, `max` degenerates to the breath, and the editor's runway draws it
-/// as live notes space. No branch on "is the rail empty", and either way the
-/// bar reserves exactly what the body draws. Nothing here is derived from a row
-/// count or a styling constant, so the reservation cannot drift from the
-/// rendering.
+/// The height is the sum of what the body actually draws, term for term: the
+/// editor's own laid-out text (`content_height`, read in the **paint** phase —
+/// a later sibling, so the editor's blocks have painted and updated their
+/// bounds this frame — and decoupled from the editor's `min_height`, so
+/// growing the editor to fill the runway doesn't feed back into the height
+/// that sizes the runway), plus the footnote rail's measured height (`rail`,
+/// the distance between the two flow marks bracketing it — see
+/// [`references::flow_mark`](super::references::flow_mark); zero with no
+/// rail, since the marks then coincide), plus the trailing [`bottom_breath`]
+/// spacer the body always ends with. Every term is a rendered element, so the
+/// reservation equals the layout with no cases to reason through — and
+/// nothing here is derived from a row count or a styling constant, so it
+/// cannot drift from the rendering. (The rail's own bottom padding is
+/// [`rail_pad`], deliberately *inside* the bracketed span; the shared breath
+/// after it tops the pair up to a post's full bottom pad.)
 ///
 /// **Pinned to the origin** (`top_0().left_0()`): it's a zero-visual measuring
 /// probe, but as an `absolute` child with no inset taffy places it at its
@@ -1834,7 +2006,7 @@ fn record_height(
                 return;
             };
             let rail = (rail_bottom.get() - rail_top.get()).max(0.0);
-            let h = editor.read(cx).content_height().as_f32() + rail.max(breath);
+            let h = editor.read(cx).content_height().as_f32() + rail + breath;
             if (cell.borrow().as_f32() - h).abs() > 0.5 {
                 *cell.borrow_mut() = gpui::px(h);
                 let view = view.clone();
@@ -1992,6 +2164,7 @@ fn caret_scroll_offset(
 ///
 /// One-shot per edit: it clears the flag, so a subsequent manual scroll isn't
 /// yanked back.
+#[allow(clippy::too_many_arguments)]
 fn caret_into_view(
     view: gpui::WeakEntity<SpaceView>,
     editor: gpui::WeakEntity<MarkdownEditorState>,
@@ -2000,6 +2173,7 @@ fn caret_into_view(
     page_slot_doc_top: f32,
     window_h: f32,
     composer_gutters: ComposerGutterHeights,
+    compact_inset: f32,
 ) -> impl IntoElement {
     gpui::canvas(
         |_, _, _| {},
@@ -2083,8 +2257,11 @@ fn caret_into_view(
                 // where a post's body sits under its `POST_PAD_Y` top pad).
                 // Omitting this term put every docked caret target one pad-height
                 // too high — scrolling down never fully revealed the line,
-                // scrolling up over-revealed it.
-                let editor_top_offset = POST_PAD_Y.as_f32() + composer_gutters.top;
+                // scrolling up over-revealed it. Compact adds the frame's
+                // dock-reveal inset — the dead space the docked byline occupies
+                // ahead of the editor, at its full `gutters.top` on any settled
+                // docked frame.
+                let editor_top_offset = POST_PAD_Y.as_f32() + compact_inset;
                 let caret_doc_top = page_slot_doc_top + editor_top_offset + caret_top;
                 let caret_doc_bot = page_slot_doc_top + editor_top_offset + caret_bot;
                 // The page's scroll depth, computed from the editor's **fresh**
@@ -2094,7 +2271,7 @@ fn caret_into_view(
                 // it can still reflect the pre-edit height and clamp the caret
                 // target back to the current offset. This rebuilds the runway by
                 // the same contract `runway_height` computes it — the shared
-                // `runway_floor` under `chrome + content + max(rail, breath) +
+                // `runway_floor` under `chrome + content + rail + breath +
                 // gutters` (`record_height`'s formula, over the fresh content) —
                 // and the doc ends at `page_slot_doc_top + runway` (the slot is
                 // the on-path leaf, no trailing band / floating pad), so this
@@ -2113,7 +2290,8 @@ fn caret_into_view(
                 let runway = floor.max(
                     SpaceView::composer_chrome()
                         + natural
-                        + rail.max(bottom_breath())
+                        + rail
+                        + bottom_breath()
                         + composer_gutters.total(),
                 );
                 let scroll_max = (page_slot_doc_top + runway - window_h).max(0.0);
