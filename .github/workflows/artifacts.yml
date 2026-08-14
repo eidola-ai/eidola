@@ -406,6 +406,9 @@ jobs:
           cat /tmp/macos-artifact-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
+      - name: Verify detached Apple signature contract
+        run: ./scripts/apple-signature-differential.sh
+
   # ── Linux GUI (cheap ubuntu runner, Nix) ─────────────────────────────────────
   # The GUI's Linux release artifact is Nix-built (glibc dynamic binary; see
   # flake.nix's eidola-gui-linux for why it can't be a static musl OCI

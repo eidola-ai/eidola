@@ -1,5 +1,5 @@
-//! release officer's tool. Two subcommands, run in order on a tag that has
-//! already been pushed and built by CI:
+//! Release officer tooling. The two release subcommands run in order on a tag
+//! that has already been pushed and built by CI:
 //!
 //! 1. `release-tool verify <tag>` — fetches the CI-built
 //!    `artifact-manifest.json` + Sigstore bundle from the GitHub release,
@@ -29,7 +29,10 @@
 //! `hashedrekord` (rekord and the SSH PKI are being retired), so this
 //! shape is forward-compatible.
 //!
-//! Shells out to `gh`, `cosign`, and `git`. All must be on PATH. For
+//! `apple detach|apply|inspect` are local, cross-platform operations over the
+//! detached Apple-signature contract. They invoke no Apple tools.
+//!
+//! The release workflow shells out to `gh`, `cosign`, and `git`. All must be on PATH. For
 //! local PEM cosign keys the engineer also needs `COSIGN_PASSWORD` in
 //! the environment; for PKCS#11 / KMS keys, the device or KMS handles
 //! its own auth (PIN, IAM, ...).
@@ -122,6 +125,10 @@ enum Command {
         templates: Option<PathBuf>,
     },
 
+    /// Detach, apply, or inspect a macOS app's code signatures.
+    #[command(subcommand)]
+    Apple(AppleCommand),
+
     /// PKCS#11 helpers for hardware attestant keys (YubiKey / SmartCard /
     /// HSM).
     #[command(subcommand)]
@@ -132,6 +139,31 @@ enum Command {
     /// releases/trust/attestant-provenance/README.md).
     #[command(subcommand)]
     Provenance(ProvenanceCommand),
+}
+
+#[derive(Subcommand)]
+enum AppleCommand {
+    /// Lift signatures and sealed resources from a signed app.
+    Detach {
+        /// Signed source app.
+        signed_bundle: PathBuf,
+        /// Reproducible unsigned app whose hashes the placement record pins.
+        unsigned_bundle: PathBuf,
+        /// Directory that will hold the placement record and detached tree.
+        output_dir: PathBuf,
+    },
+    /// Reconstruct a signed app in place from detached material.
+    Apply {
+        /// Writable copy of the reproducible unsigned app.
+        unsigned_bundle: PathBuf,
+        /// Detached root or the app directory within it.
+        detached: PathBuf,
+    },
+    /// Structurally parse embedded claims; does not authenticate Apple trust.
+    Inspect {
+        /// Signed app to inspect.
+        bundle: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -200,6 +232,30 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Apple(command) => match command {
+            AppleCommand::Detach {
+                signed_bundle,
+                unsigned_bundle,
+                output_dir,
+            } => {
+                let root = eidola_apple::detach(&signed_bundle, &unsigned_bundle, &output_dir)?;
+                println!("{}", root.display());
+                Ok(())
+            }
+            AppleCommand::Apply {
+                unsigned_bundle,
+                detached,
+            } => {
+                eidola_apple::apply(&unsigned_bundle, &detached)?;
+                println!("{}", unsigned_bundle.display());
+                Ok(())
+            }
+            AppleCommand::Inspect { bundle } => {
+                let facts = eidola_apple::inspect(&bundle)?;
+                println!("{}", serde_json::to_string_pretty(&facts)?);
+                Ok(())
+            }
+        },
         // PKCS#11 helpers are device-local and need neither a workspace nor
         // a GitHub repo, so resolve those only for the release subcommands.
         Command::Pkcs11(Pkcs11Command::List { module_path }) => {

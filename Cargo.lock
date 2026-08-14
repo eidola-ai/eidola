@@ -2654,6 +2654,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidola-apple"
+version = "0.1.0"
+dependencies = [
+ "plist",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "eidola-attestation"
 version = "0.1.0"
 dependencies = [
@@ -6943,6 +6955,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plist"
+version = "1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
+dependencies = [
+ "base64 0.22.1",
+ "indexmap",
+ "quick-xml 0.41.0",
+ "serde",
+ "time",
+]
+
+[[package]]
 name = "png"
 version = "0.17.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7864,6 +7889,7 @@ dependencies = [
  "cryptoki",
  "der",
  "eidola-app-core",
+ "eidola-apple",
  "eidola-attestation",
  "reqwest 0.13.4",
  "rpassword",

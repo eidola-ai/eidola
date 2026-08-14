@@ -1,6 +1,6 @@
 # Apple round-trip fixtures
 
-Committed inputs for the golden `apply` test that the planned `crates/eidola-apple` will code against. They exist so that test runs in plain `cargo test` on **any** platform: reproducing them needs macOS and `codesign`, but consuming them needs neither. If `apply` ever starts requiring a macOS tool, the Linux `rust-checks` job goes red — which is the property the detached-signature design was chosen for.
+Committed inputs for `crates/eidola-apple/tests/placement.rs`. The golden `apply` test runs in plain `cargo test` on **any** platform: reproducing the fixtures needs macOS and `codesign`, but consuming them needs neither. If `apply` ever starts requiring a macOS tool, the Linux `rust-checks` job goes red — which is the property the detached-signature design was chosen for.
 
 `round-trip.md` beside them is the measurement they encode — its result and verdict, and the document the harness and the classifier cite by section.
 
@@ -16,7 +16,7 @@ A two-slice (x86_64 + arm64) universal Mach-O, small enough to commit whole, car
 | `settled/Fixture.app/` | after one full `codesign` ad-hoc cycle: slice alignment normalized to 2^14, vmsize 16 KiB-rounded, no bundle-level seal. This is `apply`'s input |
 | `signed/Fixture.app/` | the golden: `settled` re-signed ad-hoc with `--options runtime --entitlements`, so the replacing signature is a **different size** than the settled one. That size change is what exposes the vmsize divergence; a same-size replacement hides it |
 | `detached/Fixture.app/` | the per-slice superblobs and the sealed `CodeResources`, in signapple's layout |
-| `detached/eidola-placement.json` | the placement record — input/output hashes per Mach-O, plus the signed artifact's per-slice structural facts (fat offset/size/align, `__LINKEDIT` sizing and field offsets, superblob placement and hash), which are what let `apply` land on `codesign`'s layout without deriving it |
+| `detached/eidola-placement.json` | the placement record — the exact unsigned regular-file set and hashes, output hashes per Mach-O, plus the signed artifact's per-slice structural facts (fat offset/size/align, `__LINKEDIT` sizing and field offsets, superblob placement and hash), which are what let `apply` refuse any changed input and land on `codesign`'s layout without deriving it |
 | `facts.json` | `scripts/macho_facts.py` output for all three Mach-Os, so a test can assert one named field rather than diff whole files |
 | `Info.plist`, `ent.plist` | the bundle identity and the entitlements used to grow the signature; kept so the fixture can be regenerated |
 
@@ -33,7 +33,7 @@ x86_64: input slice carries no LC_CODE_SIGNATURE; placement rewrites that
 load command, it does not insert one
 ```
 
-Keep that case in the tree: it is the boundary of the shipped design, and `eidola-apple` should either refuse it the same way or handle it deliberately.
+Keep that case in the tree: it is the boundary of the shipped design, and the Rust test requires a typed refusal naming the file and x86_64 slice.
 
 Regenerate (macOS, no signing identity needed):
 
@@ -87,7 +87,7 @@ The sidecar is **arm64-only by decision** even inside the universal app (see `AG
 
 ## Note on signapple as the differential implementation
 
-`signapple apply` can only reach a *fat* Mach-O through the bundle path: given a bare universal binary and a single `.arch sign` file it refuses ("Cannot attach single architecture signature to universal binary"), and given a directory it derives the architecture from the directory's extension, which has none. So the differential check has to hand signapple a bundle directory — which is why the synthetic fixture is one. `eidola-apple`'s own `apply` is under no such constraint and should accept a bare Mach-O too; `unsettled.macho` is there for that.
+`signapple apply` can only reach a *fat* Mach-O through the bundle path: given a bare universal binary and a single `.arch sign` file it refuses ("Cannot attach single architecture signature to universal binary"), and given a directory it derives the architecture from the directory's extension, which has none. So the differential check has to hand signapple a bundle directory — which is why the synthetic fixture is one. `unsettled.macho` is installed as that bundle's executable by the Rust refusal test; it is never treated as a valid placement input.
 
 ## Note on the Nix build cache
 
