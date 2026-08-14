@@ -2436,6 +2436,17 @@ impl Render for SpaceView {
             // composer and minimap, which paint over it as before.
             .child(self.render_title_bar(window, cx))
             .child(self.render_active_draft(&tree, page_width, window_h, window, cx))
+            // The compact bottom action bar for a docked, *inactive* tail
+            // draft — the active composer renders its own; this one fades in
+            // as the draft's slot scrolls into view. Same paint position as
+            // the composer (after the page, before the pickers/notices).
+            .child(self.render_inactive_tail_action_bar(
+                &tree,
+                page_width,
+                window_h,
+                window.rem_size(),
+                cx,
+            ))
             // The source-highlight picker: which of several posts that quoted
             // the clicked passage to visit. Above the composer, below the
             // notices — it's a choice, not a state.

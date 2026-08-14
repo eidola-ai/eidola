@@ -4813,8 +4813,37 @@ fn compact_composer_gutters_hold_post_parity_and_the_bottom_bar(cx: &mut TestApp
         WIN - bar_h
     );
 
+    // Deactivated at the floor: the bottom bar survives the editor losing
+    // its session — rendered by the inactive-tail path, fading in with the
+    // slot — so Post meets the reader without a click into the editor first.
+    vcx.update(|window, cx| {
+        use gpui::Focusable as _;
+        let focus = editor.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries.iter().any(|(name, _)| name == "space/composer"),
+        "escape retired the active composer overlay"
+    );
+    let post = entries
+        .iter()
+        .find(|(name, _)| name == "space/composer/post")
+        .expect("the inactive tail draft keeps its bottom action bar")
+        .1
+        .bounds;
+    assert!(
+        post.origin.y >= px(WIN - bar_h) && post.origin.y + post.size.height <= px(WIN - 8.),
+        "the inactive bar anchors to the same bottom allocation (post {post:?})"
+    );
+
     // Floating: the byline is not part of the bar (its probe never paints),
     // while the verbs stay on the bottom bar and See in context joins them.
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(tail, cx));
+    vcx.run_until_parked();
     view.read_with(&vcx, |v, _| v.set_page_scroll_for_test(0.0));
     vcx.run_until_parked();
     for _ in 0..2 {

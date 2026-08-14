@@ -223,9 +223,9 @@ pub(crate) fn compact_gutter_occupancy(rem_size: Pixels) -> f32 {
     rem_size.as_f32() * (COMPACT_GUTTER_LINE_REMS + COMPACT_GUTTER_GAP_REMS)
 }
 
-/// The compact bottom action bar's total height: the verb line with a gutter
-/// gap above it and a full clearance below, so the verbs never crowd the
-/// window edge.
+/// The compact bottom action bar's total height — a verb line plus a gutter
+/// gap and a full clearance of surrounding room (the line rides vertically
+/// centered in it), so the verbs never crowd the window edge.
 pub(crate) fn compact_action_bar_h(rem_size: Pixels) -> f32 {
     rem_size.as_f32()
         * (COMPACT_GUTTER_GAP_REMS + COMPACT_GUTTER_LINE_REMS + COMPACT_ACTION_BAR_CLEARANCE_REMS)
