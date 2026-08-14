@@ -1110,13 +1110,20 @@ impl SpaceView {
         self.composer_float_bar_h(px(window_h))
     }
 
-    /// Natural composer height, its editor-and-chrome base, and the compact
-    /// gutter occupancy used by every geometry consumer.
+    /// Natural composer height (docked), its editor-and-chrome base, and the
+    /// compact gutter occupancy used by every geometry consumer.
     #[doc(hidden)]
     pub fn composer_height_contract_for_test(&self) -> (f32, f32, f32) {
         let base = Self::composer_chrome() + self.composer_content_h.borrow().as_f32();
         let gutters = self.composer_gutters.get().total();
         (self.composer_natural_height(), base, gutters)
+    }
+
+    /// The floating bar's natural height — the docked one less the compact
+    /// byline row, which never floats.
+    #[doc(hidden)]
+    pub fn composer_floating_natural_height_for_test(&self) -> f32 {
+        self.composer_floating_natural_height()
     }
 
     /// Compact composer occupancy split around the editor.
@@ -1287,11 +1294,14 @@ impl SpaceView {
         Self::composer_chrome()
     }
 
+    /// The compact composer's bottom action-bar occupancy — the room the
+    /// editor's viewport ends above, and the surface the footnote rail must
+    /// clear.
     #[doc(hidden)]
     pub fn compact_action_occupancy_for_test(&self, page_width: f32, rem_size: f32) -> f32 {
         match layout::page_layout(px(page_width)).gutters {
             layout::GutterPlacement::Sides => 0.0,
-            layout::GutterPlacement::Stacked => layout::compact_gutter_occupancy(px(rem_size)),
+            layout::GutterPlacement::Stacked => layout::compact_action_bar_h(px(rem_size)),
         }
     }
 

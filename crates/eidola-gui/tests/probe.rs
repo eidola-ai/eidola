@@ -4736,6 +4736,121 @@ fn compact_post_metadata_stays_inside_its_row_at_large_type(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn compact_composer_gutters_hold_post_parity_and_the_bottom_bar(cx: &mut TestAppContext) {
+    use gpui::{VisualTestContext, px};
+
+    let _guard = probes_on();
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let body = "A paragraph long enough that the conversation overflows the window. ".repeat(30);
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", &body)], cx)
+        });
+    });
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    const WIN: f32 = 560.0;
+    vcx.simulate_resize(gpui::size(px(760.), px(WIN)));
+    vcx.run_until_parked();
+    // Activate the branch's own auto-minted tail draft (a seeded sibling
+    // would sit off-path and float forever) and give it a line so the
+    // actions reveal.
+    let parents = view.read_with(&vcx, |v, _| v.draft_parents_for_test());
+    let tail = parents
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a1"))
+        .expect("the leaf's tail draft exists");
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(tail, cx));
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the tail draft is active");
+    editor.update(&mut vcx, |editor, cx| editor.set_value("a short draft", cx));
+    vcx.run_until_parked();
+
+    // Docked at the document floor: the quad fills the window exactly, the
+    // byline sits a full post pad below the slot top (where a post's metadata
+    // row sits), and the verbs ride the bottom action bar with real clearance
+    // from the window edge.
+    // Re-assert the floor each frame while estimated heights converge to
+    // measured ones (the floor deepens as they settle).
+    for _ in 0..4 {
+        view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    let rem_size = vcx.update(|window, _| window.rem_size().as_f32());
+    let bar_h = view.read_with(&vcx, |v, _| {
+        v.compact_action_occupancy_for_test(760.0, rem_size)
+    });
+    let entries = fresh_entries(cx, window);
+    let entry = |name: &str| {
+        &entries
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .1
+    };
+    let quad = entry("space/composer").bounds;
+    assert!(
+        quad.origin.y.abs() < px(0.5) && (quad.size.height - px(WIN)).abs() < px(0.5),
+        "at the floor the docked quad fills the window exactly: {quad:?}"
+    );
+    let byline = entry("space/composer/byline").bounds;
+    assert!(
+        (byline.origin.y - quad.origin.y - px(40.)).abs() < px(1.0),
+        "the docked byline sits POST_PAD_Y below the slot top, where a post's \
+         metadata row sits (byline {byline:?}, quad {quad:?})"
+    );
+    let post = entry("space/composer/post").bounds;
+    assert!(
+        post.origin.y >= px(WIN - bar_h) && post.origin.y + post.size.height <= px(WIN - 8.),
+        "Post rides the bottom action bar with clearance from the window edge \
+         (post {post:?}, bar {}..{WIN})",
+        WIN - bar_h
+    );
+
+    // Floating: the byline is not part of the bar (its probe never paints),
+    // while the verbs stay on the bottom bar and See in context joins them.
+    view.read_with(&vcx, |v, _| v.set_page_scroll_for_test(0.0));
+    vcx.run_until_parked();
+    for _ in 0..2 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    let entries = fresh_entries(cx, window);
+    assert!(
+        view.read_with(&vcx, |v, _| v.composer_overlayed_for_test()),
+        "scrolled to the top, the composer floats"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(name, _)| name == "space/composer/byline"),
+        "the floating bar carries no byline"
+    );
+    let post = entries
+        .iter()
+        .find(|(name, _)| name == "space/composer/post")
+        .expect("Post stays on the bottom bar while floating")
+        .1
+        .bounds;
+    assert!(
+        post.origin.y >= px(WIN - bar_h) && post.origin.y + post.size.height <= px(WIN - 8.),
+        "the floating bar keeps its verbs on the bottom action bar (post {post:?})"
+    );
+    assert_probe(
+        &entries,
+        "space/composer/home",
+        gpui::Role::Button,
+        "See in context",
+    );
+}
+
+#[gpui::test]
 fn entering_compact_affordances_reveals_an_oversized_posts_action(cx: &mut TestAppContext) {
     use gpui::{VisualTestContext, px};
 
