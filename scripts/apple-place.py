@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import struct
 import sys
 
@@ -60,6 +61,7 @@ from macho_facts import (  # noqa: E402  (sibling script, not a package)
 
 # signapple names detached files by cputype alone (sign.py CPU_NAMES).
 ARCH_SUFFIX = {"arm64": "arm64", "arm64e": "arm64", "x86_64": "x86_64"}
+RECORD_NAME = "eidola-placement.json"
 
 # Offset of `flags` in a 64-bit mach header, and of `dataoff` in a
 # linkedit_data_command (past cmd/cmdsize).
@@ -67,10 +69,114 @@ MH_FLAGS_OFFSET = 24
 LC_DATAOFF_OFFSET = 8
 
 
+def validate_detached_material(root, record):
+    """Require exactly the signature blobs and plain files the record names."""
+    expected = set(record["files"])
+    for rel, entry in record["machos"].items():
+        name = os.path.basename(rel)
+        for target in entry["slices"]:
+            expected.add(
+                f"Contents/MacOS/{name}.{ARCH_SUFFIX[target['arch']]}sign"
+            )
+
+    actual = set()
+    for directory, dirs, files in os.walk(root):
+        for name in dirs + files:
+            path = os.path.join(directory, name)
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            mode = os.lstat(path).st_mode
+            if stat.S_ISLNK(mode):
+                raise SystemExit(f"{rel}: detached material is a symbolic link")
+            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                raise SystemExit(f"{rel}: detached material is not a regular file")
+        for name in files:
+            path = os.path.join(directory, name)
+            actual.add(os.path.relpath(path, root).replace(os.sep, "/"))
+    unexpected = sorted(actual - expected)
+    if unexpected:
+        raise SystemExit(f"{unexpected[0]}: unexpected detached material")
+
+
+def require_plain_directory(path, label):
+    """Refuse roots that are symbolic links or non-directories."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError as error:
+        raise SystemExit(f"{label} does not exist: {path}") from error
+    if stat.S_ISLNK(mode):
+        raise SystemExit(f"{label} is a symbolic link: {path}")
+    if not stat.S_ISDIR(mode):
+        raise SystemExit(f"{label} is not a directory: {path}")
+
+
+def is_plain_file(path):
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def validate_detached_root(detached, record):
+    """Require one placement record plus exactly the recorded app tree."""
+    require_plain_directory(detached, "detached archive root")
+    for name in sorted(os.listdir(detached)):
+        path = os.path.join(detached, name)
+        mode = os.lstat(path).st_mode
+        if name == RECORD_NAME:
+            if stat.S_ISREG(mode):
+                continue
+            raise SystemExit(f"{name}: placement record is not a regular file")
+        if name == record["bundle"]:
+            if stat.S_ISDIR(mode):
+                continue
+            raise SystemExit(f"{name}: recorded app tree is not a directory")
+        if stat.S_ISREG(mode):
+            raise SystemExit(f"{name}: unexpected detached material")
+        if stat.S_ISLNK(mode):
+            raise SystemExit(f"{name}: detached archive root contains a symbolic link")
+        if stat.S_ISDIR(mode):
+            raise SystemExit(f"{name}: detached archive root contains an unexpected directory")
+        raise SystemExit(f"{name}: detached archive root contains a special file")
+
+
 def rebuild(source, source_slices, record, signatures):
     """The signed Mach-O, rebuilt from the unsigned one plus the record."""
     by_arch = {sl["arch"]: sl for sl in source_slices}
-    out = bytearray(record["output_len"])
+    if record["kind"] == "fat":
+        (magic,) = struct.unpack_from(">I", source, 0)
+        (count,) = struct.unpack_from(">I", source, 4)
+        entry = FAT_ARCH_64 if magic == FAT_MAGIC_64 else FAT_ARCH
+        cpu = {}
+        for i in range(count):
+            fields = entry.unpack_from(source, 8 + i * entry.size)
+            cpu[cpu_name(fields[0], fields[1])] = fields[:2]
+        if count != len(source_slices):
+            raise SystemExit("input fat table and parsed slices disagree")
+        source_end = 8 + count * entry.size
+        input_max_align = 0
+        for source_slice in source_slices:
+            arch = source_slice["arch"]
+            if source_slice.get("fat_offset") != source_slice["header_offset"]:
+                raise SystemExit(
+                    f"{arch}: input fat offset and Mach header offset disagree"
+                )
+            align = source_slice.get("fat_align")
+            if not isinstance(align, int) or align < 0 or align >= sys.maxsize.bit_length():
+                raise SystemExit(f"{arch}: input fat alignment exponent is too large")
+            input_max_align = max(input_max_align, align)
+            alignment = 1 << align
+            source_end = (source_end + alignment - 1) & ~(alignment - 1)
+            if source_end > sys.maxsize:
+                raise SystemExit(f"{arch}: input fat slice alignment overflow")
+            if source_slice["fat_offset"] != source_end:
+                raise SystemExit(f"{arch}: input fat table is not canonically packed")
+            source_end += source_slice["fat_size"]
+        if source_end != len(source):
+            raise SystemExit(
+                f"input fat slices end at {source_end}, file length is {len(source)}"
+            )
+    planned = []
+    ranges = []
 
     for target in record["slices"]:
         arch = target["arch"]
@@ -87,6 +193,8 @@ def rebuild(source, source_slices, record, signatures):
             raise SystemExit(f"{arch}: detached signature is not the recorded superblob")
 
         base = target["header_offset"]
+        if base < 0:
+            raise SystemExit(f"{arch}: negative slice offset")
         source_base = by_arch[arch]["header_offset"]
 
         # The precondition the whole approach rests on: signing rewrites load
@@ -138,20 +246,61 @@ def rebuild(source, source_slices, record, signatures):
         struct.pack_into("<I", head, MH_FLAGS_OFFSET, int(target["mh_flags"], 16))
 
         body = bytes(head) + blob
-        if base + len(body) > len(out):
-            raise SystemExit(f"{arch}: slice overruns the recorded output length")
-        out[base : base + len(body)] = body
+        end = base + len(body)
+        if any(base < prior_end and prior_start < end for prior_start, prior_end in ranges):
+            raise SystemExit(f"{arch}: slice overlaps another recorded slice")
+        if record["kind"] == "fat" and target.get("fat_size") != len(body):
+            raise SystemExit(
+                f"{arch}: slice is {len(body)} bytes, record says {target.get('fat_size')}"
+            )
+        planned.append((base, end, body))
+        ranges.append((base, end))
+
+    if record["kind"] == "thin":
+        if len(ranges) != 1 or ranges[0][0] != 0:
+            raise SystemExit("thin output is not exactly one slice at file offset zero")
+        derived_len = ranges[0][1]
+    else:
+        derived_len = 8 + len(record["slices"]) * entry.size
+        for target, (start, end), source_slice in zip(
+            record["slices"], ranges, source_slices
+        ):
+            arch = target["arch"]
+            if arch != source_slice["arch"]:
+                raise SystemExit(f"{arch}: slice order disagrees with the input fat table")
+            if target.get("fat_offset") != target["header_offset"]:
+                raise SystemExit(f"{arch}: fat offset and Mach header offset disagree")
+            align = target.get("fat_align")
+            if not isinstance(align, int) or align < 0:
+                raise SystemExit(f"{arch}: fat alignment exponent is too large")
+            if align > input_max_align:
+                raise SystemExit(
+                    f"{arch}: fat alignment exponent {align} exceeds input maximum "
+                    f"{input_max_align}"
+                )
+            if align >= sys.maxsize.bit_length():
+                raise SystemExit(f"{arch}: fat alignment exponent is too large")
+            alignment = 1 << align
+            derived_len = (derived_len + alignment - 1) & ~(alignment - 1)
+            if derived_len > sys.maxsize:
+                raise SystemExit(f"{arch}: fat slice alignment overflow")
+            if start != derived_len:
+                raise SystemExit(
+                    f"{arch}: fat slice starts at {start}, canonical packing "
+                    f"requires {derived_len}"
+                )
+            derived_len = end
+    if record["output_len"] != derived_len:
+        raise SystemExit(
+            f"recorded output length {record['output_len']} does not equal "
+            f"reconstructed end {derived_len}"
+        )
+
+    out = bytearray(derived_len)
+    for base, end, body in planned:
+        out[base:end] = body
 
     if record["kind"] == "fat":
-        # Rebuilt rather than copied: `codesign` renormalizes the x86_64
-        # slice's alignment, so every offset in the table moves.
-        (magic,) = struct.unpack_from(">I", source, 0)
-        (count,) = struct.unpack_from(">I", source, 4)
-        entry = FAT_ARCH_64 if magic == FAT_MAGIC_64 else FAT_ARCH
-        cpu = {}
-        for i in range(count):
-            fields = entry.unpack_from(source, 8 + i * entry.size)
-            cpu[cpu_name(fields[0], fields[1])] = fields[:2]
         struct.pack_into(">II", out, 0, magic, len(record["slices"]))
         for i, target in enumerate(record["slices"]):
             values = cpu[target["arch"]] + (
@@ -167,17 +316,44 @@ def rebuild(source, source_slices, record, signatures):
 
 
 def place(bundle, detached):
-    record_path = os.path.join(detached, "eidola-placement.json")
-    if not os.path.isfile(record_path):
+    require_plain_directory(detached, "detached input")
+    record_path = os.path.join(detached, RECORD_NAME)
+    if not is_plain_file(record_path):
         # `signapple apply` is handed the <Bundle>.app inside the detached
         # tree, so accept the same argument and step up to the record.
         detached = os.path.dirname(detached.rstrip("/"))
-        record_path = os.path.join(detached, "eidola-placement.json")
+        require_plain_directory(detached, "detached archive root")
+        record_path = os.path.join(detached, RECORD_NAME)
+    if not is_plain_file(record_path):
+        raise SystemExit(f"placement record is not a regular file: {record_path}")
     with open(record_path) as f:
         record = json.load(f)
     if record.get("schema_version") != 1:
         raise SystemExit(f"unsupported placement record schema: {record.get('schema_version')}")
+    validate_detached_root(detached, record)
     root = os.path.join(detached, record["bundle"])
+    validate_detached_material(root, record)
+
+    actual_inputs = {}
+    for directory, dirs, files in os.walk(bundle):
+        for name in dirs + files:
+            path = os.path.join(directory, name)
+            if os.path.islink(path):
+                raise SystemExit(f"unsigned input is a symbolic link: {path}")
+        for name in files:
+            path = os.path.join(directory, name)
+            rel = os.path.relpath(path, bundle).replace(os.sep, "/")
+            with open(path, "rb") as f:
+                actual_inputs[rel] = f"sha256:{hashlib.sha256(f.read()).hexdigest()}"
+    expected_inputs = record["inputs"]
+    for rel in sorted(expected_inputs):
+        if rel not in actual_inputs:
+            raise SystemExit(f"{rel}: unsigned bundle input is missing")
+        if actual_inputs[rel] != expected_inputs[rel]:
+            raise SystemExit(f"{rel}: unsigned bundle input does not match its record")
+    unexpected = sorted(set(actual_inputs) - set(expected_inputs))
+    if unexpected:
+        raise SystemExit(f"{unexpected[0]}: unexpected unsigned bundle input")
 
     for rel in sorted(record["machos"]):
         entry = record["machos"][rel]
@@ -208,11 +384,13 @@ def place(bundle, detached):
 
     # The bundle seal and, when one has been stapled, the ticket. Both are
     # plain files to `apply`. A seal the record does not name must not survive
-    # from whatever signed the input, for the same reason detach clears its
-    # output directory.
-    seal_dir = os.path.join(bundle, "Contents", "_CodeSignature")
-    if "Contents/_CodeSignature/CodeResources" not in record["files"] and os.path.isdir(seal_dir):
-        shutil.rmtree(seal_dir)
+    # from whatever signed the input, but other exact-bound files beside it do.
+    seal = os.path.join(bundle, "Contents", "_CodeSignature", "CodeResources")
+    if "Contents/_CodeSignature/CodeResources" not in record["files"] and os.path.isfile(seal):
+        os.remove(seal)
+    ticket = os.path.join(bundle, "Contents", "CodeResources")
+    if "Contents/CodeResources" not in record["files"] and os.path.isfile(ticket):
+        os.remove(ticket)
     for rel, expected in sorted(record["files"].items()):
         src = os.path.join(root, rel)
         dest = os.path.join(bundle, rel)

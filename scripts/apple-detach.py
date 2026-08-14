@@ -18,8 +18,9 @@ at — `[dataoff, dataoff + datasize)` within the slice — which is what
 signapple writes and what it reads back.
 
 Plus one file signapple ignores, `eidola-placement.json`, the placement
-record. It holds the input and output hashes per Mach-O, so applying to the
-wrong build is a refusal rather than a corruption, and the signed artifact's
+record. It holds the exact unsigned regular-file set and hashes, plus the
+output hashes per Mach-O, so applying to the wrong build is a refusal rather
+than a corruption, and the signed artifact's
 **per-slice structural facts** — the fat-header placement, `__LINKEDIT`'s
 sizing, and where each superblob lands. Those facts are what let `apply`
 reproduce the signed bundle from the artifact *as built*, without settling it
@@ -27,16 +28,14 @@ first and without reimplementing `codesign`'s arithmetic: it writes the
 recorded values rather than deriving them. `scripts/apple-place.py` is the
 apply side, and the round-trip harness grades it.
 
-Usage: apple-detach.py <signed bundle> <output dir> [unsigned bundle]
-
-The optional third argument is the unsigned build the signature was taken
-from; giving it records `input_sha256` per Mach-O in the placement record.
+Usage: apple-detach.py <signed bundle> <output dir> <unsigned bundle>
 """
 
 import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,9 +43,86 @@ from macho_facts import facts  # noqa: E402  (sibling script, not a package)
 
 # signapple names detached files by cputype alone (sign.py CPU_NAMES).
 ARCH_SUFFIX = {"arm64": "arm64", "arm64e": "arm64", "x86_64": "x86_64"}
+RECORD_NAME = "eidola-placement.json"
 
 
-def clear_previous(out_dir, root):
+def is_within(path, root):
+    """Return whether canonical `path` is equal to or below canonical `root`."""
+    try:
+        return os.path.commonpath((path, root)) == root
+    except ValueError:
+        return False
+
+
+def validate_destination(bundle, unsigned, out_dir, bundle_name):
+    """Refuse current output paths that overlap either source bundle."""
+    signed_source = os.path.realpath(bundle)
+    unsigned_source = os.path.realpath(unsigned)
+    output = os.path.realpath(os.path.abspath(out_dir))
+    material = os.path.join(output, bundle_name)
+    for source in (signed_source, unsigned_source):
+        if (
+            is_within(output, source)
+            or is_within(material, source)
+            or is_within(source, material)
+        ):
+            raise SystemExit(f"detached output overlaps source: {source}")
+
+
+def validate_existing_output(out_dir):
+    """Accept only an empty root or one complete parseable prior output."""
+    if not os.path.lexists(out_dir):
+        return None
+    mode = os.lstat(out_dir).st_mode
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise SystemExit(f"detached output is not a plain directory: {out_dir}")
+
+    names = sorted(os.listdir(out_dir))
+    if not names:
+        return None
+    if RECORD_NAME not in names:
+        raise SystemExit(f"unexpected detached output entry: {names[0]}")
+
+    record = os.path.join(out_dir, RECORD_NAME)
+    if not stat.S_ISREG(os.lstat(record).st_mode):
+        raise SystemExit(f"invalid previous placement record: {record}")
+    try:
+        with open(record) as file:
+            previous = json.load(file).get("bundle")
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"invalid previous placement record: {record}") from error
+    if (
+        not isinstance(previous, str)
+        or not previous
+        or os.path.basename(previous) != previous
+    ):
+        raise SystemExit(f"invalid previous placement record: {record}")
+
+    expected = {RECORD_NAME, previous}
+    unexpected = sorted(set(names) - expected)
+    if unexpected:
+        raise SystemExit(f"unexpected detached output entry: {unexpected[0]}")
+    missing = sorted(expected - set(names))
+    if missing:
+        raise SystemExit(f"previous detached output is missing: {missing[0]}")
+    previous_root = os.path.join(out_dir, previous)
+    previous_mode = os.lstat(previous_root).st_mode
+    if stat.S_ISLNK(previous_mode) or not stat.S_ISDIR(previous_mode):
+        raise SystemExit(f"previous detached app is not a plain directory: {previous}")
+    return previous
+
+
+def validate_previous_destination(bundle, unsigned, out_dir, previous):
+    """Refuse a validated previous cleanup root that overlaps a source."""
+    if previous is None:
+        return
+    previous_root = os.path.realpath(os.path.join(out_dir, previous))
+    for source in (os.path.realpath(bundle), os.path.realpath(unsigned)):
+        if is_within(previous_root, source) or is_within(source, previous_root):
+            raise SystemExit(f"previous detached root overlaps source: {source}")
+
+
+def clear_previous(out_dir, root, previous):
     """Remove what a previous detach into `out_dir` left behind.
 
     Regenerating into a reused directory must not keep material the new
@@ -59,34 +135,50 @@ def clear_previous(out_dir, root):
     Only what this script writes is removed: the bundle tree it is about to
     write, and the one a previous placement record names.
     """
-    record = os.path.join(out_dir, "eidola-placement.json")
-    if os.path.isfile(record):
-        try:
-            with open(record) as f:
-                previous = json.load(f).get("bundle")
-        except (OSError, ValueError):
-            previous = None
-        # A basename and nothing else, so a damaged record cannot point the
-        # removal outside `out_dir`.
-        if isinstance(previous, str) and previous and os.path.basename(previous) == previous:
-            previous_root = os.path.join(out_dir, previous)
-            if os.path.isdir(previous_root):
-                shutil.rmtree(previous_root)
+    record = os.path.join(out_dir, RECORD_NAME)
+    if previous is not None:
+        previous_root = os.path.join(out_dir, previous)
+        shutil.rmtree(previous_root)
         os.remove(record)
     if os.path.isdir(root):
         shutil.rmtree(root)
 
 
-def detach(bundle, out_dir, unsigned=None):
+def unsigned_inputs(unsigned):
+    """Return the normalized regular-file tree without following symlinks."""
+    inputs = {}
+    for directory, dirs, files in os.walk(unsigned):
+        for name in dirs + files:
+            path = os.path.join(directory, name)
+            if os.path.islink(path):
+                raise SystemExit(f"unsigned input is a symbolic link: {path}")
+        for name in files:
+            path = os.path.join(directory, name)
+            rel = os.path.relpath(path, unsigned).replace(os.sep, "/")
+            with open(path, "rb") as f:
+                inputs[rel] = f"sha256:{hashlib.sha256(f.read()).hexdigest()}"
+    return dict(sorted(inputs.items()))
+
+
+def detach(bundle, out_dir, unsigned):
     bundle_name = os.path.basename(bundle.rstrip("/"))
     root = os.path.join(out_dir, bundle_name)
+    validate_destination(bundle, unsigned, out_dir, bundle_name)
+    previous = validate_existing_output(out_dir)
+    validate_previous_destination(bundle, unsigned, out_dir, previous)
     os.makedirs(out_dir, exist_ok=True)
-    clear_previous(out_dir, root)
+    clear_previous(out_dir, root, previous)
     macos_out = os.path.join(root, "Contents", "MacOS")
     os.makedirs(macos_out)
 
     macos_dir = os.path.join(bundle, "Contents", "MacOS")
-    placement = {"schema_version": 1, "bundle": bundle_name, "machos": {}, "files": {}}
+    placement = {
+        "schema_version": 1,
+        "bundle": bundle_name,
+        "inputs": unsigned_inputs(unsigned),
+        "machos": {},
+        "files": {},
+    }
 
     for name in sorted(os.listdir(macos_dir)):
         path = os.path.join(macos_dir, name)
@@ -115,9 +207,8 @@ def detach(bundle, out_dir, unsigned=None):
             "output_sha256": info["file_sha256"],
             "output_len": info["file_size"],
         }
-        if unsigned is not None:
-            with open(os.path.join(unsigned, rel), "rb") as f:
-                record["input_sha256"] = hashlib.sha256(f.read()).hexdigest()
+        with open(os.path.join(unsigned, rel), "rb") as f:
+            record["input_sha256"] = hashlib.sha256(f.read()).hexdigest()
         placement["machos"][rel] = record
 
     seal = os.path.join(bundle, "Contents", "_CodeSignature", "CodeResources")
@@ -138,7 +229,7 @@ def detach(bundle, out_dir, unsigned=None):
             digest = hashlib.sha256(f.read()).hexdigest()
         placement["files"]["Contents/CodeResources"] = f"sha256:{digest}"
 
-    with open(os.path.join(out_dir, "eidola-placement.json"), "w") as f:
+    with open(os.path.join(out_dir, RECORD_NAME), "w") as f:
         json.dump(placement, f, indent=2, sort_keys=True)
         f.write("\n")
 
@@ -146,6 +237,6 @@ def detach(bundle, out_dir, unsigned=None):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (3, 4):
+    if len(sys.argv) != 4:
         raise SystemExit(__doc__)
-    print(detach(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else None))
+    print(detach(sys.argv[1], sys.argv[2], sys.argv[3]))

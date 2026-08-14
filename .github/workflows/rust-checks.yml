@@ -62,8 +62,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        # Emits two booleans: `rust` (run fmt/clippy/test/openapi) and `markdown`
-        # (run rumdl). A full run is forced for everything that isn't a PR (push
+        # Emits three booleans: `rust` (run fmt/clippy/test/openapi), `apple`
+        # (run the archive/detacher regressions), and `markdown` (run rumdl).
+        # A full run is forced for everything that isn't a PR (push
         # to next/main, tag releases) and for every PR into `main` — the
         # `next` -> `main` promotion must always get the real gate. For a PR
         # into `next`, classify each changed file:
@@ -84,6 +85,7 @@ jobs:
             echo "Full run (event=$EVENT base=${BASE_REF:-n/a})."
             {
               echo "rust=true"
+              echo "apple=true"
               echo "markdown=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
@@ -109,54 +111,12 @@ jobs:
           echo "Changed files:"
           echo "$changed" | sed 's/^/  /'
 
-          rust=false
-          markdown=false
-          while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            case "$f" in
-              # The rust-checks workflow itself gates *both* the cargo run and
-              # the markdown lint (rumdl install + invocation + their `if:`
-              # guards all live in this file), so changing it must re-exercise
-              # both — otherwise a workflow-only edit that breaks the markdown
-              # step would skip it and merge unexercised. (Handled before the
-              # `.github/*` catch-all below.)
-              .github/workflows/rust-checks.yml)
-                rust=true
-                markdown=true ;;
+          classification=$(printf '%s\n' "$changed" | .github/scripts/rust-check-scope.sh)
+          echo "Resolved scope: $(echo "$classification" | tr '\n' ' ')"
+          echo "$classification" >> "$GITHUB_OUTPUT"
 
-              # Markdown content + its lint config. rumdl lints the whole tree,
-              # so markdown anywhere (docs, .github templates, crate READMEs) is
-              # in scope for the markdown step only.
-              *.md|.rumdl.toml)
-                markdown=true ;;
-
-              # Paths that cannot change a cargo fmt/clippy/test/openapi outcome:
-              .github/*)              : ;;  # other CI/workflow/config files
-              docs/*)                 : ;;  # docs assets (markdown caught above)
-              www/*)                  : ;;  # website content/assets (markdown caught above; the site build is gated by website.yml)
-              scripts/*|*.sh)         : ;;  # shell tooling
-              justfile)               : ;;  # task runner recipes
-              compose*.yaml|compose*.yml) : ;;  # local dev compose
-              Containerfile*|*.hcl|.dockerignore) : ;;  # OCI build plumbing
-              flake.nix|flake.lock|*.swift-format) : ;;  # nix/swift build tooling
-              tinfoil-config.yml|artifact-manifest.json) : ;;  # deploy records
-              .env.example|.env.release) : ;;  # sample env files
-              .envrc|.gitignore|.gitattributes|.editorconfig) : ;;  # repo meta
-              LICENSE*|SECURITY.md|GEMINI.md|CLA-SIGNERS.txt) : ;;  # repo meta
-
-              # Everything else (rust source, manifests, toolchain, and all of
-              # crates/** + releases/** — build-script inputs, fixtures, schema,
-              # openapi.json) forces the full run.
-              *)
-                rust=true ;;
-            esac
-          done <<< "$changed"
-
-          echo "Resolved scope: rust=$rust markdown=$markdown"
-          {
-            echo "rust=$rust"
-            echo "markdown=$markdown"
-          } >> "$GITHUB_OUTPUT"
+      - name: Test check scope classifier
+        run: .github/scripts/test-rust-check-scope.sh
 
       - name: Check legal document versioning
         # The published legal documents (www/pages/terms.md, privacy.md)
@@ -231,8 +191,8 @@ jobs:
 
       - name: Install Rust toolchain
         # Needed for the cargo gates and for building rumdl; skip only when
-        # neither scope is active (e.g. a workflow- or scripts-only PR).
-        if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.markdown == 'true'
+        # none of these scopes is active (e.g. an unrelated scripts-only PR).
+        if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true' || steps.scope.outputs.markdown == 'true'
         run: rustup show
 
       - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
@@ -242,7 +202,7 @@ jobs:
         # and the promotion PR's base). PRs never save (github.ref is a PR ref),
         # so there's no per-PR thrash. This job only runs tests; no artifact
         # from here is published.
-        if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.markdown == 'true'
+        if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true' || steps.scope.outputs.markdown == 'true'
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
@@ -274,6 +234,10 @@ jobs:
       - name: Run tests
         if: steps.scope.outputs.rust == 'true'
         run: cargo test
+
+      - name: Test Apple archive verifier with read-only directories
+        if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true'
+        run: ./scripts/test-verify-apple.sh
 
       - name: Check OpenAPI spec freshness
         if: steps.scope.outputs.rust == 'true'

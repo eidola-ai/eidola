@@ -35,6 +35,14 @@ precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
 SPDX-License-Identifier = "GPL-3.0-only"
 
+# Cross-platform detached Apple-signature contract (explicitly permissive
+# because it is intended for independent verifiers and downstream consumers).
+[[annotations]]
+path = "crates/eidola-apple/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
 # Documentation and website content (the site generator crate stays under the
 # repository default above).
 [[annotations]]

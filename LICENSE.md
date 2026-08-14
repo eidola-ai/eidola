@@ -14,6 +14,7 @@ This repository contains several components under different licenses. This file 
 | `eidola-app-core` | [GPL-3.0-only](LICENSES/GPL-3.0-only.txt) |
 | `eidola-cli` | [GPL-3.0-only](LICENSES/GPL-3.0-only.txt) |
 | `eidola-gui` | [GPL-3.0-only](LICENSES/GPL-3.0-only.txt) |
+| `eidola-apple` | [MIT](LICENSES/MIT.txt) OR [Apache-2.0](LICENSES/Apache-2.0.txt) |
 | all other crates | [MIT](LICENSES/MIT.txt) OR [Apache-2.0](LICENSES/Apache-2.0.txt) |
 
 The split is deliberate. Eidola's privacy guarantees are properties of verifiable code, so the full applications are copyleft: a fork of the server or the apps must offer its users the same source access that Eidola's own trust chain depends on. The reusable pieces — the attestation verifier, enclave measurement, shared contract logic, the markdown editor widget, and the operational utilities — are permissively licensed so that auditors, researchers, and other projects can freely reuse and independently verify them.
