@@ -151,11 +151,7 @@ impl Inner {
 
     /// Open the route: lease or start the engine, build the client, and read
     /// the remote catalog's pricing when the call bills.
-    async fn open_utility_route(
-        &self,
-        cfg: &crate::Config,
-        target: &UtilityTarget,
-    ) -> Result<UtilityRoute, AppError> {
+    async fn open_utility_route(&self, target: &UtilityTarget) -> Result<UtilityRoute, AppError> {
         let backend = &target.backend;
         match target.kind {
             backends::BackendKind::Local | backends::BackendKind::LlamaCpp => {
@@ -214,7 +210,7 @@ impl Inner {
                 let eidola = EidolaResolved::from_row(Some(backend))?;
                 // No attestation observer: the handshake is still verified,
                 // but a chore call writes no rows to hang a record from.
-                let client = self.build_client(cfg, &eidola, None).await?;
+                let client = self.build_client(&eidola, None).await?;
                 let models = fetch_models(&client, &eidola.base_url).await?;
                 let entry = models
                     .data
@@ -253,7 +249,7 @@ impl Inner {
     ) -> Result<String, AppError> {
         let cfg = self.load_config();
         let now = now_ms();
-        let route = self.open_utility_route(&cfg, target).await?;
+        let route = self.open_utility_route(target).await?;
 
         let messages = vec![
             serde_json::json!({ "role": "system", "content": system }),

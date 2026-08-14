@@ -1,32 +1,142 @@
-//! Integration tests against live Tinfoil infrastructure.
+//! Integration and wire-contract tests for the self-contained v3 flow.
 //!
-//! Run with: `cargo test --package tinfoil-verifier -- --ignored`
+//! Run live tests with:
+//! `cargo test --package tinfoil-verifier --test integration -- --ignored`
 
-const LIVE_ENCLAVE: &str = "inference.tinfoil.sh";
-const LIVE_REPO: &str = "tinfoilsh/confidential-model-router";
+use base64::Engine as _;
+use sha2::{Digest, Sha256};
 
-/// A real fresh attestation document captured from
-/// `inference.tinfoil.sh/.well-known/tinfoil-attestation?nonce=<NONCE>`.
-/// Used as an offline regression fixture for the new nonce-bound format so the
-/// document parser, the `REPORT_DATA` recomputation, the `tls_key_fp` ↔ cert
-/// binding, and the ECDSA (P-384 / SHA-256) document-signature verification are
-/// all exercised without network access.
-const FIXTURE_DOC: &[u8] = include_bytes!("live_attest.json");
-const FIXTURE_NONCE: &str = "478a90b1c60e55b4aeef3e7c51fcec0174cba476f6cc5f5f7887f2ec1202ff64";
+const LIVE_ORIGIN: &str = "https://inference.tinfoil.sh";
+const LIVE_ATTESTATION_URL: &str = "https://inference.tinfoil.sh/.well-known/tinfoil-attestation";
 
-/// Full connector path against a locally-running `tinfoil-shim-mock`.
-///
-/// Self-skips unless `MOCK_URL` (e.g. `https://127.0.0.1:18443/v1`) and
-/// `MOCK_CERT_DIR` (the shim's `CERT_DIR`, holding `ark.pem`, `ask.pem`,
-/// `tls-ca.pem`) are set, so it never runs — or flakes — in CI, but gives a
-/// one-command end-to-end check of the nonce flow:
-///
-/// ```sh
-/// LISTEN_ADDR=127.0.0.1:18443 CERT_DIR=/tmp/mockcerts UPSTREAM_URL=http://127.0.0.1:1 \
-///   cargo run -p tinfoil-shim-mock &
-/// MOCK_URL=https://127.0.0.1:18443/v1 MOCK_CERT_DIR=/tmp/mockcerts \
-///   cargo test -p tinfoil-verifier --test integration mock_attesting_client_e2e
-/// ```
+fn synthetic_document() -> Vec<u8> {
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let nonce = [0x47; 32];
+    let tls = [0x19; 32];
+    let hpke = [0x45; 32];
+    let crypto = serde_json::to_vec(&serde_json::json!({
+        "format": "https://tinfoil.sh/crypto-material/v1",
+        "items": [
+            {
+                "id": "tls",
+                "format": "https://tinfoil.sh/key/spki-fp-sha256/v1",
+                "data": hex::encode(tls),
+            },
+            {
+                "id": "hpke",
+                "format": "https://tinfoil.sh/key/x25519-hpke/v1",
+                "data": hex::encode(hpke),
+            },
+        ],
+    }))
+    .unwrap();
+    let devices = br#"{"format":"https://tinfoil.sh/device-evidence/v1","items":[]}"#;
+    let crypto_hash: [u8; 32] = Sha256::digest(&crypto).into();
+    let device_hash: [u8; 32] = Sha256::digest(devices).into();
+    let mut digest = Sha256::new();
+    digest.update(b"https://tinfoil.sh/report-data/v1");
+    digest.update(nonce);
+    digest.update(crypto_hash);
+    digest.update(device_hash);
+    let mut report_data = [0u8; 64];
+    report_data[..32].copy_from_slice(&digest.finalize());
+    let mut report = vec![0u8; 1184];
+    report[0x50..0x90].copy_from_slice(&report_data);
+
+    serde_json::to_vec(&serde_json::json!({
+        "format": "https://tinfoil.sh/predicate/attestation/v3",
+        "challenge": {
+            "nonce": hex::encode(nonce),
+            "report_data": hex::encode(report_data),
+            "report_data_algorithm": "https://tinfoil.sh/report-data/v1",
+        },
+        "cpu_evidence": {
+            "format": "https://tinfoil.sh/format/sev-snp-report/v1",
+            "report_base64": b64.encode(report),
+            "endorsed": {
+                "crypto_material_hash": hex::encode(crypto_hash),
+                "device_evidence_hash": hex::encode(device_hash),
+            },
+        },
+        "crypto_material": b64.encode(crypto),
+        "device_evidence": b64.encode(devices),
+        "collateral": [
+            {
+                "id": "cpu-endorsement",
+                "role": "endorsement",
+                "format": "https://tinfoil.sh/collateral/amd-vcek/v1",
+                "subjects": ["cpu"],
+                "data": {
+                    "vcek_der_base64": b64.encode([1, 2, 3]),
+                    "cert_chain_pem": concat!(
+                        "-----BEGIN CERTIFICATE-----\nAQ==\n-----END CERTIFICATE-----\n",
+                        "-----BEGIN CERTIFICATE-----\nAg==\n-----END CERTIFICATE-----\n",
+                    ),
+                },
+            },
+            {
+                "id": "cpu-crl",
+                "role": "endorsement",
+                "format": "https://tinfoil.sh/collateral/amd-crl/v1",
+                "subjects": ["cpu"],
+                "data": {"crl_der_base64": b64.encode([4, 5, 6])},
+            },
+        ],
+    }))
+    .unwrap()
+}
+
+#[test]
+fn v3_envelope_recomputes_exact_endorsed_section_hashes() {
+    let resolved =
+        tinfoil_verifier::bundle::parse_document(&synthetic_document()).expect("valid v3 envelope");
+    assert_eq!(resolved.nonce, [0x47; 32]);
+    assert_eq!(resolved.tls_key_fp, [0x19; 32]);
+    assert_eq!(resolved.hpke_key, [0x45; 32]);
+    assert_eq!(&resolved.report_bytes[0x50..0x90], &resolved.report_data);
+    assert_eq!(resolved.vcek_der.as_deref(), Some(&[1, 2, 3][..]));
+    assert_eq!(resolved.ask_der.as_deref(), Some(&[1][..]));
+    assert_eq!(resolved.ark_der.as_deref(), Some(&[2][..]));
+    assert_eq!(resolved.crl_der.as_deref(), Some(&[4, 5, 6][..]));
+}
+
+#[test]
+fn v3_envelope_rejects_tampered_endorsed_section() {
+    let mut doc: serde_json::Value = serde_json::from_slice(&synthetic_document()).unwrap();
+    let mut crypto = base64::engine::general_purpose::STANDARD
+        .decode(doc["crypto_material"].as_str().unwrap())
+        .unwrap();
+    crypto.push(b' ');
+    doc["crypto_material"] =
+        serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(crypto));
+    let err = tinfoil_verifier::bundle::parse_document(&serde_json::to_vec(&doc).unwrap())
+        .err()
+        .expect("tampered section must fail");
+    assert!(err.to_string().contains("crypto_material hash"));
+}
+
+#[test]
+fn v3_envelope_rejects_unknown_members() {
+    let mut doc: serde_json::Value = serde_json::from_slice(&synthetic_document()).unwrap();
+    doc["signature"] = serde_json::Value::String("obsolete".to_string());
+    let err = tinfoil_verifier::bundle::parse_document(&serde_json::to_vec(&doc).unwrap())
+        .err()
+        .expect("old document signature field must fail");
+    assert!(err.to_string().contains("unknown field"));
+}
+
+#[test]
+fn v3_envelope_rejects_malformed_amd_certificate_chain() {
+    let mut doc: serde_json::Value = serde_json::from_slice(&synthetic_document()).unwrap();
+    doc["collateral"][0]["data"]["cert_chain_pem"] =
+        serde_json::Value::String("not a certificate chain".to_string());
+    let err = tinfoil_verifier::bundle::parse_document(&serde_json::to_vec(&doc).unwrap())
+        .err()
+        .expect("malformed certificate chain must fail");
+    assert!(err.to_string().contains("outside CERTIFICATE blocks"));
+}
+
+/// Full connector path against a locally running `tinfoil-shim-mock`.
 #[tokio::test]
 async fn mock_attesting_client_e2e() {
     let (Ok(base_url), Ok(cert_dir)) = (std::env::var("MOCK_URL"), std::env::var("MOCK_CERT_DIR"))
@@ -37,23 +147,22 @@ async fn mock_attesting_client_e2e() {
 
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
-
     let read_der = |name: &str| {
         let pem = std::fs::read_to_string(format!("{cert_dir}/{name}"))
             .unwrap_or_else(|e| panic!("read {name}: {e}"));
-        pem::parse(&pem).expect("parse pem").into_contents()
+        let cert = <x509_cert::Certificate as der::DecodePem>::from_pem(&pem)
+            .expect("parse certificate PEM");
+        der::Encode::to_der(&cert).expect("encode certificate DER")
     };
     let ark_der = read_der("ark.pem");
     let ask_der = read_der("ask.pem");
-
-    // Trust the mock's TLS-CA so the TLS handshake itself succeeds.
     let mut tls_roots = rustls::RootCertStore::empty();
-    let ca = read_der("tls-ca.pem");
     tls_roots
-        .add(rustls::pki_types::CertificateDer::from(ca))
+        .add(rustls::pki_types::CertificateDer::from(read_der(
+            "tls-ca.pem",
+        )))
         .expect("add tls-ca");
 
-    // The mock advertises the all-zero default measurement.
     let allowed = vec![tinfoil_verifier::EnclaveMeasurement {
         snp_measurement: "00".repeat(48),
         tdx_measurement: tinfoil_verifier::TdxMeasurement {
@@ -61,16 +170,11 @@ async fn mock_attesting_client_e2e() {
             rtmr2: "0".repeat(96),
         },
     }];
-
     let client = tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
         allowed_measurements: &allowed,
         inference_base_url: &base_url,
-        atc_url: None,
-        enclave_repo: None, // mock document self-carries the VCEK; no ATC needed
         trusted_ark_der: Some(&ark_der),
         trusted_ask_der: Some(&ask_der),
-        tdx_advisory_allowlist: None,
-        tdx_observer: None,
         snp_min_tcb: None,
         snp_observer: None,
         attestation_observer: None,
@@ -79,196 +183,92 @@ async fn mock_attesting_client_e2e() {
     .await
     .expect("attesting_client failed");
 
-    // A successful send means the per-handshake attestation passed (the mock
-    // proxies to a dead upstream, so the *response* is a 502 — but reaching it
-    // proves the connection was attested).
-    let resp = client.get(format!("{base_url}/models")).send().await;
+    let response = client.get(format!("{base_url}/models")).send().await;
     assert!(
-        resp.is_ok(),
-        "attestation should pass against the mock: {resp:?}"
-    );
-    eprintln!("attested OK, upstream status: {}", resp.unwrap().status());
-}
-
-/// Offline end-to-end check of the fresh nonce-bound document format against a
-/// captured production document. No network, no clock dependence.
-#[test]
-fn fresh_document_format_offline() {
-    let resolved =
-        tinfoil_verifier::bundle::parse_document(FIXTURE_DOC).expect("failed to parse document");
-
-    // 1. The echoed nonce is the one embedded in the request URL.
-    assert_eq!(
-        hex::encode(&resolved.report_data.nonce),
-        FIXTURE_NONCE,
-        "nonce should round-trip from the request"
-    );
-
-    // 2. The document's `tls_key_fp` equals SHA-256 of the embedded cert's SPKI.
-    let cert_spki =
-        tinfoil_verifier::sevsnp::sha256_spki_from_der(&resolved.certificate_der).unwrap();
-    assert_eq!(
-        resolved.report_data.tls_key_fp, cert_spki,
-        "tls_key_fp must match the embedded certificate's SPKI hash"
-    );
-
-    // 3. The recomputed REPORT_DATA matches the hardware report's REPORT_DATA.
-    let report = tinfoil_verifier::sevsnp::parse_report(&resolved.report_bytes).unwrap();
-    assert_eq!(
-        resolved.report_data.expected_report_data(),
-        report.report_data,
-        "SHA-256(tls_key_fp || hpke_key || nonce) must equal the report's REPORT_DATA"
-    );
-
-    // 4. The enclave's ECDSA signature over the document validates (P-384/SHA-256).
-    tinfoil_verifier::bundle::verify_document_signature(&resolved)
-        .expect("document signature must verify against the embedded certificate");
-}
-
-/// Tampering with any signed byte must invalidate the document signature.
-#[test]
-fn fresh_document_signature_rejects_tampering() {
-    // Change a signed field (the nonce) to a different valid value: the
-    // document still parses, but the original signature no longer matches.
-    let mut doc: serde_json::Value = serde_json::from_slice(FIXTURE_DOC).unwrap();
-    let mut nonce = doc["report_data"]["nonce"].as_str().unwrap().to_string();
-    // Flip the last hex nibble to a guaranteed-different value.
-    nonce.pop();
-    nonce.push('0');
-    doc["report_data"]["nonce"] = serde_json::Value::String(nonce);
-    let tampered = serde_json::to_vec(&doc).unwrap();
-
-    let resolved = tinfoil_verifier::bundle::parse_document(&tampered).unwrap();
-    assert!(
-        tinfoil_verifier::bundle::verify_document_signature(&resolved).is_err(),
-        "a tampered document must fail signature verification"
+        response.is_ok(),
+        "mock attestation should pass: {response:?}"
     );
 }
 
-/// Full verification flow against the live Tinfoil attestation endpoint.
-///
-/// Fetches a real attestation bundle from the ATC service, verifies the VCEK
-/// chain, validates the report signature and TCB policy, and checks the TLS
-/// fingerprint binding. Skips the measurement check (no hardcoded values) but
-/// exercises the entire verification pipeline.
+fn webpki_client() -> reqwest::Client {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .build()
+        .unwrap()
+}
+
 #[tokio::test]
-#[ignore = "requires network access to atc.tinfoil.sh"]
-async fn live_attestation_verification() {
+#[ignore = "requires network access to inference.tinfoil.sh"]
+async fn live_self_contained_document() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
-
-    let mut webpki = rustls::RootCertStore::empty();
-    webpki.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    // Fetch the attestation bundle
-    let bundle = tinfoil_verifier::bundle::fetch_bundle(None, LIVE_ENCLAVE, LIVE_REPO, &webpki)
-        .await
-        .expect("failed to fetch attestation bundle");
-
-    eprintln!("Domain: {}", bundle.domain);
+    let resolved =
+        tinfoil_verifier::bundle::fetch_well_known(&webpki_client(), LIVE_ATTESTATION_URL)
+            .await
+            .expect("fetch and parse live v3 document");
     assert_eq!(
-        bundle.domain, LIVE_ENCLAVE,
-        "ATC POST should bind the bundle to the requested enclave"
+        resolved.platform,
+        tinfoil_verifier::bundle::Platform::SevSnp
     );
-
-    // Decode VCEK and report
-    let vcek_der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &bundle.vcek)
-        .expect("failed to decode VCEK");
-
-    let report_bytes =
-        tinfoil_verifier::bundle::decode_report_gzipped(&bundle.enclave_attestation_report.body)
-            .expect("failed to decode report");
-
-    eprintln!("Report size: {} bytes", report_bytes.len());
-
-    // Verify chain + report signature
-    let report = tinfoil_verifier::sevsnp::verify_attestation(&vcek_der, &report_bytes, None, None)
-        .expect("attestation verification failed");
-
-    // Verify TCB policy (defaults: AMD recommended floor + rollback check)
-    let policy = tinfoil_verifier::SevSnpTcbPolicy::amd_recommended();
-    let (_observation, result) = policy.evaluate(&report);
-    result.expect("TCB policy verification failed");
-
-    let measurement = hex::encode(report.measurement);
-    eprintln!("Measurement: {measurement}");
-
-    // Verify enclave cert binding
-    let tls_fingerprint = &report.report_data[..32];
-    tinfoil_verifier::sevsnp::verify_enclave_cert_binding(&bundle.enclave_cert, tls_fingerprint)
-        .expect("enclave cert binding verification failed");
-
-    eprintln!("TLS fingerprint: {}", hex::encode(tls_fingerprint));
+    assert!(resolved.vcek_der.is_some());
+    assert!(resolved.ask_der.is_some());
+    assert!(resolved.ark_der.is_some());
+    assert!(resolved.crl_der.is_some());
+    let report = tinfoil_verifier::sevsnp::parse_report(&resolved.report_bytes).unwrap();
+    assert_eq!(resolved.report_data, report.report_data);
+    let (trusted_ark, trusted_ask) =
+        tinfoil_verifier::sevsnp::resolve_chain_certs_der(None, None).unwrap();
+    assert_eq!(resolved.ark_der.as_deref(), Some(trusted_ark.as_slice()));
+    assert_eq!(resolved.ask_der.as_deref(), Some(trusted_ask.as_slice()));
+    tinfoil_verifier::sevsnp::verify_report(
+        resolved.vcek_der.as_deref().unwrap(),
+        &report,
+        resolved.ark_der.as_deref(),
+        resolved.ask_der.as_deref(),
+    )
+    .expect("live report signature and AMD chain");
 }
 
-/// Test the full attesting client flow: bootstrap via ATC, then make a request
-/// through the attesting client to verify per-connection attestation works.
 #[tokio::test]
 #[ignore = "requires network access to inference.tinfoil.sh"]
 async fn live_attesting_client() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
-
-    // Live tests reach out to inference.tinfoil.sh and ATC, both of which
-    // chain under public WebPKI.
-    let mut webpki = rustls::RootCertStore::empty();
-    webpki.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    // First, get the current measurement from ATC (we don't hardcode it in tests)
-    let bundle = tinfoil_verifier::bundle::fetch_bundle(None, LIVE_ENCLAVE, LIVE_REPO, &webpki)
-        .await
-        .expect("failed to fetch attestation bundle");
-
-    let vcek_der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &bundle.vcek)
-        .expect("failed to decode VCEK");
-    let report_bytes =
-        tinfoil_verifier::bundle::decode_report_gzipped(&bundle.enclave_attestation_report.body)
-            .expect("failed to decode report");
-    let report = tinfoil_verifier::sevsnp::verify_attestation(&vcek_der, &report_bytes, None, None)
-        .expect("attestation verification failed");
-    let measurement = hex::encode(report.measurement);
-
-    eprintln!("Using measurement: {measurement}");
-
-    // The bootstrap path here is SEV-SNP (live ATC bundle), so populate the
-    // SNP field with the observed measurement and fill the TDX side with
-    // dummy values that will never match — the verifier picks the field that
-    // matches the observed platform.
+    let resolved =
+        tinfoil_verifier::bundle::fetch_well_known(&webpki_client(), LIVE_ATTESTATION_URL)
+            .await
+            .expect("fetch live measurement");
+    let report = tinfoil_verifier::sevsnp::parse_report(&resolved.report_bytes).unwrap();
     let allowed = vec![tinfoil_verifier::EnclaveMeasurement {
-        snp_measurement: measurement.clone(),
+        snp_measurement: hex::encode(report.measurement),
         tdx_measurement: tinfoil_verifier::TdxMeasurement {
             rtmr1: "0".repeat(96),
             rtmr2: "0".repeat(96),
         },
     }];
-
-    // Build the attesting client. Verification happens lazily on the first
-    // real request.
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let client = tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
         allowed_measurements: &allowed,
-        inference_base_url: "https://inference.tinfoil.sh/v1",
-        atc_url: None,
-        enclave_repo: Some(LIVE_REPO),
+        inference_base_url: LIVE_ORIGIN,
         trusted_ark_der: None,
         trusted_ask_der: None,
-        tdx_advisory_allowlist: None,
-        tdx_observer: None,
         snp_min_tcb: None,
         snp_observer: None,
         attestation_observer: None,
-        tls_roots: webpki,
+        tls_roots: roots,
     })
     .await
-    .expect("attesting_client failed");
-
-    // Make a request through the attesting client; this is what triggers
-    // per-handshake attestation.
-    let resp = client
-        .get("https://inference.tinfoil.sh/v1/models")
+    .expect("attesting client");
+    let response = client
+        .get(format!("{LIVE_ORIGIN}/v1/models"))
         .send()
         .await
-        .expect("request through attesting client failed");
-
-    eprintln!("Response status: {}", resp.status());
-    assert!(resp.status().is_success() || resp.status().as_u16() == 401);
+        .expect("request through attested connection");
+    assert!(response.status().is_success() || response.status().as_u16() == 401);
 }

@@ -53,9 +53,8 @@ impl Config {
 
         let tinfoil_base_url = std::env::var("TINFOIL_BASE_URL").ok();
 
-        // Source repo used to attest the upstream enclave via the ATC
-        // `POST /attestation` endpoint. Must match the GitHub repo whose
-        // signed measurements correspond to the running enclave.
+        // Source repo whose signed releases drive the runtime measurement
+        // allowlist for the upstream enclave.
         let tinfoil_repo = std::env::var("TINFOIL_REPO")
             .unwrap_or_else(|_| "tinfoilsh/confidential-model-router".to_string());
 
@@ -328,22 +327,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .tinfoil_base_url
         .as_deref()
         .unwrap_or(&default_base_url);
-    // Observers wired to the OTel TDX_ATTESTATIONS / SNP_ATTESTATIONS
-    // counters so every attestation the verifier sees (including ones
-    // it rejects) is surfaced as a labeled metric. The closures run on
-    // the TLS handshake hot path inside the connector layer, so we keep
-    // them to a single counter increment each with no allocation in the
-    // steady state.
-    let tdx_observer: tinfoil_verifier::TdxObserver =
-        std::sync::Arc::new(|observation: &tinfoil_verifier::TdxTcbObservation| {
-            telemetry::metrics::TDX_ATTESTATIONS.add(
-                1,
-                &[opentelemetry::KeyValue::new(
-                    "status",
-                    observation.status.as_metric_label(),
-                )],
-            );
-        });
+    // The observer feeds the OTel SNP_ATTESTATIONS counter for every report
+    // whose signature verifies, including reports the policy then rejects.
+    // It runs on the handshake hot path, so it performs one allocation-free
+    // counter increment.
     let snp_observer: tinfoil_verifier::SevSnpObserver =
         std::sync::Arc::new(|observation: &tinfoil_verifier::SevSnpTcbObservation| {
             telemetry::metrics::SNP_ATTESTATIONS.add(
@@ -356,37 +343,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     // The server runs `FROM scratch` inside an enclave with no system trust
     // store, so trust roots come from the bundled Mozilla list. Tinfoil's
-    // production cert, the ATC service, and AMD KDS all chain under public
-    // WebPKI. We deliberately do not pull in `rustls-native-certs` here.
+    // production cert chains under public WebPKI. We deliberately do not
+    // pull in `rustls-native-certs` here.
     let mut tls_roots = rustls::RootCertStore::empty();
     tls_roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     // The allowed upstream measurements are resolved at *runtime* from
     // Tinfoil's latest router release (see `src/upstream_trust` for why).
     // This factory rebuilds the attesting client whenever that set changes;
-    // all the `attesting_client` wiring (TLS roots, ATC, enclave repo, TCB
-    // policy, telemetry observers) lives here so `upstream_trust` stays
+    // all the `attesting_client` wiring (TLS roots, TCB policy, telemetry
+    // observers) lives here so `upstream_trust` stays
     // free of a telemetry dependency. `attesting_client` does no network
     // I/O, so rebuilding is cheap.
     let client_factory: eidola_server::upstream_trust::AttestingClientFactory = {
         let inference_base_url = inference_base_url.to_string();
-        let enclave_repo = config.tinfoil_repo.clone();
         std::sync::Arc::new(move |allowed: Vec<tinfoil_verifier::EnclaveMeasurement>| {
             let inference_base_url = inference_base_url.clone();
-            let enclave_repo = enclave_repo.clone();
             let tls_roots = tls_roots.clone();
-            let tdx_observer = tdx_observer.clone();
             let snp_observer = snp_observer.clone();
             Box::pin(async move {
                 tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
                     allowed_measurements: allowed.as_slice(),
                     inference_base_url: &inference_base_url,
-                    atc_url: None,
-                    enclave_repo: Some(&enclave_repo),
                     trusted_ark_der: None,
                     trusted_ask_der: None,
-                    tdx_advisory_allowlist: None,
-                    tdx_observer: Some(tdx_observer),
                     snp_min_tcb: None,
                     snp_observer: Some(snp_observer),
                     attestation_observer: None,

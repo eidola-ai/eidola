@@ -18,8 +18,8 @@
 //!   certificate…" revealing a paste-PEM textarea otherwise). Nothing is
 //!   duplicated and nothing hides behind a disclosure — sovereignty means
 //!   the trust surface is always visible; the danger states carry the
-//!   warning band and one-click reverts. Read-only connection details
-//!   (attestation URL, domain separator) close the tab. When disabled, a
+//!   warning band and one-click reverts. The read-only domain separator
+//!   closes the tab. When disabled, a
 //!   short "no account, on-device only" explanation. (Disabling `eidola`
 //!   *is* the on-device-only configuration.) The account surface is a
 //!   top-level Settings pane (`AccountView`), shown only while this backend
@@ -1547,7 +1547,7 @@ impl BackendsSettingsView {
     /// The connection + trust rows: an always-visible override warning band,
     /// then one row per setting, each both display and editor — base URL,
     /// trusted measurements, and the two hardware CAs — followed by the
-    /// read-only connection details (attestation URL, domain separator).
+    /// read-only domain separator.
     /// Reads the config store's cached `EidolaTrust` (the eidola backend
     /// row's bundle, NULL = the embedded pin) and writes via the async
     /// setters. Nothing hides behind a disclosure: the resting state of each
@@ -1729,21 +1729,6 @@ impl BackendsSettingsView {
                     .border_t_1()
                     .border_color(theme.border)
                     .into_any_element(),
-            );
-            out.push(
-                trust_row(
-                    "Attestation URL",
-                    cx,
-                    div()
-                        .text_color(theme.muted_foreground)
-                        .child(SharedString::from(
-                            state
-                                .attestation_url
-                                .clone()
-                                .unwrap_or_else(|| "Default (Tinfoil ATC)".into()),
-                        )),
-                )
-                .into_any_element(),
             );
             // The domain separator is one long unbreakable token, so it gets
             // a stacked row (value under label, full width) rather than the

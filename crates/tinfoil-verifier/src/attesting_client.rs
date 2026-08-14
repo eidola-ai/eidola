@@ -33,9 +33,11 @@
 //! `ALLOWED_MEASUREMENTS` changes take effect immediately rather than only at
 //! process restart. The per-handshake nonce adds *freshness*: the enclave
 //! folds our random nonce into the hardware report's `REPORT_DATA`
-//! (`REPORT_DATA == sha256(tls_key_fp || hpke_key || nonce || …)`, where
-//! `tls_key_fp` is the SPKI hash of the cert we handshook with), so a stale or
-//! captured document cannot be replayed against a different nonce.
+//! (`REPORT_DATA == sha256(report-data-v1 URI || nonce ||
+//! sha256(crypto_material) || sha256(device_evidence))`), and the endorsed
+//! crypto section carries the SPKI hash of the cert we handshook with. A
+//! stale or captured document therefore cannot be replayed against a
+//! different nonce.
 //!
 //! It does **not** close the key-exfiltration gap. The report binds the
 //! long-term TLS *key*, not the live TLS *session*, so an attacker who has
@@ -63,15 +65,12 @@ use der::Decode;
 use sha2::Digest as _;
 
 use crate::measurement::EnclaveMeasurement;
-use crate::{
-    AtcFallback, Error, bundle, check_snp_measurement, check_tdx_measurement, sevsnp, sevsnp_crl,
-    tdx,
-};
+use crate::{Error, bundle, check_snp_measurement, sevsnp, sevsnp_crl};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Maximum wall-clock time the inline attestation exchange (write request,
-/// read response, parse, verify chains, optional ATC backfill) is allowed to
+/// read response, parse, and verify chains) is allowed to
 /// take before the connector aborts the handshake. Bounds the worst case
 /// where a backend completes the TLS handshake but stalls on the GET.
 const ATTESTATION_DEADLINE: Duration = Duration::from_secs(10);
@@ -91,9 +90,6 @@ pub(crate) struct BuildParams {
     pub trusted_ark_der: Option<Vec<u8>>,
     pub trusted_ask_der: Option<Vec<u8>>,
     pub allowed_measurements: Vec<EnclaveMeasurement>,
-    pub atc_fallback: AtcFallback,
-    pub tdx_policy: tdx::TcbPolicy,
-    pub tdx_observer: Option<tdx::TdxObserver>,
     pub snp_policy: sevsnp::SevSnpTcbPolicy,
     pub snp_observer: Option<sevsnp::SevSnpObserver>,
     pub attestation_observer: Option<crate::AttestationObserver>,
@@ -106,9 +102,6 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         trusted_ark_der,
         trusted_ask_der,
         allowed_measurements,
-        atc_fallback,
-        tdx_policy,
-        tdx_observer,
         snp_policy,
         snp_observer,
         attestation_observer,
@@ -135,13 +128,8 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         attestation_host: host,
         trusted_ark_der,
         trusted_ask_der,
-        atc_fallback,
-        tdx_collateral_cache: tdx::CollateralCache::new(tls_roots.clone()),
-        tdx_policy,
-        tdx_observer,
         snp_policy,
         snp_observer,
-        snp_crl_cache: sevsnp_crl::CrlCache::new(tls_roots),
         attestation_observer,
     });
 
@@ -230,43 +218,14 @@ struct AttestationCheck {
     attestation_host: String,
     trusted_ark_der: Option<Vec<u8>>,
     trusted_ask_der: Option<Vec<u8>>,
-    /// ATC fallback target, used only when the self-contained v3 attestation
-    /// document is missing required elements (today: the VCEK). The
-    /// connector itself does not call AMD KDS — ATC is the single fallback.
-    atc_fallback: AtcFallback,
-    // The three `tdx_*` fields below are dormant: the platform dispatch in
-    // `verify` refuses `Platform::Tdx` outright until MRTD/RTMR0 policy
-    // checks exist. The machinery is kept wired so re-enabling is a one-line
-    // dispatch change plus the policy.
-    /// Per-client cache of TDX collateral fetched from Intel PCS, keyed by
-    /// `(fmspc, ca)`. Bounds Intel PCS request volume to roughly one set of
-    /// fetches per FMSPC per TCB advisory cycle. Unused on SEV-SNP backends.
-    #[allow(dead_code)]
-    tdx_collateral_cache: tdx::CollateralCache,
-    /// Acceptance policy applied on top of `dcap_verify`'s built-in checks.
-    /// Unused on SEV-SNP backends.
-    #[allow(dead_code)]
-    tdx_policy: tdx::TcbPolicy,
-    /// Optional consumer-provided observer fired for every TDX
-    /// attestation that completes signature verification (including ones
-    /// the policy then rejects). Lets the consuming application record
-    /// metrics or alerts without `tinfoil-verifier` taking a dependency
-    /// on a metrics framework. Unused on SEV-SNP backends.
-    #[allow(dead_code)]
-    tdx_observer: Option<tdx::TdxObserver>,
     /// Per-component minimum SVNs the SEV-SNP `reported_tcb` must satisfy.
     /// Also drives the rollback check (`reported_tcb >= committed_tcb`),
     /// which is structural and not configurable. Unused on TDX backends.
     snp_policy: sevsnp::SevSnpTcbPolicy,
     /// Optional consumer-provided observer fired for every SEV-SNP
     /// attestation that completes signature verification (including ones
-    /// the policy then rejects). Same lifecycle and constraints as
-    /// `tdx_observer`. Unused on TDX backends.
+    /// the policy then rejects). Unused on TDX backends.
     snp_observer: Option<sevsnp::SevSnpObserver>,
-    /// Per-client cache of AMD KDS CRLs keyed by AMD platform generation.
-    /// Same stale-while-revalidate / single-flight semantics as the TDX
-    /// collateral cache. Unused on TDX backends.
-    snp_crl_cache: sevsnp_crl::CrlCache,
     /// Optional consumer-provided observer fired for every successful
     /// attestation. Same lifecycle as the platform-specific observers.
     attestation_observer: Option<crate::AttestationObserver>,
@@ -296,8 +255,8 @@ impl AttestationCheck {
 
         // Fresh random nonce per handshake. The enclave binds it into the
         // hardware report's REPORT_DATA, so a captured document cannot be
-        // replayed against a different nonce — this is what makes the
-        // attestation safe even against an exfiltrated long-lived TLS key.
+        // replayed against a different nonce. It does not bind the live TLS
+        // session or make an exfiltrated TLS key safe.
         let nonce = bundle::random_nonce()?;
 
         // Wrap the hyper IO in TokioIo so we can use AsyncRead/Write extension
@@ -306,7 +265,7 @@ impl AttestationCheck {
         let mut io = TokioIo::new(conn);
 
         let resolved = self.fetch_well_known(&mut io, &nonce).await?;
-        self.verify(&resolved, &peer_spki, &nonce).await?;
+        self.verify(&resolved, &peer_spki, &nonce)?;
 
         Ok(io.into_inner())
     }
@@ -345,20 +304,19 @@ impl AttestationCheck {
 
     /// Verify a freshly-fetched attestation document against the peer cert the
     /// TLS handshake landed on and the nonce we just sent.
-    async fn verify(
+    fn verify(
         &self,
         resolved: &bundle::ResolvedAttestation,
         peer_spki: &[u8; 32],
         sent_nonce: &[u8; bundle::NONCE_LEN],
     ) -> Result<(), Error> {
-        // Document-level binding checks that don't depend on the hardware
-        // report: freshness (nonce echo), TLS-key binding, and the enclave's
-        // own signature over the document. The platform-specific paths then
-        // verify the hardware report and cross-check its REPORT_DATA.
+        // These envelope checks are not authentication by themselves. The
+        // platform path must prove the signed report carries the same
+        // recomputed REPORT_DATA before the document is trusted.
         self.verify_document_binding(resolved, peer_spki, sent_nonce)?;
 
         match resolved.platform {
-            bundle::Platform::SevSnp => self.verify_snp(resolved, peer_spki).await,
+            bundle::Platform::SevSnp => self.verify_snp(resolved, peer_spki),
             // Refused outright — not because TDX hardware is distrusted,
             // but because the policy checks for it are incomplete: MRTD
             // (the only register measured by the TDX module itself) and
@@ -373,47 +331,30 @@ impl AttestationCheck {
         }
     }
 
-    /// Platform-independent checks binding the fresh document to *this*
-    /// connection and *this* nonce:
+    /// Platform-independent checks binding the fresh document to the TLS key
+    /// presented on this connection and to this nonce (not to the TLS session):
     ///
     /// 1. The echoed nonce equals the one we sent (freshness / anti-replay).
-    /// 2. The document's `tls_key_fp` equals `sha256(SPKI(peer_cert))`, so the
-    ///    report is bound to the TLS key we actually handshook with.
-    /// 3. The embedded certificate's SPKI matches the peer cert (defense in
-    ///    depth: the document describes the connection we're on).
-    /// 4. The document's ECDSA signature validates against that certificate,
-    ///    proving the enclave's TLS key endorsed this exact fresh document.
+    /// 2. The endorsed `tls` key equals `sha256(SPKI(peer_cert))`.
     fn verify_document_binding(
         &self,
         resolved: &bundle::ResolvedAttestation,
         peer_spki: &[u8; 32],
         sent_nonce: &[u8; bundle::NONCE_LEN],
     ) -> Result<(), Error> {
-        if resolved.report_data.nonce != sent_nonce {
+        if resolved.nonce != *sent_nonce {
             return Err(Error::NonceMismatch {
                 sent: hex::encode(sent_nonce),
-                echoed: hex::encode(&resolved.report_data.nonce),
+                echoed: hex::encode(resolved.nonce),
             });
         }
 
-        if &resolved.report_data.tls_key_fp != peer_spki {
+        if &resolved.tls_key_fp != peer_spki {
             return Err(Error::FingerprintMismatch {
-                report_data: hex::encode(resolved.report_data.tls_key_fp),
-                enclave_cert: hex::encode(peer_spki),
+                attested: hex::encode(resolved.tls_key_fp),
+                peer: hex::encode(peer_spki),
             });
         }
-
-        // The certificate carried in the document must be the very cert we
-        // landed on, so the signature we verify below is the peer's.
-        let doc_cert_spki = sevsnp::sha256_spki_from_der(&resolved.certificate_der)?;
-        if &doc_cert_spki != peer_spki {
-            return Err(Error::FingerprintMismatch {
-                report_data: hex::encode(doc_cert_spki),
-                enclave_cert: hex::encode(peer_spki),
-            });
-        }
-
-        bundle::verify_document_signature(resolved)?;
         Ok(())
     }
 
@@ -421,86 +362,83 @@ impl AttestationCheck {
     /// of the document's `report_data` inputs. This is what binds the
     /// attacker-uncontrollable hardware report to the (nonce, TLS key, HPKE
     /// key) the document claims — every one of those claimed fields is thereby
-    /// authenticated by the AMD/Intel signature over the report.
+    /// authenticated by the AMD signature over the report.
     fn verify_report_data_binding(
         &self,
         resolved: &bundle::ResolvedAttestation,
         report_data: &[u8; 64],
     ) -> Result<(), Error> {
-        let expected = resolved.report_data.expected_report_data();
-        if &expected != report_data {
+        if &resolved.report_data != report_data {
             return Err(Error::ReportDataMismatch {
-                expected: hex::encode(expected),
+                expected: hex::encode(resolved.report_data),
                 observed: hex::encode(report_data),
             });
         }
         Ok(())
     }
 
-    async fn verify_snp(
+    fn verify_snp(
         &self,
         resolved: &bundle::ResolvedAttestation,
         peer_spki: &[u8; 32],
     ) -> Result<(), Error> {
         let report = sevsnp::parse_report(&resolved.report_bytes)?;
 
-        // VCEK source: prefer a document that self-carries it (the shim mock);
-        // otherwise fall back to ATC. The production fresh document omits the
-        // VCEK, so this fallback is the normal path there. The connector never
-        // talks to AMD KDS — ATC is the single fallback target. Once Tinfoil
-        // folds the VCEK into the fresh document this path will go cold.
-        let vcek_der = match resolved.vcek_der.clone() {
-            Some(v) => v,
-            None => {
-                tracing::debug!(
-                    "well-known attestation document missing VCEK; consulting ATC fallback",
-                );
-                self.atc_fallback.fetch_vcek().await?
-            }
-        };
+        // Structural field checks the launch measurement does not cover —
+        // most importantly that the guest policy forbids DEBUG (a relaunch
+        // of the pinned image with DEBUG=1 keeps the same measurement but
+        // lets the hypervisor decrypt guest memory).
+        sevsnp::check_report_hygiene(&report)?;
 
-        // ARK/ASK come from exactly one of two trusted sources: the caller's
-        // explicit `trusted_ark_der`/`trusted_ask_der` configuration (test
-        // deployments using the tinfoil shim mock), or the built-in AMD Genoa
-        // certs in the `sev` crate (production). We resolve to owned DER
-        // bytes once so the same material can be used for chain
-        // verification, CRL signature verification, and ASK/VCEK serial
-        // extraction without re-loading the built-in certs three times.
-        let (ark_der, ask_der) = sevsnp::resolve_chain_certs_der(
+        let vcek_der = resolved.vcek_der.as_deref().ok_or_else(|| {
+            Error::Bundle("SEV-SNP document carries no VCEK collateral".to_string())
+        })?;
+        let crl_der = resolved.crl_der.as_deref().ok_or_else(|| {
+            Error::Bundle("SEV-SNP document carries no AMD CRL collateral".to_string())
+        })?;
+        let carried_ask_der = resolved.ask_der.as_deref().ok_or_else(|| {
+            Error::Bundle("SEV-SNP document carries no ASK certificate".to_string())
+        })?;
+        let carried_ark_der = resolved.ark_der.as_deref().ok_or_else(|| {
+            Error::Bundle("SEV-SNP document carries no ARK certificate".to_string())
+        })?;
+
+        // The document carries ASK + ARK so verification is network-free, but
+        // they remain untrusted transport. Require byte identity with the
+        // caller's explicit mock chain or the built-in AMD Genoa chain before
+        // using them for VCEK/report and CRL verification.
+        let (trusted_ark_der, trusted_ask_der) = sevsnp::resolve_chain_certs_der(
             self.trusted_ark_der.as_deref(),
             self.trusted_ask_der.as_deref(),
         )?;
-
-        sevsnp::verify_report(&vcek_der, &report, Some(&ark_der), Some(&ask_der))?;
-
-        // Check the AMD KDS CRL for revocation of either intermediate
-        // (ASK) or leaf (VCEK). The chain verifies above by signature
-        // alone — `sev` does not consult any CRL — so we layer this on
-        // top here. The CRL is fetched directly from AMD KDS rather
-        // than through Tinfoil's well-known doc on purpose: it is a
-        // global signed object (no information leak about which chip
-        // we are verifying) and a compromised operator could otherwise
-        // serve a stale list to silently re-enable a revoked chip.
-        //
-        // The CRL is signed by AMD's real ARK, so this check only makes
-        // sense in production where the chain is rooted in the built-in
-        // Genoa ARK. Test deployments that supply a custom ARK (the
-        // tinfoil shim mock) would always fail CRL signature verification
-        // against their mock ARK and AMD KDS has no revocation entries
-        // for mock chips anyway, so we skip the check entirely there.
-        if self.trusted_ark_der.is_none() {
-            let ark_x509 = x509_cert::Certificate::from_der(&ark_der)
-                .map_err(|e| Error::CertParse(format!("failed to parse ARK DER: {e}")))?;
-            let vcek_serial = sevsnp::cert_serial_from_der(&vcek_der)?;
-            let ask_serial = sevsnp::cert_serial_from_der(&ask_der)?;
-            self.snp_crl_cache
-                .check_revocation(
-                    sevsnp_crl::AmdGeneration::Genoa,
-                    &ark_x509,
-                    &[&vcek_serial, &ask_serial],
-                )
-                .await?;
+        if carried_ark_der != trusted_ark_der {
+            return Err(Error::CertChain(
+                "document-carried ARK does not match the trusted AMD root".to_string(),
+            ));
         }
+        if carried_ask_der != trusted_ask_der {
+            return Err(Error::CertChain(
+                "document-carried ASK does not match the trusted AMD intermediate".to_string(),
+            ));
+        }
+
+        sevsnp::verify_report(
+            vcek_der,
+            &report,
+            Some(carried_ark_der),
+            Some(carried_ask_der),
+        )?;
+
+        // Collateral is untrusted transport. Require a complete, direct CRL,
+        // verify its ARK identity and signature, enforce its signed half-open
+        // validity window, and reject either AMD-issued chain certificate if
+        // listed. This is the only revocation source: no AMD KDS request is
+        // made during verification.
+        let ark_x509 = x509_cert::Certificate::from_der(carried_ark_der)
+            .map_err(|e| Error::CertParse(format!("failed to parse ARK DER: {e}")))?;
+        let vcek_serial = sevsnp::cert_serial_from_der(vcek_der)?;
+        let ask_serial = sevsnp::cert_serial_from_der(carried_ask_der)?;
+        sevsnp_crl::check_revocation(crl_der, &ark_x509, &[&vcek_serial, &ask_serial])?;
 
         // Apply the operator-configured TCB policy. The observer fires
         // *before* we propagate the policy result so consumers see the
@@ -537,54 +475,6 @@ impl AttestationCheck {
                 attestation_hash: hex::encode(sha2::Sha256::digest(&resolved.report_bytes)),
                 attestation_doc: resolved.report_bytes.clone(),
                 pcr_digest: measurement_hex,
-                peer_spki_hash: hex::encode(peer_spki),
-            });
-        }
-
-        Ok(())
-    }
-
-    // Unreachable while the dispatch refuses `Platform::Tdx`; retained,
-    // with its policy plumbing, for the re-enable path (which must add
-    // MRTD/RTMR0 checks first.
-    #[allow(dead_code)]
-    async fn verify_tdx(
-        &self,
-        resolved: &bundle::ResolvedAttestation,
-        peer_spki: &[u8; 32],
-    ) -> Result<(), Error> {
-        let collateral = self
-            .tdx_collateral_cache
-            .get_or_fetch(&resolved.report_bytes)
-            .await?;
-        let result = tdx::verify_quote(
-            &resolved.report_bytes,
-            &collateral,
-            &self.tdx_policy,
-            self.tdx_observer.as_ref(),
-        )?;
-
-        let rtmr1_hex = hex::encode(result.rtmr1);
-        let rtmr2_hex = hex::encode(result.rtmr2);
-        let matched = check_tdx_measurement(&self.allowed_measurements, &rtmr1_hex, &rtmr2_hex)?;
-
-        // Bind the TDX quote to the document's nonce/TLS-key/HPKE-key (see the
-        // SEV-SNP path for the rationale).
-        self.verify_report_data_binding(resolved, &result.report_data)?;
-
-        tracing::info!(
-            measurement = %matched,
-            tls_fingerprint = hex::encode(peer_spki),
-            "TDX attestation verified for new connection",
-        );
-
-        if let Some(observer) = &self.attestation_observer {
-            observer(crate::VerifiedAttestation {
-                platform: bundle::Platform::Tdx,
-                matched_measurement: matched,
-                attestation_hash: hex::encode(sha2::Sha256::digest(&resolved.report_bytes)),
-                attestation_doc: resolved.report_bytes.clone(),
-                pcr_digest: format!("{rtmr1_hex}:{rtmr2_hex}"),
                 peer_spki_hash: hex::encode(peer_spki),
             });
         }

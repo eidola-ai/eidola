@@ -87,8 +87,8 @@ ignore = [
 
     # rsa: Marvin timing side channel, no fixed release exists. Every use of
     # the crate in this graph is signature *verification* (public-key
-    # operations) — rustls-rustcrypto TLS signatures, sev ARK→ASK and CRLs,
-    # dcap-qvl PCK chains — while the side channel requires observing RSA
+    # operations) — rustls-rustcrypto TLS signatures and sev ARK→ASK / CRL
+    # verification — while the side channel requires observing RSA
     # private-key operations, which no Eidola binary performs via this crate.
     { id = "RUSTSEC-2023-0071", reason = "rsa is verification-only in this graph; Marvin requires RSA private-key operations, and no fixed release exists" },
 
@@ -282,7 +282,6 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # One-off pinned repositories outside the allowed orgs.
 allow-git = [
-    "https://github.com/Phala-Network/dcap-qvl",
     "https://github.com/proptest-rs/proptest",
     "https://github.com/virtee/tdx-measure",
 ]

@@ -10,7 +10,7 @@ The upstream inference provider:
 
 - Runs an OpenAI-compatible API in a confidential-compute enclave (currently AMD SEV-SNP; Intel TDX values are tracked in releases but refused by Eidola's verifier — [gaps.md](gaps.md#tdx-acceptance)).
 - Publishes signed measurements of the running enclave through Sigstore (Fulcio identity + Rekor inclusion), tied to a public source repository.
-- Serves its TLS endpoint from inside the enclave with attestation encoded in the certificate SANs, the same construction the Eidola server itself uses.
+- Serves its TLS endpoint from inside the enclave and exposes the same self-contained v3 attestation envelope the Eidola server uses, binding a fresh challenge and the endpoint's TLS SPKI into a hardware report.
 
 The Eidola server is a *client* of this enclave. It verifies the upstream's attestation on every TCP+TLS connection it opens to the inference endpoint, using the same `tinfoil-verifier` crate the Eidola client uses to verify the Eidola server.
 
@@ -42,10 +42,10 @@ The allowed set is a rolling window of the two most recently resolved measuremen
 The Eidola server's outbound HTTPS client (constructed by `tinfoil-verifier::attesting_client`) re-verifies the upstream enclave on every new TCP+TLS handshake. The mechanics are the same as for the client→server path, because they use the same crate:
 
 - Inline `GET /.well-known/tinfoil-attestation?nonce=<hex>` (a fresh random nonce per handshake) over the same TCP+TLS connection that will carry the application request.
-- Freshness check (echoed nonce matches) and document-signature check against the embedded TLS cert.
-- AMD VCEK chain verification, SEV-SNP report verification, TCB policy enforcement. (TDX presentations are refused outright — see [gaps.md](gaps.md#tdx-acceptance).)
+- Strict envelope/hash checks, nonce freshness, and endorsed TLS SPKI comparison with the peer cert.
+- Self-contained AMD VCEK chain and complete carried-CRL verification, entirely offline; SEV-SNP report verification with field hygiene (DEBUG/MIGRATE_MA policy bits, signer, ID-block); and TCB policy enforcement. A relay can replay an older AMD-signed CRL only while its signed validity interval remains current. (TDX presentations are refused outright — see [gaps.md](gaps.md#tdx-acceptance).)
 - Measurement check against the runtime-resolved allowed set (see [What pins the upstream measurement](#what-pins-the-upstream-measurement)).
-- Binding of the report's `REPORT_DATA` to `sha256(tls_key_fp ‖ hpke_key ‖ nonce ‖ …)`, where `tls_key_fp == sha256(SPKI(peer_cert))`.
+- Binding of the report's `REPORT_DATA` to the verifier nonce and exact endorsed-section hashes, where the crypto section's `tls` item equals `sha256(SPKI(peer_cert))`.
 
 A failed attestation rejects the request before any inference data crosses the wire.
 
