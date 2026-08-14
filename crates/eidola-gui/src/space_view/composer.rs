@@ -851,18 +851,22 @@ impl SpaceView {
 
     /// The smallest honest Exact fraction for this window: at least
     /// [`COMPOSER_FRACTION_MIN`], raised to the share the bar's *fixed*
-    /// surfaces (top chrome + the compact action bar) occupy. Below it,
-    /// stored fractions all render at the same clamped height — a dead zone
-    /// where arrow steps are visually inert and the slider's reported value
-    /// drifts from the handle — so every writer of the fraction, and the
-    /// slider's reported range, clamps here; the render-side height clamp
-    /// remains only as the backstop for a stored fraction the window shrank
-    /// out from under.
+    /// surfaces (top chrome + the compact action bar) occupy **plus one
+    /// scaled prose line of editor viewport** — the bar is a writing surface,
+    /// and a minimum that seats only chrome would clip the draft and its
+    /// caret entirely (resizing does not arm a caret reveal). Below the
+    /// floor, stored fractions all render at the same clamped height — a
+    /// dead zone where arrow steps are visually inert and the slider's
+    /// reported value drifts from the handle — so every writer of the
+    /// fraction, and the slider's reported range, clamps here; the
+    /// render-side height clamp remains only as the backstop for a stored
+    /// fraction the window shrank out from under.
     pub(crate) fn composer_min_fraction(&self, win: f32) -> f32 {
         if win <= 0.0 {
             return COMPOSER_FRACTION_MIN;
         }
-        let fixed = (Self::composer_chrome() + self.composer_gutters.get().bottom).min(win);
+        let line = super::PROSE_FONT_SIZE.as_f32() * self.layout.scale() * super::PROSE_LINE_HEIGHT;
+        let fixed = (Self::composer_chrome() + self.composer_gutters.get().bottom + line).min(win);
         (fixed / win).clamp(COMPOSER_FRACTION_MIN, COMPOSER_FRACTION_MAX)
     }
 

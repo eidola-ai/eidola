@@ -5501,9 +5501,14 @@ fn space_composer_resize_drag_pins_exact_height_and_reverts_on_deactivate(cx: &m
         v.move_composer_resize_for_test(10_000.0, WIN, cx)
     });
     view.read_with(&vcx, |v, _| {
+        let floor = v.composer_min_fraction_for_test(WIN);
         assert!(
-            (v.composer_fraction_for_test() - 0.1).abs() < 1e-6,
-            "dragging past the bottom clamps to the min fraction (got {})",
+            floor >= 0.1,
+            "the effective floor never dips below the nominal minimum ({floor})"
+        );
+        assert!(
+            (v.composer_fraction_for_test() - floor).abs() < 1e-6,
+            "dragging past the bottom clamps to the effective floor (got {}, floor {floor})",
             v.composer_fraction_for_test()
         );
     });
@@ -12327,11 +12332,16 @@ fn compact_resize_floor_rises_with_the_bars_fixed_surfaces(cx: &mut TestAppConte
         let (top, total) = v.composer_gutter_contract_for_test();
         (v.composer_chrome_for_test(), total - top)
     });
-    let floor = (chrome + gutters) / WIN;
+    let floor = view.read_with(&vcx, |v, _| v.composer_min_fraction_for_test(WIN));
     assert!(
         floor > 0.1 + 1e-4,
         "precondition: the fixed surfaces exceed the nominal minimum \
-         (chrome {chrome} + action bar {gutters} in a {WIN}px window)"
+         (floor {floor} in a {WIN}px window)"
+    );
+    assert!(
+        floor > (chrome + gutters) / WIN + 1e-4,
+        "the floor reserves an editor viewport beyond the fixed surfaces \
+         (floor {floor}, chrome {chrome} + action bar {gutters})"
     );
 
     for _ in 0..100 {
