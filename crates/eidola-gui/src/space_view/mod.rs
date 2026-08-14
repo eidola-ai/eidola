@@ -150,6 +150,22 @@ impl TailPin {
     }
 }
 
+impl SpaceView {
+    /// A reader-driven scroll or navigation takes the viewport from the
+    /// post-submit pin: a still-forcing `Converging` demotes to `Observing`,
+    /// so the exchange keeps following only while the ordinary at-tail
+    /// observation holds — the pin never snaps a reader back who moved (or
+    /// asked to be taken) somewhere else before convergence finished. The
+    /// callers are exactly the seams that cancel a navigation glide, plus the
+    /// glide door itself: the reader's own motions, and the navigations they
+    /// asked for.
+    pub(crate) fn demote_tail_pin_for_reader(&mut self) {
+        if self.tail_pin.forced() {
+            self.tail_pin = TailPin::Observing;
+        }
+    }
+}
+
 /// Vertical band (px) at the top and bottom of the viewport within which an
 /// active readonly-post selection drag autoscrolls the page.
 pub(crate) const SELECTION_AUTOSCROLL_MARGIN: f32 = 56.0;
@@ -1203,6 +1219,15 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn tail_pin_forced_for_test(&self) -> bool {
         self.tail_pin.forced()
+    }
+
+    /// Scroll the page as the reader's own wheel does — through the takeover
+    /// seam (`note_scroll_activity`), not a bare offset write — so tests can
+    /// assert what reader-driven motion demotes.
+    #[doc(hidden)]
+    pub fn reader_scroll_page_by_for_test(&mut self, dy: f32, cx: &mut Context<Self>) {
+        self.scroll_page_by_for_test(dy);
+        self.note_scroll_activity(gpui::TouchPhase::Moved, true, cx);
     }
 
     /// Whether the minimap is currently shown (tests assert scroll reveals it).

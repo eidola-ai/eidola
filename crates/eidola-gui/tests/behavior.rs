@@ -6255,6 +6255,81 @@ fn space_following_reader_stops_at_the_end_of_the_streamed_content(cx: &mut Test
 }
 
 #[gpui::test]
+fn a_reader_scroll_during_convergence_takes_the_viewport(cx: &mut TestAppContext) {
+    // The post-submit pin's forcing phase (`TailPin::Converging`) exists to
+    // hold the reader at the tail while the just-posted rows converge from
+    // estimates to measured heights — but a reader who scrolls (or navigates)
+    // away during those frames has taken the viewport, and the pin must
+    // demote to observation instead of snapping them back on the next render.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2], cx)
+        })
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a2".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the draft is the active composer");
+    editor.update(&mut vcx, |e, cx| e.set_value("a new post", cx));
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| focus.dispatch_action(&Send, window, cx));
+    vcx.run_until_parked();
+
+    // Mid-convergence — the pin is still in its forcing phase — the reader
+    // scrolls up to reread. The wheel seam demotes the pin, and no later
+    // frame drags them back to the tail.
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.tail_pin_forced_for_test(),
+            "precondition: the submit's pin is still converging"
+        );
+    });
+    view.update(&mut vcx, |v, cx| {
+        v.reader_scroll_page_by_for_test(180.0, cx)
+    });
+    vcx.run_until_parked();
+    let taken = view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.tail_pin_forced_for_test(),
+            "the reader's own scroll demotes the pin to observation"
+        );
+        v.page_scroll_offset_y_for_test()
+    });
+    for _ in 0..3 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    view.read_with(&vcx, |v, _| {
+        let offset = v.page_scroll_offset_y_for_test();
+        assert!(
+            (offset - taken).abs() < 2.0,
+            "no later frame snaps the reader back to the tail \
+             (offset {offset}, where they scrolled to {taken})"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_post_parks_the_reader_at_the_tail_and_holds_it_there(cx: &mut TestAppContext) {
     // Posting from a reader parked anywhere (here: the top of a long space)
     // must land them at the *end* of the branch the post joined — including the

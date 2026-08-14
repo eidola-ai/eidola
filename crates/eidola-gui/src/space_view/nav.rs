@@ -233,6 +233,11 @@ impl SpaceView {
     /// the navigation motion (see [`PageGlide`]). A short hop, an equal
     /// destination, or a destination the page is already at lands immediately.
     pub(crate) fn glide_page_to(&mut self, y: f32, window: &mut Window, cx: &mut Context<Self>) {
+        // A navigation the reader asked for owns the viewport: the
+        // post-submit pin must not snap them back to the tail when the glide
+        // lands (its forcing phase would otherwise bypass the at-tail check
+        // on the first post-glide frame).
+        self.demote_tail_pin_for_reader();
         let from_y = self.page_scroll.offset().y.as_f32();
         let dist = (y - from_y).abs();
         // A reader who asked for less motion gets the destination, not the

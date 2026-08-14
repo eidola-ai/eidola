@@ -565,6 +565,9 @@ impl SpaceView {
             self.scroll_min_y.get(),
             REVEAL_MARGIN,
         );
+        // Keyboard navigation is the reader's own motion — it takes the
+        // viewport from the post-submit pin's forcing phase.
+        self.demote_tail_pin_for_reader();
         self.set_page_scroll_y(y);
     }
 
@@ -612,6 +615,9 @@ impl SpaceView {
             self.scroll_min_y.get(),
             REVEAL_MARGIN,
         );
+        // Keyboard navigation is the reader's own motion — it takes the
+        // viewport from the post-submit pin's forcing phase.
+        self.demote_tail_pin_for_reader();
         self.set_page_scroll_y(y);
     }
 
