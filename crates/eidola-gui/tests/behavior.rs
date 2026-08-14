@@ -12271,11 +12271,13 @@ fn space_composer_resize_handle_adjusts_with_the_arrows(cx: &mut TestAppContext)
     vcx.run_until_parked();
 
     let start = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
-    view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(true, cx));
+    view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(true, 560.0, cx));
     let taller = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
     assert!(taller > start, "Up grows the bar: {start} -> {taller}");
 
-    view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(false, cx));
+    view.update(&mut vcx, |v, cx| {
+        v.nudge_composer_fraction(false, 560.0, cx)
+    });
     let back = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
     assert!(
         (back - start).abs() < 1e-4,
@@ -12284,7 +12286,7 @@ fn space_composer_resize_handle_adjusts_with_the_arrows(cx: &mut TestAppContext)
 
     // Clamped, not unbounded.
     for _ in 0..100 {
-        view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(true, cx));
+        view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(true, 560.0, cx));
     }
     let maxed = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
     assert!(
@@ -12292,10 +12294,64 @@ fn space_composer_resize_handle_adjusts_with_the_arrows(cx: &mut TestAppContext)
         "clamped at the drag's own ceiling: {maxed}"
     );
     for _ in 0..100 {
-        view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(false, cx));
+        view.update(&mut vcx, |v, cx| {
+            v.nudge_composer_fraction(false, 560.0, cx)
+        });
     }
     let floored = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
     assert!(floored >= 0.1 - 1e-4, "and at its floor: {floored}");
+}
+
+#[gpui::test]
+fn compact_resize_floor_rises_with_the_bars_fixed_surfaces(cx: &mut TestAppContext) {
+    // The Exact clamp keeps the rendered bar above its fixed chrome — but a
+    // *stored* fraction below that height would be a dead zone: arrow steps
+    // that change the reported value while the bar doesn't move. The floor is
+    // therefore applied to the stored fraction itself, so stored and rendered
+    // agree at every position the slider can reach.
+    let (_window, view, mut vcx) = open_floating_composer_scene(cx, "resize-floor");
+    const WIN: f32 = 300.0;
+    vcx.simulate_resize(gpui::size(px(760.), px(WIN)));
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the scene's draft is active");
+    editor.update(&mut vcx, |e, cx| e.set_value("a line of draft", cx));
+    vcx.run_until_parked();
+    for _ in 0..2 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+
+    let (chrome, gutters) = view.read_with(&vcx, |v, _| {
+        let (top, total) = v.composer_gutter_contract_for_test();
+        (v.composer_chrome_for_test(), total - top)
+    });
+    let floor = (chrome + gutters) / WIN;
+    assert!(
+        floor > 0.1 + 1e-4,
+        "precondition: the fixed surfaces exceed the nominal minimum \
+         (chrome {chrome} + action bar {gutters} in a {WIN}px window)"
+    );
+
+    for _ in 0..100 {
+        view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(false, WIN, cx));
+    }
+    view.read_with(&vcx, |v, _| {
+        let fraction = v.composer_fraction_for_test();
+        assert!(
+            (fraction - floor).abs() < 1e-4,
+            "the stored fraction floors at the fixed surfaces' share \
+             ({fraction} vs {floor})"
+        );
+        let bar = v.composer_float_bar_h_for_test(WIN);
+        assert!(
+            (bar - fraction * WIN).abs() < 0.5,
+            "stored and rendered agree — no dead zone (bar {bar}, \
+             fraction*win {})",
+            fraction * WIN
+        );
+    });
 }
 
 #[gpui::test]

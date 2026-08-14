@@ -849,6 +849,23 @@ impl SpaceView {
         cx.notify();
     }
 
+    /// The smallest honest Exact fraction for this window: at least
+    /// [`COMPOSER_FRACTION_MIN`], raised to the share the bar's *fixed*
+    /// surfaces (top chrome + the compact action bar) occupy. Below it,
+    /// stored fractions all render at the same clamped height — a dead zone
+    /// where arrow steps are visually inert and the slider's reported value
+    /// drifts from the handle — so every writer of the fraction, and the
+    /// slider's reported range, clamps here; the render-side height clamp
+    /// remains only as the backstop for a stored fraction the window shrank
+    /// out from under.
+    pub(crate) fn composer_min_fraction(&self, win: f32) -> f32 {
+        if win <= 0.0 {
+            return COMPOSER_FRACTION_MIN;
+        }
+        let fixed = (Self::composer_chrome() + self.composer_gutters.get().bottom).min(win);
+        (fixed / win).clamp(COMPOSER_FRACTION_MIN, COMPOSER_FRACTION_MAX)
+    }
+
     /// One motion step of the resize drag: the bar's top edge follows the
     /// pointer as a delta from the grab (up = taller), clamped to the
     /// fraction bounds. A no-op with no drag in flight, so the window-global
@@ -866,7 +883,7 @@ impl SpaceView {
             return;
         }
         let bar_h = drag.start_bar_h + (drag.start_y - pointer_y);
-        let fraction = (bar_h / win).clamp(COMPOSER_FRACTION_MIN, COMPOSER_FRACTION_MAX);
+        let fraction = (bar_h / win).clamp(self.composer_min_fraction(win), COMPOSER_FRACTION_MAX);
         if (fraction - self.composer_fraction).abs() > f32::EPSILON {
             self.composer_fraction = fraction;
             cx.notify();
@@ -882,14 +899,14 @@ impl SpaceView {
     /// prevent — so the handle either adjusts from the keyboard or should not
     /// be focusable at all. It adjusts.
     #[doc(hidden)]
-    pub fn nudge_composer_fraction(&mut self, up: bool, cx: &mut Context<Self>) {
+    pub fn nudge_composer_fraction(&mut self, up: bool, win: f32, cx: &mut Context<Self>) {
         let delta = if up {
             COMPOSER_FRACTION_STEP
         } else {
             -COMPOSER_FRACTION_STEP
         };
-        let next =
-            (self.composer_fraction + delta).clamp(COMPOSER_FRACTION_MIN, COMPOSER_FRACTION_MAX);
+        let next = (self.composer_fraction + delta)
+            .clamp(self.composer_min_fraction(win), COMPOSER_FRACTION_MAX);
         if (next - self.composer_fraction).abs() <= f32::EPSILON {
             return;
         }
@@ -1517,20 +1534,27 @@ impl SpaceView {
                     // The slider's own values, so AT can read where the handle
                     // sits rather than only that it exists.
                     .aria_orientation(gpui::Orientation::Vertical)
-                    .aria_min_numeric_value(COMPOSER_FRACTION_MIN as f64)
+                    // The reported range is the *effective* one — the minimum
+                    // rises with the bar's fixed surfaces, so the value AT
+                    // reads always names a height the handle can actually be
+                    // at (see `composer_min_fraction`).
+                    .aria_min_numeric_value(self.composer_min_fraction(win) as f64)
                     .aria_max_numeric_value(COMPOSER_FRACTION_MAX as f64)
-                    .aria_numeric_value(self.composer_fraction as f64)
+                    .aria_numeric_value(
+                        self.composer_fraction.max(self.composer_min_fraction(win)) as f64
+                    )
                     .aria_numeric_value_step(COMPOSER_FRACTION_STEP as f64)
                     // ↑/↓ resize. The listener is inner to the view root's, so
                     // it takes the press before the conversation's tree
                     // navigation ever sees it, and consumes it either way.
-                    .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                    .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
                         if ev.keystroke.modifiers.modified() {
                             return;
                         }
+                        let win = this.page_size(window).height.as_f32();
                         match ev.keystroke.key.as_str() {
-                            "up" => this.nudge_composer_fraction(true, cx),
-                            "down" => this.nudge_composer_fraction(false, cx),
+                            "up" => this.nudge_composer_fraction(true, win, cx),
+                            "down" => this.nudge_composer_fraction(false, win, cx),
                             _ => return,
                         }
                         cx.stop_propagation();
