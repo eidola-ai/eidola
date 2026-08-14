@@ -63,7 +63,7 @@ use crate::stores::Stores;
 use crate::theme;
 use crate::window_input::WindowInput;
 
-use layout::Layout;
+use layout::{ComposerGutterHeights, Layout};
 use model::{NodeSrc, PostData, TreeNode};
 use nav::{PageGlide, ScrollAxis, ScrollOwner, SnapAnim};
 
@@ -131,6 +131,40 @@ pub(crate) const VIRT_MARGIN: f32 = 600.0;
 /// absorbs sub-pixel layout rounding without ever mistaking a deliberate scroll
 /// away from the tail for "still at the end".
 pub(crate) const TAIL_FOLLOW_EPSILON: f32 = 2.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TailPin {
+    #[default]
+    Inactive,
+    Converging,
+    Observing,
+}
+
+impl TailPin {
+    fn active(self) -> bool {
+        self != Self::Inactive
+    }
+
+    fn forced(self) -> bool {
+        self == Self::Converging
+    }
+}
+
+impl SpaceView {
+    /// A reader-driven scroll or navigation takes the viewport from the
+    /// post-submit pin: a still-forcing `Converging` demotes to `Observing`,
+    /// so the exchange keeps following only while the ordinary at-tail
+    /// observation holds — the pin never snaps a reader back who moved (or
+    /// asked to be taken) somewhere else before convergence finished. The
+    /// callers are exactly the seams that cancel a navigation glide, plus the
+    /// glide door itself: the reader's own motions, and the navigations they
+    /// asked for.
+    pub(crate) fn demote_tail_pin_for_reader(&mut self) {
+        if self.tail_pin.forced() {
+            self.tail_pin = TailPin::Observing;
+        }
+    }
+}
 
 /// Vertical band (px) at the top and bottom of the viewport within which an
 /// active readonly-post selection drag autoscrolls the page.
@@ -519,6 +553,10 @@ pub struct SpaceView {
     /// bar, the docked runway, the minimap — reads this one value, so what the
     /// bar reserves is what the body actually renders.
     pub(crate) composer_content_h: Rc<RefCell<Pixels>>,
+    /// Compact metadata and action rows around the active editor. This is
+    /// synchronized before document geometry is derived so every composer
+    /// consumer includes the same natural height.
+    pub(crate) composer_gutters: Cell<ComposerGutterHeights>,
     /// Flow positions bracketing the active composer's footnote rail, written
     /// by the two zero-height probes the composer body places around it (see
     /// [`references::flow_mark`]). Their difference is the rail's **measured**
@@ -626,7 +664,7 @@ pub struct SpaceView {
     /// is neither producing nor busy — and by [`Self::activate_draft`], since a
     /// reader who has started composing again owns the viewport. See
     /// [`Self::follow_streaming_tail`] for why the pin is needed at all.
-    pub(crate) tail_pin: bool,
+    pub(crate) tail_pin: TailPin,
     /// Test-only record of the slot-relative offset the **docked**
     /// `caret_into_view` branch folded into the caret's document position —
     /// `page_slot_doc_top + editor_top_offset` (`caret_doc_bot - caret_bot`).
@@ -877,6 +915,7 @@ impl SpaceView {
             composer_overlayed: Cell::new(false),
             composer_scrollable: Cell::new(false),
             composer_content_h: Rc::new(RefCell::new(px(0.))),
+            composer_gutters: Cell::new(ComposerGutterHeights::default()),
             composer_rail_top: Rc::new(Cell::new(0.0)),
             composer_rail_bottom: Rc::new(Cell::new(0.0)),
             slot_bounds: Rc::new(RefCell::new(HashMap::new())),
@@ -895,7 +934,7 @@ impl SpaceView {
             scroll_min_y: Cell::new(0.0),
             follow_anchor: Cell::new(0.0),
             selected_turn: Cell::new(None),
-            tail_pin: false,
+            tail_pin: TailPin::Inactive,
             docked_caret_slot_offset: Cell::new(0.0),
             scrolls: HashMap::new(),
             scroller_counts: HashMap::new(),
@@ -1062,6 +1101,11 @@ impl SpaceView {
         self.page_scroll.offset().y.as_f32()
     }
 
+    #[doc(hidden)]
+    pub fn set_page_scroll_for_test(&self, y: f32) {
+        self.set_page_scroll_y(y);
+    }
+
     /// The window-local floating-composer fraction and whether the sizing mode
     /// is pinned (`Exact`) — the resize-drag state machine's observables.
     #[doc(hidden)]
@@ -1080,6 +1124,36 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn composer_float_bar_h_for_test(&self, window_h: f32) -> f32 {
         self.composer_float_bar_h(px(window_h))
+    }
+
+    /// The effective resize floor for this window (see
+    /// `composer_min_fraction`).
+    #[doc(hidden)]
+    pub fn composer_min_fraction_for_test(&self, window_h: f32) -> f32 {
+        self.composer_min_fraction(window_h)
+    }
+
+    /// Natural composer height (docked), its editor-and-chrome base, and the
+    /// compact gutter occupancy used by every geometry consumer.
+    #[doc(hidden)]
+    pub fn composer_height_contract_for_test(&self) -> (f32, f32, f32) {
+        let base = Self::composer_chrome() + self.composer_content_h.borrow().as_f32();
+        let gutters = self.composer_gutters.get().total();
+        (self.composer_natural_height(), base, gutters)
+    }
+
+    /// The floating bar's natural height — the docked one less the compact
+    /// byline row, which never floats.
+    #[doc(hidden)]
+    pub fn composer_floating_natural_height_for_test(&self) -> f32 {
+        self.composer_floating_natural_height()
+    }
+
+    /// Compact composer occupancy split around the editor.
+    #[doc(hidden)]
+    pub fn composer_gutter_contract_for_test(&self) -> (f32, f32) {
+        let gutters = self.composer_gutters.get();
+        (gutters.top, gutters.total())
     }
 
     /// Drive the separator-handle resize drag without synthesizing mouse
@@ -1144,7 +1218,23 @@ impl SpaceView {
     /// [`Self::follow_streaming_tail`]).
     #[doc(hidden)]
     pub fn tail_pin_for_test(&self) -> bool {
-        self.tail_pin
+        self.tail_pin.active()
+    }
+
+    /// Whether the post-submit pin is still allowed to override the reader's
+    /// observed position while initial measured layout converges.
+    #[doc(hidden)]
+    pub fn tail_pin_forced_for_test(&self) -> bool {
+        self.tail_pin.forced()
+    }
+
+    /// Scroll the page as the reader's own wheel does — through the takeover
+    /// seam (`note_scroll_activity`), not a bare offset write — so tests can
+    /// assert what reader-driven motion demotes.
+    #[doc(hidden)]
+    pub fn reader_scroll_page_by_for_test(&mut self, dy: f32, cx: &mut Context<Self>) {
+        self.scroll_page_by_for_test(dy);
+        self.note_scroll_activity(gpui::TouchPhase::Moved, true, cx);
     }
 
     /// Whether the minimap is currently shown (tests assert scroll reveals it).
@@ -1215,6 +1305,36 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn doc_reserve_for_test(&self) -> f32 {
         self.doc_reserve()
+    }
+
+    #[doc(hidden)]
+    pub fn runway_height_for_test(&self, window_h: f32) -> f32 {
+        self.runway_height(px(window_h))
+    }
+
+    /// The inline slot height for one inactive draft. This reads the same
+    /// measured-height-plus-runway-floor contract as document layout.
+    #[doc(hidden)]
+    pub fn inactive_draft_height_for_test(&self, index: usize, window_h: f32) -> Option<f32> {
+        let draft = self.drafts.get(index)?;
+        (self.active_draft.as_ref() != Some(&draft.id))
+            .then(|| self.inactive_draft_height(&draft.id, px(window_h)))
+    }
+
+    #[doc(hidden)]
+    pub fn composer_chrome_for_test(&self) -> f32 {
+        Self::composer_chrome()
+    }
+
+    /// The compact composer's bottom action-bar occupancy — the room the
+    /// editor's viewport ends above, and the surface the footnote rail must
+    /// clear.
+    #[doc(hidden)]
+    pub fn compact_action_occupancy_for_test(&self, page_width: f32, rem_size: f32) -> f32 {
+        match layout::page_layout(px(page_width)).gutters {
+            layout::GutterPlacement::Sides => 0.0,
+            layout::GutterPlacement::Stacked => layout::compact_action_bar_h(px(rem_size)),
+        }
     }
 
     /// How many posts currently have a *measured* (not estimated) height in the
@@ -2087,8 +2207,12 @@ impl Render for SpaceView {
         // every post back to a rough estimate and jittering the page (and the
         // minimap) as the near-viewport posts re-measured estimate→real — even
         // where no text reflows. See `layout::body_width`.
-        self.layout
-            .ensure_width(layout::body_width(page_width), theme::font_scale(cx));
+        let page_layout = layout::page_layout(page_width);
+        self.layout.ensure_width(
+            page_layout.body_width,
+            theme::font_scale(cx),
+            page_layout.gutters,
+        );
         self.sync_bodies(window, cx);
         // Keep each post's embed map + highlight set current, and request the
         // incoming-reference index for the posts that rendered last frame.
@@ -2103,6 +2227,7 @@ impl Render for SpaceView {
         // branch's real tail composer rather than minting one that the sync
         // would then prune.
         self.adopt_offered_quotes(window, cx);
+        self.sync_composer_gutters(page_layout, window.rem_size(), cx);
 
         let turns = self.stream_overlays(cx);
         let streaming = !turns.is_empty();
@@ -2218,10 +2343,25 @@ impl Render for SpaceView {
             self.selected_turn.set(selected_turn);
         }
         let producing = selected_turn.is_some();
-        if self.tail_pin && !producing && !self.space.read(cx).is_busy() {
-            self.tail_pin = false;
+        if self.tail_pin.active() && !producing && !self.space.read(cx).is_busy() {
+            self.tail_pin = TailPin::Inactive;
         }
-        self.follow_streaming_tail(producing || self.tail_pin, prev_content_end, content_end);
+        let pin_forced = self.tail_pin.forced();
+        if self.follow_streaming_tail(
+            producing || self.tail_pin.active(),
+            pin_forced,
+            prev_content_end,
+            content_end,
+        ) {
+            let entity = cx.entity();
+            window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
+        } else if pin_forced
+            && !self.path_has_unmeasured(&tree, page_width)
+            && self.page_glide.get().is_none()
+            && (self.page_scroll.offset().y.as_f32() - content_end).abs() <= 0.5
+        {
+            self.tail_pin = TailPin::Observing;
+        }
 
         // While a readonly post is being drag-selected, autoscroll the page when
         // the pointer sits against a viewport edge — so a selection can pull
@@ -2261,7 +2401,15 @@ impl Render for SpaceView {
 
         self.composer_prev_off_y = self.composer_scroll.offset().y.as_f32();
 
-        let body = self.render_forest(&tree, doc_reserve, page_width, window_h, streaming, cx);
+        let body = self.render_forest(
+            &tree,
+            doc_reserve,
+            page_width,
+            window_h,
+            window.rem_size(),
+            streaming,
+            cx,
+        );
 
         // The window is a row: the conversation pane, then (when open and wide
         // enough) the inspector's column. The pane is `relative` and clipped,
@@ -2320,6 +2468,18 @@ impl Render for SpaceView {
             // composer and minimap, which paint over it as before.
             .child(self.render_title_bar(window, cx))
             .child(self.render_active_draft(&tree, page_width, window_h, window, cx))
+            // The compact bottom action bar for a docked, *inactive* tail
+            // draft — the active composer renders its own; this one fades in
+            // as the draft's slot scrolls into view. Same paint position as
+            // the composer (after the page, before the pickers/notices).
+            .child(self.render_inactive_tail_action_bar(
+                &tree,
+                page_width,
+                window_h,
+                window.rem_size(),
+                window,
+                cx,
+            ))
             // The source-highlight picker: which of several posts that quoted
             // the clicked passage to visit. Above the composer, below the
             // notices — it's a choice, not a state.
@@ -2496,8 +2656,8 @@ impl SpaceView {
     /// on a *sibling* branch — a routine Participants-v1 state, and one in which
     /// the reader's own branch is by definition not producing.
     ///
-    /// The one deliberate widening is the post-submit pin ([`Self::tail_pin`],
-    /// folded into `producing` by the caller): a submit *is* the reader's own
+    /// The one deliberate widening is the post-submit pin ([`Self::tail_pin`]):
+    /// a submit *is* the reader's own
     /// branch producing, but the stream that proves it only starts once the post
     /// has persisted and the notification plan resolves. Across that gap the
     /// document still grows, and a reader parked at the end by
@@ -2518,18 +2678,26 @@ impl SpaceView {
     ///
     /// Runs in `render` immediately after `scroll_min_y` is set for the frame,
     /// so every consumer of `clamped_scroll_y` sees the followed position.
-    fn follow_streaming_tail(&self, producing: bool, prev_end: f32, end: f32) {
+    fn follow_streaming_tail(
+        &self,
+        producing: bool,
+        pinned: bool,
+        prev_end: f32,
+        end: f32,
+    ) -> bool {
         if !producing || self.page_glide.get().is_some() {
-            return;
+            return false;
         }
         let off = self.page_scroll.offset();
         let at_tail = off.y.as_f32() <= prev_end + TAIL_FOLLOW_EPSILON;
-        if !at_tail {
-            return; // the reader scrolled away — never yank them back
+        if !pinned && !at_tail {
+            return false; // the reader scrolled away — never yank them back
         }
         if (end - off.y.as_f32()).abs() > 0.5 {
             self.set_page_scroll_y(end);
+            return true;
         }
+        false
     }
 
     /// While a readonly post is being drag-selected, scroll the page toward
@@ -2564,6 +2732,10 @@ impl SpaceView {
         let new_y = (off.y.as_f32() + dy).clamp(self.scroll_min_y.get(), 0.0);
         let scrolled = (new_y - off.y.as_f32()).abs() > 0.01;
         if scrolled {
+            // A selection drag pulling the page is the reader's own motion —
+            // it takes the viewport from the post-submit pin's forcing phase
+            // like every other reader-driven scroll writer.
+            self.demote_tail_pin_for_reader();
             self.set_page_scroll_y(new_y);
         }
         // Re-extend the selection to the row now under the (unmoved) pointer.
@@ -2583,19 +2755,23 @@ impl SpaceView {
 
     /// Render the top of the forest: a single root is rendered directly; a
     /// multi-root forest gets the implicit top-level branch scroller.
+    #[allow(clippy::too_many_arguments)]
     fn render_forest(
         &self,
         roots: &[TreeNode],
         doc_y: f32,
         page_width: Pixels,
         window_h: Pixels,
+        rem_size: Pixels,
         streaming: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         match roots.len() {
             0 => div().into_any_element(),
             1 => self
-                .render_subtree(&roots[0], doc_y, page_width, window_h, streaming, cx)
+                .render_subtree(
+                    &roots[0], doc_y, page_width, window_h, rem_size, streaming, cx,
+                )
                 .into_any_element(),
             _ => self
                 .render_strip(
@@ -2604,6 +2780,7 @@ impl SpaceView {
                     doc_y,
                     page_width,
                     window_h,
+                    rem_size,
                     streaming,
                     cx,
                 )
@@ -2614,12 +2791,14 @@ impl SpaceView {
     /// Render a node's whole subtree: its post, then (if it has replies) a
     /// separator band and the horizontal branch scroller whose pages are each
     /// child's entire subtree. Off-screen posts render as sized placeholders.
+    #[allow(clippy::too_many_arguments)]
     fn render_subtree(
         &self,
         node: &TreeNode,
         doc_y: f32,
         page_width: Pixels,
         window_h: Pixels,
+        rem_size: Pixels,
         streaming: bool,
         cx: &Context<Self>,
     ) -> gpui::Div {
@@ -2644,8 +2823,9 @@ impl SpaceView {
             NodeSrc::Draft => {
                 // Inactive draft: render inline (an editable "Draft" post that
                 // takes real vertical space); clicking it re-activates it.
-                column =
-                    column.child(self.render_inactive_draft(node, doc_y, page_width, window_h, cx));
+                column = column.child(
+                    self.render_inactive_draft(node, doc_y, page_width, window_h, rem_size, cx),
+                );
             }
             _ => {
                 column = column
@@ -2672,6 +2852,7 @@ impl SpaceView {
                 child_doc_y,
                 page_width,
                 window_h,
+                rem_size,
                 streaming,
                 cx,
             ))
@@ -2690,6 +2871,7 @@ impl SpaceView {
         doc_y: f32,
         page_width: Pixels,
         window_h: Pixels,
+        rem_size: Pixels,
         streaming: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -2804,7 +2986,7 @@ impl SpaceView {
             }
             let near = (i as i64 - active as i64).abs() <= 1;
             let page = if near {
-                self.render_subtree(child, doc_y, page_width, window_h, streaming, cx)
+                self.render_subtree(child, doc_y, page_width, window_h, rem_size, streaming, cx)
                     .into_any_element()
             } else {
                 let h = self.selected_subtree_height(child, page_width, window_h);

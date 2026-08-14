@@ -4547,6 +4547,434 @@ fn keyboard_focus_reveals_a_posts_hover_gated_verbs(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn compact_actionable_post_keeps_its_height_when_actions_reveal(cx: &mut TestAppContext) {
+    use gpui::{VisualTestContext, px};
+
+    let _guard = probes_on();
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the quick brown fox")], cx)
+        });
+    });
+    let vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let resting = fresh_entries(cx, window);
+    let resting_height = resting
+        .iter()
+        .find(|(name, _)| name == "space/post/0")
+        .expect("post probe at rest")
+        .1
+        .bounds
+        .size
+        .height;
+    assert!(
+        !resting.iter().any(|(name, _)| name == "space/post/0/edit"),
+        "the reserved row remains visually empty at rest"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.focus_post("a1".into(), window, cx));
+    })
+    .unwrap();
+    let focused = fresh_entries(cx, window);
+    let focused_height = focused
+        .iter()
+        .find(|(name, _)| name == "space/post/0")
+        .expect("focused post probe")
+        .1
+        .bounds
+        .size
+        .height;
+    assert!(
+        (resting_height - focused_height).abs() < px(0.5),
+        "revealing compact actions must not resize the post ({resting_height:?} -> {focused_height:?})"
+    );
+    assert_probe(
+        &focused,
+        "space/post/0/edit",
+        gpui::Role::Button,
+        "Edit this post",
+    );
+}
+
+#[gpui::test]
+fn compact_settled_post_keeps_its_action_height_while_another_turn_streams(
+    cx: &mut TestAppContext,
+) {
+    use gpui::{VisualTestContext, px};
+
+    let _guard = probes_on();
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the quick brown fox")], cx)
+        });
+    });
+    let vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let settled_height = fresh_entries(cx, window)
+        .iter()
+        .find(|(name, _)| name == "space/post/0")
+        .expect("settled post probe")
+        .1
+        .bounds
+        .size
+        .height;
+
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.push_streaming_turn_for_test(None, Some("a1".into()), Default::default(), cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let streaming_entries = fresh_entries(cx, window);
+    let streaming_height = streaming_entries
+        .iter()
+        .find(|(name, _)| name == "space/post/0")
+        .expect("settled post probe while its reply streams")
+        .1
+        .bounds
+        .size
+        .height;
+    assert!(
+        (settled_height - streaming_height).abs() < px(0.5),
+        "a settled actionable post must keep its compact action allocation while a reply streams \
+         ({settled_height:?} -> {streaming_height:?})"
+    );
+    assert!(
+        !streaming_entries
+            .iter()
+            .any(|(name, _)| name == "space/post/0/edit"),
+        "the unavailable verb stays hidden while streaming"
+    );
+}
+
+#[gpui::test]
+fn compact_post_metadata_stays_inside_its_row_at_large_type(cx: &mut TestAppContext) {
+    use gpui::{VisualTestContext, px};
+
+    let _guard = probes_on();
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let author = "A deliberately descriptive participant identity that remains recognizable";
+    let backend = "private-inference-workstation-in-the-west-studio";
+    let selection = format!("{author}@{backend}");
+    let mut post = probe_post("a1", "the metadata must not paint into this prose");
+    post.participant = PostParticipant {
+        kind: "agent".into(),
+        label: selection.clone(),
+    };
+    post.action_type = "inference".into();
+    post.model = Some(selection);
+    post.created_at = 1_700_000_000;
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![post], cx));
+    });
+    cx.update(|cx| gpui_component::Theme::global_mut(cx).font_size = px(24.));
+    let vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let entries = fresh_entries(cx, window);
+    let entry = |name: &str| {
+        &entries
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .1
+    };
+    let row = entry("space/post/a1/metadata");
+    assert!(
+        row.bounds.size.height > px(25.),
+        "the probe exercises increased type scale"
+    );
+    for name in [
+        "space/post/a1/metadata/author",
+        "space/post/a1/metadata/backend",
+        "space/post/a1/metadata/time",
+    ] {
+        let segment = entry(name);
+        assert!(
+            segment.bounds.left() >= row.bounds.left()
+                && segment.bounds.right() <= row.bounds.right(),
+            "{name} must stay inside the compact metadata row: {:?} vs {:?}",
+            segment.bounds,
+            row.bounds
+        );
+        assert!(
+            segment.bounds.size.width > px(0.),
+            "{name} retains a visible allocation"
+        );
+    }
+
+    let article = entry("space/post/0");
+    assert!(
+        article.label.contains(author) && article.label.contains(backend),
+        "visual truncation must not shorten the accessible byline: {:?}",
+        article.label
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn compact_composer_gutters_hold_post_parity_and_the_bottom_bar(cx: &mut TestAppContext) {
+    use gpui::{VisualTestContext, px};
+
+    let _guard = probes_on();
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let body = "A paragraph long enough that the conversation overflows the window. ".repeat(30);
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", &body)], cx)
+        });
+    });
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    const WIN: f32 = 560.0;
+    vcx.simulate_resize(gpui::size(px(760.), px(WIN)));
+    vcx.run_until_parked();
+    // Activate the branch's own auto-minted tail draft (a seeded sibling
+    // would sit off-path and float forever) and give it a line so the
+    // actions reveal.
+    let parents = view.read_with(&vcx, |v, _| v.draft_parents_for_test());
+    let tail = parents
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a1"))
+        .expect("the leaf's tail draft exists");
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(tail, cx));
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the tail draft is active");
+    editor.update(&mut vcx, |editor, cx| editor.set_value("a short draft", cx));
+    vcx.run_until_parked();
+
+    // Docked at the document floor: the quad fills the window exactly, the
+    // byline sits a full post pad below the slot top (where a post's metadata
+    // row sits), and the verbs ride the bottom action bar with real clearance
+    // from the window edge.
+    // Re-assert the floor each frame while estimated heights converge to
+    // measured ones (the floor deepens as they settle).
+    for _ in 0..4 {
+        view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    let rem_size = vcx.update(|window, _| window.rem_size().as_f32());
+    let bar_h = view.read_with(&vcx, |v, _| {
+        v.compact_action_occupancy_for_test(760.0, rem_size)
+    });
+    let entries = fresh_entries(cx, window);
+    let entry = |name: &str| {
+        &entries
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .1
+    };
+    let quad = entry("space/composer").bounds;
+    assert!(
+        quad.origin.y.abs() < px(0.5) && (quad.size.height - px(WIN)).abs() < px(0.5),
+        "at the floor the docked quad fills the window exactly: {quad:?}"
+    );
+    let byline = entry("space/composer/byline").bounds;
+    assert!(
+        (byline.origin.y - quad.origin.y - px(40.)).abs() < px(1.0),
+        "the docked byline sits POST_PAD_Y below the slot top, where a post's \
+         metadata row sits (byline {byline:?}, quad {quad:?})"
+    );
+    let post = entry("space/composer/post").bounds;
+    assert!(
+        post.origin.y >= px(WIN - bar_h) && post.origin.y + post.size.height <= px(WIN - 8.),
+        "Post rides the bottom action bar with clearance from the window edge \
+         (post {post:?}, bar {}..{WIN})",
+        WIN - bar_h
+    );
+
+    // Deactivated at the floor: the bottom bar survives the editor losing
+    // its session — rendered by the inactive-tail path, fading in with the
+    // slot — so Post meets the reader without a click into the editor first.
+    vcx.update(|window, cx| {
+        use gpui::Focusable as _;
+        let focus = editor.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries.iter().any(|(name, _)| name == "space/composer"),
+        "escape retired the active composer overlay"
+    );
+    let post = entries
+        .iter()
+        .find(|(name, _)| name == "space/composer/post")
+        .expect("the inactive tail draft keeps its bottom action bar")
+        .1
+        .bounds;
+    assert!(
+        post.origin.y >= px(WIN - bar_h) && post.origin.y + post.size.height <= px(WIN - 8.),
+        "the inactive bar anchors to the same bottom allocation (post {post:?})"
+    );
+
+    // Floating: the byline is not part of the bar (its probe never paints),
+    // while the verbs stay on the bottom bar and See in context joins them.
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(tail, cx));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.set_page_scroll_for_test(0.0));
+    vcx.run_until_parked();
+    for _ in 0..2 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    let entries = fresh_entries(cx, window);
+    assert!(
+        view.read_with(&vcx, |v, _| v.composer_overlayed_for_test()),
+        "scrolled to the top, the composer floats"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(name, _)| name == "space/composer/byline"),
+        "the floating bar carries no byline"
+    );
+    let post = entries
+        .iter()
+        .find(|(name, _)| name == "space/composer/post")
+        .expect("Post stays on the bottom bar while floating")
+        .1
+        .bounds;
+    assert!(
+        post.origin.y >= px(WIN - bar_h) && post.origin.y + post.size.height <= px(WIN - 8.),
+        "the floating bar keeps its verbs on the bottom action bar (post {post:?})"
+    );
+    assert_probe(
+        &entries,
+        "space/composer/home",
+        gpui::Role::Button,
+        "See in context",
+    );
+
+    // Large type: the settled byline anchor derives from the editor's offset,
+    // not the separator height, so post parity (POST_PAD_Y under the slot
+    // top) holds at every scale — and the taller action bar still keeps its
+    // verbs inside the window with clearance.
+    cx.update(|cx| gpui_component::Theme::global_mut(cx).font_size = px(24.));
+    for _ in 0..4 {
+        view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    let rem_size = vcx.update(|window, _| window.rem_size().as_f32());
+    assert!(
+        rem_size > 20.0,
+        "precondition: the window rem follows the enlarged theme ({rem_size})"
+    );
+    let bar_h = view.read_with(&vcx, |v, _| {
+        v.compact_action_occupancy_for_test(760.0, rem_size)
+    });
+    let entries = fresh_entries(cx, window);
+    let entry = |name: &str| {
+        &entries
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .1
+    };
+    let quad = entry("space/composer").bounds;
+    let byline = entry("space/composer/byline").bounds;
+    assert!(
+        (byline.origin.y - quad.origin.y - px(40.)).abs() < px(1.0),
+        "at 24px rem the docked byline still tops out POST_PAD_Y under the \
+         slot top (byline {byline:?}, quad {quad:?})"
+    );
+    let post = entry("space/composer/post").bounds;
+    assert!(
+        post.origin.y >= px(WIN - bar_h) && post.origin.y + post.size.height <= px(WIN - 8.),
+        "the scaled bar still holds its verbs clear of the edge (post {post:?})"
+    );
+}
+
+#[gpui::test]
+fn entering_compact_affordances_reveals_an_oversized_posts_action(cx: &mut TestAppContext) {
+    use gpui::{VisualTestContext, px};
+
+    let _guard = probes_on();
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let body =
+        "A long paragraph that keeps wrapping through the compact reading column. ".repeat(90);
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", &body)], cx)
+        });
+    });
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    let before = fresh_entries(cx, window);
+    let action = before
+        .iter()
+        .find(|(name, _)| name == "space/post/0/edit")
+        .expect("focus reveals Edit on the oversized post")
+        .1
+        .bounds;
+    assert!(
+        action.origin.y + action.size.height > px(560.),
+        "precondition: post-level focus aligns the oversized post's top and leaves its action below the window"
+    );
+    let before_offset = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let after = fresh_entries(cx, window);
+    let action = after
+        .iter()
+        .find(|(name, _)| name == "space/post/0/edit")
+        .expect("entered Edit affordance remains rendered")
+        .1
+        .bounds;
+    assert!(
+        action.origin.y >= px(0.) && action.origin.y + action.size.height <= px(560.),
+        "the focused compact action is inside the window: {action:?}"
+    );
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_scroll_offset_y_for_test() < before_offset,
+            "entering the action row minimally advances the page"
+        );
+    });
+}
+
+#[gpui::test]
 fn keyboard_focus_reveals_a_library_rows_verbs(cx: &mut TestAppContext) {
     // The Library's half of audit S7 — the same rule as a post's action gutter:
     // hover-gated verbs must also answer to keyboard focus, because gpui

@@ -58,6 +58,33 @@ fn register_space(s: &mut Snapshots) {
         })
     });
 
+    // The populated branch settled all the way onto its active tail composer.
+    // Unlike the blank notebook below, this exercises the composer's full
+    // docked runway rather than its titlebar-adjusted standalone slot.
+    s.add(
+        "space_docked_composer",
+        size(px(900.), px(720.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let mut view =
+                    SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+                view.space().update(cx, |sp, cx| {
+                    sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
+                });
+                view.seed_draft_quote_for_test(
+                    Some("a9"),
+                    "I want to preserve that distinction in the final paragraph.",
+                    vec![],
+                    window,
+                    cx,
+                );
+                view.set_page_scroll_for_test(-100_000.0);
+                view
+            })
+        },
+    );
+
     // The space inspector (tasks 26.2 + 26.3): the per-space settings panel
     // splitting the window — chrome type beside the paper, with a remote router
     // selected so the mandatory per-call cost copy is in frame, and the

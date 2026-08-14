@@ -47,7 +47,9 @@
 
 use gpui::{App, Context, FocusHandle, SharedString, Window};
 
+use super::POST_PAD_Y;
 use super::SpaceView;
+use super::layout::{GutterPlacement, compact_gutter_occupancy, page_layout};
 use super::model::{NodeSrc, PostData, TreeNode};
 
 /// Which rung of the two-level model holds focus.
@@ -238,6 +240,16 @@ pub(crate) fn scroll_into_view(
         return current;
     };
     target.clamp(min_y.min(0.0), 0.0)
+}
+
+fn compact_action_span(
+    post_top: f32,
+    post_height: f32,
+    row_height: f32,
+    post_pad_y: f32,
+) -> (f32, f32) {
+    let bottom = post_top + post_height - post_pad_y;
+    ((bottom - row_height).max(post_top), bottom)
 }
 
 /// Whether a keystroke is "the user started typing" for task 38 — printable
@@ -438,6 +450,9 @@ impl SpaceView {
                         node_id,
                         level: FocusLevel::Affordance(next),
                     });
+                    let handle = self.affordance_slot(next, cx);
+                    window.focus(&handle, cx);
+                    self.reveal_focused_affordance(window, cx);
                     cx.notify();
                     return true;
                 }
@@ -550,6 +565,59 @@ impl SpaceView {
             self.scroll_min_y.get(),
             REVEAL_MARGIN,
         );
+        // Keyboard navigation is the reader's own motion — it takes the
+        // viewport from the post-submit pin's forcing phase.
+        self.demote_tail_pin_for_reader();
+        self.set_page_scroll_y(y);
+    }
+
+    /// Reveal the compact action row itself. Oversized posts deliberately
+    /// align their beginning when entered at the post level; descending into
+    /// their affordances changes the target to the row at the other end.
+    fn reveal_focused_affordance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let viewport = self.page_size(window);
+        let (page_width, window_h) = (viewport.width, viewport.height);
+        if page_layout(page_width).gutters != GutterPlacement::Stacked {
+            return;
+        }
+        let Some(focus) = self.tree_focus.as_ref() else {
+            return;
+        };
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let Some(top) = self.selected_path_doc_top(&tree, &focus.node_id, page_width, window_h)
+        else {
+            return;
+        };
+        let Some(node) = super::model::node_ref(&tree, &focus.node_id) else {
+            return;
+        };
+        let (action_top, action_bottom) = compact_action_span(
+            top,
+            self.node_height(node, page_width, window_h),
+            compact_gutter_occupancy(window.rem_size()),
+            POST_PAD_Y.as_f32(),
+        );
+        let current = self.page_scroll.offset().y.as_f32();
+        let y = scroll_into_view(
+            action_top,
+            action_bottom,
+            RevealViewport {
+                height: window_h.as_f32(),
+                top_inset: self.doc_reserve(),
+                bottom_inset: if self.active_draft.is_some() {
+                    self.composer_float_bar_h(window_h)
+                } else {
+                    0.0
+                },
+            },
+            current,
+            self.scroll_min_y.get(),
+            REVEAL_MARGIN,
+        );
+        // Keyboard navigation is the reader's own motion — it takes the
+        // viewport from the post-submit pin's forcing phase.
+        self.demote_tail_pin_for_reader();
         self.set_page_scroll_y(y);
     }
 
@@ -577,6 +645,7 @@ impl SpaceView {
         });
         let handle = self.affordance_slot(0, cx);
         window.focus(&handle, cx);
+        self.reveal_focused_affordance(window, cx);
         cx.notify();
         true
     }
@@ -1063,6 +1132,11 @@ mod tests {
             ),
             0.
         );
+    }
+
+    #[test]
+    fn compact_action_span_is_the_posts_trailing_inner_row() {
+        assert_eq!(compact_action_span(100., 900., 28., 40.), (932., 960.));
     }
 
     #[test]

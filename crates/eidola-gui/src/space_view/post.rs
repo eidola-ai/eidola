@@ -7,7 +7,7 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, Context, Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, canvas, div, px,
+    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, canvas, div, px, rems,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::MarkdownEditor;
@@ -17,7 +17,9 @@ use crate::probe::Probe as _;
 use crate::overlay::{Contain as _, Overlay};
 
 use super::context_menu::ContextTarget;
-use super::layout::body_width;
+use super::layout::{
+    COMPACT_GUTTER_GAP_REMS, COMPACT_GUTTER_LINE_REMS, GutterPlacement, PageLayout, page_layout,
+};
 use super::model::{NodeSrc, TreeNode};
 use super::{
     BAND_HEIGHT, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y, SpaceView, VIRT_MARGIN, layout::Layout,
@@ -68,7 +70,8 @@ impl SpaceView {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let bw = px(body_width(page_width));
+        let page_layout = page_layout(page_width);
+        let bw = px(page_layout.body_width);
         let editing_this = self.editing.as_ref().map(|e| &e.node_id) == Some(&node.id);
 
         // A **settled** post carries its byline/backend/time as the article's
@@ -129,64 +132,106 @@ impl SpaceView {
         // The gutter stack: author (bold), the serving backend (quiet,
         // assistant rows only — suppressed when it would just repeat the
         // author line), then the time.
-        let mut byline_el = byline_gutter(byline.clone(), theme.foreground, None);
+        let probe_base = format!("space/post/{}/metadata", node.id);
+        let mut byline_el = byline_gutter_frame(page_layout)
+            .id(SharedString::from(format!(
+                "space-post-{}-metadata",
+                node.id
+            )))
+            .probe_bounds(probe_base.clone(), gpui::Role::Label, "Post metadata row")
+            .child(
+                byline_label(page_layout, byline.clone(), theme.foreground, None, true)
+                    .id(SharedString::from(format!(
+                        "space-post-{}-metadata-author",
+                        node.id
+                    )))
+                    .probe_bounds(
+                        format!("{probe_base}/author"),
+                        gpui::Role::Label,
+                        "Post author metadata",
+                    ),
+            );
         if let Some(backend) = byline_backend.filter(|b| *b != byline) {
             byline_el = byline_el.child(
                 div()
+                    .id(SharedString::from(format!(
+                        "space-post-{}-metadata-backend",
+                        node.id
+                    )))
+                    .probe_bounds(
+                        format!("{probe_base}/backend"),
+                        gpui::Role::Label,
+                        "Post backend metadata",
+                    )
                     .text_xs()
                     .text_color(theme.muted_foreground)
+                    .when(page_layout.gutters == GutterPlacement::Stacked, |d| {
+                        d.flex_shrink_1().min_w_0().truncate()
+                    })
                     .child(backend),
             );
         }
         let byline_el = byline_el.child(
             div()
+                .id(SharedString::from(format!(
+                    "space-post-{}-metadata-time",
+                    node.id
+                )))
+                .probe_bounds(
+                    format!("{probe_base}/time"),
+                    gpui::Role::Label,
+                    "Post time metadata",
+                )
                 .text_xs()
                 .text_color(theme.muted_foreground)
+                .when(page_layout.gutters == GutterPlacement::Stacked, |d| {
+                    d.flex_shrink_0().truncate()
+                })
                 .child(time),
         );
 
         let hover_id = node.id.clone();
-        let mut row = h_flex()
-            .id(SharedString::from(format!("space-post-{}", node.id)))
-            // The conversation itself, in the tree at last: each settled post
-            // is an `Article` (`AXGroup` + `AXDocumentArticle`) named for its
-            // author and time, carrying its whole text as the value. Only
-            // settled posts — a streaming reply's text mutates every token, and
-            // AT re-reads a changed value in full, so binding one there would
-            // make the app *less* usable than silence (audit §4). The row
-            // becomes a node the moment the stream finalizes into a `Msg`.
-            .when_some(article, |d, (i, label, value)| {
-                d.probe_value(format!("space/post/{i}"), gpui::Role::Article, label, value)
-            })
-            // Wave B: the *focused* post row tracks the view's single post
-            // focus handle. `Role::Article` already made the row focusable and
-            // gave it the `:focus-visible` ring; tracking the handle is what
-            // lets the arrow keys *move* focus here, and what tells gpui to
-            // report this node as focused in the AccessKit tree. One handle
-            // moved between rows — see `SpaceView::post_focus`.
-            // Only at the *post* level: once focus enters the affordance row
-            // the verb tracks its own handle, and two elements tracking one
-            // handle would claim focus twice in a frame (gpui asserts on it).
-            .when(self.post_row_holds_focus(&node.id), |d| {
-                d.track_focus(&self.post_focus)
-            })
-            .relative()
-            .w(page_width)
-            .py(POST_PAD_Y)
-            .justify_center()
-            .items_start()
-            .gap(GUTTER_GAP)
-            .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
-                this.set_post_hover(&hover_id, *hovering, cx);
-            }))
-            .child(byline_el)
-            .child(body)
-            .child(self.render_post_actions(node, cx))
-            .child(record_height(
-                self.layout.clone(),
-                node.id.clone(),
-                cx.entity().downgrade(),
-            ));
+        let mut row = match page_layout.gutters {
+            GutterPlacement::Sides => h_flex().justify_center().items_start().gap(GUTTER_GAP),
+            GutterPlacement::Stacked => v_flex().items_center(),
+        }
+        .id(SharedString::from(format!("space-post-{}", node.id)))
+        // The conversation itself, in the tree at last: each settled post
+        // is an `Article` (`AXGroup` + `AXDocumentArticle`) named for its
+        // author and time, carrying its whole text as the value. Only
+        // settled posts — a streaming reply's text mutates every token, and
+        // AT re-reads a changed value in full, so binding one there would
+        // make the app *less* usable than silence (audit §4). The row
+        // becomes a node the moment the stream finalizes into a `Msg`.
+        .when_some(article, |d, (i, label, value)| {
+            d.probe_value(format!("space/post/{i}"), gpui::Role::Article, label, value)
+        })
+        // Wave B: the *focused* post row tracks the view's single post
+        // focus handle. `Role::Article` already made the row focusable and
+        // gave it the `:focus-visible` ring; tracking the handle is what
+        // lets the arrow keys *move* focus here, and what tells gpui to
+        // report this node as focused in the AccessKit tree. One handle
+        // moved between rows — see `SpaceView::post_focus`.
+        // Only at the *post* level: once focus enters the affordance row
+        // the verb tracks its own handle, and two elements tracking one
+        // handle would claim focus twice in a frame (gpui asserts on it).
+        .when(self.post_row_holds_focus(&node.id), |d| {
+            d.track_focus(&self.post_focus)
+        })
+        .relative()
+        .w(page_width)
+        .py(POST_PAD_Y)
+        .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+            this.set_post_hover(&hover_id, *hovering, cx);
+        }))
+        .child(byline_el)
+        .child(body)
+        .child(self.render_post_actions(node, page_layout, cx))
+        .child(record_height(
+            self.layout.clone(),
+            node.id.clone(),
+            cx.entity().downgrade(),
+        ));
         if editing_this {
             // Escape restores the pre-edit text and exits the session. The
             // row (an ancestor of the focused editor) sees the key first —
@@ -317,17 +362,28 @@ impl SpaceView {
     /// this post is being edited it shows the session's Save/Cancel verbs
     /// instead. Hidden entirely while streaming (the entity refuses mutations
     /// mid-stream, so dead verbs would lie).
-    fn render_post_actions(&self, node: &TreeNode, cx: &Context<Self>) -> gpui::Div {
-        let col = action_gutter().gap_0p5();
+    fn render_post_actions(
+        &self,
+        node: &TreeNode,
+        page_layout: PageLayout,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let empty = || action_gutter(page_layout, false).gap_0p5();
         let NodeSrc::Msg(i) = node.src else {
-            return col;
+            return empty();
         };
         let post = &self.posts[i];
         let Some(action_id) = post.action_id.clone() else {
-            return col; // optimistic/synthetic rows aren't actionable yet
+            return empty(); // optimistic/synthetic rows aren't actionable yet
         };
+        if !matches!(post.role.as_ref(), "user" | "assistant") {
+            return empty();
+        }
         if self.space.read(cx).is_streaming() {
-            return col;
+            // This settled row remains actionable once the turn finishes, so
+            // compact layout keeps its latent action line stable while the
+            // temporarily disabled verbs stay hidden.
+            return action_gutter(page_layout, true).gap_0p5();
         }
 
         // The shared quiet-verb look (see `verb_button`) — the same family the
@@ -353,7 +409,8 @@ impl SpaceView {
         };
 
         if self.editing.as_ref().map(|e| &e.node_id) == Some(&node.id) {
-            return col
+            return action_gutter(page_layout, true)
+                .gap_0p5()
                 .child(
                     verb(
                         0,
@@ -381,9 +438,10 @@ impl SpaceView {
         // hover-only gate would hide these verbs from exactly the user the
         // keyboard model exists for.
         if !self.post_affordances_revealed(&node.id) || self.editing.is_some() {
-            return col;
+            return action_gutter(page_layout, true).gap_0p5();
         }
 
+        let col = action_gutter(page_layout, true).gap_0p5();
         match post.role.as_ref() {
             "user" => {
                 let id = node.id.clone();
@@ -580,6 +638,7 @@ impl SpaceView {
         doc_y: f32,
         page_width: gpui::Pixels,
         window_h: gpui::Pixels,
+        rem_size: gpui::Pixels,
         cx: &Context<Self>,
     ) -> AnyElement {
         let h = self.node_height(node, page_width, window_h);
@@ -599,7 +658,8 @@ impl SpaceView {
         }
 
         let theme = cx.theme();
-        let bw = px(body_width(page_width));
+        let page_layout = page_layout(page_width);
+        let bw = px(page_layout.body_width);
         let focus = editor.read(cx).focus_handle(cx);
         let id = node.id.clone();
         // The editor fills the inline runway (the frame reserves a standalone
@@ -607,63 +667,93 @@ impl SpaceView {
         // below the text lands inside the editor and resolves to document end —
         // the same notes-editor affordance as the active composer, owned by the
         // editor.
-        let slot_h = self.standalone_slot_h(window_h);
-        let editor_fill = px((slot_h - 2.0 * POST_PAD_Y.as_f32()).max(0.0));
+        let slot_h = self.runway_floor(window_h);
+        // The occupancy must resolve against the same rem the painted gutter
+        // rows resolve their `rems(..)` heights against — the window's rem
+        // size, threaded down from `render` (a second derivation from the
+        // theme constants would silently break the inactive/active slot
+        // continuity the day the two diverge).
+        let compact_top = match page_layout.gutters {
+            GutterPlacement::Sides => 0.0,
+            GutterPlacement::Stacked => super::layout::compact_gutter_occupancy(rem_size),
+        };
+        // The bottom action bar overlays the window's bottom edge whenever
+        // this draft has something to post (see
+        // `SpaceView::render_inactive_tail_action_bar`), so the row reserves
+        // its occupancy — the inactive twin of the active composer's
+        // `composer_gutters.bottom` — as an in-flow tail spacer. Without it a
+        // draft tall enough to fill its runway ends its last lines under the
+        // bar with no scroll left to reveal them.
+        let bar_reserve = match page_layout.gutters {
+            GutterPlacement::Stacked if !editor.read(cx).is_empty() => {
+                super::layout::compact_action_bar_h(rem_size)
+            }
+            _ => 0.0,
+        };
+        let editor_fill =
+            px((slot_h - 2.0 * POST_PAD_Y.as_f32() - compact_top - bar_reserve).max(0.0));
 
-        let byline_el = byline_gutter("You", theme.info, Some(DRAFT_BYLINE_OPACITY));
+        let byline_el = byline_gutter(page_layout, "You", theme.info, Some(DRAFT_BYLINE_OPACITY));
 
-        h_flex()
-            .relative()
-            .w(page_width)
-            // A draft is always the end of its branch, so reserve at least a
-            // standalone slot — the same `max(natural, standalone)` runway the
-            // active composer docks into — so activating/deactivating it never
-            // shifts the layout (`node_height` reports the same height).
-            .min_h(px(slot_h))
-            .py(POST_PAD_Y)
-            .justify_center()
-            .items_start()
-            .gap(GUTTER_GAP)
-            .id(SharedString::from(format!(
-                "space-draft-inactive-{}",
-                node.id
-            )))
-            .probe(
-                "space/draft/inactive",
-                gpui::Role::Button,
-                "Draft — open to edit",
-            )
-            // Re-activate on click (byline/gutter clicks that miss the editor);
-            // `on_click` (mouse-up) so the focus sticks — focusing during
-            // mouse-down is undone by that same event's focus pass. Clicking the
-            // editor itself activates via its `Focus` event; the editor also
-            // owns caret placement (text → clicked position, blank tail → end),
-            // so there's no cursor-resetting overlay here.
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.activate_draft(id.clone(), cx);
-                window.focus(&focus, cx);
-            }))
-            .child(byline_el)
-            .child(
-                div()
-                    .w(bw)
-                    .child(
-                        MarkdownEditor::new(&editor)
-                            .style(prose_style(cx))
-                            .min_height(editor_fill),
-                    )
-                    // The draft's pending quotes, as footnotes — the same rail
-                    // a posted exchange carries, so composing looks like what
-                    // it will become.
-                    .children(self.render_draft_footnotes(&node.id, false, cx)),
-            )
-            .child(action_gutter())
-            .child(record_height(
-                self.layout.clone(),
-                node.id.clone(),
-                cx.entity().downgrade(),
-            ))
-            .into_any_element()
+        match page_layout.gutters {
+            GutterPlacement::Sides => h_flex().justify_center().items_start().gap(GUTTER_GAP),
+            GutterPlacement::Stacked => v_flex().items_center(),
+        }
+        .relative()
+        .w(page_width)
+        // A draft is always the end of its branch, so reserve at least a
+        // trailing runway floor. Its own content can grow the row beyond this
+        // through normal layout measurement; another draft's content cannot.
+        .min_h(px(slot_h))
+        .py(POST_PAD_Y)
+        .id(SharedString::from(format!(
+            "space-draft-inactive-{}",
+            node.id
+        )))
+        // Indexed by the draft's node id: several branches' inactive tail
+        // drafts paint at once, and probe names must be unique per painted
+        // element (a shared name collapses them in the driver's registry).
+        .probe(
+            format!("space/draft/inactive/{}", node.id),
+            gpui::Role::Button,
+            "Draft — open to edit",
+        )
+        // Re-activate on click (byline/gutter clicks that miss the editor);
+        // `on_click` (mouse-up) so the focus sticks — focusing during
+        // mouse-down is undone by that same event's focus pass. Clicking the
+        // editor itself activates via its `Focus` event; the editor also
+        // owns caret placement (text → clicked position, blank tail → end),
+        // so there's no cursor-resetting overlay here.
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.activate_draft(id.clone(), cx);
+            window.focus(&focus, cx);
+        }))
+        .child(byline_el)
+        .child(
+            div()
+                .w(bw)
+                .child(
+                    MarkdownEditor::new(&editor)
+                        .style(prose_style(cx))
+                        .min_height(editor_fill),
+                )
+                // The draft's pending quotes, as footnotes — the same rail
+                // a posted exchange carries, so composing looks like what
+                // it will become.
+                .children(self.render_draft_footnotes(&node.id, false, cx))
+                // The bottom action bar's reservation (zero in the Sides
+                // scheme and for an empty draft) — in flow, so a long draft's
+                // measured height carries it and the page can scroll the last
+                // lines clear of the bar.
+                .child(div().h(px(bar_reserve)).w_full().flex_none()),
+        )
+        .child(action_gutter(page_layout, false))
+        .child(record_height(
+            self.layout.clone(),
+            node.id.clone(),
+            cx.entity().downgrade(),
+        ))
+        .into_any_element()
     }
 
     /// One streaming turn's reply body: a reasoning disclosure (clickable
@@ -1016,8 +1106,18 @@ pub(crate) const DRAFT_BYLINE_OPACITY: f32 = 0.85;
 /// [`SpaceView::render_post_actions`]); the active composer fills it with the
 /// request actions (see `request.rs`); otherwise it's reserved empty space
 /// that keeps the reading column centered.
-pub(crate) fn action_gutter() -> gpui::Div {
-    v_flex().w(GUTTER_WIDTH).flex_none().items_start().pt_4()
+pub(crate) fn action_gutter(layout: PageLayout, occupied: bool) -> gpui::Div {
+    match layout.gutters {
+        GutterPlacement::Sides => v_flex().w(GUTTER_WIDTH).flex_none().items_start().pt_4(),
+        GutterPlacement::Stacked => h_flex()
+            .w(px(layout.body_width))
+            .flex_none()
+            .items_center()
+            .when(occupied, |d| {
+                d.h(rems(COMPACT_GUTTER_LINE_REMS))
+                    .mt(rems(COMPACT_GUTTER_GAP_REMS))
+            }),
+    }
 }
 
 /// A **quiet verb** — the shared look of every per-post affordance: small,
@@ -1081,24 +1181,47 @@ pub(crate) fn thinking_labels(streaming: bool, expanded: bool) -> (&'static str,
 /// byline. Callers append extras (the time line, "See in context") as further
 /// children.
 pub(crate) fn byline_gutter(
+    layout: PageLayout,
     label: impl Into<SharedString>,
     color: gpui::Hsla,
     label_opacity: Option<f32>,
 ) -> gpui::Div {
+    byline_gutter_frame(layout).child(byline_label(layout, label, color, label_opacity, false))
+}
+
+fn byline_gutter_frame(layout: PageLayout) -> gpui::Div {
+    match layout.gutters {
+        GutterPlacement::Sides => v_flex().w(GUTTER_WIDTH).items_end().pt_4(),
+        GutterPlacement::Stacked => h_flex()
+            .w(px(layout.body_width))
+            .min_w_0()
+            .overflow_hidden()
+            .items_center()
+            .gap_2()
+            .h(rems(COMPACT_GUTTER_LINE_REMS))
+            .mb(rems(COMPACT_GUTTER_GAP_REMS)),
+    }
+    .flex_none()
+}
+
+fn byline_label(
+    layout: PageLayout,
+    label: impl Into<SharedString>,
+    color: gpui::Hsla,
+    label_opacity: Option<f32>,
+    compact_flexible: bool,
+) -> gpui::Div {
     use gpui::prelude::FluentBuilder as _;
-    v_flex()
-        .w(GUTTER_WIDTH)
-        .flex_none()
-        .items_end()
-        .pt_4()
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::BOLD)
-                .when_some(label_opacity, |d, o| d.opacity(o))
-                .text_color(color)
-                .child(label.into()),
+    div()
+        .text_sm()
+        .font_weight(FontWeight::BOLD)
+        .when_some(label_opacity, |d, o| d.opacity(o))
+        .text_color(color)
+        .when(
+            compact_flexible && layout.gutters == GutterPlacement::Stacked,
+            |d| d.flex_shrink_1().min_w_0().truncate(),
         )
+        .child(label.into())
 }
 
 /// An invisible, zero-layout-impact overlay that records its own painted height
