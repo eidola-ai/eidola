@@ -40,7 +40,6 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use base64::Engine;
 use der::{Decode, Encode};
 use sev::certs::snp::{Certificate, Chain, Verifiable, builtin::genoa, ca};
 use sev::firmware::guest::AttestationReport;
@@ -50,23 +49,84 @@ use sha2::{Digest, Sha256};
 
 use crate::Error;
 
-/// Decode base64, ignoring whitespace and PEM headers/footers.
-pub fn decode_base64(s: &str) -> Result<Vec<u8>, Error> {
-    let clean: String = s
-        .lines()
-        .filter(|line| !line.trim().starts_with("-----"))
-        .flat_map(|line| line.chars().filter(|c| !c.is_whitespace()))
-        .collect();
-
-    base64::engine::general_purpose::STANDARD
-        .decode(&clean)
-        .map_err(|e| Error::CertParse(format!("base64 decode: {e}")))
-}
+/// Exact wire size of a SEV-SNP attestation report (AMD SEV-SNP ABI,
+/// `ATTESTATION_REPORT` structure). The `sev` crate reads exactly this many
+/// bytes and would silently ignore trailing data, so the length is pinned
+/// here to keep the accepted encoding unique.
+const REPORT_LEN: usize = 1184;
 
 /// Parse a raw attestation report without verifying its signature.
 pub fn parse_report(report_bytes: &[u8]) -> Result<AttestationReport, Error> {
+    if report_bytes.len() != REPORT_LEN {
+        return Err(Error::Report(format!(
+            "attestation report must be exactly {REPORT_LEN} bytes, got {}",
+            report_bytes.len()
+        )));
+    }
     AttestationReport::decode(&mut Cursor::new(report_bytes), ())
         .map_err(|e| Error::Report(format!("failed to parse attestation report: {e}")))
+}
+
+/// Structural checks on report fields that are *not* covered by the launch
+/// measurement and must therefore be policed by the relying party.
+///
+/// The guest policy is the sharp one: it is chosen by the hypervisor at
+/// launch and enforced by the PSP, but it is **not** folded into the launch
+/// digest — a malicious host can relaunch the exact pinned image with
+/// `POLICY.DEBUG=1` and obtain an identical measurement while gaining
+/// `SNP_DBG_DECRYPT` access to guest memory. `MIGRATE_MA` similarly hands
+/// guest state to a migration agent outside the measured image. Both must
+/// be off.
+///
+/// The signer/ID-block fields are hygiene: the report must be VCEK-signed
+/// (`SIGNING_KEY=0`), with the chip identity unmasked and no ID-block or
+/// author key in play — matching what Tinfoil's own v3 verifier enforces
+/// and what its production fleet presents.
+///
+/// Report version 3 (firmware 1.55+) is required so the CPUID
+/// family/model/stepping fields are present and the product generation is
+/// bound by the report itself rather than inferred.
+pub fn check_report_hygiene(report: &AttestationReport) -> Result<(), Error> {
+    if report.version < 3 {
+        return Err(Error::Report(format!(
+            "attestation report version {} is below the required minimum of 3",
+            report.version
+        )));
+    }
+    if report.policy.debug_allowed() {
+        return Err(Error::Report(
+            "guest policy allows DEBUG: the hypervisor could decrypt guest memory \
+             via SNP_DBG_DECRYPT despite a matching launch measurement"
+                .to_string(),
+        ));
+    }
+    if report.policy.migrate_ma_allowed() {
+        return Err(Error::Report(
+            "guest policy allows migration-agent association".to_string(),
+        ));
+    }
+    if report.key_info.mask_chip_key() {
+        return Err(Error::Report(
+            "report has MASK_CHIP_KEY set; chip identity is masked".to_string(),
+        ));
+    }
+    if report.key_info.signing_key() != 0 {
+        return Err(Error::Report(format!(
+            "report SIGNING_KEY is {}; only VCEK (0) is accepted",
+            report.key_info.signing_key()
+        )));
+    }
+    if report.key_info.author_key_en()
+        || report.id_key_digest != [0u8; 48]
+        || report.author_key_digest != [0u8; 48]
+    {
+        return Err(Error::Report(
+            "report indicates an ID-block launch (AUTHOR_KEY_EN or a non-zero \
+             ID_KEY_DIGEST/AUTHOR_KEY_DIGEST); only plain launches are accepted"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Verify a VCEK certificate chain and an already-parsed report's signature.
@@ -113,21 +173,6 @@ pub fn verify_report(
         .map_err(|e| Error::Signature(format!("report signature verification failed: {e}")))?;
 
     Ok(())
-}
-
-/// Verify the VCEK certificate chain and attestation report signature.
-///
-/// Convenience wrapper that parses the report and verifies in one call.
-/// Returns the parsed [`AttestationReport`] on success.
-pub fn verify_attestation(
-    vcek_der: &[u8],
-    report_bytes: &[u8],
-    ark_der: Option<&[u8]>,
-    ask_der: Option<&[u8]>,
-) -> Result<AttestationReport, Error> {
-    let report = parse_report(report_bytes)?;
-    verify_report(vcek_der, &report, ark_der, ask_der)?;
-    Ok(report)
 }
 
 /// Resolve ARK and ASK as raw DER bytes, falling back to the built-in
@@ -385,24 +430,6 @@ impl SevSnpTcbObservation {
 /// cheap and non-blocking — they run on the TLS handshake hot path.
 pub type SevSnpObserver = Arc<dyn Fn(&SevSnpTcbObservation) + Send + Sync>;
 
-/// Verify the enclave certificate's public key fingerprint matches report_data[0..32].
-pub fn verify_enclave_cert_binding(
-    enclave_cert_b64: &str,
-    expected_fingerprint: &[u8],
-) -> Result<(), Error> {
-    let cert_der = decode_base64(enclave_cert_b64)?;
-    let actual = sha256_spki_from_der(&cert_der)?;
-
-    if actual.as_slice() != expected_fingerprint {
-        return Err(Error::FingerprintMismatch {
-            report_data: hex::encode(expected_fingerprint),
-            enclave_cert: hex::encode(actual),
-        });
-    }
-
-    Ok(())
-}
-
 /// Compute SHA-256 of the SPKI from a raw DER-encoded certificate.
 pub fn sha256_spki_from_der(cert_der: &[u8]) -> Result<[u8; 32], Error> {
     let cert = x509_cert::Certificate::from_der(cert_der)
@@ -549,6 +576,92 @@ mod tests {
             SevSnpTcbPolicy::default(),
             SevSnpTcbPolicy::amd_recommended()
         );
+    }
+
+    /// Minimal parseable version-3 (Genoa) report byte buffer with a
+    /// production-shaped guest policy, mutated per test.
+    fn v3_report_bytes(mutate: impl FnOnce(&mut [u8; 1184])) -> Vec<u8> {
+        let mut b = [0u8; 1184];
+        b[0..4].copy_from_slice(&3u32.to_le_bytes()); // version 3
+        b[0x08..0x10].copy_from_slice(&0x30000u64.to_le_bytes()); // policy: SMT + reserved-1 bit
+        b[0x34..0x38].copy_from_slice(&1u32.to_le_bytes()); // sig_algo: ECDSA P-384
+        b[0x188] = 0x19; // CPUID family: Genoa
+        b[0x189] = 0x11; // CPUID model
+        b[0x18A] = 0x01; // CPUID stepping
+        mutate(&mut b);
+        b.to_vec()
+    }
+
+    #[test]
+    fn parse_rejects_wrong_report_length() {
+        let ok = v3_report_bytes(|_| {});
+        assert!(parse_report(&ok).is_ok());
+        let mut long = ok.clone();
+        long.push(0);
+        assert!(parse_report(&long).is_err(), "trailing byte must fail");
+        assert!(parse_report(&ok[..1183]).is_err(), "short report must fail");
+    }
+
+    #[test]
+    fn hygiene_accepts_production_shaped_report() {
+        let report = parse_report(&v3_report_bytes(|_| {})).unwrap();
+        check_report_hygiene(&report).expect("clean v3 report must pass");
+    }
+
+    #[test]
+    fn hygiene_rejects_report_version_below_3() {
+        // A version-2 report needs the chip_id heuristic for generation
+        // detection instead of the CPUID fields.
+        let bytes = v3_report_bytes(|b| {
+            b[0..4].copy_from_slice(&2u32.to_le_bytes());
+            b[0x188] = 0;
+            b[0x189] = 0;
+            b[0x18A] = 0;
+            b[0x1A0 + 8] = 0x01; // chip_id byte 8+ nonzero → Genoa detection
+        });
+        let report = parse_report(&bytes).unwrap();
+        let err = check_report_hygiene(&report).unwrap_err();
+        assert!(err.to_string().contains("version"), "got: {err}");
+    }
+
+    #[test]
+    fn hygiene_rejects_debug_allowed_policy() {
+        let bytes = v3_report_bytes(|b| b[0x0A] |= 0x08); // policy bit 19: DEBUG
+        let report = parse_report(&bytes).unwrap();
+        let err = check_report_hygiene(&report).unwrap_err();
+        assert!(err.to_string().contains("DEBUG"), "got: {err}");
+    }
+
+    #[test]
+    fn hygiene_rejects_migration_agent_policy() {
+        let bytes = v3_report_bytes(|b| b[0x0A] |= 0x04); // policy bit 18: MIGRATE_MA
+        let report = parse_report(&bytes).unwrap();
+        let err = check_report_hygiene(&report).unwrap_err();
+        assert!(err.to_string().contains("migration"), "got: {err}");
+    }
+
+    #[test]
+    fn hygiene_rejects_masked_chip_key_and_non_vcek_signer() {
+        let masked = v3_report_bytes(|b| b[0x48] |= 0x02); // MASK_CHIP_KEY
+        let err = check_report_hygiene(&parse_report(&masked).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("MASK_CHIP_KEY"), "got: {err}");
+
+        let vlek = v3_report_bytes(|b| b[0x48] |= 0x04); // SIGNING_KEY = 1 (VLEK)
+        let err = check_report_hygiene(&parse_report(&vlek).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("SIGNING_KEY"), "got: {err}");
+    }
+
+    #[test]
+    fn hygiene_rejects_id_block_launches() {
+        for mutate in [
+            (|b: &mut [u8; 1184]| b[0x48] |= 0x01) as fn(&mut [u8; 1184]), // AUTHOR_KEY_EN
+            |b| b[0xE0] = 0xAA,                                            // ID_KEY_DIGEST
+            |b| b[0x110] = 0xBB,                                           // AUTHOR_KEY_DIGEST
+        ] {
+            let bytes = v3_report_bytes(mutate);
+            let err = check_report_hygiene(&parse_report(&bytes).unwrap()).unwrap_err();
+            assert!(err.to_string().contains("ID-block"), "got: {err}");
+        }
     }
 
     #[test]

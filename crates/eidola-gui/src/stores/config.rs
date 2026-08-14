@@ -1,6 +1,6 @@
 //! `ConfigStore` — the synchronous, write-through projection of app-core's
 //! config. Owns the `ConfigState` snapshot and all config mutations
-//! (base URL, default model, attestation URL, …). Reads are synchronous;
+//! (account, appearance, domain separator, update feed, …). Reads are synchronous;
 //! writes go straight through to `AppCore` and re-read the snapshot. On a
 //! real backend each write also emits `Change::Config`, so other windows'
 //! `ConfigStore`s refresh via the bus.
@@ -294,11 +294,6 @@ impl ConfigStore {
     /// The current default template id (from the config snapshot).
     pub fn default_template(&self) -> Option<String> {
         self.state.as_ref().map(|s| s.default_template.clone())
-    }
-
-    #[allow(dead_code)]
-    pub fn set_attestation_url(&mut self, url: String, cx: &mut Context<Self>) {
-        self.write(cx, |c| c.set_attestation_url(url));
     }
 
     #[allow(dead_code)]

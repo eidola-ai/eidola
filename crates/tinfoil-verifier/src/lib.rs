@@ -1,8 +1,8 @@
 //! Tinfoil attestation verification with per-handshake attesting.
 //!
 //! Verifies that every new TLS connection to a Tinfoil inference enclave
-//! terminates inside genuine AMD SEV-SNP or Intel TDX hardware running an
-//! allowed code measurement.
+//! terminates inside genuine AMD SEV-SNP hardware running an allowed code
+//! measurement. Intel TDX presentations currently fail closed.
 //!
 //! All verification happens in the data-plane connector layer (see
 //! [`attesting_client`]). On every new TCP+TLS handshake the connector
@@ -18,31 +18,24 @@
 //! fail-fast-at-startup semantics can issue a single trivial request through
 //! the client themselves.
 //!
-//! Because the report's `REPORT_DATA` binds the per-handshake nonce, a stale
-//! or captured attestation document can't be replayed against a fresh nonce:
-//! the verifier knows a live, genuine CC machine produced this report *now*.
-//! This binds the enclave's long-term TLS *key* (the cert SPKI), **not** the
-//! live TLS *session*, so it does not by itself defeat exfiltration of that
-//! key — an attacker holding the stolen key could actively MITM the connection
-//! (and thus read the plaintext) while relaying a fresh nonce-bound report
-//! from the enclave's public attestation endpoint. Closing that gap needs
-//! channel binding (a TLS-session value in `report_data`); today it rests on
-//! the TLS key staying sealed in the enclave.
+//! The v3 document is self-contained. Its signed CPU evidence binds a fresh
+//! nonce and the exact bytes of endorsed crypto/device sections; those
+//! sections include the TLS SPKI fingerprint and HPKE public key. AMD VCEK
+//! and CRL collateral travel in the same document and are verified offline
+//! against pinned AMD roots. No attestation transparency service or vendor
+//! collateral endpoint is consulted during verification. A relay can replay
+//! an older AMD-signed CRL only while its signed validity interval remains
+//! current; it cannot alter the list or extend that interval.
 //!
-//! The enclave also signs the whole document with its TLS leaf key
-//! (ECDSA — P-384 in production, P-256 for the shim mock); the verifier checks
-//! that signature against the certificate carried in the document, which must
-//! in turn match the peer cert the handshake landed on.
-//!
-//! The fresh `/.well-known/tinfoil-attestation?nonce=<hex>` document is the
-//! source of truth. It is *not* fully self-contained — Tinfoil builds it
-//! without the VCEK certificate — so the verifier consults Tinfoil's ATC
-//! service as a fallback to backfill the VCEK. The verifier never talks to
-//! AMD KDS for the chain itself — ATC is the single fallback target — though
-//! it does fetch AMD KDS CRLs in production mode for revocation checks.
+//! The nonce prevents replay, and the endorsed TLS SPKI binds the report to
+//! the key used by the peer certificate. It still does **not** bind the live
+//! TLS session. An attacker holding an exfiltrated TLS private key could MITM
+//! this connection while relaying a fresh nonce-bound report from the genuine
+//! enclave. Closing that residual gap requires TLS channel binding, such as
+//! committing exporter key material into `REPORT_DATA`.
 //!
 //! SEV-SNP verification is delegated to the [`sev`](https://crates.io/crates/sev)
-//! crate. TDX Quote V4 verification is delegated to [`dcap_qvl`].
+//! crate. TDX presentations currently fail closed before quote verification.
 //!
 //! # Prerequisites
 //!
@@ -52,10 +45,9 @@
 //! # TLS root sourcing
 //!
 //! `tinfoil-verifier` is intentionally agnostic about where TLS trust roots
-//! come from. Callers populate [`AttestingClientConfig::tls_roots`] themselves
-//! and the same store is used for the attested inference endpoint, ATC
-//! fallback lookups, and AMD KDS CRL fetches. Each consumer picks the source
-//! that fits its environment:
+//! come from. Callers populate [`AttestingClientConfig::tls_roots`] for the
+//! attested inference endpoint. Each consumer picks the source that fits its
+//! environment:
 //!
 //! - **Server (in enclave):** `webpki-roots`. The server runs `FROM scratch`
 //!   inside an enclave with no system trust store, so it bundles the Mozilla
@@ -73,14 +65,12 @@ pub mod bundle;
 mod error;
 pub mod measurement;
 pub mod sevsnp;
-pub mod sevsnp_crl;
-pub mod tdx;
+mod sevsnp_crl;
 
 pub use bundle::Platform;
 pub use error::Error;
 pub use measurement::{EnclaveMeasurement, MatchedMeasurement, TdxMeasurement};
 pub use sevsnp::{SevSnpObserver, SevSnpTcbObservation, SevSnpTcbPolicy, SevSnpTcbSvns};
-pub use tdx::{TcbPolicy as TdxTcbPolicy, TdxObserver, TdxTcbObservation, TdxTcbStatus};
 
 /// Details of a verified TEE attestation, emitted after each successful
 /// new-connection attestation check.
@@ -116,10 +106,8 @@ pub struct AttestingClientConfig<'a> {
     /// Base URL of the inference endpoint (e.g. `https://inference.tinfoil.sh/v1`).
     /// The `/.well-known/tinfoil-attestation` endpoint is derived from the origin.
     pub inference_base_url: &'a str,
-    /// TLS root store used for **all** outbound HTTPS performed by the
-    /// resulting client: the attested inference endpoint, ATC fallback
-    /// lookups, and AMD KDS CRL fetches. The verifier is intentionally
-    /// agnostic about where these roots come from — the caller decides
+    /// TLS root store used for the attested inference endpoint. The verifier
+    /// is intentionally agnostic about where these roots come from — the caller decides
     /// whether to populate the store from `webpki-roots`, the OS keychain
     /// via `rustls-native-certs`, a custom PEM, or some union. The server
     /// (running inside an enclave with no system trust store) typically
@@ -129,18 +117,6 @@ pub struct AttestingClientConfig<'a> {
     /// are deliberately *not* added here; they only feed the SEV-SNP chain
     /// verifier.
     pub tls_roots: rustls::RootCertStore,
-    /// Optional ATC URL override for **fallback** lookups when the enclave's
-    /// own v3 well-known document is missing pieces (today: the VCEK).
-    /// Defaults to [`bundle::DEFAULT_ATC_URL`] when `None`. ATC is never
-    /// consulted when the well-known document is self-contained.
-    pub atc_url: Option<&'a str>,
-    /// Source repository to attest against (e.g.
-    /// `tinfoilsh/confidential-model-router`). Used as the `repo` field in
-    /// the ATC `POST /attestation` request body when an ATC fallback lookup
-    /// is required. When `None`, the verifier will fail any handshake whose
-    /// well-known document is not self-contained, since there is no
-    /// fallback target to consult.
-    pub enclave_repo: Option<&'a str>,
     /// Optional custom trusted ARK (Root CA) DER bytes. Overrides the
     /// built-in AMD Genoa ARK in the SEV-SNP attestation chain verifier.
     /// **Not** added to any TLS root store; if you need TLS to trust a
@@ -150,46 +126,23 @@ pub struct AttestingClientConfig<'a> {
     /// Optional custom trusted ASK DER bytes. Same caveats as
     /// [`Self::trusted_ark_der`].
     pub trusted_ask_der: Option<&'a [u8]>,
-    /// Optional allowlist of Intel advisory IDs (e.g. `INTEL-SA-00837`)
-    /// the operator has explicitly reviewed and accepted.
-    ///
-    /// When `None` or empty, TDX attestation follows Intel's recommended
-    /// verifier policy: `UpToDate` accepted silently; `*Needed` levels
-    /// accepted with a warning; `OutOfDate*` and `Revoked` rejected.
-    /// When non-empty, an `OutOfDate*` level is also accepted (with a
-    /// warning) iff every advisory ID associated with the matched TCB
-    /// level is contained in the allowlist. Unrelated to SEV-SNP, which
-    /// has its own minimum-firmware floor in
-    /// [`crate::sevsnp::verify_tcb_policy`].
-    pub tdx_advisory_allowlist: Option<&'a [&'a str]>,
-    /// Optional observer fired for every TDX attestation that completes
-    /// signature verification, **including ones the policy rejects**.
-    /// Lets the consuming application record metrics, traces, or alerts
-    /// without `tinfoil-verifier` taking a dependency on a metrics
-    /// framework.
-    ///
-    /// The callback runs synchronously inside the connector layer on the
-    /// TLS handshake hot path, so it must be cheap and non-blocking
-    /// (e.g. an OTel counter increment is fine; HTTP I/O is not).
-    /// Unused on SEV-SNP backends.
-    pub tdx_observer: Option<TdxObserver>,
     /// Operator-supplied minimum TCB SVNs the SEV-SNP `reported_tcb`
     /// must satisfy. When `None`, defaults to
     /// [`SevSnpTcbPolicy::amd_recommended`] (`bootloader >= 0x07`,
     /// `snp >= 0x0E`, `microcode >= 0x48`, no `tee` floor). The rollback
     /// check (`reported_tcb >= committed_tcb`) is structural and always
-    /// applied regardless of this setting. Unrelated to TDX, which has
-    /// its own [`Self::tdx_advisory_allowlist`].
+    /// applied regardless of this setting.
     pub snp_min_tcb: Option<SevSnpTcbPolicy>,
     /// Optional observer fired for every SEV-SNP attestation that
     /// completes signature verification, **including ones the policy
-    /// rejects**. Same lifecycle and constraints as
-    /// [`Self::tdx_observer`]. Unused on TDX backends.
+    /// rejects**. The callback runs synchronously on the TLS handshake hot
+    /// path and must be cheap and non-blocking. Unused on TDX backends.
     pub snp_observer: Option<SevSnpObserver>,
     /// Optional observer fired on every successful attestation verification
     /// for a new TLS connection. Receives the full attestation details
     /// including the raw report bytes, matched measurement, and TLS
-    /// binding hash. Same lifecycle and constraints as [`Self::tdx_observer`].
+    /// binding hash. It has the same hot-path constraints as
+    /// [`Self::snp_observer`].
     pub attestation_observer: Option<AttestationObserver>,
 }
 
@@ -204,35 +157,23 @@ pub struct AttestingClientConfig<'a> {
 /// 2. Generates a fresh random nonce and issues an inline HTTP/1.1
 ///    `GET /.well-known/tinfoil-attestation?nonce=<hex>` over the *same*
 ///    connection.
-/// 3. Falls back to ATC for the VCEK (the fresh document omits it).
-/// 4. Verifies the echoed nonce matches the one sent, the document's
-///    `tls_key_fp` matches `sha256(SPKI(peer_cert))`, the embedded
-///    certificate matches the peer cert, and the document's ECDSA signature
-///    validates against it.
-/// 5. Verifies the AMD VCEK chain, the report signature, the TCB floor, the
-///    measurement against `allowed_measurements`, and that the report's
-///    `REPORT_DATA` equals `sha256(tls_key_fp || hpke_key || nonce || …)`.
+/// 3. Strictly parses the self-contained v3 envelope and recomputes its
+///    endorsed-section hashes and domain-separated `REPORT_DATA`.
+/// 4. Verifies the echoed nonce and that the endorsed TLS SPKI fingerprint
+///    matches `sha256(SPKI(peer_cert))`.
+/// 5. Enforces SEV-SNP report field hygiene (exact length, version ≥ 3,
+///    DEBUG/MIGRATE_MA policy bits off, VCEK-signed, no ID-block), then
+///    verifies the document-carried AMD VCEK chain and report, plus the
+///    complete carried CRL's ARK signature, identity, half-open validity
+///    interval, and ASK/VCEK revocation state; then enforces TCB floor,
+///    measurement, and exact `REPORT_DATA` binding.
 /// 6. Yields the connection to hyper for the real request.
 ///
 /// Callers that want fail-fast-at-startup semantics should make one trivial
 /// request (e.g. `client.get(format!("{base}/v1/models")).send().await`)
 /// after construction and treat its outcome as the readiness check.
 pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwest::Client, Error> {
-    let host = enclave_host(config.inference_base_url);
     let tls_roots = std::sync::Arc::new(config.tls_roots);
-    let atc_fallback = AtcFallback {
-        url: config.atc_url.map(str::to_string),
-        repo: config.enclave_repo.map(str::to_string),
-        enclave_host: host,
-        tls_roots: tls_roots.clone(),
-    };
-
-    let tdx_policy = match config.tdx_advisory_allowlist {
-        Some(list) if !list.is_empty() => {
-            tdx::TcbPolicy::with_advisory_allowlist(list.iter().copied())
-        }
-        _ => tdx::TcbPolicy::intel_recommended(),
-    };
 
     let snp_policy = config.snp_min_tcb.unwrap_or_default();
 
@@ -241,52 +182,11 @@ pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwe
         trusted_ark_der: config.trusted_ark_der.map(|d| d.to_vec()),
         trusted_ask_der: config.trusted_ask_der.map(|d| d.to_vec()),
         allowed_measurements: config.allowed_measurements.to_vec(),
-        atc_fallback,
-        tdx_policy,
-        tdx_observer: config.tdx_observer,
         snp_policy,
         snp_observer: config.snp_observer,
         attestation_observer: config.attestation_observer,
         tls_roots,
     })
-}
-
-/// Configuration for the ATC fallback path used by the per-handshake
-/// connector when a self-contained attestation document is missing required
-/// elements.
-#[derive(Clone)]
-pub(crate) struct AtcFallback {
-    pub url: Option<String>,
-    pub repo: Option<String>,
-    pub enclave_host: String,
-    /// Shared TLS root store used to validate the ATC endpoint's cert.
-    pub tls_roots: std::sync::Arc<rustls::RootCertStore>,
-}
-
-impl AtcFallback {
-    /// Fetch a bundle from ATC and return the VCEK certificate from it.
-    pub async fn fetch_vcek(&self) -> Result<Vec<u8>, Error> {
-        let repo = self.repo.as_deref().ok_or_else(|| {
-            Error::Bundle(
-                "well-known attestation document is not self-contained and no \
-                 enclave_repo is configured for ATC fallback"
-                    .to_string(),
-            )
-        })?;
-        let display_url = self.url.as_deref().unwrap_or(bundle::DEFAULT_ATC_URL);
-        tracing::info!(
-            "Fetching ATC fallback VCEK from {display_url} (enclave={}, repo={repo})",
-            self.enclave_host
-        );
-        let bundle = bundle::fetch_bundle(
-            self.url.as_deref(),
-            &self.enclave_host,
-            repo,
-            &self.tls_roots,
-        )
-        .await?;
-        sevsnp::decode_base64(&bundle.vcek)
-    }
 }
 
 /// Check a SEV-SNP measurement against the allowed list (case-insensitive).
@@ -307,38 +207,9 @@ pub(crate) fn check_snp_measurement(
     }
 }
 
-/// Check a TDX RTMR1+RTMR2 pair against the allowed list (case-insensitive).
-/// Returns the matched [`MatchedMeasurement::Tdx`] on success.
-///
-/// Unreachable while the platform dispatch refuses `Platform::Tdx` —
-/// RTMR1/RTMR2 alone are insufficient policy (guest-replayable without
-/// MRTD); retained for the eventual re-enable path.
-#[allow(dead_code)]
-pub(crate) fn check_tdx_measurement(
-    allowed: &[EnclaveMeasurement],
-    rtmr1_hex: &str,
-    rtmr2_hex: &str,
-) -> Result<MatchedMeasurement, Error> {
-    let hit = allowed.iter().find(|m| {
-        m.tdx_measurement.rtmr1.eq_ignore_ascii_case(rtmr1_hex)
-            && m.tdx_measurement.rtmr2.eq_ignore_ascii_case(rtmr2_hex)
-    });
-    match hit {
-        Some(m) => Ok(MatchedMeasurement::Tdx(m.tdx_measurement.clone())),
-        None => Err(Error::MeasurementMismatch {
-            observed: MatchedMeasurement::Tdx(TdxMeasurement {
-                rtmr1: rtmr1_hex.to_string(),
-                rtmr2: rtmr2_hex.to_string(),
-            }),
-            allowed_count: allowed.len(),
-        }),
-    }
-}
-
 /// Extract the bare host (no scheme, no port, no path) from an inference base URL.
 ///
-/// Used as the `enclaveUrl` parameter in the ATC `POST /attestation` request,
-/// and as the `Host` header in the per-handshake inline attestation request.
+/// Used as the `Host` header in the per-handshake inline attestation request.
 /// IPv6 literals are returned with their surrounding brackets so the result
 /// is a valid HTTP `Host` header value per RFC 7230.
 pub(crate) fn enclave_host(inference_base_url: &str) -> String {

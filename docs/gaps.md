@@ -78,7 +78,7 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 ### TLS-key exfiltration and channel binding
 
-**Current behavior.** Everything the per-handshake verifier proves rides on the enclave-held TLS key: the hardware report commits to the peer certificate (`REPORT_DATA` = `sha256(SPKI)`), and the inline attestation shares the request's connection ([privacy-guarantees.md](privacy-guarantees.md) §4.3). An adversary who exfiltrated that private key from the enclave could terminate TLS outside it and relay fresh attestations from a real one — an active MITM that fails no client-side check.
+**Current behavior.** Everything the per-handshake verifier proves rides on the enclave-held TLS key: the hardware report commits to the exact endorsed crypto-material section containing the peer certificate's SPKI hash, together with the nonce and device-evidence hash, and the inline attestation shares the request's connection ([privacy-guarantees.md](privacy-guarantees.md) §4.3). It does not commit TLS exporter or other session-specific key material. An adversary who exfiltrated that private key from the enclave could terminate TLS outside it and relay fresh attestations from a real one — an active MITM that fails no client-side check.
 
 **What constrains it today.** The key is generated and held only in enclave memory by the attestation shim, which is part of the measured boot image (§4.1, §5.1) — there is no export interface, so exfiltration requires a defect in that hash-pinned image, not any code path in this repository. The image being measurement-bound means the code that would have to leak it is fixed and inspectable.
 

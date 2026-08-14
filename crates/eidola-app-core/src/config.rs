@@ -13,10 +13,6 @@ use crate::error::AppError;
 /// operator from silently partitioning users into smaller anonymity sets.
 pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidola:inference:production:2026-03-05";
 
-/// Default GitHub source repository the eidola server enclave is attested
-/// against via the Tinfoil ATC `POST /attestation` endpoint.
-pub const DEFAULT_ATTESTATION_REPO: &str = "eidola-ai/eidola";
-
 /// Embedded fallback for the inference model. The `default_model` config key
 /// is gone (Participants v1); this is the model the seeded "Default" space
 /// template's agent participant carries, and the last-resort fallback when a
@@ -169,10 +165,6 @@ pub struct Config {
     pub account_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain_separator: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attestation_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attestation_repo: Option<String>,
     /// Base URL of an alternate update feed (a GitHub-releases-API-shaped
     /// server), for dev/test fixture servers. Same `*_override` pattern as
     /// `base_url`: the resolved endpoint comes from [`Config::update_feed_url`],
@@ -234,13 +226,6 @@ impl Config {
         self.domain_separator
             .as_deref()
             .unwrap_or(DEFAULT_DOMAIN_SEPARATOR)
-    }
-
-    /// Returns the source repo to attest the upstream enclave against.
-    pub fn attestation_repo(&self) -> &str {
-        self.attestation_repo
-            .as_deref()
-            .unwrap_or(DEFAULT_ATTESTATION_REPO)
     }
 
     /// The space template new spaces are instantiated from: the user's
@@ -361,22 +346,6 @@ fn validate_hex_field(value: &str, field: &str) -> Result<String, AppError> {
         });
     }
     Ok(value.to_ascii_lowercase())
-}
-
-/// Check an attestation (ATC) endpoint override — the same scheme rule the
-/// `eidola` row applies to `base_url`, which this key had never had. Blank
-/// is accepted here and means *clear* (see `AppCore::set_attestation_url`);
-/// everything else must name an http(s) endpoint, because the value is used
-/// verbatim as a URL and a typo would otherwise persist and fail at every
-/// handshake instead of at the setter.
-pub fn validate_attestation_url(url: &str) -> Result<(), AppError> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return Ok(());
-    }
-    Err(AppError::Config {
-        message: "attestation URL must start with http:// or https://".into(),
-    })
 }
 
 /// Check that a certificate value parses, without writing anything — the
