@@ -1398,10 +1398,20 @@ impl SpaceView {
             // the pair stay locked a post's metadata gap apart throughout the
             // transition.
             if reveal > 0.01 {
+                // The settled anchor is derived from the editor's own offset —
+                // `chrome + inset` less the byline row's full occupancy — so at
+                // rest the byline tops out at exactly `POST_PAD_Y` under the
+                // slot top at every type scale (anchoring on the separator
+                // height instead held only while the scaled gutter line
+                // happened to equal `chrome − separator`). The clamp keeps the
+                // sliding byline out of the separator strip at large scales,
+                // where the row is taller than the chrome above it.
+                let byline_top =
+                    (chrome - compact_gutters.top + compact_inset).max(COMPOSER_SEPARATOR_H);
                 composer = composer.child(
                     div()
                         .absolute()
-                        .top(px(content_shift + COMPOSER_SEPARATOR_H + compact_inset))
+                        .top(px(content_shift + byline_top))
                         .left_0()
                         .right_0()
                         .flex()
@@ -1454,6 +1464,7 @@ impl SpaceView {
                     compact_bottom_h,
                     overlayed,
                     None,
+                    window,
                     cx,
                 ));
             }
@@ -1790,6 +1801,7 @@ impl SpaceView {
         bar_h: f32,
         overlayed: bool,
         activate: Option<SharedString>,
+        window: &Window,
         cx: &Context<Self>,
     ) -> gpui::Div {
         let theme = cx.theme();
@@ -1804,7 +1816,10 @@ impl SpaceView {
             right = right.child(self.post_quiet_verb(false, activate.clone(), true, cx));
         }
         right = right.child(self.post_verb(false, activate, true, cx));
-        div()
+        // The bar is the window's bottom-most opaque surface, so the Linux
+        // CSD corner notches are its duty (`chrome.rs` — a parent's rounded
+        // quad does not mask its children); no-op on macOS/SSD/tiled.
+        crate::chrome::round_bottom_client_corners(div(), window)
             .absolute()
             .bottom_0()
             .left_0()
@@ -1851,6 +1866,7 @@ impl SpaceView {
         page_width: gpui::Pixels,
         window_h: gpui::Pixels,
         rem_size: Pixels,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let page_layout = page_layout(page_width);
@@ -1885,10 +1901,17 @@ impl SpaceView {
         // `Fade` containment: the bar owns clicks over the strip it covers
         // (the draft row's click-to-focus tail sits beneath it), while the
         // wheel keeps scrolling the page.
-        self.render_compact_action_bar(px(page_layout.body_width), bar_h, false, Some(leaf_id), cx)
-            .opacity(reveal)
-            .contain_mouse(Overlay::Fade)
-            .into_any_element()
+        self.render_compact_action_bar(
+            px(page_layout.body_width),
+            bar_h,
+            false,
+            Some(leaf_id),
+            window,
+            cx,
+        )
+        .opacity(reveal)
+        .contain_mouse(Overlay::Fade)
+        .into_any_element()
     }
 
     /// The active composer's measured geometry: `(reserved, rail, text)` — the
