@@ -175,6 +175,18 @@ update-brand:
 apple-roundtrip *args:
     ./scripts/apple-roundtrip.sh {{ args }}
 
+# Cross-platform external verification: unpack the reproducible unsigned app
+# and detached signature archives, reconstruct the signed app in a temporary
+# directory, check every recorded byte/hash, and print structurally parsed
+# embedded claims. Apple trust is established by the authenticated release
+# attestation, not by this structural parser alone.
+verify-apple unsigned_zip signature_bundle:
+    ./scripts/verify-apple.sh "{{ unsigned_zip }}" "{{ signature_bundle }}"
+
+# Regression for Nix archives whose app directories extract read-only.
+test-verify-apple:
+    ./scripts/test-verify-apple.sh
+
 # --- CI / Release ---
 
 # Compute enclave measurements from tinfoil-config.yml and CVM artifacts
