@@ -555,18 +555,6 @@ pub mod metrics {
             .build()
     });
 
-    /// Total TDX attestations observed during outbound enclave handshakes,
-    /// labeled by the merged platform + QE TCB status. Includes
-    /// attestations the verifier ultimately rejects, so the rate of
-    /// non-`up_to_date` observations is the operator-visible signal that
-    /// Intel has published a TCB advisory affecting the upstream fleet.
-    pub static TDX_ATTESTATIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-        meter()
-            .u64_counter("tinfoil.tdx.attestations")
-            .with_description("TDX attestations observed by the tinfoil verifier")
-            .build()
-    });
-
     /// Signed clock drift between the server and the database, in
     /// seconds. Positive values mean the database is ahead of the
     /// server; negative values mean the server is ahead of the
