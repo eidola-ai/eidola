@@ -1398,39 +1398,52 @@ impl SpaceView {
             // the pair stay locked a post's metadata gap apart throughout the
             // transition.
             if reveal > 0.01 {
-                // The settled anchor is derived from the editor's own offset —
-                // `chrome + inset` less the byline row's full occupancy — so at
-                // rest the byline tops out at exactly `POST_PAD_Y` under the
-                // slot top at every type scale (anchoring on the separator
-                // height instead held only while the scaled gutter line
-                // happened to equal `chrome − separator`). The clamp keeps the
-                // sliding byline out of the separator strip at large scales,
-                // where the row is taller than the chrome above it.
-                let byline_top =
-                    (chrome - compact_gutters.top + compact_inset).max(COMPOSER_SEPARATOR_H);
+                // The row rides at `chrome − occupancy + inset`, derived from
+                // the editor's own offset — which holds the label exactly one
+                // gutter occupancy above the first prose line at **every**
+                // reveal fraction and type scale, and tops it out at exactly
+                // `POST_PAD_Y` under the slot top at rest. At scales where the
+                // row is taller than the chrome above it, that offset starts
+                // above the separator — so the row slides in from *under* it,
+                // inside an overflow-clipped strip spanning the separator's
+                // lower edge to the settled bottom. (Clamping the anchor at
+                // the separator instead pinned a large-scale byline in place
+                // while the editor kept sliding, crowding the first prose line
+                // for the first half of the reveal.)
+                let byline_offset =
+                    chrome - compact_gutters.top + compact_inset - COMPOSER_SEPARATOR_H;
                 composer = composer.child(
                     div()
                         .absolute()
-                        .top(px(content_shift + byline_top))
+                        .top(px(content_shift + COMPOSER_SEPARATOR_H))
                         .left_0()
                         .right_0()
-                        .flex()
-                        .justify_center()
-                        .opacity(reveal)
+                        .h(px(chrome - COMPOSER_SEPARATOR_H + compact_gutters.top))
+                        .overflow_hidden()
                         .child(
                             div()
-                                .id("space-composer-byline")
-                                .probe_bounds(
-                                    "space/composer/byline",
-                                    gpui::Role::Label,
-                                    "Draft byline",
-                                )
-                                .child(super::post::byline_gutter(
-                                    page_layout,
-                                    "You",
-                                    theme.info,
-                                    Some(super::post::DRAFT_BYLINE_OPACITY),
-                                )),
+                                .absolute()
+                                .top(px(byline_offset))
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .justify_center()
+                                .opacity(reveal)
+                                .child(
+                                    div()
+                                        .id("space-composer-byline")
+                                        .probe_bounds(
+                                            "space/composer/byline",
+                                            gpui::Role::Label,
+                                            "Draft byline",
+                                        )
+                                        .child(super::post::byline_gutter(
+                                            page_layout,
+                                            "You",
+                                            theme.info,
+                                            Some(super::post::DRAFT_BYLINE_OPACITY),
+                                        )),
+                                ),
                         ),
                 );
             }
