@@ -11,38 +11,6 @@ license = "MIT OR Apache-2.0"
 # SEV-SNP attestation report parsing and certificate chain verification
 sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
 
-# TDX Quote V4 parsing and verification (pure Rust, rustcrypto backend).
-#
-# We deliberately do **not** enable the `report` feature: it pulls in an
-# optional `reqwest` dependency hardcoded to `["rustls-tls", "blocking",
-# "hickory-dns"]`, and `rustls-tls` activates `__rustls-ring` — which
-# unifies `ring` into the workspace's rustls build, breaking our
-# deterministic Nix release pipeline (ring's build script needs C/asm
-# that nix's wrapped clang can't cross-compile to `arm64-apple-macosx`).
-# We carry our own collateral fetcher in `tdx.rs::fetch_and_build_entry`
-# instead, reusing the verifier's existing reqwest stack
-# (`rustls-no-provider` + `rustls-rustcrypto`). The Tinfoil enclave only
-# emits cert_type 5 quotes (PCK chain embedded in the quote itself), so
-# we never need dcap-qvl's encrypted-PPID PCK fetch path.
-#
-# Pinned to upstream master past the published 0.3.12 release because we
-# need `pub mod tcb_info;` (added on master) so we can name `TcbStatus` /
-# `TcbStatusWithAdvisory` for our TCB acceptance policy. Master also
-# includes a TCB-level sorting fix and TDX module identity verification
-# (PRs #137, #138) — both strict improvements over 0.3.12. Drop back to a
-# crates.io version once `tcb_info` lands in a release.
-dcap-qvl = { git = "https://github.com/Phala-Network/dcap-qvl", rev = "90c4c9ffd6fd1565b138df161ecdf6fe568a326c", default-features = false, features = ["std", "rustcrypto"] }
-
-# PEM parsing for the Intel PCS issuer chains returned in `*-Issuer-Chain`
-# response headers. We only need to walk the certs to extract the root
-# CA's CRL distribution point URL; using a tiny dedicated crate keeps the
-# parsing surface honest. Already in our dep tree transitively via dcap-qvl.
-pem = "3"
-
-# Date parsing for TCB / QE identity nextUpdate fields driving the
-# collateral cache TTL. Already in the dep tree transitively via dcap-qvl.
-chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
-
 # DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
 x509-cert = "0.2"
 der = { version = "0.7", features = ["alloc"] }
@@ -52,24 +20,11 @@ der = { version = "0.7", features = ["alloc"] }
 # `sev` crate doesn't handle).
 rsa = "0.9"
 
-# ECDSA verification of the enclave's *document* signature on a fresh
-# nonce-bound attestation (`?nonce=<hex>`). The enclave signs the JSON with
-# its TLS leaf private key; production uses P-384, the local shim mock uses
-# P-256, so we carry both curves. Mirrors the dependency shape already used
-# by `eidola-app-core`'s Rekor verifier. `spki` provides the
-# `DecodePublicKey` trait (`from_public_key_der`); `signature` provides the
-# `hazmat::PrehashVerifier` trait so we can verify the SHA-256 prehash that
-# Tinfoil signs (note: P-384 paired with SHA-256, not SHA-384).
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
-p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
-signature = "2"
-spki = "0.7"
-
 # CSPRNG for the per-handshake attestation nonce.
 getrandom = "0.4"
 
-# HTTP client for fetching attestation bundle
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+# HTTP client returned to callers and used by the standalone attestation-document helper.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 
 # TLS verification. Trust roots are supplied by the caller via
 # `AttestingClientConfig::tls_roots` — the verifier intentionally does not
@@ -92,17 +47,15 @@ http = "1"
 # Async runtime
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"] }
 
-# Hashing. Pinned to 0.10 because the rest of our dep tree (dcap-qvl,
-# rsa, p256, etc.) is on 0.10 and the rsa crate's `VerifyingKey<D>`
+# Hashing. Pinned to 0.10 because the rsa crate's `VerifyingKey<D>`
 # bounds require `D: rsa::sha2::Digest`, which only resolves when our
 # `Sha384` comes from the same `sha2` version rsa was compiled against.
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 
 # Encoding
 base64 = "0.22"
 hex = "0.4"
-flate2 = "1"
-urlencoding = "2"
+pem = "3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -118,6 +71,6 @@ tracing = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 rustls = { version = "0.23", features = ["ring"] }
 # Live integration tests pull in WebPKI roots so they can talk to
-# inference.tinfoil.sh / ATC. Production callers (eidola-server) bring their
+# inference.tinfoil.sh. Production callers (eidola-server) bring their
 # own.
 webpki-roots = "1"

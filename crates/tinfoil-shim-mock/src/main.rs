@@ -5,12 +5,11 @@
 //!
 //! - **Certificate chain:** ARK → ASK → VCEK, all signed with RSA-PSS SHA-384
 //! - **Report signature:** ECDSA P-384 with SHA-384 (VCEK signs the report)
-//! - **Fresh, nonce-bound attestation:** each `?nonce=<hex>` request builds a
-//!   *fresh* report whose `report_data[0..32] = SHA-256(tls_key_fp || hpke_key
-//!   || nonce)` (matching upstream `attestation.ComputeReportData`), then signs
-//!   the whole JSON document with the TLS leaf key (ECDSA P-256 / SHA-256). This
-//!   mirrors the production endpoint so `tinfoil-verifier`'s nonce/signature
-//!   checks exercise the same path locally.
+//! - **Fresh, nonce-bound attestation:** each `?nonce=<hex>` request serializes
+//!   the endorsed crypto/device sections once and builds a fresh report whose
+//!   `REPORT_DATA` binds their hashes plus the nonce. The response carries its
+//!   VCEK chain and ARK-signed CRL, matching Tinfoil's self-contained v3
+//!   envelope.
 //!
 //! This exercises the complete verification path in `tinfoil-verifier` with
 //! no escape hatches — the `sev` crate's `Verifiable` trait verifies every
@@ -63,7 +62,6 @@ use base64::Engine;
 use der::{Decode, Encode, asn1::BitString};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
-use p256::pkcs8::DecodePrivateKey;
 use rcgen::KeyPair;
 use rsa::sha2 as rsa_sha2;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
@@ -75,6 +73,8 @@ use tokio::net::TcpListener;
 use tower_service::Service;
 use tracing::{debug, info, warn};
 use x509_cert::Certificate;
+use x509_cert::Version;
+use x509_cert::crl::{CertificateList, TbsCertList};
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::time::{Time, Validity};
 
@@ -114,13 +114,15 @@ const RSA_PSS_SHA384_PARAMS: &[u8] = &[
 /// RSA key size for the mock CA chain. 2048-bit for fast generation.
 const RSA_KEY_BITS: usize = 2048;
 
-// ── Report byte offsets (AMD SEV-SNP ABI, V2 Genoa layout) ──────────────
+// ── Report byte offsets (AMD SEV-SNP ABI, V3 Genoa layout) ──────────────
 const OFF_VERSION: usize = 0x000; // u32 LE
+const OFF_POLICY: usize = 0x008; // u64 LE guest policy
 const OFF_SIG_ALGO: usize = 0x034; // u32 LE (1 = ECDSA P-384 SHA-384)
 const OFF_CURRENT_TCB: usize = 0x038; // 8 bytes (legacy: [bl, tee, 0,0,0,0, snp, ucode])
 const OFF_REPORT_DATA: usize = 0x050; // 64 bytes
 const OFF_MEASUREMENT: usize = 0x090; // 48 bytes
 const OFF_REPORTED_TCB: usize = 0x180; // 8 bytes
+const OFF_CPUID_FAM: usize = 0x188; // 3 bytes: family, model, stepping (V3+)
 const OFF_CHIP_ID: usize = 0x1A0; // 64 bytes
 const OFF_COMMITTED_TCB: usize = 0x1E0; // 8 bytes
 const OFF_LAUNCH_TCB: usize = 0x1F0; // 8 bytes
@@ -159,24 +161,46 @@ struct FreshBuilder {
     hpke_key: [u8; 32],
     /// VCEK key that signs the SEV-SNP report.
     vcek_signing_key: p384::ecdsa::SigningKey,
-    /// VCEK certificate, included in the document so tests need no ATC.
+    /// VCEK certificate carried as untrusted endorsement collateral.
     vcek_der: Vec<u8>,
-    /// PEM-encoded TLS leaf certificate placed in the document.
-    tls_cert_pem: String,
-    /// TLS leaf private key that signs the document (ECDSA P-256 / SHA-256).
-    tls_signing_key: p256::ecdsa::SigningKey,
+    /// ASK + ARK chain carried with the VCEK.
+    cert_chain_pem: String,
+    /// Empty, ARK-signed CRL with a bounded validity window.
+    crl_der: Vec<u8>,
 }
 
 impl FreshBuilder {
-    /// Assemble and sign a fresh attestation document for `nonce`.
+    /// Assemble a fresh self-contained v3 document for `nonce`.
     fn build(&self, nonce: &[u8; 32]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        use p256::ecdsa::signature::hazmat::PrehashSigner;
+        let crypto_material = serde_json::to_vec(&serde_json::json!({
+            "format": "https://tinfoil.sh/crypto-material/v1",
+            "items": [
+                {
+                    "id": "tls",
+                    "format": "https://tinfoil.sh/key/spki-fp-sha256/v1",
+                    "data": hex::encode(self.tls_key_fp),
+                },
+                {
+                    "id": "hpke",
+                    "format": "https://tinfoil.sh/key/x25519-hpke/v1",
+                    "data": hex::encode(self.hpke_key),
+                },
+            ],
+        }))?;
+        let device_evidence = serde_json::to_vec(&serde_json::json!({
+            "format": "https://tinfoil.sh/device-evidence/v1",
+            "items": [],
+        }))?;
+        let crypto_material_hash: [u8; 32] = Sha256::digest(&crypto_material).into();
+        let device_evidence_hash: [u8; 32] = Sha256::digest(&device_evidence).into();
 
-        // report_data[0..32] = SHA-256(tls_key_fp || hpke_key || nonce).
+        // REPORT_DATA v1 is domain-separated and binds the exact decoded
+        // section bytes, not a verifier-side re-serialization.
         let mut h = Sha256::new();
-        h.update(self.tls_key_fp);
-        h.update(self.hpke_key);
+        h.update(b"https://tinfoil.sh/report-data/v1");
         h.update(nonce);
+        h.update(crypto_material_hash);
+        h.update(device_evidence_hash);
         let report_data_prefix: [u8; 32] = h.finalize().into();
 
         let mut report = build_report(&self.measurement, &report_data_prefix);
@@ -184,30 +208,45 @@ impl FreshBuilder {
 
         let b64 = &base64::engine::general_purpose::STANDARD;
 
-        // Build the document with an empty signature, sign those exact bytes,
-        // then splice the signature back in. The verifier reconstructs the
-        // signed form by blanking the signature value, so this round-trips.
-        let mut doc = serde_json::json!({
+        let doc = serde_json::json!({
             "format": "https://tinfoil.sh/predicate/attestation/v3",
-            "report_data": {
-                "tls_key_fp": hex::encode(self.tls_key_fp),
-                "hpke_key": hex::encode(self.hpke_key),
+            "challenge": {
                 "nonce": hex::encode(nonce),
+                "report_data": hex::encode(report_data_prefix) + &"00".repeat(32),
+                "report_data_algorithm": "https://tinfoil.sh/report-data/v1",
             },
-            "cpu": {
-                "platform": "sev-snp",
-                "report": b64.encode(report),
+            "cpu_evidence": {
+                "format": "https://tinfoil.sh/format/sev-snp-report/v1",
+                "report_base64": b64.encode(report),
+                "endorsed": {
+                    "crypto_material_hash": hex::encode(crypto_material_hash),
+                    "device_evidence_hash": hex::encode(device_evidence_hash),
+                },
             },
-            "vcek": b64.encode(&self.vcek_der),
-            "certificate": self.tls_cert_pem,
-            "signature": "",
+            "crypto_material": b64.encode(crypto_material),
+            "device_evidence": b64.encode(device_evidence),
+            "collateral": [
+                {
+                    "id": "cpu-endorsement",
+                    "role": "endorsement",
+                    "format": "https://tinfoil.sh/collateral/amd-vcek/v1",
+                    "subjects": ["cpu"],
+                    "data": {
+                        "vcek_der_base64": b64.encode(&self.vcek_der),
+                        "cert_chain_pem": self.cert_chain_pem,
+                    },
+                },
+                {
+                    "id": "cpu-crl",
+                    "role": "endorsement",
+                    "format": "https://tinfoil.sh/collateral/amd-crl/v1",
+                    "subjects": ["cpu"],
+                    "data": {
+                        "crl_der_base64": b64.encode(&self.crl_der),
+                    },
+                },
+            ],
         });
-
-        let signed_payload = serde_json::to_vec(&doc)?;
-        let digest = Sha256::digest(&signed_payload);
-        let sig: p256::ecdsa::Signature = self.tls_signing_key.sign_prehash(&digest)?;
-        doc["signature"] = serde_json::Value::String(b64.encode(sig.to_der()));
-
         Ok(serde_json::to_string(&doc)?)
     }
 }
@@ -252,6 +291,34 @@ fn validity_from_now(
         not_before: Time::UtcTime(der::asn1::UtcTime::from_date_time(nb_dt)?),
         not_after: Time::UtcTime(der::asn1::UtcTime::from_date_time(na_dt)?),
     })
+}
+
+/// Build an empty, complete v2 CRL signed by the mock ARK. Its AKI and CRL
+/// number mirror AMD's production profile so the verifier exercises the same
+/// identity, signature-parameter, completeness, validity, and serial checks.
+fn build_empty_crl(ark: &PersistedCa) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let validity = validity_from_now(Duration::from_secs(365 * 24 * 60 * 60))?;
+    let algorithm = rsa_pss_alg_id()?;
+    let crl_extensions = vec![authority_key_id_ext(&ark.key_id)?, crl_number_ext(1)?];
+    let tbs = TbsCertList {
+        version: Version::V2,
+        signature: algorithm.clone(),
+        issuer: ark.subject.clone(),
+        this_update: validity.not_before,
+        next_update: Some(validity.not_after),
+        revoked_certificates: None,
+        crl_extensions: Some(crl_extensions),
+    };
+    let signature = ark
+        .signer
+        .sign_with_rng(&mut rand_core::OsRng, &tbs.to_der()?);
+    CertificateList {
+        tbs_cert_list: tbs,
+        signature_algorithm: algorithm,
+        signature: BitString::from_bytes(&signature.to_bytes())?,
+    }
+    .to_der()
+    .map_err(Into::into)
 }
 
 /// Build an X.509 certificate signed with RSA PKCS#1 v1.5 SHA-384. Used for
@@ -383,6 +450,20 @@ fn authority_key_id_ext(
     })
 }
 
+/// Build the non-critical CRL number extension required for a complete v2
+/// CRL. The mock has one freshly generated CRL per process, so its sequence
+/// starts at one each time.
+fn crl_number_ext(
+    number: u8,
+) -> Result<x509_cert::ext::Extension, Box<dyn std::error::Error + Send + Sync>> {
+    let number = x509_cert::ext::pkix::CrlNumber(der::asn1::Uint::new(&[number])?);
+    Ok(x509_cert::ext::Extension {
+        extn_id: ObjectIdentifier::new_unwrap("2.5.29.20"),
+        critical: false,
+        extn_value: der::asn1::OctetString::new(number.to_der()?)?,
+    })
+}
+
 /// Build the extensions for a CA cert (ARK / ASK):
 ///   * BasicConstraints CA:TRUE (critical)
 ///   * KeyUsage keyCertSign + cRLSign (critical)
@@ -499,19 +580,32 @@ fn write_tcb(report: &mut [u8], offset: usize, bl: u8, snp: u8, ucode: u8) {
     report[offset + 7] = ucode;
 }
 
-/// Build a mock SEV-SNP attestation report (V2 Genoa layout).
+/// Build a mock SEV-SNP attestation report (AMD report version 3, Genoa
+/// layout — matching what production firmware 1.55+ emits and what the
+/// verifier's hygiene checks require).
 ///
 /// `report_data_prefix` is written into the first 32 bytes of `REPORT_DATA`
 /// (the remaining 32 stay zero). For the fresh nonce-bound flow this is
-/// `SHA-256(tls_key_fp || hpke_key || nonce)`.
+/// the domain-separated v1 envelope digest.
 fn build_report(measurement: &[u8], report_data_prefix: &[u8; 32]) -> [u8; REPORT_SIZE] {
     let mut report = [0u8; REPORT_SIZE];
 
-    // Version = 2 (V2 report)
-    report[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&2u32.to_le_bytes());
+    // Version = 3 (V3 report, adds the CPUID family/model/stepping fields)
+    report[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&3u32.to_le_bytes());
+
+    // Guest policy: SMT allowed + the reserved must-be-one bit — the value
+    // Tinfoil's production fleet presents. DEBUG and MIGRATE_MA stay 0,
+    // which the verifier's hygiene checks require.
+    report[OFF_POLICY..OFF_POLICY + 8].copy_from_slice(&0x30000u64.to_le_bytes());
 
     // sig_algo = 1 (ECDSA P-384 SHA-384)
     report[OFF_SIG_ALGO..OFF_SIG_ALGO + 4].copy_from_slice(&1u32.to_le_bytes());
+
+    // CPUID family/model/stepping: Genoa (family 0x19, model 0x11). In V3
+    // reports these drive the parser's generation detection.
+    report[OFF_CPUID_FAM] = 0x19;
+    report[OFF_CPUID_FAM + 1] = 0x11;
+    report[OFF_CPUID_FAM + 2] = 0x01;
 
     // TCB values (must pass minimum policy: bl=0x07, snp=0x0E, ucode=0x48)
     let (bl, snp, ucode) = (0x07, 0x0E, 0x48);
@@ -520,18 +614,18 @@ fn build_report(measurement: &[u8], report_data_prefix: &[u8; 32]) -> [u8; REPOR
     write_tcb(&mut report, OFF_COMMITTED_TCB, bl, snp, ucode);
     write_tcb(&mut report, OFF_LAUNCH_TCB, bl, snp, ucode);
 
-    // report_data[0..32] = SHA-256(tls_key_fp || hpke_key || nonce)
+    // report_data[0..32] = the v1 envelope digest; the rest stays zero.
     report[OFF_REPORT_DATA..OFF_REPORT_DATA + 32].copy_from_slice(report_data_prefix);
 
     // measurement (48 bytes)
     let len = measurement.len().min(48);
     report[OFF_MEASUREMENT..OFF_MEASUREMENT + len].copy_from_slice(&measurement[..len]);
 
-    // chip_id — bytes 8..64 must NOT all be zero, otherwise the sev crate
-    // detects it as Turin-like and uses a different TcbVersion encoding.
+    // chip_id — a stable non-zero mock identity. (V3 generation detection
+    // runs off the CPUID fields above, not the chip_id shape.)
     report[OFF_CHIP_ID] = 0xDE;
     report[OFF_CHIP_ID + 1] = 0xAD;
-    report[OFF_CHIP_ID + 8] = 0x01; // byte 8+ nonzero → Genoa detection
+    report[OFF_CHIP_ID + 8] = 0x01;
 
     report
 }
@@ -998,12 +1092,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let (tls_cert_der, tls_key_der) = build_tls_leaf(&tls_ca, &["localhost", "server", "shim"])?;
     let cert_der = rustls::pki_types::CertificateDer::from(tls_cert_der.clone());
-    // Grab the leaf private key (PKCS#8 DER) before `key_der` is consumed by
-    // rustls below — we also need it to sign the attestation document.
-    let leaf_key_pkcs8 = tls_key_der.secret_der().to_vec();
     let key_der = tls_key_der;
-    let tls_signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(&leaf_key_pkcs8)
-        .map_err(|e| format!("loading P-256 leaf key for document signing: {e}"))?;
 
     // ── 5. Compute TLS fingerprint ──────────────────────────────────────
 
@@ -1017,18 +1106,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("TLS fingerprint: {}", hex::encode(tls_fingerprint));
     info!("Measurement: {measurement}");
 
-    // ── 8. Assemble the fresh-attestation builder ───────────────────────
+    // ── 6. Assemble the fresh-attestation builder ───────────────────────
     //
     // Reports are now built per request (each nonce yields fresh REPORT_DATA),
     // so we stash the per-boot key material in a `FreshBuilder` rather than
-    // pre-serializing a static document. The mock deliberately does not ship
-    // ARK/ASK in the document — those are anchors of trust configured
-    // out-of-band on the verifier (`trusted_ark_der` / `trusted_ask_der`),
-    // never sourced from the attested endpoint. The VCEK *is* shipped (unlike
-    // the production fresh document) so tests need no ATC fallback.
+    // pre-serializing a static document. The document carries the VCEK,
+    // ASK/ARK chain, and CRL as untrusted transport. The verifier requires the
+    // carried chain to equal its separately configured mock ARK/ASK anchors.
 
     let mut hpke_key = [0u8; 32];
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut hpke_key);
+    let cert_chain_pem = format!(
+        "{}{}",
+        der_to_pem_cert(&ask.cert_der),
+        der_to_pem_cert(&ark.cert_der)
+    );
+    let crl_der = build_empty_crl(&ark)?;
 
     let fresh = Arc::new(FreshBuilder {
         measurement: measurement_bytes,
@@ -1036,11 +1129,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         hpke_key,
         vcek_signing_key,
         vcek_der,
-        tls_cert_pem: der_to_pem_cert(&tls_cert_der),
-        tls_signing_key,
+        cert_chain_pem,
+        crl_der,
     });
 
-    // ── 10. Start HTTPS server ──────────────────────────────────────────
+    // ── 7. Start HTTPS server ───────────────────────────────────────────
 
     let state = AppState {
         fresh,

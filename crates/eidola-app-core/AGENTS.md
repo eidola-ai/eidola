@@ -251,7 +251,7 @@ The second of three participant layers — charter (human-owned config), **memor
 
 ## Config (`config.rs`)
 
-`Config` struct (TOML serde) with `*_override` fields and resolver methods falling back to compiled-in defaults — the domain separator, attestation repo, update feed, and `default_template` (the UUID new spaces instantiate from; resolves to the seeded `DEFAULT_TEMPLATE_ID` when unset; persisted via `set_default_template`).
+`Config` struct (TOML serde) with `*_override` fields and resolver methods falling back to compiled-in defaults — the domain separator, update feed, and `default_template` (the UUID new spaces instantiate from; resolves to the seeded `DEFAULT_TEMPLATE_ID` when unset; persisted via `set_default_template`).
 
 - **The `default_model` config key is gone (Participants v1)** — the model lives on the default template's agent. The transitional resolved default is the **async `AppCore::default_model()`** (the default template's first agent's `model_ref`, else `DEFAULT_MODEL`), **not** a `ConfigState` field: `config_state()` is pure-config and DB-free so it's safe inside the core runtime (the CLI calls it there), whereas resolving the model reads the DB — a nested `block_on` panicked. There is no `set_default_model`.
 - The eidola connection + trust bundle is **no longer here** — it moved to the `eidola` backend row (see Backends), so `Config` resolves without the database. The parse helpers (`parse_trust_measurement`, `parse_cert_config`) stay here for the row-based setters.

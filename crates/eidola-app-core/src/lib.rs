@@ -71,7 +71,6 @@ pub struct ConfigState {
     /// Locally configured account secret, shown by trusted clients for copy.
     pub account_secret: Option<String>,
     pub domain_separator: String,
-    pub attestation_url: Option<String>,
     /// The resolved circadian day/night axis (`appearance` override if set,
     /// otherwise `system`).
     pub appearance: config::AppearanceSetting,
@@ -1753,7 +1752,6 @@ impl Inner {
 
     async fn build_client(
         &self,
-        config: &Config,
         eidola: &EidolaResolved,
         attestation_observer: Option<tinfoil_verifier::AttestationObserver>,
     ) -> Result<reqwest::Client, AppError> {
@@ -1779,12 +1777,8 @@ impl Inner {
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
             allowed_measurements: &eidola.measurements,
             inference_base_url: &eidola.base_url,
-            atc_url: config.attestation_url.as_deref(),
-            enclave_repo: Some(config.attestation_repo()),
             trusted_ark_der: hardware_root_der.as_deref(),
             trusted_ask_der: hardware_intermediate_der.as_deref(),
-            tdx_advisory_allowlist: None,
-            tdx_observer: None,
             snp_min_tcb: None,
             snp_observer: None,
             attestation_observer,
@@ -1880,7 +1874,7 @@ impl Inner {
         let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
 
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
         let resp = client
             .get(format!("{base_url}/v1/account"))
             .basic_auth(id, Some(secret))
@@ -1914,7 +1908,7 @@ impl Inner {
 
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
         let resp = client
             .post(format!("{base_url}/v1/account"))
             .send()
@@ -1955,11 +1949,10 @@ impl Inner {
     /// and content hashes. Empty when the server has no acceptance gate
     /// configured.
     async fn current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
-        let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
 
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
         let resp = client
             .get(format!("{base_url}/v1/terms"))
             .send()
@@ -2000,7 +1993,7 @@ impl Inner {
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
 
         for d in &docs {
             let resp = client
@@ -2022,11 +2015,10 @@ impl Inner {
     }
 
     async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
-        let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
 
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
         let resp = client
             .get(format!("{base_url}/v1/prices"))
             .send()
@@ -2080,7 +2072,7 @@ impl Inner {
         let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
 
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
         let resp = client
             .post(format!("{base_url}/v1/account/checkout"))
             .basic_auth(id, Some(secret))
@@ -2112,7 +2104,7 @@ impl Inner {
         let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
 
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
         let resp = client
             .get(format!("{base_url}/v1/account/subscription"))
             .basic_auth(id, Some(secret))
@@ -2164,7 +2156,7 @@ impl Inner {
         let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
 
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
         let resp = client
             .post(format!("{base_url}/v1/account/portal"))
             .basic_auth(id, Some(secret))
@@ -2188,7 +2180,7 @@ impl Inner {
         let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
 
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
         let resp = client
             .get(format!("{base_url}/v1/account/balances"))
             .basic_auth(id, Some(secret))
@@ -2232,7 +2224,7 @@ impl Inner {
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
         let (account_id, secret) = self.require_credentials(&cfg)?;
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
 
         // 1. Fetch issuer keys
         let resp = client
@@ -2570,7 +2562,7 @@ impl Inner {
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
         let db_conn = self.db_conn().await?;
         let params = params_from_domain_separator(cfg.domain_separator())?;
         let now = now_ms();
@@ -2636,9 +2628,8 @@ impl Inner {
     }
 
     async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
-        let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
-        let client = self.build_client(&cfg, &eidola, None).await?;
+        let client = self.build_client(&eidola, None).await?;
 
         let models = fetch_models(&client, &eidola.base_url).await?;
         Ok(models
@@ -4820,7 +4811,7 @@ impl Inner {
                     },
                 ));
 
-                let client = self.build_client(&cfg, &eidola, observer).await?;
+                let client = self.build_client(&eidola, observer).await?;
 
                 let models = fetch_models(&client, &base_url).await?;
                 let connection_id =
@@ -7233,7 +7224,6 @@ impl AppCore {
             account_id: cfg.account_id.clone(),
             account_secret: cfg.account_secret.clone(),
             domain_separator: cfg.domain_separator().to_string(),
-            attestation_url: cfg.attestation_url.clone(),
             appearance: cfg.appearance(),
             time_of_day_tint: cfg.time_of_day_tint(),
             light_character: cfg.light_character(),
@@ -7386,23 +7376,6 @@ impl AppCore {
             })
             .await
             .map_err(join_err)?
-    }
-
-    /// Set the ATC endpoint override, or clear it when given a blank value.
-    ///
-    /// Blank has to mean *clear*: it is the only unset verb this key has (no
-    /// `--clear-attestation-url` exists), and the alternative is worse —
-    /// `Some("")` is not `None`, so it survives as an override and reaches
-    /// the verifier, whose `atc_url.unwrap_or(DEFAULT_ATC_URL)` then uses the
-    /// empty string as the endpoint. That is a client broken at every
-    /// handshake by a setter that returned success.
-    pub fn set_attestation_url(&self, url: String) -> Result<(), AppError> {
-        config::validate_attestation_url(&url)?;
-        let mut cfg = self.inner.load_config();
-        cfg.attestation_url = Some(url.trim().to_string()).filter(|u| !u.is_empty());
-        cfg.save_to(&self.inner.config_path)?;
-        self.bus.emit(Change::Config);
-        Ok(())
     }
 
     /// Set the eidola hardware root CA (ARK) PEM override on the backend row.

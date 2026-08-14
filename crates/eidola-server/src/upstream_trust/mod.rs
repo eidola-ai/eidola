@@ -53,7 +53,7 @@ use sigstore::{TrustError, TrustedRoot, VerifiedMeasurement};
 
 /// Builds a fresh attesting [`reqwest::Client`] for a given allowed
 /// measurement set. Supplied by `main.rs` so all the `attesting_client`
-/// wiring (TLS roots, ATC, enclave repo, telemetry observers) stays there
+/// wiring (TLS roots, TCB policy, telemetry observers) stays there
 /// and this module doesn't take a telemetry dependency. Returns the client
 /// or a human-readable error string.
 pub type AttestingClientFactory = Arc<

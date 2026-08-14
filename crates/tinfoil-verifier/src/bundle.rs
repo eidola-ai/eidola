@@ -1,180 +1,157 @@
-use der::{Decode, Encode};
-use flate2::read::GzDecoder;
-use serde::{Deserialize, Serialize};
+//! Strict parsing of Tinfoil's self-contained v3 attestation envelope.
+//!
+//! Parsing and challenge checking do not authenticate the document by
+//! themselves. Authentication happens only after the platform verifier proves
+//! that the signed CPU evidence carries [`ResolvedAttestation::report_data`].
+
+use std::collections::HashSet;
+
+use base64::Engine as _;
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
-use signature::hazmat::PrehashVerifier;
-use std::io::Read;
 
-use crate::{Error, sevsnp};
+use crate::Error;
 
-/// Full attestation bundle containing report, VCEK, and enclave certificate.
-///
-/// Fetched from the Tinfoil attestation transparency service (ATC). ATC is
-/// only consulted as a fallback when the enclave's own self-contained v3
-/// well-known document is missing required elements.
-///
-/// Note: this struct intentionally does **not** carry `ark` / `ask` fields
-/// even though the wire format includes them. AMD root and intermediate
-/// certificates are anchors of trust and must come from a statically known
-/// source (the built-in Genoa ARK/ASK in the `sev` crate, or an explicit
-/// `trusted_ark_der` / `trusted_ask_der` configured by the caller), never
-/// from a third-party service like ATC. Keeping unused-but-deserialized
-/// `ark` / `ask` fields here would be a foot-gun: they would sit in the
-/// struct waiting for someone to wire them into the trust chain in a later
-/// edit and silently re-introduce the very class of bug we're trying to
-/// rule out. Serde drops unknown fields silently, so simply omitting them
-/// from this struct is enough to make them unreachable from the verifier.
+pub const ATTESTATION_V3_FORMAT: &str = "https://tinfoil.sh/predicate/attestation/v3";
+pub const REPORT_DATA_V1_ALGORITHM: &str = "https://tinfoil.sh/report-data/v1";
+pub const CRYPTO_MATERIAL_V1_FORMAT: &str = "https://tinfoil.sh/crypto-material/v1";
+pub const DEVICE_EVIDENCE_V1_FORMAT: &str = "https://tinfoil.sh/device-evidence/v1";
+pub const SEV_SNP_REPORT_V1_FORMAT: &str = "https://tinfoil.sh/format/sev-snp-report/v1";
+pub const TDX_QUOTE_V1_FORMAT: &str = "https://tinfoil.sh/format/tdx-quote/v1";
+pub const KEY_SPKI_FP_SHA256_V1_FORMAT: &str = "https://tinfoil.sh/key/spki-fp-sha256/v1";
+pub const KEY_X25519_HPKE_V1_FORMAT: &str = "https://tinfoil.sh/key/x25519-hpke/v1";
+pub const COLLATERAL_AMD_VCEK_V1_FORMAT: &str = "https://tinfoil.sh/collateral/amd-vcek/v1";
+pub const COLLATERAL_AMD_CRL_V1_FORMAT: &str = "https://tinfoil.sh/collateral/amd-crl/v1";
+
+const ROLE_ENDORSEMENT: &str = "endorsement";
+const ROLE_REFERENCE_VALUES: &str = "reference-values";
+const SUBJECT_CPU: &str = "cpu";
+const CRYPTO_ID_TLS: &str = "tls";
+const CRYPTO_ID_HPKE: &str = "hpke";
+
+/// Length in bytes of the verifier-chosen challenge nonce.
+pub(crate) const NONCE_LEN: usize = 32;
+
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct AttestationBundle {
-    pub domain: String,
-    #[serde(rename = "enclaveAttestationReport")]
-    pub enclave_attestation_report: AtcReport,
-    #[serde(rename = "enclaveCert")]
-    pub enclave_cert: String,
-    pub vcek: String,
-    pub digest: String,
-    #[serde(rename = "sigstoreBundle")]
-    pub sigstore_bundle: Option<serde_json::Value>,
+#[serde(deny_unknown_fields)]
+struct Document {
+    format: String,
+    challenge: Challenge,
+    cpu_evidence: CpuEvidence,
+    crypto_material: String,
+    device_evidence: String,
+    collateral: Vec<CollateralEntry>,
 }
 
-/// Inner attestation report element of an ATC bundle. The body is base64-encoded
-/// gzip-compressed attestation report bytes; the format string identifies the
-/// platform.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AtcReport {
-    pub format: String,
-    pub body: String,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Challenge {
+    nonce: String,
+    report_data: String,
+    report_data_algorithm: String,
 }
 
-/// Fresh, nonce-bound attestation document served from
-/// `/.well-known/tinfoil-attestation?nonce=<64 hex chars>`.
-///
-/// The enclave collects a *fresh* hardware report on every request, binding
-/// the caller's random `nonce` (plus the TLS key fingerprint and HPKE key)
-/// into the report's `REPORT_DATA` field and signing the whole JSON with its
-/// TLS leaf private key. This is the format that replaced the old static
-/// `?v=3` document and is what makes the attestation replay-proof: a captured
-/// document is worthless against a different nonce, and forging a matching
-/// report requires the genuine SEV-SNP / TDX hardware.
-///
-/// Field order mirrors the upstream Go `attestation.Attestation` struct
-/// (`tinfoil/internal/attestation/attestation.go`). `cpu.report` is
-/// base64-encoded raw report bytes (NOT gzipped, unlike the legacy ATC
-/// bundle). `vcek` is **not** part of the upstream fresh document — Tinfoil
-/// builds it without one, so we treat it as optional and fall back to ATC
-/// when absent. The local shim mock *does* include it so tests need no ATC.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AttestationDocumentV3 {
-    pub format: String,
-    pub report_data: ReportDataFields,
-    pub cpu: AttestationCPU,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CpuEvidence {
+    format: String,
+    report_base64: String,
+    endorsed: EndorsedHashes,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EndorsedHashes {
+    crypto_material_hash: String,
+    device_evidence_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CryptoMaterialSection {
+    format: String,
+    items: Vec<CryptoMaterialItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CryptoMaterialItem {
+    id: String,
+    format: String,
+    data: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceEvidenceSection {
+    format: String,
+    items: Vec<DeviceEvidenceItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceEvidenceItem {
+    id: String,
+    kind: String,
+    vendor: String,
+    format: String,
+    evidence: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollateralEntry {
+    id: String,
+    role: String,
+    format: String,
     #[serde(default)]
-    pub vcek: Option<String>,
-    /// PEM-encoded TLS leaf certificate the enclave signed this document with.
-    pub certificate: String,
-    /// Base64-encoded ASN.1/DER ECDSA signature over the document with the
-    /// `signature` field blanked. Verified against `certificate`'s public key.
-    pub signature: String,
+    subjects: Vec<String>,
+    data: serde_json::Value,
 }
 
-/// The `report_data` object of a fresh attestation document. Each field is the
-/// hex encoding of the corresponding input to the `REPORT_DATA` hash. The GPU
-/// and NVSwitch evidence hashes are absent for CPU-only enclaves (the Tinfoil
-/// inference router we target).
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReportDataFields {
-    /// SHA-256 of the TLS leaf's SubjectPublicKeyInfo (DER). Equals the
-    /// verifier's own `sha256(SPKI(peer_cert))`.
-    pub tls_key_fp: String,
-    pub hpke_key: String,
-    pub nonce: String,
-    #[serde(default)]
-    pub gpu_evidence_hash: Option<String>,
-    #[serde(default)]
-    pub nvswitch_evidence_hash: Option<String>,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AmdVcekCollateral {
+    vcek_der_base64: String,
+    cert_chain_pem: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct AttestationCPU {
-    pub platform: String,
-    pub report: String, // base64-encoded raw report (NOT gzipped)
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AmdCrlCollateral {
+    crl_der_base64: String,
 }
 
-/// TEE platform identified from the attestation document.
+/// TEE platform identified by the CPU evidence format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     SevSnp,
     Tdx,
 }
 
-/// Decoded `report_data` inputs, ready to recompute the `REPORT_DATA` hash and
-/// cross-check against the hardware report.
-#[derive(Debug, Clone)]
-pub struct ReportData {
-    /// SHA-256 of the TLS leaf SPKI (32 bytes).
-    pub tls_key_fp: [u8; 32],
-    pub hpke_key: Vec<u8>,
-    pub nonce: Vec<u8>,
-    /// Empty when the enclave reports no GPU evidence.
-    pub gpu_evidence_hash: Vec<u8>,
-    /// Empty when the enclave reports no NVSwitch evidence.
-    pub nvswitch_evidence_hash: Vec<u8>,
-}
-
-impl ReportData {
-    /// Recompute the 64-byte `REPORT_DATA` value the hardware should carry:
-    ///
-    /// ```text
-    /// SHA-256(tls_key_fp || hpke_key || nonce || gpu_hash || nvswitch_hash)
-    /// ```
-    ///
-    /// padded to 64 bytes with trailing zeros. Matches upstream
-    /// `attestation.ComputeReportData`.
-    pub fn expected_report_data(&self) -> [u8; 64] {
-        let mut h = Sha256::new();
-        h.update(self.tls_key_fp);
-        h.update(&self.hpke_key);
-        h.update(&self.nonce);
-        h.update(&self.gpu_evidence_hash);
-        h.update(&self.nvswitch_evidence_hash);
-        let digest = h.finalize();
-        let mut out = [0u8; 64];
-        out[..32].copy_from_slice(&digest);
-        out
-    }
-}
-
-/// Unified attestation data extracted from a fresh well-known document, with
-/// everything the per-handshake verifier needs already decoded.
+/// Fully decoded challenge and CPU evidence needed by the handshake verifier.
 pub struct ResolvedAttestation {
     pub platform: Platform,
     pub report_bytes: Vec<u8>,
-    /// Present only when the document self-carries a VCEK (the shim mock); the
-    /// production fresh document omits it and the verifier backfills via ATC.
+    /// The recomputed v1 REPORT_DATA that the signed CPU evidence must carry.
+    pub report_data: [u8; 64],
+    pub nonce: [u8; NONCE_LEN],
+    /// SHA-256 of the endorsed TLS SubjectPublicKeyInfo.
+    pub tls_key_fp: [u8; 32],
+    /// Endorsed X25519 HPKE public key.
+    pub hpke_key: [u8; 32],
+    /// Present and required for SEV-SNP evidence.
     pub vcek_der: Option<Vec<u8>>,
-    /// Decoded `report_data` inputs for the `REPORT_DATA` cross-check.
-    pub report_data: ReportData,
-    /// DER bytes of the TLS leaf certificate the document was signed with.
-    pub certificate_der: Vec<u8>,
-    /// Exact bytes the enclave signed (the served document with the
-    /// `signature` value blanked). Verified against `signature_der`.
-    pub signed_payload: Vec<u8>,
-    /// Decoded ASN.1/DER ECDSA signature over `signed_payload`.
-    pub signature_der: Vec<u8>,
+    /// Present and required for SEV-SNP evidence.
+    pub ask_der: Option<Vec<u8>>,
+    /// Present and required for SEV-SNP evidence.
+    pub ark_der: Option<Vec<u8>>,
+    /// Present and required for SEV-SNP evidence.
+    pub crl_der: Option<Vec<u8>>,
 }
 
-/// ATC bundle format strings identifying the platform of the nested report.
-pub(crate) const ATC_SNP_FORMAT: &str = "https://tinfoil.sh/predicate/sev-snp-guest/v2";
-pub(crate) const ATC_TDX_FORMAT: &str = "https://tinfoil.sh/predicate/tdx-guest/v2";
-pub(crate) const V3_FORMAT: &str = "https://tinfoil.sh/predicate/attestation/v3";
-
-/// Length in bytes of the per-handshake attestation nonce. Fixed by the
-/// upstream endpoint, which rejects anything other than exactly 32 bytes
-/// (64 hex chars).
-pub(crate) const NONCE_LEN: usize = 32;
-
-/// Generate a fresh 32-byte attestation nonce from the OS CSPRNG.
+/// Generate a fresh 32-byte challenge nonce from the OS CSPRNG.
 pub(crate) fn random_nonce() -> Result<[u8; NONCE_LEN], Error> {
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce)
@@ -182,88 +159,21 @@ pub(crate) fn random_nonce() -> Result<[u8; NONCE_LEN], Error> {
     Ok(nonce)
 }
 
-/// Named-curve OIDs for the two ECDSA curves the enclave's TLS leaf may use:
-/// production is P-384, the local shim mock is P-256.
-const OID_P256: spki::ObjectIdentifier = spki::ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
-const OID_P384: spki::ObjectIdentifier = spki::ObjectIdentifier::new_unwrap("1.3.132.0.34");
-
-/// Default Tinfoil attestation transparency service URL.
-pub const DEFAULT_ATC_URL: &str = "https://atc.tinfoil.sh/attestation";
-
-/// Request body for the ATC `POST /attestation` endpoint.
-#[derive(Debug, Serialize)]
-struct AtcRequest<'a> {
-    #[serde(rename = "enclaveUrl")]
-    enclave_url: &'a str,
-    repo: &'a str,
-}
-
-/// Fetch the full attestation bundle from the Tinfoil ATC service.
+/// Fetch and resolve a v3 document with a fresh challenge.
 ///
-/// Issues a `POST /attestation` with `{enclaveUrl, repo}` so ATC returns an
-/// attestation bundle bound to the specific enclave the caller intends to
-/// connect to and the source repository it should match. (The legacy
-/// parameterless `GET /attestation` returns whatever the default router is
-/// pointing at, which is not necessarily the enclave we'll talk to.)
-///
-/// The bundle contains the attestation report, VCEK certificate, and enclave
-/// TLS certificate — everything needed for verification.
-pub async fn fetch_bundle(
-    atc_url: Option<&str>,
-    enclave_url: &str,
-    repo: &str,
-    tls_roots: &rustls::RootCertStore,
-) -> Result<AttestationBundle, Error> {
-    let url = atc_url.unwrap_or(DEFAULT_ATC_URL);
-    // Cloning the store is cheap-ish (a Vec of trust anchors). The verifier
-    // is the only caller and reuses the same store across all of its
-    // outbound HTTPS, so the clone happens at most a few times per process.
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(tls_roots.clone())
-        .with_no_client_auth();
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .tls_backend_preconfigured(tls_config)
-        .build()
-        .map_err(|e| Error::Bundle(format!("failed to build HTTP client: {e}")))?;
-    let bundle: AttestationBundle = client
-        .post(url)
-        .json(&AtcRequest { enclave_url, repo })
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-
-    let format = &bundle.enclave_attestation_report.format;
-    if format != ATC_SNP_FORMAT && format != ATC_TDX_FORMAT {
-        return Err(Error::Bundle(format!(
-            "unsupported ATC bundle format: {format}",
-        )));
-    }
-
-    Ok(bundle)
-}
-
-/// Fetch and resolve a fresh nonce-bound attestation document out-of-band.
-///
-/// Generates a random nonce, requests `?nonce=<hex>`, parses the document, and
-/// verifies the two integrity properties that don't require the hardware
-/// report: the echoed nonce matches what we sent (freshness), and the
-/// document's ECDSA signature validates against its embedded TLS certificate.
-/// The hardware report verification (VCEK chain, TCB, measurement) and the
-/// `REPORT_DATA` cross-check remain the caller's responsibility, since they are
-/// platform-specific. The per-handshake connector path does not use this — it
-/// drives the request inline over the attested connection (see
-/// `attesting_client`) — but it is convenient for out-of-band tooling.
+/// This checks the envelope's internal bindings and nonce. The result is not
+/// authenticated until its CPU evidence and `report_data` are verified.
 pub async fn fetch_well_known(
     client: &reqwest::Client,
     attestation_url: &str,
 ) -> Result<ResolvedAttestation, Error> {
     let nonce = random_nonce()?;
-    let url = format!("{attestation_url}?nonce={}", hex::encode(nonce));
+    let separator = if attestation_url.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    let url = format!("{attestation_url}{separator}nonce={}", hex::encode(nonce));
     let raw = client
         .get(&url)
         .send()
@@ -272,205 +182,462 @@ pub async fn fetch_well_known(
         .bytes()
         .await?;
     let resolved = parse_document(&raw)?;
-    if resolved.report_data.nonce != nonce {
+    if resolved.nonce != nonce {
         return Err(Error::NonceMismatch {
             sent: hex::encode(nonce),
-            echoed: hex::encode(&resolved.report_data.nonce),
+            echoed: hex::encode(resolved.nonce),
         });
     }
-    verify_document_signature(&resolved)?;
-    tracing::info!(
-        "Fetched fresh attestation document (platform: {:?})",
-        resolved.platform
-    );
     Ok(resolved)
 }
 
-/// Parse the raw JSON bytes of a fresh attestation document into a
-/// [`ResolvedAttestation`], decoding every field the verifier needs.
+/// Strictly parse a self-contained v3 attestation document.
 ///
-/// Takes the raw bytes (not a parsed struct) because the document signature is
-/// computed over the exact serialized form with the `signature` value blanked,
-/// and reconstructing that byte-for-byte from a typed struct is fragile across
-/// upstream field-order or field-addition changes. Instead we blank the
-/// `signature` value in place (see [`signed_payload`]), which preserves any
-/// field we don't model.
+/// The parser mirrors Tinfoil's v3 rules: object members are case-sensitive,
+/// unknown or duplicate members are rejected, hex is lowercase and
+/// fixed-width, base64 is canonical, and item IDs are unique. The two
+/// endorsed section hashes are computed over their exact decoded JSON bytes,
+/// never over a re-serialization.
 pub fn parse_document(raw: &[u8]) -> Result<ResolvedAttestation, Error> {
-    let doc: AttestationDocumentV3 = serde_json::from_slice(raw)
-        .map_err(|e| Error::Connector(format!("attestation JSON parse: {e}")))?;
-    if doc.format != V3_FORMAT {
-        return Err(Error::Bundle(format!(
-            "unexpected attestation document format: {}",
-            doc.format
-        )));
+    reject_duplicate_members(raw, "attestation document")?;
+    let doc: Document = serde_json::from_slice(raw)
+        .map_err(|e| Error::Bundle(format!("parsing attestation document: {e}")))?;
+
+    require_eq("document format", &doc.format, ATTESTATION_V3_FORMAT)?;
+    require_eq(
+        "report_data_algorithm",
+        &doc.challenge.report_data_algorithm,
+        REPORT_DATA_V1_ALGORITHM,
+    )?;
+
+    let nonce = decode_lower_hex_array::<NONCE_LEN>(&doc.challenge.nonce, "challenge.nonce")?;
+    let claimed_report_data =
+        decode_lower_hex_array::<64>(&doc.challenge.report_data, "challenge.report_data")?;
+    let claimed_crypto_hash = decode_lower_hex_array::<32>(
+        &doc.cpu_evidence.endorsed.crypto_material_hash,
+        "cpu_evidence.endorsed.crypto_material_hash",
+    )?;
+    let claimed_device_hash = decode_lower_hex_array::<32>(
+        &doc.cpu_evidence.endorsed.device_evidence_hash,
+        "cpu_evidence.endorsed.device_evidence_hash",
+    )?;
+
+    let crypto_bytes = decode_canonical_base64(&doc.crypto_material, "crypto_material")?;
+    let device_bytes = decode_canonical_base64(&doc.device_evidence, "device_evidence")?;
+    reject_duplicate_members(&crypto_bytes, "crypto_material")?;
+    reject_duplicate_members(&device_bytes, "device_evidence")?;
+
+    let crypto: CryptoMaterialSection = serde_json::from_slice(&crypto_bytes)
+        .map_err(|e| Error::Bundle(format!("parsing crypto_material: {e}")))?;
+    require_eq(
+        "crypto_material format",
+        &crypto.format,
+        CRYPTO_MATERIAL_V1_FORMAT,
+    )?;
+    let (tls_key_fp, hpke_key) = parse_crypto_material(&crypto.items)?;
+
+    let device: DeviceEvidenceSection = serde_json::from_slice(&device_bytes)
+        .map_err(|e| Error::Bundle(format!("parsing device_evidence: {e}")))?;
+    require_eq(
+        "device_evidence format",
+        &device.format,
+        DEVICE_EVIDENCE_V1_FORMAT,
+    )?;
+    validate_device_evidence(&device.items)?;
+
+    let crypto_hash: [u8; 32] = Sha256::digest(&crypto_bytes).into();
+    let device_hash: [u8; 32] = Sha256::digest(&device_bytes).into();
+    if crypto_hash != claimed_crypto_hash {
+        return Err(Error::Bundle(
+            "crypto_material hash does not match cpu_evidence endorsement".to_string(),
+        ));
     }
-    let platform = match doc.cpu.platform.as_str() {
-        "tdx" => Platform::Tdx,
-        "sev-snp" => Platform::SevSnp,
+    if device_hash != claimed_device_hash {
+        return Err(Error::Bundle(
+            "device_evidence hash does not match cpu_evidence endorsement".to_string(),
+        ));
+    }
+
+    let report_data = compute_report_data(&nonce, &crypto_hash, &device_hash);
+    if report_data != claimed_report_data {
+        return Err(Error::Bundle(
+            "challenge report_data does not match the recomputed value".to_string(),
+        ));
+    }
+
+    let platform = match doc.cpu_evidence.format.as_str() {
+        SEV_SNP_REPORT_V1_FORMAT => Platform::SevSnp,
+        TDX_QUOTE_V1_FORMAT => Platform::Tdx,
         other => {
             return Err(Error::Bundle(format!(
-                "unsupported attestation platform: {other}"
+                "unsupported CPU evidence format: {other}"
             )));
         }
     };
+    let report_bytes = decode_canonical_base64(
+        &doc.cpu_evidence.report_base64,
+        "cpu_evidence.report_base64",
+    )?;
+    if report_bytes.is_empty() {
+        return Err(Error::Bundle("CPU evidence report is empty".to_string()));
+    }
 
-    let report_bytes = sevsnp::decode_base64(&doc.cpu.report)?;
-
-    let tls_key_fp = decode_hex_array::<32>(&doc.report_data.tls_key_fp, "tls_key_fp")?;
-    let hpke_key = decode_hex(&doc.report_data.hpke_key, "hpke_key")?;
-    let nonce = decode_hex(&doc.report_data.nonce, "nonce")?;
-    let gpu_evidence_hash = match &doc.report_data.gpu_evidence_hash {
-        Some(s) if !s.is_empty() => decode_hex(s, "gpu_evidence_hash")?,
-        _ => Vec::new(),
+    validate_collateral_entries(&doc.collateral)?;
+    let (vcek_der, ask_der, ark_der, crl_der) = match platform {
+        Platform::SevSnp => {
+            let vcek = endorsement_for(&doc.collateral, COLLATERAL_AMD_VCEK_V1_FORMAT, SUBJECT_CPU)
+                .ok_or_else(|| {
+                    Error::Bundle(
+                        "document carries no amd-vcek endorsement collateral for the CPU"
+                            .to_string(),
+                    )
+                })?;
+            let crl = endorsement_for(&doc.collateral, COLLATERAL_AMD_CRL_V1_FORMAT, SUBJECT_CPU)
+                .ok_or_else(|| {
+                Error::Bundle(
+                    "document carries no amd-crl endorsement collateral for the CPU".to_string(),
+                )
+            })?;
+            let vcek: AmdVcekCollateral = serde_json::from_value(vcek.data.clone())
+                .map_err(|e| Error::Bundle(format!("parsing amd-vcek collateral: {e}")))?;
+            let (ask_der, ark_der) = decode_amd_cert_chain(&vcek.cert_chain_pem)?;
+            let crl: AmdCrlCollateral = serde_json::from_value(crl.data.clone())
+                .map_err(|e| Error::Bundle(format!("parsing amd-crl collateral: {e}")))?;
+            let vcek_der = decode_canonical_base64(&vcek.vcek_der_base64, "vcek_der_base64")?;
+            let crl_der = decode_canonical_base64(&crl.crl_der_base64, "crl_der_base64")?;
+            if vcek_der.is_empty() || crl_der.is_empty() {
+                return Err(Error::Bundle(
+                    "SEV-SNP endorsement collateral contains empty DER material".to_string(),
+                ));
+            }
+            (Some(vcek_der), Some(ask_der), Some(ark_der), Some(crl_der))
+        }
+        Platform::Tdx => (None, None, None, None),
     };
-    let nvswitch_evidence_hash = match &doc.report_data.nvswitch_evidence_hash {
-        Some(s) if !s.is_empty() => decode_hex(s, "nvswitch_evidence_hash")?,
-        _ => Vec::new(),
-    };
-
-    let certificate_der = pem_to_der(&doc.certificate)?;
-    let signature_der = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        doc.signature.trim(),
-    )
-    .map_err(|e| Error::Bundle(format!("attestation signature base64 decode: {e}")))?;
-    let signed_payload = signed_payload(raw)?;
 
     Ok(ResolvedAttestation {
         platform,
         report_bytes,
-        vcek_der: doc
-            .vcek
-            .as_ref()
-            .and_then(|s| sevsnp::decode_base64(s).ok()),
-        report_data: ReportData {
-            tls_key_fp,
-            hpke_key,
-            nonce,
-            gpu_evidence_hash,
-            nvswitch_evidence_hash,
-        },
-        certificate_der,
-        signed_payload,
-        signature_der,
+        report_data,
+        nonce,
+        tls_key_fp,
+        hpke_key,
+        vcek_der,
+        ask_der,
+        ark_der,
+        crl_der,
     })
 }
 
-/// Reconstruct the exact bytes the enclave signed: the served document with the
-/// `signature` field's *value* blanked.
-///
-/// Upstream signs `json.Marshal(doc)` with `doc.Signature == ""`, then serves
-/// `json.Marshal(doc)` with the real signature. The two byte strings differ
-/// only in the signature value, so blanking it in the served bytes reproduces
-/// the signed form precisely — and survives any field we don't model, since we
-/// never re-serialize. We first trim trailing ASCII whitespace because the
-/// upstream handler streams via `json.Encoder`, which appends a newline the
-/// `json.Marshal` signing path does not (the shim mock appends nothing).
-fn signed_payload(raw: &[u8]) -> Result<Vec<u8>, Error> {
-    let body = trim_trailing_ascii_ws(raw);
-    let needle = b"\"signature\":\"";
-    let key_pos = find_subslice(body, needle)
-        .ok_or_else(|| Error::Bundle("attestation document has no signature field".to_string()))?;
-    let val_start = key_pos + needle.len();
-    let val_end = body[val_start..]
-        .iter()
-        .position(|&b| b == b'"')
-        .map(|rel| val_start + rel)
-        .ok_or_else(|| {
-            Error::Bundle("attestation signature value is not terminated".to_string())
-        })?;
-    let mut out = Vec::with_capacity(body.len() - (val_end - val_start));
-    out.extend_from_slice(&body[..val_start]);
-    out.extend_from_slice(&body[val_end..]);
-    Ok(out)
+/// Decode the AMD KDS `cert_chain` payload: exactly ASK then ARK, with no
+/// non-whitespace material outside those two PEM blocks. The chain is still
+/// untrusted transport; the handshake verifier compares both certificates
+/// with its configured/pinned AMD chain before using them.
+fn decode_amd_cert_chain(chain_pem: &str) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+
+    let mut rest = chain_pem.trim();
+    let mut certs = Vec::with_capacity(2);
+    while !rest.is_empty() {
+        if !rest.starts_with(BEGIN) {
+            return Err(Error::Bundle(
+                "amd-vcek cert_chain_pem carries data outside CERTIFICATE blocks".to_string(),
+            ));
+        }
+        let end = rest.find(END).ok_or_else(|| {
+            Error::Bundle("amd-vcek cert_chain_pem has an unterminated certificate".to_string())
+        })? + END.len();
+        let block = pem::parse(&rest[..end])
+            .map_err(|e| Error::Bundle(format!("parsing amd-vcek cert_chain_pem: {e}")))?;
+        if block.tag() != "CERTIFICATE" || block.contents().is_empty() {
+            return Err(Error::Bundle(
+                "amd-vcek cert_chain_pem must contain non-empty CERTIFICATE blocks".to_string(),
+            ));
+        }
+        certs.push(block.into_contents());
+        rest = rest[end..].trim();
+    }
+    if certs.len() != 2 {
+        return Err(Error::Bundle(format!(
+            "amd-vcek cert_chain_pem must carry exactly ASK and ARK certificates, got {}",
+            certs.len()
+        )));
+    }
+    Ok((certs.remove(0), certs.remove(0)))
 }
 
-/// Verify the document's ECDSA signature over [`ResolvedAttestation::signed_payload`]
-/// using the public key in its embedded TLS certificate.
-///
-/// The enclave signs the SHA-256 prehash of the payload with its TLS leaf key
-/// (P-384 in production, P-256 in the shim mock). Note the deliberate
-/// SHA-256/P-384 pairing — upstream hashes with SHA-256 regardless of curve, so
-/// we verify the prehash rather than letting a `DigestVerifier` impose
-/// SHA-384.
-pub fn verify_document_signature(resolved: &ResolvedAttestation) -> Result<(), Error> {
-    use spki::DecodePublicKey;
+fn compute_report_data(
+    nonce: &[u8; 32],
+    crypto_material_hash: &[u8; 32],
+    device_evidence_hash: &[u8; 32],
+) -> [u8; 64] {
+    let mut hasher = Sha256::new();
+    hasher.update(REPORT_DATA_V1_ALGORITHM.as_bytes());
+    hasher.update(nonce);
+    hasher.update(crypto_material_hash);
+    hasher.update(device_evidence_hash);
+    let mut report_data = [0u8; 64];
+    report_data[..32].copy_from_slice(&hasher.finalize());
+    report_data
+}
 
-    let cert = x509_cert::Certificate::from_der(&resolved.certificate_der)
-        .map_err(|e| Error::CertParse(format!("attestation certificate parse: {e}")))?;
-    let spki = &cert.tbs_certificate.subject_public_key_info;
-    let spki_der = spki
-        .to_der()
-        .map_err(|e| Error::CertParse(format!("attestation SPKI re-encode: {e}")))?;
-    let curve = spki
-        .algorithm
-        .parameters
-        .clone()
-        .ok_or_else(|| Error::DocSignature("certificate has no named-curve parameter".to_string()))?
-        .decode_as::<spki::ObjectIdentifier>()
-        .map_err(|e| Error::DocSignature(format!("curve OID decode: {e}")))?;
+fn parse_crypto_material(items: &[CryptoMaterialItem]) -> Result<([u8; 32], [u8; 32]), Error> {
+    let mut seen = HashSet::new();
+    let mut tls_key_fp = None;
+    let mut hpke_key = None;
+    for item in items {
+        if item.id.is_empty() || item.format.is_empty() {
+            return Err(Error::Bundle(
+                "crypto_material item is incomplete".to_string(),
+            ));
+        }
+        if !seen.insert(&item.id) {
+            return Err(Error::Bundle(format!(
+                "duplicate crypto_material item id {:?}",
+                item.id
+            )));
+        }
+        let data = match item.format.as_str() {
+            KEY_SPKI_FP_SHA256_V1_FORMAT | KEY_X25519_HPKE_V1_FORMAT => {
+                Some(decode_lower_hex_array::<32>(
+                    &item.data,
+                    &format!("crypto_material item {:?} data", item.id),
+                )?)
+            }
+            _ => {
+                if item.data.is_empty()
+                    || !item
+                        .data
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || item.data.len() % 2 != 0
+                {
+                    return Err(Error::Bundle(format!(
+                        "crypto_material item {:?} data is not non-empty lowercase hex",
+                        item.id
+                    )));
+                }
+                None
+            }
+        };
+        match item.id.as_str() {
+            CRYPTO_ID_TLS => {
+                if item.format != KEY_SPKI_FP_SHA256_V1_FORMAT {
+                    return Err(Error::Bundle(
+                        "TLS crypto material has an unsupported format".to_string(),
+                    ));
+                }
+                tls_key_fp = data;
+            }
+            CRYPTO_ID_HPKE => {
+                if item.format != KEY_X25519_HPKE_V1_FORMAT {
+                    return Err(Error::Bundle(
+                        "HPKE crypto material has an unsupported format".to_string(),
+                    ));
+                }
+                hpke_key = data;
+            }
+            _ => {}
+        }
+    }
+    Ok((
+        tls_key_fp.ok_or_else(|| Error::Bundle("crypto_material has no TLS key".to_string()))?,
+        hpke_key.ok_or_else(|| Error::Bundle("crypto_material has no HPKE key".to_string()))?,
+    ))
+}
 
-    let prehash = Sha256::digest(&resolved.signed_payload);
+fn validate_device_evidence(items: &[DeviceEvidenceItem]) -> Result<(), Error> {
+    let mut seen = HashSet::new();
+    for item in items {
+        if item.id.is_empty() {
+            return Err(Error::Bundle("device_evidence item has no id".to_string()));
+        }
+        if !seen.insert(&item.id) {
+            return Err(Error::Bundle(format!(
+                "duplicate device_evidence item id {:?}",
+                item.id
+            )));
+        }
+        // These fields are format-versioned payload metadata. Accessing them
+        // here makes it explicit that strict deserialization covered them.
+        let _ = (&item.kind, &item.vendor, &item.format, &item.evidence);
+    }
+    Ok(())
+}
 
-    if curve == OID_P384 {
-        let vk = p384::ecdsa::VerifyingKey::from_public_key_der(&spki_der)
-            .map_err(|e| Error::DocSignature(format!("P-384 key decode: {e}")))?;
-        let sig = p384::ecdsa::Signature::from_der(&resolved.signature_der)
-            .map_err(|e| Error::DocSignature(format!("P-384 signature decode: {e}")))?;
-        PrehashVerifier::verify_prehash(&vk, &prehash, &sig)
-            .map_err(|e| Error::DocSignature(format!("P-384 signature invalid: {e}")))
-    } else if curve == OID_P256 {
-        let vk = p256::ecdsa::VerifyingKey::from_public_key_der(&spki_der)
-            .map_err(|e| Error::DocSignature(format!("P-256 key decode: {e}")))?;
-        let sig = p256::ecdsa::Signature::from_der(&resolved.signature_der)
-            .map_err(|e| Error::DocSignature(format!("P-256 signature decode: {e}")))?;
-        PrehashVerifier::verify_prehash(&vk, &prehash, &sig)
-            .map_err(|e| Error::DocSignature(format!("P-256 signature invalid: {e}")))
+fn validate_collateral_entries(entries: &[CollateralEntry]) -> Result<(), Error> {
+    let mut seen = HashSet::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.id.is_empty() || entry.format.is_empty() {
+            return Err(Error::Bundle(format!(
+                "collateral entry {index} is incomplete"
+            )));
+        }
+        if !seen.insert(&entry.id) {
+            return Err(Error::Bundle(format!(
+                "duplicate collateral entry id {:?}",
+                entry.id
+            )));
+        }
+        if entry.role != ROLE_ENDORSEMENT && entry.role != ROLE_REFERENCE_VALUES {
+            return Err(Error::Bundle(format!(
+                "collateral entry {:?} has unknown role {:?}",
+                entry.id, entry.role
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn endorsement_for<'a>(
+    entries: &'a [CollateralEntry],
+    format: &str,
+    subject: &str,
+) -> Option<&'a CollateralEntry> {
+    entries.iter().find(|entry| {
+        entry.role == ROLE_ENDORSEMENT
+            && entry.format == format
+            && entry.subjects.iter().any(|candidate| candidate == subject)
+    })
+}
+
+fn require_eq(field: &str, actual: &str, expected: &str) -> Result<(), Error> {
+    if actual == expected {
+        Ok(())
     } else {
-        Err(Error::DocSignature(format!(
-            "unsupported attestation signing curve OID: {curve}"
+        Err(Error::Bundle(format!(
+            "unsupported {field} {actual:?}; expected {expected:?}"
         )))
     }
 }
 
-fn decode_hex(s: &str, field: &str) -> Result<Vec<u8>, Error> {
-    hex::decode(s).map_err(|e| Error::Bundle(format!("{field} hex decode: {e}")))
-}
-
-fn decode_hex_array<const N: usize>(s: &str, field: &str) -> Result<[u8; N], Error> {
-    let v = decode_hex(s, field)?;
-    v.try_into()
-        .map_err(|_| Error::Bundle(format!("{field} must be {N} bytes")))
-}
-
-fn pem_to_der(pem_str: &str) -> Result<Vec<u8>, Error> {
-    let parsed =
-        pem::parse(pem_str).map_err(|e| Error::CertParse(format!("certificate PEM parse: {e}")))?;
-    Ok(parsed.into_contents())
-}
-
-fn trim_trailing_ascii_ws(b: &[u8]) -> &[u8] {
-    let mut end = b.len();
-    while end > 0 && b[end - 1].is_ascii_whitespace() {
-        end -= 1;
+fn decode_lower_hex_array<const N: usize>(value: &str, field: &str) -> Result<[u8; N], Error> {
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(Error::Bundle(format!("{field} is not lowercase hex")));
     }
-    &b[..end]
+    let decoded = hex::decode(value).map_err(|e| Error::Bundle(format!("{field}: {e}")))?;
+    decoded
+        .try_into()
+        .map_err(|_| Error::Bundle(format!("{field} must be exactly {N} bytes")))
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
+fn decode_canonical_base64(value: &str, field: &str) -> Result<Vec<u8>, Error> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|e| Error::Bundle(format!("decoding {field}: {e}")))?;
+    if base64::engine::general_purpose::STANDARD.encode(&decoded) != value {
+        return Err(Error::Bundle(format!("{field} is not canonical base64")));
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    Ok(decoded)
 }
 
-/// Decode and decompress a gzipped attestation report body (base64 → gzip → raw bytes).
-pub fn decode_report_gzipped(body: &str) -> Result<Vec<u8>, Error> {
-    let compressed = sevsnp::decode_base64(body)?;
-    let mut decoder = GzDecoder::new(&compressed[..]);
-    let mut report_bytes = Vec::new();
-    decoder
-        .read_to_end(&mut report_bytes)
-        .map_err(|e| Error::Decompress(e.to_string()))?;
-    Ok(report_bytes)
+/// Reject duplicate member names recursively before typed deserialization.
+fn reject_duplicate_members(raw: &[u8], context: &str) -> Result<(), Error> {
+    let mut deserializer = serde_json::Deserializer::from_slice(raw);
+    StrictJson::deserialize(&mut deserializer)
+        .map_err(|e| Error::Bundle(format!("parsing {context}: {e}")))?;
+    deserializer
+        .end()
+        .map_err(|e| Error::Bundle(format!("parsing {context}: {e}")))
+}
+
+struct StrictJson;
+
+impl<'de> Deserialize<'de> for StrictJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictJsonVisitor)
+    }
+}
+
+struct StrictJsonVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonVisitor {
+    type Value = StrictJson;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut names = HashSet::new();
+        while let Some(name) = map.next_key::<String>()? {
+            if !names.insert(name.clone()) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate object member {name:?}"
+                )));
+            }
+            map.next_value::<StrictJson>()?;
+        }
+        Ok(StrictJson)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq.next_element::<StrictJson>()?.is_some() {}
+        Ok(StrictJson)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(StrictJson)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(StrictJson)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(StrictJson)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(StrictJson)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(StrictJson)
+    }
+    fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
+        Ok(StrictJson)
+    }
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJson)
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJson)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_members_are_rejected_recursively() {
+        let err = reject_duplicate_members(br#"{"outer":{"x":1,"x":2}}"#, "test")
+            .expect_err("duplicate should fail");
+        assert!(err.to_string().contains("duplicate object member \"x\""));
+    }
+
+    #[test]
+    fn report_data_algorithm_is_domain_separated() {
+        let nonce = [1; 32];
+        let crypto = [2; 32];
+        let device = [3; 32];
+        let actual = compute_report_data(&nonce, &crypto, &device);
+        let mut hasher = Sha256::new();
+        hasher.update(REPORT_DATA_V1_ALGORITHM);
+        hasher.update(nonce);
+        hasher.update(crypto);
+        hasher.update(device);
+        assert_eq!(&actual[..32], hasher.finalize().as_slice());
+        assert_eq!(&actual[32..], &[0; 32]);
+    }
 }

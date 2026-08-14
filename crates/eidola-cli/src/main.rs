@@ -19,9 +19,6 @@ enum Command {
     Configure {
         #[arg(long)]
         base_url: Option<String>,
-        /// URL for attestation verification (defaults to Tinfoil ATC)
-        #[arg(long)]
-        attestation_url: Option<String>,
         /// Path to PEM-encoded SEV-SNP ARK (Root CA) certificate
         #[arg(long)]
         hardware_root_ca: Option<String>,
@@ -536,15 +533,10 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     "<not set>"
                 }
             );
-            println!(
-                "attestation_url: {}",
-                state.attestation_url.as_deref().unwrap_or("<default ATC>")
-            );
             Ok(())
         }
         Some(Command::Configure {
             base_url,
-            attestation_url,
             hardware_root_ca,
             hardware_intermediate_ca,
             trust_measurement,
@@ -555,7 +547,6 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             clear_hardware_intermediate_ca,
         }) => {
             if base_url.is_none()
-                && attestation_url.is_none()
                 && hardware_root_ca.is_none()
                 && hardware_intermediate_ca.is_none()
                 && trust_measurement.is_none()
@@ -583,9 +574,6 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 hardware_intermediate_ca.as_deref(),
                 "hardware_intermediate_ca",
             )?;
-            if let Some(url) = attestation_url.as_deref() {
-                config::validate_attestation_url(url)?;
-            }
             let trust_entry = match trust_measurement.as_deref() {
                 Some(spec) => Some(config::parse_trust_measurement(spec)?),
                 None => None,
@@ -610,14 +598,6 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             if clear_hardware_intermediate_ca {
                 core.clear_hardware_intermediate_ca().await?;
                 println!("hardware_intermediate_ca override removed (production AMD chain)");
-            }
-            if let Some(url) = attestation_url {
-                core.set_attestation_url(url.clone())?;
-                if url.trim().is_empty() {
-                    println!("attestation_url override removed (using the default ATC)");
-                } else {
-                    println!("attestation_url set to {url}");
-                }
             }
             if let Some(pem) = root_ca_pem {
                 core.set_hardware_root_ca(pem).await?;

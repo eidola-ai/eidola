@@ -7,7 +7,7 @@
 //! system owns it (see [`crate::login_item`]), so it is read at construction
 //! and re-read after every write. Everything
 //! about the Eidola *connection* — base URL, trusted measurements, hardware
-//! CAs, attestation URL, domain separator — lives in Settings → Backends →
+//! CAs, domain separator — lives in Settings → Backends →
 //! Eidola, the eidola backend's own configuration surface; this pane no
 //! longer summarizes or duplicates any of it. (Earlier iterations kept
 //! read-only trust summaries here, first behind a ⌥-hold reveal and then a

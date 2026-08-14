@@ -52,7 +52,7 @@ What this policy does *not* defend against is a small total anonymity set during
 
 The server runs inside a **Tinfoil Container** on confidential-compute hardware (AMD SEV-SNP; TDX values are recorded in the trust root but TDX presentations are refused by the verifier — see [gaps.md](gaps.md#tdx-acceptance)). The relevant properties:
 
-- **TLS termination is inside the enclave.** The Tinfoil shim generates TLS certificates whose Subject Alternative Names encode the attestation hash and an HPKE public key. The certificate is issued by a public CA via ACME, so any client can validate the chain; the *binding to the enclave* is what the Eidola verifier checks beyond the basic WebPKI chain.
+- **TLS termination is inside the enclave.** The Tinfoil shim's self-contained v3 attestation endorses the TLS certificate's SPKI and an HPKE public key; its fresh hardware report binds those exact endorsed bytes and the client's nonce. The certificate is issued by a public CA via ACME, so any client can validate the chain; the *binding to the enclave* is what the Eidola verifier checks beyond the basic WebPKI chain.
 - **Secrets are sealed into the enclave.** Both `CREDENTIAL_MASTER_KEY` and `DATABASE_PASSWORD` are Tinfoil secrets, decrypted only inside the verified enclave. They are not visible to the host, the orchestrator, or any operator.
 - **The enclave measurement is deterministic from source.** The client's pinned measurement is computed from the same OVMF, kernel, initrd, and `tinfoil-config.yml` that the production enclave is built from. See [trust-root.md](trust-root.md#whats-pinned).
 

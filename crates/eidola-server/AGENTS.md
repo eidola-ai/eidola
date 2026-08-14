@@ -4,13 +4,13 @@ An OpenAI-compatible proxy that translates requests to upstream AI providers, wi
 
 - **Current upstream:** Tinfoil (inference.tinfoil.sh) — OpenAI-compatible; all models run in confidential enclaves (AMD SEV-SNP / Intel TDX / NVIDIA CC).
 - **Database:** PostgreSQL 17+ (`schema/schema.sql`).
-- **Deployment:** Tinfoil Containers — all services run inside confidential enclaves. The Tinfoil shim terminates TLS with attestation-bearing certificates; the server runs plain HTTP behind it.
+- **Deployment:** Tinfoil Containers — all services run inside confidential enclaves. The Tinfoil shim terminates TLS and serves self-contained v3 attestation; the server runs plain HTTP behind it.
 - **API endpoints:** defined in `openapi.json`, generated from utoipa annotations — see Conventions in the top-level AGENTS.md (`just update-openapi`).
 
 ## Key design decisions
 
 - Axum HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration.
-- Plain HTTP internally; TLS terminated by the Tinfoil shim (attestation hash + HPKE key encoded in SANs, issued by a public CA).
+- Plain HTTP internally; TLS terminated by the Tinfoil shim. Its self-contained v3 envelope endorses the TLS SPKI and HPKE key and carries a fresh hardware report plus vendor collateral.
 - Tinfoil attestation verified per-connection via the `tinfoil-verifier` crate (see that crate's AGENTS.md).
 - Deterministic enclave measurement via `measure-enclave` (see that crate's AGENTS.md) → `releases/trust/server-enclave.json` (the cli build input) + `artifact-manifest.json` (the signed deployment record).
 - Statically linked musl binaries; StageX-based OCI images (reproducible, `FROM scratch`, non-root).
@@ -37,7 +37,7 @@ An OpenAI-compatible proxy that translates requests to upstream AI providers, wi
 - `BIND_ADDR` (default `127.0.0.1:8443`) — HTTP bind address; Containerfile overrides to `0.0.0.0:8080`.
 - `STRIPE_API_KEY` / `STRIPE_WEBHOOK_SECRET` (optional) — billing endpoints / webhook return 503 without them.
 - `TINFOIL_BASE_URL` (optional) — override the default `https://inference.tinfoil.sh/v1`.
-- `TINFOIL_REPO` (optional) — source repo the upstream enclave is attested against via the Tinfoil ATC `POST /attestation` endpoint (default `tinfoilsh/confidential-model-router`); also the repo whose latest release the runtime measurement resolver (`src/upstream_trust`) verifies.
+- `TINFOIL_REPO` (optional) — repo whose latest signed release the runtime measurement resolver (`src/upstream_trust`) verifies (default `tinfoilsh/confidential-model-router`).
 - `TINFOIL_MEASUREMENT_REFRESH_SECS` (optional, default `600`) — how often `src/upstream_trust` re-checks Tinfoil's latest release. Bounds the release→deploy race window; 10m stays well within GitHub's unauthenticated rate limit.
 - `TINFOIL_PRICING_OVERRIDES` (optional) — JSON per-model pricing overrides, e.g. `{"kimi-k3":{"input":2.0,"output":6.0}}`. Token-based models take `input`/`output` ($/M tokens); per-request models take `request`. Defaults in `backend.rs` `MODEL_CATALOG`, whose ids, prices, and context lengths track Tinfoil's published list (`GET https://inference.tinfoil.sh/v1/models`) and are pinned by `catalog_matches_the_published_tinfoil_list`. Context lengths mirror the live API's exact `context_window` (262,144; 131,072; …), never the documentation's roundings. **Cached-input prices are deliberately not modeled** — `ModelPricing` has one prompt-token rate, so a cached turn is charged at the full input price, which over-covers rather than under-covers; wiring the discount in would change the wire contract on both sides.
 - `PRICING_MARKUP` (optional, default `1.5`) — markup factor on all model prices. The server refuses to start below 1.5 — the pricing contract's safe cost factor (`eidola-common`'s `SAFE_COST_FACTOR_NUM/DEN = 3/2`): the contract charges prompt bytes at 1/1.5 of worst-case token count, so a lower markup would sell tokens below cost (`validate_pricing_markup` in `backend.rs`).
@@ -67,11 +67,11 @@ OpenTelemetry ships metrics and logs directly to Grafana Cloud (or any OTLP endp
 
 ## Tinfoil Containers / TEE integration
 
-The server runs plain HTTP inside a Tinfoil Container; the shim terminates TLS externally with attestation-bearing certificates and serves `/.well-known/tinfoil-attestation` for client-side verification.
+The server runs plain HTTP inside a Tinfoil Container; the shim terminates WebPKI TLS and serves `/.well-known/tinfoil-attestation` with a self-contained v3 envelope for client-side verification.
 
 - `CREDENTIAL_MASTER_KEY` is injected as a Tinfoil secret (encrypted, enclave-only) in production.
 - With an external PostgreSQL (until Tinfoil supports persistent disks): connection metadata in `DATABASE_URL`, `DATABASE_PASSWORD` as a Tinfoil secret, `DATABASE_SSL_CERT` if the server cert doesn't chain to a WebPKI root.
-- The container has `/dev/sev-guest` (via the undocumented `devices` field in `tinfoil-config.yml`) for SEV-SNP attestation reports; the pre-generated attestation document and TLS key material are at `/tinfoil/`.
+- The container has `/dev/sev-guest` (via the undocumented `devices` field in `tinfoil-config.yml`) so the shim can obtain a fresh SEV-SNP report for each v3 challenge; shim runtime material is mounted at `/tinfoil/`.
 
 `tinfoil-config.yml` (workspace root) is the Tinfoil Container configuration: image digests from `artifact-manifest.json`, `_HASH` env vars for measured secrets (Argon2id hashes via `cargo run -p hash-secret`), CVM resources. Its SHA-256 is embedded in the kernel command line and bound into the enclave measurement — any change produces a different measurement.
 
