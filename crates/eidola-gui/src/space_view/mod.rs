@@ -1126,6 +1126,13 @@ impl SpaceView {
         self.composer_float_bar_h(px(window_h))
     }
 
+    /// The effective resize floor for this window (see
+    /// `composer_min_fraction`).
+    #[doc(hidden)]
+    pub fn composer_min_fraction_for_test(&self, window_h: f32) -> f32 {
+        self.composer_min_fraction(window_h)
+    }
+
     /// Natural composer height (docked), its editor-and-chrome base, and the
     /// compact gutter occupancy used by every geometry consumer.
     #[doc(hidden)]
