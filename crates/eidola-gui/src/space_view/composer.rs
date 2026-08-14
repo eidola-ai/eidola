@@ -1453,6 +1453,7 @@ impl SpaceView {
                     bw,
                     compact_bottom_h,
                     overlayed,
+                    None,
                     cx,
                 ));
             }
@@ -1647,25 +1648,40 @@ impl SpaceView {
             return col;
         }
 
-        col = col.child(self.post_verb(alt, cx));
+        col = col.child(self.post_verb(alt, None, false, cx));
         if alt {
-            col = col.child(self.post_quiet_verb(cx));
+            col = col.child(self.post_quiet_verb(None, false, cx));
         }
         // "See in context" — the floating composer's way home — belongs with
         // the other verbs, not beside the byline (attribution says who wrote
         // this; the action gutter is where you act on it).
         if overlayed {
-            col = col.child(self.home_verb(cx));
+            col = col.child(self.home_verb(false, cx));
         }
         col
     }
 
-    /// Post — save the thought; notify policies drive who responds.
-    fn post_verb(&self, alt: bool, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+    /// Post — save the thought; notify policies drive who responds. An
+    /// `activate` id posts an *inactive* draft: the click adopts it as the
+    /// active draft first, then submits through the same accept-before-consume
+    /// door. `on_muted` flips the hover ground for a verb sitting on the
+    /// separator-muted action bar (the band's own idiom: a paper chip on
+    /// muted, a muted chip on paper).
+    fn post_verb(
+        &self,
+        alt: bool,
+        activate: Option<SharedString>,
+        on_muted: bool,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let theme = cx.theme();
         let fg = theme.muted_foreground;
         let fg_hover = theme.foreground;
-        let bg_hover = theme.muted;
+        let bg_hover = if on_muted {
+            theme.background
+        } else {
+            theme.muted
+        };
         let hint_fg = theme.muted_foreground.opacity(0.7);
         h_flex()
             .id("space-post")
@@ -1682,16 +1698,31 @@ impl SpaceView {
             .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
             .child("Post")
             .when(alt, |d| d.child(kbd_hint("⌘↩", hint_fg)))
-            .on_click(cx.listener(|this, _, window, cx| this.submit(&Send, window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(id) = activate.clone() {
+                    this.activate_draft(id, cx);
+                }
+                this.submit(&Send, window, cx)
+            }))
     }
 
     /// Post quietly — save without notifying anyone. ⌥-revealed: present when
-    /// reached for, invisible in the common case.
-    fn post_quiet_verb(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+    /// reached for, invisible in the common case. `activate`/`on_muted` as on
+    /// [`Self::post_verb`].
+    fn post_quiet_verb(
+        &self,
+        activate: Option<SharedString>,
+        on_muted: bool,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let theme = cx.theme();
         let fg = theme.muted_foreground;
         let fg_hover = theme.foreground;
-        let bg_hover = theme.muted;
+        let bg_hover = if on_muted {
+            theme.background
+        } else {
+            theme.muted
+        };
         let hint_fg = theme.muted_foreground.opacity(0.7);
         h_flex()
             .id("space-post-quiet")
@@ -1711,15 +1742,24 @@ impl SpaceView {
             .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
             .child("Post quietly")
             .child(kbd_hint("⇧⌘↩", hint_fg))
-            .on_click(cx.listener(|this, _, window, cx| this.post_only(&PostOnly, window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(id) = activate.clone() {
+                    this.activate_draft(id, cx);
+                }
+                this.post_only(&PostOnly, window, cx)
+            }))
     }
 
     /// "See in context" — dock the floating composer at its own slot.
-    fn home_verb(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn home_verb(&self, on_muted: bool, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = cx.theme();
         let home_fg = theme.muted_foreground;
         let home_fg_hover = theme.foreground;
-        let home_bg_hover = theme.muted;
+        let home_bg_hover = if on_muted {
+            theme.background
+        } else {
+            theme.muted
+        };
         div()
             .id("space-draft-home")
             .probe("space/composer/home", gpui::Role::Button, "See in context")
@@ -1746,38 +1786,89 @@ impl SpaceView {
         body_width: gpui::Pixels,
         bar_h: f32,
         overlayed: bool,
+        activate: Option<SharedString>,
         cx: &Context<Self>,
     ) -> gpui::Div {
         let theme = cx.theme();
         let alt = self.window_input.read(cx).alt_held();
         let mut right = h_flex().items_baseline().gap_3();
         if alt {
-            right = right.child(self.post_quiet_verb(cx));
+            right = right.child(self.post_quiet_verb(activate.clone(), true, cx));
         }
-        right = right.child(self.post_verb(alt, cx));
+        right = right.child(self.post_verb(alt, activate, true, cx));
         div()
             .absolute()
             .bottom_0()
             .left_0()
             .right_0()
             .h(px(bar_h))
-            .bg(theme.background)
+            // The separators' own ground, so the bar reads as the same family
+            // of chrome as the band above every post.
+            .bg(theme.muted)
             .flex()
             .justify_center()
             .child(
                 h_flex()
                     .w(body_width)
                     .h_full()
-                    .items_start()
-                    .pt(gpui::rems(super::layout::COMPACT_GUTTER_GAP_REMS))
+                    .items_center()
                     .justify_between()
                     .child(if overlayed {
-                        self.home_verb(cx).into_any_element()
+                        self.home_verb(true, cx).into_any_element()
                     } else {
                         div().into_any_element()
                     })
                     .child(right),
             )
+    }
+
+    /// The compact bottom action bar for a **docked, inactive** tail draft —
+    /// the same bar the active composer anchors to the window bottom, fading
+    /// in over [`super::layout::DOCK_REVEAL_SPAN`] as the draft's slot scrolls
+    /// into view (the same span the docked byline reveals over when active),
+    /// so the Post affordance meets the reader at the end of the branch
+    /// without requiring a click into the editor first. Its verbs adopt the
+    /// draft as the active one before acting. Renders nothing wherever the
+    /// active composer already owns the bar, in the Sides scheme (whose verbs
+    /// live in the action gutter), or while the draft has nothing to reveal.
+    pub(crate) fn render_inactive_tail_action_bar(
+        &self,
+        roots: &[TreeNode],
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+        rem_size: Pixels,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let page_layout = page_layout(page_width);
+        if page_layout.gutters != GutterPlacement::Stacked || self.active_draft.is_some() {
+            return div().into_any_element();
+        }
+        let Some(leaf_id) = self.selected_leaf_id(roots, page_width) else {
+            return div().into_any_element();
+        };
+        let Some(draft) = self.drafts.iter().find(|d| d.id == leaf_id) else {
+            return div().into_any_element();
+        };
+        let revealed = !draft.editor.read(cx).is_empty() || self.window_input.read(cx).alt_held();
+        if !revealed {
+            return div().into_any_element();
+        }
+        // The reveal is keyed on the slot's top crossing the window's bottom
+        // edge — the inactive analog of the active bar's dock threshold.
+        let slot_top =
+            self.placeholder_doc_top(roots, page_width, window_h) + self.clamped_scroll_y();
+        let reveal = super::layout::dock_reveal_progress(window_h.as_f32(), slot_top);
+        if reveal <= 0.01 {
+            return div().into_any_element();
+        }
+        let bar_h = super::layout::compact_action_bar_h(rem_size);
+        // `Fade` containment: the bar owns clicks over the strip it covers
+        // (the draft row's click-to-focus tail sits beneath it), while the
+        // wheel keeps scrolling the page.
+        self.render_compact_action_bar(px(page_layout.body_width), bar_h, false, Some(leaf_id), cx)
+            .opacity(reveal)
+            .contain_mouse(Overlay::Fade)
+            .into_any_element()
     }
 
     /// The active composer's measured geometry: `(reserved, rail, text)` — the
