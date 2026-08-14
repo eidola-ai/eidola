@@ -364,8 +364,10 @@ impl SpaceView {
         if moved {
             self.minimap_visible = true;
             // The reader's own scrolling takes the page back from any
-            // navigation glide in flight (`nav::PageGlide`).
+            // navigation glide in flight (`nav::PageGlide`) — and from the
+            // post-submit pin's forcing phase.
             self.cancel_page_glide();
+            self.demote_tail_pin_for_reader();
         }
         if moved || matches!(phase, gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled) {
             self.arm_minimap_hide(cx);
@@ -750,8 +752,10 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         // Direct manipulation of the page — it takes the offset from any
-        // navigation glide in flight.
+        // navigation glide in flight, and from the post-submit pin's forcing
+        // phase.
         self.cancel_page_glide();
+        self.demote_tail_pin_for_reader();
         let m = self.minimap_local_y(window_y);
         // Content box, not the raw surface — on Linux CSD the surface includes
         // the shadow padding, which must not enter the scroll/branch geometry.

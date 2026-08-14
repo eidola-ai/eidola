@@ -34,6 +34,8 @@ pub struct Layout {
     /// The **reading-column** width (`body_width`) the cached heights were
     /// measured at — a post's height depends only on this, not the window width.
     width: Rc<Cell<f32>>,
+    /// Whether the cached row heights include compact metadata/action lines.
+    stacked: Rc<Cell<bool>>,
     /// The type-scale factor the cached heights were measured at. A post's
     /// shaped height scales with the prose font size, so a zoom must invalidate
     /// the cache exactly like a column change (the same estimate→real re-measure
@@ -50,6 +52,7 @@ impl Default for Layout {
     fn default() -> Self {
         Self {
             width: Rc::new(Cell::new(0.0)),
+            stacked: Rc::new(Cell::new(false)),
             scale: Rc::new(Cell::new(1.0)),
             heights: Rc::new(RefCell::new(HashMap::new())),
             clears: Rc::new(Cell::new(0)),
@@ -69,10 +72,15 @@ impl Layout {
     /// the measured heights survive, so the document height and scroll offset
     /// stay stable across the resize. A zoom, by contrast, reshapes every post,
     /// so a scale change *does* clear.
-    pub fn ensure_width(&self, width: f32, scale: f32) {
-        if (self.width.get() - width).abs() > 0.5 || (self.scale.get() - scale).abs() > 1e-3 {
+    pub(crate) fn ensure_width(&self, width: f32, scale: f32, gutters: GutterPlacement) {
+        let stacked = gutters == GutterPlacement::Stacked;
+        if (self.width.get() - width).abs() > 0.5
+            || (self.scale.get() - scale).abs() > 1e-3
+            || self.stacked.get() != stacked
+        {
             self.width.set(width);
             self.scale.set(scale);
+            self.stacked.set(stacked);
             self.heights.borrow_mut().clear();
             self.clears.set(self.clears.get().wrapping_add(1));
         }
@@ -166,22 +174,128 @@ use super::{
 };
 use gpui::Pixels;
 
-/// The reading-column width for a post body at a given page width — the
-/// centered measure between the two symmetric gutters (byline on the left,
-/// actions on the right), capped at [`BODY_MAX_WIDTH`].
-pub(crate) fn body_width(page_width: Pixels) -> f32 {
-    (page_width - (GUTTER_WIDTH + GUTTER_GAP) * 2.)
-        .min(BODY_MAX_WIDTH)
-        .max(gpui::px(240.))
-        .as_f32()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GutterPlacement {
+    Sides,
+    Stacked,
 }
 
-/// The narrowest page whose [`body_width`] is the full [`BODY_MAX_WIDTH`]
-/// measure. Below it the reading column compresses (prose wraps short); above
-/// it only the gutters grow. `lib.rs::writing_surface_size` derives the default
-/// space-window width from this, so a fresh window opens at full measure.
+/// The shared horizontal contract for every conversation row. Side gutters
+/// stay in place while they leave the prose at its full measure. Once they
+/// would squeeze it, metadata and actions stack around the prose instead.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PageLayout {
+    pub(crate) body_width: f32,
+    pub(crate) gutters: GutterPlacement,
+}
+
+/// The compact composer's vertical occupancy around the editor — both parts
+/// exist only in the Stacked scheme, and they live in *different states*:
+///
+/// - `top` is the **docked byline row** — the "You" line the docked bar shows
+///   at a post's metadata position. It is docked-only chrome (the floating bar
+///   carries no byline; see the dock-reveal machinery in `composer.rs`), so it
+///   counts toward the docked natural height and the runway but **not** toward
+///   the floating bar.
+/// - `bottom` is the **bottom action bar** — Post and its siblings on their
+///   own surface anchored to the window's bottom edge, present (and reserved)
+///   whenever the actions are revealed, floating and docked alike.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ComposerGutterHeights {
+    pub(crate) top: f32,
+    pub(crate) bottom: f32,
+}
+
+impl ComposerGutterHeights {
+    pub(crate) fn total(self) -> f32 {
+        self.top + self.bottom
+    }
+}
+
+pub(crate) const COMPACT_GUTTER_LINE_REMS: f32 = 1.5;
+pub(crate) const COMPACT_GUTTER_GAP_REMS: f32 = 0.5;
+/// The bottom action bar's clearance under its verb line — what keeps Post
+/// off the very edge of the screen.
+pub(crate) const COMPACT_ACTION_BAR_CLEARANCE_REMS: f32 = 1.0;
+pub(crate) const COMPACT_PAGE_INSET: Pixels = POST_PAD_Y;
+
+pub(crate) fn compact_gutter_occupancy(rem_size: Pixels) -> f32 {
+    rem_size.as_f32() * (COMPACT_GUTTER_LINE_REMS + COMPACT_GUTTER_GAP_REMS)
+}
+
+/// The compact bottom action bar's total height — a verb line plus a gutter
+/// gap and a full clearance of surrounding room (the line rides vertically
+/// centered in it), so the verbs never crowd the window edge.
+pub(crate) fn compact_action_bar_h(rem_size: Pixels) -> f32 {
+    rem_size.as_f32()
+        * (COMPACT_GUTTER_GAP_REMS + COMPACT_GUTTER_LINE_REMS + COMPACT_ACTION_BAR_CLEARANCE_REMS)
+}
+
+pub(crate) fn composer_gutter_heights(
+    page_layout: PageLayout,
+    rem_size: Pixels,
+    actions_revealed: bool,
+) -> ComposerGutterHeights {
+    match page_layout.gutters {
+        GutterPlacement::Sides => ComposerGutterHeights::default(),
+        GutterPlacement::Stacked => ComposerGutterHeights {
+            top: compact_gutter_occupancy(rem_size),
+            bottom: if actions_revealed {
+                compact_action_bar_h(rem_size)
+            } else {
+                0.0
+            },
+        },
+    }
+}
+
+/// How much page travel past the dock threshold completes the compact
+/// byline's reveal (and the matching content slide) — short enough that any
+/// deliberately docked position shows the settled, post-parity layout, long
+/// enough that the transition reads as a slide rather than a pop.
+pub(crate) const DOCK_REVEAL_SPAN: f32 = 56.0;
+
+/// The compact docked byline's reveal progress: `0` at (or above) the float
+/// line — the floating bar carries no byline — ramping to `1` over the first
+/// [`DOCK_REVEAL_SPAN`] of page travel past the dock threshold. Drives both
+/// the byline's opacity and the dead-space inset that slides the editor down
+/// to its post-parity offset, so the two can never disagree.
+pub(crate) fn dock_reveal_progress(float_top: f32, top_y: f32) -> f32 {
+    ((float_top - top_y) / DOCK_REVEAL_SPAN).clamp(0.0, 1.0)
+}
+
+pub(crate) fn page_layout(page_width: Pixels) -> PageLayout {
+    if page_width >= full_measure_page_width() {
+        PageLayout {
+            body_width: BODY_MAX_WIDTH.as_f32(),
+            gutters: GutterPlacement::Sides,
+        }
+    } else {
+        PageLayout {
+            body_width: (page_width.min(compact_full_measure_page_width())
+                - COMPACT_PAGE_INSET * 2.0)
+                .max(gpui::px(0.))
+                .as_f32(),
+            gutters: GutterPlacement::Stacked,
+        }
+    }
+}
+
+/// The reading-column width for a post body at a given page width.
+pub(crate) fn body_width(page_width: Pixels) -> f32 {
+    page_layout(page_width).body_width
+}
+
+/// The narrowest page that fits the full reading measure between side gutters.
+/// Below it the gutters stack; `lib.rs::writing_surface_size` derives the
+/// default space-window width from this so a fresh window opens in side mode.
 pub(crate) fn full_measure_page_width() -> Pixels {
     BODY_MAX_WIDTH + (GUTTER_WIDTH + GUTTER_GAP) * 2.
+}
+
+/// The narrowest stacked page that preserves the full reading measure.
+pub(crate) fn compact_full_measure_page_width() -> Pixels {
+    BODY_MAX_WIDTH + COMPACT_PAGE_INSET * 2.0
 }
 
 /// The selected branch's two ends as page-scroll `y`s (both ≤ 0). See
@@ -217,15 +331,20 @@ impl SpaceView {
         ((scrolled / stride).round() as i64).clamp(0, count as i64 - 1) as usize
     }
 
-    /// Half the document's inter-post spacing — the composer bar's **total**
-    /// fixed top chrome (bar top edge → editor content). Every height / dock /
-    /// runway computation uses this total; the render alone splits it at the
-    /// scroll clip — a thin pane-separator band outside
+    /// The document's full inter-post pad — the composer bar's **total** fixed
+    /// top chrome (bar top edge → editor content). It is the whole
+    /// [`POST_PAD_Y`] because the docked bar's top edge sits exactly at its
+    /// slot top, where a post row begins: the editor content then starts
+    /// `POST_PAD_Y` below the slot top, exactly where a post's body sits under
+    /// its own top pad, and the bar's surface abuts the separator band above
+    /// it the way every post row does. Every height / dock / runway
+    /// computation uses this total; the render alone splits it at the scroll
+    /// clip — a thin pane-separator band outside
     /// ([`super::composer::COMPOSER_SEPARATOR_H`]) and the remainder as an
     /// in-content spacer ([`super::composer::composer_scroll_gap`]) — so the
     /// split is invisible until the composer scrolls internally.
     pub(crate) fn composer_chrome() -> f32 {
-        POST_PAD_Y.as_f32() / 2.0
+        POST_PAD_Y.as_f32()
     }
 
     /// The document's top reserve: headroom that holds whatever leads the
@@ -258,13 +377,37 @@ impl SpaceView {
         (window_h.as_f32() - self.doc_reserve()).max(0.0)
     }
 
-    /// A branch's trailing runway: at least a standalone slot (so the docked
-    /// composer can stand alone below the reserve), or as tall as the
-    /// composer's content if more.
+    /// The minimum runway for a trailing draft, independent of any draft's
+    /// content. Populated conversations claim **exactly one window**, and the
+    /// docked bar's top edge is its slot top ([`Self::composer_chrome`]), so
+    /// at the document floor the two readings coincide: the slot — the
+    /// composer's minimum height, and the runway a reader scrolls through —
+    /// fills the window, and the painted surface is flush with the window's
+    /// top edge, the previous separator band just cleared above it. A blank
+    /// notebook keeps its titlebar-adjusted no-scroll slot.
+    pub(crate) fn runway_floor(&self, window_h: Pixels) -> f32 {
+        if self.posts.is_empty() {
+            self.standalone_slot_h(window_h)
+        } else {
+            window_h.as_f32()
+        }
+    }
+
+    /// The active composer's runway combines the shared floor with that
+    /// composer's own measured natural height.
     pub(crate) fn runway_height(&self, window_h: Pixels) -> f32 {
-        let content = self.composer_content_h.borrow().as_f32();
-        self.standalone_slot_h(window_h)
-            .max(Self::composer_chrome() + content)
+        self.runway_floor(window_h)
+            .max(self.composer_natural_height())
+    }
+
+    /// An inactive draft is an inline row, so its own recorded layout — never
+    /// the active composer's natural height — decides whether it exceeds the
+    /// same trailing runway floor.
+    pub(crate) fn inactive_draft_height(&self, id: &str, window_h: Pixels) -> f32 {
+        self.layout
+            .measured(id)
+            .unwrap_or(0.0)
+            .max(self.runway_floor(window_h))
     }
 
     /// The in-flow slot height the draft reserves — the runway (the composer
@@ -286,16 +429,12 @@ impl SpaceView {
             NodeSrc::Draft if self.active_draft.as_deref() == Some(&node.id) => {
                 self.draft_slot_height(node, page_width, window_h)
             }
-            // An inactive draft renders inline as an editable post, but reserves
-            // at least a standalone slot (it's always the end of its branch), so
-            // there's perfect continuity with the active draft's runway slot —
-            // activating/deactivating it never resizes the layout. `min_h` on
-            // the inline frame makes the measured height honour the same floor.
-            NodeSrc::Draft => self
-                .layout
-                .measured(&node.id)
-                .unwrap_or(0.0)
-                .max(self.standalone_slot_h(window_h)),
+            // An inactive draft renders inline as an editable post and claims
+            // its own measured height over the shared runway floor. That keeps
+            // one draft continuous across activation without letting another
+            // active draft inflate it. `min_h` on the inline frame makes the
+            // measurement honour the same floor.
+            NodeSrc::Draft => self.inactive_draft_height(&node.id, window_h),
             NodeSrc::Streaming(_) => self
                 .layout
                 .measured(&node.id)
@@ -608,13 +747,20 @@ impl SpaceView {
     /// can never disagree on the bar. Pure core:
     /// [`super::composer::float_bar_height`], unit-tested.
     pub(crate) fn composer_float_bar_h(&self, window_h: Pixels) -> f32 {
-        let natural = Self::composer_chrome() + self.composer_content_h.borrow().as_f32();
+        // Exact sizing pins the bar to the window fraction regardless of
+        // content, and at the minimum fraction in a short window that can
+        // dip below the bar's *fixed* surfaces (the top chrome and the
+        // compact action bar). Clamp so the chrome always fits — the editor
+        // is what compresses, never the fixed surfaces.
+        let fixed =
+            (Self::composer_chrome() + self.composer_gutters.get().bottom).min(window_h.as_f32());
         super::composer::float_bar_height(
-            natural,
+            self.composer_floating_natural_height(),
             self.composer_fraction,
             window_h.as_f32(),
             self.composer_sizing,
         )
+        .max(fixed)
     }
 
     /// Bottom padding the page needs so the selected branch's tail can scroll
@@ -647,24 +793,24 @@ mod tests {
     #[test]
     fn width_change_invalidates() {
         let l = Layout::new();
-        l.ensure_width(600.0, 1.0);
+        l.ensure_width(600.0, 1.0, GutterPlacement::Sides);
         let id = SharedString::from("a1");
         assert!(l.record(&id, 200.0));
         assert_eq!(l.measured("a1"), Some(200.0));
         // Same width + scale, same value → no change reported, value retained.
         assert!(!l.record(&id, 200.3));
         // Same width and scale re-asserted → cache survives (no phantom clear).
-        l.ensure_width(600.0, 1.0);
+        l.ensure_width(600.0, 1.0, GutterPlacement::Sides);
         assert_eq!(l.measured("a1"), Some(200.0));
         // Width change clears.
-        l.ensure_width(480.0, 1.0);
+        l.ensure_width(480.0, 1.0, GutterPlacement::Sides);
         assert_eq!(l.measured("a1"), None);
     }
 
     #[test]
     fn scale_change_invalidates() {
         let l = Layout::new();
-        l.ensure_width(600.0, 1.0);
+        l.ensure_width(600.0, 1.0, GutterPlacement::Sides);
         let id = SharedString::from("a1");
         l.record(&id, 200.0);
         assert_eq!(l.measured("a1"), Some(200.0));
@@ -672,9 +818,20 @@ mod tests {
         // A zoom reshapes every post, so a scale change clears at the same
         // width and updates the reported scale (which the estimate reads).
         let before = l.clears();
-        l.ensure_width(600.0, 1.25);
+        l.ensure_width(600.0, 1.25, GutterPlacement::Sides);
         assert_eq!(l.measured("a1"), None);
         assert_eq!(l.scale(), 1.25);
+        assert_eq!(l.clears(), before + 1);
+    }
+
+    #[test]
+    fn gutter_placement_change_invalidates() {
+        let l = Layout::new();
+        l.ensure_width(600.0, 1.0, GutterPlacement::Sides);
+        l.record(&SharedString::from("a1"), 200.0);
+        let before = l.clears();
+        l.ensure_width(600.0, 1.0, GutterPlacement::Stacked);
+        assert_eq!(l.measured("a1"), None);
         assert_eq!(l.clears(), before + 1);
     }
 
@@ -702,16 +859,94 @@ mod tests {
     }
 
     #[test]
-    fn full_measure_page_width_is_the_narrowest_full_column() {
+    fn page_layout_preserves_measure_across_gutter_breakpoint() {
         let full = full_measure_page_width();
-        assert_eq!(body_width(full), BODY_MAX_WIDTH.as_f32());
-        assert!(body_width(full - gpui::px(1.)) < BODY_MAX_WIDTH.as_f32());
+        assert_eq!(
+            page_layout(full),
+            PageLayout {
+                body_width: BODY_MAX_WIDTH.as_f32(),
+                gutters: GutterPlacement::Sides,
+            }
+        );
+        assert_eq!(
+            page_layout(full - gpui::px(1.)),
+            PageLayout {
+                body_width: BODY_MAX_WIDTH.as_f32(),
+                gutters: GutterPlacement::Stacked,
+            }
+        );
+        assert_eq!(
+            body_width(compact_full_measure_page_width()),
+            BODY_MAX_WIDTH.as_f32()
+        );
+        assert_eq!(
+            body_width(compact_full_measure_page_width() - gpui::px(1.)),
+            BODY_MAX_WIDTH.as_f32() - 1.0
+        );
+    }
+
+    #[test]
+    fn composer_gutters_share_compact_occupancy() {
+        let compact = PageLayout {
+            body_width: BODY_MAX_WIDTH.as_f32(),
+            gutters: GutterPlacement::Stacked,
+        };
+        // The docked byline row is unconditional — a docked composer always
+        // shows "You", exactly as a post always shows its metadata; only the
+        // bottom action bar waits for the actions to reveal.
+        let line = compact_gutter_occupancy(gpui::px(16.));
+        let bar = compact_action_bar_h(gpui::px(16.));
+        assert_eq!(
+            composer_gutter_heights(compact, gpui::px(16.), false),
+            ComposerGutterHeights {
+                top: line,
+                bottom: 0.0,
+            }
+        );
+        assert_eq!(
+            composer_gutter_heights(compact, gpui::px(16.), true),
+            ComposerGutterHeights {
+                top: line,
+                bottom: bar,
+            }
+        );
+        assert!(
+            bar > line,
+            "the action bar carries clearance beyond a bare gutter line, \
+             keeping Post off the window edge"
+        );
+        assert_eq!(
+            composer_gutter_heights(
+                PageLayout {
+                    body_width: BODY_MAX_WIDTH.as_f32(),
+                    gutters: GutterPlacement::Sides,
+                },
+                gpui::px(16.),
+                true,
+            ),
+            ComposerGutterHeights::default()
+        );
+    }
+
+    #[test]
+    fn dock_reveal_ramps_over_the_first_travel_past_the_threshold() {
+        // Floating (at or above the float line): no byline.
+        assert_eq!(dock_reveal_progress(500.0, 500.0), 0.0);
+        assert_eq!(dock_reveal_progress(500.0, 520.0), 0.0);
+        // Half the span in: half revealed.
+        assert_eq!(
+            dock_reveal_progress(500.0, 500.0 - DOCK_REVEAL_SPAN / 2.0),
+            0.5
+        );
+        // Anywhere deeper than the span: fully settled, post-parity layout.
+        assert_eq!(dock_reveal_progress(500.0, 500.0 - DOCK_REVEAL_SPAN), 1.0);
+        assert_eq!(dock_reveal_progress(500.0, 0.0), 1.0);
     }
 
     #[test]
     fn retain_prunes_dead_ids() {
         let l = Layout::new();
-        l.ensure_width(600.0, 1.0);
+        l.ensure_width(600.0, 1.0, GutterPlacement::Sides);
         l.record(&SharedString::from("a1"), 100.0);
         l.record(&SharedString::from("a2"), 100.0);
         l.retain(&|id| id == "a1");

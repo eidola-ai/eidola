@@ -263,6 +263,37 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_docked_composer",
+                description: "Space view: a populated conversation settled at the document floor with its active composer fully docked",
+                default_size: size(px(900.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    view.update(cx, |view, cx| {
+                        view.space().update(cx, |space, cx| {
+                            space.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
+                        });
+                        view.seed_draft_quote_for_test(
+                            Some("a9"),
+                            "I want to preserve that distinction in the final paragraph.",
+                            vec![],
+                            window,
+                            cx,
+                        );
+                        view.set_page_scroll_for_test(-100_000.0);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_long_post",
                 description: "Space view: a conversation whose assistant reply is far taller than the window (selection repro)",
                 default_size: size(px(760.), px(680.)),
@@ -299,6 +330,28 @@ mod driver {
                     });
                     let space = view.read(cx).space().clone();
                     space.update(cx, |s, cx| s.set_post_tree_for_test(structured_posts(), cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_long_metadata",
+                description: "Space view: compact post metadata with long author and backend labels",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(long_metadata_posts(), cx)
+                    });
                     root(view, window, cx)
                 },
             },
@@ -434,6 +487,38 @@ mod driver {
                     let space = view.read(cx).space().clone();
                     space.update(cx, |s, cx| {
                         s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_off_branch_composer",
+                description: "Space view: a long active composer floating over a sibling branch whose own tail draft remains compact",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let long = (0..36)
+                        .map(|i| {
+                            format!(
+                                "Paragraph {i} belongs only to the composer on the tangent branch."
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    view.update(cx, |view, cx| {
+                        view.space().update(cx, |space, cx| {
+                            space.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
+                        });
+                        view.seed_draft_quote_for_test(Some("a6"), &long, vec![], window, cx);
                     });
                     root(view, window, cx)
                 },
@@ -1874,6 +1959,18 @@ mod driver {
                 6,
             ),
         ]
+    }
+
+    fn long_metadata_posts() -> Vec<eidola_app_core::PostNode> {
+        let mut posts = fixtures::kitchen_sink_posts();
+        let post = posts
+            .iter_mut()
+            .find(|post| post.action_id == "a2")
+            .expect("the fixture includes its first assistant reply");
+        let selection = "A deliberately descriptive participant identity that remains recognizable@private-inference-workstation-in-the-west-studio";
+        post.participant.label = selection.into();
+        post.model = Some(selection.into());
+        posts
     }
 
     fn library_spaces() -> Vec<SpaceInfo> {

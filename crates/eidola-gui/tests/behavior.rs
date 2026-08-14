@@ -3129,6 +3129,118 @@ fn space_blank_composer_does_not_scroll(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_populated_composer_has_full_window_docking_runway(cx: &mut TestAppContext) {
+    const WINDOW_H: f32 = 560.0;
+    let stores = stub_stores_with_config(cx);
+    let (blank_window, blank) = open_space(cx, &stores, None);
+    let reserve = blank.read_with(cx, |v, _| v.doc_reserve_for_test());
+    blank.read_with(cx, |v, _| {
+        assert_eq!(
+            v.runway_height_for_test(WINDOW_H),
+            WINDOW_H - reserve,
+            "a blank notebook keeps its titlebar-adjusted no-scroll slot"
+        );
+    });
+    cx.update_window(blank_window, |_, _, _| {}).unwrap();
+
+    let (window, populated) = open_space(cx, &stores, Some("runway".into()));
+    populated.update(cx, |v, cx| {
+        v.space().update(cx, |space, cx| {
+            space.set_post_tree_for_test(
+                vec![fixture_post_with_block("a1", "b1", "A settled post.")],
+                cx,
+            )
+        });
+    });
+    cx.run_until_parked();
+    populated.read_with(cx, |v, _| {
+        let runway = v.runway_height_for_test(WINDOW_H);
+        let chrome = v.composer_chrome_for_test();
+        assert_eq!(
+            runway, WINDOW_H,
+            "a populated branch's trailing slot claims exactly one window — no more, no less"
+        );
+        assert_eq!(
+            WINDOW_H - runway,
+            0.0,
+            "at the document floor the slot top — which is also the docked surface's \
+             top edge — lands exactly at the window top, the previous separator band \
+             just cleared above it"
+        );
+        assert_eq!(
+            chrome, 40.0,
+            "the bar's top chrome is the full post pad, so the docked editor's text \
+             sits POST_PAD_Y below the slot top exactly as a post's body does"
+        );
+    });
+    cx.update_window(window, |_, _, _| {}).unwrap();
+}
+
+#[gpui::test]
+fn an_inactive_tail_draft_does_not_borrow_an_off_branch_composers_height(cx: &mut TestAppContext) {
+    const WINDOW_H: f32 = 560.0;
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("draft-heights".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut left = fixture_assistant_post("a2", "left branch");
+    left.parent_action_id = Some("a1".into());
+    let mut right = fixture_assistant_post("a3", "right branch");
+    right.parent_action_id = Some("a1".into());
+    space.update(cx, |s, cx| {
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", "root"), left, right], cx)
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(WINDOW_H)));
+    vcx.run_until_parked();
+    let parents = view.read_with(&vcx, |v, _| v.draft_parents_for_test());
+    let left_index = parents
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a2"))
+        .expect("left branch tail draft");
+    let right_index = parents
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a3"))
+        .expect("right branch tail draft");
+
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(right_index, cx));
+    vcx.run_until_parked();
+    let left_before = view
+        .read_with(&vcx, |v, _| {
+            v.inactive_draft_height_for_test(left_index, WINDOW_H)
+        })
+        .expect("left draft remains inactive");
+
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("right draft is active");
+    let long = (0..80)
+        .map(|i| format!("Paragraph {i} fills the off-branch composer with its own content."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    editor.update(&mut vcx, |editor, cx| editor.set_value(long, cx));
+    vcx.run_until_parked();
+
+    let (left_after, active_runway) = view.read_with(&vcx, |v, _| {
+        (
+            v.inactive_draft_height_for_test(left_index, WINDOW_H)
+                .expect("left draft remains inactive"),
+            v.runway_height_for_test(WINDOW_H),
+        )
+    });
+    assert!(
+        active_runway > left_after + 1.0,
+        "the long active composer must exceed the inactive draft's own slot \
+         ({active_runway} vs {left_after})"
+    );
+    assert!(
+        (left_before - left_after).abs() < 0.5,
+        "off-branch composer growth must not inflate an inactive tail draft \
+         ({left_before} -> {left_after})"
+    );
+}
+
+#[gpui::test]
 fn space_composer_text_sits_where_its_post_will_land(cx: &mut TestAppContext) {
     // REGRESSION (task 40): the composer *becomes* the post, so the words in it
     // must already sit where the post will render them — submitting must not
@@ -5388,9 +5500,14 @@ fn space_composer_resize_drag_pins_exact_height_and_reverts_on_deactivate(cx: &m
         v.move_composer_resize_for_test(10_000.0, WIN, cx)
     });
     view.read_with(&vcx, |v, _| {
+        let floor = v.composer_min_fraction_for_test(WIN);
         assert!(
-            (v.composer_fraction_for_test() - 0.1).abs() < 1e-6,
-            "dragging past the bottom clamps to the min fraction (got {})",
+            floor >= 0.1,
+            "the effective floor never dips below the nominal minimum ({floor})"
+        );
+        assert!(
+            (v.composer_fraction_for_test() - floor).abs() < 1e-6,
+            "dragging past the bottom clamps to the effective floor (got {}, floor {floor})",
             v.composer_fraction_for_test()
         );
     });
@@ -5421,6 +5538,50 @@ fn space_composer_resize_drag_pins_exact_height_and_reverts_on_deactivate(cx: &m
             (v.composer_fraction_for_test() - pinned).abs() < 1e-6,
             "the fraction survives deactivation ({} vs {pinned})",
             v.composer_fraction_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn compact_floating_composer_uses_complete_natural_height(cx: &mut TestAppContext) {
+    let (_window, view, mut vcx) = open_floating_composer_scene(cx, "compact-natural-height");
+    const WIN: f32 = 620.0;
+
+    // A non-empty draft, so the actions reveal and the bottom bar holds its
+    // reservation alongside the docked byline row.
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the scene's draft is active");
+    editor.update(&mut vcx, |editor, cx| {
+        editor.set_value("a line of draft", cx)
+    });
+    vcx.run_until_parked();
+    for _ in 0..2 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+
+    view.read_with(&vcx, |v, _| {
+        let (natural, base, gutters) = v.composer_height_contract_for_test();
+        let (byline_row, total) = v.composer_gutter_contract_for_test();
+        let action_bar = total - byline_row;
+        assert!(
+            byline_row > 0.0 && action_bar > 0.0,
+            "the compact composer reserves its docked byline row and its bottom action bar"
+        );
+        assert!(
+            (natural - base - gutters).abs() < 0.01,
+            "docked natural height {natural} includes base {base} and both gutters {gutters}"
+        );
+        let floating = v.composer_floating_natural_height_for_test();
+        assert!(
+            (floating - base - action_bar).abs() < 0.01,
+            "the floating bar carries the action bar but never the byline row \
+             (floating {floating}, base {base}, action bar {action_bar})"
+        );
+        assert!(
+            (v.composer_float_bar_h_for_test(WIN) - floating).abs() < 0.5,
+            "the uncapped floating bar uses the complete floating natural height"
         );
     });
 }
@@ -5514,7 +5675,7 @@ fn space_docked_composer_edit_scrolls_page_into_view(cx: &mut TestAppContext) {
         );
     });
 
-    // Full-reveal assertion (the off-by-one regression, Task C). The docked
+    // Full-reveal assertion. The docked
     // branch computes the caret's DOCUMENT position as `page_slot_doc_top +
     // editor_top_offset + caret_content_bottom`, then scrolls the page to reveal
     // it. The final page-scroll value is gpui-clamped against a frame-lagged
@@ -5523,24 +5684,31 @@ fn space_docked_composer_edit_scrolls_page_into_view(cx: &mut TestAppContext) {
     // folded in (`caret_doc_bottom − caret_content_bottom` = `page_slot_doc_top +
     // editor_top_offset`). For a blank ⌘N space the sole node is the draft leaf,
     // so `page_slot_doc_top` is just the document's top reserve and this must
-    // equal `reserve + POST_PAD_Y` (= 2·half_pad = 40px) — the editor's
-    // content-top offset within the slot. Before the fix the offset term was
-    // dropped, so the docked reveal aimed a pad-height too high and never fully
-    // revealed the line.
-    let (slot_offset, reserve) = view.read_with(&vcx, |v, _| {
+    // equal `reserve + POST_PAD_Y + compact_top` — the editor's content-top
+    // offset within the slot. The top metadata line precedes the editor in
+    // compact layout, while total top+bottom occupancy still sizes the runway.
+    let (slot_offset, reserve, compact_top, compact_total) = view.read_with(&vcx, |v, _| {
+        let (top, total) = v.composer_gutter_contract_for_test();
         (
             v.docked_caret_slot_offset_for_test(),
             v.doc_reserve_for_test(),
+            top,
+            total,
         )
     });
     let post_pad_y = 40.0_f32;
+    assert!(compact_top > 0.0, "the compact composer has top metadata");
     assert!(
-        (slot_offset - (reserve + post_pad_y)).abs() < 1.0,
-        "the docked reveal must fold the editor's {post_pad_y}px content-top \
-         offset into the caret's document position (slot-relative offset was \
-         {slot_offset}, expected the {reserve}px top reserve plus that pad; \
-         omitting the pad — a value near {reserve} — under-scrolls the line \
-         out of view)",
+        compact_total > compact_top,
+        "the nonempty compact composer also has bottom actions"
+    );
+    let expected = reserve + post_pad_y + compact_top;
+    assert!(
+        (slot_offset - expected).abs() < 1.0,
+        "the docked reveal must fold the {compact_top}px compact metadata line \
+         into the editor's document position (slot-relative offset {slot_offset}, \
+         expected {expected}); omitting it under-scrolls the lower-fold caret \
+         by exactly that occupancy",
     );
 }
 
@@ -6041,9 +6209,11 @@ fn space_following_reader_stops_at_the_end_of_the_streamed_content(cx: &mut Test
     });
     vcx.run_until_parked();
     view.read_with(&vcx, |v, _| {
+        let offset = v.page_scroll_offset_y_for_test();
+        let end = v.scroll_min_y_for_test();
         assert!(
-            (v.page_scroll_offset_y_for_test() - v.scroll_min_y_for_test()).abs() < 2.0,
-            "while streaming, the end of content *is* the end of the document"
+            (offset - end).abs() < 2.0,
+            "while streaming, the end of content *is* the end of the document ({offset} vs {end})"
         );
     });
 
@@ -6084,6 +6254,81 @@ fn space_following_reader_stops_at_the_end_of_the_streamed_content(cx: &mut Test
             "the reader rests at the end of the streamed content, not at the \
              end of the document (offset {offset}, content end {content_end}, \
              document end {doc_end})"
+        );
+    });
+}
+
+#[gpui::test]
+fn a_reader_scroll_during_convergence_takes_the_viewport(cx: &mut TestAppContext) {
+    // The post-submit pin's forcing phase (`TailPin::Converging`) exists to
+    // hold the reader at the tail while the just-posted rows converge from
+    // estimates to measured heights — but a reader who scrolls (or navigates)
+    // away during those frames has taken the viewport, and the pin must
+    // demote to observation instead of snapping them back on the next render.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", &long), a2], cx)
+        })
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a2".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the draft is the active composer");
+    editor.update(&mut vcx, |e, cx| e.set_value("a new post", cx));
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| focus.dispatch_action(&Send, window, cx));
+    vcx.run_until_parked();
+
+    // Mid-convergence — the pin is still in its forcing phase — the reader
+    // scrolls up to reread. The wheel seam demotes the pin, and no later
+    // frame drags them back to the tail.
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.tail_pin_forced_for_test(),
+            "precondition: the submit's pin is still converging"
+        );
+    });
+    view.update(&mut vcx, |v, cx| {
+        v.reader_scroll_page_by_for_test(180.0, cx)
+    });
+    vcx.run_until_parked();
+    let taken = view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.tail_pin_forced_for_test(),
+            "the reader's own scroll demotes the pin to observation"
+        );
+        v.page_scroll_offset_y_for_test()
+    });
+    for _ in 0..3 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    view.read_with(&vcx, |v, _| {
+        let offset = v.page_scroll_offset_y_for_test();
+        assert!(
+            (offset - taken).abs() < 2.0,
+            "no later frame snaps the reader back to the tail \
+             (offset {offset}, where they scrolled to {taken})"
         );
     });
 }
@@ -6139,6 +6384,12 @@ fn space_post_parks_the_reader_at_the_tail_and_holds_it_there(cx: &mut TestAppCo
     let focus = view.read_with(&vcx, |v, _| v.focus_handle());
     vcx.update(|window, cx| focus.dispatch_action(&Send, window, cx));
     vcx.run_until_parked();
+    // The headless dispatcher does not advance `on_next_frame`; draw the
+    // settled extent the production tail pin reasserts against.
+    for _ in 0..3 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
 
     let (parked, end) = view.read_with(&vcx, |v, _| {
         assert!(v.tail_pin_for_test(), "the post arms the tail pin");
@@ -6154,11 +6405,41 @@ fn space_post_parks_the_reader_at_the_tail_and_holds_it_there(cx: &mut TestAppCo
          (offset {parked} should be the document end {end})"
     );
 
+    // Once the optimistic post has measured and the initial landing has
+    // converged, the pin keeps the pre-stream gap eligible for following but
+    // no longer overrides the reader's observed position. Re-reading during
+    // the live exchange must therefore remain possible.
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.tail_pin_for_test(),
+            "the exchange still owns the follow gate"
+        );
+        assert!(
+            !v.tail_pin_forced_for_test(),
+            "initial measured-floor convergence releases forced authority"
+        );
+        v.scroll_page_by_for_test(180.0);
+    });
+    vcx.run_until_parked();
+    let reader_offset = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    let seq = view.read_with(&vcx, |v, cx| v.space().read(cx).streams()[0].seq);
+    space.update(&mut vcx, |s, cx| {
+        s.push_content_delta_for_test(seq, &"a growing answer\n".repeat(20), cx)
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            (v.page_scroll_offset_y_for_test() - reader_offset).abs() < 2.0,
+            "stream growth leaves a reader who moved away where they chose to read"
+        );
+        v.scroll_page_to_end_for_test();
+    });
+    vcx.run_until_parked();
+
     // Now the production gap the pin exists for: the save is in flight and
     // nothing is streaming yet (the stub's synthetic turn stands in for the
     // real one, which only starts once the post has persisted). Both steps run
     // in one update so no frame observes a settled space and retires the pin.
-    let seq = view.read_with(&vcx, |v, cx| v.space().read(cx).streams()[0].seq);
     space.update(&mut vcx, |s, cx| {
         s.finish_streaming_turn_for_test(seq, cx);
         s.arm_post_runner_for_test(cx);
@@ -10345,18 +10626,18 @@ fn space_quote_survives_the_round_trip_into_the_ask_path(cx: &mut TestAppContext
 #[gpui::test]
 fn space_composer_counts_the_bottom_breath_once(cx: &mut TestAppContext) {
     // The composer bar sizes itself to what its body draws — the editor's
-    // laid-out text plus the *tail* below it — and the bar's bottom breath is
-    // part of that tail exactly once.
+    // laid-out text, the footnote rail's measured span, and the trailing
+    // breath spacer — a straight sum of rendered elements, each counted
+    // exactly once.
     //
-    // Which element draws the breath depends on what ends the body. With no
-    // rail it is the editor's own runway (its `min_height` fills the bar, so
-    // the breath is live notes space, not a dead strip). With a footnote rail
-    // it is the rail's own bottom padding — *inside* the span the two flow
-    // marks measure. Counting both (a measured rail whose padding is the
-    // breath, plus the breath again as a separate term) inflates the bar, and
-    // the whole floating/docking runway with it, by a pad-height: the editor's
-    // floor (`body_h − rail`) grows to swallow the surplus, opening a gap
-    // between the last line of text and the footnote rule.
+    // The breath is one in-flow spacer, always the last thing in the body,
+    // so a scrolled draft's last line stops a breath above the fold. The
+    // rail's own bottom padding (`rail_pad`) stays *inside* the measured
+    // flow-mark span, sized so pad-plus-breath totals a post's full bottom
+    // pad — double-counting either term inflates the bar, and the whole
+    // floating/docking runway with it: the editor's floor grows to swallow
+    // the surplus, opening a gap between the last line of text and the
+    // footnote rule.
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, Some("s".into()));
     seed_quotable_space(
@@ -10392,8 +10673,9 @@ fn space_composer_counts_the_bottom_breath_once(cx: &mut TestAppContext) {
          (reserved {reserved}, text {text}, breath {breath})"
     );
 
-    // Phase 2 — a populated rail. The tail is the measured rail, which carries
-    // the breath as its own bottom padding.
+    // Phase 2 — a populated rail. The reservation is the same sum with the
+    // rail's measured span in the middle; the breath still follows outside
+    // it, and the rail's own `rail_pad` tops the pair up to a full post pad.
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
             v.seed_draft_quote_for_test(
@@ -10415,24 +10697,23 @@ fn space_composer_counts_the_bottom_breath_once(cx: &mut TestAppContext) {
         .read_with(cx, |v, cx| v.composer_geometry_for_test(cx))
         .expect("the quoting draft is the active composer");
     assert!(
-        rail > breath,
-        "the rail measures its rule, its row, and the breath it pads with \
-         (rail {rail}, breath {breath})"
+        rail > 0.5,
+        "the rail measures its rule, its row, and its own pad (rail {rail})"
     );
     assert!(
-        (reserved - (text + rail)).abs() < 0.5,
-        "with a rail the bar reserves the editor's text plus the rail's measured \
-         occupancy — the breath rides inside that span, so adding it again would \
-         reserve {breath}px the body never draws (reserved {reserved}, text {text}, \
-         rail {rail})"
+        (reserved - (text + rail + breath)).abs() < 0.5,
+        "the bar reserves exactly what the body draws — text, the rail's \
+         measured span, and one trailing breath (reserved {reserved}, \
+         text {text}, rail {rail}, breath {breath})"
     );
 }
 
 #[gpui::test]
 fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppContext) {
-    // The rail is the composer bar's **footer**, so it must land on the bar's
-    // *visible* bottom edge in every configuration — floating, docked at the
-    // end of the document, and docked mid-ramp.
+    // The rail is the editor body's footer, so it must land on that body's
+    // visible bottom edge in every configuration — floating, docked at the
+    // end of the document, and docked mid-ramp. In compact layout the action
+    // line follows it; side layout has no vertical action occupancy.
     //
     // Mid-ramp is where it used to fall off. `bar_h` is deliberately virtual
     // (the dock ramp grows it toward `full_h ≥ window` so the internal scroll
@@ -10473,13 +10754,21 @@ fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppConte
     // strictly between 0 and 1): the bar's virtual bottom is past the window
     // edge while its painted quad stops at it.
     vcx.update(|window, cx| view.update(cx, |v, cx| v.dock_active_draft_for_test(window, cx)));
+    view.update(&mut vcx, |v, _| v.drive_page_glide_for_test(1.0));
     vcx.run_until_parked();
     vcx.update(|window, _| window.refresh());
     vcx.run_until_parked();
 
     // The test window has no CSD insets, so its content box is the size it
-    // was resized to.
+    // was resized to. This width is compact, so the editor's visible clip
+    // ends above the bottom action bar, and the body's trailing breath
+    // spacer separates the rail's lower mark from that clip edge.
     let win = 560.0;
+    let rem_size = vcx.update(|window, _| window.rem_size().as_f32());
+    let action_occupancy = view.read_with(&vcx, |v, _| {
+        v.compact_action_occupancy_for_test(760.0, rem_size)
+    });
+    let breath = eidola_gui::space_view::composer::bottom_breath();
     view.read_with(&vcx, |v, cx| {
         assert!(
             !v.composer_overlayed_for_test(),
@@ -10490,11 +10779,14 @@ fn space_docked_composer_keeps_its_footnote_rail_on_screen(cx: &mut TestAppConte
             .expect("the quoting draft is the active composer");
         assert!(rail > 0.5, "the seeded quote renders a rail (was {rail})");
         let bottom = v.composer_rail_bottom_for_test();
+        let clip_bottom = win - action_occupancy;
+        let expected = clip_bottom - breath;
         assert!(
-            (bottom - win).abs() < 0.5,
-            "the docked rail lands on the bar's *visible* bottom edge — not \
-             clipped off below it (the bug), and not floated up above it \
-             (an over-correction): rail bottom {bottom}, window {win}"
+            bottom >= expected - 0.5 && bottom <= clip_bottom + 0.5,
+            "the docked rail stays on screen, its lower mark one breath above \
+             the clip edge the action bar owns — not clipped below the window \
+             (the bug), and not floated higher (an over-correction): rail \
+             bottom {bottom}, expected {expected}..{clip_bottom}"
         );
     });
 }
@@ -11983,11 +12275,13 @@ fn space_composer_resize_handle_adjusts_with_the_arrows(cx: &mut TestAppContext)
     vcx.run_until_parked();
 
     let start = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
-    view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(true, cx));
+    view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(true, 560.0, cx));
     let taller = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
     assert!(taller > start, "Up grows the bar: {start} -> {taller}");
 
-    view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(false, cx));
+    view.update(&mut vcx, |v, cx| {
+        v.nudge_composer_fraction(false, 560.0, cx)
+    });
     let back = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
     assert!(
         (back - start).abs() < 1e-4,
@@ -11996,7 +12290,7 @@ fn space_composer_resize_handle_adjusts_with_the_arrows(cx: &mut TestAppContext)
 
     // Clamped, not unbounded.
     for _ in 0..100 {
-        view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(true, cx));
+        view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(true, 560.0, cx));
     }
     let maxed = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
     assert!(
@@ -12004,10 +12298,69 @@ fn space_composer_resize_handle_adjusts_with_the_arrows(cx: &mut TestAppContext)
         "clamped at the drag's own ceiling: {maxed}"
     );
     for _ in 0..100 {
-        view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(false, cx));
+        view.update(&mut vcx, |v, cx| {
+            v.nudge_composer_fraction(false, 560.0, cx)
+        });
     }
     let floored = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
     assert!(floored >= 0.1 - 1e-4, "and at its floor: {floored}");
+}
+
+#[gpui::test]
+fn compact_resize_floor_rises_with_the_bars_fixed_surfaces(cx: &mut TestAppContext) {
+    // The Exact clamp keeps the rendered bar above its fixed chrome — but a
+    // *stored* fraction below that height would be a dead zone: arrow steps
+    // that change the reported value while the bar doesn't move. The floor is
+    // therefore applied to the stored fraction itself, so stored and rendered
+    // agree at every position the slider can reach.
+    let (_window, view, mut vcx) = open_floating_composer_scene(cx, "resize-floor");
+    const WIN: f32 = 300.0;
+    vcx.simulate_resize(gpui::size(px(760.), px(WIN)));
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the scene's draft is active");
+    editor.update(&mut vcx, |e, cx| e.set_value("a line of draft", cx));
+    vcx.run_until_parked();
+    for _ in 0..2 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+
+    let (chrome, gutters) = view.read_with(&vcx, |v, _| {
+        let (top, total) = v.composer_gutter_contract_for_test();
+        (v.composer_chrome_for_test(), total - top)
+    });
+    let floor = view.read_with(&vcx, |v, _| v.composer_min_fraction_for_test(WIN));
+    assert!(
+        floor > 0.1 + 1e-4,
+        "precondition: the fixed surfaces exceed the nominal minimum \
+         (floor {floor} in a {WIN}px window)"
+    );
+    assert!(
+        floor > (chrome + gutters) / WIN + 1e-4,
+        "the floor reserves an editor viewport beyond the fixed surfaces \
+         (floor {floor}, chrome {chrome} + action bar {gutters})"
+    );
+
+    for _ in 0..100 {
+        view.update(&mut vcx, |v, cx| v.nudge_composer_fraction(false, WIN, cx));
+    }
+    view.read_with(&vcx, |v, _| {
+        let fraction = v.composer_fraction_for_test();
+        assert!(
+            (fraction - floor).abs() < 1e-4,
+            "the stored fraction floors at the fixed surfaces' share \
+             ({fraction} vs {floor})"
+        );
+        let bar = v.composer_float_bar_h_for_test(WIN);
+        assert!(
+            (bar - fraction * WIN).abs() < 0.5,
+            "stored and rendered agree — no dead zone (bar {bar}, \
+             fraction*win {})",
+            fraction * WIN
+        );
+    });
 }
 
 #[gpui::test]
