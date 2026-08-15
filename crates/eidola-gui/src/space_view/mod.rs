@@ -809,23 +809,25 @@ impl SpaceView {
     ) -> Self {
         let focus_handle = cx.focus_handle();
 
-        // A brand-new (blank ⌘N) space opens with the composer ready — the
-        // cursor at the top of an empty notebook. A reopened space with history
-        // opens **without** a composer: you start one by clicking a band's "+".
-        let is_blank = space_id.is_none();
+        // A brand-new (⌘N) space opens with the composer ready — the cursor at
+        // the top of an empty notebook. A reopened space opens **without** a
+        // composer: you start one by clicking a band's "+".
+        let opens_composing = space_id.is_none();
 
         // Get-or-create the shared `Space` through the registry (join-existing).
         let spaces = stores.spaces.clone();
         let space = match space_id {
             Some(id) => spaces.update(cx, |s, cx| s.open(id, cx)),
-            None => spaces.update(cx, |s, cx| s.blank(cx)),
+            None => spaces.update(cx, |s, cx| s.create(cx)),
         };
         // Tell the entity this window is drawing it. A space is not a singleton
         // on screen, so a cross-window handoff (task 37's quote) has to be able
         // to ask whether this conversation is *already* open, and to address
         // itself to one of the windows that has it. Registered on the entity
-        // rather than by space id because a blank ⌘N space is adopted into the
-        // registry only once it earns an id — the entity is what stays put.
+        // rather than in a store map keyed by id because the entity is the one
+        // thing every window on this conversation already shares — the answer
+        // lives with the thing the question is about, and a collected entity
+        // takes its window list with it.
         let handle = window.window_handle();
         space.update(cx, |space, _| space.attach_window(handle));
 
@@ -977,8 +979,8 @@ impl SpaceView {
         this.ensure_participants(cx);
         // Name the window before its first frame; the observer keeps it current.
         this.sync_window_title(window, cx);
-        if is_blank {
-            // The blank notebook: a root draft, focused and ready.
+        if opens_composing {
+            // The new notebook: a root draft, focused and ready.
             this.create_draft(None, window, cx);
         } else {
             // No composer yet — focus the root so action dispatch still works.
@@ -988,14 +990,13 @@ impl SpaceView {
     }
 
     /// Lazily load this space's participant list (the Ask menus + streaming
-    /// bylines read it). A no-op until the space has a persisted id — called
-    /// again from `on_space_event` once a blank space adopts one.
+    /// bylines read it). Idempotent — `ensure` declines once the cell has
+    /// answered.
     fn ensure_participants(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.space.read(cx).id().map(str::to_string) {
-            self.stores
-                .participants
-                .update(cx, |p, cx| p.ensure(id, cx));
-        }
+        let id = self.space.read(cx).id().to_string();
+        self.stores
+            .participants
+            .update(cx, |p, cx| p.ensure(id, cx));
     }
 
     // -- Test seams --------------------------------------------------------
@@ -1776,12 +1777,9 @@ impl SpaceView {
 
     /// The space's **agent** participants — `(id, label)` pairs feeding the
     /// separator Ask menus, the cascade notice's ask affordances, and the
-    /// streaming bylines. Empty until the space has a persisted id and its
-    /// participant list has loaded.
+    /// streaming bylines. Empty until the participant list has loaded.
     pub(crate) fn space_agents(&self, cx: &gpui::App) -> Vec<(String, String)> {
-        let Some(space_id) = self.space.read(cx).id() else {
-            return Vec::new();
-        };
+        let space_id = self.space.read(cx).id();
         self.stores
             .participants
             .read(cx)
@@ -1828,9 +1826,7 @@ impl SpaceView {
         let Some(pid) = participant_id else {
             return false;
         };
-        let Some(space_id) = self.space.read(cx).id() else {
-            return false;
-        };
+        let space_id = self.space.read(cx).id();
         let Some(model) = self
             .stores
             .participants
@@ -1883,9 +1879,6 @@ impl SpaceView {
                     self.error = None;
                 }
                 self.rebuild(cx);
-                // A blank space just adopted its id — its participants are
-                // loadable now (the Ask menus need them).
-                self.ensure_participants(cx);
             }
             SpaceEvent::TurnEnded {
                 seq,
@@ -1900,7 +1893,6 @@ impl SpaceView {
             SpaceEvent::Failed(e) => {
                 self.error = Some(error_copy(e));
                 self.rebuild(cx);
-                self.ensure_participants(cx);
             }
             SpaceEvent::CascadePaused {
                 depth,
@@ -3473,10 +3465,10 @@ impl SpaceView {
 
     /// The space's title as the Library index knows it — what the window is
     /// named, what the inspector's title field edits, and what a saved template
-    /// is proposed as. `None` for a blank ⌘N space or one the index hasn't
-    /// caught up with.
+    /// is proposed as. `None` for a space the index has not caught up with, or
+    /// one with no title yet (a title is derived from the first post).
     fn space_title(&self, cx: &gpui::App) -> Option<SharedString> {
-        let space_id = self.space.read(cx).id()?.to_string();
+        let space_id = self.space.read(cx).id().to_string();
         self.stores
             .spaces
             .read(cx)

@@ -717,8 +717,8 @@ impl SpaceView {
         // is tracked on no element this frame, and focusing it would be the
         // dead handle this whole family of fixes is about — so the popover
         // itself takes it, and it is live either way.
-        let here = self.space.read(cx).id().map(str::to_string);
-        match self.quote_destination_count(here.as_deref(), cx) {
+        let here = self.space.read(cx).id().to_string();
+        match self.quote_destination_count(&here, cx) {
             0 => window.focus(&focus, cx),
             _ => window.focus(&list_focus, cx),
         }
@@ -955,7 +955,7 @@ impl SpaceView {
     pub(crate) fn render_quote_destination(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let dest = self.quote_destination.as_ref()?;
         let theme = cx.theme();
-        let here = self.space.read(cx).id().map(str::to_string);
+        let here = self.space.read(cx).id().to_string();
 
         let mut col = v_flex()
             .id("space-quote-destination")
@@ -1069,7 +1069,7 @@ impl SpaceView {
             let cell = self.stores.spaces.read(cx).index();
             (cell.error().map(|e| e.to_string()), cell.has_value())
         };
-        let destinations = self.quote_destination_count(here.as_deref(), cx);
+        let destinations = self.quote_destination_count(&here, cx);
 
         if destinations == 0 {
             let (line, retry) = match (&load_error, has_listing) {
@@ -1178,8 +1178,8 @@ impl SpaceView {
     /// draws.
     fn quote_destination_cursor(&self, cx: &gpui::App) -> Option<usize> {
         let dest = self.quote_destination.as_ref()?;
-        let here = self.space.read(cx).id().map(str::to_string);
-        self.quote_destination_count(here.as_deref(), cx)
+        let here = self.space.read(cx).id().to_string();
+        self.quote_destination_count(&here, cx)
             .checked_sub(1)
             .map(|last| dest.cursor.min(last))
     }
@@ -1207,8 +1207,8 @@ impl SpaceView {
         if !dest.list_focus.is_focused(window) || ev.keystroke.modifiers.modified() {
             return false;
         }
-        let here = self.space.read(cx).id().map(str::to_string);
-        let count = self.quote_destination_count(here.as_deref(), cx);
+        let here = self.space.read(cx).id().to_string();
+        let count = self.quote_destination_count(&here, cx);
         let (Some(last), Some(cursor)) = (count.checked_sub(1), self.quote_destination_cursor(cx))
         else {
             return false;
@@ -1224,7 +1224,7 @@ impl SpaceView {
                     store
                         .list()
                         .iter()
-                        .filter(|s| here.as_deref() != Some(s.id.as_str()))
+                        .filter(|s| here != s.id)
                         .nth(cursor)
                         .map(|s| (s.id.clone(), space_label(s)))
                 };
@@ -1310,7 +1310,7 @@ impl SpaceView {
     ) -> Vec<AnyElement> {
         let theme = cx.theme();
         let muted = theme.muted;
-        let here = self.space.read(cx).id().map(str::to_string);
+        let here = self.space.read(cx).id().to_string();
         // **The range is applied before anything is cloned.** A dumb indexer
         // that materializes the whole display model and then slices it has
         // virtualized the *elements* and left the rest O(loaded) — half the
@@ -1320,10 +1320,7 @@ impl SpaceView {
         // allocation: the id, the label, and the row.
         let (total, visible) = {
             let store = self.stores.spaces.read(cx);
-            let rows = store
-                .list()
-                .iter()
-                .filter(|s| here.as_deref() != Some(s.id.as_str()));
+            let rows = store.list().iter().filter(|s| here != s.id);
             let visible: Vec<(String, SharedString)> = rows
                 .clone()
                 .skip(range.start)
@@ -1391,13 +1388,13 @@ impl SpaceView {
     /// (for the list's height and the empty-state question) and nothing else,
     /// and materializing a vector to ask its length is the same defect the
     /// indexer above cures.
-    fn quote_destination_count(&self, here: Option<&str>, cx: &gpui::App) -> usize {
+    fn quote_destination_count(&self, here: &str, cx: &gpui::App) -> usize {
         self.stores
             .spaces
             .read(cx)
             .list()
             .iter()
-            .filter(|s| here != Some(s.id.as_str()))
+            .filter(|s| s.id != here)
             .count()
     }
 
@@ -1412,8 +1409,8 @@ impl SpaceView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        let here = self.space.read(cx).id().map(str::to_string);
-        let _ = self.quote_destination_count(here.as_deref(), cx);
+        let here = self.space.read(cx).id().to_string();
+        let _ = self.quote_destination_count(&here, cx);
         self.render_quote_destination_rows(range, window, cx).len()
     }
 

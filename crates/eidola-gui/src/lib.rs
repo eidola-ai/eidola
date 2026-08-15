@@ -849,7 +849,7 @@ fn open_about_window(cx: &mut App) {
 
 fn open_main_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
-    open_blank_space_window(cx, stores);
+    open_new_space_window(cx, stores);
 }
 
 /// Open a chat window onto an existing space. Public-to-the-crate entry
@@ -879,11 +879,12 @@ pub fn raise_space_window(cx: &mut App, handle: gpui::AnyWindowHandle) -> bool {
     raised
 }
 
-/// Open a chat window onto a fresh blank space (⌘N). Takes the stores
-/// explicitly for the same reason [`open_space_window`] does: onboarding
-/// opens one on its way out, and its stub-store tests run without
-/// `AppGlobal` installed.
-pub fn open_blank_space_window(cx: &mut App, stores: Stores) {
+/// Open a chat window onto a **new** space (⌘N): the id is minted and the row
+/// committed by `SpacesStore::create`, so the window is addressed by a real
+/// space from its first frame. Takes the stores explicitly for the same reason
+/// [`open_space_window`] does: onboarding opens one on its way out, and its
+/// stub-store tests run without `AppGlobal` installed.
+pub fn open_new_space_window(cx: &mut App, stores: Stores) {
     open_chat_window(cx, stores, None);
 }
 

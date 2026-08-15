@@ -718,9 +718,9 @@ fn provisioning_fast_fails_when_no_covering_in_flight() {
         let elapsed = started.elapsed();
 
         assert!(
-            matches!(err.root(), AppError::InsufficientBalance { available, .. } if *available == 20_000),
+            matches!(&err, AppError::InsufficientBalance { available, .. } if *available == 20_000),
             "expected an immediate InsufficientBalance, got {:?}",
-            err.root()
+            err
         );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
@@ -1586,7 +1586,7 @@ fn the_decline_name_alone_is_not_a_decline_without_the_tool_registered() {
             Ok(r) => assert!(r.declined.is_none(), "no decline without registration"),
             // (the `Err` arm is checked below)
             Err(e) => assert!(
-                matches!(e.root(), AppError::ToolLoop { .. }),
+                matches!(e, AppError::ToolLoop { .. }),
                 "expected the ordinary tool loop to run on, got {e:?}"
             ),
         }

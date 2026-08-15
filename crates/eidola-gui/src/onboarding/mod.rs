@@ -414,7 +414,7 @@ impl OnboardingView {
     /// app had quit.
     fn leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if cx.windows().len() <= 1 {
-            crate::open_blank_space_window(cx, self.stores.clone());
+            crate::open_new_space_window(cx, self.stores.clone());
         }
         window.remove_window();
     }

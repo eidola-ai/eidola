@@ -596,10 +596,7 @@ fn local_chat_with_missing_model_is_typed_error() {
             .runtime()
             .block_on(core.chat("Hi".into(), "never-loaded@local".into(), None))
             .expect_err("must fail");
-        assert!(
-            matches!(err.root(), AppError::LocalModel { .. }),
-            "got {err:?}"
-        );
+        assert!(matches!(err, AppError::LocalModel { .. }), "got {err:?}");
         assert!(err.to_string().contains("no model file"), "got {err}");
 
         // The post persisted before routing failed — the saved thought

@@ -620,10 +620,7 @@ fn llamacpp_auto_start_disabled_refuses_request_without_spawning() {
             .expect_err("must refuse a request-triggered load");
         // Typed refusal following the disabled-backend pattern; nothing was
         // spawned (the model stays Available, never Loading/Loaded).
-        assert!(
-            matches!(err.root(), AppError::NotConfigured { .. }),
-            "got {err:?}"
-        );
+        assert!(matches!(err, AppError::NotConfigured { .. }), "got {err:?}");
         assert!(err.to_string().contains("auto-start"), "got {err}");
 
         let state = core
@@ -659,10 +656,7 @@ fn disabled_backend_refuses_turns_with_typed_error() {
             .runtime()
             .block_on(core.chat("Hi".into(), "gemma4-31b".into(), None))
             .expect_err("must refuse");
-        assert!(
-            matches!(err.root(), AppError::NotConfigured { .. }),
-            "got {err:?}"
-        );
+        assert!(matches!(err, AppError::NotConfigured { .. }), "got {err:?}");
         assert!(err.to_string().contains("disabled"), "got {err}");
 
         // Unknown backend ids are refused distinctly.
