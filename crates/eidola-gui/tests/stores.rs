@@ -2569,3 +2569,72 @@ fn a_refused_creation_after_an_early_send_says_so_instead_of_spinning(cx: &mut T
          it with — got {cell:?}"
     );
 }
+
+/// **A conversation this window could not read carries its own way back.**
+///
+/// A failed *initial* transcript load is the one dead end in a space window:
+/// there are no posts, so `sync_tail_drafts` mints no composer, and
+/// `Space::load_transcript` re-runs only on construction, a bus
+/// `Change::Space`, or a mutation's failure exit — none of which the reader can
+/// cause with nothing on screen to act on. Recovery meant another writer's
+/// invalidation or closing every window on the space.
+///
+/// Both arms of the Retry are driven against a real core, staged by the id
+/// itself: a space that does not exist reads as `NotConfigured`, and creating
+/// the row under that same id is what turns the next read into an answer.
+///
+/// The failing arm is the one with a trap in it — the cell must land back on
+/// `Failed`, never on the `Loading` it passes through, or the retry replaces an
+/// honest error with a permanent spinner.
+#[gpui::test]
+fn a_failed_initial_transcript_load_can_be_retried(cx: &mut TestAppContext) {
+    use eidola_gui::loadable::Loadable;
+
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space_id = eidola_app_core::new_space_id();
+
+    // A window opened on an id naming no row: the initial read refuses.
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(space_id.clone(), cx));
+    wait_until(cx, "the initial transcript read fails", |cx| {
+        space.read_with(cx, |s, _| s.transcript_load_failure().is_some())
+    });
+    assert!(
+        !space.read_with(cx, |s, _| s.transcript_visible()),
+        "no tree answered, so there is no composer to act from — the dead end"
+    );
+
+    // Retry, still with no row behind the id: the error stands, and the cell
+    // is settled rather than left spinning.
+    space.update(cx, |s, cx| s.retry_transcript_load(cx));
+    settle(cx);
+    let failure = space.read_with(cx, |s, _| {
+        s.transcript_load_failure().map(|e| e.to_string())
+    });
+    assert!(
+        failure
+            .as_deref()
+            .is_some_and(|e| e.contains("space not found")),
+        "a retry that failed keeps the honest error — got {failure:?}"
+    );
+    assert!(
+        !space.read_with(cx, |s, _| matches!(s.transcript(), Loadable::Loading)),
+        "and never leaves a spinner behind it"
+    );
+
+    // The row appears (another writer, a recovered database) — the same Retry
+    // now opens the conversation.
+    core.runtime()
+        .block_on(core.create_space_with_id(space_id.clone(), None))
+        .expect("create the row under the same id");
+    space.update(cx, |s, cx| s.retry_transcript_load(cx));
+    wait_until(cx, "the retried load answers", |cx| {
+        space.read_with(cx, |s, _| s.transcript_visible())
+    });
+    assert!(
+        space.read_with(cx, |s, _| s.transcript_load_failure().is_none()),
+        "a load that answered leaves no failure surface standing"
+    );
+}
