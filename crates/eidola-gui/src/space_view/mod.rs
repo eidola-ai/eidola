@@ -2159,6 +2159,7 @@ fn post_data_from(
         reasoning_expanded: m.reasoning_expanded,
         references: m.references.clone(),
         blocks: m.blocks.clone(),
+        regenerable: m.regenerable,
     }
 }
 

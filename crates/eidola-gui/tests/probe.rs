@@ -6424,3 +6424,74 @@ fn space_inspector_invite_probes_its_door_and_its_form(cx: &mut TestAppContext) 
 
     probe::set_probes_enabled(false);
 }
+
+/// **An affordance may not offer what the core refuses.**
+///
+/// A `brief` — the post an agent writes to open a delegated conversation —
+/// renders in the assistant column, because its author *is* an agent and the
+/// byline and the column are right. What it is not is a *response*: nothing was
+/// inferred, so there is no attempt to repeat, and `regenerate` refuses it
+/// (`AppError::WrongPostKind`). The role alone cannot tell the two apart, so
+/// the row carries the fact and the gutter reads it.
+///
+/// Edit is checked from the other side: it is offered on `role == "user"`,
+/// which is exactly the `user_input` the core allows, so a brief never had that
+/// ghost — asserted here so it stays that way.
+#[gpui::test]
+fn a_brief_offers_no_regenerate_and_an_answer_still_does(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut brief = probe_post("a1", "Check the tide tables for Friday.");
+    brief.action_type = "brief".into();
+    brief.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Navigator".into(),
+    };
+    let mut answer = probe_post("a2", "Low water at 06:12 and 18:41.");
+    answer.action_type = "inference".into();
+    answer.parent_action_id = Some("a1".into());
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![brief, answer], cx)
+        });
+    });
+    draw(cx, window);
+
+    // One gutter at a time (hover is a single row), so an absent verb is absent
+    // rather than merely unrevealed.
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a1", cx));
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"space/post/0/regenerate".to_string()),
+        "a brief was never inferred, so there is nothing to regenerate: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/post/0/edit".to_string()),
+        "and it is not the reader's post to edit either: {names:?}"
+    );
+
+    // The agent's actual answer keeps the verb — this is the half that fails if
+    // the rule were "no assistant post may be regenerated".
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a2", cx));
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/1/regenerate".to_string()),
+        "an inferred answer is still regenerable: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}

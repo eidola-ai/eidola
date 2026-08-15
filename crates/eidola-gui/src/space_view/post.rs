@@ -458,7 +458,13 @@ impl SpaceView {
                     })),
                 )
             }
-            "assistant" => {
+            // **Only an agent's inferred answer**, which is not the same set
+            // as "everything in the assistant column": an agent-authored brief
+            // renders there too, and regenerating one is refused by the core
+            // (it was never inferred, so there is no attempt to repeat). The
+            // verb reads `post.regenerable` rather than the role so it offers
+            // exactly what would work.
+            "assistant" if post.regenerable => {
                 let id = action_id.clone();
                 col.child(
                     verb(
@@ -497,6 +503,16 @@ impl SpaceView {
             self.hovered_post = None;
             cx.notify();
         }
+    }
+
+    /// Test-only: reveal one post's action gutter, as hovering it would.
+    ///
+    /// Exists because an *absent* verb is only meaningful against a revealed
+    /// gutter — otherwise a test asserting "no Regenerate here" would pass on a
+    /// gutter that was simply not showing.
+    #[doc(hidden)]
+    pub fn reveal_post_affordances_for_test(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.set_post_hover(&SharedString::from(id.to_string()), true, cx);
     }
 
     /// Begin editing a persisted user post in place: retire any active draft,

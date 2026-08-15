@@ -2025,3 +2025,135 @@ fn a_notify_all_owner_is_quiet_among_its_helpers_and_answers_a_human() {
         );
     });
 }
+
+/// **The owner's quiet policy is not merely written once — it stays written.**
+///
+/// A spawn writes the owner's membership override as `human`, but an override
+/// is ordinary per-space configuration and the inspector can edit it. Setting
+/// it to `all` would restore exactly the square fan-out the write was there to
+/// prevent, and *clearing* it would be worse than it looks: the membership
+/// would fall back to the agent's global row, which another door can flip to
+/// `all` afterwards, reopening the hole through a write that never mentioned
+/// this conversation.
+///
+/// So the rule is the airtight one rather than the clever one — the override is
+/// **always present and never `all`** for a live sub-space owner — which makes
+/// the global policy irrelevant here by construction, and needs no second guard
+/// anywhere else. Both halves are proven below, including that the config door
+/// cannot reach into the room.
+#[test]
+fn a_sub_space_owners_policy_cannot_be_edited_back_into_the_cascade() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tides.",
+            vec![helper.clone()],
+            vec![],
+        )
+        .expect("spawn");
+        let sub = out.space.id.clone();
+
+        let policy_of = |core: &AppCore, space: &str, who: &str| -> String {
+            core.runtime()
+                .block_on(core.list_space_participants(space.to_string()))
+                .expect("roster")
+                .into_iter()
+                .find(|p| p.id == who)
+                .expect("a member")
+                .notify_policy
+        };
+        let set_policy = |core: &AppCore, who: &str, value: Option<&str>| {
+            core.runtime().block_on(core.set_space_participant_override(
+                sub.clone(),
+                who.to_string(),
+                eidola_app_core::ParticipantOverride {
+                    notify_policy: Some(value.map(str::to_string)),
+                    ..Default::default()
+                },
+            ))
+        };
+
+        // Setting it to the agent-triggering value is refused…
+        let err = set_policy(&core, &owner, Some("all")).expect_err("`all` is the whole hazard");
+        assert!(
+            err.to_string().contains("stays quiet"),
+            "and the refusal says why: {err}"
+        );
+        // …and so is handing it back to the global row.
+        assert!(
+            set_policy(&core, &owner, None).is_err(),
+            "inherit is the state the write exists to replace"
+        );
+        assert_eq!(policy_of(&core, &sub, &owner), "human", "neither landed");
+
+        // What a reader keeps is the choice that matters.
+        set_policy(&core, &owner, Some("explicit")).expect("silent is allowed");
+        assert_eq!(policy_of(&core, &sub, &owner), "explicit");
+        set_policy(&core, &owner, Some("human")).expect("and back again");
+        assert_eq!(policy_of(&core, &sub, &owner), "human");
+
+        // A helper is ordinary configuration — the guard is about the owner,
+        // not about sub-spaces being frozen.
+        set_policy(&core, &helper, Some("human")).expect("a helper is editable");
+        assert_eq!(policy_of(&core, &sub, &helper), "human");
+
+        // **The other door cannot reach in.** Flipping the agent's global
+        // policy to `all` changes what it does everywhere it inherits — and
+        // this room inherits nothing, which is the point of refusing the clear.
+        core.runtime()
+            .block_on(core.update_space_participant(
+                owner.clone(),
+                eidola_app_core::ParticipantUpdate {
+                    notify_policy: Some("all".into()),
+                    ..Default::default()
+                },
+                eidola_app_core::ExpectedScope::Global,
+            ))
+            .expect("edit everywhere");
+        assert_eq!(
+            policy_of(&core, &parent, &owner),
+            "all",
+            "loud everywhere it inherits"
+        );
+        assert_eq!(
+            policy_of(&core, &sub, &owner),
+            "human",
+            "and unchanged in the room it opened"
+        );
+
+        // Which is the behaviour that actually matters: its helper's answer
+        // still schedules nobody.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let answer = core
+            .runtime()
+            .block_on(core.respond_stream_as(
+                sub.clone(),
+                helper.clone(),
+                out.brief_action_id.clone(),
+                tx,
+            ))
+            .expect("the helper answers")
+            .response_action_id
+            .expect("an answer");
+        match core
+            .runtime()
+            .block_on(core.plan_notifications(sub.clone(), answer))
+            .expect("plan")
+        {
+            NotificationPlan::Turns(t) => {
+                let ids: Vec<String> = t.into_iter().map(|p| p.participant_id).collect();
+                assert!(
+                    !ids.contains(&owner),
+                    "a global flipped to `all` must not wake the owner here: {ids:?}"
+                );
+            }
+            other => panic!("expected turns, got {other:?}"),
+        }
+    });
+}
