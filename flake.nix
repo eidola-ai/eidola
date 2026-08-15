@@ -263,7 +263,12 @@
           filter =
             path: type:
             craneLib.filterCargoSources path type
-            || (type == "regular" && pkgs.lib.hasSuffix ".ftl" path);
+            || (type == "regular" && pkgs.lib.hasSuffix ".ftl" path)
+            # .ttf and .sql feed include_bytes!/include_str! the same way .ftl
+            # feeds the localization build script; without them the workspace
+            # check derivations cannot compile eidola-gui or eidola-app-core.
+            || (type == "regular" && pkgs.lib.hasSuffix ".ttf" path)
+            || (type == "regular" && pkgs.lib.hasSuffix ".sql" path);
         };
 
         # Base RUSTFLAGS for deterministic builds (extended per-target in mkTargetConfig)
