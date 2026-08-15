@@ -16,10 +16,15 @@
 //! *any* locale, a translation reading a variable English never passes, a
 //! translation inventing an id) live in `build_support/codegen.rs`.
 //!
-//! **A missing translation is not an error** — the lookup chain is
-//! `[active locale, en]`, so an untranslated message renders in English rather
-//! than failing. Hard-failing on an untranslated string is the wrong production
-//! behavior.
+//! **A missing translation is not an error, and the fallback is structural.**
+//! Each locale's bundle is built as the English resource *overridden by* that
+//! locale's own, so an untranslated message is present as English rather than
+//! absent — one bundle, no lookup chain, and no runtime error branch for the
+//! promise to depend on. It has to be that way: Fluent resolves a message
+//! reference against one bundle only, so a translated message reaching through
+//! `{ another-message }` for something its locale never translated would render
+//! the reference's error text and never consult a fallback bundle. Merging makes
+//! the guarantee true by construction; see [`bundle_for`].
 //!
 //! **The active locale is a gpui [`Global`]** (per `STATE.md`), installed by
 //! [`install`] and pointed at the user's real preference by [`wire_config`].
@@ -70,27 +75,26 @@ fn shipped(tag: &str) -> Option<&'static str> {
 // The active locale
 // ---------------------------------------------------------------------------
 
-/// The active locale and its lookup chain. Held in a [`Global`] so any render
-/// pass can format a message with only an `&App` in hand.
+/// The active locale and the single bundle it formats through. Held in a
+/// [`Global`] so any render pass can format a message with only an `&App` in
+/// hand.
 pub struct Localization {
     tag: &'static str,
-    /// `[active locale, en]` — or just `[en]` when the active locale *is* the
-    /// source. Ordered: the first bundle carrying the message wins, which is
-    /// what makes a missing translation fall back rather than fail.
-    chain: Vec<FluentBundle<Arc<FluentResource>>>,
+    /// **One** bundle, built as the English resource *overridden by* the active
+    /// locale's. Fallback is a property of the bundle's contents rather than of
+    /// a lookup order — see [`bundle_for`].
+    bundle: FluentBundle<Arc<FluentResource>>,
 }
 
 impl Global for Localization {}
 
 impl Localization {
-    /// Build the chain for `tag`, which must be a shipped locale.
+    /// Build the bundle for `tag`, which must be a shipped locale.
     fn for_locale(tag: &'static str) -> Self {
-        let mut chain = Vec::new();
-        if tag != SOURCE_LOCALE {
-            chain.extend(bundle_for(tag));
+        Self {
+            tag,
+            bundle: bundle_for(tag),
         }
-        chain.extend(bundle_for(SOURCE_LOCALE));
-        Self { tag, chain }
     }
 
     /// The active locale's tag.
@@ -99,15 +103,14 @@ impl Localization {
     }
 
     fn format(&self, id: &str, args: Option<&Args>) -> SharedString {
-        for bundle in &self.chain {
-            let Some(message) = bundle.get_message(id) else {
-                continue;
-            };
-            let Some(pattern) = message.value() else {
-                continue;
-            };
+        if let Some(pattern) = self.bundle.get_message(id).and_then(|m| m.value()) {
             let mut errors = Vec::new();
-            let formatted = bundle.format_pattern(pattern, args, &mut errors);
+            let formatted = self.bundle.format_pattern(pattern, args, &mut errors);
+            // Not a case to recover from — a formatting error means the
+            // build-time contract was violated, and `build_support/codegen.rs`
+            // refuses every shape that can produce one (an unresolvable
+            // reference, a cycle, a variable the accessor does not pass). The
+            // assertion is how that claim stays true as the rules change.
             debug_assert!(
                 errors.is_empty(),
                 "localization: `{id}` in `{}` formatted with errors: {errors:?}",
@@ -116,28 +119,63 @@ impl Localization {
             return SharedString::from(formatted.into_owned());
         }
         // Unreachable through a generated accessor: every id it names exists in
-        // the source locale, which is always the last link of the chain. Answer
-        // with the id rather than panicking — a chrome string is never worth a
-        // crash, and the id is a legible thing to see in a screenshot.
-        debug_assert!(false, "localization: no bundle carries `{id}`");
+        // the source locale, which every bundle contains. Answer with the id
+        // rather than panicking — a chrome string is never worth a crash, and
+        // the id is a legible thing to see in a screenshot.
+        debug_assert!(
+            false,
+            "localization: the `{}` bundle has no `{id}`",
+            self.tag
+        );
         SharedString::from(id.to_string())
     }
 }
 
-fn bundle_for(tag: &'static str) -> Option<FluentBundle<Arc<FluentResource>>> {
-    let (_, source) = LOCALES.iter().find(|(t, _)| *t == tag)?;
-    // Both of these were validated at build time: the tag is a directory name
-    // we ship, and the FTL parsed. A failure here means the generated file and
-    // this module disagree, which is a bug rather than a user-facing state.
-    let langid: LanguageIdentifier = tag.parse().ok()?;
-    let resource = FluentResource::try_new((*source).to_string()).ok()?;
+/// Build one locale's bundle: **the English resource, then the locale's own
+/// overriding it.**
+///
+/// Fallback has to live *inside* the bundle rather than in a chain of them,
+/// because Fluent resolves a message reference against one bundle only: a
+/// translated message that says `{ about-title }` reaches nothing if its own
+/// bundle lacks `about-title`, and `format_pattern` then answers with the
+/// reference's error text (`关于 {about-title}`) rather than deferring to a
+/// fallback bundle the chain would have tried next. Merging makes the promised
+/// fallback true by construction — an untranslated message *is* in this bundle,
+/// as English — and leaves no runtime error branch for it to depend on.
+///
+/// The accepted cost: the bundle's locale is the active one, and fluent-bundle
+/// takes plural rules from `locales[0]`, so an *untranslated* message carrying a
+/// plural selector selects with the active locale's categories rather than
+/// English's. That only reaches a string already showing in the wrong language,
+/// and the cure for it is to translate the string.
+fn bundle_for(tag: &'static str) -> FluentBundle<Arc<FluentResource>> {
+    // The tag is a directory name we ship and every locale's FTL parsed at build
+    // time, so neither of these can fail; a failure would mean the generated
+    // file and this module disagree, which is a bug and not a user-facing state.
+    let langid: LanguageIdentifier = tag.parse().unwrap_or_default();
     let mut bundle = FluentBundle::new(vec![langid]);
     // No Unicode isolation marks around placeables: they are invisible
     // directional controls for bidirectional text, we ship no RTL locale, and
     // gpui would have to shape them.
     bundle.set_use_isolating(false);
-    bundle.add_resource(Arc::new(resource)).ok()?;
-    Some(bundle)
+    if let Some(source) = resource_for(SOURCE_LOCALE) {
+        bundle.add_resource(source).ok();
+    }
+    if tag != SOURCE_LOCALE
+        && let Some(translation) = resource_for(tag)
+    {
+        // Whole-message override: this locale's `about-version-label` replaces
+        // English's, while every message it did not translate stays.
+        bundle.add_resource_overriding(translation);
+    }
+    bundle
+}
+
+fn resource_for(tag: &str) -> Option<Arc<FluentResource>> {
+    let (_, source) = LOCALES.iter().find(|(t, _)| *t == tag)?;
+    FluentResource::try_new((*source).to_string())
+        .ok()
+        .map(Arc::new)
 }
 
 thread_local! {
@@ -325,16 +363,19 @@ mod tests {
     }
 
     #[test]
-    fn every_shipped_locale_builds_a_bundle() {
-        // A tag that does not parse as a language identifier, or FTL the
-        // runtime cannot load, would silently drop that locale from its own
-        // chain and render English — the one failure the build-time checks
-        // cannot see.
+    fn every_shipped_locale_carries_the_whole_source_locale() {
+        // The merge is what makes fallback true, so each bundle must actually
+        // hold every source message — a resource the runtime failed to load
+        // would silently answer in English (or, for a reference, not at all),
+        // which the build-time checks cannot see.
         for tag in available_locales() {
-            assert!(
-                bundle_for(tag).is_some(),
-                "`{tag}` did not build a Fluent bundle"
-            );
+            let bundle = bundle_for(tag);
+            for id in MESSAGE_IDS {
+                assert!(
+                    bundle.get_message(id).is_some(),
+                    "the `{tag}` bundle is missing `{id}`"
+                );
+            }
         }
     }
 }

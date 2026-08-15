@@ -194,6 +194,35 @@ fn a_locale_change_notifies_global_observers(cx: &mut TestAppContext) {
     assert_eq!(changes.get(), baseline + 1, "a no-op apply must not notify");
 }
 
+/// A translated message may reference an **untranslated** one, and the
+/// reference has to resolve across that boundary.
+///
+/// `about-window-title` is the live case: every locale translates it, and every
+/// locale reaches through `{ about-title }` for the wordmark, which no locale
+/// translates. Fluent resolves a message reference against one bundle only, so
+/// the whole fallback story has to hold *inside* the bundle the message is
+/// formatted in — a per-message chain would answer with the reference's error
+/// text (`关于 {about-title}`) and never reach the source locale.
+#[gpui::test]
+fn a_translated_message_can_reference_an_untranslated_one(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        i18n::install(cx);
+        assert_eq!(msg::about_window_title(cx).as_ref(), "About Eidola");
+
+        i18n::apply("zh-Hans", cx);
+        assert_eq!(msg::about_window_title(cx).as_ref(), "关于 Eidola");
+
+        i18n::apply("zh-Hant", cx);
+        assert_eq!(msg::about_window_title(cx).as_ref(), "關於 Eidola");
+
+        i18n::apply("es", cx);
+        assert_eq!(msg::about_window_title(cx).as_ref(), "Acerca de Eidola");
+
+        i18n::apply("fr", cx);
+        assert_eq!(msg::about_window_title(cx).as_ref(), "À propos d'Eidola");
+    });
+}
+
 #[gpui::test]
 fn a_locale_we_do_not_ship_leaves_the_active_one_alone(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -270,7 +299,90 @@ fn a_selectors_variable_is_a_parameter_too() {
 #[test]
 fn a_message_reference_carries_the_referenced_messages_variables() {
     let en = parse("en", "inner = v{ $version }\nouter = { inner } —\n");
-    assert_eq!(en.message("outer").unwrap().vars, ["version"]);
+    assert_eq!(
+        codegen::resolve_vars("outer", &en, None).unwrap(),
+        ["version"]
+    );
+}
+
+/// The resolution is done through the same merged view the runtime formats
+/// through, so a translation's reference into an *untranslated* message carries
+/// that message's variables — English's, not this locale's.
+#[test]
+fn a_translations_reference_resolves_through_the_source_locale() {
+    let en = parse("en", "inner = v{ $version }\nouter = { inner } —\n");
+    let es = parse("es", "outer = versión { inner }\n");
+    assert_eq!(
+        codegen::resolve_vars("outer", &es, Some(&en)).unwrap(),
+        ["version"],
+        "the reference reaches English's `inner`, which reads $version"
+    );
+    // And the pair is consistent: English passes $version, so this is allowed.
+    codegen::check_translation(&en, &es).expect("a reference into the source locale is fine");
+}
+
+/// The merge is what makes that reference resolve, and it is also what lets a
+/// translation reach a variable the *call site* never passes — so the check
+/// follows the reference rather than looking only inside the translation.
+#[test]
+fn a_translation_reaching_a_variable_through_the_source_locale_is_a_build_error() {
+    let en = parse("en", "inner = v{ $version }\nouter = plain\n");
+    let es = parse("es", "outer = { inner }\n");
+    let err = codegen::check_translation(&en, &es).expect_err("should refuse");
+    assert!(err.contains("$version"), "{err}");
+    assert!(err.contains("outer"), "{err}");
+}
+
+/// A reference that reaches nothing in either locale would render its own error
+/// text at runtime, so it never reaches runtime.
+#[test]
+fn a_reference_to_a_message_that_exists_nowhere_is_a_build_error() {
+    let en = parse("en", "outer = { nope }\n");
+    let err = codegen::resolve_vars("outer", &en, None).expect_err("should refuse");
+    assert!(err.contains("nope"), "{err}");
+
+    let en = parse("en", "outer = plain\n");
+    let fr = parse("fr", "outer = { nope }\n");
+    let err = codegen::check_translation(&en, &fr).expect_err("should refuse");
+    assert!(err.contains("nope"), "{err}");
+}
+
+/// Fluent gives up on a reference cycle at runtime; the build gives up first.
+#[test]
+fn a_reference_cycle_is_a_build_error() {
+    let en = parse("en", "a = { b }\nb = { a }\n");
+    let err = codegen::resolve_vars("a", &en, None).expect_err("should refuse");
+    assert!(err.contains("cycle"), "{err}");
+}
+
+/// No message may have attributes, so a reference to one could only fail.
+#[test]
+fn an_attribute_reference_is_a_build_error() {
+    let err =
+        codegen::parse_locale("en", "outer = { inner.tooltip }\n").expect_err("should refuse");
+    assert!(err.contains("attribute"), "{err}");
+}
+
+/// Terms stay closed: a term that reached a message could drag a variable
+/// across the merge with nothing to fill it.
+#[test]
+fn a_term_referencing_a_message_is_refused() {
+    let err =
+        codegen::parse_locale("en", "-brand = { other }\nother = Eidola\n").expect_err("refuse");
+    assert!(err.contains("term"), "{err}");
+}
+
+/// A term a locale never defines is unresolvable in that locale's bundle.
+#[test]
+fn a_reference_to_an_undefined_term_is_a_build_error() {
+    let en = parse("en", "hello = { -brand }\n");
+    let err = codegen::resolve_vars("hello", &en, None).expect_err("should refuse");
+    assert!(err.contains("-brand"), "{err}");
+
+    // Defined in the source locale, it resolves for every locale that merges it.
+    let en = parse("en", "-brand = Eidola\nhello = { -brand }\n");
+    let es = parse("es", "hello = Hola, { -brand }\n");
+    codegen::resolve_vars("hello", &es, Some(&en)).expect("the merge supplies the term");
 }
 
 #[test]
