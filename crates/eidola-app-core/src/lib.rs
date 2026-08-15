@@ -2785,21 +2785,26 @@ impl Inner {
         ))
     }
 
-    /// Create a new space by instantiating the (live) default space template:
-    /// the space copies the template's `cascade_limit`, the shared human "User"
-    /// joins as owner, and each template agent participant is copied into a
-    /// fresh per-space instance. This is the single new-space path so every
-    /// space has participants from birth. Returns the new space id.
+    /// Create a new space **under `space_id`** by instantiating the (live)
+    /// default space template: the space copies the template's
+    /// `cascade_limit`, the shared human "User" joins as owner, and each
+    /// template agent participant is copied into a fresh per-space instance.
+    /// This is the single new-space path so every space has participants from
+    /// birth.
+    ///
+    /// The id is an argument rather than minted here because a client can need
+    /// to name the space before the row exists — see [`new_space_id`], the one
+    /// source every caller takes it from.
     async fn instantiate_default_space(
         &self,
         conn: &turso::Connection,
+        space_id: &str,
         title: Option<&str>,
         now: i64,
-    ) -> Result<String, AppError> {
+    ) -> Result<(), AppError> {
         let template_id = self.resolve_default_template_id(conn).await?;
-        let space_id = Uuid::now_v7().to_string();
-        db::instantiate_template(conn, &template_id, &space_id, title, "unlinked", now).await?;
-        Ok(space_id)
+        db::instantiate_template(conn, &template_id, space_id, title, "unlinked", now).await?;
+        Ok(())
     }
 
     /// Resolve the agent participant an inference should be recorded against
@@ -4113,15 +4118,20 @@ impl Inner {
         Ok(removed)
     }
 
-    async fn create_space(&self, title: Option<&str>) -> Result<SpaceInfo, AppError> {
+    async fn create_space(
+        &self,
+        space_id: &str,
+        title: Option<&str>,
+    ) -> Result<SpaceInfo, AppError> {
         let db_conn = self.db_conn().await?;
         let now = now_ms();
-        let space_id = self.instantiate_default_space(&db_conn, title, now).await?;
+        self.instantiate_default_space(&db_conn, space_id, title, now)
+            .await?;
 
         self.bus.emit(Change::SpaceIndex);
 
         Ok(SpaceInfo {
-            id: space_id,
+            id: space_id.to_string(),
             title: title.map(String::from),
             snippet: None,
             created_at: now,
@@ -4247,7 +4257,9 @@ impl Inner {
         } else {
             // A new space is instantiated from the default template, so it has
             // its participants (You + the template agents) from birth.
-            let sid = self.instantiate_default_space(&db_conn, None, now).await?;
+            let sid = new_space_id();
+            self.instantiate_default_space(&db_conn, &sid, None, now)
+                .await?;
             (sid, None, true)
         };
 
@@ -8222,10 +8234,27 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Create a new space from the **default** template, minting its id here.
     pub async fn create_space(&self, title: Option<String>) -> Result<SpaceInfo, AppError> {
+        self.create_space_with_id(new_space_id(), title).await
+    }
+
+    /// Create a new space from the default template **under an id the caller
+    /// already holds** ([`new_space_id`]).
+    ///
+    /// This is the door for a client that has to name the space before the row
+    /// exists: the GUI opens a new conversation window addressed by a real id
+    /// on the frame the keystroke lands, and commits the row behind it. The
+    /// instantiation is the same one `post` performs for a space-less save, so
+    /// a space created this way is indistinguishable from any other.
+    pub async fn create_space_with_id(
+        &self,
+        space_id: String,
+        title: Option<String>,
+    ) -> Result<SpaceInfo, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.create_space(title.as_deref()).await })
+            .spawn(async move { inner.create_space(&space_id, title.as_deref()).await })
             .await
             .map_err(join_err)?
     }
@@ -12320,6 +12349,17 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before epoch")
         .as_millis() as i64
+}
+
+/// Mint the id a new space will be created under.
+///
+/// Every space id comes from here — the ones [`AppCore::create_space`] and
+/// `post` mint for themselves, and the ones a client mints **before** the row
+/// exists and hands back to [`AppCore::create_space_with_id`]. UUIDv7, so ids
+/// stay time-ordered whichever way round the id and the insert happen. Needs
+/// no `AppCore`: naming a space is not a database operation.
+pub fn new_space_id() -> String {
+    Uuid::now_v7().to_string()
 }
 
 /// Parse an ISO 8601 timestamp to epoch ms.

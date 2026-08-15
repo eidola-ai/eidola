@@ -3,8 +3,9 @@
 //! Per `crates/eidola-gui/STATE.md` ("Space entities — shared, registried"),
 //! a `Space` is a long-lived gpui entity owning *everything* about one
 //! conversation: the transcript (`Loadable<Vec<ChatMessageView>>`), the live
-//! streaming turns, and the space id (`None` until the first exchange persists
-//! and assigns one). It is created and shared through
+//! streaming turns, and the space id — which it has from birth, because a
+//! space is created durably when its window opens. It is created and shared
+//! through
 //! [`crate::stores::SpacesStore`]'s registry, so **two windows on the same
 //! space hold the same entity** — a submit/stream in one window appears in the
 //! other, structurally (the wave-2 bug-4 fix).
@@ -384,10 +385,10 @@ pub enum SpaceEvent {
 
 pub struct Space {
     app_core: Option<Arc<AppCore>>,
-    /// The persisted space id. `None` for a blank ⌘N space until its first
-    /// exchange persists and assigns one (at which point the registry adopts
-    /// the entity under that id — see [`crate::stores::SpacesStore`]).
-    id: Option<String>,
+    /// The space id. Always present: a new space's row is committed when its
+    /// window opens, so the registry holds the entity under this key from the
+    /// first frame (see [`crate::stores::SpacesStore`]).
+    id: String,
     /// The conversation transcript.
     transcript: Loadable<Vec<ChatMessageView>>,
     /// The in-flight streaming turns, in start order (`seq` ascending) — the
@@ -518,12 +519,18 @@ pub struct OfferedQuote {
 impl EventEmitter<SpaceEvent> for Space {}
 
 impl Space {
-    /// Construct a blank space (⌘N): no id, empty transcript, instant. The
-    /// registry adopts it once its first exchange assigns an id.
-    pub fn blank(app_core: Option<Arc<AppCore>>) -> Self {
+    /// Construct the entity for a space **this client is creating** (⌘N): the
+    /// id is already minted, the row is being inserted behind us, and there is
+    /// by construction nothing durable to read — so the transcript starts
+    /// answered-and-empty and the page is instant (STATE.md).
+    ///
+    /// If that insert fails, [`Self::creation_failed`] replaces the empty
+    /// answer with the error, so the window says so instead of offering a
+    /// composer that would write nowhere.
+    pub fn created(app_core: Option<Arc<AppCore>>, id: String) -> Self {
         Self {
             app_core,
-            id: None,
+            id,
             transcript: Loadable::loaded(Vec::new()),
             streams: Vec::new(),
             next_turn_seq: 0,
@@ -546,13 +553,31 @@ impl Space {
         }
     }
 
+    /// The insert behind a [`Self::created`] space failed: the id names no
+    /// row, so there is no conversation to show and nothing a composer could
+    /// write into.
+    ///
+    /// The failure lands in the transcript cell — the same door a failed
+    /// *read* of an existing space lands in — so the whole window reads it
+    /// with no second mechanism: `transcript_visible` goes false (no tail
+    /// composer minted against a space that does not exist), and the `Failed`
+    /// event raises the window's error band with what went wrong.
+    pub fn creation_failed(&mut self, error: AppError, cx: &mut Context<Self>) {
+        self.transcript = Loadable::Failed {
+            error: error.clone(),
+            prior: None,
+        };
+        cx.emit(SpaceEvent::Failed(error));
+        cx.notify();
+    }
+
     /// Construct a space bound to an existing id and kick off the initial
     /// transcript load. The load lands via [`Self::apply_loaded_transcript`]
     /// inside the entity, so it serializes against any submit that races it.
     pub fn existing(app_core: Option<Arc<AppCore>>, id: String, cx: &mut Context<Self>) -> Self {
         let mut space = Self {
             app_core: app_core.clone(),
-            id: Some(id.clone()),
+            id,
             transcript: Loadable::NotLoaded,
             streams: Vec::new(),
             next_turn_seq: 0,
@@ -579,7 +604,7 @@ impl Space {
 
     /// A stub space with a fixture transcript (tests). No backend, so async
     /// methods early-return after the local mutation.
-    pub fn stub(id: Option<String>, messages: Vec<ChatMessageView>) -> Self {
+    pub fn stub(id: String, messages: Vec<ChatMessageView>) -> Self {
         Self {
             app_core: None,
             id,
@@ -607,9 +632,9 @@ impl Space {
 
     // -- Readers -----------------------------------------------------------
 
-    /// The persisted space id, if one has been assigned.
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    /// This space's id.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// The transcript cell.
@@ -883,12 +908,7 @@ impl Space {
         if !matches!(self.traces, Loadable::NotLoaded) {
             return;
         }
-        let Some(id) = self.id.clone() else {
-            // A blank space has nothing persisted to disclose. Left
-            // `NotLoaded`, so the index loads the moment its first exchange
-            // assigns an id.
-            return;
-        };
+        let id = self.id.clone();
         let Some(app_core) = self.app_core.clone() else {
             // Stub mode: record an empty index so we don't re-enter each frame
             // (a seeded fixture has already replaced it).
@@ -1036,7 +1056,7 @@ impl Space {
     /// only another window's or the CLI's concurrent post can open. Worth its
     /// own task, with a way to tell our own writes from a stranger's.
     pub fn on_space_changed(&mut self, changed_id: &str, cx: &mut Context<Self>) {
-        if self.id.as_deref() != Some(changed_id) {
+        if self.id != changed_id {
             return;
         }
         if self.is_busy() {
@@ -1105,12 +1125,10 @@ impl Space {
         if !self.is_busy() {
             self.pending_transcript_refresh = false;
         }
-        let Some(id) = self.id.clone() else {
-            return;
-        };
         let Some(app_core) = self.app_core.clone() else {
             return;
         };
+        let id = self.id.clone();
         self.transcript = std::mem::take(&mut self.transcript).to_loading();
         let rx = bridge::get_space_tree(app_core, id);
         self.load_task = Some(cx.spawn(async move |this, cx| {
@@ -1203,7 +1221,6 @@ impl Space {
             .find(|s| s.seq == seq)
             .map(|s| s.response.reasoning.clone());
         self.streams.retain(|s| s.seq != seq);
-        self.id = Some(result.space_id.clone());
         match msgs {
             Ok(messages) => {
                 let attach = captured
@@ -1299,10 +1316,8 @@ impl Space {
 
     /// Shared failure completion for the exclusive mutation runner (submit's
     /// post phase / post-only / edit / regenerate): clear the runner slot,
-    /// drop any synthetic streams, adopt the id a `ChatFailed` wrapper carries
-    /// (blank-space adoption on failure), **restart the transcript load**, and
-    /// emit `Failed` with the unwrapped source so the view's error routing
-    /// sees the real variant.
+    /// drop any synthetic streams, **restart the transcript load**, and emit
+    /// `Failed` so the view's error routing sees it.
     ///
     /// The reload is load-bearing, not defensive: accepting the mutation
     /// cancelled any in-flight transcript load
@@ -1313,29 +1328,22 @@ impl Space {
     /// change) is silently lost, and durable rows committed by the failed
     /// mutation itself (whose `Change::Space` the [`Self::on_space_changed`]
     /// guard dropped while the operation was in flight) never render until
-    /// the next unrelated invalidation (the codex finding on PR #206). A
-    /// pre-persist failure on a blank space has no id, so `load_transcript`
-    /// no-ops — nothing durable exists to reload.
+    /// the next unrelated invalidation (the codex finding on PR #206).
     fn fail_mutation(&mut self, e: AppError, cx: &mut Context<Self>) {
         self.streams.clear();
         self.post_runner = None;
-        if self.id.is_none()
-            && let Some(id) = e.chat_space_id()
-        {
-            self.id = Some(id.to_string());
-        }
         self.load_transcript(cx);
-        cx.emit(SpaceEvent::Failed(e.root().clone()));
+        cx.emit(SpaceEvent::Failed(e));
         cx.notify();
     }
 
     /// Failure completion for one streaming **turn**: remove that turn's
     /// buffers + runner (sibling turns keep streaming untouched), record the
-    /// [`FailedTurn`] so Retry can re-ask the same participant, adopt a
-    /// `ChatFailed` id, restart the transcript load (the same cancelled-load
-    /// debt as [`Self::fail_mutation`]; while siblings still stream the
-    /// restarted load is dropped as stale and their completions re-establish
-    /// the truth instead), and emit `Failed` with the unwrapped source.
+    /// [`FailedTurn`] so Retry can re-ask the same participant, restart the
+    /// transcript load (the same cancelled-load debt as
+    /// [`Self::fail_mutation`]; while siblings still stream the restarted load
+    /// is dropped as stale and their completions re-establish the truth
+    /// instead), and emit `Failed`.
     fn fail_turn(
         &mut self,
         seq: u64,
@@ -1352,13 +1360,8 @@ impl Space {
                 target_action_id: t,
             });
         }
-        if self.id.is_none()
-            && let Some(id) = e.chat_space_id()
-        {
-            self.id = Some(id.to_string());
-        }
         self.load_transcript(cx);
-        cx.emit(SpaceEvent::Failed(e.root().clone()));
+        cx.emit(SpaceEvent::Failed(e));
         cx.notify();
     }
 
@@ -1436,7 +1439,7 @@ impl Space {
             match outcome {
                 Ok(result) => {
                     let space_id = result.post.space_id.clone();
-                    let msgs = bridge::get_space_tree(app_core, space_id.clone())
+                    let msgs = bridge::get_space_tree(app_core, space_id)
                         .await
                         .unwrap_or_else(|_| {
                             Err(AppError::Internal {
@@ -1445,15 +1448,14 @@ impl Space {
                         })
                         .map(views_from_nodes);
                     let _ = this.update(cx, |this, cx| {
-                        this.id = Some(space_id);
                         this.post_runner = None;
                         match msgs {
                             Ok(messages) => {
                                 this.merge_from_db(messages, None);
                                 cx.emit(SpaceEvent::MessagesChanged);
-                                // StreamEnded drives the registry's blank-space
-                                // adoption (it reads id()); the saved post
-                                // earned the id whether or not anyone responds.
+                                // A plain post ends no stream, but it is the
+                                // same "this space settled" announcement the
+                                // view's tail-following reads.
                                 cx.emit(SpaceEvent::StreamEnded);
                             }
                             Err(e) => {
@@ -1622,7 +1624,7 @@ impl Space {
     ) {
         match outcome {
             Ok(space_id) => {
-                let msgs = bridge::get_space_tree(app_core, space_id.clone())
+                let msgs = bridge::get_space_tree(app_core, space_id)
                     .await
                     .unwrap_or_else(|_| {
                         Err(AppError::Internal {
@@ -1631,7 +1633,6 @@ impl Space {
                     })
                     .map(views_from_nodes);
                 let _ = this.update(cx, |this, cx| {
-                    this.id = Some(space_id);
                     this.post_runner = None;
                     match msgs {
                         Ok(messages) => {
@@ -1668,7 +1669,7 @@ impl Space {
     /// started** — the render key of the streaming leaf the answer will grow
     /// in, so the view can select *that branch* (a new sibling of whatever the
     /// target already replied with) rather than merely the target's path.
-    /// `None` when nothing started: a refusal, or a space with no id yet.
+    /// `None` when nothing started (a refusal).
     pub fn ask(
         &mut self,
         participant_id: String,
@@ -1736,7 +1737,7 @@ impl Space {
         cx: &mut Context<Self>,
     ) -> Option<u64> {
         let app_core = self.app_core.clone()?;
-        let space_id = self.id.clone()?;
+        let space_id = self.id.clone();
         let seq = self.mint_turn_seq();
         self.streams.push(StreamingTurn {
             seq,
@@ -2046,22 +2047,19 @@ impl Space {
         cx.notify();
     }
 
-    /// Test-only: complete a **blank** space's first save exactly as
-    /// [`Self::finish_reload`]'s success arm does — adopt the id the write
-    /// assigned, release the exclusive slot, announce the end (which is what
-    /// the registry's blank-space adoption keys off), and discharge the
-    /// deferred-invalidation debt.
+    /// Test-only: complete a save exactly as [`Self::finish_reload`]'s success
+    /// arm does — release the exclusive slot, announce the end, and discharge
+    /// the deferred-invalidation debt.
     ///
     /// The DB reload the real arm performs between those steps is the caller's
     /// to stage (a fixture tree stands in for the one the operation's own
     /// multi-read query captured). What this seam exists to drive is the part
     /// no other seam reaches: an invalidation recorded while the space was
-    /// still **id-less** has to survive the adoption that finally gives it
-    /// something to read. The failure arms need no equivalent —
-    /// [`Self::fail_mutation`] restarts the load unconditionally.
+    /// busy has to be replayed by the exit that clears the busy gate. The
+    /// failure arms need no equivalent — [`Self::fail_mutation`] restarts the
+    /// load unconditionally.
     #[doc(hidden)]
-    pub fn adopt_id_for_test(&mut self, space_id: String, cx: &mut Context<Self>) {
-        self.id = Some(space_id);
+    pub fn finish_save_for_test(&mut self, cx: &mut Context<Self>) {
         self.post_runner = None;
         cx.emit(SpaceEvent::StreamEnded);
         self.settle_transcript_debt(cx);
@@ -2100,7 +2098,7 @@ impl Space {
         cx: &mut Context<Self>,
     ) {
         let result = ChatResult {
-            space_id: self.id.clone().unwrap_or_default(),
+            space_id: self.id.clone(),
             content: String::new(),
             model: String::new(),
             input_tokens: None,

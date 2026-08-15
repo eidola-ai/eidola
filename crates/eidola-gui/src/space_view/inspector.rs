@@ -178,16 +178,16 @@ impl SpaceView {
         cx.notify();
     }
 
-    /// Ask for this space's settings once the panel can show them. Idempotent
-    /// (`ensure` declines when a snapshot exists), and run again each frame the
-    /// panel renders — a blank ⌘N space has no id to fetch by until its first
-    /// post adopts one, and that moment is not a toggle.
+    /// Ask for this space's settings when the panel opens. Idempotent
+    /// (`ensure` declines when a snapshot exists, and a failed read is retried
+    /// through [`SpaceView::inspector_retry_settings`] rather than re-requested
+    /// on a timer), so opening is the only moment that has to ask: the space
+    /// this panel annotates has an id from the frame its window opened.
     fn ensure_inspector_settings(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.space.read(cx).id().map(str::to_string) {
-            self.stores
-                .space_settings
-                .update(cx, |s, cx| s.ensure(id, cx));
-        }
+        let id = self.space.read(cx).id().to_string();
+        self.stores
+            .space_settings
+            .update(cx, |s, cx| s.ensure(id, cx));
     }
 
     /// The conversation pane's width this frame (test seam): what the split
@@ -236,16 +236,14 @@ impl SpaceView {
     fn inspector_settings(
         &self,
         cx: &gpui::App,
-    ) -> Option<crate::loadable::Loadable<eidola_app_core::SpaceSettings>> {
-        let id = self.space.read(cx).id()?;
-        Some(self.stores.space_settings.read(cx).settings(id).clone())
+    ) -> crate::loadable::Loadable<eidola_app_core::SpaceSettings> {
+        let id = self.space.read(cx).id();
+        self.stores.space_settings.read(cx).settings(id).clone()
     }
 
     /// The cascade limit currently shown, if the settings have loaded.
     pub(crate) fn inspector_cascade(&self, cx: &gpui::App) -> Option<i64> {
-        self.inspector_settings(cx)?
-            .value()
-            .map(|s| s.cascade_limit)
+        self.inspector_settings(cx).value().map(|s| s.cascade_limit)
     }
 
     #[doc(hidden)]
@@ -257,7 +255,7 @@ impl SpaceView {
     /// loaded, inner `None` = Off (test seam).
     #[doc(hidden)]
     pub fn inspector_router_for_test(&self, cx: &gpui::App) -> Option<Option<String>> {
-        self.inspector_settings(cx)?
+        self.inspector_settings(cx)
             .value()
             .map(|s| s.router_model.clone())
     }
@@ -271,9 +269,7 @@ impl SpaceView {
     // -- Writes ------------------------------------------------------------
 
     pub(crate) fn inspector_step_cascade(&mut self, delta: i64, cx: &mut Context<Self>) {
-        let Some(space_id) = self.space.read(cx).id().map(str::to_string) else {
-            return;
-        };
+        let space_id = self.space.read(cx).id().to_string();
         let Some(current) = self.inspector_cascade(cx) else {
             return; // nothing loaded yet — a stepper with no value writes nothing
         };
@@ -289,9 +285,7 @@ impl SpaceView {
 
     pub(crate) fn inspector_set_router(&mut self, model_id: Option<&str>, cx: &mut Context<Self>) {
         self.inspector_router_picker = false;
-        let Some(space_id) = self.space.read(cx).id().map(str::to_string) else {
-            return;
-        };
+        let space_id = self.space.read(cx).id().to_string();
         let value = model_id.map(str::to_string);
         self.stores
             .space_settings
@@ -333,11 +327,10 @@ impl SpaceView {
     }
 
     pub(crate) fn inspector_retry_settings(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.space.read(cx).id().map(str::to_string) {
-            self.stores
-                .space_settings
-                .update(cx, |s, cx| s.refresh(id, cx));
-        }
+        let id = self.space.read(cx).id().to_string();
+        self.stores
+            .space_settings
+            .update(cx, |s, cx| s.refresh(id, cx));
         cx.notify();
     }
 
@@ -346,9 +339,7 @@ impl SpaceView {
     /// the field re-seeds from the stored value on the next frame it is not
     /// being typed in.
     pub fn inspector_commit_title(&mut self, cx: &mut Context<Self>) {
-        let Some(space_id) = self.space.read(cx).id().map(str::to_string) else {
-            return;
-        };
+        let space_id = self.space.read(cx).id().to_string();
         let Some((state, _)) = self.inspector_title.as_ref() else {
             return;
         };
@@ -418,7 +409,6 @@ impl SpaceView {
         if layout == InspectorLayout::Hidden {
             return Vec::new();
         }
-        self.ensure_inspector_settings(cx);
         self.sync_inspector_title(window, cx);
         // The panel meets the window's right edge in both forms, so it owns
         // those corner notches under Linux CSD (no-ops elsewhere).
@@ -524,7 +514,7 @@ impl SpaceView {
                                     .pb_5()
                                     .gap_3()
                                     .child(self.render_inspector_space_section(cx))
-                                    .children(self.render_inspector_participants_section(cx)),
+                                    .child(self.render_inspector_participants_section(cx)),
                             ),
                     )
                     .child(crate::scrollbar::vertical(
@@ -551,34 +541,8 @@ impl SpaceView {
                 .child("Space"),
         );
 
-        // A blank ⌘N space has no id yet, so it has no settings row to edit.
-        // Say so rather than showing controls that would write nowhere.
-        let Some(cell) = self.inspector_settings(cx) else {
-            return col
-                .child(
-                    div()
-                        .id("space-inspector-unsaved")
-                        .probe_value(
-                            "space/inspector/unsaved",
-                            gpui::Role::Label,
-                            "Space settings",
-                            "This space is saved with its first post. Its settings appear then.",
-                        )
-                        .text_xs()
-                        .text_color(muted)
-                        .child(
-                            "This space is saved with its first post. Its settings appear then.",
-                        ),
-                )
-                .into_any_element();
-        };
-
-        let space_id = self
-            .space
-            .read(cx)
-            .id()
-            .map(str::to_string)
-            .unwrap_or_default();
+        let cell = self.inspector_settings(cx);
+        let space_id = self.space.read(cx).id().to_string();
         // **Both** of this panel's write refusals, from either store it writes
         // to: the title (`SpacesStore`, which owns the Library index) and the
         // settings rows (`SpaceSettingsStore`). They are different facts about

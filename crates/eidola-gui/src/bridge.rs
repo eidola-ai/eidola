@@ -114,12 +114,12 @@ pub fn respond_stream_as(
 pub fn submit(
     core: Arc<AppCore>,
     text: String,
-    space_id: Option<String>,
+    space_id: String,
     reply_to: Option<String>,
     references: Vec<ReferenceSpec>,
 ) -> oneshot::Receiver<Result<SubmitResult, AppError>> {
     spawn_oneshot(core, move |core| async move {
-        core.submit_with_references(text, space_id, reply_to, references)
+        core.submit_with_references(text, Some(space_id), reply_to, references)
             .await
     })
 }
@@ -144,17 +144,17 @@ pub fn plan_notifications(
 }
 
 /// Save a post without requesting a response (the save side of save-vs-request:
-/// `⌘⇧↩`). Creates the space when `space_id` is `None`; needs no credential.
-/// `reply_to`, when set, branches off that post (vs the linear tail).
+/// `⌘⇧↩`). Needs no credential. `reply_to`, when set, branches off that post
+/// (vs the linear tail).
 pub fn post(
     core: Arc<AppCore>,
     prompt: String,
-    space_id: Option<String>,
+    space_id: String,
     reply_to: Option<String>,
     references: Vec<ReferenceSpec>,
 ) -> oneshot::Receiver<Result<PostResult, AppError>> {
     spawn_oneshot(core, move |core| async move {
-        core.post_with_references(prompt, space_id, reply_to, references)
+        core.post_with_references(prompt, Some(space_id), reply_to, references)
             .await
     })
 }
