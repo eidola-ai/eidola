@@ -731,6 +731,42 @@ pub(crate) fn engine_key_for_id(id: &str) -> EngineKey {
     }
 }
 
+/// What a model URL resolves to: where the bytes come from, the file they
+/// land in, and the **slug that identifies the transfer**.
+///
+/// The slug is the identity [`AppCore::download_local_model`] deduplicates on,
+/// so it is also the only honest key for a caller that wants to know whether a
+/// transfer is already under way: equivalent spellings of one model (a Hugging
+/// Face `/blob/` page versus its `/resolve/` object, a `?download=true`
+/// suffix, any two URLs naming the same file) collapse onto it exactly as they
+/// collapse in app-core's own map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelDownloadTarget {
+    /// The URL the bytes are fetched from (normalized).
+    pub url: String,
+    /// The file name they are written under.
+    pub file_name: String,
+    /// The `<slug>` of the resulting `<slug>@local` id — the transfer's identity.
+    pub slug: String,
+}
+
+/// Resolve a pasted or curated model URL to its [`ModelDownloadTarget`].
+///
+/// **The single derivation of a download's identity.** `download_local_model`
+/// resolves through it, and so must anything outside app-core that keys work
+/// on "this download" — a caller that keys on the raw URL instead lets one
+/// transfer be requested twice under two spellings, which is the duplicate
+/// app-core would then refuse.
+pub fn resolve_model_download(input: &str) -> Result<ModelDownloadTarget, AppError> {
+    let (url, file_name) = normalize_model_url(input)?;
+    let slug = slug_for_file(&file_name);
+    Ok(ModelDownloadTarget {
+        url,
+        file_name,
+        slug,
+    })
+}
+
 /// Normalize a pasted model URL into `(download_url, file_name)`.
 ///
 /// Accepts direct `.gguf` URLs and Hugging Face `/blob/` page URLs (the
@@ -1272,8 +1308,11 @@ impl Inner {
     /// [`Change::LocalModels`] emissions. If the URL matches a curated
     /// catalog entry its display name is adopted.
     pub(crate) async fn download_local_model(&self, url: &str) -> Result<String, AppError> {
-        let (download_url, file_name) = normalize_model_url(url)?;
-        let slug = slug_for_file(&file_name);
+        let ModelDownloadTarget {
+            url: download_url,
+            file_name,
+            slug,
+        } = resolve_model_download(url)?;
         let id = engine_model_id(crate::backends::LOCAL_BACKEND_ID, &slug);
         let dir = models_dir(&self.data_dir);
 
@@ -2130,6 +2169,28 @@ mod tests {
             "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf"
         );
         assert_eq!(name, "gemma-4-12b-it-qat-q4_0.gguf");
+    }
+
+    /// Equivalent spellings of one model resolve to one transfer identity.
+    /// Callers key work on that slug — a key taken from the raw text would let
+    /// the same transfer be requested twice, once per spelling.
+    #[test]
+    fn equivalent_spellings_resolve_to_one_slug() {
+        let base = "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf";
+        let file = "gemma-4-12b-it-qat-q4_0.gguf";
+        let spellings = [
+            format!("{base}/resolve/main/{file}"),
+            format!("{base}/blob/main/{file}"),
+            format!("{base}/blob/main/{file}?download=true"),
+            format!("{base}/resolve/main/{file}#fragment"),
+            format!("  {base}/resolve/main/{file}  "),
+        ];
+        let first = resolve_model_download(&spellings[0]).expect("resolves");
+        assert_eq!(first.slug, "gemma-4-12b-it-qat-q4_0");
+        for spelling in &spellings[1..] {
+            let target = resolve_model_download(spelling).expect("resolves");
+            assert_eq!(target, first, "`{spelling}` names the same transfer");
+        }
     }
 
     #[test]

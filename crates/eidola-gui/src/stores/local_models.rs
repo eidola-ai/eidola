@@ -180,18 +180,41 @@ impl LocalModelsStore {
         self.op_tasks.contains_key(&Self::download_key(url))
     }
 
+    /// The pending slot's key for a download URL.
+    ///
+    /// **It is the identity app-core deduplicates on, never the spelling a
+    /// door happened to hold** — `resolve_model_download` maps every
+    /// equivalent spelling of one model (a Hugging Face `/blob/` page and its
+    /// `/resolve/` object, a `?download=true` suffix, any two URLs naming the
+    /// same file) onto the one slug app-core keys its transfer map by. The two
+    /// **must** agree: a key that separates what app-core joins lets a second
+    /// door miss the pending lookup, reach app-core, and publish its
+    /// "already downloading" refusal over the transfer that is working —
+    /// exactly the race [`Self::download`]'s non-reentrancy exists to prevent.
+    /// Every read and write of the slot goes through here, so there is one
+    /// derivation and no place for a raw URL to slip back in.
+    ///
+    /// A URL app-core would reject (not a `.gguf`, not http) has no transfer
+    /// identity to key on, so the trimmed text stands in — enough to make a
+    /// repeat of that very paste a no-op while the first is being refused, and
+    /// the refusal is what the reader wants either way. The `?` prefix cannot
+    /// collide with a slug, whose characters app-core restricts.
     fn download_key(url: &str) -> String {
-        format!("download:{url}")
+        match eidola_app_core::resolve_model_download(url) {
+            Ok(target) => format!("download:{}", target.slug),
+            Err(_) => format!("download:?{}", url.trim()),
+        }
     }
 
     /// Start a model download (curated entry or pasted URL). The transfer
     /// itself is core-owned; progress arrives via `Change::LocalModels`.
     ///
-    /// **Not re-entrant for a URL whose transfer is already being started.**
-    /// Several surfaces open onto this one operation — a failed row's Retry,
-    /// the curated catalog's Download, the paste-a-URL row — and they all ask
-    /// for the *same* thing with the same argument, so a second call is one
-    /// request twice rather than a newer intent. [`Self::run_op`]'s keep-newest
+    /// **Not re-entrant for a transfer that is already being started**
+    /// ([`Self::download_key`] decides what "the same transfer" means, and
+    /// answers as app-core does). Several surfaces open onto this one
+    /// operation — a failed row's Retry, the curated catalog's Download, the
+    /// paste-a-URL row — and they all ask for the *same* thing, so a second
+    /// call is one request twice rather than a newer intent. [`Self::run_op`]'s keep-newest
     /// supersede is the wrong shape for that: the second `op_tasks.insert`
     /// drops the first continuation while the core call it issued runs on, and
     /// app-core then refuses the duplicate ("already downloading") — a failure
