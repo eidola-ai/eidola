@@ -2311,12 +2311,21 @@ fn a_window_closed_over_its_own_insert_still_leaves_nothing_behind(cx: &mut Test
     );
 }
 
-/// **A window that took the space back outranks a pending disposal.** The
-/// entity outlives the frame its last window closes in, so the question is
-/// asked in the disposal's own task — by which time a registry entry that still
-/// upgrades can only mean a new window is drawing this conversation.
+/// **A reopen that lands before the verdict is asked for cancels the
+/// disposal** — and the window it opened is released to work normally.
+///
+/// Store calls and every stretch of a spawned task between its `await` points
+/// run on gpui's main thread, and `bridge` issues its core call on the first
+/// poll of the future being awaited — so the disposal's registry recheck and
+/// the issuance of the delete are one uninterrupted segment. A reopen can only
+/// land on one side of it. This is the *before* side: the recheck upgrades a
+/// live entity, nothing is judged, and the entity — which `open` constructed
+/// with its row undecided, because a disposal was in flight for that id — is
+/// told the row is there. The submit at the end is what proves the release:
+/// a save waits on exactly that gate, so a space left undecided would hang
+/// instead of writing.
 #[gpui::test]
-fn a_space_a_window_took_back_is_not_disposed_of(cx: &mut TestAppContext) {
+fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
     let (stores, _dir) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
@@ -2334,6 +2343,15 @@ fn a_space_a_window_took_back_is_not_disposed_of(cx: &mut TestAppContext) {
     let reopened = stores
         .spaces
         .update(cx, |s, cx| s.open(space_id.clone(), cx));
+    assert!(
+        reopened.read_with(cx, |s, _| s.row_undecided_for_test()),
+        "the window opens undecided — a disposal is in flight for this id, so \
+         its reads and writes queue behind the verdict rather than racing it"
+    );
+    assert!(
+        !reopened.read_with(cx, |s, _| s.transcript_visible()),
+        "and it has answered nothing, so no composer stands over it"
+    );
 
     settle(cx);
     assert!(
@@ -2346,7 +2364,96 @@ fn a_space_a_window_took_back_is_not_disposed_of(cx: &mut TestAppContext) {
             .read_with(cx, |s, _| s.disposed_for_test().is_empty()),
         "and app-core was never asked to delete it"
     );
-    drop(reopened);
+
+    // Released, not merely un-deleted: a save waits on the same gate.
+    assert!(reopened.update(cx, |s, cx| {
+        s.submit("The tide is the moon's doing.".into(), None, Vec::new(), cx)
+    }));
+    wait_until(cx, "the post lands in the space that was kept", |_| {
+        core.runtime()
+            .block_on(core.get_space_messages(space_id.clone()))
+            .is_ok_and(|m| m.len() == 1)
+    });
+}
+
+/// **A window that opens while a verdict is outstanding waits for it, and then
+/// reports it** — the *after* side of that same segment boundary, where the
+/// delete is already travelling and `open` may not proceed blind.
+///
+/// The store cannot stage this arm: a window opened before the recheck cancels
+/// the disposal outright (the test above), so "gated **and** deleted" is
+/// unreachable from there — which is itself the point. So the two halves are
+/// driven directly: an entity constructed the way `open` constructs one inside
+/// the window, and the verdict the disposal's task delivers to it. What must
+/// hold is that nothing escapes in either direction — no read answers, no write
+/// reaches the database, and when the verdict is *taken* the window says so
+/// rather than offering a composer over nothing.
+#[gpui::test]
+fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestAppContext) {
+    use eidola_gui::space::Space;
+
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space_id = core
+        .runtime()
+        .block_on(core.create_space(None))
+        .expect("create space")
+        .id;
+
+    // Exactly what `SpacesStore::open` builds when a disposal is in flight.
+    let app_core = stores.app_core();
+    let space = cx.new(|cx| Space::existing(app_core, space_id.clone(), true, cx));
+    assert!(space.read_with(cx, |s, _| s.row_undecided_for_test()));
+    assert!(
+        !space.read_with(cx, |s, _| s.transcript_visible()),
+        "no read has answered, so no composer is minted"
+    );
+
+    // A save issued into that window is accepted on the frame and held.
+    assert!(space.update(cx, |s, cx| {
+        s.submit("The tide is the moon's doing.".into(), None, Vec::new(), cx)
+    }));
+    settle(cx);
+    assert_eq!(
+        core.runtime()
+            .block_on(core.get_space_messages(space_id.clone()))
+            .unwrap()
+            .len(),
+        0,
+        "and nothing reached the database while the verdict was outstanding"
+    );
+
+    // The verdict: the space was untouched, and it is gone.
+    assert!(
+        core.runtime()
+            .block_on(core.discard_if_pristine(space_id.clone()))
+            .unwrap()
+    );
+    space.update(cx, |s, cx| {
+        s.row_is_gone(
+            eidola_app_core::error::AppError::NotConfigured {
+                message: "This conversation was empty and untouched, so it was \
+                          discarded when its last window closed."
+                    .into(),
+            },
+            cx,
+        )
+    });
+    settle(cx);
+
+    assert!(
+        !space.read_with(cx, |s, _| s.row_undecided_for_test()),
+        "the verdict settled the gate rather than leaving the window waiting"
+    );
+    assert!(
+        !space.read_with(cx, |s, _| s.transcript_visible()),
+        "the window reports the conversation is gone; it never offers a \
+         composer over a space that does not exist"
+    );
+    assert!(
+        !space_row_exists(&core, &space_id),
+        "and the held save never resurrected it"
+    );
 }
 
 /// Give work that is *not* supposed to happen a real chance to happen.
