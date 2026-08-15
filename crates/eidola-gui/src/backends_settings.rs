@@ -1243,7 +1243,7 @@ impl BackendsSettingsView {
                         .italic()
                         .text_color(theme.muted_foreground)
                         .flex_none()
-                        .child("starting…"),
+                        .child(msg::local_model_retry_starting(cx)),
                 );
             } else {
                 let url = entry.url;
