@@ -122,6 +122,10 @@ fn a_missing_translation_falls_back_to_the_source_locale(cx: &mut TestAppContext
         i18n::apply("zh-Hans", cx);
         assert_eq!(i18n::active_locale(cx), "zh-Hans");
         assert_eq!(msg::about_version_label(cx).as_ref(), "版本");
+        // The window's OS-level name localizes with the rest of the surface,
+        // even though it paints nothing (it names the window for the Window
+        // menu, the window switcher, and VoiceOver).
+        assert_eq!(msg::about_window_title(cx).as_ref(), "关于 Eidola");
         // Untranslated: the source locale answers.
         assert_eq!(msg::about_title(cx).as_ref(), "Eidola");
 
@@ -148,6 +152,46 @@ fn without_the_global_every_lookup_answers_in_english(cx: &mut TestAppContext) {
             "an argument reaches the pattern through the fallback path too"
         );
     });
+}
+
+/// A locale change has to reach the strings that live *outside* a view's
+/// render — the OS window titles, set once at open. `run()` hangs that re-set
+/// off `observe_global::<Localization>`, so `apply` must notify, and must not
+/// notify when the active locale did not actually move (which would re-title
+/// windows for nothing).
+///
+/// This observes the trigger rather than the effect: gpui's test platform does
+/// not record a window title (`PlatformWindow::get_title` keeps its empty
+/// default there) and `Window::a11y` is crate-private, so the title itself is
+/// not readable from a test.
+#[gpui::test]
+fn a_locale_change_notifies_global_observers(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let changes = Rc::new(Cell::new(0usize));
+    cx.update(|cx| {
+        i18n::install(cx);
+        let changes = changes.clone();
+        cx.observe_global::<i18n::Localization>(move |_| changes.set(changes.get() + 1))
+            .detach();
+    });
+    cx.run_until_parked();
+    let baseline = changes.get();
+
+    cx.update(|cx| i18n::apply("fr", cx));
+    cx.run_until_parked();
+    assert_eq!(
+        changes.get(),
+        baseline + 1,
+        "a real locale change must reach the window titles"
+    );
+
+    // Re-applying the locale already active changes nothing, so nothing is
+    // re-titled for it.
+    cx.update(|cx| i18n::apply("fr", cx));
+    cx.run_until_parked();
+    assert_eq!(changes.get(), baseline + 1, "a no-op apply must not notify");
 }
 
 #[gpui::test]

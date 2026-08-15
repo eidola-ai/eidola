@@ -7,6 +7,12 @@
 
 about-title = Eidola
 
+# The window's OS-level name. It paints nothing (the title bar is transparent
+# and the title hidden) but it names the window in the macOS Window menu, the
+# window switcher, and VoiceOver's window chooser, and labels the accessibility
+# tree's root node — so it is part of the window's accessible surface.
+about-window-title = About Eidola
+
 about-version-label = Version
 about-version-value = v{ $version }
 
