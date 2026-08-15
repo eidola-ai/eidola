@@ -89,8 +89,11 @@ objc2-service-management = { version = "0.3", features = ["SMAppService"] }
 
 [build-dependencies]
 # `build.rs` parses every locale's FTL and generates the typed accessors from
-# the English source (see `build_support/codegen.rs`).
+# the English source (see `build_support/codegen.rs`). `unic-langid` is the same
+# parser the runtime builds bundles with, used here to refuse a locale directory
+# whose name is not a canonical language tag.
 fluent-syntax = "0.12"
+unic-langid = "0.9"
 
 [dev-dependencies]
 # The same parser the build script uses: `tests/i18n.rs` includes

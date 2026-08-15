@@ -89,6 +89,9 @@ fn read_locale_sources(dir: &Path) -> Result<Vec<(String, String)>, String> {
             .to_str()
             .ok_or_else(|| format!("non-UTF-8 locale directory in {}", dir.display()))?
             .to_string();
+        // The directory name *is* the locale's tag at runtime, so it has to be
+        // one the runtime and negotiation will both recognize.
+        codegen::validate_locale_tag(&tag)?;
 
         let mut files = BTreeMap::new();
         let inner = fs::read_dir(entry.path())

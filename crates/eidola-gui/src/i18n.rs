@@ -362,6 +362,33 @@ mod tests {
         assert!(shipped(ZH_HANT).is_some());
     }
 
+    /// A locale nothing can negotiate to is a translation shipped inside the
+    /// binary that no reader could ever see. The build refuses a directory whose
+    /// name is not a canonical tag (`codegen::validate_locale_tag`); this is the
+    /// same claim stated where it is actually observable — through negotiation.
+    #[test]
+    fn every_shipped_locale_is_reachable_by_negotiation() {
+        for tag in available_locales() {
+            assert_eq!(
+                negotiate(&[tag.to_string()]),
+                tag,
+                "nothing negotiates to `{tag}`"
+            );
+            // Compared as *strings*, deliberately: `LanguageIdentifier`'s own
+            // `PartialEq<&str>` re-parses the right-hand side, so it would call
+            // `zh-hans` equal to `zh-Hans` and prove nothing about spelling.
+            let canonical = tag
+                .parse::<LanguageIdentifier>()
+                .map(|id| id.to_string())
+                .unwrap_or_default();
+            assert_eq!(
+                canonical.as_str(),
+                tag,
+                "`{tag}` is not a canonical language tag"
+            );
+        }
+    }
+
     #[test]
     fn every_shipped_locale_carries_the_whole_source_locale() {
         // The merge is what makes fallback true, so each bundle must actually
