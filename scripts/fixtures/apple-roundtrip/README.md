@@ -2,7 +2,7 @@
 
 Committed inputs for `crates/eidola-apple/tests/placement.rs`. The golden `apply` test runs in plain `cargo test` on **any** platform: reproducing the fixtures needs macOS and `codesign`, but consuming them needs neither. If `apply` ever starts requiring a macOS tool, the Linux `rust-checks` job goes red — which is the property the detached-signature design was chosen for.
 
-`round-trip.md` beside them is the measurement they encode — its result and verdict, and the document the harness and the classifier cite by section.
+`round-trip.md` beside them is the measurement they encode — its result and verdict, and the document the harness and the classifier cite by section. It describes the measurement as it was made, with the Python detacher and placer that were written as instruments; `crates/eidola-apple`, driven through `release-tool apple detach|apply`, has since subsumed both, and the harness and the recipes below run the crate. See the addendum at the end of `round-trip.md`.
 
 Measured and generated on macOS 26.5.2 (25F84), Xcode CLT 26.6.0.0.1781586589. Signature layout is a moving target across macOS releases; regenerate and re-measure rather than hand-edit, and record the new version here.
 
@@ -20,13 +20,13 @@ A two-slice (x86_64 + arm64) universal Mach-O, small enough to commit whole, car
 | `facts.json` | `scripts/macho_facts.py` output for all three Mach-Os, so a test can assert one named field rather than diff whole files |
 | `Info.plist`, `ent.plist` | the bundle identity and the entitlements used to grow the signature; kept so the fixture can be regenerated |
 
-The test is `apply(settled/Fixture.app, detached/Fixture.app) == signed/Fixture.app`, byte for byte. `scripts/apple-place.py` already satisfies it from the placement record alone, so the fixture is a golden the implementation can be held to rather than a hope.
+The test is `apply(settled/Fixture.app, detached/) == signed/Fixture.app`, byte for byte, from the placement record alone. `apply` takes the detached *root* — the directory holding `eidola-placement.json` — not the app tree inside it.
 
 It is a `.app` rather than a bare Mach-O for one reason: `signapple apply` can only reach a fat Mach-O through the bundle path (see the last section), so the differential half of the test needs a bundle. `unsettled.macho` is the one bare file, and it is only ever read, never applied to.
 
 ## Note on the one input placement cannot reach
 
-Placing a recorded layout *rewrites* load commands; it never inserts one. So the input must already carry an `LC_CODE_SIGNATURE` per slice, at the same offset the record names — which is exactly what the real artifact has, because `autoSignDarwinBinariesHook` ad-hoc signs every slice during the Nix build. `unsettled.macho`'s x86_64 slice has never been signed at all, and `apple-place.py` refuses it by name rather than producing a wrong file:
+Placing a recorded layout *rewrites* load commands; it never inserts one. So the input must already carry an `LC_CODE_SIGNATURE` per slice, at the same offset the record names — which is exactly what the real artifact has, because `autoSignDarwinBinariesHook` ad-hoc signs every slice during the Nix build. `unsettled.macho`'s x86_64 slice has never been signed at all, and `apply` refuses it by name rather than producing a wrong file:
 
 ```text
 x86_64: input slice carries no LC_CODE_SIGNATURE; placement rewrites that
@@ -54,7 +54,8 @@ rm -rf settled/Fixture.app/Contents/_CodeSignature
 
 cp -R settled/Fixture.app/. signed/Fixture.app/
 codesign --force --sign - --options runtime --entitlements ent.plist signed/Fixture.app
-python3 ../../../apple-detach.py signed/Fixture.app detached settled/Fixture.app
+cargo run -q -p release-tool -- apple detach \
+  signed/Fixture.app settled/Fixture.app detached
 
 python3 -c '
 import json, sys
@@ -72,7 +73,9 @@ print(json.dumps(out, indent=2, sort_keys=True))' > facts.json
 
 The last step is not optional. `facts.json` records hashes, sizes, offsets and signature metadata for **these exact three Mach-Os**, and the golden test reads it as the description of the binaries beside it. A compiler or `codesign` change moves the binaries, so regenerating without rebuilding `facts.json` commits a fixture tree that disagrees with itself — and the disagreement is silent, because the stale file still parses.
 
-Re-running the recipe is otherwise safe on an existing tree: `apple-detach.py` clears the bundle it is about to write (and the one a previous `eidola-placement.json` names) before regenerating, so a slice, executable, seal or ticket the new input no longer has cannot survive as a stale `.archsign` for `signapple apply` to consume.
+Re-running the recipe is otherwise safe on an existing tree: `detach` clears the bundle it is about to write (and the one a previous `eidola-placement.json` names) before regenerating, so a slice, executable, seal or ticket the new input no longer has cannot survive as a stale `.archsign` for `signapple apply` to consume.
+
+`eidola-placement.json` is written by `release-tool apple detach`; regenerate it with that command rather than hand-editing, so the committed record stays exactly what the shipping detacher emits.
 
 ## `llama-server/`
 

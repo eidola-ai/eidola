@@ -15,7 +15,11 @@ while IFS= read -r path; do
       rust=true
       apple=true
       markdown=true ;;
-    scripts/verify-apple.sh|scripts/test-verify-apple.sh|scripts/test-apple-detach.py|scripts/test-apple-place.py|scripts/apple-detach.py|scripts/apple-place.py|scripts/macho_facts.py|scripts/fixtures/apple-roundtrip/*)
+    # Glob rather than an enumeration so a script added under `scripts/` with
+    # `apple` in its path is gated by existence, not by remembering to list
+    # it. `macho_facts.py` is the one Apple instrument whose name does not
+    # carry the word.
+    scripts/*apple*|scripts/macho_facts.py)
       apple=true ;;
     *.md|.rumdl.toml) : ;;
     .github/*|docs/*|www/*|scripts/*|*.sh|justfile) : ;;

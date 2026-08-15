@@ -27,6 +27,15 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
+# Detaching and placing are the shipping crate, driven through its CLI, so the
+# implementation that ships is the one graded against real bundles here.
+# `macho_facts.py` and `apple_linkedit_diff.py` stay Python: they only read and
+# classify, and using the implementation as its own instrument would make the
+# measurement circular.
+apple_tool() { (cd "$REPO_ROOT" && cargo run -q -p release-tool -- apple "$@"); }
+echo "==> cargo build -p release-tool"
+(cd "$REPO_ROOT" && cargo build -q -p release-tool)
+
 APP_SRC="${1:-}"
 if [[ -z "$APP_SRC" ]]; then
   echo "==> nix build .#eidola-gui-macos-universal (this is slow)"
@@ -201,11 +210,11 @@ echo "=== (b) detach -> signapple apply ==="
 # `signapple sign --detach` is not the detach side here: it takes a PKCS#12,
 # which a non-exportable Developer ID key on a hardware token can never
 # supply, and it does not sign or seal a second Mach-O in Contents/MacOS.
-# So `codesign` signs (S1, above) and scripts/apple-detach.py lifts the
+# So `codesign` signs (S1, above) and `release-tool apple detach` lifts the
 # superblobs into signapple's layout; signapple's `apply` stays the
 # independent implementation. This is exactly the equation the design
 # rests on: apply(unsigned, detached) == shipped.
-python3 "$REPO_ROOT/scripts/apple-detach.py" "$S1" "$WORK/detached" "$U" >/dev/null
+apple_tool detach "$S1" "$U" "$WORK/detached" >/dev/null
 A="$(stage A)"
 "$SIGNAPPLE" apply --no-verify "$A" "$WORK/detached/$APP_NAME" >/dev/null
 
@@ -270,7 +279,7 @@ SS="$WORK/SS/$APP_NAME"; rm -rf "$WORK/SS"; mkdir -p "$WORK/SS"; cp -R "$SB" "$S
 SA_="$WORK/SA/$APP_NAME"; rm -rf "$WORK/SA"; mkdir -p "$WORK/SA"; cp -R "$SB" "$SA_"
 chmod -R u+w "$SS" "$SA_"
 sign_adhoc "$SS"
-python3 "$REPO_ROOT/scripts/apple-detach.py" "$SS" "$WORK/detached-settled" "$SB" >/dev/null
+apple_tool detach "$SS" "$SB" "$WORK/detached-settled" >/dev/null
 "$SIGNAPPLE" apply --no-verify "$SA_" "$WORK/detached-settled/$APP_NAME" >/dev/null
 # Exactness of one applied bundle — this is what (d) may excuse a verification
 # failure with, and it is a property of that bundle alone. Two round trips are
@@ -316,8 +325,8 @@ echo "=== (b++) the latent case: a replacing signature of a different size ==="
 # spans more than 16 KiB of signature growth, so some size must cross; if
 # none does, the harness has stopped testing what it advertises and says so
 # instead of reporting an exact round trip. Nothing else here consumes
-# scripts/fixtures/apple-roundtrip/ — those are inputs for the planned
-# `eidola-apple` crate's test, not a substitute for exercising the case now.
+# scripts/fixtures/apple-roundtrip/ — the synthetic fixture is the crate's
+# committed golden, not a substitute for exercising the case on a real bundle.
 boundary_state() { # boundary_state <mach-o> -> crossed|aligned|absent
   python3 "$FACTS" "$1" | python3 -c '
 import json, sys
@@ -345,7 +354,7 @@ for pad in 0 800 1600 2400 3200 4000 4800 5600 6400 7200 8000 8800 9600 10400; d
   ent_plist "$pad"
   codesign --force --sign - --options runtime --entitlements "$WORK/ent.plist" "$PS/$SIDE" 2>/dev/null
   codesign --force --sign - --options runtime --entitlements "$WORK/ent.plist" "$PS" 2>/dev/null
-  python3 "$REPO_ROOT/scripts/apple-detach.py" "$PS" "$WORK/det-boundary" "$SB" >/dev/null
+  apple_tool detach "$PS" "$SB" "$WORK/det-boundary" >/dev/null
   "$SIGNAPPLE" apply --no-verify "$PA" "$WORK/det-boundary/$APP_NAME" >/dev/null 2>&1
   # The padding grows the sidecar's signature too, so every iteration is also
   # a resized-signature case for it. The sidecar is arm64-only and both
@@ -399,8 +408,8 @@ echo "=== (e) placement-driven apply on the artifact as built ==="
 # settles inside the derivation, so `apply` receives the artifact carrying
 # sigtool's signatures, sigtool's fat alignment and sigtool's __LINKEDIT
 # sizing, and has to land on codesign's layout from the placement record
-# alone. scripts/apple-place.py is that apply, written as a measurement — the
-# shipping one is `eidola-apple::apply`.
+# alone. `release-tool apple apply` is `eidola-apple::apply`, the shipping
+# implementation, so this section grades it against a real bundle.
 #
 # This is the same equation as (b), with the record standing in for the
 # settling, and it is graded the same way:
@@ -408,7 +417,7 @@ echo "=== (e) placement-driven apply on the artifact as built ==="
 # $WORK/detached was taken from S1, which is the as-built artifact signed, so
 # U is exactly the input the record names.
 P="$(stage P)"
-python3 "$REPO_ROOT/scripts/apple-place.py" "$P" "$WORK/detached/$APP_NAME" >/dev/null
+apple_tool apply "$P" "$WORK/detached" >/dev/null
 grade_bundle "placement " "$S1" "$P"
 PLACEMENT_EXACT="$GRADE_EXACT"
 
@@ -427,9 +436,9 @@ if [[ -n "$BOUNDARY_PAD" ]]; then
   codesign --force --sign - --options runtime --entitlements "$WORK/ent.plist" "$PBS" 2>/dev/null
   printf '    %-34s main: %s (%s)\n' "pad $BOUNDARY_PAD, signed as built" \
     "$(vmsizes "$PBS/$MAIN")" "$(boundary_state "$PBS/$MAIN")"
-  python3 "$REPO_ROOT/scripts/apple-detach.py" "$PBS" "$WORK/det-placement" "$U" >/dev/null
+  apple_tool detach "$PBS" "$U" "$WORK/det-placement" >/dev/null
   PB="$(stage PB)"
-  python3 "$REPO_ROOT/scripts/apple-place.py" "$PB" "$WORK/det-placement/$APP_NAME" >/dev/null
+  apple_tool apply "$PB" "$WORK/det-placement" >/dev/null
   grade_bundle "placement, resized signature " "$PBS" "$PB"
   PLACEMENT_BOUNDARY_EXACT="$GRADE_EXACT"
   PLACEMENT_BOUNDARY_STAGE=PB
