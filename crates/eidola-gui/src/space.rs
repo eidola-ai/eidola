@@ -189,6 +189,18 @@ pub struct ChatMessageView {
     pub blocks: Vec<PostBlockSpan>,
     pub reasoning: Option<String>,
     pub reasoning_expanded: bool,
+    /// Whether **Regenerate** applies to this post — true only for an agent's
+    /// *inferred* answer.
+    ///
+    /// Carried rather than derived from [`Self::message`]'s role, because the
+    /// role cannot answer it: an agent-authored `brief` renders in the same
+    /// `assistant` slot (it is that agent's own words, so the byline and the
+    /// column are right) and regenerating one is refused by the core —
+    /// `AppError::WrongPostKind`, since a brief was never inferred and there is
+    /// no attempt to repeat. Offering a verb whose only outcome is that refusal
+    /// is the affordance lying about what it does, so the fact travels from
+    /// where the action type is known and the gutter reads it.
+    pub regenerable: bool,
 }
 
 impl ChatMessageView {
@@ -212,6 +224,8 @@ impl ChatMessageView {
             blocks: Vec::new(),
             reasoning: None,
             reasoning_expanded: false,
+            // A synthetic row has no persisted action to regenerate.
+            regenerable: false,
         }
     }
 
@@ -227,9 +241,16 @@ impl ChatMessageView {
             "user_input" => "user",
             "inference" => "assistant",
             "error" => "error",
+            // An agent-authored post that was not inferred — today the `brief`
+            // that opens a delegated conversation. Its author is an agent, so
+            // it belongs in the same column under the same byline; what it is
+            // not is a *response*, which `regenerable` below is what records.
             _ => "assistant",
         }
         .to_string();
+        // Mirrors the core's own rule for `regenerate` (an `inference` tip), so
+        // the affordance and the refusal cannot disagree.
+        let regenerable = node.action_type == "inference";
         // Concatenate the text blocks, recording each block's span within the
         // joined content (the selection→quote mapping); collect the thinking
         // blocks separately as the disclosure.
@@ -272,6 +293,7 @@ impl ChatMessageView {
             blocks,
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
             reasoning_expanded: false,
+            regenerable,
         }
     }
 }

@@ -3803,6 +3803,7 @@ pub async fn update_space_participant_override(
         Value::Text(space_id.to_string()),
         Value::Text(participant_id.to_string()),
     ];
+    let mut policy_param: Option<usize> = None;
     for (col, val) in [
         ("override_label", override_label),
         ("override_model_ref", override_model_ref),
@@ -3812,17 +3813,54 @@ pub async fn update_space_participant_override(
         if let Some(inner) = val {
             params.push(opt_str(inner));
             sets.push(format!("{col} = ?{}", params.len()));
+            if col == "override_notify_policy" {
+                policy_param = Some(params.len());
+            }
         }
     }
     if sets.is_empty() {
         return Ok(false);
     }
+    // **A sub-space owner's notify policy may not become agent-triggering, and
+    // may not go back to being inherited.** The room's helpers are `all` so
+    // that anything they say wakes each other; the owner must never be, or its
+    // answer wakes them all again and one spawn's work grows with the square of
+    // its roster ([`spawn_subspace_tx`] states the whole argument).
+    //
+    // Refusing `all` alone would not close it: an inherited (NULL) override
+    // resolves to the agent's **global** row, which another door can flip to
+    // `all` afterwards — so the hole would reopen through a write that never
+    // mentioned this space. Keeping the override *always present and never
+    // `all`* makes the global policy irrelevant here by construction
+    // (`COALESCE` takes the override every time), which is why this refuses the
+    // clear as well as the value, and why no second guard is needed on the
+    // config door. What a reader keeps is the choice that matters — `human` or
+    // `explicit`; what they lose is "inherit", which is exactly the state that
+    // was unsafe.
+    //
+    // In the statement's own `WHERE`, like the two structural memberships'
+    // refusals: a spawn commits the room and this membership together, so a
+    // guard that read first could be looking at a space that was ordinary a
+    // moment ago.
+    let owner_guard = match policy_param {
+        Some(k) => format!(
+            " AND NOT ( \
+                 (?{k} IS NULL OR ?{k} = 'all') \
+                 AND role = 'owner' \
+                 AND EXISTS ( \
+                     SELECT 1 FROM space s \
+                     WHERE s.id = ?1 AND s.parent_space_id IS NOT NULL \
+                 ) \
+             )"
+        ),
+        None => String::new(),
+    };
     let sql = format!(
         "UPDATE space_participant SET {} \
          WHERE space_id = ?1 AND participant_id = ?2 AND left_at IS NULL \
            AND EXISTS ( \
                SELECT 1 FROM participant p WHERE p.id = ?2 AND p.removed_at IS NULL \
-           )",
+           ){owner_guard}",
         sets.join(", ")
     );
     // An override is per-space configuration, so it stamps the space — before

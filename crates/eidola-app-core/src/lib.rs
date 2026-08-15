@@ -3236,6 +3236,21 @@ impl Inner {
                     .to_string(),
             });
         }
+        // Still a live member, so the write was refused rather than orphaned:
+        // the only clause left is the sub-space owner's notify policy, which
+        // the statement keeps non-inherited and never `all` (see
+        // `db::update_space_participant_override`). Read afterwards to *name*
+        // the refusal — never to decide it.
+        if ov.notify_policy.is_some()
+            && db::subspace_owner_of(&conn, space_id).await?.as_deref() == Some(participant_id)
+        {
+            return Err(AppError::Config {
+                message: "this agent opened this conversation and answers for it, so it stays \
+                          quiet while its helpers work — it can be set to reply to people or \
+                          to nobody, but not to every post, and not left to inherit"
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 

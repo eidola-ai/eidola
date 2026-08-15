@@ -67,6 +67,11 @@ pub struct PostData {
     /// Content-block spans within `content` (the selection→quote mapping and
     /// the incoming-highlight range mapping).
     pub blocks: Vec<PostBlockSpan>,
+    /// Whether **Regenerate** applies — an agent's *inferred* answer, which is
+    /// a narrower set than `role == "assistant"` (an agent-authored brief
+    /// renders in that column too and cannot be regenerated). Carried from
+    /// `ChatMessageView::regenerable`, which reads the action type.
+    pub regenerable: bool,
 }
 
 /// What a [`TreeNode`] renders from.
@@ -277,6 +282,7 @@ mod tests {
             reasoning_expanded: false,
             references: Vec::new(),
             blocks: Vec::new(),
+            regenerable: kind == "agent",
         }
     }
 
@@ -296,6 +302,7 @@ mod tests {
             reasoning_expanded: false,
             references: Vec::new(),
             blocks: Vec::new(),
+            regenerable: false,
         }
     }
 
