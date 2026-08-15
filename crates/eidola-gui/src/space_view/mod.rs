@@ -458,6 +458,19 @@ pub struct SpaceView {
     /// while it paints, so the dismiss can ask *containment* before it clears
     /// and hand the keyboard back only from a band that was holding it.
     pub(crate) band_focus: [FocusHandle; 3],
+    /// The focus handle whichever **transcript failure surface** is painting
+    /// tracks — the centred panel over an empty page, or the stale-read strip
+    /// over posts we still hold.
+    ///
+    /// One handle for both because they are mutually exclusive by
+    /// construction: the panel answers `Failed { prior: None }` and the strip
+    /// `Failed { prior: Some(..) }`, so no frame can paint both and nothing
+    /// can claim it twice. Its Retry is the surface's only tab stop and the
+    /// press unmounts the surface around it (the read leaves `Failed` the
+    /// moment it restarts), so the handle is what
+    /// [`SpaceView::retry_transcript_load`] asks containment of *before* it
+    /// acts — the same shape the bottom bands take.
+    pub(crate) transcript_retry_focus: FocusHandle,
     /// The open right-click menu over one of the space's editors, if any —
     /// window-local transient state, like the band menu and the picker (one
     /// open at a time; see [`context_menu`]).
@@ -934,6 +947,7 @@ impl SpaceView {
             quote_destination: None,
             quote_destination_scroll: gpui::UniformListScrollHandle::new(),
             band_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
+            transcript_retry_focus: cx.focus_handle(),
             context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),
@@ -3091,6 +3105,10 @@ impl SpaceView {
             v_flex()
                 .w_full()
                 .items_center()
+                // Tracked while it paints, so the Retry below can ask whether
+                // this surface is the one holding the keyboard before it takes
+                // the surface away.
+                .track_focus(&self.transcript_retry_focus)
                 .child(div().w_full().max_w(BODY_MAX_WIDTH).child(
                     crate::participants::load_error_panel(
                         "space/transcript/retry",
@@ -3098,8 +3116,8 @@ impl SpaceView {
                         &detail,
                         crate::i18n::msg::space_transcript_retry(cx),
                         cx,
-                        cx.listener(|this, _, _, cx| {
-                            this.space.update(cx, |s, cx| s.retry_transcript_load(cx));
+                        cx.listener(|this, _, window, cx| {
+                            this.retry_transcript_load(window, cx);
                         }),
                     ),
                 ))
@@ -3150,6 +3168,9 @@ impl SpaceView {
                 .right_0()
                 .flex()
                 .justify_center()
+                // The strip's own half of the handback contract, exactly as
+                // the panel's: this is the surface the press unmounts.
+                .track_focus(&self.transcript_retry_focus)
                 .child(
                     div()
                         .id("space-transcript-refresh-retry")
@@ -3169,8 +3190,8 @@ impl SpaceView {
                         .text_color(theme.muted_foreground)
                         .hover(|s| s.text_color(theme.foreground))
                         .child(crate::i18n::msg::space_transcript_stale_retry(cx))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.space.update(cx, |s, cx| s.retry_transcript_load(cx));
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.retry_transcript_load(window, cx);
                         })),
                 )
                 .into_any_element(),
@@ -3334,8 +3355,42 @@ impl SpaceView {
         let held = self.band_holds_focus(Self::BAND_ERROR, window, cx);
         self.error = None;
         self.space.update(cx, |s, cx| s.clear_failed_turn(cx));
-        self.hand_back_band_focus(held, window, cx);
+        self.hand_back_focus(held, window, cx);
         cx.notify();
+    }
+
+    /// Re-run the transcript read — the reader pressed Retry, on whichever of
+    /// the two failure surfaces is standing.
+    ///
+    /// **Both of those Retrys unmount under the press**, which is why the door
+    /// is here rather than in the render closures: the read leaves `Failed` the
+    /// moment it restarts, so `transcript_load_failure` /
+    /// `transcript_refresh_failure` go `None` and the panel (or the strip) is
+    /// gone with the button the reader activated — its only tab stop, since
+    /// `probe(Role::Button)` derives a real one. Left alone the window holds a
+    /// handle nobody paints: no keystroke reaches anything and Tab restarts
+    /// from the root, the class the bands and `RecordView::close_detail`
+    /// already cure.
+    ///
+    /// The target is [`Self::keyboard_home`], this window's one answer for a
+    /// surface that borrowed the keyboard going away — and the right one from
+    /// either surface. After the panel's press there is nothing on the page to
+    /// stand on, and `keyboard_home` is the view root there; after the strip's
+    /// the posts stay, and it is the reader's own place among them. The reading
+    /// column is not an alternative: `space/conversation` is a `Role::Main`
+    /// landmark, which is neither a tab stop nor focusable, so nothing could
+    /// focus it.
+    pub fn retry_transcript_load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.transcript_retry_focus.contains_focused(window, cx);
+        self.space.update(cx, |s, cx| s.retry_transcript_load(cx));
+        self.hand_back_focus(held, window, cx);
+    }
+
+    /// Test seam: the handle the standing transcript-failure surface tracks —
+    /// the subtree a Retry asks containment of.
+    #[doc(hidden)]
+    pub fn transcript_retry_focus_for_test(&self) -> FocusHandle {
+        self.transcript_retry_focus.clone()
     }
 
     /// Whether the band at `slot` is the one holding the keyboard — asked
@@ -3347,9 +3402,9 @@ impl SpaceView {
 
     /// Give the keyboard back where a closing surface's keyboard belongs — the
     /// reader's place in the conversation if they have one, else the view root
-    /// ([`Self::keyboard_home`]) — and only from a band that was holding it, so
-    /// a reader typing beside a notice keeps their caret.
-    fn hand_back_band_focus(&self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// ([`Self::keyboard_home`]) — and only from a surface that was holding it,
+    /// so a reader typing beside a notice keeps their caret.
+    fn hand_back_focus(&self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
         if held {
             window.focus(&self.keyboard_home(), cx);
         }
@@ -3378,7 +3433,7 @@ impl SpaceView {
     pub fn dismiss_reference_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let held = self.band_holds_focus(Self::BAND_REFERENCE, window, cx);
         self.reference_notice = None;
-        self.hand_back_band_focus(held, window, cx);
+        self.hand_back_focus(held, window, cx);
         cx.notify();
     }
 
@@ -3494,7 +3549,7 @@ impl SpaceView {
     pub fn dismiss_cascade(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let held = self.band_holds_focus(Self::BAND_CASCADE, window, cx);
         self.cascade_notice = None;
-        self.hand_back_band_focus(held, window, cx);
+        self.hand_back_focus(held, window, cx);
         cx.notify();
     }
 
