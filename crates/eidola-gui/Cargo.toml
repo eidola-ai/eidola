@@ -43,6 +43,16 @@ gpui-component-assets = { git = "https://github.com/eidola-ai/gpui-component", b
 
 eidola-app-core = { path = "../eidola-app-core" }
 gpui-markdown-editor = { path = "../gpui-markdown-editor" }
+# Localization (see `src/i18n.rs`). `fluent-bundle` formats the messages;
+# `unic-langid` supplies the locale identifiers a bundle is built with;
+# `sys-locale` reads the OS's preferred-language list for negotiation. All
+# three are pure Rust (sys-locale reaches CoreFoundation/`libc` through plain
+# extern declarations, no C to compile), which is what the cross-compilation
+# convention requires. The FTL itself is embedded at build time — nothing here
+# ever reads a translation from disk.
+fluent-bundle = "0.16"
+sys-locale = "0.3"
+unic-langid = "0.9"
 # Only for `localtime_r` (the circadian clock's local hour) — already in the
 # tree via gpui; the workspace avoids a chrono dependency.
 libc = "0.2"
@@ -77,7 +87,16 @@ objc2-app-kit = { version = "0.3", features = [
 objc2-foundation = { version = "0.3", features = ["NSError", "NSString"] }
 objc2-service-management = { version = "0.3", features = ["SMAppService"] }
 
+[build-dependencies]
+# `build.rs` parses every locale's FTL and generates the typed accessors from
+# the English source (see `build_support/codegen.rs`).
+fluent-syntax = "0.12"
+
 [dev-dependencies]
+# The same parser the build script uses: `tests/i18n.rs` includes
+# `build_support/codegen.rs` directly, so the build-error contract is asserted
+# by tests rather than by committing deliberately-broken FTL.
+fluent-syntax = "0.12"
 # Pulls in `VisualTestAppContext` and `Window::render_to_image`. Cargo unifies
 # this with the regular `gpui` dep, so feature flags merge for dev/test builds
 # — and for examples, which is how `examples/driver.rs` reaches the visual

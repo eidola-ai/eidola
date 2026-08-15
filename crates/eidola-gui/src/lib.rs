@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod chrome;
 pub mod focus;
 pub mod general;
+pub mod i18n;
 pub mod library;
 pub mod lifecycle;
 pub mod loadable;
@@ -129,6 +130,9 @@ pub fn run_with(opts: LaunchOptions) {
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
         theme::install(cx);
+        // The source locale until `i18n::wire_config` below resolves the real
+        // one — the same install-then-wire shape the theme uses.
+        i18n::install(cx);
 
         let stores = Stores::new(cx);
 
@@ -144,6 +148,11 @@ pub fn run_with(opts: LaunchOptions) {
         // the clock's ~4h slot boundaries. `theme::install` above applied
         // the neutral defaults; this turns the circadian machinery on.
         theme::wire_config(&stores.config, cx);
+
+        // Resolve the display language: the persisted `language` preference if
+        // the reader set one, otherwise the OS's preferred languages negotiated
+        // against the locales this binary ships.
+        i18n::wire_config(&stores.config, cx);
 
         // Startup refreshes — each in its own store task slot, no shared
         // busy flag, so none can starve another (the wave-2 launch-order
