@@ -186,7 +186,34 @@ impl LocalModelsStore {
 
     /// Start a model download (curated entry or pasted URL). The transfer
     /// itself is core-owned; progress arrives via `Change::LocalModels`.
+    ///
+    /// **Not re-entrant for a URL whose transfer is already being started.**
+    /// Several surfaces open onto this one operation — a failed row's Retry,
+    /// the curated catalog's Download, the paste-a-URL row — and they all ask
+    /// for the *same* thing with the same argument, so a second call is one
+    /// request twice rather than a newer intent. [`Self::run_op`]'s keep-newest
+    /// supersede is the wrong shape for that: the second `op_tasks.insert`
+    /// drops the first continuation while the core call it issued runs on, and
+    /// app-core then refuses the duplicate ("already downloading") — a failure
+    /// published over a transfer that is working, and a slot that clears while
+    /// the real transfer is still being started.
+    ///
+    /// Re-entry is therefore a **no-op**, which is the shape this codebase
+    /// already takes wherever an operation has exactly one meaning
+    /// (`UpdateStore::check_now`'s `checking` flag; `Space`'s exclusive
+    /// `post_runner`). The chained last-wins of the keyed *edit* slots
+    /// (`AgentsStore`, `ParticipantsStore`) is for the opposite case — there a
+    /// successor carries a newer value that must win, and here there is no
+    /// newer value to carry.
+    ///
+    /// It covers the initiating call only, which is all the slot knows about:
+    /// once it clears, the snapshot's own `Downloading` row (with Cancel) is
+    /// what stands in the way, and a press landing after that reaches
+    /// app-core's own honest refusal rather than superseding anything.
     pub fn download(&mut self, url: String, cx: &mut Context<Self>) {
+        if self.download_pending(&url) {
+            return;
+        }
         let key = Self::download_key(&url);
         self.run_op(key, cx, move |c| async move {
             c.download_local_model(url).await.map(|_| ())

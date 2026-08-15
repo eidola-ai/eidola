@@ -316,14 +316,11 @@ impl BackendsSettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // **Not re-entrant while its own transfer is being started.** The two
-        // activations are not alternatives — they are one request twice — so
-        // the keyed op slot's keep-newest supersede is the wrong shape here: it
-        // drops the first continuation while the core call it issued runs on,
-        // and the second call is then refused by app-core ("already
-        // downloading"), publishing a failure over a retry that is working.
-        // The control is not painted while this holds (see `model_row`); the
-        // guard is here as well because the programmatic path is a door too.
+        // Re-entry while this URL's transfer is being started does nothing:
+        // `LocalModelsStore::download` is where that is decided, for every door
+        // at once. Asked here too so the *press* has no effects of its own —
+        // the handback below would otherwise move a reader who is standing on
+        // this row for an activation that started nothing.
         if self.local_models.read(cx).download_pending(&url) {
             return;
         }
@@ -610,6 +607,12 @@ impl BackendsSettingsView {
     // -- Operations (public so behavior tests share the click paths) --------
 
     /// Start downloading whatever URL is in the paste field.
+    ///
+    /// The third door onto `LocalModelsStore::download`, and the one that needs
+    /// no pending state of its own: the field is cleared on submit, so this row
+    /// never stands as a second live control over a URL it just handed off —
+    /// re-typing the same one is a fresh intent, which the store's
+    /// non-reentrancy makes safe rather than racy.
     pub fn submit_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let url = self.url_state.read(cx).value().trim().to_string();
         if url.is_empty() {
@@ -903,10 +906,12 @@ impl BackendsSettingsView {
             LocalModelStatus::Available if failed_download => {
                 if let Some(url) = model.source_url.clone() {
                     if self.local_models.read(cx).download_pending(&url) {
-                        // The transfer is being started. A verb here would be a
-                        // second door onto an operation that already has one,
-                        // so the slot says what is happening instead — muted
-                        // text, no id, no probe: not a tab stop, nothing to
+                        // The transfer is being started. Pressing again does
+                        // nothing — `LocalModelsStore::download` is not
+                        // re-entrant for this URL — so a verb here would be a
+                        // live-looking control over a settled decision; the
+                        // slot says what is happening instead: muted text, no
+                        // id, no probe, so not a tab stop and nothing to
                         // activate. (The pane's register for a state that is
                         // not a verb, as in the greyed "disabled" marker.)
                         verbs = verbs.child(
@@ -1215,6 +1220,30 @@ impl BackendsSettingsView {
                         .text_color(theme.muted_foreground)
                         .flex_none()
                         .child("Installed"),
+                );
+            } else if store.download_pending(entry.url) {
+                // This entry's transfer is being started — by this verb, or by
+                // the failed row's Retry, which re-runs the very same URL. The
+                // store makes a second call a no-op, so the door is presentation
+                // only: the same muted, id-less, probe-less marker the Retry
+                // verb's slot takes (no tab stop, nothing to activate), rather
+                // than a Download that would now do nothing. English like the
+                // rest of this row — the localized set is the failed-download
+                // row (`AGENTS.md` → Localization), and "Installed" is this
+                // slot's other non-verb marker.
+                //
+                // Bounded by the initiating call, like every other reading of
+                // `download_pending`: while the transfer itself runs, this row
+                // still offers Download and a press meets app-core's honest
+                // "already downloading" — which is a refusal, never a
+                // superseded continuation.
+                row = row.child(
+                    div()
+                        .text_sm()
+                        .italic()
+                        .text_color(theme.muted_foreground)
+                        .flex_none()
+                        .child("starting…"),
                 );
             } else {
                 let url = entry.url;
