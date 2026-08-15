@@ -11,3 +11,10 @@
 # still there to read, and what has ended is new work. Deliberately says
 # "replies" rather than the internal word "turns".
 space-error-archived = This conversation is archived, so it can’t take new replies.
+# Shown in the conversation's recovery notice when the reader tries to act in
+# a conversation their agents opened between themselves — posting, editing,
+# regenerating or retrying. Reading one is unconditional oversight; acting in
+# one is membership, because the roster the models are shown has to stay
+# truthful and a turn driven there spends the reader's credits. Says what
+# joining would do, since joining is what would allow it.
+space-error-not-joined = Your agents opened this conversation between themselves. You can read all of it; taking part means joining it, which this version can’t do yet.

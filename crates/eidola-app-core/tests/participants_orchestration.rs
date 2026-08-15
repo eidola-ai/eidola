@@ -1889,3 +1889,77 @@ fn an_archived_space_plans_no_turns_and_starts_none() {
         );
     });
 }
+
+/// **A closed room is not worth asking the router about.**
+///
+/// Planning and refinement are two calls, and an archival can land between
+/// them — a retirement closing the rooms an agent owned is the case that made
+/// this reachable. Refinement would then hold a live plan for a conversation
+/// that has since closed, and a *remote* router model bills a real inference
+/// per triggering post: money spent choosing among turns `prepare_turn` will
+/// refuse the moment anyone tries to drive them.
+///
+/// The fix is the same one-read shape the turn path uses: refinement reads the
+/// space's own row once and takes both facts off it — still open, and does it
+/// route — rather than reading the router setting alone.
+#[test]
+fn refinement_asks_no_router_about_a_room_that_closed_under_it() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            router: chat_harness::RouterBehavior::Reply(r#"{"notify": [1]}"#.into()),
+            ..MockConfig::default()
+        });
+        let (space, post) = space_with_two_candidates(&core);
+        enable_router(&core, &mock, &space);
+
+        // The plan is computed while the conversation is open…
+        let plan = core
+            .runtime()
+            .block_on(core.mechanical_notification_plan(space.clone(), post.clone()))
+            .expect("plan");
+        assert!(
+            matches!(&plan, NotificationPlan::Turns(t) if t.len() == 2),
+            "precondition: a real plan to refine, {plan:?}"
+        );
+
+        // …and the room closes before refinement runs.
+        assert!(
+            core.runtime()
+                .block_on(core.archive_space(space.clone()))
+                .expect("archive")
+        );
+
+        let before = router_calls(&mock).len();
+        let refined = core
+            .runtime()
+            .block_on(core.test_refine_notifications(space.clone(), post.clone(), plan.clone()))
+            .expect("refine");
+
+        assert_eq!(
+            router_calls(&mock).len(),
+            before,
+            "no router request for a conversation that has closed"
+        );
+        assert_eq!(
+            refined, plan,
+            "and the plan comes back untouched — refinement degrades, it never invents"
+        );
+
+        // The control: the same call on an open conversation does ask.
+        let (open_space, open_post) = space_with_two_candidates(&core);
+        enable_router(&core, &mock, &open_space);
+        let open_plan = core
+            .runtime()
+            .block_on(core.mechanical_notification_plan(open_space.clone(), open_post.clone()))
+            .expect("plan");
+        let before = router_calls(&mock).len();
+        core.runtime()
+            .block_on(core.test_refine_notifications(open_space, open_post, open_plan))
+            .expect("refine");
+        assert_eq!(
+            router_calls(&mock).len(),
+            before + 1,
+            "an open conversation is still routed"
+        );
+    });
+}

@@ -1327,13 +1327,9 @@ fn a_human_cannot_post_into_a_subspace_without_joining_it() {
             .block_on(core.post("Actually, check Saturday.".into(), Some(sub.clone())))
             .expect_err("posting is membership");
         match &err {
-            AppError::NotJoined { space_id, message } => {
-                assert_eq!(space_id, &sub);
-                assert!(
-                    message.contains("read") && message.contains("join"),
-                    "the refusal says what the join would do: {message}"
-                );
-            }
+            // Data, not prose: the id is what a surface offering the join
+            // needs, and the sentence a reader sees is chosen in their locale.
+            AppError::NotJoined { space_id } => assert_eq!(space_id, &sub),
             other => panic!("expected NotJoined, got {other:?}"),
         }
         // Zero trace: the room still holds only its brief.
@@ -1395,6 +1391,19 @@ fn a_brief_can_be_neither_edited_nor_regenerated() {
             vec![],
         )
         .expect("spawn");
+
+        // Two independent gates stand in front of these verbs, and this test is
+        // about the inner one: joining first takes the membership gate out of
+        // the way so the *kind* rule is what answers.
+        // (`an_unjoined_reader_cannot_spend_or_write_in_a_room_they_only_watch`
+        // covers the outer one.)
+        core.runtime()
+            .block_on(core.add_global_participant(
+                out.space.id.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("join");
 
         for err in [
             core.runtime()
@@ -2155,5 +2164,142 @@ fn a_sub_space_owners_policy_cannot_be_edited_back_into_the_cascade() {
             }
             other => panic!("expected turns, got {other:?}"),
         }
+    });
+}
+
+/// **Oversight is looking, and the line it stops at is every verb that acts.**
+///
+/// A human can open any room their agents opened between themselves, and the
+/// window that opens is an ordinary one — composer, per-post gutter, retry.
+/// `post` was gated when the read bypass was built, which left the other three
+/// doors that act *as the human* open: an edit, a regeneration and a retry all
+/// write into a conversation nobody joined, and the last two **spend** doing
+/// it. Each takes the same gate now, before any write and before any request.
+///
+/// `respond_stream_as` is deliberately not on that list and is checked here
+/// too: it names the participant it acts as, is gated on *that* participant's
+/// membership, and is the door a turn driver uses — a human-membership test
+/// there would refuse a room's own agents working in their own room.
+#[test]
+fn an_unjoined_reader_cannot_spend_or_write_in_a_room_they_only_watch() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tides.",
+            vec![helper.clone()],
+            vec![],
+        )
+        .expect("spawn");
+        let sub = out.space.id.clone();
+
+        // An agent's answer exists to aim the human's verbs at — driven through
+        // the door a driver uses, which the gate must leave alone.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let answer = core
+            .runtime()
+            .block_on(core.respond_stream_as(
+                sub.clone(),
+                helper.clone(),
+                out.brief_action_id.clone(),
+                tx,
+            ))
+            .expect("the room's own agent works in its own room")
+            .response_action_id
+            .expect("an answer");
+
+        let requests_before = mock.chat_bodies().len();
+        let models_before = mock.models_hits();
+        let actions_before = core
+            .runtime()
+            .block_on(core.test_space_actions(sub.clone()))
+            .expect("actions")
+            .len();
+
+        // Every door that acts as the human refuses, naming the room.
+        let post_err = core
+            .runtime()
+            .block_on(core.post("Actually, check Saturday.".into(), Some(sub.clone())))
+            .expect_err("post");
+        let edit_err = core
+            .runtime()
+            .block_on(core.edit_post(answer.clone(), "Say it differently.".into()))
+            .expect_err("edit");
+        let regen_err = core
+            .runtime()
+            .block_on(core.regenerate(answer.clone(), MODEL.into()))
+            .expect_err("regenerate");
+        let retry_err = core
+            .runtime()
+            .block_on(async {
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                core.respond_stream(sub.clone(), MODEL.into(), answer.clone(), tx)
+                    .await
+            })
+            .expect_err("retry");
+        for (what, err) in [
+            ("post", post_err),
+            ("edit", edit_err),
+            ("regenerate", regen_err),
+            ("retry", retry_err),
+        ] {
+            match &err {
+                AppError::NotJoined { space_id } => assert_eq!(space_id, &sub),
+                other => panic!("{what} must refuse with NotJoined, got {other:?}"),
+            }
+        }
+
+        // **Nothing written and nothing spent.** The regeneration and the retry
+        // are the ones that would have cost money: `models_hits` catches a gate
+        // placed after the backend is resolved, which `chat_bodies` cannot see.
+        assert_eq!(
+            mock.models_hits(),
+            models_before,
+            "a refused verb never got as far as building a client"
+        );
+        assert_eq!(mock.chat_bodies().len(), requests_before, "nor sent one");
+        assert_eq!(
+            core.runtime()
+                .block_on(core.test_space_actions(sub.clone()))
+                .expect("actions")
+                .len(),
+            actions_before,
+            "and wrote nothing"
+        );
+
+        // Reading is untouched — that is the whole point of the bypass.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.get_space_tree(sub.clone()))
+                .expect("tree")
+                .len(),
+            2
+        );
+
+        // And once joined, the same verbs work.
+        core.runtime()
+            .block_on(core.add_global_participant(
+                sub.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("join");
+        core.runtime()
+            .block_on(core.post("Now I can speak.".into(), Some(sub.clone())))
+            .expect("a member posts");
+        core.runtime()
+            .block_on(core.regenerate(answer, MODEL.into()))
+            .expect("and may regenerate an answer");
+
+        // The parent — an ordinary conversation the human is a member of — was
+        // never affected by any of this.
+        core.runtime()
+            .block_on(core.post("Ordinary.".into(), Some(parent)))
+            .expect("posting where you are a member is unchanged");
     });
 }
