@@ -896,17 +896,17 @@ async fn handle_conn(
 
     // Route. Paths are matched without the `?...` query (none used here).
     match (req.method.as_str(), path) {
-        ("GET", "/v1/models") => match {
+        ("GET", "/v1/models") => {
             models_hits.fetch_add(1, Ordering::SeqCst);
-            config.models_status
-        } {
-            Some(status) => {
-                write_json(&mut stream, status, r#"{"error":"models unavailable"}"#).await?;
+            match config.models_status {
+                Some(status) => {
+                    write_json(&mut stream, status, r#"{"error":"models unavailable"}"#).await?;
+                }
+                None => {
+                    write_json(&mut stream, 200, &models_body()).await?;
+                }
             }
-            None => {
-                write_json(&mut stream, 200, &models_body()).await?;
-            }
-        },
+        }
         ("GET", "/v1/keys") => {
             write_json(&mut stream, 200, &keys_body(&issuer)).await?;
         }
