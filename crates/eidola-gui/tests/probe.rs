@@ -2688,6 +2688,81 @@ fn a_failed_catalog_download_still_affords_downloading(cx: &mut TestAppContext) 
     probe::set_probes_enabled(false);
 }
 
+/// The installed row for a failed download is a report, not a model: Load has
+/// no file to open and Delete has no file to remove. It affords **Retry** (the
+/// download the row remembers) and **Dismiss** (the report acknowledged) — and
+/// where the row remembers no URL, only Dismiss, because a Retry with nothing
+/// to re-run is the defect one door over.
+#[gpui::test]
+fn a_failed_download_row_affords_retry_and_dismiss(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::{BackendsSettingsView, BackendsTab};
+
+    let _guard = probes_on();
+
+    let failed = |source_url: Option<&str>| eidola_app_core::LocalModelInfo {
+        id: "wisp@local".into(),
+        slug: "wisp".into(),
+        display_name: "Wisp".into(),
+        file_name: "wisp.gguf".into(),
+        size_bytes: None,
+        source_url: source_url.map(str::to_string),
+        status: eidola_app_core::LocalModelStatus::Available,
+        last_error: Some("HTTP 500".into()),
+        on_disk: false,
+    };
+
+    let open = |cx: &mut TestAppContext, row: eidola_app_core::LocalModelInfo| {
+        let mut state = local_models_fixture();
+        state.models = vec![row];
+        let stores = stub_stores(cx, |s| {
+            s.config_state = Some(probe_config_state());
+            s.eidola_trust = Some(probe_eidola_trust());
+            s.backends = backends_fixture();
+            s.local_models = Some(state);
+        });
+        let (window, view) = open_view(cx, |window, cx| {
+            cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+        });
+        view.update(cx, |v, cx| v.select_tab(BackendsTab::Local, cx));
+        fresh_names(cx, window)
+    };
+
+    let names = open(cx, failed(Some("https://example.com/wisp.gguf")));
+    for expected in [
+        "settings/backends/local/installed/0/retry",
+        "settings/backends/local/installed/0/dismiss",
+        // The error itself still stands beside them.
+        "settings/backends/local/installed/0/error",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "failed-download probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+    for absent in [
+        "settings/backends/local/installed/0/load",
+        "settings/backends/local/installed/0/delete",
+    ] {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "{absent:?} can only fail on a row with no file: {names:?}"
+        );
+    }
+
+    // No remembered URL, no Retry — the way out is still offered.
+    let names = open(cx, failed(None));
+    assert!(
+        !names.contains(&"settings/backends/local/installed/0/retry".to_string()),
+        "a row that remembers no download must not offer to re-run one: {names:?}"
+    );
+    assert!(
+        names.contains(&"settings/backends/local/installed/0/dismiss".to_string()),
+        "the report must always be dismissible: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContext) {
     use eidola_gui::backends_settings::BackendsSettingsView;

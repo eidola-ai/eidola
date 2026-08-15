@@ -340,6 +340,30 @@ impl Drop for ReservationGuard {
 /// the identity (two backends may hold same-named files).
 pub(crate) type EngineKey = (String, String);
 
+/// A standing failure for one `(backend, slug)` — everything the surface
+/// showing it needs to offer a way out.
+///
+/// `source_url` is what makes a retry possible for the case where the failure
+/// is *all that is left*: a download that failed left no file, so the row a
+/// snapshot synthesizes for it has nothing to load and nothing to delete, and
+/// the only honest verb is "try that download again" — which needs the URL the
+/// row itself cannot otherwise remember. It is `None` for an engine-load
+/// failure, whose `.gguf` is on disk and whose retry is an ordinary Load.
+pub(crate) struct EngineFailure {
+    pub(crate) message: String,
+    pub(crate) source_url: Option<String>,
+}
+
+impl EngineFailure {
+    /// A failure with no way back to a download — every load-side failure.
+    fn load(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source_url: None,
+        }
+    }
+}
+
 /// All runtime (non-durable) local-inference state, held by `Inner` behind
 /// an `Arc` so transfer/supervisor tasks can outlive individual calls.
 /// Plain `std::sync::Mutex` — never held across an `.await`.
@@ -349,7 +373,7 @@ pub(crate) struct LocalRuntime {
     downloads: StdMutex<HashMap<String, Arc<DownloadEntry>>>,
     engines: StdMutex<HashMap<EngineKey, EngineEntry>>,
     /// Last failure per (backend, slug) — download or load — until retried.
-    failures: StdMutex<HashMap<EngineKey, String>>,
+    failures: StdMutex<HashMap<EngineKey, EngineFailure>>,
     /// Test override for the machine memory budget ([`memory_budget`]).
     budget_override: StdMutex<Option<u64>>,
     /// One-way shutdown latch. Set by [`Inner::shutdown_all_engines`] and
@@ -1113,7 +1137,7 @@ impl Inner {
         // visible).
         {
             let failures = self.local.failures.lock().expect("failures lock");
-            for ((backend_id, slug), message) in failures.iter() {
+            for ((backend_id, slug), failure) in failures.iter() {
                 if backend_id != crate::backends::LOCAL_BACKEND_ID
                     || models.iter().any(|m| &m.slug == slug)
                 {
@@ -1125,9 +1149,12 @@ impl Inner {
                     display_name: prettify_stem(slug),
                     file_name: format!("{slug}.gguf"),
                     size_bytes: None,
-                    source_url: None,
+                    // Where the failed download was fetching from, so the row
+                    // can afford a retry: it is the only thing left of an
+                    // attempt that put nothing on disk.
+                    source_url: failure.source_url.clone(),
                     status: LocalModelStatus::Available,
-                    last_error: Some(message.clone()),
+                    last_error: Some(failure.message.clone()),
                     // The failure is all that is left — the scan found no file.
                     on_disk: false,
                 });
@@ -1217,7 +1244,7 @@ impl Inner {
                     .lock()
                     .expect("failures lock")
                     .get(&key)
-                    .cloned();
+                    .map(|f| f.message.clone());
 
                 let display_name = sidecar
                     .as_ref()
@@ -1290,6 +1317,10 @@ impl Inner {
         let bus = self.bus.clone();
         let local = self.local.clone();
         let slug_task = slug.clone();
+        // The normalized URL round-trips through `normalize_model_url` (a
+        // direct `.gguf` URL is its own normal form), so recording it is
+        // enough for a retry to re-enter this method unchanged.
+        let retry_url = download_url.clone();
         // Core-owned transfer task: survives any window; cancellation is the
         // explicit flag, checked between chunks.
         tokio::spawn(async move {
@@ -1302,7 +1333,10 @@ impl Inner {
             if let Err(e) = result {
                 local.failures.lock().expect("failures lock").insert(
                     (crate::backends::LOCAL_BACKEND_ID.to_string(), slug_task),
-                    e.to_string(),
+                    EngineFailure {
+                        message: e.to_string(),
+                        source_url: Some(retry_url),
+                    },
                 );
             }
             bus.emit(Change::LocalModels);
@@ -1374,6 +1408,34 @@ impl Inner {
             .expect("failures lock")
             .remove(&key);
         self.bus.emit(Change::LocalModels);
+        Ok(())
+    }
+
+    /// Forget the standing failure recorded for `id` (`<slug>@<backend>` or a
+    /// bare slug for the managed store).
+    ///
+    /// A failure is a **report**, not state: it names an attempt that already
+    /// ended, and where that attempt left nothing on disk the report is the
+    /// whole row a snapshot synthesizes. So acknowledging it is its own verb —
+    /// [`Self::delete_local_model`] happens to clear one on its way past, but
+    /// that is a file operation, and asking a reader to press Delete to
+    /// dismiss an error is asking them to believe something is being deleted.
+    ///
+    /// Idempotent, and touches nothing else: no file, no engine, no database.
+    /// Emits only when something was actually forgotten, so two windows
+    /// dismissing the same report raise one invalidation.
+    pub(crate) fn dismiss_local_model_failure(&self, id: &str) -> Result<(), AppError> {
+        let key = engine_key_for_id(id);
+        let removed = self
+            .local
+            .failures
+            .lock()
+            .expect("failures lock")
+            .remove(&key)
+            .is_some();
+        if removed {
+            self.bus.emit(Change::LocalModels);
+        }
         Ok(())
     }
 
@@ -1561,7 +1623,7 @@ impl Inner {
                     .lock()
                     .expect("failures lock")
                     .get(key)
-                    .cloned()
+                    .map(|f| f.message.clone())
                     .unwrap_or_else(|| "the engine load was cancelled".into());
                 return Err(AppError::LocalModel { message });
             }
@@ -1846,7 +1908,7 @@ async fn supervise_engine(
             .failures
             .lock()
             .expect("failures lock")
-            .insert(key.clone(), message.to_string());
+            .insert(key.clone(), EngineFailure::load(message));
     };
 
     // **Every** emission in this supervisor goes through here, and it is

@@ -8013,6 +8013,22 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Forget the standing failure recorded against a local model, without
+    /// touching any file, engine or row.
+    ///
+    /// A failure is a report of an attempt that already ended. Where that
+    /// attempt left nothing on disk — a download that failed — the report *is*
+    /// the row [`Self::local_models_state`] synthesizes, so this is what makes
+    /// such a row go away once the reader has read it. Idempotent; emits
+    /// [`Change::LocalModels`] only when something was actually forgotten.
+    pub async fn dismiss_local_model_failure(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.dismiss_local_model_failure(&id) })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Load a local model: spawn `llama-server` for it and wait until it
     /// is ready to serve. Resolves when the model is chat-selectable (or
     /// the load failed); intermediate states arrive via

@@ -187,6 +187,16 @@ impl LocalModelsStore {
         );
     }
 
+    /// Forget a standing download/load failure. Clears the report, nothing
+    /// else — where the failure is all that is left of a download, the row it
+    /// synthesizes goes with it.
+    pub fn dismiss_failure(&mut self, id: String, cx: &mut Context<Self>) {
+        let key = format!("dismiss:{id}");
+        self.run_op(key, cx, move |c| async move {
+            c.dismiss_local_model_failure(id).await
+        });
+    }
+
     /// Load a model (spawns its engine; resolves when ready or failed).
     /// Intermediate `Loading` state arrives via the bus.
     pub fn load(&mut self, id: String, cx: &mut Context<Self>) {
