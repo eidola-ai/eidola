@@ -1461,11 +1461,12 @@ fn only_a_spawn_can_mint_a_capability() {
 
     assert!(
         production.contains(
-            "#[doc(hidden)]\n#[cfg(any(test, feature = \"test-support\"))]\npub async fn \
+            "#[doc(hidden)]\n#[cfg(any(test, feature = \"test-support\"))]\npub(crate) async fn \
              test_insert_space_capability("
         ),
-        "the capability seam must be compiled out of release builds: it mints the one thing \
-         the attenuation gate exists to make unmintable"
+        "the capability seam must be compiled out of release builds *and* crate-private: it \
+         mints the one thing the attenuation gate exists to make unmintable, and `test-support` \
+         is a feature a downstream crate's dev-dependencies may enable"
     );
 
     // Every function containing a write against the table, by the same
@@ -1474,7 +1475,14 @@ fn only_a_spawn_can_mint_a_capability() {
     let mut writers: std::collections::BTreeSet<&str> = Default::default();
     for line in production.lines() {
         let trimmed = line.trim_start();
-        for head in ["pub async fn ", "async fn ", "pub fn ", "fn "] {
+        for head in [
+            "pub(crate) async fn ",
+            "pub async fn ",
+            "async fn ",
+            "pub(crate) fn ",
+            "pub fn ",
+            "fn ",
+        ] {
             if let Some(rest) = trimmed.strip_prefix(head) {
                 let len = rest
                     .chars()
@@ -1797,20 +1805,28 @@ fn retiring_an_owner_stops_the_helpers_mid_cascade() {
 /// **A guard that wraps a statement protects nothing if the statement is
 /// exported.**
 ///
-/// The rules a membership write has to respect live in the transactions —
-/// `remove_space_participant_tx` refuses to end the two structural
-/// memberships, `join_space_participant_tx` and `grant_space_membership_tx`
-/// refuse a second owner of a sub-space, `retire_participant_tx` archives the
-/// rooms a retirement closes. Every one of them wraps a raw primitive, and a
-/// `pub` on any of those primitives is a way to do the guarded thing without
-/// the guard — reachable by a release dependent, since `db` is a public module.
+/// `db` is a public module, so a `pub` on a raw write is a way for a release
+/// dependent to do a guarded thing without the guard. Two kinds of guard are
+/// bypassed that way, and both are load-bearing:
 ///
-/// So the primitives are private, and this pins the class: adding one, or
+/// * the ones decided against **live state**, inside a transaction —
+///   `remove_space_participant_tx` refuses to end the two structural
+///   memberships, `join_space_participant_tx` and `grant_space_membership_tx`
+///   refuse a second owner of a sub-space, `retire_participant_tx` archives
+///   the rooms a retirement closes; and
+/// * the ones decided against the **caller's own values**, in front of the
+///   transaction, where a message belongs — `Inner::spawn_subspace` refuses a
+///   brief that is empty or nothing but whitespace, which no interleaving can
+///   change and which would otherwise commit a room that plans and bills turns
+///   off a post saying nothing.
+///
+/// So the raw writes are crate-private, and this pins the class: adding one, or
 /// exporting one for convenience, fails here rather than quietly reopening the
-/// hole. It is the sibling of `the_raw_space_insert_has_no_production_caller`
-/// in `reap_pristine.rs`, which holds the raw space insert to the same rule.
+/// hole. Reads stay `pub` — they answer questions, they do not perform acts.
+/// It is the sibling of `the_raw_space_insert_has_no_production_caller` in
+/// `reap_pristine.rs`, which holds the raw space insert to the same rule.
 #[test]
-fn the_raw_membership_writers_are_not_exported() {
+fn the_raw_db_writers_are_not_exported() {
     let source = include_str!("../src/db.rs");
     let production = source
         .split_once("\n#[cfg(test)]\nmod tests {")
@@ -1818,11 +1834,18 @@ fn the_raw_membership_writers_are_not_exported() {
         .expect("db.rs ends in its test module");
 
     for raw in [
+        // Membership.
         "insert_space_participant",
         "ensure_space_participant",
         "insert_participant_ref",
         "leave_space_participant",
         "soft_remove_participant",
+        // The sub-space spawn, whose value-level guards live in `Inner`.
+        "spawn_subspace_tx",
+        // The capability seam: it mints the one thing attenuation exists to
+        // make unmintable, and `test-support` is enable-able by a downstream
+        // crate's dev-dependencies.
+        "test_insert_space_capability",
     ] {
         assert!(
             production.contains(&format!("async fn {raw}(")),
@@ -1830,12 +1853,19 @@ fn the_raw_membership_writers_are_not_exported() {
         );
         assert!(
             !production.contains(&format!("pub async fn {raw}(")),
-            "{raw} is a raw membership write and must stay private to db.rs: exported, it is a \
-             way to end a sub-space owner's membership, mint a second owner, or retire an agent \
-             without archiving the rooms it owned — each of which the wrapping transaction \
-             exists to refuse"
+            "{raw} is a raw write and must not be exported from db: reachable from outside, it \
+             is a way to end a sub-space owner's membership, mint a second owner, retire an \
+             agent without archiving the rooms it owned, open a room on an empty brief, or hand \
+             a space a capability no parent held — each of which its caller exists to refuse"
         );
     }
+
+    // An argument type reachable from outside is the write reachable from
+    // outside, so the plan travels with the door.
+    assert!(
+        !production.contains("pub struct SubspacePlan"),
+        "SubspacePlan is spawn_subspace_tx's argument and must not outlive its privacy"
+    );
 
     // The leave is the sharpest of them: it is the guarded statement *minus*
     // the two refusals, so it may not even be compiled into a release build.
