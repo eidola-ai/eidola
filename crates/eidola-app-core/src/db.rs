@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use turso::{Builder, Connection, Database, Value};
 
 use crate::error::AppError;
-use crate::subspaces::{MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, SpawnRefusal};
+use crate::subspaces::{
+    MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, MAX_SUBAGENTS_PER_SPAWN, SpawnRefusal,
+};
 
 const SCHEMA: &str = include_str!("../schema/schema.sql");
 
@@ -1633,14 +1635,77 @@ pub struct SpaceCapabilityRow {
 /// that resolves a sub-space's owner — so "who owns this" cannot be answered
 /// two ways.
 ///
-/// Deliberately **not** filtered on `left_at`: the row records who opened the
-/// room, the way `parent_space_id` records where it was opened from, and no
-/// door ends a sub-space ownership today. Archiving is the stated remedy for a
-/// sub-space someone regrets, and it is what frees the owner's live-count slot
-/// below.
+/// **The uniqueness this reads is enforced at the writes, not assumed here.**
+/// A sub-space's owner membership cannot be ended
+/// ([`remove_space_participant_tx`] refuses it in the leave's own `WHERE`, the
+/// notebook owner's rule applied to the other structural membership) and no
+/// door may grant a *second* `role = 'owner'` into a sub-space
+/// ([`subspace_owner_of`] is asked inside both granting transactions). So this
+/// names one row by construction; the `left_at IS NULL` filter and the total
+/// ordering are the belt to that brace — with the guards in place a departed
+/// owner is unrepresentable, and if one ever appeared this would answer "no
+/// owner" (a sub-space that stops being one, which every consumer already
+/// handles) rather than resurrect a membership that ended, and two owners
+/// would answer the *older* one rather than whichever the query planner
+/// reached first.
 const SUBSPACE_OWNER_SQL: &str = "\
 (SELECT r.participant_id FROM space_participant r \
-  WHERE r.space_id = s.id AND r.role = 'owner' LIMIT 1)";
+  WHERE r.space_id = s.id AND r.role = 'owner' AND r.left_at IS NULL \
+  ORDER BY r.joined_at ASC, r.participant_id ASC LIMIT 1)";
+
+/// The live owner of `space_id` **if it is a sub-space** — `None` for an
+/// ordinary space, and `None` for a sub-space with no live owner membership
+/// (unrepresentable while the guards hold; see [`SUBSPACE_OWNER_SQL`]).
+///
+/// This is the predicate both granting transactions ask before writing a
+/// `role = 'owner'` membership. It is asked **inside** them because "does this
+/// room already have an owner" is exactly the kind of fact a concurrent spawn
+/// changes, and a caller that read it earlier would be deciding from a
+/// snapshot rather than from the state its own write lands on.
+pub async fn subspace_owner_of(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = format!(
+        "SELECT {SUBSPACE_OWNER_SQL} FROM space s \
+         WHERE s.id = ?1 AND s.parent_space_id IS NOT NULL"
+    );
+    let mut rows = conn
+        .query(&sql, (Value::Text(space_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(row.get::<Option<String>>(0).map_err(AppError::db)?),
+    }
+}
+
+/// Refuse a `role = 'owner'` membership into a sub-space that already has an
+/// owner — the guard both granting doors share.
+///
+/// A sub-space's owner is minted with the room and is the whole of what
+/// `parent_space_id` + one membership row encode: who is answerable for the
+/// delegation, whose live-room quota it counts against, and who the report
+/// goes to. A second owner would make all three arbitrary. The remedy for a
+/// delegation someone regrets is archiving it, exactly as it is for the quota.
+async fn refuse_second_subspace_owner(
+    conn: &Connection,
+    space_id: &str,
+    role: &str,
+    joining: &str,
+) -> Result<(), AppError> {
+    if role != "owner" {
+        return Ok(());
+    }
+    match subspace_owner_of(conn, space_id).await? {
+        Some(owner) if owner != joining => Err(AppError::Config {
+            message: "this conversation was opened by an agent that already owns it; another \
+                      participant can join it, but not as its owner"
+                .into(),
+        }),
+        _ => Ok(()),
+    }
+}
 
 fn subspace_row(row: &turso::Row) -> Result<SubspaceRow, AppError> {
     Ok(SubspaceRow {
@@ -1765,7 +1830,16 @@ pub async fn space_capabilities(
 /// Test-only seam: seed a capability on a space. See
 /// `AppCore::test_grant_space_capability` for why the attenuation gate cannot
 /// be tested in both directions without one.
+///
+/// **Compiled out of release builds, not merely hidden from the docs.** The
+/// read seams beside it (`space_footprint_counts`, `space_is_archived`) are
+/// `#[doc(hidden)]` alone because a read cannot forge state; this one *mints a
+/// capability*, which is the one thing the whole attenuation model exists to
+/// make impossible outside a spawn. `#[doc(hidden)]` gates documentation and
+/// nothing else, so a release-built dependent could link it and hand itself a
+/// grant no parent held.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn test_insert_space_capability(
     conn: &Connection,
     space_id: &str,
@@ -1783,6 +1857,14 @@ pub async fn test_insert_space_capability(
     .await
     .map_err(AppError::db)?;
     Ok(())
+}
+
+/// Whether a participant row carries a model of its own — the configuration a
+/// **new** space sees, since nothing but the notify policy is overridden into
+/// one. An agent without one is skipped by every planner
+/// (`Inner::mechanical_plan`), so seating it schedules nothing.
+fn has_model(p: &ParticipantRow) -> bool {
+    p.model_ref.as_deref().is_some_and(|m| !m.trim().is_empty())
 }
 
 /// Everything a spawn needs, with every id already minted by the caller so the
@@ -1844,12 +1926,12 @@ pub struct SubspacePlan<'a> {
 pub async fn spawn_subspace_tx(
     conn: &Connection,
     plan: &SubspacePlan<'_>,
-) -> Result<Result<(), SpawnRefusal>, AppError> {
+) -> Result<Result<String, SpawnRefusal>, AppError> {
     begin_write(conn).await?;
     match spawn_subspace_tx_body(conn, plan).await {
-        Ok(Ok(())) => {
+        Ok(Ok(title)) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
-            Ok(Ok(()))
+            Ok(Ok(title))
         }
         Ok(Err(refusal)) => {
             let _ = conn.execute("ROLLBACK", ()).await;
@@ -1865,7 +1947,7 @@ pub async fn spawn_subspace_tx(
 async fn spawn_subspace_tx_body(
     conn: &Connection,
     plan: &SubspacePlan<'_>,
-) -> Result<Result<(), SpawnRefusal>, AppError> {
+) -> Result<Result<String, SpawnRefusal>, AppError> {
     macro_rules! refuse {
         ($r:expr) => {
             return Ok(Err($r))
@@ -1893,17 +1975,28 @@ async fn spawn_subspace_tx_body(
     let parent_router_model = row.get::<Option<String>>(1).map_err(AppError::db)?;
     drop(rows);
 
-    // (2) the spawner.
-    match get_participant(conn, plan.owner_participant_id).await? {
+    // (2) the spawner. **Its base config is what the sub-space will see** —
+    // the spawn copies no overrides, so a model supplied by an override in the
+    // parent does not travel — which is why the model is read from the row
+    // rather than from the parent's effective view.
+    let owner = match get_participant(conn, plan.owner_participant_id).await? {
         Some(p)
             if p.scope == "global"
                 && p.kind == "agent"
                 && p.removed_at.is_none()
                 && is_space_member(conn, plan.parent_space_id, plan.owner_participant_id)
-                    .await? => {}
+                    .await? =>
+        {
+            p
+        }
         _ => refuse!(SpawnRefusal::SpawnerNotEligible {
             participant_id: plan.owner_participant_id.to_string(),
         }),
+    };
+    if !has_model(&owner) {
+        refuse!(SpawnRefusal::NoModelConfigured {
+            label: owner.label.clone(),
+        });
     }
 
     // (3) depth.
@@ -1938,15 +2031,48 @@ async fn spawn_subspace_tx_body(
         }
     }
 
-    // (6) the sub-agents.
+    // (6) how many sub-agents. Every seat is written with
+    // `override_notify_policy = 'all'`, so each one answers every post in the
+    // room and each of those answers notifies all the others: the work a
+    // spawn schedules grows with the square of the roster and the cascade
+    // guard is the only thing that ever stops it. A panel is the point, but a
+    // panel is small.
+    if plan.participant_ids.len() as i64 > MAX_SUBAGENTS_PER_SPAWN {
+        refuse!(SpawnRefusal::TooManySubagents {
+            requested: plan.participant_ids.len() as i64,
+            limit: MAX_SUBAGENTS_PER_SPAWN,
+        });
+    }
+
+    // (7) the sub-agents themselves — the same base-config rule as the owner:
+    // an agent with no model of its own is skipped by every planner, so
+    // seating one would report a spawn that scheduled nothing.
     for id in plan.participant_ids {
         match get_participant(conn, id).await? {
-            Some(p) if p.scope == "global" && p.kind == "agent" && p.removed_at.is_none() => {}
+            Some(p) if p.scope == "global" && p.kind == "agent" && p.removed_at.is_none() => {
+                if !has_model(&p) {
+                    refuse!(SpawnRefusal::NoModelConfigured {
+                        label: p.label.clone(),
+                    });
+                }
+            }
             _ => refuse!(SpawnRefusal::ParticipantNotEligible {
                 participant_id: id.to_string(),
             }),
         }
     }
+
+    // The title the room carries in the Library. An explicit one, or the
+    // brief's opening line, has already been chosen by the caller; what is
+    // left is a brief that yields no line at all (pure markdown scaffolding,
+    // say). A row with neither a title nor a snippet — briefs are not what
+    // `first_user_text` reads — would be unrecognizable, and refusing the
+    // spawn would punish a model for its formatting, so the room is named
+    // after the agent answerable for it instead.
+    let title = plan
+        .title
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Delegated by {}", owner.label));
 
     // ---- writes -----------------------------------------------------------
     //
@@ -1962,7 +2088,7 @@ async fn spawn_subspace_tx_body(
         (
             Value::Text(plan.space_id.to_string()),
             Value::Text(plan.parent_space_id.to_string()),
-            opt_str(plan.title),
+            Value::Text(title.clone()),
             Value::Integer(parent_cascade_limit),
             opt_str(parent_router_model.as_deref()),
             Value::Integer(plan.now),
@@ -2051,7 +2177,7 @@ async fn spawn_subspace_tx_body(
         })?;
     }
 
-    Ok(Ok(()))
+    Ok(Ok(title))
 }
 
 // ---------------------------------------------------------------------------
@@ -2805,6 +2931,8 @@ pub async fn join_space_participant_tx(
 ) -> Result<Option<(bool, EffectiveParticipantRow)>, AppError> {
     begin_write(conn).await?;
     let body = async {
+        // A sub-space has exactly one owner and it is minted with the room.
+        refuse_second_subspace_owner(conn, space_id, role, participant_id).await?;
         let joined = ensure_space_participant(conn, space_id, participant_id, role, now).await?;
         let member = space_participants(conn, space_id)
             .await?
@@ -2863,6 +2991,10 @@ async fn grant_space_membership_tx_body(
             message: format!("{} has been retired and cannot rejoin a space", row.label),
         });
     }
+    // A sub-space has exactly one owner and it is minted with the room. Asked
+    // before the already-a-member shortcut so the refusal is about the role the
+    // caller asked for rather than silently satisfied by a lesser membership.
+    refuse_second_subspace_owner(conn, space_id, role, participant_id).await?;
     // Already a live member: satisfied. This is the whole point of deciding
     // here — the competing promotion may have granted this very space, and an
     // operation that reports failure about a state that already holds is
@@ -3608,6 +3740,13 @@ pub enum SpaceRemoval {
     /// the `core` memory it writes. Refused rather than obeyed, because nothing
     /// can grant a notebook membership back.
     RefusedNotebookOwner,
+    /// The participant **owns this sub-space**, and that membership is
+    /// structural for the same kind of reason a notebook owner's is: it is the
+    /// whole of what records who is answerable for the delegation, whose
+    /// live-room quota it counts against, and who the report goes to. Nothing
+    /// can grant a sub-space ownership back, so it is refused rather than
+    /// obeyed; archiving the sub-space is the remedy.
+    RefusedSubspaceOwner,
 }
 
 /// Take a participant out of one space, **deciding at the write** whether that
@@ -3677,11 +3816,12 @@ async fn remove_space_participant_tx_body(
     if struck > 0 {
         return Ok(SpaceRemoval::SoftRemoved);
     }
-    // The notebook owner's membership is guarded **in the leave's own `WHERE`**,
-    // for the reason the soft-remove is guarded above: a promotion mints the
-    // notebook and its membership in one transaction, so a removal that read the
-    // space a moment earlier saw an ordinary conversation. The read below only
-    // *explains* a write that struck nothing — it never decides one.
+    // The two **structural** memberships are guarded **in the leave's own
+    // `WHERE`**, for the reason the soft-remove is guarded above: a promotion
+    // mints a notebook and its membership in one transaction, and a spawn mints
+    // a sub-space and its owner's in one transaction, so a removal that read the
+    // space a moment earlier saw an ordinary conversation. The reads below only
+    // *explain* a write that struck nothing — they never decide one.
     let left = conn
         .execute(
             "UPDATE space_participant SET left_at = ?3 \
@@ -3689,6 +3829,12 @@ async fn remove_space_participant_tx_body(
                AND NOT EXISTS ( \
                    SELECT 1 FROM space s \
                    WHERE s.id = ?1 AND s.notebook_participant_id = ?2 \
+               ) \
+               AND NOT ( \
+                   role = 'owner' AND EXISTS ( \
+                       SELECT 1 FROM space s \
+                       WHERE s.id = ?1 AND s.parent_space_id IS NOT NULL \
+                   ) \
                )",
             (
                 Value::Text(space_id.to_string()),
@@ -3701,10 +3847,13 @@ async fn remove_space_participant_tx_body(
     if left > 0 {
         return Ok(SpaceRemoval::Left);
     }
-    match notebook_participant_of(conn, space_id).await?.as_deref() == Some(participant_id) {
-        true => Ok(SpaceRemoval::RefusedNotebookOwner),
-        false => Ok(SpaceRemoval::NothingToDo),
+    if notebook_participant_of(conn, space_id).await?.as_deref() == Some(participant_id) {
+        return Ok(SpaceRemoval::RefusedNotebookOwner);
     }
+    if subspace_owner_of(conn, space_id).await?.as_deref() == Some(participant_id) {
+        return Ok(SpaceRemoval::RefusedSubspaceOwner);
+    }
+    Ok(SpaceRemoval::NothingToDo)
 }
 
 /// The participant a space is the **notebook** of, if it is one — the reverse of

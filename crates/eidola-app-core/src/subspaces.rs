@@ -19,9 +19,14 @@
 //!   and the remedy for a grant someone regrets is archiving the sub-space.
 //!   Because each sub-space's own snapshot is the only source its children can
 //!   be granted from, a chain attenuates without anyone walking it.
-//! * **Runaway is bounded by two constants**, checked inside the spawning
-//!   transaction: how deep the chain may go, and how many live sub-spaces one
-//!   owner may hold.
+//! * **Runaway is bounded by three constants**, checked inside the spawning
+//!   transaction: how deep the chain may go, how many live sub-spaces one
+//!   owner may hold, and how many sub-agents one room may seat.
+//! * **The owner membership is structural.** Nothing can end it and nothing
+//!   can add a second one (`db::refuse_second_subspace_owner`, and the leave's
+//!   own `WHERE` in `db::remove_space_participant_tx`), so the row that
+//!   records who is answerable for a delegation cannot be edited into
+//!   something else by ordinary roster work.
 //!
 //! **Billing is unchanged.** The pricing contract inspects only the shape of
 //! the message and tool JSON, and holds are minted from the process's single
@@ -51,6 +56,17 @@ pub const MAX_SPAWN_DEPTH: i64 = 3;
 /// delegation that went wrong.
 pub const MAX_LIVE_SUBSPACES_PER_OWNER: i64 = 8;
 
+/// How many sub-agents one spawn may seat beside the owner.
+///
+/// Every seat is written with `override_notify_policy = 'all'`, so each
+/// sub-agent answers every post in the room *and* each of those answers
+/// notifies all the others: the work a single spawn schedules grows with the
+/// square of the roster, and the cascade guard is the only thing that ever
+/// stops it. A panel is the point of seating several, but a panel is small —
+/// so this shares the live-room guard's register rather than inventing a
+/// second scale.
+pub const MAX_SUBAGENTS_PER_SPAWN: i64 = 8;
+
 /// Why a spawn was refused.
 ///
 /// Every variant is something the asking agent can act on — narrow the
@@ -72,6 +88,14 @@ pub enum SpawnRefusal {
     TooDeep { depth: i64, limit: i64 },
     /// The owner already holds the maximum number of live sub-spaces.
     TooManyLiveSubspaces { live: i64, limit: i64 },
+    /// More sub-agents were asked for in one room than may be seated in one.
+    TooManySubagents { requested: i64, limit: i64 },
+    /// A participant the spawn would seat — the owner itself, or one of the
+    /// sub-agents — carries no model of its own. The sub-space sees each
+    /// participant's **base** configuration (a spawn copies no overrides), and
+    /// an agent with no model is skipped by every planner, so seating it would
+    /// report a room that schedules nothing.
+    NoModelConfigured { label: String },
     /// A requested capability is one the parent space does not hold, so there
     /// is nothing to pass down. This is the attenuation gate.
     CapabilityNotHeld { name: String },
@@ -104,6 +128,16 @@ impl std::fmt::Display for SpawnRefusal {
                 f,
                 "you already have {live} delegated conversations open and the limit is {limit} \
                  — finish and archive one before opening another"
+            ),
+            Self::TooManySubagents { requested, limit } => write!(
+                f,
+                "that would seat {requested} participants and one delegated conversation holds \
+                 at most {limit} — send fewer, or split the work across conversations"
+            ),
+            Self::NoModelConfigured { label } => write!(
+                f,
+                "{label} has no model of its own, so it would never answer there — give it one, \
+                 or delegate to an agent that has one"
             ),
             Self::CapabilityNotHeld { name } => write!(
                 f,
@@ -211,11 +245,15 @@ impl Inner {
             names.push(c.to_string());
         }
 
-        // A sub-space is always titled: it appears in the Library beside every
-        // other conversation, and the human reading it there has no prompt of
-        // their own to recognize it by. An explicit title wins; otherwise the
-        // brief's own opening line names it, the same derivation an untitled
-        // space's first post gets.
+        // A sub-space is **always** titled: it appears in the Library beside
+        // every other conversation, and the human reading it there has no
+        // prompt of their own to recognize it by — nor a snippet, since a
+        // brief is not what the listing's fallback text reads. An explicit
+        // title wins; otherwise the brief's own opening line names it, the
+        // same derivation an untitled space's first post gets. A brief that
+        // yields no line at all (pure markdown scaffolding, say) is named
+        // after its owner inside the transaction, which is where that agent's
+        // label is already read.
         let derived = title
             .map(str::trim)
             .filter(|t| !t.is_empty())
@@ -240,9 +278,10 @@ impl Inner {
             capabilities: &names,
             now,
         };
-        if let Err(refusal) = db::spawn_subspace_tx(&conn, &plan).await? {
-            return Err(AppError::SpawnRefused { refusal });
-        }
+        let title = match db::spawn_subspace_tx(&conn, &plan).await? {
+            Ok(title) => title,
+            Err(refusal) => return Err(AppError::SpawnRefused { refusal }),
+        };
 
         // One emission per thing the spawn wrote, mirroring what an
         // instantiation announces: the Library gained a row, the new space has
@@ -257,7 +296,7 @@ impl Inner {
                 id: space_id,
                 parent_space_id: parent_space_id.to_string(),
                 owner_participant_id: owner_participant_id.to_string(),
-                title: derived,
+                title: Some(title),
                 created_at: now,
                 archived_at: None,
             },
