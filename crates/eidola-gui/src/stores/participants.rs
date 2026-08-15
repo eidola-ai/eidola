@@ -224,7 +224,12 @@ impl ParticipantsStore {
     }
 
     /// Whether any write is in flight for `space_id`.
-    fn writes_in_flight(&self, space_id: &str) -> bool {
+    ///
+    /// Also read from outside this store, by the disposal of untouched spaces
+    /// (`stores::space_writes_in_flight`): a roster edit's core call outlives
+    /// the gpui task that issued it, so a window closing on top of one must not
+    /// let a disposal race it.
+    pub(crate) fn writes_in_flight(&self, space_id: &str) -> bool {
         self.op_tasks.keys().any(|(space, _)| space == space_id)
     }
 

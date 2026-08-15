@@ -1611,10 +1611,43 @@ impl Inner {
 
 impl Inner {
     async fn db_conn(&self) -> Result<turso::Connection, AppError> {
-        let database = self.db.get_or_try_init(|| db::open(&self.data_dir)).await?;
+        let database = self
+            .db
+            .get_or_try_init(|| async {
+                let database = db::open(&self.data_dir).await?;
+                self.sweep_pristine_spaces(&database).await;
+                Ok::<_, AppError>(database)
+            })
+            .await?;
         // FK enforcement is per-connection (turso defaults it OFF), and the
         // scope-owned schema depends on it — enable it on every connection.
         db::connect(database).await
+    }
+
+    /// The startup sweep, run exactly once per process — inside the `OnceCell`
+    /// initializer, so it is over before any read in this process is answered
+    /// (see [`Inner::reap_pristine_spaces`] for why that placement is the whole
+    /// liveness argument).
+    ///
+    /// **A failed sweep is never a failed open.** Reaping is housekeeping, and
+    /// the asymmetry runs the same way here as everywhere else in this feature:
+    /// spaces nobody touched surviving one more session costs a Library row,
+    /// while refusing to open the database costs the reader everything. So the
+    /// error is warned about and swallowed.
+    async fn sweep_pristine_spaces(&self, database: &turso::Database) {
+        let swept = async {
+            let conn = db::connect(database).await?;
+            self.reap_pristine_spaces(&conn).await
+        }
+        .await;
+        match swept {
+            Ok(0) => {}
+            // The bus has subscribers by now (the database opens lazily, at the
+            // first call that needs it), and the Library index this just
+            // changed is one of the things waiting behind this initializer.
+            Ok(_) => self.bus.emit(Change::SpaceIndex),
+            Err(e) => eprintln!("warning: could not sweep untouched spaces: {e}"),
+        }
     }
 
     /// Load the `eidola` backend row and resolve its connection + trust
@@ -3174,6 +3207,7 @@ impl Inner {
             to_ref(&ov.model_ref),
             to_ref(&ov.system_prompt),
             to_ref(&ov.notify_policy),
+            now_ms(),
         )
         .await?;
         if changed {
@@ -3200,6 +3234,27 @@ impl Inner {
         Ok(())
     }
 
+    /// Name a write that a space's disappearance made impossible.
+    ///
+    /// These doors have no rows-affected to read — a foreign key is what
+    /// refuses them, which is the right enforcement and the wrong sentence.
+    /// The read here only *explains* a write that already failed; it never
+    /// decides one, so no interleaving can put a stale answer in front of a
+    /// refusal. Anything else keeps the error it actually got.
+    async fn name_missing_space(
+        &self,
+        conn: &turso::Connection,
+        space_id: &str,
+        err: AppError,
+    ) -> AppError {
+        match db::get_space(conn, space_id).await {
+            Ok(None) => AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            },
+            _ => err,
+        }
+    }
+
     async fn add_space_participant(
         &self,
         space_id: &str,
@@ -3224,7 +3279,7 @@ impl Inner {
         // Added agents are SPACE-OWNED (a fresh per-space instance). Ownership
         // implies membership, so no reference row.
         let pid = Uuid::now_v7().to_string();
-        db::insert_participant(
+        if let Err(e) = db::insert_participant(
             &conn,
             &pid,
             "space",
@@ -3239,7 +3294,10 @@ impl Inner {
             None,
             now,
         )
-        .await?;
+        .await
+        {
+            return Err(self.name_missing_space(&conn, space_id, e).await);
+        }
         self.bus.emit(Change::Participants);
         let row = db::get_participant(&conn, &pid)
             .await?
@@ -3262,7 +3320,7 @@ impl Inner {
     ) -> Result<(), AppError> {
         let persona = validate_persona(&update, expected)?;
         let conn = self.db_conn().await?;
-        if persona.apply(&conn, participant_id).await? {
+        if persona.apply(&conn, participant_id, now_ms()).await? {
             self.bus.emit(Change::Participants);
             return Ok(());
         }
@@ -3369,7 +3427,12 @@ impl Inner {
         // right after the write cannot turn a committed join into a failure
         // message (Codex review, PR #280).
         let joined =
-            db::join_space_participant_tx(&conn, space_id, participant_id, role, now_ms()).await?;
+            match db::join_space_participant_tx(&conn, space_id, participant_id, role, now_ms())
+                .await
+            {
+                Ok(joined) => joined,
+                Err(e) => return Err(self.name_missing_space(&conn, space_id, e).await),
+            };
         match joined {
             // Joined now, or already a member — either way it is one, and the
             // emission is honest (an idempotent re-join changes nothing, but
@@ -3457,7 +3520,7 @@ impl Inner {
         // Minted here so the transaction can be handed one: it is used only on
         // the branch that promotes, and an unused uuid costs nothing.
         let notebook_space_id = Uuid::now_v7().to_string();
-        let outcome = db::grant_space_membership_tx(
+        let outcome = match db::grant_space_membership_tx(
             &conn,
             space_id,
             participant_id,
@@ -3465,7 +3528,11 @@ impl Inner {
             &notebook_space_id,
             now_ms(),
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => return Err(self.name_missing_space(&conn, space_id, e).await),
+        };
         if outcome.decision != db::GrantDecision::AlreadyAMember {
             self.bus.emit(Change::Participants);
         }
@@ -4045,7 +4112,7 @@ impl Inner {
     ) -> Result<(), AppError> {
         let conn = self.db_conn().await?;
         let normalized = self.validate_router_model(&conn, router_model).await?;
-        if !db::set_space_router_model(&conn, space_id, normalized.as_deref()).await? {
+        if !db::set_space_router_model(&conn, space_id, normalized.as_deref(), now_ms()).await? {
             return Err(AppError::NotConfigured {
                 message: format!("space not found: {space_id}"),
             });
@@ -4068,7 +4135,7 @@ impl Inner {
             });
         }
         let conn = self.db_conn().await?;
-        if !db::set_space_cascade_limit(&conn, space_id, cascade_limit).await? {
+        if !db::set_space_cascade_limit(&conn, space_id, cascade_limit, now_ms()).await? {
             return Err(AppError::NotConfigured {
                 message: format!("space not found: {space_id}"),
             });
@@ -4198,6 +4265,39 @@ impl Inner {
         Ok(archived)
     }
 
+    async fn discard_if_pristine(&self, space_id: &str) -> Result<bool, AppError> {
+        let db_conn = self.db_conn().await?;
+        let discarded = db::discard_space_if_pristine(&db_conn, space_id).await?;
+        if discarded {
+            self.bus.emit(Change::SpaceIndex);
+        }
+        Ok(discarded)
+    }
+
+    /// Delete every space that is still pristine — the crash sweep, run once
+    /// per process from [`Inner::db_conn`]'s first open.
+    ///
+    /// A session that ended without closing its windows fires no close hook,
+    /// so its abandoned blanks are still here. Each candidate is disposed of
+    /// through the same transactional primitive the close trigger uses, so the
+    /// candidate list is advisory and nothing rests on it being current.
+    ///
+    /// **Nothing can be open at this point.** The database lock is exclusive
+    /// for the process lifetime, so no other Eidola holds this file; and this
+    /// runs *inside* the `OnceCell` initializer, so every read in this process
+    /// — the Library index above all — is still waiting behind it, and the
+    /// space a ⌘N is about cannot exist yet because creating it is itself a
+    /// call that has to get past this point first.
+    async fn reap_pristine_spaces(&self, conn: &turso::Connection) -> Result<usize, AppError> {
+        let mut reaped = 0usize;
+        for space_id in db::pristine_space_ids(conn).await? {
+            if db::discard_space_if_pristine(conn, &space_id).await? {
+                reaped += 1;
+            }
+        }
+        Ok(reaped)
+    }
+
     /// Save a thought as a `user_input` action **without requesting a
     /// response** — the save-vs-request split (wave 5). Posting needs no
     /// credential and no account; only `chat` / `request_response` spend.
@@ -4319,8 +4419,7 @@ impl Inner {
             && last_action_id.is_none()
             && let Some(title) = derive_space_title(prompt)
         {
-            db::update_space_title(&db_conn, &space_id, &title).await?;
-            auto_titled = true;
+            auto_titled = db::update_space_title(&db_conn, &space_id, &title, now).await?;
         }
 
         // Link the structural `reply` edge: to the explicit `reply_to` target
@@ -4614,14 +4713,20 @@ impl Inner {
         }
     }
 
+    /// Rename a space. **The existence check is the write's own**: a space can
+    /// stop existing between a read and the statement that follows it — an
+    /// untouched one is disposed of when its last window closes — and a rename
+    /// that reported success for a title no row took would be the worst of both
+    /// worlds, since the caller's optimistic edit then stands over a database
+    /// that never agreed to it. `update_space_title` answers whether a row took
+    /// the title, and zero is the refusal.
     async fn rename_space(&self, space_id: &str, title: &str) -> Result<(), AppError> {
         let db_conn = self.db_conn().await?;
-        db::get_space(&db_conn, space_id)
-            .await?
-            .ok_or_else(|| AppError::NotConfigured {
+        if !db::update_space_title(&db_conn, space_id, title, now_ms()).await? {
+            return Err(AppError::NotConfigured {
                 message: format!("space not found: {space_id}"),
-            })?;
-        db::update_space_title(&db_conn, space_id, title).await?;
+            });
+        }
         self.bus.emit(Change::SpaceIndex);
         Ok(())
     }
@@ -8086,6 +8191,46 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Test-only seam: a space's whole footprint as raw row counts —
+    /// `(space rows, space_participant rows, owned participant rows)`.
+    ///
+    /// It exists for one claim that no production read can make:
+    /// [`Self::discard_if_pristine`] takes the space's membership and its owned
+    /// participants with it. Every ordinary read of those is keyed on the space,
+    /// so once the space row is gone they answer "empty" whether or not the
+    /// rows are — which is exactly the difference a delete has to be held to.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_space_footprint(
+        &self,
+        space_id: String,
+    ) -> Result<(i64, i64, i64), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                db::space_footprint_counts(&conn, &space_id).await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Test-only seam: whether a space still reads as pristine — the same
+    /// predicate [`Self::discard_if_pristine`] decides by, asked without
+    /// deleting anything, so the door sweep can name what it is asserting.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_space_is_pristine(&self, space_id: String) -> Result<bool, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                Ok(db::pristine_space_ids(&conn).await?.contains(&space_id))
+            })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Test-only seam: a space's title, for the same reason as the one above —
     /// a **notebook**'s title has no production reader (`list_spaces` excludes
     /// notebooks), and the promoting transaction names the notebook after the
@@ -8271,6 +8416,37 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.archive_space(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Delete a space **if nothing has ever been done with it**, answering
+    /// whether it did.
+    ///
+    /// A space is created when its window opens, so an abandoned window (and
+    /// every launch that opens a blank one) would otherwise leave a durable
+    /// empty conversation in the Library forever. This is the disposal for
+    /// those, and the only real delete in the app — everything else that
+    /// removes is soft.
+    ///
+    /// **Pristine means untouched, and the doubt is always resolved in favour
+    /// of keeping.** A space qualifies only with no action of any kind in it
+    /// (no post, no answer, no trace, no memory, no summary) *and* nothing ever
+    /// written to its own configuration — its title, its cascade limit, its
+    /// router, its roster, its per-space overrides, its own agents' personas.
+    /// A space with participants configured and no posts is work someone did,
+    /// and is kept. Notebooks are never disposed of at all.
+    ///
+    /// The predicate is re-asked **inside the deleting transaction**, so a
+    /// caller's earlier reading of it is never trusted and a write that commits
+    /// between the two keeps its space. What goes with the row is exactly the
+    /// space's own footprint: its memberships (the referenced globals stay —
+    /// they are the shared library) and the participants it owns. Emits
+    /// [`Change::SpaceIndex`], and only when something was deleted.
+    pub async fn discard_if_pristine(&self, space_id: String) -> Result<bool, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.discard_if_pristine(&space_id).await })
             .await
             .map_err(join_err)?
     }

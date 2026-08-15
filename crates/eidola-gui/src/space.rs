@@ -477,17 +477,22 @@ pub struct Space {
     /// Entries are **addressed** (see [`PendingOffer::to`]) because "which
     /// window" has to mean "the one the reader is looking at".
     offered_quotes: std::collections::VecDeque<PendingOffer>,
-    /// The row this space is being created under, while that insert is still
-    /// in flight (or once it has been refused) — see [`Creation`].
+    /// Whether this id is known to name a row — see [`RowState`]. `None` for
+    /// all but a few frames of a space's life.
     ///
-    /// Its whole purpose is to **order the first save against the insert**.
-    /// The two are independent work on one runtime, so without it a Send
+    /// Its purpose is to **order this window's own calls against whatever is
+    /// deciding the row**, in both directions. After ⌘N that is the insert:
+    /// the two are independent work on one runtime, so without it a Send
     /// pressed in the frames after ⌘N can reach `post`'s space-existence check
     /// first and be refused for a space that then exists perfectly well — and
     /// the failure completion's reload takes the thought the reader had
-    /// already typed off the screen with it. Only *mutations* wait; the first
-    /// frame never does, which is what keeps the blank page instant.
-    creation: Option<Creation>,
+    /// already typed off the screen with it. On a space reopened out of the
+    /// Library it is the **disposal**: a window that opens while an untouched
+    /// space is being judged must not read or write against it until the
+    /// verdict is in, or it will offer a composer over a conversation that is
+    /// about to stop existing. Only *calls* wait; the first frame never does,
+    /// which is what keeps the page instant either way.
+    row: Option<RowState>,
     /// The windows currently drawing this space, in the order they opened.
     ///
     /// A space is *not* a singleton on screen (see the GUI AGENTS.md window
@@ -499,15 +504,23 @@ pub struct Space {
     windows: Vec<AnyWindowHandle>,
 }
 
-/// The state of the row a [`Space::created`] space is being written into.
-/// `None` on the entity means the row exists — the ordinary case, and the only
-/// one a reopened space is ever in.
-enum Creation {
-    /// The insert is in flight. Each entry is a save-side mutation that
-    /// started before it settled and is waiting the insert out.
-    Pending(Vec<oneshot::Sender<Result<(), AppError>>>),
-    /// The insert was refused: this id names no row, and never will.
-    Refused(AppError),
+/// Whether the row an entity's id names is **settled**. `None` on the entity
+/// means it is — the ordinary case, and the one every space is in for all but
+/// a few frames of its life.
+///
+/// Two writes can leave it unsettled, and they are mirror images: the insert
+/// behind ⌘N, deciding whether the row will exist, and the disposal of an
+/// untouched space, deciding whether it still does. One gate serves both
+/// because the question is the same — *may I read from, or write to, this id
+/// yet?* — and because a second gate would be a second thing every call has to
+/// remember to consult.
+enum RowState {
+    /// A write that decides the row is in flight. Each entry is a read or a
+    /// save-side mutation that started before it settled and is waiting it out.
+    Deciding(Vec<oneshot::Sender<Result<(), AppError>>>),
+    /// Settled, negatively: this id names no row and never will — the insert
+    /// was refused, or a disposal found nothing worth keeping and took it.
+    Gone(AppError),
 }
 
 /// A quote waiting in the mailbox, and the window it is waiting *for*.
@@ -545,8 +558,8 @@ impl Space {
     /// by construction nothing durable to read — so the transcript starts
     /// answered-and-empty and the page is instant (STATE.md).
     ///
-    /// The insert's outcome comes back through [`Self::creation_committed`] /
-    /// [`Self::creation_failed`]: the first releases the mutations that were
+    /// The insert's outcome comes back through [`Self::row_committed`] /
+    /// [`Self::row_is_gone`]: the first releases the mutations that were
     /// waiting it out, the second replaces the empty answer with the error, so
     /// the window says so instead of offering a composer that would write
     /// nowhere.
@@ -554,7 +567,7 @@ impl Space {
         Self {
             app_core,
             id,
-            creation: Some(Creation::Pending(Vec::new())),
+            row: Some(RowState::Deciding(Vec::new())),
             transcript: Loadable::loaded(Vec::new()),
             streams: Vec::new(),
             next_turn_seq: 0,
@@ -579,9 +592,9 @@ impl Space {
 
     /// The insert behind a [`Self::created`] space committed: the row exists,
     /// so every mutation that was waiting it out is released.
-    pub fn creation_committed(&mut self, cx: &mut Context<Self>) {
-        self.settle_creation(Ok(()));
-        self.creation = None;
+    pub fn row_committed(&mut self, cx: &mut Context<Self>) {
+        self.settle_row(Ok(()));
+        self.row = None;
         cx.notify();
     }
 
@@ -596,9 +609,9 @@ impl Space {
     /// event raises the window's error band with what went wrong. Any mutation
     /// waiting on the insert is released with the same error, so a Send that
     /// raced it fails for the reason it actually failed.
-    pub fn creation_failed(&mut self, error: AppError, cx: &mut Context<Self>) {
-        self.settle_creation(Err(error.clone()));
-        self.creation = Some(Creation::Refused(error.clone()));
+    pub fn row_is_gone(&mut self, error: AppError, cx: &mut Context<Self>) {
+        self.settle_row(Err(error.clone()));
+        self.row = Some(RowState::Gone(error.clone()));
         self.transcript = Loadable::Failed {
             error: error.clone(),
             prior: None,
@@ -609,8 +622,8 @@ impl Space {
 
     /// Hand the insert's outcome to everything waiting on it. A receiver whose
     /// mutation has since been dropped is simply gone.
-    fn settle_creation(&mut self, outcome: Result<(), AppError>) {
-        if let Some(Creation::Pending(waiters)) = self.creation.take() {
+    fn settle_row(&mut self, outcome: Result<(), AppError>) {
+        if let Some(RowState::Deciding(waiters)) = self.row.take() {
             for tx in waiters {
                 let _ = tx.send(outcome.clone());
             }
@@ -624,14 +637,14 @@ impl Space {
     /// A **refused** creation answers immediately with the refusal, so a
     /// mutation against a space that was never created fails at once rather
     /// than waiting forever on a settle that has already happened.
-    fn creation_wait(&mut self) -> Option<oneshot::Receiver<Result<(), AppError>>> {
-        match self.creation.as_mut()? {
-            Creation::Pending(waiters) => {
+    fn row_wait(&mut self) -> Option<oneshot::Receiver<Result<(), AppError>>> {
+        match self.row.as_mut()? {
+            RowState::Deciding(waiters) => {
                 let (tx, rx) = oneshot::channel();
                 waiters.push(tx);
                 Some(rx)
             }
-            Creation::Refused(error) => {
+            RowState::Gone(error) => {
                 let (tx, rx) = oneshot::channel();
                 let _ = tx.send(Err(error.clone()));
                 Some(rx)
@@ -639,9 +652,18 @@ impl Space {
         }
     }
 
-    /// Await what [`Self::creation_wait`] handed back, inside the mutation's
+    /// Test seam: whether the row this id names is still undecided — a
+    /// disposal judging it, or an insert still landing. Its whole effect is
+    /// invisible until something waits on it, so a regression about the gate
+    /// has to be able to see the gate.
+    #[doc(hidden)]
+    pub fn row_undecided_for_test(&self) -> bool {
+        matches!(self.row, Some(RowState::Deciding(_)))
+    }
+
+    /// Await what [`Self::row_wait`] handed back, inside the mutation's
     /// own task — never on the frame.
-    async fn await_creation(
+    async fn await_row(
         wait: Option<oneshot::Receiver<Result<(), AppError>>>,
     ) -> Result<(), AppError> {
         let Some(rx) = wait else {
@@ -657,11 +679,24 @@ impl Space {
     /// Construct a space bound to an existing id and kick off the initial
     /// transcript load. The load lands via [`Self::apply_loaded_transcript`]
     /// inside the entity, so it serializes against any submit that races it.
-    pub fn existing(app_core: Option<Arc<AppCore>>, id: String, cx: &mut Context<Self>) -> Self {
+    ///
+    /// `being_decided` is for the one case where an existing id is **not**
+    /// known to name a row: a disposal of this space has already been issued
+    /// and its verdict has not come back. The entity is constructed normally —
+    /// the window opens on the frame the reader clicked — but its reads and its
+    /// writes queue behind that verdict rather than racing it, so no window can
+    /// issue a call against a space something is still judging. The store
+    /// settles it (see `SpacesStore::open`).
+    pub fn existing(
+        app_core: Option<Arc<AppCore>>,
+        id: String,
+        being_decided: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut space = Self {
             app_core: app_core.clone(),
             id,
-            creation: None,
+            row: being_decided.then(|| RowState::Deciding(Vec::new())),
             transcript: Loadable::NotLoaded,
             streams: Vec::new(),
             next_turn_seq: 0,
@@ -750,6 +785,17 @@ impl Space {
         let live: Vec<_> = cx.windows().iter().map(|w| w.window_id()).collect();
         self.windows.retain(|h| live.contains(&h.window_id()));
         &self.windows
+    }
+
+    /// Whether any window **other than** `closing` still draws this space.
+    ///
+    /// The close hook's question, and it names the window it is about rather
+    /// than reading [`Self::open_windows`] alone: a view is released during the
+    /// same effect flush that removes its window, so whether `cx.windows()` has
+    /// caught up yet is not something the caller should have to know. Excluding
+    /// it by id makes the answer the same either way.
+    pub fn has_other_open_window(&self, closing: WindowId, cx: &gpui::App) -> bool {
+        self.live_window_ids(cx).iter().any(|id| *id != closing)
     }
 
     // -- Cross-space quote handoff -----------------------------------------
@@ -1184,11 +1230,38 @@ impl Space {
         let Some(app_core) = self.app_core.clone() else {
             return;
         };
+        // **A window on a space that is known not to exist says so, and never
+        // spins.** Once the row is settled-negative there is nothing to read
+        // and nothing a later read could learn, and [`Self::row_is_gone`] has
+        // already put the reason in the transcript cell — which is the *whole*
+        // of what the window shows about a dead space. Starting a load here
+        // would take that terminal failure and flip the cell to `Loading`
+        // (`Failed { prior: None }.to_loading()` is `Loading`), and the load's
+        // own gate then refuses before anything can resolve it: a permanent
+        // spinner, with the real error destroyed on the way. The path is
+        // ordinary — a Send that beat its space's insert (or its disposal's
+        // verdict) fails, and every failure completion restarts the load.
+        if matches!(self.row, Some(RowState::Gone(_))) {
+            return;
+        }
         let id = self.id.clone();
         self.transcript = std::mem::take(&mut self.transcript).to_loading();
-        let rx = bridge::get_space_tree(app_core, id);
+        // **A read waits out whatever is deciding this id, exactly as a write
+        // does.** For all but a few frames of a space's life there is nothing
+        // to wait for and this resolves inside the task's first poll. The
+        // frames that matter are the ones where a disposal has been issued and
+        // its verdict has not returned: answering a read in there would hand
+        // the window a loaded-and-empty transcript, which mints a composer over
+        // a conversation that may stop existing a millisecond later. A
+        // settled-negative row has already put its reason in the transcript
+        // cell ([`Self::row_is_gone`]), so that arm adds nothing to it.
+        let wait = self.row_wait();
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = rx
+            if Self::await_row(wait).await.is_err() {
+                let _ = this.update(cx, |this, _| this.load_task = None);
+                return;
+            }
+            let result = bridge::get_space_tree(app_core, id)
                 .await
                 .unwrap_or_else(|_| {
                     Err(AppError::Internal {
@@ -1485,13 +1558,13 @@ impl Space {
         };
 
         let space_id = self.id.clone();
-        let wait = self.creation_wait();
+        let wait = self.row_wait();
         self.post_runner = Some(cx.spawn(async move |this, cx| {
             // The row this posts into may still be committing (⌘N, then Send).
             // Waiting here rather than at the call site is what keeps the page
             // instant: the draft was accepted on the frame, and only the write
             // is ordered behind the insert.
-            if let Err(e) = Self::await_creation(wait).await {
+            if let Err(e) = Self::await_row(wait).await {
                 let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
                 return;
             }
@@ -1596,9 +1669,9 @@ impl Space {
             return true;
         };
         let space_id = self.id.clone();
-        let wait = self.creation_wait();
+        let wait = self.row_wait();
         self.post_runner = Some(cx.spawn(async move |this, cx| {
-            if let Err(e) = Self::await_creation(wait).await {
+            if let Err(e) = Self::await_row(wait).await {
                 let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
                 return;
             }
@@ -1640,9 +1713,9 @@ impl Space {
         let Some(app_core) = self.app_core.clone() else {
             return true; // stub: no backend
         };
-        let wait = self.creation_wait();
+        let wait = self.row_wait();
         self.post_runner = Some(cx.spawn(async move |this, cx| {
-            if let Err(e) = Self::await_creation(wait).await {
+            if let Err(e) = Self::await_row(wait).await {
                 let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
                 return;
             }
@@ -1678,9 +1751,9 @@ impl Space {
         let Some(app_core) = self.app_core.clone() else {
             return true; // stub: no backend
         };
-        let wait = self.creation_wait();
+        let wait = self.row_wait();
         self.post_runner = Some(cx.spawn(async move |this, cx| {
-            if let Err(e) = Self::await_creation(wait).await {
+            if let Err(e) = Self::await_row(wait).await {
                 let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
                 return;
             }
