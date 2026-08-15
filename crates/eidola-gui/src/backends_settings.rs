@@ -43,14 +43,17 @@
 //! app-core — downloads and engine processes are core-owned, so closing
 //! this window interrupts nothing.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use eidola_app_core::{
     BackendInfo, BackendKind, EidolaTrust, LOCAL_MODEL_CATALOG, LocalModelInfo, LocalModelStatus,
     MeasurementInfo, NewBackend,
 };
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Entity, Focusable as _, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, div, prelude::FluentBuilder, px,
+    App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable as _,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     ActiveTheme, Sizable, StyledExt,
@@ -173,6 +176,24 @@ pub struct BackendsSettingsView {
     intermediate_ca_state: Entity<InputState>,
     /// The inline add-backend form, while one is open.
     add_form: Option<AddForm>,
+    /// The pane's own focus handle — where the keyboard goes when a verb
+    /// unmounts the element that was holding it (see [`Self::hand_back_focus`]).
+    focus_handle: FocusHandle,
+    /// One focus handle per model row, keyed by selection id, minted on first
+    /// render of that row and kept for as long as this pane lives.
+    ///
+    /// A row's verbs are the only tab stops inside it, and the failed-download
+    /// row's two verbs **unmount themselves** — Dismiss takes the whole row
+    /// away, Retry replaces both with Cancel — so the row is the subtree the
+    /// handback rule has to ask about. Per row rather than per pane because the
+    /// question is "was *this* row holding the keyboard": a pointer press moves
+    /// focus nowhere on macOS, so a coarser test would take a keyboard reader's
+    /// place on another row away from them.
+    ///
+    /// Interior-mutable because `render` is `&self` (the height cache and the
+    /// space view's reference queue are the same shape). Bounded by the number
+    /// of local model rows.
+    row_focus: RefCell<HashMap<String, FocusHandle>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -243,8 +264,78 @@ impl BackendsSettingsView {
             root_ca_state,
             intermediate_ca_state,
             add_form: None,
+            focus_handle: cx.focus_handle(),
+            row_focus: RefCell::new(HashMap::new()),
             _subscriptions,
         }
+    }
+
+    /// The pane's focus handle — the surviving surface a verb hands the
+    /// keyboard back to.
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
+    /// This model row's focus handle, minted once and reused.
+    fn row_focus(&self, id: &str, cx: &App) -> FocusHandle {
+        self.row_focus
+            .borrow_mut()
+            .entry(id.to_string())
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// Test seam: the handle a model row tracks, once it has painted.
+    #[doc(hidden)]
+    pub fn model_row_focus_for_test(&self, id: &str) -> Option<FocusHandle> {
+        self.row_focus.borrow().get(id).cloned()
+    }
+
+    /// Hand the keyboard back to the pane, but **only from a verb that was
+    /// actually holding it** — the handback rule (`AGENTS.md` → focus): a
+    /// pointer press moves focus nowhere, so restoring unconditionally would
+    /// take a keyboard reader's place somewhere else in the pane away from them.
+    fn hand_back_focus(&self, held: bool, window: &mut Window, cx: &mut App) {
+        if held {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
+    /// Re-run the download a failed row remembers.
+    ///
+    /// **Its own button does not survive this**: the download starts, the bus
+    /// re-reads, and the row comes back as a downloading one whose single verb
+    /// is Cancel — so Retry unmounts under the keyboard exactly as Dismiss does,
+    /// and owes the same handback. (The row itself survives; the tab stop the
+    /// reader is standing on does not, which is what the rule is about.)
+    pub fn retry_failed_download(
+        &mut self,
+        id: &str,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let held = self.row_focus(id, cx).contains_focused(window, cx);
+        self.local_models.update(cx, |s, cx| s.download(url, cx));
+        self.hand_back_focus(held, window, cx);
+    }
+
+    /// Forget a standing download failure — which takes the row with it, since
+    /// the failure was the whole of it. Hands the keyboard back for the same
+    /// reason `RecordView::close_detail` does: the element holding it is about
+    /// to stop being painted.
+    pub fn dismiss_failed_download(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let held = self.row_focus(id, cx).contains_focused(window, cx);
+        self.local_models
+            .update(cx, |s, cx| s.dismiss_failure(id.to_string(), cx));
+        // The row is gone; nothing should keep a handle for it alive.
+        self.row_focus.borrow_mut().remove(id);
+        self.hand_back_focus(held, window, cx);
     }
 
     /// Whether the trusted-measurements row is showing its add input (test
@@ -797,11 +888,11 @@ impl BackendsSettingsView {
             // remember one affords only the way out.
             LocalModelStatus::Available if failed_download => {
                 if let Some(url) = model.source_url.clone() {
+                    let id_r = id.clone();
                     verbs = verbs.child(
                         quiet_verb(SharedString::from(format!("model-retry-{id}")), "Retry", cx)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.local_models
-                                    .update(cx, |s, cx| s.download(url.clone(), cx));
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.retry_failed_download(&id_r, url.clone(), window, cx);
                             }))
                             .probe(
                                 format!("{probe_prefix}/{idx}/retry"),
@@ -817,9 +908,8 @@ impl BackendsSettingsView {
                         "Dismiss",
                         cx,
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.local_models
-                            .update(cx, |s, cx| s.dismiss_failure(id_x.clone(), cx));
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.dismiss_failed_download(&id_x, window, cx);
                     }))
                     .probe(
                         format!("{probe_prefix}/{idx}/dismiss"),
@@ -911,6 +1001,10 @@ impl BackendsSettingsView {
 
         let loaded = matches!(model.status, LocalModelStatus::Loaded { .. });
         let mut row = v_flex()
+            // The row is the subtree a verb's handback asks about: its verbs
+            // are the only tab stops in it, and the failed-download row's two
+            // unmount themselves. Tracked (focusable), never a tab stop.
+            .track_focus(&self.row_focus(&id, cx))
             .w_full()
             .py_2()
             .gap_1()
@@ -1458,6 +1552,7 @@ impl Render for BackendsSettingsView {
 
         let mut col = v_flex()
             .id("backends-pane")
+            .track_focus(&self.focus_handle)
             .px_6()
             .py_5()
             .gap_4()

@@ -2482,9 +2482,6 @@ impl Render for SpaceView {
                             .w_full()
                             .pt(px(doc_reserve))
                             .pb(px(floating_pad))
-                            // Above the posts it qualifies: everything below is
-                            // as of the last read that succeeded.
-                            .children(self.render_transcript_refresh_failure(cx))
                             .child(body)
                             // The reading column's empty state when the
                             // transcript could not be read at all — the one
@@ -2503,6 +2500,11 @@ impl Render for SpaceView {
             // selection while the window moved (task 32). It stays ahead of the
             // composer and minimap, which paint over it as before.
             .child(self.render_title_bar(window, cx))
+            // The stale-read line, floating just under the title band — chrome
+            // over the page, so it is on screen at every scroll offset (the
+            // reader is usually at the tail). After the scroll subtree, so its
+            // hitbox wins over the posts passing beneath it.
+            .children(self.render_transcript_refresh_failure(cx))
             .child(self.render_active_draft(&tree, page_width, window_h, window, cx))
             // The compact bottom action bar for a docked, *inactive* tail
             // draft — the active composer renders its own; this one fades in
@@ -3116,20 +3118,37 @@ impl SpaceView {
     /// and the composer is not the answer, because retrying a read must not
     /// require writing a message.
     ///
-    /// It rides at the top of the reading column, above the posts it qualifies —
-    /// the Library's structural position for the same line. Deliberately *not* a
-    /// fourth bottom-anchored band: those are a precedence family for **events**
-    /// (a failed turn, a click just made, a paused cascade), and a stale read is
-    /// a property of the page. **Residual:** in a long conversation a reader
-    /// parked at the tail scrolls to see it.
+    /// **It floats at the top edge of the reading viewport, not in the page.**
+    /// The Library puts this line above its rows because there the rows do not
+    /// move under it; a conversation opens at its tail and follows it, so "the
+    /// top of the document" is the one place the reader reliably is *not* —
+    /// in-flow, the common case was a silently stale page with the only cure
+    /// scrolled off-screen. So it is chrome over the page (`absolute`, below the
+    /// title band, painted after the scroll subtree so its hitbox wins), which
+    /// is the scroll indicator's shape: visible at any offset, consuming no
+    /// layout, moving nothing when it appears or goes.
+    ///
+    /// A pill rather than a bare line, because chrome over live text has to stay
+    /// legible as posts pass beneath it — the quiet register is the *type*
+    /// (`text_xs`, muted, hover to foreground), which is the Library's, not the
+    /// absence of a ground.
+    ///
+    /// Deliberately not a fourth **bottom-anchored band**: those are a
+    /// precedence family for *events* (a failed turn, a click just made, a
+    /// paused cascade), each a card that has to be dismissed and ordered against
+    /// the others, while a stale read is a standing property of the page with
+    /// nothing to acknowledge — it ends when the read succeeds.
     fn render_transcript_refresh_failure(&self, cx: &Context<Self>) -> Option<AnyElement> {
         self.space.read(cx).transcript_refresh_failure()?;
         let theme = cx.theme();
         Some(
-            h_flex()
-                .w_full()
+            div()
+                .absolute()
+                .top(TITLE_BAR_RESERVE)
+                .left_0()
+                .right_0()
+                .flex()
                 .justify_center()
-                .pb_2()
                 .child(
                     div()
                         .id("space-transcript-refresh-retry")
@@ -3139,6 +3158,12 @@ impl SpaceView {
                             "Retry loading this conversation",
                         )
                         .cursor_pointer()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .hover(|s| s.text_color(theme.foreground))

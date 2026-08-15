@@ -7297,6 +7297,38 @@ impl AppCore {
         })
     }
 
+    /// Open and validate the local database **now**, rather than at the first
+    /// read that needs it.
+    ///
+    /// [`Self::new`] takes the single-writer lock and builds the runtime, but
+    /// the database itself lives behind a `OnceCell` filled on the first
+    /// `db_conn()` — so the two failures that end a session are found at
+    /// different times: `DatabaseInUse` at construction, and a schema this build
+    /// refuses (`user_version` neither `0` nor `LATEST_VERSION`) only once
+    /// something reads. A client with a startup-failure surface needs both
+    /// before it commits to coming up; this is the call that makes construction
+    /// and validation one moment.
+    ///
+    /// **It also runs the once-per-process startup sweep earlier**
+    /// ([`Inner::sweep_pristine_spaces`], which lives in that initializer), and
+    /// every premise the sweep rests on is *stronger* here than at a first
+    /// read: the exclusive lock is already held, nothing has been spawned, and
+    /// no read can have been answered because none has been issued. Its
+    /// `Change::SpaceIndex` emission then reaches no subscriber — which costs
+    /// nothing, because that emission exists for the case where the initializer
+    /// runs *behind* an already-subscribed reader's query, and after this call
+    /// every reader's first query is issued strictly afterwards.
+    ///
+    /// Idempotent (the `OnceCell` is the same one every read uses) and cheap on
+    /// the happy path.
+    pub async fn open_database(&self) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.db_conn().await.map(|_| ()) })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Subscribe to the invalidation bus.
     ///
     /// Returns a [`tokio::sync::broadcast::Receiver`] that receives a

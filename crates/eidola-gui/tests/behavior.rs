@@ -15957,3 +15957,121 @@ fn a_settled_space_is_still_disposed_of_at_the_same_close(cx: &mut TestAppContex
     });
     drain_runtime(&core);
 }
+
+/// **A verb that unmounts itself hands the keyboard back.** The failed-download
+/// row's two verbs are the only tab stops in it, and both take themselves away:
+/// Dismiss removes the whole row, Retry replaces it with a downloading row whose
+/// verb is Cancel. Left alone, the window keeps a handle nobody paints — no
+/// keystroke reaches anything and Tab restarts from the window root, the class
+/// `RecordView::close_detail` and the space bands already cure.
+///
+/// And it restores **only from a verb that was holding it**: a pointer press
+/// moves focus nowhere on macOS, so a reader standing on another row must keep
+/// their place.
+#[gpui::test]
+fn backends_a_failed_download_verb_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    use eidola_app_core::{LocalModelInfo, LocalModelStatus, LocalModelsState};
+    use eidola_gui::backends_settings::BackendsTab;
+
+    let failed = LocalModelInfo {
+        id: "wisp@local".into(),
+        slug: "wisp".into(),
+        display_name: "Wisp".into(),
+        file_name: "wisp.gguf".into(),
+        size_bytes: None,
+        source_url: Some("https://example.com/wisp.gguf".into()),
+        status: LocalModelStatus::Available,
+        last_error: Some("HTTP 500".into()),
+        on_disk: false,
+    };
+    let intact = LocalModelInfo {
+        id: "tiny@local".into(),
+        slug: "tiny".into(),
+        display_name: "Tiny".into(),
+        file_name: "tiny.gguf".into(),
+        size_bytes: Some(1_000_000),
+        source_url: None,
+        status: LocalModelStatus::Available,
+        last_error: None,
+        on_disk: true,
+    };
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
+        s.local_models = Some(LocalModelsState {
+            engine_path: None,
+            models: vec![failed, intact],
+            external: Vec::new(),
+        });
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+        pane.update(cx, |p, cx| p.select_tab(BackendsTab::Local, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let root = pane.read_with(cx, |p, _| p.focus_handle());
+    let row = |cx: &mut TestAppContext, id: &str| {
+        pane.read_with(cx, |p, _| p.model_row_focus_for_test(id))
+            .unwrap_or_else(|| panic!("row {id} painted"))
+    };
+
+    // Retry: its own button becomes the downloading row's Cancel.
+    let failed_row = row(cx, "wisp@local");
+    cx.update_window(window, |_, window, cx| window.focus(&failed_row, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| {
+            p.retry_failed_download(
+                "wisp@local",
+                "https://example.com/wisp.gguf".into(),
+                window,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "Retry unmounts under the keyboard exactly as Dismiss does"
+    );
+
+    // Dismiss: the row goes entirely.
+    cx.update_window(window, |_, window, cx| window.focus(&failed_row, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| {
+            p.dismiss_failed_download("wisp@local", window, cx)
+        });
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "Dismiss took its own row away, so it owed the keyboard back"
+    );
+
+    // Standing somewhere else, the same press takes nothing.
+    draw_window(cx, window);
+    let other_row = row(cx, "tiny@local");
+    cx.update_window(window, |_, window, cx| window.focus(&other_row, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| {
+            p.dismiss_failed_download("wisp@local", window, cx)
+        });
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| other_row.is_focused(window))
+            .unwrap(),
+        "a reader standing on another row keeps their place"
+    );
+}
