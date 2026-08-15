@@ -578,12 +578,13 @@ pub(crate) fn mode_chip(
 pub(crate) fn ghost_button(
     id: SharedString,
     probe_name: SharedString,
-    label: &'static str,
+    label: impl Into<SharedString>,
     primary: bool,
     cx: &gpui::App,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
-    ghost_button_labeled(id, probe_name, label, label, primary, cx, on_click)
+    let label = label.into();
+    ghost_button_labeled(id, probe_name, label.clone(), label, primary, cx, on_click)
 }
 
 /// [`ghost_button`] with the accessible name spelled separately from the
@@ -594,7 +595,7 @@ pub(crate) fn ghost_button(
 pub(crate) fn ghost_button_labeled(
     id: SharedString,
     probe_name: SharedString,
-    label: &'static str,
+    label: impl Into<SharedString>,
     aria: impl Into<SharedString>,
     primary: bool,
     cx: &gpui::App,
@@ -609,6 +610,7 @@ pub(crate) fn ghost_button_labeled(
         .py_1()
         .rounded_md()
         .text_sm();
+    let label = label.into();
     let el = if primary {
         el.bg(theme.primary)
             .text_color(theme.primary_foreground)
@@ -639,14 +641,23 @@ pub(crate) fn ghost_button_labeled(
 /// was a duplicate id (a `debug_assert`, silently dropped in release). Deriving
 /// the id from the probe makes every present and future caller distinct by
 /// construction. Regression: `each_failed_section_gets_a_retry_of_its_own`.
+///
+/// `headline` and `retry_label` are `SharedString`s rather than `&'static str`
+/// because a localized surface has neither at compile time (the message is
+/// formatted per locale); the callers still on English literals pass them
+/// unchanged. **The retry label is the caller's** for the same reason: a shared
+/// default here would translate one word of a panel whose headline is still
+/// English, which reads worse than a consistently English one.
 pub(crate) fn load_error_panel(
     retry_probe: &'static str,
-    headline: &'static str,
+    headline: impl Into<SharedString>,
     detail: &str,
+    retry_label: impl Into<SharedString>,
     cx: &gpui::App,
     on_retry: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
     let theme = cx.theme();
+    let retry_label = retry_label.into();
     v_flex()
         .w_full()
         .py_8()
@@ -656,7 +667,7 @@ pub(crate) fn load_error_panel(
             div()
                 .text_sm()
                 .text_color(theme.foreground)
-                .child(SharedString::from(headline.to_string())),
+                .child(headline.into()),
         )
         .child(
             div()
@@ -669,7 +680,7 @@ pub(crate) fn load_error_panel(
         .child(ghost_button(
             SharedString::from(retry_probe),
             SharedString::from(retry_probe),
-            "Retry",
+            retry_label,
             true,
             cx,
             on_retry,

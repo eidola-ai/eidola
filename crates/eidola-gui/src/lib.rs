@@ -118,7 +118,9 @@ pub fn run_with(opts: LaunchOptions) {
     // report. See [`crate::startup`].
     let app_core = match stores::open_app_core() {
         Ok(core) => core,
-        Err(e) => startup::report_and_exit(&e),
+        // The locale is resolved here rather than inside the reporter so the
+        // pure read happens once, on the path that needs it.
+        Err(e) => startup::report_and_exit(startup::locale(), &e),
     };
 
     let application = gpui_platform::application()

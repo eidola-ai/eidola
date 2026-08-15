@@ -68,6 +68,7 @@ use gpui_component::{
 
 use crate::actions::OpenRecord;
 use crate::focus::TabRegion as _;
+use crate::i18n::msg;
 use crate::probe::Probe as _;
 use crate::stores::{BackendsStore, ConfigStore, LocalModelsStore, Stores};
 
@@ -315,6 +316,17 @@ impl BackendsSettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // **Not re-entrant while its own transfer is being started.** The two
+        // activations are not alternatives — they are one request twice — so
+        // the keyed op slot's keep-newest supersede is the wrong shape here: it
+        // drops the first continuation while the core call it issued runs on,
+        // and the second call is then refused by app-core ("already
+        // downloading"), publishing a failure over a retry that is working.
+        // The control is not painted while this holds (see `model_row`); the
+        // guard is here as well because the programmatic path is a door too.
+        if self.local_models.read(cx).download_pending(&url) {
+            return;
+        }
         let held = self.row_focus(id, cx).contains_focused(window, cx);
         self.local_models.update(cx, |s, cx| s.download(url, cx));
         self.hand_back_focus(held, window, cx);
@@ -847,7 +859,9 @@ impl BackendsSettingsView {
             // "downloaded" is what this status says for a scanned file, and
             // saying it over a row with no file is the plainest lie the pane
             // can tell.
-            LocalModelStatus::Available if failed_download => ("not downloaded".into(), None),
+            LocalModelStatus::Available if failed_download => {
+                (msg::local_model_not_downloaded(cx).to_string(), None)
+            }
             LocalModelStatus::Available => ("downloaded".into(), None),
             LocalModelStatus::Loading => ("starting engine…".into(), None),
             LocalModelStatus::Loaded { port, pinned, .. } => (
@@ -888,24 +902,45 @@ impl BackendsSettingsView {
             // remember one affords only the way out.
             LocalModelStatus::Available if failed_download => {
                 if let Some(url) = model.source_url.clone() {
-                    let id_r = id.clone();
-                    verbs = verbs.child(
-                        quiet_verb(SharedString::from(format!("model-retry-{id}")), "Retry", cx)
+                    if self.local_models.read(cx).download_pending(&url) {
+                        // The transfer is being started. A verb here would be a
+                        // second door onto an operation that already has one,
+                        // so the slot says what is happening instead — muted
+                        // text, no id, no probe: not a tab stop, nothing to
+                        // activate. (The pane's register for a state that is
+                        // not a verb, as in the greyed "disabled" marker.)
+                        verbs = verbs.child(
+                            div()
+                                .flex_none()
+                                .text_sm()
+                                .italic()
+                                .text_color(theme.muted_foreground)
+                                .child(msg::local_model_retry_starting(cx)),
+                        );
+                    } else {
+                        let id_r = id.clone();
+                        verbs = verbs.child(
+                            quiet_verb(
+                                SharedString::from(format!("model-retry-{id}")),
+                                msg::local_model_retry(cx),
+                                cx,
+                            )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.retry_failed_download(&id_r, url.clone(), window, cx);
                             }))
                             .probe(
                                 format!("{probe_prefix}/{idx}/retry"),
                                 gpui::Role::Button,
-                                format!("Retry the download of {}", model.display_name),
+                                msg::local_model_retry_label(cx, model.display_name.clone()),
                             ),
-                    );
+                        );
+                    }
                 }
                 let id_x = id.clone();
                 verbs = verbs.child(
                     quiet_verb(
                         SharedString::from(format!("model-dismiss-{id}")),
-                        "Dismiss",
+                        msg::local_model_dismiss(cx),
                         cx,
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -914,7 +949,7 @@ impl BackendsSettingsView {
                     .probe(
                         format!("{probe_prefix}/{idx}/dismiss"),
                         gpui::Role::Button,
-                        format!("Dismiss the failed download of {}", model.display_name),
+                        msg::local_model_dismiss_label(cx, model.display_name.clone()),
                     ),
                 );
             }
@@ -1553,6 +1588,16 @@ impl Render for BackendsSettingsView {
         let mut col = v_flex()
             .id("backends-pane")
             .track_focus(&self.focus_handle)
+            // **The handback target has to be a node, and a node needs a
+            // role.** gpui registers any element with a tracked handle and an
+            // id as focusable, but `set_focus` only reports a node the tree
+            // actually has — an element with no role never got one, and the
+            // adapter logs "it has an id but no role" and leaves focus at the
+            // window root. So the pane names itself: a landmark it was owed
+            // anyway, and the reason a verb can hand the keyboard back to
+            // something a reader is told about. `Region` is a container role,
+            // so this adds no tab stop.
+            .probe("settings/backends/pane", gpui::Role::Region, "Backends")
             .px_6()
             .py_5()
             .gap_4()

@@ -3094,8 +3094,9 @@ impl SpaceView {
                 .child(div().w_full().max_w(BODY_MAX_WIDTH).child(
                     crate::participants::load_error_panel(
                         "space/transcript/retry",
-                        "Couldn't open this conversation.",
+                        crate::i18n::msg::space_transcript_failed(cx),
                         &detail,
+                        crate::i18n::msg::space_transcript_retry(cx),
                         cx,
                         cx.listener(|this, _, _, cx| {
                             this.space.update(cx, |s, cx| s.retry_transcript_load(cx));
@@ -3155,7 +3156,7 @@ impl SpaceView {
                         .probe(
                             "space/transcript/refresh-retry",
                             Role::Button,
-                            "Retry loading this conversation",
+                            crate::i18n::msg::space_transcript_stale_retry_label(cx),
                         )
                         .cursor_pointer()
                         .px_2()
@@ -3167,7 +3168,7 @@ impl SpaceView {
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .hover(|s| s.text_color(theme.foreground))
-                        .child("Couldn't refresh — retry")
+                        .child(crate::i18n::msg::space_transcript_stale_retry(cx))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.space.update(cx, |s, cx| s.retry_transcript_load(cx));
                         })),

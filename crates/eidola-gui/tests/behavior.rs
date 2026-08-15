@@ -16017,6 +16017,30 @@ fn backends_a_failed_download_verb_hands_the_keyboard_back(cx: &mut TestAppConte
     draw_window(cx, window);
 
     let root = pane.read_with(cx, |p, _| p.focus_handle());
+    // **The target has to be a node the reader is told about.** gpui only
+    // reports focus on a node the a11y tree actually has, and an element with a
+    // tracked handle but no role never gets one — the adapter logs "it has an
+    // id but no role" and leaves focus at the window root, which is the whole
+    // of what a handback was supposed to prevent. So the pane names itself.
+    {
+        use eidola_gui::probe;
+        probe::set_probes_enabled(true);
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        let entries = probe::window_entries(window.window_id().as_u64());
+        probe::set_probes_enabled(false);
+        let (_, entry) = entries
+            .iter()
+            .find(|(n, _)| n == "settings/backends/pane")
+            .expect("the pane carries its own landmark");
+        assert_eq!(
+            entry.role,
+            gpui::Role::Region,
+            "the handback target is a named region, not a role-less div"
+        );
+        assert_eq!(entry.label, "Backends");
+    }
+
     let row = |cx: &mut TestAppContext, id: &str| {
         pane.read_with(cx, |p, _| p.model_row_focus_for_test(id))
             .unwrap_or_else(|| panic!("row {id} painted"))
@@ -16073,5 +16097,144 @@ fn backends_a_failed_download_verb_hands_the_keyboard_back(cx: &mut TestAppConte
         cx.update_window(window, |_, window, _| other_row.is_focused(window))
             .unwrap(),
         "a reader standing on another row keeps their place"
+    );
+}
+
+/// **Retry is not re-entrant while its own transfer is being started.** The two
+/// activations are one request twice, not alternatives — but the store's keyed
+/// op slot is keep-newest, so a second press superseded the first: either the
+/// first continuation was dropped while the core call it issued ran on (app-core
+/// then refusing the duplicate, "already downloading", published over a retry
+/// that was working), or the first task had not been polled at all and its press
+/// simply never happened. Both are the same defect — a control that can be
+/// activated twice for one operation.
+///
+/// Driven against a real core, because the pending-ness being asserted *is* the
+/// live op slot (a stub store starts no task at all). The URL points at a
+/// listener that accepts and never answers, so the transfer stays in flight and
+/// the window being tested is genuinely open.
+///
+/// The assertion that pins it is the **control**, not the outcome: while the
+/// operation is pending the row paints no Retry at all, so there is nothing to
+/// press a second time — no tab stop, nothing to activate. The op-error
+/// assertion is the symptom the finding named, kept as the honest end state.
+#[gpui::test]
+fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext) {
+    use eidola_app_core::{LocalModelInfo, LocalModelStatus};
+    use eidola_gui::backends_settings::BackendsTab;
+    use eidola_gui::probe;
+
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+
+    // A listener that accepts and never answers, so the first transfer is
+    // genuinely still in flight when the second press lands — a port that
+    // refuses instantly would let the first finish and hide the window.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}/wisp.gguf", listener.local_addr().unwrap());
+
+    // The pane lists the registry, so the seeded singletons have to be in it
+    // before the Local tab has anything to draw.
+    stores.backends.update(cx, |s, cx| s.refresh(cx));
+    for _ in 0..8 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    cx.run_until_parked();
+
+    // The row the reader is looking at: a failed download, remembering its URL.
+    stores.local_models.update(cx, |s, _| {
+        s.set_state_for_test(eidola_app_core::LocalModelsState {
+            engine_path: None,
+            external: Vec::new(),
+            models: vec![LocalModelInfo {
+                id: "wisp@local".into(),
+                slug: "wisp".into(),
+                display_name: "Wisp".into(),
+                file_name: "wisp.gguf".into(),
+                size_bytes: None,
+                source_url: Some(url.clone()),
+                status: LocalModelStatus::Available,
+                last_error: Some("HTTP 500".into()),
+                on_disk: false,
+            }],
+        })
+    });
+
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+        pane.update(cx, |p, cx| p.select_tab(BackendsTab::Local, cx));
+    })
+    .unwrap();
+
+    probe::set_probes_enabled(true);
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        names.contains(&"settings/backends/local/installed/0/retry".to_string()),
+        "the failed row offers its Retry before anything is pending: {names:?}"
+    );
+
+    // One press.
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| {
+            p.retry_failed_download("wisp@local", url.clone(), window, cx)
+        });
+    })
+    .unwrap();
+    assert!(
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url)),
+        "the press owns the operation while it runs"
+    );
+
+    // ...and the control is gone, so there is no second press to make.
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    probe::set_probes_enabled(false);
+    assert!(
+        !names.contains(&"settings/backends/local/installed/0/retry".to_string()),
+        "a pending retry must not leave a second door onto itself: {names:?}"
+    );
+
+    // The programmatic door is shut too, and nothing is published over the
+    // retry that is working.
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| {
+            p.retry_failed_download("wisp@local", url.clone(), window, cx)
+        });
+    })
+    .unwrap();
+    for _ in 0..12 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    cx.run_until_parked();
+    assert!(
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.op_error().is_none()),
+        "a doubled press must not publish `already downloading` over a working retry: {:?}",
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.op_error().map(str::to_string))
     );
 }

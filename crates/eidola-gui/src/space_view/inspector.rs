@@ -596,6 +596,7 @@ impl SpaceView {
                 "space/inspector/retry",
                 "Couldn't load this space's settings.",
                 load_error.as_deref().unwrap_or_default(),
+                "Retry",
                 cx,
                 cx.listener(|this, _, _, cx| this.inspector_retry_settings(cx)),
             ));
