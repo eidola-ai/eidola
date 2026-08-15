@@ -2482,6 +2482,9 @@ impl Render for SpaceView {
                             .w_full()
                             .pt(px(doc_reserve))
                             .pb(px(floating_pad))
+                            // Above the posts it qualifies: everything below is
+                            // as of the last read that succeeded.
+                            .children(self.render_transcript_refresh_failure(cx))
                             .child(body)
                             // The reading column's empty state when the
                             // transcript could not be read at all — the one
@@ -3077,9 +3080,9 @@ impl SpaceView {
     /// driving the same `Space::load_transcript` everything else does.
     ///
     /// Which failures it is offered for is [`Space::transcript_load_failure`]'s
-    /// decision, not this method's: a failed *refresh* keeps its posts (and its
-    /// composer), and a space known not to exist says so through the error band
-    /// instead — a retry there could only refuse.
+    /// decision, not this method's: a failed *refresh* takes the quiet strip
+    /// below instead, and a space known not to exist says so through the error
+    /// band — a retry there could only refuse.
     fn render_transcript_failure(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let detail = self.space.read(cx).transcript_load_failure()?.to_string();
         Some(
@@ -3097,6 +3100,53 @@ impl SpaceView {
                         }),
                     ),
                 ))
+                .into_any_element(),
+        )
+    }
+
+    /// The other half of the same doctrine: a **refresh** that failed over posts
+    /// this window still holds keeps every one of them and adds the Library's
+    /// quiet "Couldn't refresh — retry" strip — same wording, same register, one
+    /// idiom (`library.rs`, and the quote-destination picker took it too).
+    ///
+    /// It is a line rather than the panel because there is nothing empty to
+    /// fill: the conversation is on screen and readable, and what the reader
+    /// needs to know is only that it is as of the last successful read. Without
+    /// it that fact is invisible — nothing in this window re-reads on its own —
+    /// and the composer is not the answer, because retrying a read must not
+    /// require writing a message.
+    ///
+    /// It rides at the top of the reading column, above the posts it qualifies —
+    /// the Library's structural position for the same line. Deliberately *not* a
+    /// fourth bottom-anchored band: those are a precedence family for **events**
+    /// (a failed turn, a click just made, a paused cascade), and a stale read is
+    /// a property of the page. **Residual:** in a long conversation a reader
+    /// parked at the tail scrolls to see it.
+    fn render_transcript_refresh_failure(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        self.space.read(cx).transcript_refresh_failure()?;
+        let theme = cx.theme();
+        Some(
+            h_flex()
+                .w_full()
+                .justify_center()
+                .pb_2()
+                .child(
+                    div()
+                        .id("space-transcript-refresh-retry")
+                        .probe(
+                            "space/transcript/refresh-retry",
+                            Role::Button,
+                            "Retry loading this conversation",
+                        )
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .hover(|s| s.text_color(theme.foreground))
+                        .child("Couldn't refresh — retry")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.space.update(cx, |s, cx| s.retry_transcript_load(cx));
+                        })),
+                )
                 .into_any_element(),
         )
     }

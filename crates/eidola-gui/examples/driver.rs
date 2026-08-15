@@ -498,6 +498,29 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_transcript_stale",
+                description: "Space view: a refresh that failed over posts already on screen — every post stays, with the quiet \"couldn't refresh\" strip above them",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_messages_for_test(conversation(), cx);
+                        s.fail_transcript_refresh_for_test(cx);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_branches",
                 description: "Space view: a branched post tree with docked tail drafts (kitchen-sink fixture)",
                 default_size: size(px(900.), px(700.)),

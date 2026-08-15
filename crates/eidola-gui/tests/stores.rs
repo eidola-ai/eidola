@@ -2638,3 +2638,94 @@ fn a_failed_initial_transcript_load_can_be_retried(cx: &mut TestAppContext) {
         "a load that answered leaves no failure surface standing"
     );
 }
+
+/// **A refresh that failed over posts already on screen says so, without taking
+/// the posts away.**
+///
+/// `Failed { prior: Some(..) }` renders as an ordinary conversation — which is
+/// the doctrine (a re-fetch must never blank a page) and exactly why silence
+/// here is wrong: those posts are as of the last read that succeeded, nothing in
+/// this window re-reads on its own, and the composer is not a way to re-run a
+/// *read*. So the surface owes the other half, a quiet retry, and this drives
+/// the entity behind it.
+///
+/// Staged on a real core by the id: a space whose row does not exist reads as
+/// `NotConfigured`, so the retry can be made to fail over retained posts — the
+/// arm with the trap in it, since the cell must come back to `Failed` while
+/// still holding them, and must never pass through the valueless `Loading` that
+/// would blank the page mid-flight.
+#[gpui::test]
+fn a_failed_transcript_refresh_keeps_its_posts_and_can_be_retried(cx: &mut TestAppContext) {
+    use eidola_gui::loadable::Loadable;
+
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space_id = eidola_app_core::new_space_id();
+
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(space_id.clone(), cx));
+    settle(cx);
+
+    // Posts on screen, and then a refresh over them that failed.
+    space.update(cx, |s, cx| {
+        s.set_messages_for_test(
+            vec![eidola_app_core::SpaceMessage {
+                role: "user".into(),
+                content: "the question".into(),
+            }],
+            cx,
+        );
+        s.fail_transcript_refresh_for_test(cx);
+    });
+    assert!(
+        space.read_with(cx, |s, _| s.transcript_refresh_failure().is_some()),
+        "the failed refresh is reported"
+    );
+    assert!(
+        space.read_with(cx, |s, _| s.transcript_load_failure().is_none()),
+        "and not as the dead-end surface — there are posts and a composer"
+    );
+    assert_eq!(
+        space.read_with(cx, |s, _| s.messages().len()),
+        1,
+        "the posts we had stay on screen"
+    );
+
+    // Retrying with no row behind the id fails again — and the page must not
+    // blank on the way, in flight or at rest.
+    space.update(cx, |s, cx| s.retry_transcript_load(cx));
+    assert!(
+        space.read_with(cx, |s, _| s.transcript_visible()),
+        "a retry over retained posts keeps them visible while it runs"
+    );
+    assert!(
+        !space.read_with(cx, |s, _| matches!(s.transcript(), Loadable::Loading)),
+        "`Failed {{ prior: Some }}` must go stale, never blank to Loading"
+    );
+    settle(cx);
+    assert!(
+        space.read_with(cx, |s, _| s.transcript_refresh_failure().is_some()),
+        "a retry that failed again keeps saying so"
+    );
+    assert_eq!(
+        space.read_with(cx, |s, _| s.messages().len()),
+        1,
+        "still over the posts it had"
+    );
+
+    // The row appears; the same retry clears the strip.
+    core.runtime()
+        .block_on(core.create_space_with_id(space_id.clone(), None))
+        .expect("create the row under the same id");
+    space.update(cx, |s, cx| s.retry_transcript_load(cx));
+    wait_until(cx, "the retried refresh answers", |cx| {
+        space.read_with(cx, |s, _| s.transcript_refresh_failure().is_none())
+    });
+    settle(cx);
+    assert!(
+        space.read_with(cx, |s, _| s.transcript_refresh_failure().is_none()
+            && matches!(s.transcript(), Loadable::Loaded { .. })),
+        "a read that answered leaves no failure surface standing"
+    );
+}
