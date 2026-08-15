@@ -1558,9 +1558,15 @@ fn the_grant_picker_offers_only_agents_that_could_join_and_only_ones_you_know_of
 // ===========================================================================
 
 /// Following is following, whoever does it. The GUI resolves a quoted post's
-/// home before navigating to it, and that read is membership-gated: the one
-/// space the shared human is genuinely not in is an agent's notebook, and an
-/// ungated resolve would have opened its window. The refusal names nothing.
+/// home before navigating to it, and that read is gated: an ungated resolve
+/// would have opened an agent's notebook window to a reader who is not in it.
+///
+/// **This is also the boundary of the human read bypass.** `db::may_read_space`
+/// opens any other space to a human viewer — that is what lets the human
+/// oversee the sub-spaces their agents open, which have no human member at all
+/// — and stops at the notebook clause, because an agent's own residence is the
+/// privacy this gate was built for. Deleting that clause fails here.
+/// The refusal names nothing.
 #[test]
 fn a_human_following_a_quote_into_a_space_they_are_not_in_is_refused() {
     run(|| {
