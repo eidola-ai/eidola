@@ -51,9 +51,18 @@ fn main() {
         ));
     };
 
+    // Everything the source locale ships must resolve on its own...
+    if let Err(e) = codegen::check_locale(&en, None) {
+        fail(&e);
+    }
+    // ...and everything each translation ships must resolve through the merged
+    // view the runtime formats it in, and stay consistent with the source.
     for locale in &parsed {
         if locale.tag == SOURCE_LOCALE {
             continue;
+        }
+        if let Err(e) = codegen::check_locale(locale, Some(&en)) {
+            fail(&e);
         }
         if let Err(e) = codegen::check_translation(&en, locale) {
             fail(&e);

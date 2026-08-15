@@ -550,3 +550,60 @@ fn a_locale_directory_must_be_a_canonical_language_tag() {
         assert!(err.contains(bad) || bad.is_empty(), "{err}");
     }
 }
+
+/// A term attribute is text nothing can reference — it would ship inside the
+/// binary and never reach a screen, exactly like a message attribute.
+#[test]
+fn a_term_attribute_is_a_build_error() {
+    let err = codegen::parse_locale("es", "-brand = Eidola\n    .short = E\n")
+        .expect_err("should refuse");
+    assert!(err.contains("attributes"), "{err}");
+    assert!(err.contains("-brand"), "{err}");
+    assert!(err.contains("es"), "the error names the locale: {err}");
+}
+
+/// Validation covers everything a locale ships, not only what something else
+/// happens to reach: a term nothing references today is referenced tomorrow,
+/// and the reference site would not be the broken one.
+#[test]
+fn an_unreferenced_term_is_validated_too() {
+    // Reaches a term that exists nowhere; no message mentions `-brand`.
+    let en = parse("en", "hello = Hello\n-brand = { -missing }\n");
+    let err = codegen::check_locale(&en, None).expect_err("should refuse");
+    assert!(err.contains("-missing"), "{err}");
+
+    // A cycle no message enters.
+    let en = parse("en", "hello = Hello\n-a = { -b }\n-b = { -a }\n");
+    let err = codegen::check_locale(&en, None).expect_err("should refuse");
+    assert!(err.contains("cycle"), "{err}");
+
+    // Same rule inside a translation, resolved through the merged view.
+    let en = parse("en", "hello = Hello\n");
+    let es = parse("es", "hello = Hola\n-marca = { -inexistente }\n");
+    let err = codegen::check_locale(&es, Some(&en)).expect_err("should refuse");
+    assert!(err.contains("-inexistente"), "{err}");
+
+    // And a translation's term reaching one the *source* defines is fine.
+    let en = parse("en", "-brand = Eidola\nhello = Hello\n");
+    let es = parse("es", "hello = Hola\n-marca = { -brand }\n");
+    codegen::check_locale(&es, Some(&en)).expect("the merge supplies the term");
+}
+
+/// The shipped tree satisfies the whole-locale invariant, not just the
+/// cross-locale one.
+#[test]
+fn every_shipped_locale_validates_on_its_own_terms() {
+    let parsed: Vec<codegen::LocaleDef> = i18n::LOCALES
+        .iter()
+        .map(|(tag, source)| parse(tag, source))
+        .collect();
+    let en = parsed.iter().find(|l| l.tag == "en").expect("source ships");
+    codegen::check_locale(en, None).expect("the source locale validates");
+    for locale in &parsed {
+        if locale.tag == "en" {
+            continue;
+        }
+        codegen::check_locale(locale, Some(en))
+            .unwrap_or_else(|e| panic!("shipped locale failed the contract: {e}"));
+    }
+}

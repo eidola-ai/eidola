@@ -37,20 +37,25 @@
 //!    English behind it, which is exactly what the runtime bundle contains. A
 //!    message or term that exists in neither is refused, and **term chains are
 //!    followed to their end**, not checked one hop deep.
-//! 8. **No reference cycles**, message or term. Fluent gives up on one at
+//! 8. **Everything a locale ships is validated, reached or not**
+//!    ([`check_locale`]). There is no dead-text exception: a term nothing
+//!    references today is referenced tomorrow, and the reference site would not
+//!    be the broken one.
+//! 9. **No reference cycles**, message or term. Fluent gives up on one at
 //!    runtime; the build gives up first.
-//! 9. **No function references.** Nothing registers a Fluent function — see the
-//!    note at the `FunctionReference` arm — so `{ NUMBER($n) }` would render
-//!    `{NUMBER()}`. The number/date formatting work is what will register some
-//!    and loosen this to the registered names.
-//! 10. **No attributes and no attribute references.** The model is one message,
-//!     one accessor. An attribute is refused loudly rather than ignored, because
-//!     ignoring it would let a translator write text that never reaches a
-//!     screen — and a reference to one could then only fail.
-//! 11. **Terms stay closed.** A term body may reference other terms, never
+//! 10. **No function references.** Nothing registers a Fluent function — see the
+//!     note at the `FunctionReference` arm — so `{ NUMBER($n) }` would render
+//!     `{NUMBER()}`. The number/date formatting work is what will register some
+//!     and loosen this to the registered names.
+//! 11. **No attributes and no attribute references** — on messages *or* terms.
+//!     The model is one message, one accessor. An attribute is refused loudly
+//!     rather than ignored, because ignoring it would let a translator write text
+//!     that ships inside the binary and never reaches a screen — and a reference
+//!     to one could then only fail.
+//! 12. **Terms stay closed.** A term body may reference other terms, never
 //!     messages or variables, so nothing can reach through a term for a variable
 //!     to fill.
-//! 12. **No duplicate message or term ids.** A later definition silently shadows
+//! 13. **No duplicate message or term ids.** A later definition silently shadows
 //!     the earlier one, so it is refused instead.
 
 use std::collections::{BTreeMap, HashSet};
@@ -256,6 +261,14 @@ pub fn parse_locale(tag: &str, source: &str) -> Result<LocaleDef, String> {
                 // filled (Fluent gives terms their own scope) and a message it
                 // reached could drag in a variable nothing passes. Both are
                 // refused so a term contributes only its own call arguments.
+                if !term.attributes.is_empty() {
+                    return Err(format!(
+                        "{tag}: term `-{}` has attributes, which the codegen does not \
+                         support — nothing may reference one, so the text would ship \
+                         inside the binary and never reach a screen. Give it its own term.",
+                        term.id.name
+                    ));
+                }
                 let mut refs = Refs::default();
                 walk_pattern(&term.value, &mut refs)
                     .map_err(|e| format!("{tag}: term `-{}`: {e}", term.id.name))?;
@@ -334,6 +347,25 @@ fn walk_term(id: &str, view: &MergedView, stack: &mut Vec<String>) -> Result<(),
         walk_term(nested, view, stack)?;
     }
     stack.pop();
+    Ok(())
+}
+
+/// Everything this locale ships resolves through the view it will be formatted
+/// in — `primary` overriding `base`, or `base: None` for the source locale
+/// itself.
+///
+/// This walks **every** message and **every** term the locale defines, not only
+/// what something else happens to reach. A term nothing references today is
+/// referenced tomorrow, and the reference site would not be the broken one — so
+/// the invariant is that all shipped FTL validates, with no dead-text exception.
+pub fn check_locale(primary: &LocaleDef, base: Option<&LocaleDef>) -> Result<(), String> {
+    let view = MergedView { primary, base };
+    for message in &primary.messages {
+        walk_message(&message.id, &view, &mut Vec::new(), &mut Vec::new())?;
+    }
+    for term in &primary.terms {
+        walk_term(&term.id, &view, &mut Vec::new())?;
+    }
     Ok(())
 }
 
