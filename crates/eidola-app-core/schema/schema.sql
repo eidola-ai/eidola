@@ -228,7 +228,27 @@ CREATE TABLE space (
     -- which is defined below — FK targets resolve at DML time.)
     notebook_participant_id TEXT REFERENCES participant(id),
     created_at        INTEGER NOT NULL,
-    archived_at       INTEGER
+    archived_at       INTEGER,
+    -- The pristineness stamp: NULL means nothing has ever changed this space's
+    -- own configuration since it was instantiated. Set (first-write-wins, so
+    -- the value is the moment it stopped being untouched) by every write that
+    -- alters the space's CONFIGURATION FOOTPRINT — the columns above, its
+    -- `space_participant` rows, and the `participant` rows it owns. That is
+    -- exactly the footprint a pristine space's disposal deletes.
+    --
+    -- **Actions deliberately do not stamp it.** A post, an inference, a trace,
+    -- a memory revision or a branch summary is its own witness: the disposal
+    -- predicate refuses on any `action` row in the space, so stamping the hot
+    -- write path would buy a second statement per action for a fact the first
+    -- leg already knows.
+    --
+    -- **Instantiation is not a change.** `instantiate_template` writes this
+    -- column last, inside its own transaction, resetting whatever its copies
+    -- stamped: a fresh instantiation is pristine by definition. The one thing
+    -- it can carry that is not is a caller-supplied `title`, which is a user
+    -- saying what this conversation is for, so a titled creation is born
+    -- stamped.
+    touched_at        INTEGER
 );
 
 -- One notebook per agent.
