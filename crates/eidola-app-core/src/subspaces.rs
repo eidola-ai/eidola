@@ -80,6 +80,11 @@ pub enum SpawnRefusal {
     EmptyBrief,
     /// The named parent space does not exist.
     UnknownParent { space_id: String },
+    /// The parent conversation has been archived, so it is closed to new work
+    /// — and a room opened under a closed one is work nobody asked to
+    /// continue. Reachable because a turn already in flight when the archival
+    /// landed runs to completion by design.
+    ParentArchived { space_id: String },
     /// The spawner is not a live, shared agent taking part in the parent
     /// space. A space-owned participant cannot be referenced into another
     /// space at all, so it cannot own one either.
@@ -114,6 +119,11 @@ impl std::fmt::Display for SpawnRefusal {
             Self::UnknownParent { space_id } => {
                 write!(f, "no such conversation: {space_id}")
             }
+            Self::ParentArchived { .. } => write!(
+                f,
+                "this conversation has been archived, so it takes no new work — nothing \
+                 delegated from it now would be read"
+            ),
             Self::SpawnerNotEligible { participant_id } => write!(
                 f,
                 "{participant_id} is not a shared agent taking part in this conversation, so \

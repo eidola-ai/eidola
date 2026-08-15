@@ -465,7 +465,7 @@ impl SpaceView {
             // (it was never inferred, so there is no attempt to repeat). The
             // verb reads `post.regenerable` rather than the role so it offers
             // exactly what would work.
-            "assistant" if post.regenerable => {
+            "assistant" if post.regenerable && self.viewer_may_act(cx) => {
                 let id = action_id.clone();
                 col.child(
                     verb(
@@ -511,27 +511,33 @@ impl SpaceView {
     ///
     /// A human can open any conversation their agents opened between
     /// themselves, and the window that opens is an ordinary one: a composer, a
-    /// per-post gutter, the lot. The core refuses every one of those verbs
-    /// there ([`AppError::NotJoined`]) and that refusal is what makes the
-    /// promise real — this only keeps the window from offering what it knows
-    /// would be refused.
+    /// per-post gutter, an Ask menu. The core refuses every one of those verbs
+    /// there ([`AppError::NotJoined`]) — except **Ask**, which cannot be
+    /// refused there and must not be: it drives `respond_stream_as`, which
+    /// names the agent it acts as and is the door a turn driver uses. So for
+    /// Ask this *is* the gate, and for the rest it keeps the window from
+    /// offering what it knows would be refused.
     ///
-    /// **Every unknown answers `true`.** A reader waiting a frame for a cell to
-    /// answer must not lose their verbs: guessing wrong this way costs a
-    /// refusal they were going to get anyway, and the other way costs a working
-    /// affordance that vanished.
+    /// **A pure read, asked at render.** The two cells it reads land
+    /// asynchronously and their store observers only repaint — they do not
+    /// rebuild — so a verdict cached into the render snapshot would go on
+    /// offering verbs after the roster had answered. Loading is
+    /// [`Self::ensure_viewer_gate`]'s job; deciding is this one's, every frame.
+    ///
+    /// **Every unknown answers `true`.** A reader waiting a frame for a cell
+    /// must not lose their verbs: guessing wrong this way costs a refusal they
+    /// were going to get anyway (and, for Ask, one turn they meant to drive),
+    /// and the other way costs a working affordance that vanished.
     ///
     /// The roster decides it alone in every ordinary conversation, where the
     /// human is a member. Only when the roster has answered and does *not*
     /// carry the human is a second fact needed — is this an agent's
     /// **notebook**, which the human is genuinely not a member of and may
-    /// nonetheless write in, a difference app-core draws deliberately. That
-    /// cell is loaded here rather than at open precisely so the common case
-    /// never asks for it.
-    pub(crate) fn viewer_may_act(&mut self, cx: &mut Context<Self>) -> bool {
-        let id = self.space.read(cx).id().to_string();
+    /// nonetheless write in, a difference app-core draws deliberately.
+    pub(crate) fn viewer_may_act(&self, cx: &gpui::App) -> bool {
+        let id = self.space.read(cx).id();
         let Loadable::Loaded { value: roster, .. } =
-            self.stores.participants.read(cx).participants(&id)
+            self.stores.participants.read(cx).participants(id)
         else {
             return true;
         };
@@ -541,12 +547,48 @@ impl SpaceView {
         {
             return true;
         }
-        self.stores
-            .space_settings
-            .update(cx, |s, cx| s.ensure(id.clone(), cx));
-        match self.stores.space_settings.read(cx).settings(&id) {
+        match self.stores.space_settings.read(cx).settings(id) {
             Loadable::Loaded { value, .. } => value.notebook_participant_id.is_some(),
             _ => true,
+        }
+    }
+
+    /// Load what [`Self::viewer_may_act`] needs to answer with.
+    ///
+    /// The notebook cell is asked for **only** once the roster has answered
+    /// without the reader in it, so an ordinary conversation — where the human
+    /// is always a member — never loads it at all.
+    pub(crate) fn ensure_viewer_gate(&mut self, cx: &mut Context<Self>) {
+        let id = self.space.read(cx).id().to_string();
+        let Loadable::Loaded { value: roster, .. } =
+            self.stores.participants.read(cx).participants(&id)
+        else {
+            return;
+        };
+        if roster
+            .iter()
+            .any(|p| p.id == eidola_app_core::HUMAN_PARTICIPANT_ID)
+        {
+            return;
+        }
+        self.stores
+            .space_settings
+            .update(cx, |s, cx| s.ensure(id, cx));
+    }
+
+    /// The agents this reader may **ask** to respond — [`Self::space_agents`]
+    /// for a participant, nobody for someone who is only watching.
+    ///
+    /// Every Ask surface reads this rather than `space_agents`, which is what
+    /// keeps the sweep closed: Ask is the one acting verb app-core cannot
+    /// refuse on the reader's behalf, so an Ask chip that renders is a billed
+    /// inference that will run. `space_agents` itself stays unfiltered — it
+    /// also names streaming bylines, and who is speaking is not a permission.
+    pub(crate) fn askable_agents(&self, cx: &gpui::App) -> Vec<(String, String)> {
+        if self.viewer_may_act(cx) {
+            self.space_agents(cx)
+        } else {
+            Vec::new()
         }
     }
 
@@ -1021,12 +1063,15 @@ impl SpaceView {
             .children
             .iter()
             .any(|c| matches!(c.src, NodeSrc::Msg(_)));
+        // One gate for the whole band — the Ask chips *and* the Reply that
+        // opens a draft — so a reader who is only watching is not handed a
+        // composer whose Send is refused, nor an Ask that would spend.
         let agents = if is_persisted {
-            self.space_agents(cx)
+            self.askable_agents(cx)
         } else {
             Vec::new()
         };
-        let offer_reply = is_persisted && has_committed_reply;
+        let offer_reply = is_persisted && has_committed_reply && self.viewer_may_act(cx);
         let offer_ask = !agents.is_empty();
         let menu_open = self.band_menu.as_ref() == Some(&parent_id);
 

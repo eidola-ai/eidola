@@ -285,6 +285,18 @@ fn a_refused_spawn_writes_nothing_at_all() {
         let (_mock, core, _dir) = setup();
         let parent = space(&core);
         let owner = shared_agent(&core, &parent, "Navigator");
+        // A parent that has been closed takes no new work either — and that is
+        // reachable rather than theoretical: a turn already past
+        // `prepare_turn` when the archival landed runs to completion by
+        // design, so the owner's spawn call is still to come. Arranged before
+        // the count below, which is about what the *refusals* leave behind.
+        let closed = space(&core);
+        let closed_owner = shared_agent(&core, &closed, "Bystander");
+        assert!(
+            core.runtime()
+                .block_on(core.archive_space(closed.clone()))
+                .expect("archive")
+        );
         let before = core
             .runtime()
             .block_on(core.list_spaces(true))
@@ -311,6 +323,21 @@ fn a_refused_spawn_writes_nothing_at_all() {
             SpawnRefusal::UnknownParent {
                 space_id: "no-such-space".into()
             }
+        );
+        assert_eq!(
+            refusal(
+                spawn(&core, &closed, &closed_owner, "Do a thing.", vec![], vec![]).unwrap_err()
+            ),
+            SpawnRefusal::ParentArchived {
+                space_id: closed.clone()
+            }
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.subspaces_of(closed))
+                .unwrap()
+                .is_empty(),
+            "and nothing was minted under it"
         );
         // The shared human is not an agent, and Eidola takes part in nothing.
         assert!(matches!(
