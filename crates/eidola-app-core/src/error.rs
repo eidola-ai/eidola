@@ -8,6 +8,17 @@ pub enum AppError {
     #[error("not configured: {message}")]
     NotConfigured { message: String },
 
+    /// An agent's request to spawn a sub-space was refused — a guard, an
+    /// attenuation check, or an ineligible participant (see
+    /// [`crate::subspaces::SpawnRefusal`], which carries which and says so in
+    /// words a model can act on). Typed rather than a message so the tool that
+    /// exposes the door can render a refusal as a tool result the model
+    /// corrects, instead of failing a turn over it. Nothing was written.
+    #[error("{refusal}")]
+    SpawnRefused {
+        refusal: crate::subspaces::SpawnRefusal,
+    },
+
     /// An HTTP request failed at the transport layer.
     #[error("network error: {message}")]
     Network { message: String },

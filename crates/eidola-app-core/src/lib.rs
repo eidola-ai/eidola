@@ -8,6 +8,7 @@ pub mod error;
 pub mod local_models;
 pub mod memory;
 pub mod router;
+pub mod subspaces;
 pub mod summaries;
 pub mod tools;
 pub mod trust_root;
@@ -42,6 +43,10 @@ use error::AppError;
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
     LocalModelStatus, LocalModelsState, RunningEngine,
+};
+pub use subspaces::{
+    MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, SpaceCapability, SpawnRefusal, SpawnedSubspace,
+    SubspaceInfo,
 };
 
 // ============================================================================
@@ -2766,7 +2771,7 @@ impl Inner {
                 Some(v) => *v,
                 None => {
                     let v =
-                        db::is_space_member(&db_conn, &r.space_id, viewer_participant_id).await?;
+                        db::may_read_space(&db_conn, &r.space_id, viewer_participant_id).await?;
                     seen.insert(r.space_id.clone(), v);
                     v
                 }
@@ -6730,8 +6735,8 @@ impl Inner {
         // depth behind `ChatResult::response_action_id` being `None` on a
         // declined turn (see [`decline`]); the guard is cheap and the failure
         // it prevents is silent.
-        match db::action_type(&conn, post_action_id).await?.as_deref() {
-            Some("user_input") | Some("inference") => {}
+        match db::action_type(&conn, post_action_id).await? {
+            Some(t) if db::is_post_action_type(&t) => {}
             _ => return Ok(NotificationPlan::Turns(Vec::new())),
         }
 
@@ -7114,15 +7119,23 @@ impl AppCore {
     ///
     /// **This is the human click path of task 37's rule 4, so it is gated like
     /// the agent one.** Following a reference is following it whoever does it:
-    /// the read answers only for a `viewer_participant_id` that is a live
-    /// member of the action's space, and otherwise refuses with
-    /// [`AppError::NotAParticipant`] — which names no title, no participant and
-    /// no content (rule 3 already made *existence* public inside the
-    /// referencing space; nothing else is). The viewer is a required argument
-    /// rather than a second entry point so no caller can navigate without
-    /// asking: the ungated read would have opened an agent's private notebook
-    /// to a reader who is not in it, which is the one space the human is
-    /// genuinely not a member of.
+    /// the read answers only for a `viewer_participant_id` that may read the
+    /// action's space (`db::may_read_space` — a live member, or any human),
+    /// and otherwise refuses with [`AppError::NotAParticipant`] — which names
+    /// no title, no participant and no content (rule 3 already made
+    /// *existence* public inside the referencing space; nothing else is). The
+    /// viewer is a required argument rather than a second entry point so no
+    /// caller can navigate without asking.
+    ///
+    /// **The human arm is the one that is wider than membership**, and this is
+    /// one of the two surfaces it is wider on (see `db::may_read_space` for
+    /// the whole rule). An agent-spawned sub-space has no human member by
+    /// construction, so a membership-only read would make the rooms an agent
+    /// opened on the human's behalf the one thing the human could not oversee.
+    /// A **notebook** is still refused — an agent's own residence is the
+    /// privacy this gate was built for, and refusing it is what keeps the
+    /// bypass about oversight rather than about access. Models' gates are
+    /// untouched.
     ///
     /// `Ok(None)` stays "no such action" — an unknown id is not a refusal, and
     /// conflating the two would make this read a membership oracle.
@@ -7140,7 +7153,7 @@ impl AppCore {
                 else {
                     return Ok(None);
                 };
-                if !db::is_space_member(&conn, &space_id, &viewer_participant_id).await? {
+                if !db::may_read_space(&conn, &space_id, &viewer_participant_id).await? {
                     return Err(AppError::NotAParticipant {
                         participant_id: viewer_participant_id,
                         action_id,
@@ -8191,6 +8204,33 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Test-only seam: grant a space a capability outright.
+    ///
+    /// It exists because the capability model is deliberately closed: the only
+    /// writer is a spawn, and a spawn may only carry down what the parent
+    /// already holds — so with no capability in the world there is nothing for
+    /// the attenuation gate to *pass*, and only its refusals could be tested.
+    /// This seeds the root of a chain so the gate can be held to both answers.
+    /// Nothing in production grants a capability yet, which is the whole point
+    /// of the shape (see [`subspaces`]).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_grant_space_capability(
+        &self,
+        space_id: String,
+        name: String,
+        config: String,
+    ) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                db::test_insert_space_capability(&conn, &space_id, &name, &config).await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Test-only seam: a space's whole footprint as raw row counts —
     /// `(space rows, space_participant rows, owned participant rows)`.
     ///
@@ -8420,6 +8460,102 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// **Spawn a sub-space**: a new space under `parent_space_id` with **no
+    /// human member**, owned by `owner_participant_id` and opened by the
+    /// `brief` that agent writes into it. See [`subspaces`] for the shape and
+    /// the attenuation rule; `db::spawn_subspace_tx` for the guards, every one
+    /// of which is decided inside the writing transaction.
+    ///
+    /// `participants` are global agents seated beside the owner (empty = the
+    /// owner alone, the scratch-space mode). `capabilities` are names the
+    /// parent space must already hold, carried down with their configuration
+    /// copied verbatim — a request can narrow the set and can never widen one.
+    /// `title` is optional; the brief's opening line names the room when none
+    /// is given.
+    ///
+    /// Refusals arrive as [`AppError::SpawnRefused`] carrying a
+    /// [`SpawnRefusal`], and leave nothing behind. On success:
+    /// [`Change::SpaceIndex`] (the Library lists sub-spaces like any other
+    /// conversation), [`Change::Space`] for the new id, and
+    /// [`Change::Participants`].
+    pub async fn spawn_subspace(
+        &self,
+        parent_space_id: String,
+        owner_participant_id: String,
+        brief: String,
+        participants: Vec<String>,
+        capabilities: Vec<String>,
+        title: Option<String>,
+    ) -> Result<SpawnedSubspace, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .spawn_subspace(
+                        &parent_space_id,
+                        &owner_participant_id,
+                        &brief,
+                        &participants,
+                        &capabilities,
+                        title.as_deref(),
+                    )
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Every sub-space spawned from `parent_space_id`, oldest first, archived
+    /// ones included. Pure read.
+    pub async fn subspaces_of(
+        &self,
+        parent_space_id: String,
+    ) -> Result<Vec<SubspaceInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.subspaces_of(&parent_space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Every live sub-space `owner_participant_id` owns — the rooms an agent
+    /// is answerable for, and the set the per-owner spawn guard counts. Pure
+    /// read.
+    pub async fn live_subspaces_owned_by(
+        &self,
+        owner_participant_id: String,
+    ) -> Result<Vec<SubspaceInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.live_subspaces_owned_by(&owner_participant_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Read a space **as a sub-space** — its parent and its owner — or `None`
+    /// when it is an ordinary space. This is the read behind "where does this
+    /// report go, and who writes it". Pure read.
+    pub async fn subspace(&self, space_id: String) -> Result<Option<SubspaceInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.subspace(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The capabilities a space holds — its spawn-time snapshot, immutable
+    /// afterwards. Empty for every space today. Pure read.
+    pub async fn space_capabilities(
+        &self,
+        space_id: String,
+    ) -> Result<Vec<SpaceCapability>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.space_capabilities(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Delete a space **if nothing has ever been done with it**, answering
     /// whether it did.
     ///
@@ -8599,11 +8735,13 @@ impl AppCore {
     }
 
     /// [`Self::references_to`] filtered per viewer: only the referring posts
-    /// `viewer_participant_id` takes part in — the referrers it could actually
-    /// follow (task 37's inbound-exposure rule). A cross-space-aware surface
-    /// wants this one; a same-space highlight sees the same rows either way,
-    /// since a viewer is a member of the space it is reading. Pure read; emits
-    /// nothing.
+    /// `viewer_participant_id` could actually follow (the permission model's
+    /// inbound-exposure rule) — the read-side rule of `db::may_read_space`, so
+    /// a human sees the backlinks from the sub-spaces their agents opened and
+    /// an agent sees only the spaces it takes part in. A cross-space-aware
+    /// surface wants this one; a same-space highlight sees the same rows
+    /// either way, since a viewer is a member of the space it is reading. Pure
+    /// read; emits nothing.
     ///
     /// For the human surfaces the viewer is `db::HUMAN_PARTICIPANT_ID` — the
     /// shared "User" the default template references into every space.
@@ -11292,8 +11430,9 @@ fn header_prefix_viable(line: &str) -> bool {
 
 /// Convert space action rows into a sequence of role/content messages for UI
 /// display and for external callers. Groups content blocks by action and
-/// concatenates text; roles are the legacy shape (`user_input` → `user`,
-/// `inference` → `assistant`) with no headers. The upstream wire rendering is
+/// concatenates text; roles are the legacy shape (an agent's post →
+/// `assistant`, anyone else's → `user`) with no headers. The upstream wire
+/// rendering is
 /// [`actions_to_upstream_messages`].
 fn actions_to_messages(action_rows: &[db::SpaceActionRow]) -> Vec<SpaceMessage> {
     render_messages(action_rows, None)
@@ -11340,7 +11479,7 @@ fn render_messages(
     let mut current_action_id: Option<&str> = None;
 
     for row in action_rows {
-        if !matches!(row.action_type.as_str(), "user_input" | "inference") {
+        if !db::is_post_action_type(&row.action_type) {
             continue; // skip tool_call, tool_result, etc. for now
         }
         let role = match responder_participant_id {
@@ -11352,9 +11491,11 @@ fn render_messages(
                     "user"
                 }
             }
-            // Display/legacy: by action type.
+            // Display/legacy: by action type. An agent's post is its own
+            // words whether it inferred them or authored them directly (a
+            // sub-space brief), and there is no responder here to ask.
             None => {
-                if row.action_type == "inference" {
+                if db::is_agent_post_action_type(&row.action_type) {
                     "assistant"
                 } else {
                     "user"

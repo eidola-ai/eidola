@@ -620,6 +620,13 @@ const STAMP_LEDGER: &[(&str, &str)] = &[
         "insert_space",
         "raw helper with no production caller (asserted below)",
     ),
+    (
+        "spawn_subspace_tx_body",
+        "born stamped in the insert itself: an agent minted this sub-space \
+         deliberately, exactly as a promotion mints a notebook — and the same \
+         transaction writes its brief, so it has an action before it has \
+         existed for anyone",
+    ),
     // -- participant + membership writes --
     (
         "insert_participant",
