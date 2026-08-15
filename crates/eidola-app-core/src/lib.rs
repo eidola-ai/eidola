@@ -45,8 +45,8 @@ pub use local_models::{
     LocalModelStatus, LocalModelsState, RunningEngine,
 };
 pub use subspaces::{
-    MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, SpaceCapability, SpawnRefusal, SpawnedSubspace,
-    SubspaceInfo,
+    MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, MAX_SUBAGENTS_PER_SPAWN, SpaceCapability,
+    SpawnRefusal, SpawnedSubspace, SubspaceInfo,
 };
 
 // ============================================================================
@@ -3873,6 +3873,23 @@ impl Inner {
                         ),
                     });
                 }
+                // The other structural membership, refused in the same
+                // statement and for the same shape of reason: the owner row is
+                // the whole of what records who is answerable for a delegation,
+                // whose live-room quota it counts against, and who its report
+                // goes to, and nothing can grant a sub-space ownership back.
+                db::SpaceRemoval::RefusedSubspaceOwner => {
+                    let who = db::get_participant(&conn, participant_id)
+                        .await?
+                        .map(|p| p.label)
+                        .unwrap_or_else(|| "that agent".to_string());
+                    return Err(AppError::Config {
+                        message: format!(
+                            "{who} opened this conversation and is answerable for it, so it \
+                             cannot leave it — archive the conversation instead"
+                        ),
+                    });
+                }
                 outcome => outcome != db::SpaceRemoval::NothingToDo,
             };
         if removed {
@@ -4374,6 +4391,30 @@ impl Inner {
                     .ok_or_else(|| AppError::NotConfigured {
                         message: format!("space not found: {sid}"),
                     })?;
+            // **Reading a sub-space is oversight; writing into one is
+            // membership.** A human can open any of the rooms their agents
+            // opened (`db::may_read_space`), and the Library offers a composer
+            // on every row it lists — but a post written by a participant the
+            // roster does not carry makes that roster a lie to every model in
+            // the room, and makes the `human` notify policy fire in a space
+            // whose whole premise is that it has no human. The join that fixes
+            // it is a deliberate act with a surface of its own; until that
+            // surface exists this refuses, before any write, and says what the
+            // join will do. A **notebook** is deliberately untouched — the
+            // human has always been able to write in their own agent's
+            // notebook from Settings, and narrowing that is not this door's
+            // business.
+            if db::subspace(&db_conn, sid).await?.is_some()
+                && !db::is_space_member(&db_conn, sid, db::HUMAN_PARTICIPANT_ID).await?
+            {
+                return Err(AppError::NotJoined {
+                    space_id: sid.to_string(),
+                    message: "your agents opened this conversation between themselves. You can \
+                              read all of it; posting here will join you to it, which is not \
+                              something this version can do yet"
+                        .into(),
+                });
+            }
             (sid.to_string(), row.title, false)
         } else {
             // A new space is instantiated from the default template, so it has
@@ -4512,6 +4553,22 @@ impl Inner {
             .ok_or_else(|| AppError::Internal {
                 message: format!("item has no current generation: {item_id}"),
             })?;
+        // **An edit appends a `user_input` generation authored by the human**,
+        // so aimed at anything else it does not amend a post — it replaces
+        // another participant's words with the human's, under that
+        // participant's byline for every prior generation, in an item whose
+        // whole trail then says two different things about who was writing.
+        // The kind it may claim is the kind it writes. (An agent-authored
+        // brief is the case that made this reachable: it renders in the
+        // assistant slot, and it is a contract the room's participants are
+        // working from.)
+        require_post_kind(
+            &db_conn,
+            &tip,
+            "user_input",
+            "only your own posts can be edited",
+        )
+        .await?;
         let reply_parent = db::reply_antecedent(&db_conn, &tip).await?;
         let tip_references = db::reference_antecedents(&db_conn, &tip).await?;
 
@@ -6245,6 +6302,23 @@ impl Inner {
             .ok_or_else(|| AppError::Internal {
                 message: format!("item has no current generation: {item_id}"),
             })?;
+        // **Regeneration is "that agent, again", and it is destructive**: it
+        // supersedes the tip with a fresh `inference`, and `Revise` withholds
+        // the generation being replaced from the context, so what comes back
+        // is written without having seen what it replaces. Aimed at anything
+        // that was not inferred, that is not a second attempt at the same
+        // thing — it is a billed turn that overwrites authored text with a
+        // model's guess at it. The sub-space brief is the sharp case (it
+        // renders in the assistant slot, so a surface offering Regenerate by
+        // role would offer it): the brief is the contract the room is working
+        // from, and there is no attempt to repeat.
+        require_post_kind(
+            &db_conn,
+            &tip,
+            "inference",
+            "only an agent's answer can be regenerated",
+        )
+        .await?;
         drop(db_conn);
         self.run_turn(
             &space_id,
@@ -12540,6 +12614,28 @@ const SNIPPET_MAX_CHARS: usize = 120;
 /// bullets, blockquotes, numbered lists) and surrounding emphasis
 /// characters, then truncate to ~64 chars on a word boundary (appending an
 /// ellipsis when truncated). Returns `None` if nothing presentable is left.
+/// Refuse a post-level write aimed at a generation of the wrong kind.
+///
+/// Both writers that claim an item's identity — `edit_post` (appends a
+/// `user_input` generation) and `regenerate` (appends an `inference` one) —
+/// ask this of the tip they are about to supersede, before anything is
+/// written. The kind a write may claim is the kind it produces; anything else
+/// is a replacement wearing an amendment's clothes. `reason` is the sentence
+/// the caller wants read; the kinds themselves are never surfaced.
+async fn require_post_kind(
+    conn: &turso::Connection,
+    action_id: &str,
+    expected: &str,
+    reason: &str,
+) -> Result<(), AppError> {
+    match db::action_type(conn, action_id).await?.as_deref() {
+        Some(t) if t == expected => Ok(()),
+        _ => Err(AppError::WrongPostKind {
+            message: reason.to_string(),
+        }),
+    }
+}
+
 pub(crate) fn derive_space_title(prompt: &str) -> Option<String> {
     let line = prompt.lines().map(str::trim).find(|l| !l.is_empty())?;
 

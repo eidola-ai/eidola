@@ -27,8 +27,8 @@ use chat_harness::{ChatBehavior, MockConfig, MockServer, flat_messages};
 use eidola_app_core::changes::Change;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AppCore, MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, NewParticipant, NotificationPlan,
-    SpawnRefusal, SpawnedSubspace,
+    AppCore, MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, MAX_SUBAGENTS_PER_SPAWN,
+    NewParticipant, NotificationPlan, SpawnRefusal, SpawnedSubspace,
 };
 
 /// The external backend's model — these tests never need a credential, so the
@@ -931,4 +931,570 @@ fn a_brief_is_agent_authored_so_the_room_opens_one_cascade_hop_in() {
             other => panic!("a cascade limit of 1 must pause on the brief, got {other:?}"),
         }
     });
+}
+
+// ===========================================================================
+// The owner membership is structural
+// ===========================================================================
+
+/// Ownership is one membership row, so ordinary roster work must not be able
+/// to end it or add a second one. Both guards ride the write — a spawn and a
+/// removal are separate transactions, and the roster a caller read a moment
+/// ago is exactly what a concurrent spawn changes.
+#[test]
+fn a_subspace_owner_cannot_leave_and_cannot_be_joined_by_a_second_owner() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![helper.clone()],
+            vec![],
+        )
+        .expect("spawn");
+        let sub = out.space.id.clone();
+
+        // The owner cannot be taken out of the room it opened.
+        let err = core
+            .runtime()
+            .block_on(core.remove_space_participant(sub.clone(), owner.clone()))
+            .expect_err("the owner membership is structural");
+        assert!(
+            err.to_string().contains("Navigator") && err.to_string().contains("archive"),
+            "the refusal names the agent and the remedy: {err}"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.subspace(sub.clone()))
+                .unwrap()
+                .expect("still a sub-space")
+                .owner_participant_id,
+            owner,
+            "and ownership is exactly where it was"
+        );
+
+        // An ordinary member still leaves — the guard is about the owner, not
+        // about sub-spaces being frozen.
+        assert!(
+            core.runtime()
+                .block_on(core.remove_space_participant(sub.clone(), helper.clone()))
+                .expect("an ordinary membership ends normally")
+        );
+
+        // And nobody else can be granted ownership of it.
+        let outsider = shared_agent(&core, &parent, "Interloper");
+        for (who, how) in [
+            (outsider.clone(), "a stranger"),
+            (helper.clone(), "a member that left"),
+        ] {
+            let err = core
+                .runtime()
+                .block_on(core.grant_space_membership(
+                    sub.clone(),
+                    who.clone(),
+                    eidola_app_core::MembershipRole::Owner,
+                ))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("not as its owner"),
+                "{how} must be refused ownership: {err}"
+            );
+        }
+        // The same door with an ordinary role is unaffected.
+        core.runtime()
+            .block_on(core.grant_space_membership(
+                sub.clone(),
+                outsider.clone(),
+                eidola_app_core::MembershipRole::Member,
+            ))
+            .expect("joining as a member is ordinary work");
+        // …as is the other join door, which takes the role too.
+        let err = core
+            .runtime()
+            .block_on(core.add_global_participant(
+                sub.clone(),
+                helper.clone(),
+                Some(eidola_app_core::MembershipRole::Owner),
+            ))
+            .expect_err("the other join door carries the same guard");
+        assert!(
+            err.to_string().contains("not as its owner"),
+            "and says the same thing: {err}"
+        );
+
+        // Through all of that, one owner and it is the original.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.subspace(sub.clone()))
+                .unwrap()
+                .expect("still a sub-space")
+                .owner_participant_id,
+            owner
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(owner.clone()))
+                .unwrap()
+                .len(),
+            1,
+            "so the quota still counts it against the agent that opened it"
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(outsider))
+                .unwrap()
+                .is_empty()
+        );
+
+        // An ordinary space has no such rule: 'owner' is a descriptive role
+        // there, and this guard must not have leaked into every roster.
+        core.runtime()
+            .block_on(core.grant_space_membership(
+                parent.clone(),
+                helper,
+                eidola_app_core::MembershipRole::Owner,
+            ))
+            .expect("an ordinary space's roles are unconstrained");
+    });
+}
+
+// ===========================================================================
+// The other guards
+// ===========================================================================
+
+#[test]
+fn a_room_seats_the_subagent_limit_and_refuses_one_more() {
+    run(|| {
+        assert_eq!(
+            MAX_SUBAGENTS_PER_SPAWN, 8,
+            "the boundary these assertions are about"
+        );
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let mut agents: Vec<String> = (0..MAX_SUBAGENTS_PER_SPAWN)
+            .map(|n| shared_agent(&core, &parent, &format!("Panelist {n}")))
+            .collect();
+
+        spawn(
+            &core,
+            &parent,
+            &owner,
+            "A full panel.",
+            agents.clone(),
+            vec![],
+        )
+        .expect("the limit itself is admitted");
+
+        agents.push(shared_agent(&core, &parent, "One too many"));
+        assert_eq!(
+            refusal(
+                spawn(
+                    &core,
+                    &parent,
+                    &owner,
+                    "A panel one too large.",
+                    agents.clone(),
+                    vec![],
+                )
+                .unwrap_err()
+            ),
+            SpawnRefusal::TooManySubagents {
+                requested: MAX_SUBAGENTS_PER_SPAWN + 1,
+                limit: MAX_SUBAGENTS_PER_SPAWN,
+            }
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.subspaces_of(parent))
+                .unwrap()
+                .len(),
+            1,
+            "and the refused room was never opened"
+        );
+    });
+}
+
+/// A spawn reports work scheduled, so it must not seat a participant that can
+/// never take a turn. The configuration that decides it is the **base** one —
+/// a spawn copies no overrides, so a model supplied by an override in the
+/// parent does not travel to the child.
+#[test]
+fn an_agent_with_no_model_of_its_own_is_refused_a_seat() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+
+        // A shared agent with no model at all.
+        let mute = core
+            .runtime()
+            .block_on(core.add_space_participant(
+                parent.clone(),
+                NewParticipant {
+                    label: "Mute".into(),
+                    model_ref: None,
+                    system_prompt: None,
+                    notify_policy: "human".into(),
+                },
+            ))
+            .expect("add")
+            .id;
+        core.runtime()
+            .block_on(core.promote_participant(mute.clone(), None, None))
+            .expect("promote");
+
+        assert_eq!(
+            refusal(
+                spawn(
+                    &core,
+                    &parent,
+                    &owner,
+                    "Ask the mute one.",
+                    vec![mute.clone()],
+                    vec![],
+                )
+                .unwrap_err()
+            ),
+            SpawnRefusal::NoModelConfigured {
+                label: "Mute".into()
+            }
+        );
+
+        // A per-space override in the parent is not the child's configuration,
+        // so it does not make the agent eligible: overrides do not travel.
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                parent.clone(),
+                mute.clone(),
+                eidola_app_core::ParticipantOverride {
+                    model_ref: Some(Some(MODEL.into())),
+                    ..Default::default()
+                },
+            ))
+            .expect("override here");
+        assert_eq!(
+            refusal(
+                spawn(
+                    &core,
+                    &parent,
+                    &owner,
+                    "Ask the mute one again.",
+                    vec![mute.clone()],
+                    vec![],
+                )
+                .unwrap_err()
+            ),
+            SpawnRefusal::NoModelConfigured {
+                label: "Mute".into()
+            },
+            "the child sees the base config, so the parent's override cannot vouch for it"
+        );
+
+        // Giving it a model of its own — the thing the child will actually see
+        // — makes it eligible.
+        core.runtime()
+            .block_on(core.update_space_participant(
+                mute.clone(),
+                eidola_app_core::ParticipantUpdate {
+                    model_ref: Some(Some(MODEL.into())),
+                    ..Default::default()
+                },
+                eidola_app_core::ExpectedScope::Global,
+            ))
+            .expect("edit everywhere");
+        spawn(
+            &core,
+            &parent,
+            &owner,
+            "Now it can answer.",
+            vec![mute],
+            vec![],
+        )
+        .expect("a model of its own is what it needed");
+
+        // The owner is held to the same rule, for the same reason: it has to
+        // answer in the room it opened.
+        let voiceless = core
+            .runtime()
+            .block_on(core.add_space_participant(
+                parent.clone(),
+                NewParticipant {
+                    label: "Voiceless".into(),
+                    model_ref: None,
+                    system_prompt: None,
+                    notify_policy: "human".into(),
+                },
+            ))
+            .expect("add")
+            .id;
+        core.runtime()
+            .block_on(core.promote_participant(voiceless.clone(), None, None))
+            .expect("promote");
+        assert_eq!(
+            refusal(
+                spawn(
+                    &core,
+                    &parent,
+                    &voiceless,
+                    "I cannot speak.",
+                    vec![],
+                    vec![]
+                )
+                .unwrap_err()
+            ),
+            SpawnRefusal::NoModelConfigured {
+                label: "Voiceless".into()
+            }
+        );
+    });
+}
+
+/// A brief that yields no opening line still has to be findable in the
+/// Library: it carries no snippet either (a brief is not what the listing's
+/// fallback text reads), so a titleless row would be a blank line in a list.
+#[test]
+fn a_brief_with_no_openable_line_still_names_its_room() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+
+        let out = spawn(&core, &parent, &owner, "###", vec![], vec![]).expect("spawn");
+        assert_eq!(out.space.title.as_deref(), Some("Delegated by Navigator"));
+        let row = core
+            .runtime()
+            .block_on(core.list_spaces(true))
+            .expect("spaces")
+            .into_iter()
+            .find(|s| s.id == out.space.id)
+            .expect("listed");
+        assert_eq!(row.title.as_deref(), Some("Delegated by Navigator"));
+        assert!(
+            row.snippet.is_none(),
+            "which is exactly why the title has to be there: {row:?}"
+        );
+
+        // A brief with an ordinary opening line is still named by its own
+        // words — the fallback is a fallback.
+        let named = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn");
+        assert_eq!(named.space.title.as_deref(), Some("Check the tide tables."));
+    });
+}
+
+// ===========================================================================
+// Writing into a room you were not asked into
+// ===========================================================================
+
+/// Reading a sub-space is oversight; writing into one is membership. Until the
+/// join has a surface of its own, the composer's post is refused rather than
+/// written by a participant the roster does not carry.
+#[test]
+fn a_human_cannot_post_into_a_subspace_without_joining_it() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let out = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn");
+        let sub = out.space.id.clone();
+
+        let err = core
+            .runtime()
+            .block_on(core.post("Actually, check Saturday.".into(), Some(sub.clone())))
+            .expect_err("posting is membership");
+        match &err {
+            AppError::NotJoined { space_id, message } => {
+                assert_eq!(space_id, &sub);
+                assert!(
+                    message.contains("read") && message.contains("join"),
+                    "the refusal says what the join would do: {message}"
+                );
+            }
+            other => panic!("expected NotJoined, got {other:?}"),
+        }
+        // Zero trace: the room still holds only its brief.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.get_space_tree(sub.clone()))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // `chat` reaches the same gate — it is `post` plus a turn, and the
+        // post is what commits first.
+        let err = core
+            .runtime()
+            .block_on(core.chat(
+                "Actually, check Saturday.".into(),
+                MODEL.into(),
+                Some(sub.clone()),
+            ))
+            .expect_err("chat posts first, so it is refused first");
+        assert!(matches!(err, AppError::NotJoined { .. }), "{err:?}");
+        assert_eq!(
+            core.runtime()
+                .block_on(core.get_space_tree(sub.clone()))
+                .unwrap()
+                .len(),
+            1,
+            "and no turn was funded either"
+        );
+
+        // The human's own conversations are untouched.
+        core.runtime()
+            .block_on(core.post("Ordinary.".into(), Some(parent)))
+            .expect("posting where you are a member is unchanged");
+    });
+}
+
+// ===========================================================================
+// A brief is not something to edit or regenerate
+// ===========================================================================
+
+/// Both writes claim a post's item: an edit appends a `user_input` generation,
+/// a regeneration an `inference` one. Aimed at a brief, either would replace
+/// the contract a room is working from with a different kind of thing — and
+/// the regeneration would pay a model to guess at text it is not shown.
+#[test]
+fn a_brief_can_be_neither_edited_nor_regenerated() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let out = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn");
+
+        for err in [
+            core.runtime()
+                .block_on(core.edit_post(out.brief_action_id.clone(), "Check Saturday.".into()))
+                .expect_err("a brief is not the human's post to edit"),
+            core.runtime()
+                .block_on(core.regenerate(out.brief_action_id.clone(), MODEL.into()))
+                .expect_err("a brief was not inferred, so there is nothing to try again"),
+        ] {
+            assert!(matches!(err, AppError::WrongPostKind { .. }), "{err:?}");
+        }
+
+        // Zero trace: one generation, still a brief, still the same words.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(out.space.id))
+            .expect("tree");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].action_type, "brief");
+        assert_eq!(tree[0].generation_count, 1);
+
+        // And the ordinary cases still work: a human edits their own post, and
+        // an agent's answer is regenerable.
+        let mine = core
+            .runtime()
+            .block_on(core.post("Mine.".into(), Some(parent.clone())))
+            .expect("post");
+        core.runtime()
+            .block_on(core.edit_post(mine.action_id, "Mine, edited.".into()))
+            .expect("a human's own post is editable");
+        // Regenerating a human post is refused for the mirror reason.
+        let mine2 = core
+            .runtime()
+            .block_on(core.post("Mine again.".into(), Some(parent)))
+            .expect("post");
+        assert!(
+            matches!(
+                core.runtime()
+                    .block_on(core.regenerate(mine2.action_id, MODEL.into()))
+                    .expect_err("a human post was never inferred"),
+                AppError::WrongPostKind { .. }
+            ),
+            "the rule is symmetric"
+        );
+    });
+}
+
+/// **A capability can only be minted by a spawn.**
+///
+/// The attenuation model is a claim about *writes*: absence of a row is
+/// absence of the capability, so a second writer anywhere would make every
+/// check upstream of it decorative. Two things are therefore pinned lexically,
+/// where the writes live rather than in a reviewer's memory —
+///
+/// 1. the test seam that seeds a capability is compiled out of release builds,
+///    not merely hidden from the documentation (`#[doc(hidden)]` gates docs and
+///    nothing else, so without the cfg a release-built dependent could link it
+///    and hand itself a grant no parent held); and
+/// 2. no other function in the module writes the table.
+#[test]
+fn only_a_spawn_can_mint_a_capability() {
+    let source = include_str!("../src/db.rs");
+    let production = source
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .map(|(before, _)| before)
+        .expect("db.rs ends in its test module");
+
+    assert!(
+        production.contains(
+            "#[doc(hidden)]\n#[cfg(any(test, feature = \"test-support\"))]\npub async fn \
+             test_insert_space_capability("
+        ),
+        "the capability seam must be compiled out of release builds: it mints the one thing \
+         the attenuation gate exists to make unmintable"
+    );
+
+    // Every function containing a write against the table, by the same
+    // owner-tracking scan the stamp ledger uses.
+    let mut current = "<file scope>";
+    let mut writers: std::collections::BTreeSet<&str> = Default::default();
+    for line in production.lines() {
+        let trimmed = line.trim_start();
+        for head in ["pub async fn ", "async fn ", "pub fn ", "fn "] {
+            if let Some(rest) = trimmed.strip_prefix(head) {
+                let len = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .count();
+                let start = line.len() - rest.len();
+                current = &line[start..start + len];
+                break;
+            }
+        }
+        if line.contains("INTO space_capability")
+            || line.contains("UPDATE space_capability")
+            || line.contains("DELETE FROM space_capability")
+        {
+            writers.insert(current);
+        }
+    }
+    assert_eq!(
+        writers.into_iter().collect::<Vec<_>>(),
+        vec!["spawn_subspace_tx_body", "test_insert_space_capability"],
+        "a capability may be written by the spawn and by the test seam, and by nothing else"
+    );
 }

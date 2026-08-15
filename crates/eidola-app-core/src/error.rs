@@ -8,6 +8,30 @@ pub enum AppError {
     #[error("not configured: {message}")]
     NotConfigured { message: String },
 
+    /// The human tried to write into an agent-spawned sub-space they have not
+    /// joined.
+    ///
+    /// Reading one is unconditional (oversight — see `db::may_read_space`);
+    /// writing into one is membership, because the roster the models are shown
+    /// has to stay truthful about who is in the room. The two are not the same
+    /// permission and this is where they part. Carries the `space_id` the
+    /// caller already named, so the surface that raises it can offer the join
+    /// that would satisfy it.
+    #[error("{message}")]
+    NotJoined { space_id: String, message: String },
+
+    /// A post-level write was aimed at a kind of post it does not apply to:
+    /// editing something that is not the human's own input, or regenerating
+    /// something that is not an agent's inferred answer.
+    ///
+    /// Both writes claim a post's *item* — an edit appends a `user_input`
+    /// generation, a regeneration appends an `inference` one — so aimed at the
+    /// wrong kind they do not amend a post, they replace it with a different
+    /// kind of thing. Typed so a surface can withhold the affordance and say
+    /// why, rather than discovering it by writing.
+    #[error("{message}")]
+    WrongPostKind { message: String },
+
     /// An agent's request to spawn a sub-space was refused — a guard, an
     /// attenuation check, or an ineligible participant (see
     /// [`crate::subspaces::SpawnRefusal`], which carries which and says so in
