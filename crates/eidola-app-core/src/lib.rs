@@ -41,7 +41,7 @@ pub use db::HUMAN_PARTICIPANT_ID;
 use error::AppError;
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
-    LocalModelStatus, LocalModelsState, RunningEngine,
+    LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
 };
 
 // ============================================================================

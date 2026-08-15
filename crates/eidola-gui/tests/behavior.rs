@@ -16400,6 +16400,174 @@ fn backends_a_catalog_press_cannot_race_a_pending_retry(cx: &mut TestAppContext)
     assert_eq!(downloading[0].slug, "wisp");
 }
 
+/// **One transfer is one transfer however its URL is spelled.** App-core keys
+/// its download map by the model's slug, and `normalize_model_url` folds
+/// equivalent spellings onto it: a Hugging Face `/blob/` file page and its
+/// `/resolve/` object are the same bytes, as is either with `?download=true`.
+/// A pending key taken from the raw text separates what app-core joins — the
+/// failed row remembers the spelling that was pasted, the catalog offers its
+/// own — so the second door missed the lookup, reached app-core, and had its
+/// "already downloading" refusal published over the transfer that was working.
+/// The key is therefore derived, by `resolve_model_download`, from the same
+/// identity app-core deduplicates on.
+///
+/// Staged like its sibling above: one `tick` leaves the first press's core call
+/// genuinely out and its continuation outstanding, and the listener never
+/// answers, so the window stays open for the rest of the test. The teeth are
+/// both halves — `download_pending` answering for a spelling nobody pressed,
+/// and `op_error` staying empty after two more doors open on the same model.
+/// The URL is local but carries `huggingface.co/` in its path, which is what
+/// the rewrite rule keys on, so the real normalization runs against a listener
+/// this machine owns.
+#[gpui::test]
+fn backends_an_equivalent_url_spelling_is_the_same_transfer(cx: &mut TestAppContext) {
+    use eidola_app_core::{LocalModelInfo, LocalModelStatus};
+    use eidola_gui::backends_settings::BackendsTab;
+
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let host = listener.local_addr().unwrap();
+    // What the reader pastes out of the address bar, and what the catalog
+    // would hold for the same file.
+    let blob_url = format!("http://{host}/huggingface.co/wisp-gguf/blob/main/wisp.gguf");
+    let resolve_url = format!("http://{host}/huggingface.co/wisp-gguf/resolve/main/wisp.gguf");
+    let query_url = format!("{resolve_url}?download=true");
+
+    stores.backends.update(cx, |s, cx| s.refresh(cx));
+    for _ in 0..8 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    cx.run_until_parked();
+
+    stores.local_models.update(cx, |s, _| {
+        s.set_state_for_test(eidola_app_core::LocalModelsState {
+            engine_path: None,
+            external: Vec::new(),
+            models: vec![LocalModelInfo {
+                id: "wisp@local".into(),
+                slug: "wisp".into(),
+                display_name: "Wisp".into(),
+                file_name: "wisp.gguf".into(),
+                size_bytes: None,
+                source_url: Some(blob_url.clone()),
+                status: LocalModelStatus::Available,
+                last_error: Some("HTTP 500".into()),
+                on_disk: false,
+            }],
+        })
+    });
+
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+        pane.update(cx, |p, cx| p.select_tab(BackendsTab::Local, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| {
+            p.retry_failed_download("wisp@local", blob_url.clone(), window, cx)
+        });
+    })
+    .unwrap();
+    for (spelling, name) in [
+        (&blob_url, "the spelling that was pressed"),
+        (&resolve_url, "the object that spelling resolves to"),
+        (&query_url, "the same object with a download query"),
+    ] {
+        assert!(
+            stores
+                .local_models
+                .read_with(cx, |s, _| s.download_pending(spelling)),
+            "the slot must answer for {name}: {spelling}"
+        );
+    }
+
+    // Poll that task exactly far enough to issue its core call, and no further.
+    let running = |cx: &mut TestAppContext| {
+        let _ = cx;
+        core.runtime()
+            .block_on(core.local_models_state())
+            .map(|s| {
+                s.models.iter().any(|m| {
+                    m.slug == "wisp" && matches!(m.status, LocalModelStatus::Downloading { .. })
+                })
+            })
+            .unwrap_or(false)
+    };
+    let mut in_flight = false;
+    for _ in 0..8 {
+        cx.executor().tick();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        in_flight = running(cx);
+        if in_flight {
+            break;
+        }
+    }
+    assert!(
+        in_flight,
+        "the retry's transfer is genuinely running — the window this test is about"
+    );
+    assert!(
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&resolve_url)),
+        "…and the slot, still the retry's, is still reachable by the other spelling"
+    );
+
+    // Two more doors onto the same model, each under a spelling of its own.
+    cx.update_window(window, |_, _, cx| {
+        pane.update(cx, |p, cx| p.download_catalog(&resolve_url, cx));
+        pane.update(cx, |p, cx| p.download_catalog(&query_url, cx));
+    })
+    .unwrap();
+    for _ in 0..12 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    cx.run_until_parked();
+
+    assert!(
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.op_error().is_none()),
+        "an equivalent spelling must start nothing rather than refuse the transfer it names: {:?}",
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.op_error().map(str::to_string))
+    );
+
+    let live = core
+        .runtime()
+        .block_on(core.local_models_state())
+        .expect("read the live listing");
+    let downloading: Vec<&LocalModelInfo> = live
+        .models
+        .iter()
+        .filter(|m| matches!(m.status, LocalModelStatus::Downloading { .. }))
+        .collect();
+    assert_eq!(
+        downloading.len(),
+        1,
+        "three spellings, one operation, one transfer: {:?}",
+        live.models
+    );
+    assert_eq!(downloading[0].slug, "wisp");
+}
+
 /// **The catalog row yields its verb the way the Retry verb does.** A curated
 /// entry is `Installed` only once its file is on disk, so while a Retry-started
 /// transfer of that very entry is being set up the row went on painting a live
