@@ -604,7 +604,8 @@ const STAMP_LEDGER: &[(&str, &str)] = &[
     ("update_space_title", "stamps in the same statement"),
     (
         "retire_participant_tx_body",
-        "archives the retired agent's notebook; stamps in the same statement",
+        "archives the retired agent's notebook and the sub-spaces it owned; \
+         stamps in the same statements",
     ),
     // -- births --
     (

@@ -1498,3 +1498,212 @@ fn only_a_spawn_can_mint_a_capability() {
         "a capability may be written by the spawn and by the test seam, and by nothing else"
     );
 }
+
+/// **Retirement completes the set of write boundaries around ownership.** The
+/// leave is refused and a second owner is refused, but retirement writes
+/// neither of those rows: it soft-removes the participant and leaves its
+/// memberships standing, after which every membership *question* answers "no".
+/// A live sub-space left behind is therefore a Library row whose owner is
+/// named by the ownership read and absent from its own roster, whose planning
+/// can never reach that agent again, and which still holds a live-room quota
+/// nothing can spend — and no door can repair it, because a replacement owner
+/// is (correctly) refused. So the retirement archives it, in its own
+/// transaction, exactly as it archives the notebook and for the same reason:
+/// the room existed only because of that agent.
+#[test]
+fn retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+
+        let live = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![helper.clone()],
+            vec![],
+        )
+        .expect("spawn");
+        let already = spawn(&core, &parent, &owner, "An older errand.", vec![], vec![])
+            .expect("spawn")
+            .space
+            .id;
+        core.runtime()
+            .block_on(core.archive_space(already.clone()))
+            .expect("archive");
+        let archived_at = |core: &AppCore, id: &str| -> Option<i64> {
+            core.runtime()
+                .block_on(core.list_spaces(true))
+                .expect("spaces")
+                .into_iter()
+                .find(|s| s.id == id)
+                .expect("listed")
+                .archived_at
+        };
+        let already_at = archived_at(&core, &already).expect("archived");
+
+        // A room the *other* agent spawned from the owner's room — its owner is
+        // not being retired, so it is nobody else's to close.
+        let nested = spawn(
+            &core,
+            &live.space.id,
+            &helper,
+            "A sub-errand of my own.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.retire_participant(owner.clone()))
+            .expect("retire");
+
+        // The room it owned is archived — in the same transaction, so no
+        // ownerless-live-room state ever existed to be observed.
+        assert!(
+            archived_at(&core, &live.space.id).is_some(),
+            "a room whose owner is gone is not left live"
+        );
+        assert!(
+            !core
+                .runtime()
+                .block_on(core.list_spaces(false))
+                .unwrap()
+                .iter()
+                .any(|s| s.id == live.space.id),
+            "so the Library stops offering it"
+        );
+        // The quota it held is released with it, and the ownership question
+        // dissolves rather than being answered wrongly.
+        assert!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(owner.clone()))
+                .unwrap()
+                .is_empty(),
+            "a retired agent holds no live rooms"
+        );
+
+        // **No live sub-space anywhere has an owner that is not one of its own
+        // live members.** This is the invariant the whole write-boundary set
+        // exists for, asked of every room at once rather than of the one this
+        // test happens to have retired.
+        for room in core
+            .runtime()
+            .block_on(core.subspaces_of(parent.clone()))
+            .unwrap()
+            .into_iter()
+            .chain(
+                core.runtime()
+                    .block_on(core.subspaces_of(live.space.id.clone()))
+                    .unwrap(),
+            )
+            .filter(|r| r.archived_at.is_none())
+        {
+            let roster: Vec<String> = core
+                .runtime()
+                .block_on(core.list_space_participants(room.id.clone()))
+                .expect("roster")
+                .into_iter()
+                .map(|p| p.id)
+                .collect();
+            assert!(
+                roster.contains(&room.owner_participant_id),
+                "live room {} reports an owner that is not in its roster: {roster:?}",
+                room.id
+            );
+        }
+
+        // Archival is a visibility choice, not a deletion: the transcript
+        // survives whole, and the human can still read it — neither membership
+        // nor the read bypass filters on archival.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(live.space.id.clone()))
+            .expect("tree");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].action_type, "brief");
+        assert_eq!(
+            core.runtime()
+                .block_on(core.action_location(
+                    eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                    live.brief_action_id.clone(),
+                ))
+                .expect("a human may still read it")
+                .expect("some location")
+                .1,
+            live.space.id
+        );
+
+        // The other agent's room is left alone — its owner is still live and
+        // still answerable for it — and it reads fine with its parent link
+        // pointing at an archived room.
+        assert!(
+            archived_at(&core, &nested).is_none(),
+            "nobody else's delegation is closed by this retirement"
+        );
+        let relation = core
+            .runtime()
+            .block_on(core.subspace(nested.clone()))
+            .unwrap()
+            .expect("still a sub-space");
+        assert_eq!(relation.parent_space_id, live.space.id);
+        assert_eq!(relation.owner_participant_id, helper);
+        assert_eq!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(helper.clone()))
+                .unwrap()
+                .len(),
+            1,
+            "and it still counts against the agent that opened it"
+        );
+
+        // An already-archived room is not archived twice: its timestamp is
+        // where it was, which is what the write's own rows-affected count is
+        // read from.
+        assert_eq!(archived_at(&core, &already), Some(already_at));
+
+        // Emissions: the roster changed, and so did the Library — because a
+        // sub-space *is* a Library row, unlike the notebook this same
+        // transaction also archived.
+        let seen = drain(&mut rx);
+        assert!(seen.contains(&Change::Participants), "{seen:?}");
+        assert!(
+            seen.contains(&Change::SpaceIndex),
+            "archiving a listed room moved the listing: {seen:?}"
+        );
+
+        // And the unchanged half: retiring an agent that owns no live room
+        // says nothing about the Library, because the notebook it archives is
+        // one the listing never showed.
+        let quiet = shared_agent(&core, &parent, "Quiet");
+        let mut rx2 = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.retire_participant(quiet.clone()))
+            .expect("retire");
+        let seen2 = drain(&mut rx2);
+        assert!(seen2.contains(&Change::Participants), "{seen2:?}");
+        assert!(
+            !seen2.contains(&Change::SpaceIndex),
+            "a notebook is not a Library row, so nothing announced one: {seen2:?}"
+        );
+        assert!(
+            core.runtime()
+                .block_on(
+                    core.test_space_archived(
+                        core.runtime()
+                            .block_on(core.notebook_space_id(quiet))
+                            .expect("notebook")
+                            .expect("has one")
+                    )
+                )
+                .expect("archived?"),
+            "the notebook arm is exactly as it was"
+        );
+    });
+}

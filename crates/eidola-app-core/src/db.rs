@@ -3161,14 +3161,54 @@ pub async fn list_grantable_agents(
     Ok(out)
 }
 
-/// Retire a global agent: the soft-remove **and** its notebook's archival, in
-/// one transaction (task 36 — "archival tied to retirement").
+/// What a retirement did: whether it retired anything, and how many spaces the
+/// **Library lists** it archived on the way (the notebook is never one — the
+/// listing excludes notebooks in both its branches — so this counts sub-spaces
+/// and is what decides whether the caller announces a listing change).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retirement {
+    pub retired: bool,
+    pub listed_spaces_archived: i64,
+}
+
+/// Retire a global agent: the soft-remove **and** the archival of every space
+/// that exists only because of it — its notebook, and any sub-space it still
+/// owns — in one transaction ("archival tied to retirement").
 ///
-/// The two belong together because the notebook exists only for the agent: a
+/// **The notebook** belongs here because it exists only for the agent: a
 /// retired agent whose notebook stayed open would leave a live space nobody
 /// owns, and an archived notebook beside a live agent would take away the
-/// residence its next `core` memory block needs. Answers `false` when the row
-/// was already retired — the caller decides whether that is a refusal.
+/// residence its next `core` memory block needs.
+///
+/// **A sub-space it owns belongs here for the first of those reasons, sharpened
+/// by what ownership carries.** Retirement soft-removes the participant and
+/// deliberately leaves its membership rows standing, and every membership
+/// *question* then answers "no" ([`is_space_member`], [`space_participants`]) —
+/// so a live sub-space left behind is a room the Library still lists, whose
+/// owner is named by [`subspace_owner_of`] and absent from its own roster,
+/// whose planning can never reach that agent again, and which still counts
+/// against a live-room quota nothing can now spend. No door could repair it
+/// either: `refuse_second_subspace_owner` correctly refuses a replacement
+/// owner, because ownership is not transferable. Archiving dissolves the
+/// question instead of answering it — the room stops being live, so it holds
+/// no quota, schedules nothing, and is no longer a Library row promising work
+/// that cannot happen. The transcript survives in full: archival is a
+/// visibility choice, not a deletion, and neither membership nor the human
+/// read bypass filters on it, so everyone who could read the room yesterday
+/// still can.
+///
+/// **Refusing the retirement was the alternative and was rejected.** It would
+/// let one stuck delegation make a shared agent unretirable, which is the
+/// opposite of what retirement is for, and it would contradict the notebook
+/// arm standing beside it in this very function.
+///
+/// **Only the retiring agent's own rooms are touched.** The statement selects
+/// by *ownership*, not by descent, so it reaches the agent's sub-spaces at
+/// every depth and reaches nobody else's: a sub-space that another agent
+/// spawned from one of these keeps its live owner and stays live, with its
+/// parent link pointing at an archived room. That is the honest state — its
+/// owner is still answerable for it — and nothing reads a parent's
+/// `archived_at` to decide anything about a child.
 ///
 /// The participant row itself always survives (soft-remove), so every
 /// `action.participant_id` in the trail stays resolvable; retirement is about
@@ -3177,12 +3217,12 @@ pub async fn retire_participant_tx(
     conn: &Connection,
     participant_id: &str,
     now: i64,
-) -> Result<bool, AppError> {
+) -> Result<Retirement, AppError> {
     begin_write(conn).await?;
     match retire_participant_tx_body(conn, participant_id, now).await {
-        Ok(retired) => {
+        Ok(retirement) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
-            Ok(retired)
+            Ok(retirement)
         }
         Err(e) => {
             // Best-effort rollback; propagate the original error regardless.
@@ -3196,9 +3236,12 @@ async fn retire_participant_tx_body(
     conn: &Connection,
     participant_id: &str,
     now: i64,
-) -> Result<bool, AppError> {
+) -> Result<Retirement, AppError> {
     if !soft_remove_participant(conn, participant_id, now).await? {
-        return Ok(false);
+        return Ok(Retirement {
+            retired: false,
+            listed_spaces_archived: 0,
+        });
     }
     conn.execute(
         "UPDATE space SET archived_at = ?2, touched_at = COALESCE(touched_at, ?2) \
@@ -3209,7 +3252,30 @@ async fn retire_participant_tx_body(
     .map_err(|e| AppError::Database {
         message: format!("failed to archive the retired agent's notebook: {e}"),
     })?;
-    Ok(true)
+    // Owner-scoped, so depth is irrelevant and nobody else's room is reached.
+    // The membership predicate is [`SUBSPACE_OWNER_SQL`]'s, minus its
+    // tie-break: that fragment names *the* owner where this asks *is an owner*,
+    // which is the same set while the write guards hold and the safer of the
+    // two if one ever did not.
+    let archived = conn
+        .execute(
+            "UPDATE space SET archived_at = ?2, touched_at = COALESCE(touched_at, ?2) \
+             WHERE archived_at IS NULL AND parent_space_id IS NOT NULL \
+               AND EXISTS ( \
+                   SELECT 1 FROM space_participant r \
+                   WHERE r.space_id = space.id AND r.participant_id = ?1 \
+                     AND r.role = 'owner' AND r.left_at IS NULL \
+               )",
+            (Value::Text(participant_id.to_string()), Value::Integer(now)),
+        )
+        .await
+        .map_err(|e| AppError::Database {
+            message: format!("failed to archive the retired agent's sub-spaces: {e}"),
+        })?;
+    Ok(Retirement {
+        retired: true,
+        listed_spaces_archived: archived as i64,
+    })
 }
 
 /// Whether a participant is a member of one space — **owned row ∪ live
