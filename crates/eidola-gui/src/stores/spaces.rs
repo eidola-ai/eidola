@@ -273,12 +273,21 @@ impl SpacesStore {
                 .await;
                 let _ = this.update(cx, |this, cx| {
                     this.instantiations.remove(&key);
-                    if let Err(e) = result {
-                        this.fail_creation(&key, e, cx);
+                    match result {
+                        // The index needs nothing here — the write emitted
+                        // `Change::SpaceIndex` and the bus refreshes it the
+                        // ordinary way. What the entity needs is the release:
+                        // a mutation started before this commit is waiting on
+                        // it (see `Space::creation_committed`).
+                        Ok(_) => {
+                            if let Some(space) =
+                                this.registry.get(&key).and_then(WeakEntity::upgrade)
+                            {
+                                space.update(cx, |space, cx| space.creation_committed(cx));
+                            }
+                        }
+                        Err(e) => this.fail_creation(&key, e, cx),
                     }
-                    // The success arm needs nothing: the write emitted
-                    // `Change::SpaceIndex`, which refreshes the index the
-                    // ordinary way.
                 });
             }),
         );
@@ -289,7 +298,9 @@ impl SpacesStore {
     /// there is no registry entry either. Dropping the key is what keeps the
     /// registry a map of conversations that exist — a later `open` of that id
     /// would otherwise join an entity standing on an error. The entity itself
-    /// is told, because its window is what has to say so.
+    /// is told, because its window is what has to say so — and because a save
+    /// waiting on the insert has to be released with the refusal rather than
+    /// left waiting on a settle that has already happened.
     fn fail_creation(&mut self, space_id: &str, error: AppError, cx: &mut Context<Self>) {
         let entity = self
             .registry
