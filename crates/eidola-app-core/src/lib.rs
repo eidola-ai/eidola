@@ -3254,6 +3254,47 @@ impl Inner {
         Ok(())
     }
 
+    /// **Reading a sub-space is oversight; acting in one is membership.**
+    ///
+    /// A human can open any of the rooms their agents opened
+    /// (`db::may_read_space`), and the Library offers every listed row a window
+    /// with a composer and a full set of per-post verbs. What none of that may
+    /// do is *act*: a post written by a participant the roster does not carry
+    /// makes that roster a lie to every model in the room and fires the `human`
+    /// notify policy in a space whose whole premise is that it has none, and a
+    /// regeneration or a retry spends the reader's credits driving a
+    /// conversation they never joined. Oversight is looking; this is the line
+    /// it stops at.
+    ///
+    /// **Every door that acts *as the human* asks this**, and that is exactly
+    /// the set: `post` (and `chat`/`chat_stream`/`submit` through it), which
+    /// hard-codes the human as author, and `edit_post`, `regenerate` and
+    /// `respond_stream`, which the human's own picker and per-post verbs drive.
+    /// `respond_stream_as` deliberately does **not** — it names the participant
+    /// it acts as, is already gated on *that* participant's membership
+    /// (`resolve_explicit_participant`), and is the door a turn driver uses, so
+    /// a human-membership test there would refuse the sub-space's own agents
+    /// working in their own room.
+    ///
+    /// Asked before any write and before any spend, so a refusal is zero-trace.
+    /// A **notebook** is deliberately untouched — the human has always been
+    /// able to write in their own agent's notebook from Settings, and
+    /// narrowing that is not this rule's business.
+    async fn require_human_joined(
+        &self,
+        conn: &turso::Connection,
+        space_id: &str,
+    ) -> Result<(), AppError> {
+        if db::subspace(conn, space_id).await?.is_some()
+            && !db::is_space_member(conn, space_id, db::HUMAN_PARTICIPANT_ID).await?
+        {
+            return Err(AppError::NotJoined {
+                space_id: space_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Name a write that a space's disappearance made impossible.
     ///
     /// These doors have no rows-affected to read — a foreign key is what
@@ -4419,30 +4460,7 @@ impl Inner {
                     .ok_or_else(|| AppError::NotConfigured {
                         message: format!("space not found: {sid}"),
                     })?;
-            // **Reading a sub-space is oversight; writing into one is
-            // membership.** A human can open any of the rooms their agents
-            // opened (`db::may_read_space`), and the Library offers a composer
-            // on every row it lists — but a post written by a participant the
-            // roster does not carry makes that roster a lie to every model in
-            // the room, and makes the `human` notify policy fire in a space
-            // whose whole premise is that it has no human. The join that fixes
-            // it is a deliberate act with a surface of its own; until that
-            // surface exists this refuses, before any write, and says what the
-            // join will do. A **notebook** is deliberately untouched — the
-            // human has always been able to write in their own agent's
-            // notebook from Settings, and narrowing that is not this door's
-            // business.
-            if db::subspace(&db_conn, sid).await?.is_some()
-                && !db::is_space_member(&db_conn, sid, db::HUMAN_PARTICIPANT_ID).await?
-            {
-                return Err(AppError::NotJoined {
-                    space_id: sid.to_string(),
-                    message: "your agents opened this conversation between themselves. You can \
-                              read all of it; posting here will join you to it, which is not \
-                              something this version can do yet"
-                        .into(),
-                });
-            }
+            self.require_human_joined(&db_conn, sid).await?;
             (sid.to_string(), row.title, false)
         } else {
             // A new space is instantiated from the default template, so it has
@@ -4581,6 +4599,10 @@ impl Inner {
             .ok_or_else(|| AppError::Internal {
                 message: format!("item has no current generation: {item_id}"),
             })?;
+        // Acting as the human in a room they have not joined — same gate as
+        // `post`, asked here because an edit is the same act on an older post.
+        self.require_human_joined(&db_conn, &space_id).await?;
+
         // **An edit appends a `user_input` generation authored by the human**,
         // so aimed at anything else it does not amend a post — it replaces
         // another participant's words with the human's, under that
@@ -6361,6 +6383,12 @@ impl Inner {
             .ok_or_else(|| AppError::Internal {
                 message: format!("item has no current generation: {item_id}"),
             })?;
+        // A regeneration is the human's verb — their picker chooses the model —
+        // and it *spends*, so it takes the same gate as `post`, before any of
+        // that. Reading a delegated conversation must not come with a button
+        // that drives one.
+        self.require_human_joined(&db_conn, &space_id).await?;
+
         // **Regeneration is "that agent, again", and it is destructive**: it
         // supersedes the tip with a fresh `inference`, and `Revise` withholds
         // the generation being replaced from the context, so what comes back
@@ -7164,6 +7192,14 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move {
+                // Retry is the human's verb — their picker chose the model —
+                // and it spends, so it takes the same gate `post` does before
+                // anything else happens. `respond_stream_as` below deliberately
+                // does not: it names the participant it acts as, and that is a
+                // door a turn driver uses.
+                let conn = inner.db_conn().await?;
+                inner.require_human_joined(&conn, &space_id).await?;
+                drop(conn);
                 inner
                     .run_turn_stream(
                         &space_id,
@@ -7356,6 +7392,35 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.mechanical_plan(&space_id, &post_action_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Test-only seam: refine a plan the caller already holds.
+    ///
+    /// Production always plans and refines in one call
+    /// ([`Self::plan_notifications`]), which is exactly why the interleaving
+    /// worth testing cannot be reached from outside: an archival that lands
+    /// *between* the two — the one a retirement performs, say — leaves
+    /// refinement holding a plan for a room that has since closed, and a remote
+    /// router would bill an inference to choose among turns that can no longer
+    /// run. Handing refinement a plan directly is the only way to stage that
+    /// moment.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_refine_notifications(
+        &self,
+        space_id: String,
+        post_action_id: String,
+        plan: NotificationPlan,
+    ) -> Result<NotificationPlan, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                Ok(inner
+                    .refine_notifications(&space_id, &post_action_id, plan)
+                    .await)
+            })
             .await
             .map_err(join_err)?
     }

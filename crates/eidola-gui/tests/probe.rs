@@ -6495,3 +6495,73 @@ fn a_brief_offers_no_regenerate_and_an_answer_still_does(cx: &mut TestAppContext
 
     probe::set_probes_enabled(false);
 }
+
+/// **A window onto a room you only watch offers no verb that would be
+/// refused.**
+///
+/// The human can open any conversation their agents opened between themselves,
+/// and what opens is an ordinary window. App-core refuses every acting verb
+/// there (`AppError::NotJoined`) and that refusal is the guarantee; this is the
+/// window declining to offer what it knows would be refused. Both facts have
+/// to be known before it does: the roster has answered and does not carry the
+/// human, and the settings have answered that this is not an agent's
+/// **notebook** — which the human is also not a member of, and may nonetheless
+/// write in.
+#[gpui::test]
+fn a_room_the_reader_only_watches_offers_no_regenerate(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let agent_only = vec![eidola_app_core::ParticipantInfo {
+        id: "agent-a".into(),
+        scope: "global".into(),
+        source: "referenced".into(),
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+        model_ref: Some("gemma4-31b".into()),
+        system_prompt: None,
+        notify_policy: "all".into(),
+        role: "member".into(),
+        reference: None,
+    }];
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        // The roster has answered, and the reader is not in it.
+        s.participants = Some(("s".to_string(), agent_only));
+        // …and this is not a notebook, so the refusal really applies.
+        s.space_settings = Some((
+            "s".to_string(),
+            eidola_app_core::SpaceSettings {
+                notebook_participant_id: None,
+                ..Default::default()
+            },
+        ));
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12.");
+    answer.action_type = "inference".into();
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![answer], cx));
+    });
+    draw(cx, window);
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a1", cx));
+    });
+
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"space/post/0/regenerate".to_string()),
+        "an inferred answer is regenerable in general — but not by someone who has not joined \
+         the conversation, because the core refuses it: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}

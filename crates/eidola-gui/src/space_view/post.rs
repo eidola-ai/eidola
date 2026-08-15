@@ -12,6 +12,7 @@ use gpui::{
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::MarkdownEditor;
 
+use crate::loadable::Loadable;
 use crate::probe::Probe as _;
 
 use crate::overlay::{Contain as _, Overlay};
@@ -502,6 +503,50 @@ impl SpaceView {
         } else if self.hovered_post.as_ref() == Some(id) {
             self.hovered_post = None;
             cx.notify();
+        }
+    }
+
+    /// Whether the reader may *act* in this conversation, or is only watching
+    /// it — the view's half of app-core's `require_human_joined`.
+    ///
+    /// A human can open any conversation their agents opened between
+    /// themselves, and the window that opens is an ordinary one: a composer, a
+    /// per-post gutter, the lot. The core refuses every one of those verbs
+    /// there ([`AppError::NotJoined`]) and that refusal is what makes the
+    /// promise real — this only keeps the window from offering what it knows
+    /// would be refused.
+    ///
+    /// **Every unknown answers `true`.** A reader waiting a frame for a cell to
+    /// answer must not lose their verbs: guessing wrong this way costs a
+    /// refusal they were going to get anyway, and the other way costs a working
+    /// affordance that vanished.
+    ///
+    /// The roster decides it alone in every ordinary conversation, where the
+    /// human is a member. Only when the roster has answered and does *not*
+    /// carry the human is a second fact needed — is this an agent's
+    /// **notebook**, which the human is genuinely not a member of and may
+    /// nonetheless write in, a difference app-core draws deliberately. That
+    /// cell is loaded here rather than at open precisely so the common case
+    /// never asks for it.
+    pub(crate) fn viewer_may_act(&mut self, cx: &mut Context<Self>) -> bool {
+        let id = self.space.read(cx).id().to_string();
+        let Loadable::Loaded { value: roster, .. } =
+            self.stores.participants.read(cx).participants(&id)
+        else {
+            return true;
+        };
+        if roster
+            .iter()
+            .any(|p| p.id == eidola_app_core::HUMAN_PARTICIPANT_ID)
+        {
+            return true;
+        }
+        self.stores
+            .space_settings
+            .update(cx, |s, cx| s.ensure(id.clone(), cx));
+        match self.stores.space_settings.read(cx).settings(&id) {
+            Loadable::Loaded { value, .. } => value.notebook_participant_id.is_some(),
+            _ => true,
         }
     }
 

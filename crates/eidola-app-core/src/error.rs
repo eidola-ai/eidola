@@ -29,13 +29,21 @@ pub enum AppError {
     /// joined.
     ///
     /// Reading one is unconditional (oversight — see `db::may_read_space`);
-    /// writing into one is membership, because the roster the models are shown
-    /// has to stay truthful about who is in the room. The two are not the same
-    /// permission and this is where they part. Carries the `space_id` the
-    /// caller already named, so the surface that raises it can offer the join
-    /// that would satisfy it.
-    #[error("{message}")]
-    NotJoined { space_id: String, message: String },
+    /// *acting* in one is membership, because the roster the models are shown
+    /// has to stay truthful about who is in the room, and because a turn driven
+    /// there spends the reader's credits. The two are not the same permission
+    /// and this is where they part. Raised by every door that acts as the human
+    /// — `post` (and `chat`/`chat_stream` through it), `edit_post`,
+    /// `regenerate`, `respond_stream` — before any write and before any spend.
+    ///
+    /// **Data, not prose.** It carries the `space_id` the caller already named,
+    /// so the surface that raises it can offer the join that would satisfy it,
+    /// and nothing else: the sentence a reader sees is chosen in their own
+    /// locale by the presentation layer (`space-error-not-joined`), and a
+    /// message carried from here would be a second source for it to drift
+    /// from. This `Display` is the log-shaped fallback every other variant has.
+    #[error("this conversation was opened between agents; joining it is what allows posting")]
+    NotJoined { space_id: String },
 
     /// A post-level write was aimed at a kind of post it does not apply to:
     /// editing something that is not the human's own input, or regenerating

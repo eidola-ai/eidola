@@ -1672,7 +1672,7 @@ impl SpaceView {
     /// way and is forwarded by the same rule — see [`Self::retarget_tree_focus`].
     pub(crate) fn rebuild(&mut self, cx: &mut Context<Self>) {
         let messages: Vec<crate::space::ChatMessageView> = self.space.read(cx).messages().to_vec();
-        let posts: Vec<PostData> = messages
+        let mut posts: Vec<PostData> = messages
             .iter()
             .map(|m| {
                 // Assistant rows carry the raw model selection id as their
@@ -1688,6 +1688,14 @@ impl SpaceView {
                 post_data_from(m, byline, byline_backend)
             })
             .collect();
+        // A reader who is only watching gets no verb that would be refused —
+        // see `viewer_may_act`. Applied here rather than per row because the
+        // question is about the conversation, not about any post in it.
+        if !self.viewer_may_act(cx) {
+            for p in &mut posts {
+                p.regenerable = false;
+            }
+        }
         self.rethread_drafts(&posts);
         self.retarget_tree_focus(&posts);
         self.posts = posts;
@@ -2201,6 +2209,7 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
             "Not enough credits to send. Add credits to continue.".to_string()
         }
         AppError::SpaceArchived { .. } => crate::i18n::msg::space_error_archived(cx).to_string(),
+        AppError::NotJoined { .. } => crate::i18n::msg::space_error_not_joined(cx).to_string(),
         other => other.to_string(),
     }
 }

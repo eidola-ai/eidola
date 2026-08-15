@@ -6090,6 +6090,11 @@ pub struct SpaceRow {
     /// no new turns**: not a soft delete, not a departure — every membership
     /// and every read goes on working exactly as before.
     pub archived_at: Option<i64>,
+    /// The may-decline router's model (`None` = the router is off), read here
+    /// so refinement can decide "is this room still open, and does it route"
+    /// in one statement rather than two. [`space_router_model`] remains for the
+    /// callers that want the column alone.
+    pub router_model: Option<String>,
 }
 
 /// One row of the space listing, with the cheap activity signals the UI
@@ -6205,7 +6210,8 @@ pub async fn space_is_archived(conn: &Connection, space_id: &str) -> Result<bool
 pub async fn get_space(conn: &Connection, space_id: &str) -> Result<Option<SpaceRow>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, created_at, cascade_limit, archived_at FROM space WHERE id = ?1",
+            "SELECT id, title, created_at, cascade_limit, archived_at, router_model \
+             FROM space WHERE id = ?1",
         )
         .await
         .map_err(AppError::db)?;
@@ -6221,6 +6227,7 @@ pub async fn get_space(conn: &Connection, space_id: &str) -> Result<Option<Space
             created_at: row.get::<i64>(2).map_err(AppError::db)?,
             cascade_limit: row.get::<i64>(3).map_err(AppError::db)?,
             archived_at: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+            router_model: row.get::<Option<String>>(5).map_err(AppError::db)?,
         })),
     }
 }
