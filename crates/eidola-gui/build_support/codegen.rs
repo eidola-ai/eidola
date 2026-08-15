@@ -22,7 +22,10 @@
 //!
 //! 3. **English is the source.** One accessor per English message, taking one
 //!    parameter per placeable variable — so a mistyped id or a changed argument
-//!    set is a compile error at the call site.
+//!    set is a compile error at the call site. Two modules of them, differing
+//!    only in how the locale is named: `msg` asks the `App`, `msg_in` takes the
+//!    tag explicitly (for surfaces that exist before gpui does). Same pass, same
+//!    ids, same parameters — a pre-gpui string gives up no checking.
 //! 4. **A translation may not invent a message id.** Nothing would ever ask for
 //!    it, so it is either dead weight or a typo silently falling back.
 //! 5. **A translation may not need a variable English does not pass** — not in
@@ -687,14 +690,30 @@ pub fn generate(en: &LocaleDef, locales: &[LocaleDef]) -> Result<String, String>
     }
     out.push_str("];\n\n");
 
-    out.push_str(
-        "/// Typed accessors — one per message of the source locale.\n\
+    // Two modules, one per way of naming the locale — see the `msg_in` header
+    // below. Everything else about them is identical, so they are emitted from
+    // one pass and the pair cannot drift.
+    let mut msg = String::from(
+        "/// Typed accessors — one per message of the source locale, formatting in\n\
+         /// the locale the `App` says is active.\n\
          ///\n\
          /// A mistyped id is a missing function; a changed argument set is a changed\n\
          /// signature. Both are compile errors at the call site, which is the whole\n\
          /// point of generating this file.\n\
          #[allow(dead_code)]\n\
          pub mod msg {\n",
+    );
+    let mut msg_in = String::from(
+        "/// The same accessors, formatting in a locale named **explicitly** rather\n\
+         /// than read from an `App`.\n\
+         ///\n\
+         /// For the surfaces that exist before gpui does — today the startup-failure\n\
+         /// alert, which runs before `Application::run` and so has no `cx` to ask.\n\
+         /// Generated from the same messages in the same pass, so a pre-gpui string\n\
+         /// gives up none of the id and argument checking the `msg` module provides;\n\
+         /// resolve the tag with `i18n::resolve` (pure) and pass it in.\n\
+         #[allow(dead_code)]\n\
+         pub mod msg_in {\n",
     );
 
     let mut fn_names: BTreeMap<String, String> = BTreeMap::new();
@@ -723,37 +742,47 @@ pub fn generate(en: &LocaleDef, locales: &[LocaleDef]) -> Result<String, String>
             params.push((ident, var.clone()));
         }
 
-        out.push_str(&format!(
-            "    /// `{}` — en: {:?}\n",
-            message.id, message.preview
-        ));
-        if params.is_empty() {
+        // `(module, the first parameter, the formatting call's first argument)`.
+        for (out, receiver, locus) in [
+            (&mut msg, "cx: &gpui::App", "cx"),
+            (&mut msg_in, "locale: &str", "locale"),
+        ] {
             out.push_str(&format!(
-                "    pub fn {fn_name}(cx: &gpui::App) -> gpui::SharedString {{\n\
-                 \x20       super::format(cx, {:?}, None)\n\
-                 \x20   }}\n\n",
-                message.id
+                "    /// `{}` — en: {:?}\n",
+                message.id, message.preview
             ));
-        } else {
-            let signature: Vec<String> = params
-                .iter()
-                .map(|(ident, _)| format!("{ident}: impl Into<super::Arg<'a>>"))
-                .collect();
-            out.push_str(&format!(
-                "    pub fn {fn_name}<'a>(cx: &gpui::App, {}) -> gpui::SharedString {{\n\
-                 \x20       let mut args = super::Args::new();\n",
-                signature.join(", ")
-            ));
-            for (ident, var) in &params {
-                out.push_str(&format!("        args.set({var:?}, {ident});\n"));
+            let format_fn = if locus == "cx" { "format" } else { "format_in" };
+            if params.is_empty() {
+                out.push_str(&format!(
+                    "    pub fn {fn_name}({receiver}) -> gpui::SharedString {{\n\
+                     \x20       super::{format_fn}({locus}, {:?}, None)\n\
+                     \x20   }}\n\n",
+                    message.id
+                ));
+            } else {
+                let signature: Vec<String> = params
+                    .iter()
+                    .map(|(ident, _)| format!("{ident}: impl Into<super::Arg<'a>>"))
+                    .collect();
+                out.push_str(&format!(
+                    "    pub fn {fn_name}<'a>({receiver}, {}) -> gpui::SharedString {{\n\
+                     \x20       let mut args = super::Args::new();\n",
+                    signature.join(", ")
+                ));
+                for (ident, var) in &params {
+                    out.push_str(&format!("        args.set({var:?}, {ident});\n"));
+                }
+                out.push_str(&format!(
+                    "        super::{format_fn}({locus}, {:?}, Some(&args))\n    }}\n\n",
+                    message.id
+                ));
             }
-            out.push_str(&format!(
-                "        super::format(cx, {:?}, Some(&args))\n    }}\n\n",
-                message.id
-            ));
         }
     }
-    out.push_str("}\n");
+    msg.push_str("}\n\n");
+    msg_in.push_str("}\n");
+    out.push_str(&msg);
+    out.push_str(&msg_in);
     Ok(out)
 }
 

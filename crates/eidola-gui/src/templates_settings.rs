@@ -472,6 +472,7 @@ impl Render for TemplatesSettingsView {
                 "settings/templates/retry",
                 "Couldn't load your space templates.",
                 &err,
+                "Retry",
                 cx,
                 cx.listener(|this, _, _, cx| this.retry_load(cx)),
             ));

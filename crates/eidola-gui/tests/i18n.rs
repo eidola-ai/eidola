@@ -244,14 +244,25 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
             i18n::apply(tag, cx);
             for id in i18n::MESSAGE_IDS {
                 let mut args = i18n::Args::new();
-                // The pilot's only variable. Passing an argument a message does
-                // not read is harmless in Fluent; a *missing* one is what shows
-                // up as an unresolved placeable in the output.
+                // **Every variable any message reads, in one bag.** Passing an
+                // argument a message does not read is harmless in Fluent; a
+                // *missing* one is what shows up as an unresolved placeable in
+                // the output — so a new variable joins this list or the message
+                // fails here rather than on a reader's screen.
                 args.set("version", "0.0.0");
+                args.set("model", "Gemma 4 27B");
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),
                     "`{id}` did not resolve in `{tag}`: {formatted:?}"
+                );
+                // The pre-gpui twin resolves the same message in the same
+                // locale — the surfaces that have no `cx` are not a second,
+                // weaker path (`msg_in`, `i18n::format_in`).
+                let explicit = i18n::format_in(tag, id, Some(&args));
+                assert_eq!(
+                    explicit, formatted,
+                    "`{id}` differs between the `App` and explicit-locale paths in `{tag}`"
                 );
             }
         }
@@ -462,6 +473,25 @@ fn the_generated_accessor_signature_is_the_messages_variables() {
     assert!(
         generated.contains("args.set(\"name\", name);"),
         "{generated}"
+    );
+
+    // The pre-gpui twin: same ids, same parameters, only the locale is named
+    // differently — so a surface with no `cx` gives up no checking.
+    assert!(
+        generated.contains("pub fn plain(locale: &str) -> gpui::SharedString"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains(
+            "pub fn greeting<'a>(locale: &str, name: impl Into<super::Arg<'a>>, \
+             count: impl Into<super::Arg<'a>>)"
+        ),
+        "{generated}"
+    );
+    assert_eq!(
+        generated.matches("pub mod msg").count(),
+        2,
+        "both accessor modules are emitted from the one pass: {generated}"
     );
 }
 

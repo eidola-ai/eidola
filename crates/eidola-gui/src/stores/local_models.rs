@@ -57,6 +57,15 @@ impl LocalModelsStore {
         }
     }
 
+    /// Test seam: seat a snapshot on a **backend-backed** store, so a test can
+    /// put a row on screen and still exercise the real op slots. (A stub store
+    /// takes its fixture through `LocalModelsStore::stub`, but that one starts
+    /// no tasks, which is exactly what a pending-operation test needs.)
+    #[doc(hidden)]
+    pub fn set_state_for_test(&mut self, state: LocalModelsState) {
+        self.state = Loadable::loaded(state);
+    }
+
     /// The current snapshot.
     pub fn state(&self) -> &Loadable<LocalModelsState> {
         &self.state
@@ -160,10 +169,25 @@ impl LocalModelsStore {
         cx.notify();
     }
 
+    /// Whether this URL's download is **being started** right now — the keyed
+    /// op slot, which is what "in flight" means here (STATE.md: no shared busy
+    /// flags; in-flight is the presence of the task).
+    ///
+    /// It covers the initiating call only. Once app-core has accepted the
+    /// transfer the snapshot's own row carries it (`Downloading`, with Cancel),
+    /// which is the state every surface reads from there on.
+    pub fn download_pending(&self, url: &str) -> bool {
+        self.op_tasks.contains_key(&Self::download_key(url))
+    }
+
+    fn download_key(url: &str) -> String {
+        format!("download:{url}")
+    }
+
     /// Start a model download (curated entry or pasted URL). The transfer
     /// itself is core-owned; progress arrives via `Change::LocalModels`.
     pub fn download(&mut self, url: String, cx: &mut Context<Self>) {
-        let key = format!("download:{url}");
+        let key = Self::download_key(&url);
         self.run_op(key, cx, move |c| async move {
             c.download_local_model(url).await.map(|_| ())
         });
