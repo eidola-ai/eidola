@@ -5057,12 +5057,32 @@ impl Inner {
             context_length.min(4096) as u32
         };
 
-        // The space already exists (post created it). Validate it first.
-        db::get_space(&db_conn, space_id)
-            .await?
-            .ok_or_else(|| AppError::NotConfigured {
-                message: format!("space not found: {space_id}"),
-            })?;
+        // **The space must exist and must still be open, decided at one read.**
+        // The row answers both, so no interleaving can put "it is there" in
+        // front of an archival that has already landed — and this is the gate
+        // every entry point passes through (`chat` / `chat_stream`,
+        // `regenerate`, `respond_stream`, and the participant-aware
+        // `respond_stream_as` the cascade driver uses), which is what makes
+        // "an archived conversation takes no new turns" a property of the turn
+        // path rather than a rule each caller has to remember.
+        //
+        // It is the *second* of two gates and the one that closes the race the
+        // first cannot: a plan is computed, the space is archived, and only
+        // then is the planned turn driven. Planning refuses afterwards
+        // (`mechanical_plan`); this refuses in between. A turn already past
+        // this point runs to completion and persists — see
+        // [`AppError::SpaceArchived`] for why the boundary is drawn there.
+        let space_row =
+            db::get_space(&db_conn, space_id)
+                .await?
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("space not found: {space_id}"),
+                })?;
+        if space_row.archived_at.is_some() {
+            return Err(AppError::SpaceArchived {
+                space_id: space_id.to_string(),
+            });
+        }
         // The target (the post being replied to / the generation being revised)
         // must belong to this space — otherwise a caller could splice another
         // space's thread into this turn (cross-space context + reply edge). This
@@ -6827,8 +6847,20 @@ impl Inner {
             _ => return Ok(NotificationPlan::Turns(Vec::new())),
         }
 
-        let limit = db::space_cascade_limit(&conn, space_id)
-            .await?
+        // **An archived conversation plans no turns**, and the same read that
+        // answers that carries the cascade budget — one statement for the
+        // whole verdict, so an archival cannot land between the two halves of
+        // it. This is the gate that stops a *cascade*: every hop re-plans, so
+        // an archival stops the next hop even when it lands mid-flight, and a
+        // turn that was already streaming persists its answer into a room that
+        // then goes quiet. Archival is not a soft delete — nothing here is
+        // hidden or refused a reader — it is the end of new work.
+        let space = db::get_space(&conn, space_id).await?;
+        if space.as_ref().is_some_and(|s| s.archived_at.is_some()) {
+            return Ok(NotificationPlan::Turns(Vec::new()));
+        }
+        let limit = space
+            .map(|s| s.cascade_limit)
             .unwrap_or(DEFAULT_CASCADE_LIMIT);
         let depth = db::agent_cascade_depth(&conn, post_action_id).await?;
         if depth >= limit {

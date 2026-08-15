@@ -1697,3 +1697,167 @@ fn two_declines_by_one_agent_on_one_post_stay_separate_disclosures() {
         assert_ne!(traces[0].id, traces[1].id, "and each turn has its own id");
     });
 }
+
+// ===========================================================================
+// Archival stops new work
+// ===========================================================================
+
+/// **An archived conversation takes no new turns**, and the rule lives on the
+/// turn path rather than in any caller.
+///
+/// Archival is what closes a conversation — the Library stops offering it, and
+/// retiring a shared agent archives every room it owned — but nothing in
+/// planning or in turn preparation used to read it, so a cascade planned a
+/// moment before an archival went on driving and re-planning and spending
+/// inside a room somebody had closed. Two gates, each at a read that was
+/// already being taken: planning yields no turns, and preparation refuses one
+/// that was planned before the archival landed.
+///
+/// The boundary is deliberate and is asserted below: a turn that got past the
+/// second gate finishes and persists (the request was made and the tokens were
+/// spent; dropping the answer would bill for nothing), and it is that answer's
+/// *re-plan* that stops the cascade.
+#[test]
+fn an_archived_space_plans_no_turns_and_starts_none() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let space = core
+            .runtime()
+            .block_on(core.create_space(None))
+            .expect("space")
+            .id;
+        // Two auto-responders, so an agent's answer plans the *other* one's
+        // turn — a cascade with a next hop to stop.
+        add_agent(&core, &space, "Chatter", MODEL, "all", None);
+        add_agent(&core, &space, "Answerer", MODEL, "all", None);
+        let chatter = agent_id(&core, &space, "Chatter");
+
+        // A turn that completes *before* the archival persists its answer, and
+        // that answer is what the cascade would have continued from.
+        let u1 = core
+            .runtime()
+            .block_on(core.post("start".into(), Some(space.clone())))
+            .expect("post");
+        let i1 = drive_as(&core, &space, &chatter, &u1.action_id)
+            .expect("i1")
+            .response_action_id
+            .expect("i1 id");
+        assert!(
+            matches!(
+                core.runtime()
+                    .block_on(core.plan_notifications(space.clone(), i1.clone()))
+                    .expect("plan"),
+                NotificationPlan::Turns(t) if !t.is_empty()
+            ),
+            "while the space is open, the cascade would continue"
+        );
+
+        // A second turn is planned — and then the space is archived before it
+        // is driven. This is the race the driving gate exists for.
+        let pending = match core
+            .runtime()
+            .block_on(core.plan_notifications(space.clone(), i1.clone()))
+            .expect("plan")
+        {
+            NotificationPlan::Turns(t) => t.into_iter().next().expect("a planned turn"),
+            other => panic!("expected turns, got {other:?}"),
+        };
+        assert!(
+            core.runtime()
+                .block_on(core.archive_space(space.clone()))
+                .expect("archive")
+        );
+
+        let requests_before = mock.chat_bodies().len();
+        let actions_before = core
+            .runtime()
+            .block_on(core.test_space_actions(space.clone()))
+            .expect("actions")
+            .len();
+
+        // The planned turn refuses rather than starting.
+        let err = core
+            .runtime()
+            .block_on(async {
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                core.respond_stream_as(
+                    space.clone(),
+                    pending.participant_id.clone(),
+                    i1.clone(),
+                    tx,
+                )
+                .await
+            })
+            .expect_err("a turn planned before the archival must not start after it");
+        match &err {
+            AppError::SpaceArchived { space_id } => assert_eq!(space_id, &space),
+            other => panic!("expected SpaceArchived, got {other:?}"),
+        }
+
+        // Nothing else on the turn path starts one either — the gate is in the
+        // shared preparation, so every entry point inherits it.
+        for (what, result) in [
+            (
+                "an explicit retry",
+                core.runtime().block_on(async {
+                    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                    core.respond_stream(space.clone(), MODEL.into(), i1.clone(), tx)
+                        .await
+                }),
+            ),
+            (
+                "a regeneration",
+                core.runtime()
+                    .block_on(core.regenerate(i1.clone(), MODEL.into())),
+            ),
+        ] {
+            assert!(
+                matches!(result, Err(AppError::SpaceArchived { .. })),
+                "{what} must be refused too, got {result:?}"
+            );
+        }
+
+        // And the persisted answer does not resurrect the room: re-planning
+        // from it yields nothing at all.
+        assert!(
+            matches!(
+                core.runtime()
+                    .block_on(core.plan_notifications(space.clone(), i1.clone()))
+                    .expect("plan"),
+                NotificationPlan::Turns(t) if t.is_empty()
+            ),
+            "an archived space plans no turns"
+        );
+
+        // Nothing was spent past the archival: no request left the process and
+        // no action was written after it.
+        assert_eq!(
+            mock.chat_bodies().len(),
+            requests_before,
+            "a refused turn makes no upstream request"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.test_space_actions(space.clone()))
+                .expect("actions")
+                .len(),
+            actions_before,
+            "and writes nothing"
+        );
+
+        // Reading is untouched — archival closes a conversation, it does not
+        // hide or delete one.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.get_space_tree(space))
+                .expect("tree")
+                .len(),
+            2,
+            "the transcript is whole"
+        );
+    });
+}
