@@ -1230,6 +1230,20 @@ impl Space {
         let Some(app_core) = self.app_core.clone() else {
             return;
         };
+        // **A window on a space that is known not to exist says so, and never
+        // spins.** Once the row is settled-negative there is nothing to read
+        // and nothing a later read could learn, and [`Self::row_is_gone`] has
+        // already put the reason in the transcript cell — which is the *whole*
+        // of what the window shows about a dead space. Starting a load here
+        // would take that terminal failure and flip the cell to `Loading`
+        // (`Failed { prior: None }.to_loading()` is `Loading`), and the load's
+        // own gate then refuses before anything can resolve it: a permanent
+        // spinner, with the real error destroyed on the way. The path is
+        // ordinary — a Send that beat its space's insert (or its disposal's
+        // verdict) fails, and every failure completion restarts the load.
+        if matches!(self.row, Some(RowState::Gone(_))) {
+            return;
+        }
         let id = self.id.clone();
         self.transcript = std::mem::take(&mut self.transcript).to_loading();
         // **A read waits out whatever is deciding this id, exactly as a write

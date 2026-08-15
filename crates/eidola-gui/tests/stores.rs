@@ -2446,9 +2446,16 @@ fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestA
         "the verdict settled the gate rather than leaving the window waiting"
     );
     assert!(
+        matches!(
+            space.read_with(cx, |s, _| s.transcript().clone()),
+            eidola_gui::loadable::Loadable::Failed { .. }
+        ),
+        "the window *reports* the conversation is gone — `Loading` is equally \
+         invisible and would be a permanent spinner instead"
+    );
+    assert!(
         !space.read_with(cx, |s, _| s.transcript_visible()),
-        "the window reports the conversation is gone; it never offers a \
-         composer over a space that does not exist"
+        "and it never offers a composer over a space that does not exist"
     );
     assert!(
         !space_row_exists(&core, &space_id),
@@ -2503,5 +2510,62 @@ fn the_store_never_disposes_over_an_outstanding_write(cx: &mut TestAppContext) {
             .spaces
             .read_with(cx, |s, _| s.disposed_for_test().is_empty()),
         "app-core was never asked"
+    );
+}
+
+/// **A window on a space that turned out not to exist says so — it never
+/// spins.**
+///
+/// The path is ordinary: a Send pressed in the frames after ⌘N waits out the
+/// insert, the insert is refused, and the waiter is released with that
+/// refusal. Every save-side failure completion then restarts the transcript
+/// load — the debt a superseded load owes — and a restart over a settled
+/// negative row is the trap: `Failed { prior: None }.to_loading()` is
+/// `Loading`, so the reload flips the cell to a spinner, its own gate refuses
+/// before anything can resolve it, and the window is left spinning forever
+/// with the real error thrown away on the way. So a read against a row known
+/// not to exist does not start at all, and the verdict stands.
+///
+/// The same shape reaches the disposal's verdict, which settles the identical
+/// gate; the assertion is on the cell rather than on `transcript_visible`,
+/// because `Loading` and `Failed` are both invisible and only one of them is
+/// honest.
+#[gpui::test]
+fn a_refused_creation_after_an_early_send_says_so_instead_of_spinning(cx: &mut TestAppContext) {
+    use eidola_gui::loadable::Loadable;
+
+    let (stores, _dir) = backed_stores(cx);
+
+    let space = stores.spaces.update(cx, |s, cx| s.create(cx));
+    let space_id = space.read_with(cx, |s, _| s.id().to_string());
+    assert!(space.update(cx, |s, cx| {
+        s.submit("The tide is the moon's doing.".into(), None, Vec::new(), cx)
+    }));
+
+    stores.spaces.update(cx, |s, cx| {
+        s.fail_creation_for_test(
+            &space_id,
+            eidola_app_core::error::AppError::Database {
+                message: "disk is full".into(),
+            },
+            cx,
+        )
+    });
+    settle(cx);
+
+    let cell = space.read_with(cx, |s, _| match s.transcript() {
+        Loadable::Failed { error, .. } => format!("failed: {error}"),
+        Loadable::Loading => "loading".to_string(),
+        Loadable::NotLoaded => "not loaded".to_string(),
+        Loadable::Loaded { .. } => "loaded".to_string(),
+    });
+    assert!(
+        cell.starts_with("failed:"),
+        "the window holds the refusal, not a spinner — got {cell:?}"
+    );
+    assert!(
+        cell.contains("disk is full"),
+        "and it is the creation's own error, not something a reload replaced \
+         it with — got {cell:?}"
     );
 }

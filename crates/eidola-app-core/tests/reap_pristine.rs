@@ -845,3 +845,234 @@ fn the_raw_space_insert_has_no_production_caller() {
         "and app-core must not reach for it either"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The doors, asked about a space that is no longer there
+// ---------------------------------------------------------------------------
+
+/// Every per-space configuration door, and what it must do when the space it
+/// names has been disposed of underneath it.
+///
+/// A disposal is issued from a window's close and travels while the Library
+/// still lists the row, so a rename from that row — or a cascade / router /
+/// roster edit in an inspector — can be issued after the delete is on its way.
+/// None of these is *gated*, which is the accepted residual; what the residual
+/// promises in exchange is that none of them can be **hollow**: a door that
+/// answered `Ok` for a write no row took would leave the caller's optimistic
+/// edit standing over a database that never agreed to it, with nothing on
+/// screen to say so. So every one of them refuses.
+///
+/// Each case answers `Ok(())` when the door refused as it should.
+type ConfigDoor = (&'static str, fn(&AppCore, &str, &str) -> Result<(), String>);
+
+/// The doors take a space id and an agent id from that space — captured before
+/// the disposal, because afterwards there is nothing left to read them from.
+const CONFIGURATION_DOORS: &[ConfigDoor] = &[
+    ("rename_space", |core, space, _| {
+        expect_refusal(
+            core.runtime()
+                .block_on(core.rename_space(space.to_string(), "Tides".into())),
+        )
+    }),
+    ("set_space_cascade_limit", |core, space, _| {
+        expect_refusal(
+            core.runtime()
+                .block_on(core.set_space_cascade_limit(space.to_string(), 2)),
+        )
+    }),
+    ("set_space_router_model", |core, space, _| {
+        expect_refusal(
+            core.runtime()
+                .block_on(core.set_space_router_model(space.to_string(), None)),
+        )
+    }),
+    ("add_space_participant", |core, space, _| {
+        expect_refusal(core.runtime().block_on(core.add_space_participant(
+            space.to_string(),
+            NewParticipant {
+                label: "Ada".into(),
+                model_ref: Some("some-model".into()),
+                system_prompt: None,
+                notify_policy: "explicit".into(),
+            },
+        )))
+    }),
+    ("update_space_participant", |core, space, agent| {
+        expect_refusal(core.runtime().block_on(core.update_space_participant(
+            agent.to_string(),
+            ParticipantUpdate {
+                label: Some("Renamed".into()),
+                ..Default::default()
+            },
+            ExpectedScope::SpaceOwned {
+                space_id: space.to_string(),
+            },
+        )))
+    }),
+    ("set_space_participant_override", |core, space, _| {
+        expect_refusal(core.runtime().block_on(core.set_space_participant_override(
+            space.to_string(),
+            HUMAN_PARTICIPANT_ID.to_string(),
+            ParticipantOverride {
+                label: Some(Some("Mike".into())),
+                ..Default::default()
+            },
+        )))
+    }),
+    ("remove_space_participant", |core, space, agent| {
+        // Answers a `bool` rather than erroring: "removed nothing" is what its
+        // caller renders, and on a space that is gone there is indeed nothing
+        // to remove. What it must not do is claim it removed something.
+        match core
+            .runtime()
+            .block_on(core.remove_space_participant(space.to_string(), agent.to_string()))
+        {
+            Ok(false) => Ok(()),
+            Ok(true) => Err("claimed to remove a participant of a space that is gone".into()),
+            Err(_) => Ok(()),
+        }
+    }),
+    ("add_global_participant", |core, space, _| {
+        let shared = shared_agent(core);
+        expect_refusal(core.runtime().block_on(core.add_global_participant(
+            space.to_string(),
+            shared,
+            None,
+        )))
+    }),
+    ("grant_space_membership", |core, space, _| {
+        let shared = shared_agent(core);
+        expect_refusal(core.runtime().block_on(core.grant_space_membership(
+            space.to_string(),
+            shared,
+            MembershipRole::Observer,
+        )))
+    }),
+];
+
+fn expect_refusal<T>(outcome: Result<T, eidola_app_core::error::AppError>) -> Result<(), String> {
+    match outcome {
+        Err(_) => Ok(()),
+        Ok(_) => Err("reported success for a space that is gone".into()),
+    }
+}
+
+/// A live shared agent, promoted out of a throwaway space.
+fn shared_agent(core: &AppCore) -> String {
+    let donor = blank_space(core);
+    let agent = owned_agent(core, &donor);
+    core.runtime()
+        .block_on(core.promote_participant(agent.clone(), None, None))
+        .expect("promote");
+    agent
+}
+
+#[test]
+fn every_configuration_door_refuses_a_space_that_is_gone() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let mut hollow: Vec<String> = Vec::new();
+
+        for (name, door) in CONFIGURATION_DOORS {
+            let space = blank_space(&core);
+            let agent = owned_agent(&core, &space);
+            assert!(
+                core.runtime()
+                    .block_on(core.discard_if_pristine(space.clone()))
+                    .unwrap(),
+                "{name}: the space is disposed of first (the premise)"
+            );
+
+            if let Err(why) = door(&core, &space, &agent) {
+                hollow.push(format!("{name}: {why}"));
+                continue;
+            }
+            assert_eq!(
+                core.runtime()
+                    .block_on(core.test_space_footprint(space.clone()))
+                    .unwrap(),
+                (0, 0, 0),
+                "{name}: and it wrote nothing into the space's grave"
+            );
+        }
+
+        assert!(
+            hollow.is_empty(),
+            "these doors decide a space's existence from a read taken before \
+             their write, so the refusal the disposal's residual promises never \
+             happens: {hollow:?}"
+        );
+    });
+}
+
+#[test]
+fn a_refusal_names_the_missing_space_rather_than_its_constraint() {
+    // What the doors refuse with is user-facing: the GUI renders it beside the
+    // control that was refused. A foreign key is the right enforcement and the
+    // wrong sentence, so the doors that have no rows-affected to read explain
+    // themselves afterwards — a read that only names a write that already
+    // failed, never one that decides.
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let shared = {
+            let donor = blank_space(&core);
+            let agent = owned_agent(&core, &donor);
+            core.runtime()
+                .block_on(core.promote_participant(agent.clone(), None, None))
+                .unwrap();
+            agent
+        };
+
+        let space = blank_space(&core);
+        assert!(
+            core.runtime()
+                .block_on(core.discard_if_pristine(space.clone()))
+                .unwrap()
+        );
+
+        for (name, err) in [
+            (
+                "add_space_participant",
+                core.runtime()
+                    .block_on(core.add_space_participant(
+                        space.clone(),
+                        NewParticipant {
+                            label: "Ada".into(),
+                            model_ref: Some("some-model".into()),
+                            system_prompt: None,
+                            notify_policy: "explicit".into(),
+                        },
+                    ))
+                    .map(|_| ())
+                    .expect_err("refused"),
+            ),
+            (
+                "add_global_participant",
+                core.runtime()
+                    .block_on(core.add_global_participant(space.clone(), shared.clone(), None))
+                    .map(|_| ())
+                    .expect_err("refused"),
+            ),
+            (
+                "grant_space_membership",
+                core.runtime()
+                    .block_on(core.grant_space_membership(
+                        space.clone(),
+                        shared.clone(),
+                        MembershipRole::Observer,
+                    ))
+                    .map(|_| ())
+                    .expect_err("refused"),
+            ),
+        ] {
+            assert!(
+                matches!(err, eidola_app_core::error::AppError::NotConfigured { .. }),
+                "{name} refused with {err:?} rather than naming the missing space"
+            );
+            assert!(
+                !format!("{err}").contains("FOREIGN KEY"),
+                "{name}: a constraint is not a sentence a reader can act on"
+            );
+        }
+    });
+}
