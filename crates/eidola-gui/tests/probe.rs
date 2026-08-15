@@ -536,8 +536,13 @@ fn settled_posts_are_articles_carrying_their_text(cx: &mut TestAppContext) {
 
 /// A conversation whose **initial** transcript read failed is the one page in
 /// this window with no composer to act from — `sync_tail_drafts` has no tree to
-/// attach one to — so the reading column carries the way back itself. A failed
-/// *refresh* does not: its posts and its composer are still on screen.
+/// attach one to — so the reading column carries the way back itself, as the
+/// centred panel.
+///
+/// A failed *refresh* keeps its posts (never a blank page over a page we had)
+/// and takes the Library's quiet strip instead: the reader can still act, but
+/// what they are reading is silently as of the last successful read, and the
+/// composer is not a way to re-run a *read*.
 #[gpui::test]
 fn a_failed_initial_transcript_load_offers_a_retry(cx: &mut TestAppContext) {
     let _guard = probes_on();
@@ -558,21 +563,35 @@ fn a_failed_initial_transcript_load_offers_a_retry(cx: &mut TestAppContext) {
         gpui::Role::Button,
         "Retry",
     );
+    let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+    assert!(
+        !names.contains(&"space/transcript/refresh-retry".to_string()),
+        "with nothing on screen the panel is the surface, not the strip: {names:?}"
+    );
 
-    // The same failure over posts we still hold is not a dead end.
+    // The same failure over posts we still hold: the posts stay, and the quiet
+    // strip says the last read is no longer the last word.
     cx.update(|cx| {
         space.update(cx, |s, cx| {
             s.set_post_tree_for_test(vec![probe_post("a1", "the question")], cx);
             s.fail_transcript_refresh_for_test(cx);
         });
     });
-    let names: Vec<String> = fresh_entries(cx, window)
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/transcript/refresh-retry",
+        gpui::Role::Button,
+        "Retry loading this conversation",
+    );
+    let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+    assert!(
+        names.contains(&"space/post/0".to_string()),
+        "a failed refresh never blanks the page it had: {names:?}"
+    );
     assert!(
         !names.contains(&"space/transcript/retry".to_string()),
-        "a failed refresh keeps its posts and its composer: {names:?}"
+        "and it is not the centred panel — there is nothing empty to fill: {names:?}"
     );
 
     probe::set_probes_enabled(false);
