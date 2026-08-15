@@ -15892,3 +15892,67 @@ fn closing_one_of_two_windows_disposes_of_nothing(cx: &mut TestAppContext) {
     });
     drain_runtime(&core);
 }
+
+/// **A save still on its way to the database holds off the disposal.**
+///
+/// A `bridge`d core call outlives the gpui task that issued it, so a Send
+/// pressed a moment before ⌘W leaves a post travelling to the same database the
+/// disposal is about to reserve the writer on. Whichever reaches it first wins:
+/// if the disposal does, the space is still pristine and goes, and the post
+/// lands on nothing — with the window gone, nobody is even told. Lost prose is
+/// the one outcome the whole feature exists to prevent, so the close asks —
+/// while the entity is still alive to answer — whether anything is still
+/// writing, and refuses to dispose when it is.
+///
+/// The in-flight save is staged with the entity's own busy seam rather than a
+/// real one, because a real save's core call settles in a millisecond and
+/// "still travelling" would then be a timing hope rather than a fact. What the
+/// test drives is the production path — the view's release, the cross-store
+/// question, the store's refusal.
+#[gpui::test]
+fn a_save_still_in_flight_holds_off_the_disposal(cx: &mut TestAppContext) {
+    let (stores, core, _dir, _seeded) = participants_scene(cx);
+
+    let (window, view) = open_space(cx, &stores, None);
+    let entity = view.read_with(cx, |v, _| v.space().clone());
+    let space = entity.read_with(cx, |s, _| s.id().to_string());
+    wait_until(cx, "the space's row commits", |_| {
+        space_exists(&core, &space)
+    });
+
+    // A save whose core call has not come back yet.
+    entity.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+    assert!(
+        entity.read_with(cx, |s, _| s.is_busy()),
+        "the premise: a mutation is outstanding"
+    );
+    drop(entity);
+
+    close_space_window(cx, window, view);
+    settle(cx);
+    assert!(
+        space_exists(&core, &space),
+        "the space a write is still travelling to is kept, whatever else it \
+         does or does not contain"
+    );
+    drain_runtime(&core);
+}
+
+/// The mirror: with nothing outstanding, the same close disposes of the same
+/// untouched space — so the guard above is a guard and not a disabling.
+#[gpui::test]
+fn a_settled_space_is_still_disposed_of_at_the_same_close(cx: &mut TestAppContext) {
+    let (stores, core, _dir, _seeded) = participants_scene(cx);
+
+    let (window, view) = open_space(cx, &stores, None);
+    let space = view.read_with(cx, |v, cx| v.space().read(cx).id().to_string());
+    wait_until(cx, "the space's row commits", |_| {
+        space_exists(&core, &space)
+    });
+
+    close_space_window(cx, window, view);
+    wait_until(cx, "the untouched space is disposed of", |_| {
+        !space_exists(&core, &space)
+    });
+    drain_runtime(&core);
+}

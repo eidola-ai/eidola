@@ -130,6 +130,16 @@ pub struct SpacesStore {
     /// what makes ⌘N-then-immediately-close leave nothing behind rather than
     /// waiting for the next launch's sweep.
     reap_after_creation: std::collections::HashSet<String>,
+    /// The spaces app-core reported it actually deleted — a test seam, and
+    /// three words of state rather than a `cfg` split because the GUI crate
+    /// has no test-only feature (its seams are `#[doc(hidden)]`).
+    ///
+    /// A disposal that succeeded is otherwise indistinguishable from one that
+    /// never ran — both leave the id naming nothing — so a regression asserting
+    /// "the space is gone" can pass without either the creation or the disposal
+    /// having happened. This records the `true` answers, which only a space
+    /// that existed and was pristine can produce.
+    disposed: Vec<String>,
     /// In-flight "New Space from Template" ops, keyed by a monotonic id so each
     /// activation is **independent** and runs to completion (STATE.md "keyed
     /// per-key work") — a supersede slot would let a superseded result, whose
@@ -164,6 +174,7 @@ impl SpacesStore {
             instantiations: HashMap::new(),
             reap_tasks: HashMap::new(),
             reap_after_creation: std::collections::HashSet::new(),
+            disposed: Vec::new(),
             create_ops: HashMap::new(),
             next_create_op: 0,
             op_errors: Vec::new(),
@@ -187,6 +198,7 @@ impl SpacesStore {
             instantiations: HashMap::new(),
             reap_tasks: HashMap::new(),
             reap_after_creation: std::collections::HashSet::new(),
+            disposed: Vec::new(),
             create_ops: HashMap::new(),
             next_create_op: 0,
             op_errors: Vec::new(),
@@ -356,6 +368,28 @@ impl SpacesStore {
         self.fail_creation(space_id, error, cx);
     }
 
+    /// Test seam: whether a space's disposal is waiting on its own insert.
+    /// Observing the deferral is what keeps the regression for it honest — the
+    /// row does not exist yet at that point, so "the space is gone" is true
+    /// before anything has happened.
+    #[doc(hidden)]
+    pub fn disposal_deferred_for_test(&self, space_id: &str) -> bool {
+        self.reap_after_creation.contains(space_id)
+    }
+
+    /// Test seam: the spaces app-core reported it actually deleted (see the
+    /// `disposed` field).
+    #[doc(hidden)]
+    pub fn disposed_for_test(&self) -> &[String] {
+        &self.disposed
+    }
+
+    /// Whether a rename or an archive is in flight for `space_id` — this
+    /// store's own half of `stores::space_writes_in_flight`.
+    pub(crate) fn writes_in_flight(&self, space_id: &str) -> bool {
+        self.op_tasks.contains_key(space_id)
+    }
+
     /// A window drawing `space_id` has closed and no other window is drawing
     /// it — so **dispose of the space if nothing was ever done with it**.
     ///
@@ -367,14 +401,37 @@ impl SpacesStore {
     /// the space is *untouched* belongs to app-core, inside the transaction
     /// that deletes it.
     ///
+    /// **A write this client has already issued outranks the disposal, and the
+    /// close is where that is decided.** A core call outlives the gpui task
+    /// that issued it (`bridge` cancels nothing), so a Send pressed a moment
+    /// before ⌘W leaves a post travelling to a database the disposal is about
+    /// to reserve the writer on — and if the disposal gets there first the
+    /// space is still pristine, so it goes, and the post lands on nothing. No
+    /// window is left to report that to, which makes it the one outcome the
+    /// whole feature exists to avoid: a reader's words gone. `still_writing`
+    /// is the client's own answer, taken by
+    /// [`crate::stores::space_writes_in_flight`] while the entity and every
+    /// per-space store slot are still there to be asked, and this store adds
+    /// what only it can see. **Nothing is deferred and nothing is retried**:
+    /// the write either lands (and marks the space, which keeps it forever) or
+    /// fails (leaving a pristine space nobody holds), and the next launch's
+    /// sweep collects that second case exactly as it collects a crash's
+    /// orphans. Erring towards keeping is the whole design.
+    ///
     /// **A space whose insert is still in flight is deferred, not skipped.**
     /// The store owns the insert precisely so that a window closed a keystroke
     /// after ⌘N still leaves a whole space; disposing of one before it exists
     /// would answer "no such space" and leave the very orphan this exists to
-    /// prevent, so the id waits for the insert's completion instead.
-    pub fn window_closed(&mut self, space_id: String, cx: &mut Context<Self>) {
+    /// prevent, so the id waits for the insert's completion instead. Nothing
+    /// can start writing to that space in between — its window is gone and its
+    /// entity with it — so the answer taken at the close is still the answer
+    /// when the insert settles.
+    pub fn window_closed(&mut self, space_id: String, still_writing: bool, cx: &mut Context<Self>) {
         if self.app_core.is_none() {
             return; // stub stores (tests): nothing durable to dispose of
+        }
+        if still_writing || self.writes_in_flight(&space_id) {
+            return;
         }
         if self.instantiations.contains_key(&space_id) {
             self.reap_after_creation.insert(space_id);
@@ -431,6 +488,7 @@ impl SpacesStore {
                     // so it stays a map of conversations that exist.
                     if matches!(discarded, Ok(true)) {
                         this.registry.remove(&key);
+                        this.disposed.push(key.clone());
                     }
                 });
             }),

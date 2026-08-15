@@ -741,6 +741,84 @@ fn the_stamp_ledger_covers_every_space_write() {
     );
 }
 
+/// **A separate-statement stamp comes before every statement in its function.**
+///
+/// The ledger above pins *coverage* — that each write door marks its space at
+/// all. This pins the *order*, which is the half that decides whether a mark is
+/// worth anything: turso autocommits each statement, so a stamp written after
+/// the row it describes leaves a window in which the row is durable and its
+/// space still reads untouched — long enough for a disposal to take both, and
+/// the stamp then updates nothing. Marking first can only over-mark, which
+/// keeps a space nothing changed; the other order loses the change.
+///
+/// The rule is lexical because it can be: a function that calls `touch_space` /
+/// `touch_space_of_participant` must do so before it runs any statement of its
+/// own. Doors that fold the stamp into the statement, and the transactions that
+/// hold several statements atomically, call neither and are not asked.
+#[test]
+fn a_stamp_is_written_before_the_statements_it_covers() {
+    let source = include_str!("../src/db.rs");
+    let production = source
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .map(|(before, _)| before)
+        .expect("db.rs ends in its test module");
+    let lines: Vec<&str> = production.lines().collect();
+
+    // Line -> the function it belongs to.
+    let mut owner: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut current = "<file scope>";
+    for line in &lines {
+        let trimmed = line.trim_start();
+        for head in ["pub async fn ", "async fn ", "pub fn ", "fn "] {
+            if let Some(rest) = trimmed.strip_prefix(head) {
+                let name_len = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .count();
+                let start = line.len() - rest.len();
+                current = &line[start..start + name_len];
+                break;
+            }
+        }
+        owner.push(current);
+    }
+
+    let is_stamp_call =
+        |l: &str| l.contains("touch_space(conn") || l.contains("touch_space_of_participant(conn");
+    let is_statement =
+        |l: &str| l.contains(".execute(") || l.contains(".query(") || l.contains(".prepare(");
+
+    let mut offenders: Vec<String> = Vec::new();
+    let stampers: std::collections::BTreeSet<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| is_stamp_call(l))
+        .map(|(i, _)| owner[i])
+        .collect();
+
+    for func in stampers {
+        // `touch_space` is itself the stamp; its own statement is the mark.
+        if func == "touch_space" || func == "touch_space_of_participant" {
+            continue;
+        }
+        let first_stamp = lines
+            .iter()
+            .enumerate()
+            .position(|(i, l)| owner[i] == func && is_stamp_call(l))
+            .expect("the function was found by this predicate");
+        for (i, line) in lines.iter().enumerate() {
+            if owner[i] == func && is_statement(line) && i < first_stamp {
+                offenders.push(format!("{func} (statement at db.rs:{})", i + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these functions run a statement before they stamp the space it \n         changes, so a disposal interleaving between the two takes the change \n         with the space: {offenders:?}"
+    );
+}
+
 #[test]
 fn the_raw_space_insert_has_no_production_caller() {
     // `insert_space` writes a `space` row with no stamp and no template behind
