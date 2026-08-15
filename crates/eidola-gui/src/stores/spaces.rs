@@ -120,6 +120,16 @@ pub struct SpacesStore {
     /// rather than a half-instantiated one — the store outlives every window
     /// (STATE.md, "owner = blast radius"). Each task removes its own key.
     instantiations: HashMap<String, Task<()>>,
+    /// In-flight disposals of untouched spaces, keyed by the space each is
+    /// about (see [`Self::window_closed`]). Store-owned for the same reason the
+    /// inserts are: the window that triggered it is already gone.
+    reap_tasks: HashMap<String, Task<()>>,
+    /// Spaces whose last window closed while their own insert was still in
+    /// flight. A space cannot be disposed of before it exists, so the close
+    /// hands the id here and the insert's completion picks it up — which is
+    /// what makes ⌘N-then-immediately-close leave nothing behind rather than
+    /// waiting for the next launch's sweep.
+    reap_after_creation: std::collections::HashSet<String>,
     /// In-flight "New Space from Template" ops, keyed by a monotonic id so each
     /// activation is **independent** and runs to completion (STATE.md "keyed
     /// per-key work") — a supersede slot would let a superseded result, whose
@@ -152,6 +162,8 @@ impl SpacesStore {
             refresh_pending: false,
             registry: HashMap::new(),
             instantiations: HashMap::new(),
+            reap_tasks: HashMap::new(),
+            reap_after_creation: std::collections::HashSet::new(),
             create_ops: HashMap::new(),
             next_create_op: 0,
             op_errors: Vec::new(),
@@ -173,6 +185,8 @@ impl SpacesStore {
             refresh_pending: false,
             registry: HashMap::new(),
             instantiations: HashMap::new(),
+            reap_tasks: HashMap::new(),
+            reap_after_creation: std::collections::HashSet::new(),
             create_ops: HashMap::new(),
             next_create_op: 0,
             op_errors: Vec::new(),
@@ -285,8 +299,20 @@ impl SpacesStore {
                             {
                                 space.update(cx, |space, cx| space.creation_committed(cx));
                             }
+                            // The window may already have closed over this
+                            // insert (⌘N, then close a keystroke later). The
+                            // space exists only now, so this is the earliest
+                            // its disposal could be asked for.
+                            if this.reap_after_creation.remove(&key) {
+                                this.dispose_if_pristine(key.clone(), cx);
+                            }
                         }
-                        Err(e) => this.fail_creation(&key, e, cx),
+                        Err(e) => {
+                            // Nothing was written, so there is nothing to
+                            // dispose of — the refusal already drops the key.
+                            this.reap_after_creation.remove(&key);
+                            this.fail_creation(&key, e, cx);
+                        }
                     }
                 });
             }),
@@ -328,6 +354,87 @@ impl SpacesStore {
         cx: &mut Context<Self>,
     ) {
         self.fail_creation(space_id, error, cx);
+    }
+
+    /// A window drawing `space_id` has closed and no other window is drawing
+    /// it — so **dispose of the space if nothing was ever done with it**.
+    ///
+    /// A space is created when its window opens, so an abandoned ⌘N (and every
+    /// launch that opens a blank one) would otherwise leave a durable empty
+    /// conversation in the Library forever. The GUI answers only "was that the
+    /// last window" — the entity's own window list answers it
+    /// ([`Space::has_other_open_window`]) — and every judgement about whether
+    /// the space is *untouched* belongs to app-core, inside the transaction
+    /// that deletes it.
+    ///
+    /// **A space whose insert is still in flight is deferred, not skipped.**
+    /// The store owns the insert precisely so that a window closed a keystroke
+    /// after ⌘N still leaves a whole space; disposing of one before it exists
+    /// would answer "no such space" and leave the very orphan this exists to
+    /// prevent, so the id waits for the insert's completion instead.
+    pub fn window_closed(&mut self, space_id: String, cx: &mut Context<Self>) {
+        if self.app_core.is_none() {
+            return; // stub stores (tests): nothing durable to dispose of
+        }
+        if self.instantiations.contains_key(&space_id) {
+            self.reap_after_creation.insert(space_id);
+            return;
+        }
+        self.dispose_if_pristine(space_id, cx);
+    }
+
+    /// Ask app-core to delete `space_id` if it is provably pristine.
+    ///
+    /// **Whether a window took the space back is asked in the task, not here.**
+    /// The entity outlives the frame its last window closes in, so a check at
+    /// the close would see it either way; by the task's first poll the release
+    /// has run, and a registry entry that still upgrades therefore means a
+    /// *new* window is drawing this space. Asking too early only ever keeps a
+    /// space, which is the direction to be wrong in.
+    ///
+    /// Residual, stated: a reopen landing after the call is issued races the
+    /// delete and can lose it, leaving a window on a space that no longer
+    /// exists. It costs no work — a pristine space contains none by definition
+    /// — and closing it properly would mean app-core knowing what a window is.
+    ///
+    /// A refused or failed disposal says nothing to anyone: nobody asked for
+    /// it, the Library is unchanged either way, and the next launch's sweep
+    /// gets another go.
+    fn dispose_if_pristine(&mut self, space_id: String, cx: &mut Context<Self>) {
+        let Some(core) = self.app_core.clone() else {
+            return;
+        };
+        let key = space_id.clone();
+        self.reap_tasks.insert(
+            key.clone(),
+            cx.spawn(async move |this, cx| {
+                let reopened = this
+                    .update(cx, |this, _| {
+                        this.registry
+                            .get(&key)
+                            .and_then(WeakEntity::upgrade)
+                            .is_some()
+                    })
+                    .unwrap_or(true);
+                if reopened {
+                    let _ = this.update(cx, |this, _| this.reap_tasks.remove(&key));
+                    return;
+                }
+                let discarded = bridge(core, move |c| async move {
+                    c.discard_if_pristine(space_id).await
+                })
+                .await;
+                let _ = this.update(cx, |this, _| {
+                    this.reap_tasks.remove(&key);
+                    // The listing refreshes through the bus like any other
+                    // write; what the store has to drop is the registry entry,
+                    // so it stays a map of conversations that exist.
+                    if matches!(discarded, Ok(true)) {
+                        this.registry.remove(&key);
+                    }
+                });
+            }),
+        );
     }
 
     /// **Every live `Space` this store knows of** — the registry, minus the

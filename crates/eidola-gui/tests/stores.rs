@@ -2240,3 +2240,85 @@ fn a_refused_account_operation_leaves_the_subscription_alone(cx: &mut TestAppCon
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Disposing of untouched spaces — the store's half
+// ---------------------------------------------------------------------------
+
+/// Whether the core still holds `space`, archived or not.
+fn space_row_exists(core: &std::sync::Arc<AppCore>, space: &str) -> bool {
+    core.runtime()
+        .block_on(core.list_spaces(true))
+        .is_ok_and(|spaces| spaces.iter().any(|s| s.id == space))
+}
+
+/// **A window can close over its own insert, and the space is still disposed
+/// of.** The store owns the insert precisely so a ⌘N closed a keystroke later
+/// leaves a *whole* space rather than half of one — which means the close can
+/// arrive while the row does not exist yet, where a disposal would answer "no
+/// such space" and leave behind the very orphan it exists to prevent. So the id
+/// waits for the insert's completion and is disposed of from there.
+///
+/// The interleaving is staged rather than hoped for: creating and closing in
+/// one pass means the creation task has not been polled yet.
+#[gpui::test]
+fn a_window_closed_over_its_own_insert_still_leaves_nothing_behind(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
+    let space_id = entity.read_with(cx, |s, _| s.id().to_string());
+    // The entity dies with its last window in production; here the test is the
+    // only holder, so it has to let go for the release to mean anything.
+    drop(entity);
+    stores
+        .spaces
+        .update(cx, |s, cx| s.window_closed(space_id.clone(), cx));
+
+    wait_until(
+        cx,
+        "the insert commits and the space is disposed of",
+        |_| !space_row_exists(&core, &space_id),
+    );
+    assert!(
+        !stores
+            .spaces
+            .read_with(cx, |s, _| s.list().iter().any(|r| r.id == space_id)),
+        "and the Library index shows no residue"
+    );
+}
+
+/// **A window that took the space back outranks a pending disposal.** The
+/// entity outlives the frame its last window closes in, so the question is
+/// asked in the disposal's own task — by which time a registry entry that still
+/// upgrades can only mean a new window is drawing this conversation.
+#[gpui::test]
+fn a_space_a_window_took_back_is_not_disposed_of(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
+    let space_id = entity.read_with(cx, |s, _| s.id().to_string());
+    drop(entity);
+    wait_until(cx, "the space's row commits", |_| {
+        space_row_exists(&core, &space_id)
+    });
+
+    // The close, and — before the disposal's task gets a turn — a reopen.
+    stores
+        .spaces
+        .update(cx, |s, cx| s.window_closed(space_id.clone(), cx));
+    let reopened = stores
+        .spaces
+        .update(cx, |s, cx| s.open(space_id.clone(), cx));
+
+    for _ in 0..8 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        space_row_exists(&core, &space_id),
+        "the conversation someone reopened is not an abandoned one"
+    );
+    drop(reopened);
+}
