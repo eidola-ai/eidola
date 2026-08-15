@@ -11,9 +11,6 @@ command -v python3 >/dev/null 2>&1 || {
   exit 2
 }
 
-./scripts/test-apple-detach.py
-./scripts/test-apple-place.py
-
 fixture=scripts/fixtures/apple-roundtrip/synthetic-universal
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/eidola-apple-archive-test.XXXXXX")
 cleanup() {

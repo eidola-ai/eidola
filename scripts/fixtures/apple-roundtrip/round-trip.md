@@ -17,6 +17,8 @@ This is the go/no-go gate for the detached-signature design: does a signature li
 
 Reproduce with `just apple-roundtrip [path/to/Eidola.app]` — `scripts/apple-roundtrip.sh`, plus `scripts/apple-detach.py`, `scripts/apple-place.py` and `scripts/macho_facts.py`, all committed in this repository (paths here are relative to the repository root).
 
+> The measurement below is kept as written. The two Python mutation scripts it names have since been subsumed by the `eidola-apple` crate and deleted; the harness drives `release-tool apple detach|apply` instead. Read every mention of them as naming the crate, and see the addendum at the end for what changed.
+
 ---
 
 ## Verdict
@@ -362,3 +364,22 @@ Open before this measurement and still open; nothing here settles them:
 - Whether the notarization ticket travels in the detached bundle and `apply` reproduces the **stapled** bundle. `apply` copies non-signature files verbatim, so `Contents/CodeResources` will land; that it is excluded from the seal is still documentation-derived, not observed.
 - Whether Apple's notary service accepts the relocated sidecar in `Contents/MacOS/`.
 - Whether `codesign` drives the PIV token unattended with the PIN supplied non-interactively.
+
+---
+
+## Addendum, 2026-08-14: the crate subsumed the measurement scripts
+
+Everything above is the measurement as it was made, and it stays as written — it describes what was measured, with the instruments that existed then. What has changed since is which implementation the harness drives.
+
+`scripts/apple-detach.py` and `scripts/apple-place.py` were scaffolding: written to demonstrate the placement route before `eidola-apple` existed, and never independent oracles, because ground truth throughout is `codesign`'s output bytes. The shipping crate now carries both operations, so `scripts/apple-roundtrip.sh` calls `release-tool apple detach` and `release-tool apple apply`, and the two scripts, their tests, and their duplicated hardening are deleted. Every reference to them above should be read as naming the crate's `detach` and `apply`.
+
+Two consequences worth stating, because they are what the swap bought and what it cost:
+
+- **The shipping implementation is now the one graded against real bundles.** Section (e)'s placement-driven round trip, the boundary sweep in (b++), and the detach feeding signapple in (b) all run the crate. Before this, the crate only ever touched the committed synthetic fixture.
+- **The Python that remains reads and never writes.** `scripts/macho_facts.py` and `scripts/apple_linkedit_diff.py` are the instruments the divergences are graded with; making the crate its own classifier would collapse the measurement into the implementation. The rule is the boundary: no Python on any path that writes bytes.
+
+The equivalence was checked before the swap, not assumed: `release-tool apple detach` over the fixture inputs emits a placement record semantically identical to the committed Python-emitted one, differing only in JSON key order (`serde` struct order rather than Python's sorted keys) — the same 2,177 bytes, field for field. `detached/eidola-placement.json` was regenerated once from the crate so the committed record is what the shipping detacher emits, and `README.md`'s recipe now says so.
+
+The independent checks are untouched: `codesign --verify --deep --strict` and the narrow signapple differential (§5.2) both survive the retirement, because neither was ever Python of ours.
+
+One interface change went with it. `eidola_apple::apply` previously accepted either the detached root or the app directory inside it, walking *up* to the parent to find `eidola-placement.json` — reading outside the path it was handed. It now requires the root; `scripts/verify-apple.sh` already located both trees and passes the root, and `scripts/apple-roundtrip.sh` does the same. `signapple apply`, which can only reach a fat Mach-O through the bundle path, still takes the app directory — that is its interface, not ours.
