@@ -266,7 +266,7 @@ fn a_refused_space_creation_says_so_instead_of_showing_a_blank_page(cx: &mut Tes
         );
     });
     let shown = view
-        .read_with(cx, |v, _| v.error_for_test())
+        .read_with(cx, |v, cx| v.error_for_test(cx))
         .expect("the window says the space could not be created rather than showing a blank page");
     assert!(shown.contains("disk is full"), "got {shown}");
 
@@ -4788,7 +4788,9 @@ fn space_turn_failure_leaves_sibling_streams_untouched(cx: &mut TestAppContext) 
             streams[0].response.content, "partial thoughts…",
             "the sibling's live buffer is untouched"
         );
-        let msg = v.error_for_test().expect("the failed turn shows a notice");
+        let msg = v
+            .error_for_test(cx)
+            .expect("the failed turn shows a notice");
         assert!(msg.contains("connection reset"));
         assert!(space.can_retry());
         let failed = space.failed_turn().expect("the failed turn is recorded");
@@ -4802,7 +4804,7 @@ fn space_turn_failure_leaves_sibling_streams_untouched(cx: &mut TestAppContext) 
     })
     .unwrap();
     view.read_with(cx, |v, cx| {
-        assert!(v.error_for_test().is_none(), "retry clears the notice");
+        assert!(v.error_for_test(cx).is_none(), "retry clears the notice");
         let space = v.space().read(cx);
         let streams = space.streams();
         assert_eq!(streams.len(), 2, "retry streams beside the sibling");
@@ -4869,7 +4871,7 @@ fn space_sibling_success_keeps_failed_turn_notice(cx: &mut TestAppContext) {
     cx.run_until_parked();
     view.read_with(cx, |v, cx| {
         assert!(
-            v.error_for_test().is_some(),
+            v.error_for_test(cx).is_some(),
             "the failed turn shows a notice"
         );
         assert!(v.space().read(cx).can_retry(), "Retry is available");
@@ -4884,7 +4886,7 @@ fn space_sibling_success_keeps_failed_turn_notice(cx: &mut TestAppContext) {
     cx.run_until_parked();
     view.read_with(cx, |v, cx| {
         assert!(
-            v.error_for_test().is_some(),
+            v.error_for_test(cx).is_some(),
             "a sibling's success must not hide the failed turn's notice"
         );
         let space = v.space().read(cx);
@@ -4902,7 +4904,7 @@ fn space_sibling_success_keeps_failed_turn_notice(cx: &mut TestAppContext) {
     })
     .unwrap();
     view.read_with(cx, |v, cx| {
-        assert!(v.error_for_test().is_none(), "dismiss clears the notice");
+        assert!(v.error_for_test(cx).is_none(), "dismiss clears the notice");
         assert!(
             !v.space().read(cx).can_retry(),
             "dismiss ends the recovery — nothing left to retry"
@@ -6738,9 +6740,9 @@ fn space_failed_ask_notice_is_dismissible(cx: &mut TestAppContext) {
     seed_failed_ask(&view, window, cx);
 
     // The failure surfaced the recovery notice (with the source's text).
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, cx| {
         let msg = v
-            .error_for_test()
+            .error_for_test(cx)
             .expect("a failure shows the recovery notice");
         assert!(msg.contains("dns error"), "notice carries the error: {msg}");
     });
@@ -6751,7 +6753,7 @@ fn space_failed_ask_notice_is_dismissible(cx: &mut TestAppContext) {
     })
     .unwrap();
     view.read_with(cx, |v, cx| {
-        assert!(v.error_for_test().is_none(), "notice dismissed");
+        assert!(v.error_for_test(cx).is_none(), "notice dismissed");
         assert_eq!(v.post_count_for_test(), 1, "the saved post remains");
         assert!(!v.space().read(cx).is_streaming());
     });
@@ -6814,7 +6816,7 @@ fn space_failed_ask_can_re_request(cx: &mut TestAppContext) {
     })
     .unwrap();
     view.read_with(cx, |v, cx| {
-        assert!(v.error_for_test().is_none(), "retry clears the notice");
+        assert!(v.error_for_test(cx).is_none(), "retry clears the notice");
         let space = v.space().read(cx);
         assert!(
             space.is_streaming(),
@@ -14984,9 +14986,9 @@ fn space_a_denied_follow_says_so_without_naming_the_conversation(cx: &mut TestAp
             "the notice leaked {leak:?}: {notice}"
         );
     }
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, cx| {
         assert!(
-            v.error_for_test().is_none(),
+            v.error_for_test(cx).is_none(),
             "a refusal is not a failure — no danger band, no Retry"
         );
     });
@@ -15958,14 +15960,21 @@ fn a_settled_space_is_still_disposed_of_at_the_same_close(cx: &mut TestAppContex
     drain_runtime(&core);
 }
 
-/// **A refusal a reader sees is copy, and copy is localized.**
+/// **A refusal a reader sees is copy, copy is localized, and a view renders it
+/// from state rather than from a string it kept.**
 ///
 /// `error_copy` answers the conversation's recovery notice, and its fallback is
 /// `AppError`'s own `Display` — written for a log, and English in every locale.
 /// App-core ships no user-facing strings by doctrine, so that fallback is a
 /// known residual the localization extraction sweep owns; `SpaceArchived` is
-/// the first variant taken out of it, and this pins the pattern: the copy comes
-/// from the locale's resources, not from a literal beside the match arm.
+/// the first variant taken out of it.
+///
+/// The locale is switched here **without re-emitting the failure**, which is
+/// the whole point: the band holds the typed error and formats at render, so a
+/// language change repaints the sentence that is already on screen. Holding the
+/// formatted string instead would pass a test that re-failed after each switch
+/// and leave a real reader looking at the old language until something else
+/// went wrong.
 #[gpui::test]
 async fn an_archived_conversations_refusal_is_localized(cx: &mut gpui::TestAppContext) {
     let stores = stub_stores_with_agents(cx, "s");
@@ -15995,7 +16004,7 @@ async fn an_archived_conversations_refusal_is_localized(cx: &mut gpui::TestAppCo
     .unwrap();
     cx.run_until_parked();
 
-    let english = view.read_with(cx, |v, _| v.error_for_test().expect("a notice is shown"));
+    let english = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
     assert_eq!(
         english, "This conversation is archived, so it can’t take new replies.",
         "the source locale's own words, not the error's Display"
@@ -16005,35 +16014,118 @@ async fn an_archived_conversations_refusal_is_localized(cx: &mut gpui::TestAppCo
         "the raw Display must not be what a reader sees: {english}"
     );
 
-    // The proof that it went through the resources rather than a literal: the
-    // same failure in another locale says it in that language.
+    // **One failure, three languages.** Nothing is re-emitted between these —
+    // only the locale changes, and the band must follow it.
     for (tag, expected) in [
         (
             "fr",
             "Cette conversation est archivée : elle ne peut plus recevoir de réponses.",
         ),
         ("zh-Hans", "此对话已归档，无法接收新的回复。"),
+        (
+            "en",
+            "This conversation is archived, so it can’t take new replies.",
+        ),
     ] {
         cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
-        cx.update_window(window, |_, _, cx| {
-            space.update(cx, |s, cx| {
-                s.apply_turn_failure_for_test(
-                    "agent-b",
-                    "a1",
-                    AppError::SpaceArchived {
-                        space_id: "s".into(),
-                    },
-                    cx,
-                )
-            });
-        })
-        .unwrap();
         cx.run_until_parked();
         assert_eq!(
-            view.read_with(cx, |v, _| v.error_for_test().expect("a notice is shown")),
+            view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown")),
             expected,
-            "{tag} reads its own resources"
+            "{tag} repaints the notice already on screen — no new failure was emitted"
         );
     }
-    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}
+
+/// **An affordance that cannot succeed is worse than none.**
+///
+/// Archival is what closes a conversation and there is no unarchive door
+/// anywhere in the app, so a Retry on an archived-space failure could only
+/// re-hit the same guard. The failure therefore records no `failed_turn`, which
+/// is what arms Retry — while the notice still explains itself, because what
+/// has nothing to retry still has something to say.
+#[gpui::test]
+async fn an_archived_conversation_explains_itself_without_offering_retry(
+    cx: &mut gpui::TestAppContext,
+) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // An ordinary failure is retryable — the control case, so this test fails
+    // if the record simply stopped being written at all.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::Network {
+                    message: "dns error".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, cx| {
+        assert!(v.error_for_test(cx).is_some(), "the notice explains it");
+        assert!(v.space().read(cx).can_retry(), "and offers another press");
+    });
+
+    // The permanent one does not.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.clear_failed_turn(cx);
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::SpaceArchived {
+                    space_id: "s".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, cx| {
+        let msg = v
+            .error_for_test(cx)
+            .expect("the band still explains what happened");
+        assert!(msg.contains("archived"), "and says what: {msg}");
+        assert!(
+            !v.space().read(cx).can_retry(),
+            "but arms no Retry — it could only re-hit the guard that closed the room"
+        );
+        assert!(
+            v.space().read(cx).failed_turn().is_none(),
+            "and leaves nothing armed behind the notice either"
+        );
+    });
+
+    // A sibling turn finishing must not take the explanation with it. The
+    // notice's lifetime is normally owned by the `failed_turn` record, and a
+    // permanent refusal records none — so this is exactly where the
+    // explanation could have been blanked by somebody else's success.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.finish_save_for_test(cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test(cx).is_some(),
+            "a sibling ending does not erase a refusal that stands"
+        );
+    });
 }

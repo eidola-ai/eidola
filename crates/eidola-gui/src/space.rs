@@ -79,9 +79,38 @@ pub struct StreamingTurn {
     pub response: StreamingResponse,
 }
 
+/// Whether a failure is worth offering **Retry** for — i.e. whether re-asking
+/// could plausibly succeed *given the affordances this app has*.
+///
+/// That last clause is why the question is answered here and not in app-core:
+/// the core ships typed variants and no opinion about what a reader can do
+/// next, and retryability is exactly such an opinion. It is also why the
+/// default is `true` — a network blip recovers, credits get topped up, a
+/// missing model gets configured, so almost every refusal is worth another
+/// press, and a new variant should keep that behaviour until somebody decides
+/// otherwise rather than silently losing its recovery path.
+///
+/// The exception is a refusal nothing in the app can lift.
+/// [`AppError::SpaceArchived`] is the first: archival is what closes a
+/// conversation, and there is **no unarchive door anywhere in this
+/// application** — the Library lists only live spaces and offers Archive, and
+/// nothing offers the reverse. So a Retry there could only ever re-hit the
+/// same guard, and an affordance that cannot succeed is worse than none: it
+/// invites the reader to keep pressing while the explanation stays put.
+///
+/// The explanation itself is not affected — see
+/// `SpaceView::render_error_band`. What goes is the button, not the sentence.
+pub(crate) fn is_retryable(e: &AppError) -> bool {
+    !matches!(e, AppError::SpaceArchived { .. })
+}
+
 /// The turn a failed ask leaves behind — who was asked, about what — so the
 /// recovery notice's Retry can re-ask the *same* participant without
 /// disturbing any sibling turns still streaming.
+///
+/// **Only a retryable failure leaves one** ([`is_retryable`]): the record *is*
+/// what arms Retry ([`Space::can_retry`]), so a permanent refusal recording one
+/// would offer a button whose only possible outcome is the same refusal again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailedTurn {
     pub participant_id: String,
@@ -1483,7 +1512,13 @@ impl Space {
     ) {
         self.streams.retain(|s| s.seq != seq);
         self.turn_runners.remove(&seq);
-        if let (Some(p), Some(t)) = (participant_id, target_action_id) {
+        // A permanent refusal records nothing: the record is what arms Retry,
+        // and Retry on a closed conversation can only re-hit the guard that
+        // closed it (see [`is_retryable`]). The notice still explains itself —
+        // `SpaceEvent::Failed` carries the error either way.
+        if let (Some(p), Some(t)) = (participant_id, target_action_id)
+            && is_retryable(&e)
+        {
             self.failed_turn = Some(FailedTurn {
                 participant_id: p,
                 target_action_id: t,

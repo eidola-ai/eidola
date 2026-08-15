@@ -58,7 +58,7 @@ use crate::actions::CloseWindow;
 use crate::focus::TabRegion as _;
 use crate::overlay::{Contain as _, Overlay};
 use crate::probe::Probe as _;
-use crate::space::{ChatMessageView, Space, SpaceEvent};
+use crate::space::{ChatMessageView, Space, SpaceEvent, is_retryable};
 use crate::stores::Stores;
 use crate::theme;
 use crate::window_input::WindowInput;
@@ -739,7 +739,15 @@ pub struct SpaceView {
 
     /// A minimal honest error band (e.g. a submit failing before onboarding
     /// exists). Full onboarding is a later, separate window.
-    pub(crate) error: Option<String>,
+    ///
+    /// **The typed error, not its text.** `error_copy` reads the reader's
+    /// locale, so a formatted string held here is a cached render decision:
+    /// changing language refreshes every window, the band re-renders, and it
+    /// would paint the same sentence in the old language until some *other*
+    /// failure happened to replace it. Views render from state; the words are
+    /// chosen at render. (`stores::account`'s `account_op_error` already holds
+    /// its `AppError` for the same reason.)
+    pub(crate) error: Option<AppError>,
 
     /// A quiet notice about a **reference** that could not be followed (task
     /// 37): the reader clicked a quote from a conversation they take no part
@@ -1444,10 +1452,12 @@ impl SpaceView {
         self.hovered_post.as_ref().map(|s| s.to_string())
     }
 
-    /// The recovery-notice error text, if the notice is showing.
+    /// The recovery-notice error text, if the notice is showing — formatted
+    /// exactly as the band formats it, `cx` and all, so a test reads what a
+    /// reader reads *in the active locale* rather than a cached string.
     #[doc(hidden)]
-    pub fn error_for_test(&self) -> Option<String> {
-        self.error.clone()
+    pub fn error_for_test(&self, cx: &gpui::App) -> Option<String> {
+        self.error.as_ref().map(|e| error_copy(e, cx))
     }
 
     /// The node id whose separator band menu is open, if any.
@@ -1911,7 +1921,14 @@ impl SpaceView {
                 // silently removing the user's only recovery path (the Retry
                 // renders inside the notice). It persists until that turn is
                 // retried or explicitly dismissed.
-                if self.space.read(cx).failed_turn().is_none() {
+                // A **permanent** refusal records no `failed_turn` at all
+                // (see `space::is_retryable`), so keying the notice's lifetime
+                // on that record alone would let a sibling turn — one that was
+                // already streaming when the conversation was archived — blank
+                // the explanation on its way out. What has nothing to retry
+                // still has something to say.
+                let unretryable = self.error.as_ref().is_some_and(|e| !is_retryable(e));
+                if self.space.read(cx).failed_turn().is_none() && !unretryable {
                     self.error = None;
                 }
                 self.rebuild(cx);
@@ -1927,7 +1944,7 @@ impl SpaceView {
                 self.follow_completed_turn(*seq, response_action_id.as_deref());
             }
             SpaceEvent::Failed(e) => {
-                self.error = Some(error_copy(e, cx));
+                self.error = Some(e.clone());
                 self.rebuild(cx);
             }
             SpaceEvent::CascadePaused {
@@ -3083,9 +3100,13 @@ impl SpaceView {
     /// itself is already recovered (the composer and per-post Edit remain live),
     /// so the user can also just keep typing a follow-up or edit their message.
     fn render_error_band(&self, cx: &Context<Self>) -> AnyElement {
-        let Some(msg) = self.error.clone() else {
+        let Some(err) = self.error.as_ref() else {
             return div().into_any_element();
         };
+        // Formatted here, every frame, from the typed value — so a locale
+        // change repaints this band in the new language without anything
+        // having to invalidate a cache.
+        let msg = error_copy(err, cx);
         let theme = cx.theme();
         let can_retry = self.space.read(cx).can_retry();
         let to_copy = msg.clone();
