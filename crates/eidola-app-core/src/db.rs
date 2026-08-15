@@ -2445,11 +2445,15 @@ pub async fn participant_is_live(conn: &Connection, id: &str) -> Result<bool, Ap
 /// Soft-remove a participant row (global: library soft-remove; owned:
 /// left/deactivated). The row survives so `action.participant_id` references
 /// stay resolvable.
-pub async fn soft_remove_participant(
-    conn: &Connection,
-    id: &str,
-    now: i64,
-) -> Result<bool, AppError> {
+///
+/// **Private, like every other raw membership write in this module.** Retiring
+/// a shared agent is not one statement: it has to archive the spaces that
+/// existed only because of that agent — its notebook, and every sub-space it
+/// owned — or it leaves rooms the Library still lists whose owner is absent
+/// from their own roster. [`retire_participant_tx`] is that operation, and
+/// this is one third of it. Exported, it would have been a way to perform the
+/// first third alone.
+async fn soft_remove_participant(conn: &Connection, id: &str, now: i64) -> Result<bool, AppError> {
     let n = conn
         .execute(
             "UPDATE participant SET removed_at = ?2 WHERE id = ?1 AND removed_at IS NULL",
@@ -3561,7 +3565,11 @@ pub async fn participant_spaces(
 
 /// Reference a global into a space (pinned `participant_scope='global'`, no
 /// overrides). The common membership-add.
-pub async fn insert_space_participant(
+///
+/// **Private** — see the note on [`ensure_space_participant`]: a `role`
+/// arriving here is written verbatim, so an exported version was a way to mint
+/// a second owner of a sub-space.
+async fn insert_space_participant(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
@@ -3598,7 +3606,18 @@ pub async fn insert_space_participant(
 /// Answers whether the membership *changed*: a fresh join or a revived one.
 /// A membership that was already live is left exactly as it stands, which is
 /// what "idempotent" has always meant here.
-pub async fn ensure_space_participant(
+///
+/// **Private, and that is the enforcement.** The rules a membership write has
+/// to respect do not live in this statement — they live in the transactions
+/// that wrap it ([`join_space_participant_tx`],
+/// [`grant_space_membership_tx`]), which refuse a second `role = 'owner'` in a
+/// sub-space, and in [`remove_space_participant_tx`], which refuses to end the
+/// two structural memberships. Duplicating those checks here would put the
+/// same rule in two places to drift apart; withholding the primitive from
+/// outside the module makes the guarded doors the only way in, so the invalid
+/// state is unrepresentable at the API boundary rather than guarded at each
+/// entrance. Every caller is in this file.
+async fn ensure_space_participant(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
@@ -3945,10 +3964,22 @@ pub async fn notebook_participant_of(
 }
 
 /// End a space membership (reference) — set `left_at`. For a referenced global;
-/// owned participants are removed via [`soft_remove_participant`]. Callers
-/// choosing *between* the two must go through [`remove_space_participant_tx`],
-/// which decides at the write.
-pub async fn leave_space_participant(
+/// owned participants are removed via [`soft_remove_participant`].
+///
+/// **Compiled only into test builds**, which is the strongest form the
+/// no-production-caller rule takes in this module: `insert_space` is held to it
+/// by an assertion (`the_raw_space_insert_has_no_production_caller`), and this
+/// one is held to it by the compiler.
+///
+/// The real leave is the statement inside [`remove_space_participant_tx`],
+/// which carries in its own `WHERE` the two refusals this one has never had: a
+/// notebook's owner and a sub-space's owner cannot leave, because nothing can
+/// grant either membership back. This is the same write *without* them — so it
+/// survives only as an arrangement primitive for this module's own tests,
+/// which need a departed membership to revive, and cannot become a second,
+/// unguarded way to do a guarded thing.
+#[cfg(test)]
+async fn leave_space_participant(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,

@@ -1927,7 +1927,7 @@ impl SpaceView {
                 self.follow_completed_turn(*seq, response_action_id.as_deref());
             }
             SpaceEvent::Failed(e) => {
-                self.error = Some(error_copy(e));
+                self.error = Some(error_copy(e, cx));
                 self.rebuild(cx);
             }
             SpaceEvent::CascadePaused {
@@ -2163,12 +2163,26 @@ fn collect_scrollers(
 
 /// Window-facing copy for a typed submit failure (Phase 1 minimal surface;
 /// onboarding is a later, separate window).
-fn error_copy(e: &AppError) -> String {
+///
+/// **`SpaceArchived` is the first arm read from the localization resources**,
+/// and it is the pattern the rest of this function is waiting for: match the
+/// typed variant, and answer with a message the reader's locale defines. It
+/// takes `cx` for no other reason.
+///
+/// The two arms above it are English literals and the fallback prints
+/// `AppError`'s own `Display`, which is written for a log rather than for a
+/// reader and is English in every locale. That is a **known, accepted
+/// residual** owned by the localization extraction sweep, not something this
+/// arm is exempt from — app-core ships no user-facing strings by doctrine, so
+/// every one of these belongs here eventually. See the localization section of
+/// this crate's AGENTS.md.
+fn error_copy(e: &AppError, cx: &gpui::App) -> String {
     match e {
         AppError::NoAccount => "No account yet — create one to start a conversation.".to_string(),
         AppError::InsufficientBalance { .. } => {
             "Not enough credits to send. Add credits to continue.".to_string()
         }
+        AppError::SpaceArchived { .. } => crate::i18n::msg::space_error_archived(cx).to_string(),
         other => other.to_string(),
     }
 }

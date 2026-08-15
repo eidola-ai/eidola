@@ -15957,3 +15957,83 @@ fn a_settled_space_is_still_disposed_of_at_the_same_close(cx: &mut TestAppContex
     });
     drain_runtime(&core);
 }
+
+/// **A refusal a reader sees is copy, and copy is localized.**
+///
+/// `error_copy` answers the conversation's recovery notice, and its fallback is
+/// `AppError`'s own `Display` — written for a log, and English in every locale.
+/// App-core ships no user-facing strings by doctrine, so that fallback is a
+/// known residual the localization extraction sweep owns; `SpaceArchived` is
+/// the first variant taken out of it, and this pins the pattern: the copy comes
+/// from the locale's resources, not from a literal beside the match arm.
+#[gpui::test]
+async fn an_archived_conversations_refusal_is_localized(cx: &mut gpui::TestAppContext) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::SpaceArchived {
+                    space_id: "s".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let english = view.read_with(cx, |v, _| v.error_for_test().expect("a notice is shown"));
+    assert_eq!(
+        english, "This conversation is archived, so it can’t take new replies.",
+        "the source locale's own words, not the error's Display"
+    );
+    assert!(
+        !english.contains("takes no new turns"),
+        "the raw Display must not be what a reader sees: {english}"
+    );
+
+    // The proof that it went through the resources rather than a literal: the
+    // same failure in another locale says it in that language.
+    for (tag, expected) in [
+        (
+            "fr",
+            "Cette conversation est archivée : elle ne peut plus recevoir de réponses.",
+        ),
+        ("zh-Hans", "此对话已归档，无法接收新的回复。"),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        cx.update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.apply_turn_failure_for_test(
+                    "agent-b",
+                    "a1",
+                    AppError::SpaceArchived {
+                        space_id: "s".into(),
+                    },
+                    cx,
+                )
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.error_for_test().expect("a notice is shown")),
+            expected,
+            "{tag} reads its own resources"
+        );
+    }
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}

@@ -4834,6 +4834,43 @@ impl Inner {
 
         let db_conn = self.db_conn().await?;
 
+        // **The space must exist and must still be open, and that is asked
+        // before anything else is done — first read, first refusal.**
+        //
+        // One statement answers both, so no interleaving can put "it is there"
+        // in front of an archival that has already landed. It sits here, ahead
+        // of the participant and the backend, because everything below it
+        // *acts*: resolving a backend persists a provider row, an engine-backed
+        // model may start a llama.cpp subprocess, and the eidola path builds an
+        // attested client and fetches the model catalogue over the network. A
+        // refusal that came after those would be a turn that never ran leaving
+        // a spawned sidecar, a durable row and a handshake behind it — work
+        // done on behalf of a conversation somebody had closed. Refusing on the
+        // first read costs one query and leaves nothing.
+        //
+        // This is the gate every entry point passes through (`chat` /
+        // `chat_stream`, `regenerate`, `respond_stream`, and the
+        // participant-aware `respond_stream_as` a cascade is driven through),
+        // which is what makes "an archived conversation takes no new turns" a
+        // property of the turn path rather than a rule each caller has to
+        // remember. It is the *second* of two gates and the one that closes the
+        // race the first cannot: a plan is computed, the space is archived, and
+        // only then is the planned turn driven — planning refuses afterwards
+        // (`mechanical_plan`), this refuses in between. A turn already past
+        // this point runs to completion and persists; see
+        // [`AppError::SpaceArchived`] for why the boundary is drawn there.
+        let space_row =
+            db::get_space(&db_conn, space_id)
+                .await?
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("space not found: {space_id}"),
+                })?;
+        if space_row.archived_at.is_some() {
+            return Err(AppError::SpaceArchived {
+                space_id: space_id.to_string(),
+            });
+        }
+
         let attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
             Arc::new(Mutex::new(Vec::new()));
 
@@ -5057,32 +5094,6 @@ impl Inner {
             context_length.min(4096) as u32
         };
 
-        // **The space must exist and must still be open, decided at one read.**
-        // The row answers both, so no interleaving can put "it is there" in
-        // front of an archival that has already landed — and this is the gate
-        // every entry point passes through (`chat` / `chat_stream`,
-        // `regenerate`, `respond_stream`, and the participant-aware
-        // `respond_stream_as` the cascade driver uses), which is what makes
-        // "an archived conversation takes no new turns" a property of the turn
-        // path rather than a rule each caller has to remember.
-        //
-        // It is the *second* of two gates and the one that closes the race the
-        // first cannot: a plan is computed, the space is archived, and only
-        // then is the planned turn driven. Planning refuses afterwards
-        // (`mechanical_plan`); this refuses in between. A turn already past
-        // this point runs to completion and persists — see
-        // [`AppError::SpaceArchived`] for why the boundary is drawn there.
-        let space_row =
-            db::get_space(&db_conn, space_id)
-                .await?
-                .ok_or_else(|| AppError::NotConfigured {
-                    message: format!("space not found: {space_id}"),
-                })?;
-        if space_row.archived_at.is_some() {
-            return Err(AppError::SpaceArchived {
-                space_id: space_id.to_string(),
-            });
-        }
         // The target (the post being replied to / the generation being revised)
         // must belong to this space — otherwise a caller could splice another
         // space's thread into this turn (cross-space context + reply edge). This

@@ -1772,7 +1772,21 @@ fn an_archived_space_plans_no_turns_and_starts_none() {
                 .expect("archive")
         );
 
+        // The **earliest** observable effects of a turn, not just the last one.
+        // The refusal is the first read after the database handle, ahead of
+        // resolving the participant and the backend — so nothing below it runs:
+        // no provider row is persisted, no engine is started, no attested
+        // client is built and no catalogue is fetched. `models_hits` is the one
+        // that catches a gate placed too late: a refusal after backend setup
+        // still leaves `chat_bodies` untouched, because the turn never reaches
+        // a completion — but the catalogue fetch has already happened.
+        let models_before = mock.models_hits();
         let requests_before = mock.chat_bodies().len();
+        let records_before = core
+            .runtime()
+            .block_on(core.list_requests(100, 0))
+            .expect("requests")
+            .len();
         let actions_before = core
             .runtime()
             .block_on(core.test_space_actions(space.clone()))
@@ -1836,9 +1850,23 @@ fn an_archived_space_plans_no_turns_and_starts_none() {
         // Nothing was spent past the archival: no request left the process and
         // no action was written after it.
         assert_eq!(
+            mock.models_hits(),
+            models_before,
+            "a refused turn never got as far as building a client and fetching \
+             the catalogue — this is what pins the gate ahead of backend setup"
+        );
+        assert_eq!(
             mock.chat_bodies().len(),
             requests_before,
             "a refused turn makes no upstream request"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.list_requests(100, 0))
+                .expect("requests")
+                .len(),
+            records_before,
+            "and records none"
         );
         assert_eq!(
             core.runtime()
