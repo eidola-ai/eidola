@@ -6563,5 +6563,101 @@ fn a_room_the_reader_only_watches_offers_no_regenerate(cx: &mut TestAppContext) 
          the conversation, because the core refuses it: {names:?}"
     );
 
+    // **No door into acting, anywhere on the surface.** The band's `+` opens
+    // Reply and Ask together, so it is gone; Ask is the sharp one, because it
+    // is the single acting verb app-core cannot refuse on the reader's behalf
+    // (it drives `respond_stream_as`, which names the agent it acts as and is
+    // the door a turn driver uses) — an Ask chip that renders is a billed
+    // inference that will run.
+    for probe_name in ["space/band/add", "space/band/menu"] {
+        assert!(
+            !names.contains(&probe_name.to_string()),
+            "{probe_name} opens Reply and Ask, which a watching reader may not do: {names:?}"
+        );
+    }
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.starts_with("space/band/menu/ask/") || n.starts_with("space/cascade/ask/")),
+        "and no Ask reaches the surface by any route: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The same conversation, read by a **member** — every affordance the test
+/// above finds absent is present here, so that one is proving suppression
+/// rather than an empty fixture.
+#[gpui::test]
+fn a_room_the_reader_belongs_to_keeps_its_verbs(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let roster = vec![
+        eidola_app_core::ParticipantInfo {
+            id: eidola_app_core::HUMAN_PARTICIPANT_ID.into(),
+            scope: "global".into(),
+            source: "referenced".into(),
+            kind: "human".into(),
+            label: "User".into(),
+            model_ref: None,
+            system_prompt: None,
+            notify_policy: "explicit".into(),
+            role: "owner".into(),
+            reference: None,
+        },
+        eidola_app_core::ParticipantInfo {
+            id: "agent-a".into(),
+            scope: "global".into(),
+            source: "referenced".into(),
+            kind: "agent".into(),
+            label: "Surveyor".into(),
+            model_ref: Some("gemma4-31b".into()),
+            system_prompt: None,
+            notify_policy: "all".into(),
+            role: "member".into(),
+            reference: None,
+        },
+    ];
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+        s.participants = Some(("s".to_string(), roster));
+        s.space_settings = Some((
+            "s".to_string(),
+            eidola_app_core::SpaceSettings {
+                notebook_participant_id: None,
+                ..Default::default()
+            },
+        ));
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12.");
+    answer.action_type = "inference".into();
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![answer], cx));
+    });
+    draw(cx, window);
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a1", cx));
+    });
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/0/regenerate".to_string()),
+        "a member may regenerate an inferred answer: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/band/add".to_string()),
+        "and reach Reply and Ask: {names:?}"
+    );
+
     probe::set_probes_enabled(false);
 }

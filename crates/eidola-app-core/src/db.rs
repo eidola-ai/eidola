@@ -1974,21 +1974,28 @@ async fn spawn_subspace_tx_body(
     // looser runaway guard than the room it was delegated from) and
     // `router_model` (a panel wants routing exactly as much as its parent
     // did).
-    let mut rows = conn
-        .query(
-            "SELECT cascade_limit, router_model FROM space WHERE id = ?1",
-            (Value::Text(plan.parent_space_id.to_string()),),
-        )
-        .await
-        .map_err(AppError::db)?;
-    let Some(row) = rows.next().await.map_err(AppError::db)? else {
+    // **Exists, is still open, and what it passes down — one read.** The
+    // parent being *archived* refuses a spawn for the same reason an archived
+    // space takes no new turns: a room minted under a closed conversation is
+    // work nobody asked to continue, and nothing about archival makes the
+    // parent row or the owner's membership stop looking live. It is reachable
+    // rather than theoretical — a turn already past `prepare_turn` runs to
+    // completion by design, so an archival landing mid-turn leaves the owner's
+    // spawn call still to come. Read here rather than inherited from that turn
+    // for the same reason refinement re-reads it: two calls, and the archival
+    // can land between them.
+    let Some(parent) = get_space(conn, plan.parent_space_id).await? else {
         refuse!(SpawnRefusal::UnknownParent {
             space_id: plan.parent_space_id.to_string(),
         });
     };
-    let parent_cascade_limit = row.get::<i64>(0).map_err(AppError::db)?;
-    let parent_router_model = row.get::<Option<String>>(1).map_err(AppError::db)?;
-    drop(rows);
+    if parent.archived_at.is_some() {
+        refuse!(SpawnRefusal::ParentArchived {
+            space_id: plan.parent_space_id.to_string(),
+        });
+    }
+    let parent_cascade_limit = parent.cascade_limit;
+    let parent_router_model = parent.router_model;
 
     // (2) the spawner. **Its base config is what the sub-space will see** —
     // the spawn copies no overrides, so a model supplied by an override in the
