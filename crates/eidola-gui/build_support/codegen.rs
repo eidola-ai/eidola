@@ -37,10 +37,15 @@
 //!    English behind it, which is exactly what the runtime bundle contains. A
 //!    message or term that exists in neither is refused, and **term chains are
 //!    followed to their end**, not checked one hop deep.
-//! 8. **Everything a locale ships is validated, reached or not**
-//!    ([`check_locale`]). There is no dead-text exception: a term nothing
-//!    references today is referenced tomorrow, and the reference site would not
-//!    be the broken one.
+//! 8. **Every message that can format in a locale validates under that locale's
+//!    merged view** ([`check_locale`]) — which is *all* source messages, not
+//!    only the ones this locale translates, plus every term either side
+//!    defines. Two exemptions refused at once: nothing is skipped for being
+//!    unreferenced (dead text today is referenced tomorrow, and the reference
+//!    site would not be the broken one), and nothing is skipped for being
+//!    untranslated (it still formats here, through *this* locale's overrides).
+//!    Every rule below that depends on what a reference *resolves to* is
+//!    therefore decided per locale, not once against the source.
 //! 9. **No reference cycles**, message or term. Fluent gives up on one at
 //!    runtime; the build gives up first.
 //! 10. **No function references.** Nothing registers a Fluent function — see the
@@ -62,9 +67,11 @@
 //!     expansion on one per-format counter and bails at 100, returning the
 //!     message truncated or with raw ids in it — so a legal, acyclic chain that
 //!     doubles (`a = { b }{ b }`) still breaks. The count is computed through
-//!     the merged view with the resolver's own semantics: one per pattern
-//!     element, references paying their own cost with multiplicity, and a select
-//!     paying only its worst variant.
+//!     each locale's merged view (rule 8 — a source message reaching a term the
+//!     locale overrides can be legal in the source and over the limit here) with
+//!     the resolver's own semantics: one per pattern element, references paying
+//!     their own cost with multiplicity, and a select paying only its worst
+//!     variant.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -182,6 +189,41 @@ impl<'a> MergedView<'a> {
     /// How to describe this view in an error — the locale being built.
     fn tag(&self) -> &str {
         &self.primary.tag
+    }
+
+    /// Every message id that can be formatted in this view: the source locale's,
+    /// plus anything this locale adds. Source order first so errors are stable.
+    ///
+    /// This is the set the *bundle* holds, which is the point — a locale's
+    /// bundle carries every source message, translated or not, so every one of
+    /// them formats here and has to be judged here.
+    fn message_ids(&self) -> Vec<&'a str> {
+        let mut ids: Vec<&'a str> = self
+            .base
+            .into_iter()
+            .flat_map(|base| base.messages.iter().map(|m| m.id.as_str()))
+            .collect();
+        for message in &self.primary.messages {
+            if !ids.contains(&message.id.as_str()) {
+                ids.push(message.id.as_str());
+            }
+        }
+        ids
+    }
+
+    /// Every term id defined in this view, on the same principle.
+    fn term_ids(&self) -> Vec<&'a str> {
+        let mut ids: Vec<&'a str> = self
+            .base
+            .into_iter()
+            .flat_map(|base| base.terms.iter().map(|t| t.id.as_str()))
+            .collect();
+        for term in &self.primary.terms {
+            if !ids.contains(&term.id.as_str()) {
+                ids.push(term.id.as_str());
+            }
+        }
+        ids
     }
 
     /// Where a reference could have been satisfied from, for an error message.
@@ -516,34 +558,46 @@ fn eval_cost(cost: &Cost, view: &MergedView, memo: &mut CostMemo) -> u32 {
     total
 }
 
-/// Everything this locale ships resolves through the view it will be formatted
-/// in — `primary` overriding `base`, or `base: None` for the source locale
-/// itself.
+/// Everything that can format in this locale resolves through the view it will
+/// be formatted in — `primary` overriding `base`, or `base: None` for the source
+/// locale itself.
 ///
-/// This walks **every** message and **every** term the locale defines, not only
-/// what something else happens to reach. A term nothing references today is
-/// referenced tomorrow, and the reference site would not be the broken one — so
-/// the invariant is that all shipped FTL validates, with no dead-text exception.
+/// **The set judged here is the view's, not the locale's.** A locale's bundle
+/// carries every source message, translated or not, so an untranslated message
+/// still formats here — through *this* locale's overrides. Anything that depends
+/// on what a reference resolves to therefore has to be re-decided per locale:
+/// a source message reaching a term the locale overrides can be perfectly legal
+/// in the source and over Fluent's placeable limit here, with each side
+/// validating alone. Two exemptions are refused together: nothing is skipped for
+/// being unreferenced (dead text today is referenced tomorrow, and the reference
+/// site would not be the broken one), and nothing is skipped for being
+/// untranslated.
+///
+/// Cost: memoized per view, so one locale is linear in its nodes and edges and
+/// the whole tree is that times the locale count — negligible at any plausible
+/// number of locales, and the memo is what keeps a doubling chain from being
+/// exponential.
 pub fn check_locale(primary: &LocaleDef, base: Option<&LocaleDef>) -> Result<(), String> {
     let view = MergedView { primary, base };
-    for message in &primary.messages {
-        walk_message(&message.id, &view, &mut Vec::new(), &mut Vec::new())?;
+    for id in view.message_ids() {
+        walk_message(id, &view, &mut Vec::new(), &mut Vec::new())?;
     }
-    for term in &primary.terms {
-        walk_term(&term.id, &view, &mut Vec::new())?;
+    for id in view.term_ids() {
+        walk_term(id, &view, &mut Vec::new())?;
     }
     // Only after the walks above: they refuse the cycles that would make the
     // cost of a message undefined, so the traversal below is finite by then.
     let mut memo = CostMemo::default();
-    for message in &primary.messages {
-        let resolved = resolved_placeables(&message.id, &view, &mut memo);
+    for id in view.message_ids() {
+        let resolved = resolved_placeables(id, &view, &mut memo);
         if resolved > MAX_PLACEABLES {
             return Err(format!(
-                "{}: message `{}` resolves to {resolved} placeables, over Fluent's limit of \
-                 {MAX_PLACEABLES} per format — the resolver stops there and returns the \
-                 message truncated or with unresolved references in it. Flatten the \
-                 references it expands through.",
-                primary.tag, message.id
+                "{}: message `{id}` resolves to {resolved} placeables in this locale, over \
+                 Fluent's limit of {MAX_PLACEABLES} per format — the resolver stops there \
+                 and returns the message truncated or with unresolved references in it. A \
+                 message this locale does not translate still formats here, through this \
+                 locale's overrides. Flatten the references it expands through.",
+                primary.tag
             ));
         }
     }

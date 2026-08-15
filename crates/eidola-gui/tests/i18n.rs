@@ -737,3 +737,84 @@ fn every_shipped_locale_is_within_the_placeable_limit() {
         codegen::check_locale(locale, base).unwrap_or_else(|e| panic!("{e}"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Composition: what a locale's overrides do to the source's own messages
+// ---------------------------------------------------------------------------
+
+/// The reported hole, and the reason rule 8 is scoped to the *view* rather than
+/// the locale: a source message the locale never translates still formats in
+/// that locale, through that locale's overrides. Each side is legal alone.
+#[test]
+fn a_source_message_is_costed_under_each_locales_overrides() {
+    let en = parse("en", "-heavy = {\"x\"}\nm = { -heavy }\n");
+    let es = parse("es", &format!("-heavy = {}\n", placeables(100)));
+
+    // Both sides are unimpeachable on their own.
+    codegen::check_locale(&en, None).expect("the source costs 2");
+    codegen::check_translation(&en, &es).expect("the override translates nothing wrongly");
+
+    // Composed, the source's own message resolves to 101 here.
+    let err = codegen::check_locale(&es, Some(&en)).expect_err("101 under this locale");
+    assert!(err.contains("101"), "{err}");
+    assert!(err.contains("`m`"), "names the source message: {err}");
+    assert!(err.contains("es"), "names the locale it breaks in: {err}");
+}
+
+/// Reachability is closed under composition — an override replaces a definition
+/// but never removes an id, so a source reference still resolves. Asserted
+/// rather than assumed, and it is now structural: the walk starts from every id
+/// in the view.
+#[test]
+fn an_override_cannot_strand_a_source_reference() {
+    let en = parse("en", "inner = one\nm = { inner }\n");
+    let es = parse("es", "inner = uno\n");
+    codegen::check_locale(&es, Some(&en)).expect("`m` still reaches `inner`, now the Spanish one");
+}
+
+/// A cycle that exists in neither locale alone: the source reaches the locale's
+/// override, which reaches back. Caught before and after this change (the walk
+/// from the overriding node traverses the merged view), and now caught from
+/// either end.
+#[test]
+fn a_cycle_created_only_by_composition_is_refused() {
+    let en = parse("en", "a = { b }\nb = plain\n");
+    let es = parse("es", "b = { a }\n");
+    codegen::check_locale(&en, None).expect("the source alone is acyclic");
+    codegen::check_locale(&es, None).expect_err("es alone cannot resolve `a`");
+
+    let err = codegen::check_locale(&es, Some(&en)).expect_err("composed, it cycles");
+    assert!(err.contains("cycle"), "{err}");
+}
+
+/// The variable rule is closed under composition by `check_translation`'s
+/// pointwise bound: an override may only need what the *source's* accessor for
+/// that same id already passes, and any message reaching it passes at least
+/// that. Terms cannot widen it either, because a term body may not read a
+/// variable at all (rule 12).
+#[test]
+fn an_override_cannot_demand_a_variable_the_accessor_never_passes() {
+    let en = parse("en", "inner = plain\nm = { inner }\n");
+    let es = parse("es", "inner = { $x }\n");
+    let err = codegen::check_translation(&en, &es).expect_err("nothing passes $x");
+    assert!(err.contains("$x"), "{err}");
+
+    // A term override cannot smuggle one in: variables in term bodies are
+    // refused outright, so a term contributes none however it is overridden.
+    let err = codegen::parse_locale("es", "-t = { $x }\n").expect_err("refused at parse");
+    assert!(err.contains("term"), "{err}");
+}
+
+/// Every shipped locale still validates with the whole view in scope.
+#[test]
+fn every_shipped_locale_validates_the_whole_view() {
+    let parsed: Vec<codegen::LocaleDef> = i18n::LOCALES
+        .iter()
+        .map(|(tag, source)| parse(tag, source))
+        .collect();
+    let en = parsed.iter().find(|l| l.tag == "en").expect("source ships");
+    for locale in &parsed {
+        let base = (locale.tag != "en").then_some(en);
+        codegen::check_locale(locale, base).unwrap_or_else(|e| panic!("{e}"));
+    }
+}
