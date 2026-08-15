@@ -831,6 +831,29 @@ impl SpaceView {
         let handle = window.window_handle();
         space.update(cx, |space, _| space.attach_window(handle));
 
+        // Closing the last window on an untouched space disposes of it. A view
+        // lives exactly as long as its window, so its release *is* the close;
+        // the entity answers whether any other window still draws this
+        // conversation, and app-core decides — inside its own transaction —
+        // whether there is anything here worth keeping.
+        {
+            let spaces = stores.spaces.clone();
+            let space = space.clone();
+            let closing = handle.window_id();
+            cx.on_release(move |_, cx| {
+                let (id, alone) = space.read_with(cx, |space, cx| {
+                    (
+                        space.id().to_string(),
+                        !space.has_other_open_window(closing, cx),
+                    )
+                });
+                if alone {
+                    spaces.update(cx, |spaces, cx| spaces.window_closed(id, cx));
+                }
+            })
+            .detach();
+        }
+
         let _subs = vec![
             // Any space change re-derives the render snapshot and re-renders.
             cx.observe(&space, |this: &mut Self, _, cx| {

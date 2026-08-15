@@ -752,6 +752,17 @@ impl Space {
         &self.windows
     }
 
+    /// Whether any window **other than** `closing` still draws this space.
+    ///
+    /// The close hook's question, and it names the window it is about rather
+    /// than reading [`Self::open_windows`] alone: a view is released during the
+    /// same effect flush that removes its window, so whether `cx.windows()` has
+    /// caught up yet is not something the caller should have to know. Excluding
+    /// it by id makes the answer the same either way.
+    pub fn has_other_open_window(&self, closing: WindowId, cx: &gpui::App) -> bool {
+        self.live_window_ids(cx).iter().any(|id| *id != closing)
+    }
+
     // -- Cross-space quote handoff -----------------------------------------
 
     /// Hand this space a quote made in another window (task 37's creation UI),
