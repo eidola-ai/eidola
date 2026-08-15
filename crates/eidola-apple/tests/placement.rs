@@ -698,28 +698,60 @@ fn unexpected_detached_files_are_refused_before_bundle_mutation() {
 }
 
 #[test]
-fn unexpected_detached_root_file_is_refused_for_both_input_forms() {
-    for pass_app_path in [false, true] {
-        let (_temporary, bundle) = prepared_bundle();
-        let detached_temp = tempfile::tempdir().unwrap();
-        copy_tree(&fixtures().join("detached"), detached_temp.path());
-        fs::write(detached_temp.path().join("stale.sign"), b"stale").unwrap();
-        let executable = bundle.join("Contents/MacOS/Fixture");
-        let before = fs::read(&executable).unwrap();
-        let detached = if pass_app_path {
-            detached_temp.path().join("Fixture.app")
-        } else {
-            detached_temp.path().to_path_buf()
-        };
+fn unexpected_detached_root_file_is_refused_before_bundle_mutation() {
+    let (_temporary, bundle) = prepared_bundle();
+    let detached_temp = tempfile::tempdir().unwrap();
+    copy_tree(&fixtures().join("detached"), detached_temp.path());
+    fs::write(detached_temp.path().join("stale.sign"), b"stale").unwrap();
+    let executable = bundle.join("Contents/MacOS/Fixture");
+    let before = fs::read(&executable).unwrap();
 
-        let error = apply(&bundle, &detached).unwrap_err();
-        assert!(matches!(
-            error,
-            ApplyError::DetachedInputUnexpected { ref path }
-                if path == Path::new("stale.sign")
-        ));
-        assert_eq!(fs::read(executable).unwrap(), before);
-    }
+    let error = apply(&bundle, detached_temp.path()).unwrap_err();
+    assert!(matches!(
+        error,
+        ApplyError::DetachedInputUnexpected { ref path }
+            if path == Path::new("stale.sign")
+    ));
+    assert_eq!(fs::read(executable).unwrap(), before);
+}
+
+#[test]
+fn the_recorded_app_directory_is_not_a_detached_root() {
+    let (_temporary, bundle) = prepared_bundle();
+    let app_directory = fixtures().join("detached/Fixture.app");
+
+    let error = apply(&bundle, &app_directory).unwrap_err();
+    assert!(matches!(
+        error,
+        ApplyError::Read { ref path, ref source }
+            if path == &app_directory.join("eidola-placement.json")
+                && source.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert_eq!(
+        fs::read(bundle.join("Contents/MacOS/Fixture")).unwrap(),
+        fs::read(fixtures().join("settled/Fixture.app/Contents/MacOS/Fixture")).unwrap()
+    );
+}
+
+#[test]
+fn stale_ticket_bound_as_input_is_removed_to_reach_the_signed_tree() {
+    let (_temporary, bundle) = prepared_bundle();
+    let detached_temp = tempfile::tempdir().unwrap();
+    copy_tree(&fixtures().join("detached"), detached_temp.path());
+    let record_path = detached_temp.path().join("eidola-placement.json");
+    let mut record: PlacementRecord =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+
+    let stale_ticket = b"stale ticket";
+    fs::write(bundle.join("Contents/CodeResources"), stale_ticket).unwrap();
+    record.inputs.insert(
+        "Contents/CodeResources".into(),
+        format!("sha256:{}", sha256(stale_ticket)),
+    );
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    apply(&bundle, detached_temp.path()).unwrap();
+    assert_tree_equal(&bundle, &fixtures().join("signed/Fixture.app"));
 }
 
 #[test]

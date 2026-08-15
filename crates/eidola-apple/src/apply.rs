@@ -12,12 +12,10 @@ const MH_FLAGS_OFFSET: usize = 24;
 const LC_DATAOFF_OFFSET: usize = 8;
 
 pub(crate) fn apply(unsigned_bundle: &Path, detached: &Path) -> Result<(), ApplyError> {
-    let (detached_root, record_path) = locate_record(detached)?;
+    let detached_root = detached.to_path_buf();
+    let record_path = locate_record(&detached_root)?;
     fs_guard::root(unsigned_bundle)?;
-    let record_relative = record_path
-        .strip_prefix(&detached_root)
-        .expect("located record is beneath detached root");
-    let record_bytes = read_guarded(&detached_root, record_relative)?;
+    let record_bytes = read_guarded(&detached_root, Path::new(RECORD_NAME))?;
     let record: PlacementRecord =
         serde_json::from_slice(&record_bytes).map_err(|source| ApplyError::RecordJson {
             path: record_path.clone(),
@@ -230,25 +228,20 @@ fn add_parent_directories(
     }
 }
 
-fn locate_record(detached: &Path) -> Result<(PathBuf, PathBuf), ApplyError> {
-    fs_guard::root(detached)?;
-    if let Some(direct) = fs_guard::optional_existing(detached, Path::new(RECORD_NAME))?
-        && direct.is_file()
+/// Resolve the placement record directly under the supplied detached root.
+///
+/// Only that root is read: a caller holding the recorded app directory must
+/// pass its parent rather than have reconstruction reach outside the path it
+/// was given.
+fn locate_record(detached_root: &Path) -> Result<PathBuf, ApplyError> {
+    fs_guard::root(detached_root)?;
+    if let Some(record) = fs_guard::optional_existing(detached_root, Path::new(RECORD_NAME))?
+        && record.is_file()
     {
-        return Ok((detached.to_path_buf(), direct));
-    }
-    let parent = detached.parent().unwrap_or(detached);
-    fs_guard::root(parent)?;
-    if let Some(name) = detached.file_name() {
-        fs_guard::existing(parent, Path::new(name))?;
-    }
-    if let Some(beside) = fs_guard::optional_existing(parent, Path::new(RECORD_NAME))?
-        && beside.is_file()
-    {
-        return Ok((parent.to_path_buf(), beside));
+        return Ok(record);
     }
     Err(ApplyError::Read {
-        path: detached.join(RECORD_NAME),
+        path: detached_root.join(RECORD_NAME),
         source: std::io::Error::new(std::io::ErrorKind::NotFound, "placement record not found"),
     })
 }

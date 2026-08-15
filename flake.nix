@@ -108,37 +108,65 @@
         # List of crate names
         workspaceCrates = builtins.attrNames cratePaths;
 
-        # Parse a crate's Cargo.toml and extract workspace dependencies
-        # (dependencies with path = "../<crate>" pointing to sibling crates)
-        getWorkspaceDeps =
-          pname:
-          let
-            cratePath = cratePaths.${pname};
-            cargoToml = builtins.fromTOML (builtins.readFile ./${cratePath}/Cargo.toml);
-            deps = cargoToml.dependencies or { };
-            # Filter to only path dependencies that point to workspace crates
-            workspaceDeps = pkgs.lib.filterAttrs (
-              name: spec: builtins.isAttrs spec && spec ? path && builtins.elem name workspaceCrates
-            ) deps;
-          in
-          builtins.attrNames workspaceDeps;
+        readCrateToml = pname: builtins.fromTOML (builtins.readFile ./${cratePaths.${pname}}/Cargo.toml);
 
-        # Recursively resolve all transitive workspace dependencies
+        # Dependency-table kinds. Ordinary and build dependencies are actually
+        # compiled; dev-dependencies are compiled only for the crate whose
+        # tests are being run.
+        buildDepKinds = [
+          "dependencies"
+          "build-dependencies"
+        ];
+        devDepKind = "dev-dependencies";
+
+        # Every dependency table of the requested kinds in a manifest: the
+        # top-level ones plus their `[target.'cfg(...)'.*]` counterparts.
+        depTables =
+          cargoToml: kinds:
+          map (k: cargoToml.${k} or { }) kinds
+          ++ builtins.concatMap (t: map (k: t.${k} or { }) kinds) (
+            builtins.attrValues (cargoToml.target or { })
+          );
+
+        isWorkspacePathDep =
+          name: spec: builtins.isAttrs spec && spec ? path && builtins.elem name workspaceCrates;
+
+        # Sibling workspace crates a crate declares as path dependencies.
+        # `kinds` selects which dependency tables count. Self-references (the
+        # `{ path = "." }` idiom for enabling a crate's own test-only feature)
+        # are dropped so the graph stays acyclic.
+        getWorkspaceDeps =
+          kinds: pname:
+          let
+            cargoToml = readCrateToml pname;
+            names = builtins.concatMap (
+              tbl: builtins.attrNames (pkgs.lib.filterAttrs isWorkspacePathDep tbl)
+            ) (depTables cargoToml kinds);
+          in
+          pkgs.lib.unique (builtins.filter (n: n != pname) names);
+
+        # Recursively resolve all transitive workspace dependencies that are
+        # actually compiled.
         getAllDeps =
           pname:
           let
-            directDeps = getWorkspaceDeps pname;
+            directDeps = getWorkspaceDeps buildDepKinds pname;
             transitiveDeps = builtins.concatMap getAllDeps directDeps;
           in
           pkgs.lib.unique (directDeps ++ transitiveDeps);
 
-        # Build the full dependency graph (auto-discovered from Cargo.toml files)
-        packageDeps = builtins.listToAttrs (
-          map (pname: {
-            name = pname;
-            value = getAllDeps pname;
-          }) workspaceCrates
-        );
+        # Crates whose sources a package build needs: the package itself, the
+        # workspace crates its own dev-dependencies name (a package build may
+        # run `cargo test` for that one package), and the compiled closure of
+        # all of those.
+        packageCrates =
+          pname:
+          let
+            devDeps = getWorkspaceDeps [ devDepKind ] pname;
+          in
+          pkgs.lib.unique (
+            [ pname ] ++ getAllDeps pname ++ builtins.concatMap (d: [ d ] ++ getAllDeps d) devDeps
+          );
 
         # Create filtered source that only includes specific crates
         mkFilteredSrc =
@@ -242,12 +270,59 @@
                 };
               }
             );
+
+            # Cargo insists every `path` dependency's manifest resolve, even
+            # for a dependency it will never build — a dev-dependency on a
+            # workspace crate is enough to fail manifest loading for the whole
+            # workspace if that crate's directory isn't here. Only the package
+            # being built ever has its tests compiled (`packageCrates` keeps
+            # *its* dev-dependencies in the set), so instead of dragging the
+            # other crates' test-only graphs into every desktop closure —
+            # which would tie the desktop narHashes to unrelated crates'
+            # churn forever — materialize those manifests with the out-of-set
+            # dev-dependency edges dropped. Cargo then resolves and prunes
+            # them from the in-sandbox lockfile exactly as it already does for
+            # the workspace members this filter omits.
+            pruneDevDeps = pkgs.lib.filterAttrs (
+              name: spec: !(isWorkspacePathDep name spec) || crateSet ? ${name}
+            );
+            pruneDevDepTables =
+              attrs:
+              attrs
+              // pkgs.lib.optionalAttrs (attrs ? ${devDepKind}) {
+                ${devDepKind} = pruneDevDeps attrs.${devDepKind};
+              };
+            pruneManifest =
+              cargoToml:
+              pruneDevDepTables cargoToml
+              // pkgs.lib.optionalAttrs (cargoToml ? target) {
+                target = builtins.mapAttrs (_: pruneDevDepTables) cargoToml.target;
+              };
+            prunedManifests = builtins.filter (m: m != null) (
+              map (
+                c:
+                let
+                  cargoToml = readCrateToml c;
+                  pruned = pruneManifest cargoToml;
+                in
+                if pruned == cargoToml then
+                  null
+                else
+                  {
+                    path = cratePaths.${c};
+                    file = (pkgs.formats.toml { }).generate "Cargo.toml" pruned;
+                  }
+              ) crates
+            );
           in
           # Combine filtered source with the modified Cargo.toml
           pkgs.runCommand "filtered-workspace-${builtins.concatStringsSep "-" crates}" { } ''
             cp -r ${filteredSrc} $out
             chmod -R u+w $out
             cp ${filteredCargoTomlContent} $out/Cargo.toml
+            ${pkgs.lib.concatMapStrings (m: ''
+              cp ${m.file} $out/${m.path}/Cargo.toml
+            '') prunedManifests}
           '';
 
         # Full repo source for checks that compare committed vs generated files
@@ -403,8 +478,7 @@
           }:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
-            deps = packageDeps.${pname} or [ ];
-            relevantCrates = [ pname ] ++ deps;
+            relevantCrates = packageCrates pname;
             filteredSrc = mkFilteredSrc relevantCrates;
           in
           cfg.craneLibTarget.buildDepsOnly (
@@ -446,8 +520,7 @@
           }:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
-            deps = packageDeps.${pname} or [ ];
-            relevantCrates = [ pname ] ++ deps;
+            relevantCrates = packageCrates pname;
             filteredSrc = mkFilteredSrc relevantCrates;
             packageCargoArtifacts = mkPackageDeps {
               inherit
