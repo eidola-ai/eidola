@@ -3816,7 +3816,8 @@ impl Inner {
             });
         }
 
-        if !db::retire_participant_tx(&conn, participant_id, now_ms()).await? {
+        let retirement = db::retire_participant_tx(&conn, participant_id, now_ms()).await?;
+        if !retirement.retired {
             // The pre-check read a live row, so a `false` here means another
             // writer retired it in between. Same fact, same message.
             return Err(AppError::NotConfigured {
@@ -3824,15 +3825,27 @@ impl Inner {
             });
         }
 
-        // `Change::Participants` and nothing else — the same reasoning
-        // `promote_participant` states: the space this archived is a notebook,
-        // which `list_spaces` excludes unconditionally (in **both** its
-        // `include_archived` branches), so the Library listing provably did not
-        // change and a `SpaceIndex` here would invalidate a store that reads
-        // nothing new. `archive_space` emits `SpaceIndex` because the space it
-        // archives is one the Library lists; the rule is the same, the answer
-        // differs because the space does.
+        // **`Change::Participants` always, and `SpaceIndex` exactly when the
+        // Library's listing actually moved.** The rule has never been about
+        // what was archived but about whether the listing shows it: a notebook
+        // is excluded from `list_spaces` in **both** its `include_archived`
+        // branches, so archiving one provably changes nothing a store would
+        // re-read, while a sub-space is an ordinary Library row and archiving
+        // one takes it out of the default view. The transaction counts the
+        // listed rows it archived so this can announce the one it changed and
+        // stay silent about the one it did not — which is why the count comes
+        // back from inside the write rather than from a read after it.
+        //
+        // Nothing else is emitted, and that is checked rather than assumed: no
+        // store reads a *single* space's archival (`SpaceSettings` carries the
+        // cascade limit, the router and the notebook owner, not `archived_at`),
+        // so a `Space(id)` here would announce a change no subscriber can
+        // observe. `archive_space` emits `SpaceIndex` alone for the same
+        // reason.
         self.bus.emit(Change::Participants);
+        if retirement.listed_spaces_archived > 0 {
+            self.bus.emit(Change::SpaceIndex);
+        }
         Ok(())
     }
 
