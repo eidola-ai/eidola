@@ -15,9 +15,8 @@ Ground rules:
 Emission doctrine:
 
 - Every durable commit emits **after** the write succeeds. Pure errors with no durable side effects never emit.
-- `chat`/`chat_stream` defer the new-space row insert until after `ensure_spendable_credential` succeeds, so a typed onboarding failure (`NoAccount` / `InsufficientBalance`) on a blank window leaves zero durable trace and emits nothing.
+- `chat`/`chat_stream` **post first**, unconditionally: the user's turn (and, for a space-less call, the space itself) is committed before any credential is acquired, so a funding failure leaves the saved thought rather than swallowing it. Its `Change::Space(id)` + `Change::SpaceIndex` are emitted at that commit like any other.
 - Once a space is persisted, partial-failure paths emit on every explicit error exit, mirroring the success path (`Change::Wallet` as soon as a credential enters `spending`; `Change::Space(id)` + `Change::SpaceIndex` when a new/auto-titled space committed a user turn; `Change::Record` where a request row committed). Plain `?` on intervening local-DB inserts stays unemitted (internal-consistency failures).
-- Every error returned after the space is persisted is wrapped as `AppError::ChatFailed { space_id }` so a blank GUI `Space` can adopt its id on failure; pre-space errors stay unwrapped.
 - The full exit-point → emissions table lives in `tests/bus.rs`'s doc module. Keep it current.
 
 ## Backend registry (`backends.rs`)
@@ -42,6 +41,7 @@ Because "OpenAI-compatible" does not guarantee `GET /v1/models` (Azure, scoped g
 `AppCore` holds all high-level operations and DTO record types (`ConfigState`, `ChatResult`, `PostResult`, `PriceInfo`, `SpaceInfo`, …).
 
 - `list_spaces(include_archived)` returns title + first-message snippet + last-activity + message-count for the GUI's Library. `chat`/`chat_stream`/`post` auto-title an untitled space on its first exchange from the first line of the user's prompt (local heuristic, no model call).
+- **`create_space(title)` / `create_space_with_id(space_id, title)`** instantiate the default template into a new empty space (the same door `post` takes for a space-less save) and emit `Change::SpaceIndex`. The second exists for a client that must **name the space before the row exists**: `new_space_id()` (a free function — minting an id is not a database operation) hands out the UUIDv7, so the GUI opens a ⌘N window addressed by a real id on the frame the keystroke lands and commits the row behind it.
 - **`post(space_id, prompt)` is the save side of the save-vs-request split:** persists a `user_input` action (fresh gen-0 item) with no credential, no account, no HTTP — creating the space if new, auto-titling, linking a `reply` antecedent edge to the prior tail — and emits `Change::Space(id)` (+ `Change::SpaceIndex` for new/auto-title). Tested in `tests/bus.rs` (no HTTP).
 - **`edit_post(action_id, new_prompt)`:** appends a new `user_input` generation of the action's item (append-only — supersedes the tip, replicates its `reply` edge, prior generation preserved), so `item_current` resolves to the edit; emits `Space` + `SpaceIndex`.
 - `list_spaces`/`first_user_text` count and snippet **current generations of post-bearing types only** (a tip filter plus `POST_ACTION_TYPES_SQL`), so editing replaces in the default view without inflating `message_count`, and traces/decisions/summaries never move a space's Library signals.
@@ -312,10 +312,11 @@ Embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at 
 `AppError` enum; request error classification (attestation vs network vs server); typed variants UIs route on (never strings):
 
 - `NoAccount`, `InsufficientBalance { available, required }`, `ProvisioningTimeout { message }` — onboarding/funding.
-- `ToolLoop { message }` — the bounded tool loop couldn't finish honestly (round cap with the model still asking, or structurally unusable `tool_calls`); everything that happened is committed first, wrapped with the space id.
+- `ToolLoop { message }` — the bounded tool loop couldn't finish honestly (round cap with the model still asking, or structurally unusable `tool_calls`); everything that happened is committed first.
 - `DatabaseInUse { pid, message }` — another process holds the DB lock (`pid` best-effort).
 - `NotAParticipant { participant_id, action_id }` — the cross-space ACL; non-leaking by construction (names only what the caller supplied).
-- `ChatFailed { space_id, source }` — the id-carrying wrapper for any error after a space persists (Display defers to source; `root()` unwraps for variant routing; `chat_space_id()` extracts the id; `into_chat_failed(space_id)` wraps idempotently and is applied at the `run_turn` call site so **early setup failures** from `prepare_turn` also carry the id — without it a blank GUI space couldn't adopt its id, suppressing Retry).
+
+Chat errors are returned **as themselves**: a turn's failures are the typed variants above, unwrapped, so every consumer routes on the variant it sees. The `ChatFailed { space_id }` wrapper that used to carry a persisted space id back to the caller is gone with the client state that read it — the GUI creates a space when its window opens, so it never has to learn an id from a failure (see `crates/eidola-gui/AGENTS.md`). A caller that lets `post`/`chat` create the space for it (the CLI's one-shot `chat`) and needs the id after a failure reads `list_spaces`.
 
 ## Account reads (`lib.rs`)
 

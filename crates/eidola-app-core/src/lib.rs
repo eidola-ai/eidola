@@ -4872,7 +4872,7 @@ impl Inner {
         // space's thread into this turn (cross-space context + reply edge). This
         // covers both modes and every entry point (`respond_stream_as` /
         // `respond_stream`, and the same-space `chat` / `regenerate`). Wrapped
-        // by the caller's `into_chat_failed` like the space-existence check.
+        // like the space-existence check.
         self.require_action_in_space(&db_conn, target_action_id, space_id)
             .await?;
         // Record the inference against the responding agent participant, and
@@ -4923,13 +4923,6 @@ impl Inner {
         // precedes every rendering it feeds.
         let members = db::space_participants(&db_conn, &space_id).await?;
 
-        // The space is always persisted here, so every error exit carries its id
-        // for blank-space adoption (a request failure leaves the saved post).
-        let wrap = |source: AppError| AppError::ChatFailed {
-            space_id: space_id.clone(),
-            source: Box::new(source),
-        };
-
         // Resolve how the inference attaches to the thread.
         let (inf_item_id, inf_supersedes, inf_reply_to) = match mode {
             ResponseMode::Reply => (
@@ -4940,10 +4933,8 @@ impl Inner {
             ResponseMode::Revise => {
                 let (item_id, _sp) = db::action_item_and_space(&db_conn, target_action_id)
                     .await?
-                    .ok_or_else(|| {
-                        wrap(AppError::NotConfigured {
-                            message: format!("target action not found: {target_action_id}"),
-                        })
+                    .ok_or_else(|| AppError::NotConfigured {
+                        message: format!("target action not found: {target_action_id}"),
                     })?;
                 let reply_to = db::reply_antecedent(&db_conn, target_action_id).await?;
                 (item_id, Some(target_action_id.to_string()), reply_to)
@@ -5380,17 +5371,16 @@ impl Inner {
                     pricing,
                 );
                 if charge_credits == 0 {
-                    return Err(wrap(AppError::Credential {
+                    return Err(AppError::Credential {
                         message: "computed charge is zero — model pricing may be missing".into(),
-                    }));
+                    });
                 }
                 // Spend budget ceiling — checked *per round*, so a tool loop's
                 // later rounds re-check it against their own (grown) estimate.
-                check_turn_budget(charge_credits, budget).map_err(wrap)?;
+                check_turn_budget(charge_credits, budget)?;
                 let (spend, auth_value) = self
                     .acquire_spend(&cfg, &db_conn, charge_credits, now)
-                    .await
-                    .map_err(wrap)?;
+                    .await?;
                 (charge_credits, Some(spend), Some(auth_value))
             }
         };
@@ -5689,7 +5679,7 @@ impl Inner {
     /// one extra request, and `remember_tool_incapable` is not reached unless
     /// the retry actually succeeds.
     fn should_degrade_tools(&self, prep: &TurnPrep, round: usize, err: &AppError) -> bool {
-        round == 1 && prep.auto_tools && matches!(err.root(), AppError::Server { .. })
+        round == 1 && prep.auto_tools && matches!(err, AppError::Server { .. })
     }
 
     /// `Reply` → a new child item replying to the target; `Revise` → a new
@@ -5736,9 +5726,7 @@ impl Inner {
         // own state machine — already the largest in the crate — off the worker
         // stack.
         let mut prep =
-            Box::pin(self.prepare_turn(space_id, selector, target_action_id, mode, budget))
-                .await
-                .map_err(|e| e.into_chat_failed(space_id))?;
+            Box::pin(self.prepare_turn(space_id, selector, target_action_id, mode, budget)).await?;
 
         // One iteration per model request. `run_turn_round` is boxed: the
         // per-round future (request, SSE-free body read, refund, persistence)
@@ -5760,9 +5748,7 @@ impl Inner {
                 // schemas are no longer held for. `begin_next_round` refuses to
                 // replace a hold the rejected attempt failed to settle; a
                 // no-op on the non-spend backends.
-                self.begin_next_round(&mut prep)
-                    .await
-                    .map_err(|e| prep.wrap(e))?;
+                self.begin_next_round(&mut prep).await?;
                 outcome = Box::pin(self.run_turn_round(&mut prep, round)).await;
                 if outcome.is_ok() {
                     self.remember_tool_incapable(&prep.backend_id, &prep.wire_model);
@@ -5828,8 +5814,7 @@ impl Inner {
             Ok(resp) => {
                 prep.flush_new_attestations()
                     .await
-                    .inspect_err(|_| emit_user_turn())
-                    .map_err(|e| prep.wrap(e))?;
+                    .inspect_err(|_| emit_user_turn())?;
 
                 let status = resp.status();
                 let text = resp
@@ -5838,8 +5823,7 @@ impl Inner {
                     .map_err(|e| AppError::Network {
                         message: format!("failed to read response: {e}"),
                     })
-                    .inspect_err(|_| emit_user_turn())
-                    .map_err(|e| prep.wrap(e))?;
+                    .inspect_err(|_| emit_user_turn())?;
                 // **The status classifies the response, not the body shape.**
                 // A non-2xx body is an error document and is never required to
                 // parse: a rejection raised by the endpoint's own body
@@ -5861,9 +5845,9 @@ impl Inner {
                     Err(e) => {
                         let _ = prep.try_refund_recovery().await;
                         emit_user_turn();
-                        return Err(prep.wrap(AppError::Network {
+                        return Err(AppError::Network {
                             message: format!("failed to parse response JSON: {e}"),
-                        }));
+                        });
                     }
                 };
                 (status, text, parsed)
@@ -5878,7 +5862,7 @@ impl Inner {
                 // already committed — emit it so other windows see the persisted
                 // turn, then wrap with the space id for blank-space adoption.
                 emit_user_turn();
-                return Err(prep.wrap(original_err));
+                return Err(original_err);
             }
         };
 
@@ -5892,8 +5876,7 @@ impl Inner {
                 Some(refund_obj) => {
                     prep.process_refund_obj(refund_obj)
                         .await
-                        .inspect_err(|_| emit_user_turn())
-                        .map_err(|e| prep.wrap(e))?;
+                        .inspect_err(|_| emit_user_turn())?;
                 }
                 None => {
                     let _ = prep.try_refund_recovery().await;
@@ -5958,7 +5941,7 @@ impl Inner {
                     .await?;
                     self.bus.emit(Change::Space(prep.space_id.clone()));
                     self.bus.emit(Change::Record);
-                    return Err(prep.wrap(e));
+                    return Err(e);
                 }
             }
         } else {
@@ -5993,11 +5976,11 @@ impl Inner {
                 // is not wasted, and the turn ends saying so.
                 self.bus.emit(Change::Space(prep.space_id.clone()));
                 self.bus.emit(Change::Record);
-                return Err(prep.wrap(AppError::ToolLoop {
+                return Err(AppError::ToolLoop {
                     message: format!(
                         "the model was still requesting tools after {MAX_TURN_ROUNDS} rounds"
                     ),
-                }));
+                });
             }
 
             let outcomes = execute_tool_calls(&prep.tools, &tool_calls).await;
@@ -6010,7 +5993,7 @@ impl Inner {
             if let Err(e) = self.begin_next_round(prep).await {
                 self.bus.emit(Change::Space(prep.space_id.clone()));
                 self.bus.emit(Change::Record);
-                return Err(prep.wrap(e));
+                return Err(e);
             }
             return Ok(RoundOutcome::ToolRound);
         }
@@ -6043,7 +6026,7 @@ impl Inner {
                 .await?;
                 self.bus.emit(Change::Space(prep.space_id.clone()));
                 self.bus.emit(Change::Record);
-                return Err(prep.wrap(rejected));
+                return Err(rejected);
             }
         }
 
@@ -6071,10 +6054,10 @@ impl Inner {
             // emitted at spend start. post owns the user-turn SpaceIndex.
             self.bus.emit(Change::Space(prep.space_id.clone()));
             self.bus.emit(Change::Record);
-            return Err(prep.wrap(AppError::Server {
+            return Err(AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
-            }));
+            });
         }
 
         // All durable writes succeeded — emit per affected domain. post owns the
@@ -6197,9 +6180,7 @@ impl Inner {
         // own state machine — already the largest in the crate — off the worker
         // stack.
         let mut prep =
-            Box::pin(self.prepare_turn(space_id, selector, target_action_id, mode, budget))
-                .await
-                .map_err(|e| e.into_chat_failed(space_id))?;
+            Box::pin(self.prepare_turn(space_id, selector, target_action_id, mode, budget)).await?;
 
         for round in 1..=MAX_TURN_ROUNDS {
             let mut outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
@@ -6210,9 +6191,7 @@ impl Inner {
                 && self.should_degrade_tools(&prep, round, e)
             {
                 prep.withdraw_auto_tools();
-                self.begin_next_round(&mut prep)
-                    .await
-                    .map_err(|e| prep.wrap(e))?;
+                self.begin_next_round(&mut prep).await?;
                 outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
                 if outcome.is_ok() {
                     self.remember_tool_incapable(&prep.backend_id, &prep.wire_model);
@@ -6275,8 +6254,7 @@ impl Inner {
             Ok(resp) => {
                 prep.flush_new_attestations()
                     .await
-                    .inspect_err(|_| emit_user_turn())
-                    .map_err(|e| prep.wrap(e))?;
+                    .inspect_err(|_| emit_user_turn())?;
                 resp
             }
             Err(e) => {
@@ -6284,7 +6262,7 @@ impl Inner {
                 let _ = prep.try_refund_recovery().await;
                 // User turn is committed — emit it, then wrap with the space id.
                 emit_user_turn();
-                return Err(prep.wrap(original_err));
+                return Err(original_err);
             }
         };
 
@@ -6310,10 +6288,10 @@ impl Inner {
             // SpaceIndex.
             self.bus.emit(Change::Space(prep.space_id.clone()));
             self.bus.emit(Change::Record);
-            return Err(prep.wrap(AppError::Server {
+            return Err(AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
-            }));
+            });
         }
 
         // Consume the SSE body. We accumulate bytes in a small buffer and
@@ -6347,8 +6325,7 @@ impl Inner {
                 // Mid-stream read failure: the user turn is committed (the
                 // request row is not yet) — emit the user turn so other windows
                 // see it, then wrap with the space id for blank-space adoption.
-                .inspect_err(|_| emit_user_turn())
-                .map_err(|e| prep.wrap(e))?;
+                .inspect_err(|_| emit_user_turn())?;
             // Keep the raw bytes for the request log so we can debug
             // upstream behaviour the same way as the non-streaming path.
             response_buf.extend_from_slice(&bytes);
@@ -6488,7 +6465,7 @@ impl Inner {
                 .await?;
                 self.bus.emit(Change::Space(prep.space_id.clone()));
                 self.bus.emit(Change::Record);
-                return Err(prep.wrap(e));
+                return Err(e);
             }
         };
 
@@ -6516,11 +6493,11 @@ impl Inner {
             if round == MAX_TURN_ROUNDS {
                 self.bus.emit(Change::Space(prep.space_id.clone()));
                 self.bus.emit(Change::Record);
-                return Err(prep.wrap(AppError::ToolLoop {
+                return Err(AppError::ToolLoop {
                     message: format!(
                         "the model was still requesting tools after {MAX_TURN_ROUNDS} rounds"
                     ),
-                }));
+                });
             }
 
             let outcomes = execute_tool_calls(&prep.tools, &tool_calls).await;
@@ -6530,7 +6507,7 @@ impl Inner {
             if let Err(e) = self.begin_next_round(prep).await {
                 self.bus.emit(Change::Space(prep.space_id.clone()));
                 self.bus.emit(Change::Record);
-                return Err(prep.wrap(e));
+                return Err(e);
             }
             return Ok(RoundOutcome::ToolRound);
         }
@@ -6905,9 +6882,7 @@ impl AppCore {
     ///
     /// This is exactly the `run_turn_stream(Reply)` half of [`Self::chat_stream`]
     /// without the leading `post`, so every exit point and emission is identical
-    /// to a `chat_stream` that reused an existing post (see `tests/bus.rs`). A
-    /// failure is wrapped as `AppError::ChatFailed { space_id }` so a GUI space
-    /// can route it the same way it routes a failed ask.
+    /// to a `chat_stream` that reused an existing post (see `tests/bus.rs`).
     pub async fn respond_stream(
         &self,
         space_id: String,
@@ -9217,15 +9192,6 @@ struct SpendPrep {
 }
 
 impl TurnPrep {
-    /// Wrap an error with the (always-persisted) space id so a blank GUI
-    /// window can adopt it on failure.
-    fn wrap(&self, source: AppError) -> AppError {
-        AppError::ChatFailed {
-            space_id: self.space_id.clone(),
-            source: Box::new(source),
-        }
-    }
-
     /// Withdraw the navigation tools this turn attached, falling back to the
     /// registry the consumer configured. Idempotent, and a no-op for a turn
     /// that attached none — a consumer's own tools are never dropped.
