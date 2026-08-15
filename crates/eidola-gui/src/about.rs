@@ -6,12 +6,13 @@
 //! stacking new ones. ~360×420 px.
 
 use gpui::{
-    Context, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    Context, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
     StatefulInteractiveElement, Styled, Window, div, px, relative, rems,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 use crate::actions::CloseWindow;
+use crate::i18n::msg;
 use crate::probe::Probe as _;
 
 /// The version string baked in at compile time.
@@ -44,6 +45,13 @@ impl Render for AboutView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
+        // Every visible string here comes from `locales/` through the generated
+        // accessors (`crate::i18n`) — including the accessible labels, which
+        // *are* the localized strings. Probe **names** never move: they are the
+        // driver's stable selectors, and localizing them would break QA the way
+        // localizing an id breaks a lookup.
+        let version = msg::about_version_value(cx, VERSION);
+
         // Wordmark block: large "Eidola" + a hairline rule underneath,
         // matching the welcome page's title-page treatment.
         let wordmark = v_flex()
@@ -52,29 +60,29 @@ impl Render for AboutView {
             .child(
                 div()
                     .id("about-title")
-                    .probe("about/title", gpui::Role::Heading, "Eidola")
+                    .probe("about/title", gpui::Role::Heading, msg::about_title(cx))
                     .aria_level(1)
                     .text_size(px(32.))
                     .line_height(relative(1.2))
-                    .child("Eidola"),
+                    .child(msg::about_title(cx)),
             )
             .child(div().w(rems(3.)).h(px(1.)).bg(theme.border));
 
         // Version line: muted, italic, small — unobtrusive. Unobtrusive is not
         // absent, though: it carries the version as its accessible value, so
         // "which build am I running" is answerable without sighted reading.
-        let version = div()
+        let version_line = div()
             .id("about-version")
             .probe_value(
                 "about/version",
                 gpui::Role::Label,
-                "Version",
-                SharedString::from(format!("v{VERSION}")),
+                msg::about_version_label(cx),
+                version.clone(),
             )
             .text_sm()
             .italic()
             .text_color(theme.muted_foreground)
-            .child(SharedString::from(format!("v{VERSION}")));
+            .child(version);
 
         // Purpose copy: echoes the welcome page's voice (same three-sentence
         // set minus the call to action — the reader has already begun).
@@ -82,15 +90,8 @@ impl Render for AboutView {
             .gap_3()
             .text_sm()
             .text_color(theme.muted_foreground)
-            .child(
-                "A quiet page for thinking with a machine — private by \
-                 construction, not by policy.",
-            )
-            .child(
-                "Every request runs inside sealed, hardware-attested enclaves, \
-                 and this app verifies the cryptographic evidence before a word \
-                 leaves your machine.",
-            );
+            .child(msg::about_purpose_lead(cx))
+            .child(msg::about_purpose_attestation(cx));
 
         // Source note. Deliberately no license claim: the repository does
         // not yet carry a LICENSE file, and the About page must not assert
@@ -99,12 +100,14 @@ impl Render for AboutView {
         let license = div()
             .text_xs()
             .text_color(theme.muted_foreground)
-            .child("Source available on GitHub.");
+            .child(msg::about_source_note(cx));
 
-        // "View on GitHub" link — `cx.open_url` opens the default browser.
+        // "View on GitHub" link — `cx.open_url` opens the default browser. The
+        // accessible name is the bare verb; the visible text adds the arrow that
+        // marks the link as leaving the app.
         let github_link = div()
             .id("github-link")
-            .probe("about/github", gpui::Role::Link, "View on GitHub")
+            .probe("about/github", gpui::Role::Link, msg::about_github(cx))
             .text_sm()
             .cursor_pointer()
             .text_color(theme.link)
@@ -112,7 +115,7 @@ impl Render for AboutView {
             .on_click(cx.listener(|_, _, _, cx| {
                 cx.open_url(REPO_URL);
             }))
-            .child("View on GitHub →");
+            .child(msg::about_github_cta(cx));
 
         crate::chrome::round_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)
@@ -139,7 +142,7 @@ impl Render for AboutView {
                             .gap_6()
                             .items_center()
                             .child(wordmark)
-                            .child(version)
+                            .child(version_line)
                             .child(purpose)
                             .child(license)
                             .child(github_link),

@@ -217,6 +217,16 @@ pub struct Config {
         skip_serializing_if = "Option::is_none"
     )]
     pub font_scale_override: Option<f32>,
+    /// The presentation layer's stored display-language preference — an
+    /// **opaque** string this crate never interprets. `None` means "follow the
+    /// system"; any other value is a tag the presentation layer resolves
+    /// against whatever languages it ships. Kept here because config is where
+    /// the client's persisted preferences live (beside `appearance` and
+    /// `font_scale`), and deliberately unparsed: app-core stays locale-free
+    /// and keeps returning typed errors, so an unrecognized value can only
+    /// ever be a presentation-layer decision, never a load failure here.
+    #[serde(rename = "language", default, skip_serializing_if = "Option::is_none")]
+    pub language_override: Option<String>,
 }
 
 impl Config {
@@ -264,6 +274,18 @@ impl Config {
         self.font_scale_override
             .map(clamp_font_scale)
             .unwrap_or(FONT_SCALE_DEFAULT)
+    }
+
+    /// The stored display-language preference, or `None` for "follow the
+    /// system". Blank/whitespace is normalized to `None` on read as well as on
+    /// write, so a hand-edited `language = ""` means the same thing as an
+    /// absent key. The value is returned verbatim otherwise — resolving it is
+    /// the presentation layer's job.
+    pub fn language(&self) -> Option<&str> {
+        self.language_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// The full URL of the latest-release endpoint the update checker

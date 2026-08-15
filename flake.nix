@@ -243,13 +243,17 @@
                 # Keep directories that are parents of crate paths
                 else if type == "directory" && isParentOfCrate relPath then
                   true
-                # Include .sql files (used by include_str! in the CLI) and
-                # .ttf font files (used by include_bytes! in the GUI). These
-                # both feed compile-time macros; craneLib.filterCargoSources
+                # Include .sql files (used by include_str! in the CLI), .ttf
+                # font files (used by include_bytes! in the GUI), and .ftl
+                # localization files (read by the GUI's build.rs, which emits
+                # them as string literals — every shipped string is a build
+                # input inside the measured artifact, never loaded at runtime).
+                # All three feed compile-time inputs; craneLib.filterCargoSources
                 # discards them by default because they aren't Rust source.
                 else if type == "regular" && (
                   pkgs.lib.hasSuffix ".sql" path
                   || pkgs.lib.hasSuffix ".ttf" path
+                  || pkgs.lib.hasSuffix ".ftl" path
                 ) then
                   true
                 # For everything else, use crane's filter (which handles .rs, Cargo.toml, etc.)
@@ -324,8 +328,23 @@
         # Full repo source for checks that compare committed vs generated files
         repoSrc = craneLib.path ./.;
 
-        # Full source for workspace-wide operations
-        fullSrc = craneLib.cleanCargoSource ./.;
+        # Full source for workspace-wide operations. Carries the same `.ftl`
+        # exception as `filteredSrc`: craneLib's filter keeps only Rust and
+        # Cargo files, and the GUI's build script reads `locales/` to generate
+        # its typed accessors, so the workspace-wide clippy/test derivations
+        # cannot compile it without them.
+        fullSrc = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter =
+            path: type:
+            craneLib.filterCargoSources path type
+            || (type == "regular" && pkgs.lib.hasSuffix ".ftl" path)
+            # .ttf and .sql feed include_bytes!/include_str! the same way .ftl
+            # feeds the localization build script; without them the workspace
+            # check derivations cannot compile eidola-gui or eidola-app-core.
+            || (type == "regular" && pkgs.lib.hasSuffix ".ttf" path)
+            || (type == "regular" && pkgs.lib.hasSuffix ".sql" path);
+        };
 
         # Base RUSTFLAGS for deterministic builds (extended per-target in mkTargetConfig)
         baseRustFlags = "-C debuginfo=0 -C target-cpu=generic";
