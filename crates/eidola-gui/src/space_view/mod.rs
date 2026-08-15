@@ -2482,7 +2482,12 @@ impl Render for SpaceView {
                             .w_full()
                             .pt(px(doc_reserve))
                             .pb(px(floating_pad))
-                            .child(body),
+                            .child(body)
+                            // The reading column's empty state when the
+                            // transcript could not be read at all — the one
+                            // page in this window with no composer to act
+                            // from, so it carries its own way back.
+                            .children(self.render_transcript_failure(cx)),
                     );
                 scroll.style().restrict_scroll_to_axis = Some(true);
                 scroll
@@ -3054,6 +3059,46 @@ impl SpaceView {
                 gpui::linear_color_stop(bg.opacity(0.0), 1.0),
             ));
         crate::titlebar::make_draggable(band, "space-title-bar", window, cx)
+    }
+
+    /// The window's own failure surface, in the reading column's empty state:
+    /// the house `load_error_panel` + Retry over a conversation whose
+    /// **initial** transcript read failed.
+    ///
+    /// This is the one `Loadable` in the window that had no reader
+    /// ([`Space::transcript_visible`] was its only consumer), and a failed
+    /// initial read of it is a genuine dead end rather than a blank page:
+    /// `sync_tail_drafts` correctly declines to mint a tail composer — there is
+    /// no tree to attach one to — so there is nothing the reader can do that
+    /// re-runs the load, and `Space::load_transcript` otherwise re-runs only on
+    /// construction, a bus `Change::Space`, or a mutation's failure exit. The
+    /// way out was another writer's invalidation, or closing every window on
+    /// the space so the registry re-created its entity. Retry is that way out,
+    /// driving the same `Space::load_transcript` everything else does.
+    ///
+    /// Which failures it is offered for is [`Space::transcript_load_failure`]'s
+    /// decision, not this method's: a failed *refresh* keeps its posts (and its
+    /// composer), and a space known not to exist says so through the error band
+    /// instead — a retry there could only refuse.
+    fn render_transcript_failure(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let detail = self.space.read(cx).transcript_load_failure()?.to_string();
+        Some(
+            v_flex()
+                .w_full()
+                .items_center()
+                .child(div().w_full().max_w(BODY_MAX_WIDTH).child(
+                    crate::participants::load_error_panel(
+                        "space/transcript/retry",
+                        "Couldn't open this conversation.",
+                        &detail,
+                        cx,
+                        cx.listener(|this, _, _, cx| {
+                            this.space.update(cx, |s, cx| s.retry_transcript_load(cx));
+                        }),
+                    ),
+                ))
+                .into_any_element(),
+        )
     }
 
     /// A minimal honest error band pinned over the bottom (Phase 1 surface for a

@@ -478,6 +478,26 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_transcript_failed",
+                description: "Space view: a conversation whose initial transcript read failed — the reading column's own error and Retry, the one page with no composer to act from",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.fail_initial_transcript_load_for_test(cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_branches",
                 description: "Space view: a branched post tree with docked tail drafts (kitchen-sink fixture)",
                 default_size: size(px(900.), px(700.)),

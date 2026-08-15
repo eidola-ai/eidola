@@ -534,6 +534,50 @@ fn settled_posts_are_articles_carrying_their_text(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// A conversation whose **initial** transcript read failed is the one page in
+/// this window with no composer to act from — `sync_tail_drafts` has no tree to
+/// attach one to — so the reading column carries the way back itself. A failed
+/// *refresh* does not: its posts and its composer are still on screen.
+#[gpui::test]
+fn a_failed_initial_transcript_load_offers_a_retry(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.fail_initial_transcript_load_for_test(cx));
+    });
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/transcript/retry",
+        gpui::Role::Button,
+        "Retry",
+    );
+
+    // The same failure over posts we still hold is not a dead end.
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the question")], cx);
+            s.fail_transcript_refresh_for_test(cx);
+        });
+    });
+    let names: Vec<String> = fresh_entries(cx, window)
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert!(
+        !names.contains(&"space/transcript/retry".to_string()),
+        "a failed refresh keeps its posts and its composer: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn a_streaming_reply_is_not_an_article(cx: &mut TestAppContext) {
     // The §4 trap: a value bound to streaming text makes assistive technology

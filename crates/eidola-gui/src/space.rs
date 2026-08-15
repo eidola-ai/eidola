@@ -757,6 +757,50 @@ impl Space {
         self.transcript.value().is_some()
     }
 
+    /// The failure standing between this window and its conversation, when a
+    /// **later read could learn something** — the window's own retry door.
+    ///
+    /// Two states put an error in the transcript cell and they are not the same
+    /// question. A failed *initial read* is a read that can be taken again: the
+    /// database was locked, the row was mid-write, the process was busy — and
+    /// with no posts there is no composer either ([`Self::transcript_visible`]
+    /// is false, so `sync_tail_drafts` mints nothing), which means nothing the
+    /// reader can do re-runs the load. That is the dead end this answers, and
+    /// `SpaceView` renders it as the house `load_error_panel` + Retry.
+    ///
+    /// A settled-negative row ([`Self::row_is_gone`]) is the other, and answers
+    /// `None`: the space does not exist, a read can only refuse, and
+    /// [`Self::load_transcript`] declines to start one for exactly that reason.
+    /// The window already says so through its error band (`SpaceEvent::Failed`
+    /// is emitted with the refusal), so a Retry here would be a second, false
+    /// door onto the same fact.
+    ///
+    /// A failed *refresh* (`Failed { prior: Some(..) }`) answers `None` too:
+    /// the posts are on screen and so is the composer, so there is no dead end
+    /// — the reader can act, and the next write's exit reload re-reads.
+    pub fn transcript_load_failure(&self) -> Option<&AppError> {
+        if matches!(self.row, Some(RowState::Gone(_))) {
+            return None;
+        }
+        match &self.transcript {
+            Loadable::Failed { error, prior: None } => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Re-run a failed initial transcript load — the reader pressed Retry.
+    ///
+    /// An explicit user action is precisely the case the settled-negative rule
+    /// carves out ("a debt-driven reload owes its restart only where a later
+    /// read could learn something"), and the gate inside
+    /// [`Self::load_transcript`] still holds the other side: a row known to be
+    /// gone starts nothing, so a Retry could never flip a terminal failure into
+    /// a permanent spinner. The affordance is not offered there in the first
+    /// place ([`Self::transcript_load_failure`]).
+    pub fn retry_transcript_load(&mut self, cx: &mut Context<Self>) {
+        self.load_transcript(cx);
+    }
+
     /// The transcript as a slice (empty if not loaded).
     pub fn messages(&self) -> &[ChatMessageView] {
         self.transcript.value().map(|v| v.as_slice()).unwrap_or(&[])
@@ -2092,6 +2136,21 @@ impl Space {
         self.transcript = std::mem::take(&mut self.transcript).resolve(Err(AppError::Internal {
             message: "database is locked".into(),
         }));
+        cx.notify();
+    }
+
+    /// Test-only: fail the transcript's **initial** load —
+    /// `Failed { prior: None }`, the state a window opened on a conversation it
+    /// could not read lands in. No posts, no composer: the dead end
+    /// [`Self::transcript_load_failure`] is the way out of.
+    #[doc(hidden)]
+    pub fn fail_initial_transcript_load_for_test(&mut self, cx: &mut Context<Self>) {
+        self.transcript = Loadable::Failed {
+            error: AppError::Database {
+                message: "database is locked".into(),
+            },
+            prior: None,
+        };
         cx.notify();
     }
 
