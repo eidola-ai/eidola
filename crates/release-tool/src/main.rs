@@ -156,7 +156,7 @@ enum AppleCommand {
     Apply {
         /// Writable copy of the reproducible unsigned app.
         unsigned_bundle: PathBuf,
-        /// Detached root or the app directory within it.
+        /// Detached root holding `eidola-placement.json` and the app tree.
         detached: PathBuf,
     },
     /// Structurally parse embedded claims; does not authenticate Apple trust.
