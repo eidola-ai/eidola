@@ -16238,3 +16238,295 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
             .read_with(cx, |s, _| s.op_error().map(str::to_string))
     );
 }
+
+/// **The catalog's Download and the failed row's Retry are one operation.** Both
+/// hand `LocalModelsStore::download` the same URL, so both land in the same
+/// keyed op slot — which is keep-newest, so pressing the second door while the
+/// first door's transfer was being started superseded it: the first
+/// continuation was dropped while the core call it had already issued ran on,
+/// and app-core then refused the duplicate ("already downloading"), publishing
+/// a failure over a transfer that was working. The cure is the store's rather
+/// than the pane's — `download` is a no-op for a URL whose slot is pending — so
+/// every door onto it is safe and the rows are free to be presentation.
+///
+/// The window is **staged, not hoped for**: one `tick` polls the retry's task,
+/// which issues its core call on the runtime and parks on the answer, and
+/// nothing polls it again — so the transfer is genuinely running while the slot
+/// is still the first press's, which is exactly the window the catalog door used
+/// to reach into. The URL is a listener that accepts and never answers, so the
+/// transfer stays in flight for the rest of the test.
+///
+/// `op_error` is the assertion with teeth: without the store's guard the second
+/// press supersedes a call that has already gone out, and app-core's refusal of
+/// the duplicate is what lands in the dropped continuation's place.
+#[gpui::test]
+fn backends_a_catalog_press_cannot_race_a_pending_retry(cx: &mut TestAppContext) {
+    use eidola_app_core::{LocalModelInfo, LocalModelStatus};
+    use eidola_gui::backends_settings::BackendsTab;
+
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}/wisp.gguf", listener.local_addr().unwrap());
+
+    stores.backends.update(cx, |s, cx| s.refresh(cx));
+    for _ in 0..8 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    cx.run_until_parked();
+
+    stores.local_models.update(cx, |s, _| {
+        s.set_state_for_test(eidola_app_core::LocalModelsState {
+            engine_path: None,
+            external: Vec::new(),
+            models: vec![LocalModelInfo {
+                id: "wisp@local".into(),
+                slug: "wisp".into(),
+                display_name: "Wisp".into(),
+                file_name: "wisp.gguf".into(),
+                size_bytes: None,
+                source_url: Some(url.clone()),
+                status: LocalModelStatus::Available,
+                last_error: Some("HTTP 500".into()),
+                on_disk: false,
+            }],
+        })
+    });
+
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+        pane.update(cx, |p, cx| p.select_tab(BackendsTab::Local, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    // Settle first, so the task the press leaves behind is the one the tick
+    // below runs.
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| {
+            p.retry_failed_download("wisp@local", url.clone(), window, cx)
+        });
+    })
+    .unwrap();
+    assert!(
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url)),
+        "the retry owns the slot from the frame it is pressed on"
+    );
+
+    // Poll that task exactly far enough to issue its core call, and no further:
+    // its continuation stays outstanding, which is the state a second press used
+    // to drop.
+    let running = |cx: &mut TestAppContext| {
+        let _ = cx;
+        core.runtime()
+            .block_on(core.local_models_state())
+            .map(|s| {
+                s.models.iter().any(|m| {
+                    m.slug == "wisp" && matches!(m.status, LocalModelStatus::Downloading { .. })
+                })
+            })
+            .unwrap_or(false)
+    };
+    let mut in_flight = false;
+    for _ in 0..8 {
+        cx.executor().tick();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        in_flight = running(cx);
+        if in_flight {
+            break;
+        }
+    }
+    assert!(
+        in_flight,
+        "the retry's transfer is genuinely running — the window this test is about"
+    );
+    assert!(
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url)),
+        "…and its continuation has not landed, so the slot is still the retry's"
+    );
+
+    // The catalog's door, onto that same URL.
+    cx.update_window(window, |_, _, cx| {
+        pane.update(cx, |p, cx| p.download_catalog(&url, cx));
+    })
+    .unwrap();
+    for _ in 0..12 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    cx.run_until_parked();
+
+    assert!(
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.op_error().is_none()),
+        "a second door must start nothing rather than supersede a working transfer: {:?}",
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.op_error().map(str::to_string))
+    );
+
+    let live = core
+        .runtime()
+        .block_on(core.local_models_state())
+        .expect("read the live listing");
+    let downloading: Vec<&LocalModelInfo> = live
+        .models
+        .iter()
+        .filter(|m| matches!(m.status, LocalModelStatus::Downloading { .. }))
+        .collect();
+    assert_eq!(
+        downloading.len(),
+        1,
+        "two presses, one operation, one transfer: {:?}",
+        live.models
+    );
+    assert_eq!(downloading[0].slug, "wisp");
+}
+
+/// **The catalog row yields its verb the way the Retry verb does.** A curated
+/// entry is `Installed` only once its file is on disk, so while a Retry-started
+/// transfer of that very entry is being set up the row went on painting a live
+/// Download onto the operation already in flight. The store makes pressing it
+/// harmless (above); this is the other half — a control over a settled decision
+/// is not a control, so the slot says what is happening instead, with no id and
+/// no probe: no tab stop, nothing to activate.
+///
+/// Staged with the real catalog URL, because the URL *is* what joins the two
+/// doors. The press is never meant to complete, so the entry's file is put on
+/// disk first: `download_local_model` refuses a file it already has before it
+/// opens any connection, which keeps the settle at teardown local to this
+/// machine. The frame is taken synchronously — pumping the executor would run
+/// the continuation and end the very state being drawn.
+#[gpui::test]
+fn backends_a_catalog_row_stands_down_while_its_transfer_starts(cx: &mut TestAppContext) {
+    use eidola_app_core::{LOCAL_MODEL_CATALOG, LocalModelInfo, LocalModelStatus};
+    use eidola_gui::backends_settings::BackendsTab;
+    use eidola_gui::probe;
+
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let entry = &LOCAL_MODEL_CATALOG[0];
+    let models_dir = dir.path().join("data").join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(models_dir.join(entry.file_name), b"").unwrap();
+
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+
+    stores.backends.update(cx, |s, cx| s.refresh(cx));
+    for _ in 0..8 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    cx.run_until_parked();
+
+    // The reader's situation: this catalog entry's download failed and left
+    // nothing behind, so the row remembers the entry's own URL — and the
+    // catalog, seeing no file, still offers Download.
+    let seed = |cx: &mut TestAppContext| {
+        stores.local_models.update(cx, |s, _| {
+            s.set_state_for_test(eidola_app_core::LocalModelsState {
+                engine_path: None,
+                external: Vec::new(),
+                models: vec![LocalModelInfo {
+                    id: "wisp@local".into(),
+                    slug: "wisp".into(),
+                    display_name: "Wisp".into(),
+                    file_name: "wisp.gguf".into(),
+                    size_bytes: None,
+                    source_url: Some(entry.url.to_string()),
+                    status: LocalModelStatus::Available,
+                    last_error: Some("HTTP 500".into()),
+                    on_disk: false,
+                }],
+            })
+        });
+    };
+    seed(cx);
+
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+        pane.update(cx, |p, cx| p.select_tab(BackendsTab::Local, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+    seed(cx);
+
+    let probes = |cx: &mut TestAppContext| -> Vec<String> {
+        probe::set_probes_enabled(true);
+        probe::clear_window(window.window_id().as_u64());
+        // Synchronous: `draw_window` would run the pending continuation with it.
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        probe::set_probes_enabled(false);
+        names
+    };
+
+    let before = probes(cx);
+    assert!(
+        before.contains(&"settings/backends/local/catalog/0/download".to_string()),
+        "the entry is not installed, so its door stands: {before:?}"
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| {
+            p.retry_failed_download("wisp@local", entry.url.to_string(), window, cx)
+        });
+    })
+    .unwrap();
+    assert!(
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(entry.url)),
+        "the retry owns this entry's transfer"
+    );
+    assert!(
+        stores.local_models.read_with(cx, |s, _| !s
+            .models()
+            .iter()
+            .any(|m| m.file_name == entry.file_name && m.on_disk)),
+        "nothing here is installed, so the row below can only be about pendingness"
+    );
+
+    let during = probes(cx);
+    assert!(
+        !during.contains(&"settings/backends/local/catalog/0/download".to_string()),
+        "the catalog must not offer a second door onto a transfer already starting: {during:?}"
+    );
+    assert!(
+        !during.contains(&"settings/backends/local/installed/0/retry".to_string()),
+        "nor may the row that started it"
+    );
+    assert!(
+        during.contains(&"settings/backends/local/catalog/1/download".to_string()),
+        "only this entry's door yields — the rest of the catalog is untouched: {during:?}"
+    );
+}
