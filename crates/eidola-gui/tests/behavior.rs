@@ -194,47 +194,96 @@ fn fixture_user_post(action_id: &str, text: &str) -> PostNode {
 // tests (app-core) and the visual snapshots.
 
 #[gpui::test]
-fn blank_space_adopts_id_on_wrapped_failure(cx: &mut TestAppContext) {
+fn a_new_space_is_registered_under_its_id_from_the_first_frame(cx: &mut TestAppContext) {
     use eidola_gui::space::Space;
 
-    // A blank ⌘N space (id=None) whose FIRST exchange FAILS after the space was
-    // persisted must still learn its id — app-core wraps the post-persist error
-    // as `ChatFailed { space_id }`. The registry adopts the now-id'd entity on
-    // `Failed` exactly as it does on `StreamEnded`, so a later open of that id
-    // shares the SAME entity (no fork).
+    // ⌘N creates the space: the id is minted client-side and the entity joins
+    // the registry in the same breath, so the window is addressed by a real id
+    // before the row's insert has committed. So a later `open` of that id
+    // shares the SAME entity, with no moment in between where two entities
+    // could describe one conversation.
     let stores = stub_stores_with_config(cx);
 
-    // Mint a blank space through the registry (this installs the adoption
-    // subscription on the SpacesStore).
-    let blank: Entity<Space> = stores.spaces.update(cx, |store, cx| store.blank(cx));
+    let fresh: Entity<Space> = stores.spaces.update(cx, |store, cx| store.create(cx));
     cx.run_until_parked();
-    blank.read_with(cx, |s, _| assert!(s.id().is_none(), "blank starts id-less"));
+    let id = fresh.read_with(cx, |s, _| s.id().to_string());
+    assert!(!id.is_empty(), "a new space has its id from birth");
 
-    // Drive the wrapped-failure path: the same logic as `spawn_stream`'s error
-    // arm (adopt id from wrapper, emit `Failed` with the unwrapped source).
-    let wrapped = AppError::ChatFailed {
-        space_id: "space-adopted".into(),
-        source: Box::new(AppError::Server {
-            status: 500,
-            message: "upstream blew up".into(),
-        }),
-    };
-    blank.update(cx, |s, cx| s.apply_chat_failure_for_test(wrapped, cx));
-    cx.run_until_parked();
-
-    // The entity learned its id from the wrapper…
-    blank.read_with(cx, |s, _| {
-        assert_eq!(s.id(), Some("space-adopted"), "id adopted on failure");
+    // The page is answered-and-empty at once: no transcript read stands
+    // between ⌘N and a composer (STATE.md's blank-page-stays-instant rule).
+    fresh.read_with(cx, |s, _| {
+        assert!(s.transcript_visible(), "the blank page answers immediately");
+        assert!(s.messages().is_empty());
     });
 
-    // …and the registry adopted it: opening that id returns the SAME entity.
-    let reopened = stores
-        .spaces
-        .update(cx, |store, cx| store.open("space-adopted".into(), cx));
+    let reopened = stores.spaces.update(cx, |store, cx| store.open(id, cx));
     assert_eq!(
         reopened.entity_id(),
-        blank.entity_id(),
-        "registry must adopt the blank on Failed — open(id) returns the same entity, no fork"
+        fresh.entity_id(),
+        "open(id) must join the registered entity — no fork"
+    );
+}
+
+/// A refused insert is a window-level error state, not a silent blank page.
+///
+/// ⌘N opens the window before the row commits, so the one thing the reader
+/// must never see is an ordinary empty notebook standing on a space that does
+/// not exist: a composer there would write nowhere. The failure lands in the
+/// transcript cell — the same door a failed *read* lands in — so the tail
+/// composer is never minted, and the window's own error band says what
+/// happened. And no phantom registry entry survives it: a later `open` of that
+/// id cannot join an entity standing on an error.
+#[gpui::test]
+fn a_refused_space_creation_says_so_instead_of_showing_a_blank_page(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_space(cx, &stores, None);
+    cx.run_until_parked();
+
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let space_id = space.read_with(cx, |s, _| s.id().to_string());
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.transcript_visible(),
+            "the page answers immediately while the insert runs"
+        );
+    });
+
+    stores.spaces.update(cx, |s, cx| {
+        s.fail_creation_for_test(
+            &space_id,
+            AppError::Database {
+                message: "disk is full".into(),
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            !s.transcript_visible(),
+            "a space that was never created has no tree to compose into"
+        );
+    });
+    let shown = view
+        .read_with(cx, |v, _| v.error_for_test())
+        .expect("the window says the space could not be created rather than showing a blank page");
+    assert!(shown.contains("disk is full"), "got {shown}");
+
+    let reopened = stores
+        .spaces
+        .update(cx, |s, cx| s.open(space_id.clone(), cx));
+    assert_ne!(
+        reopened.entity_id(),
+        space.entity_id(),
+        "the registry must not keep pointing at a conversation that does not exist"
+    );
+    assert!(
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.op_error_for(&space_id).map(str::to_string))
+            .is_some(),
+        "and the refusal stands for the Library banner too"
     );
 }
 
@@ -4719,11 +4768,8 @@ fn space_turn_failure_leaves_sibling_streams_untouched(cx: &mut TestAppContext) 
             s.apply_turn_failure_for_test(
                 "agent-b",
                 "a1",
-                AppError::ChatFailed {
-                    space_id: "s".into(),
-                    source: Box::new(AppError::Network {
-                        message: "connection reset".into(),
-                    }),
+                AppError::Network {
+                    message: "connection reset".into(),
                 },
                 cx,
             )
@@ -4811,11 +4857,8 @@ fn space_sibling_success_keeps_failed_turn_notice(cx: &mut TestAppContext) {
             s.apply_turn_failure_for_test(
                 "agent-b",
                 "a1",
-                AppError::ChatFailed {
-                    space_id: "s".into(),
-                    source: Box::new(AppError::Network {
-                        message: "connection reset".into(),
-                    }),
+                AppError::Network {
+                    message: "connection reset".into(),
                 },
                 cx,
             )
@@ -6673,11 +6716,8 @@ fn seed_failed_ask(view: &Entity<SpaceView>, window: AnyWindowHandle, cx: &mut T
         });
     })
     .unwrap();
-    let wrapped = AppError::ChatFailed {
-        space_id: "s".into(),
-        source: Box::new(AppError::Network {
-            message: "dns error: failed to look up address".into(),
-        }),
+    let wrapped = AppError::Network {
+        message: "dns error: failed to look up address".into(),
     };
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, cx| {
@@ -6846,11 +6886,8 @@ fn space_failed_ask_retry_selects_the_failed_posts_branch(cx: &mut TestAppContex
             s.apply_turn_failure_for_test(
                 "agent-b",
                 "a3",
-                AppError::ChatFailed {
-                    space_id: "s".into(),
-                    source: Box::new(AppError::Network {
-                        message: "connection reset".into(),
-                    }),
+                AppError::Network {
+                    message: "connection reset".into(),
                 },
                 cx,
             );
@@ -6926,11 +6963,8 @@ fn space_ask_other_post_keeps_unrelated_failed_turn(cx: &mut TestAppContext) {
             s.apply_turn_failure_for_test(
                 "agent-b",
                 "a1",
-                AppError::ChatFailed {
-                    space_id: "s".into(),
-                    source: Box::new(AppError::Network {
-                        message: "connection reset".into(),
-                    }),
+                AppError::Network {
+                    message: "connection reset".into(),
                 },
                 cx,
             );
@@ -7798,6 +7832,88 @@ fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
 
 /// The system prompt is editable where the participant lives: open a member's
 /// disclosure, rewrite its charter, save, and the durable row moves.
+/// The whole point of creating a space when its window opens: the space's
+/// configuration surface works from birth. A ⌘N window with **zero posts**
+/// renders the Participants section over a real roster and edits it — the
+/// membership exists because the space was instantiated from the default
+/// template when the window opened, not when a first message was sent.
+#[gpui::test]
+fn inspector_participants_work_on_a_fresh_space_with_no_posts(cx: &mut TestAppContext) {
+    let (stores, core, _dir, _seeded) = participants_scene(cx);
+
+    // ⌘N — no space id; the window mints one and opens on it.
+    let (window, view) = open_space(cx, &stores, None);
+    let space = view.read_with(cx, |v, cx| v.space().read(cx).id().to_string());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    })
+    .unwrap();
+
+    // The window's own reads are issued in the frame it opened, which can
+    // precede the insert they are reading behind — the instantiation's
+    // announcements are what take an early "empty" answer back (app-core's
+    // `create_space_with_id_emits_space_index_under_the_given_id` pins that it
+    // emits them; here they arrive through the dispatch seam this file uses).
+    wait_until(cx, "the space's row commits", |_| {
+        core.runtime()
+            .block_on(core.list_spaces(false))
+            .is_ok_and(|spaces| spaces.iter().any(|s| s.id == space))
+    });
+    cx.update(|cx| {
+        stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx);
+        stores::dispatch_change_for_test(&stores, Some(Change::Space(space.clone())), cx);
+    });
+
+    wait_until(cx, "the new space's roster loads", |cx| {
+        participant_labels(&stores, &space, cx).len() == 2
+    });
+    assert!(
+        view.read_with(cx, |v, cx| v.space().read(cx).messages().is_empty()),
+        "and it has not been posted into"
+    );
+
+    // The section is renderable — it used to be withheld entirely here — and
+    // its rows are the template's membership.
+    draw_frame(cx, window);
+    let agent = stores.participants.read_with(cx, |s, _| {
+        s.list(&space)
+            .iter()
+            .find(|p| p.kind == "agent")
+            .expect("the default template seeds one agent")
+            .id
+            .clone()
+    });
+
+    // …and it edits: the disclosure is the editor, and Save writes through.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent, window, cx)
+        });
+    })
+    .unwrap();
+    let name = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .expect("the disclosure is the editor");
+    cx.update_window(window, |_, window, cx| {
+        name.update(cx, |s, cx| s.set_value("Mara", window, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
+    })
+    .unwrap();
+    wait_until(cx, "the rename persists on a post-less space", |cx| {
+        participant_labels(&stores, &space, cx).contains(&"Mara".to_string())
+    });
+
+    // The Space section's settings rows are live too — the space really is in
+    // the database, so its settings are readable.
+    wait_until(cx, "the space's settings load", |cx| {
+        view.read_with(cx, |v, cx| v.inspector_cascade_for_test(cx))
+            .is_some()
+    });
+}
+
 #[gpui::test]
 fn inspector_participant_system_prompt_round_trips(cx: &mut TestAppContext) {
     let (stores, core, _dir, space) = participants_scene(cx);
@@ -12882,7 +12998,7 @@ fn every_window_can_close_and_a_new_one_opens_cleanly(cx: &mut TestAppContext) {
     draw_window(cx, third);
     cx.update(|cx| assert_eq!(cx.windows().len(), 1));
     let space = view.read_with(cx, |v, _| v.space().clone());
-    space.read_with(cx, |s, _| assert_eq!(s.id(), Some("s")));
+    space.read_with(cx, |s, _| assert_eq!(s.id(), "s"));
 }
 
 #[gpui::test]
@@ -13269,26 +13385,6 @@ fn space_inspector_title_field_renames_the_space(cx: &mut TestAppContext) {
                 .and_then(|r| r.title.clone()),
             Some("Tides and the moon".into()),
             "the title writes through the Library index, like the Library's own rename"
-        );
-    });
-}
-
-#[gpui::test]
-fn space_inspector_on_an_unsaved_space_offers_no_settings_to_edit(cx: &mut TestAppContext) {
-    // A blank ⌘N space has no id, so there is no settings row to write to.
-    let stores = stub_stores_with_config(cx);
-    let (window, view) = open_space(cx, &stores, None);
-    cx.update_window(window, |_, window, cx| {
-        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
-    })
-    .unwrap();
-    draw_window(cx, window);
-
-    view.read_with(cx, |v, cx| {
-        assert_eq!(
-            v.inspector_cascade_for_test(cx),
-            None,
-            "no settings exist for a space that has never been saved"
         );
     });
 }

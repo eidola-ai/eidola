@@ -3413,7 +3413,43 @@ pub async fn soft_remove_space_template(
 /// SPACE-owned rows; copy its reference rows (with overrides) into space
 /// references; then ensure the shared human "User" is referenced (as owner).
 /// Errors if the template is missing or removed.
+///
+/// **One transaction, because a space without its participants is not a
+/// space.** These are several statements, and turso autocommits each one — so
+/// a failure partway (a full disk, a constraint the copied rows violate) used
+/// to leave a durable `space` row with some or none of its membership: a
+/// conversation nobody could be told about, which every caller's error handling
+/// reasonably reads as "nothing was written". `BEGIN IMMEDIATE` makes the
+/// refusal zero-state and the success atomic, for every caller of this door —
+/// the default-template path `create_space` and `post` take, and the explicit
+/// one `create_space_from_template` takes. **The template's liveness is read
+/// inside it too**, decided at the write like every other guard in this module,
+/// so a template removed a moment ago cannot be instantiated by a check taken
+/// before the writer was reserved.
 pub async fn instantiate_template(
+    conn: &Connection,
+    template_id: &str,
+    new_space_id: &str,
+    title: Option<&str>,
+    linkability: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    begin_write(conn).await?;
+    match instantiate_template_body(conn, template_id, new_space_id, title, linkability, now).await
+    {
+        Ok(()) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn instantiate_template_body(
     conn: &Connection,
     template_id: &str,
     new_space_id: &str,
@@ -7579,6 +7615,81 @@ mod tests {
         );
         let r = instantiate_template(&conn, "t-gone", "space-z", None, "unlinked", 3_000).await;
         assert!(r.is_err(), "instantiating a removed template must fail");
+    }
+
+    /// **A failed instantiation leaves no space at all.** These are several
+    /// statements over one database, so before the transaction a failure
+    /// partway left a durable `space` row carrying some or none of its
+    /// membership — a conversation nobody could be told about, which every
+    /// caller reasonably reads as "nothing was written" (the GUI's ⌘N drops its
+    /// registry entry on exactly that reading).
+    ///
+    /// The fault is injected the only way a mid-instantiation failure can be
+    /// staged deterministically: a template reference naming a participant that
+    /// does not exist, written on a connection with FK enforcement off (turso's
+    /// default), so the copy of it into `space_participant` — several
+    /// statements *after* the space row and its owned agents — hits the
+    /// composite FK. What a full disk or a future constraint would do to the
+    /// same door, at a step we can name.
+    #[tokio::test]
+    async fn a_failed_instantiation_leaves_no_space_at_all() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+
+        // The seeded default template already owns an agent, so the rollback
+        // has copied rows of both kinds to take back.
+        let owned_before =
+            list_template_owned_participants(&conn, crate::config::DEFAULT_TEMPLATE_ID)
+                .await
+                .unwrap();
+        assert!(
+            !owned_before.is_empty(),
+            "the default template owns an agent"
+        );
+
+        let raw = db.connect().unwrap(); // FKs off — the staging connection
+        raw.execute(
+            "INSERT INTO space_template_participant \
+             (template_id, participant_id, participant_scope, role, joined_at) \
+             VALUES (?1, 'no-such-participant', 'global', 'member', 1)",
+            (Value::Text(crate::config::DEFAULT_TEMPLATE_ID.to_string()),),
+        )
+        .await
+        .unwrap();
+
+        let err = instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "space-partial",
+            None,
+            "unlinked",
+            1_000,
+        )
+        .await
+        .expect_err("copying a reference to a participant that does not exist must fail");
+        assert!(matches!(err, AppError::Database { .. }), "{err:?}");
+
+        // Zero state, all three ways it could have been left behind.
+        assert!(
+            get_space(&conn, "space-partial").await.unwrap().is_none(),
+            "the space row is rolled back with everything else"
+        );
+        assert!(
+            space_participants(&conn, "space-partial")
+                .await
+                .unwrap()
+                .is_empty(),
+            "and no membership survives it"
+        );
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM participant WHERE owner_space_id = ?1",
+                (Value::Text("space-partial".to_string()),),
+            )
+            .await
+            .unwrap();
+        let owned_after: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(owned_after, 0, "nor any agent copied for it");
     }
 
     /// PR #221 review comment 2: the template-update replacement is atomic. A

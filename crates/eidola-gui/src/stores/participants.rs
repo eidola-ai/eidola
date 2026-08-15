@@ -101,6 +101,15 @@ impl ParticipantsStore {
         self.spaces.get(space_id).unwrap_or(&NOT_LOADED)
     }
 
+    /// Test-only: seed one space's roster after construction — what
+    /// [`Self::stub`] does at construction, for a space whose id is only known
+    /// once it exists (a ⌘N window mints its own).
+    #[doc(hidden)]
+    pub fn seed_for_test(&mut self, space_id: &str, list: Vec<ParticipantInfo>) {
+        self.spaces
+            .insert(space_id.to_string(), Loadable::loaded(list));
+    }
+
     /// Test-only: force a space's cell into `Failed` (no prior) to exercise the
     /// failed-initial-load rendering.
     #[doc(hidden)]

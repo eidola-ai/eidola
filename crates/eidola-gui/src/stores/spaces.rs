@@ -6,9 +6,10 @@
 //! through [`SpacesStore::open`], which gets-or-creates: two windows on the
 //! same space share **one** `Space` entity (and one transcript load), which is
 //! the structural fix for wave-2 bug 4 (a submit/stream in window A appears in
-//! window B). [`SpacesStore::blank`] mints an id-less space for ⌘N; the
-//! registry adopts it when its first exchange assigns an id (a subscriber on
-//! the space's `StreamEnded` event reads its now-present id and keys it).
+//! window B). [`SpacesStore::create`] is the ⌘N door: it mints the id, hands
+//! back a registered entity in the same breath, and commits the row behind it
+//! — so there is no window without a space, and no space outside the
+//! registry.
 //!
 //! **The index's mutations follow the write-through rules** the other stores
 //! do (`crates/eidola-gui/STATE.md` → "Concurrency patterns"): rename and
@@ -42,12 +43,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use eidola_app_core::error::AppError;
 use eidola_app_core::{AppCore, SpaceInfo};
-use gpui::{AppContext, Context, Entity, Subscription, Task, WeakEntity};
+use gpui::{AppContext, Context, Entity, Task, WeakEntity};
 
 use crate::bridge::bridge;
 use crate::loadable::Loadable;
-use crate::space::{Space, SpaceEvent};
+use crate::space::Space;
 use crate::stores::Stores;
 
 /// A refused space operation: the sentence to show, plus the space it was about
@@ -112,16 +114,12 @@ pub struct SpacesStore {
     /// The per-space entity registry. `WeakEntity` so a dropped window's space
     /// (with no other holder) is collected — `open` prunes dead weaks on miss.
     registry: HashMap<String, WeakEntity<Space>>,
-    /// Spaces minted blank (⌘N) that have not yet been adopted into the
-    /// registry. Each is held as a weak handle + the subscription that watches
-    /// for its first id assignment. On `StreamEnded` the space's now-present
-    /// id is read and the entity is moved into `registry`.
-    ///
-    /// **These are live spaces, and every store-wide broadcast must reach
-    /// them** — see [`SpacesStore::live_spaces`]. They are held here rather
-    /// than in `registry` only because they have no key yet, which is a fact
-    /// about addressing, not about liveness.
-    pending_blanks: Vec<(WeakEntity<Space>, Subscription)>,
+    /// The in-flight inserts behind [`Self::create`], keyed by the space id
+    /// each is committing. Owned here rather than by the entity or its window
+    /// so a ⌘N window closed a keystroke later still leaves a whole space
+    /// rather than a half-instantiated one — the store outlives every window
+    /// (STATE.md, "owner = blast radius"). Each task removes its own key.
+    instantiations: HashMap<String, Task<()>>,
     /// In-flight "New Space from Template" ops, keyed by a monotonic id so each
     /// activation is **independent** and runs to completion (STATE.md "keyed
     /// per-key work") — a supersede slot would let a superseded result, whose
@@ -153,7 +151,7 @@ impl SpacesStore {
             op_undos: HashMap::new(),
             refresh_pending: false,
             registry: HashMap::new(),
-            pending_blanks: Vec::new(),
+            instantiations: HashMap::new(),
             create_ops: HashMap::new(),
             next_create_op: 0,
             op_errors: Vec::new(),
@@ -174,7 +172,7 @@ impl SpacesStore {
             op_undos: HashMap::new(),
             refresh_pending: false,
             registry: HashMap::new(),
-            pending_blanks: Vec::new(),
+            instantiations: HashMap::new(),
             create_ops: HashMap::new(),
             next_create_op: 0,
             op_errors: Vec::new(),
@@ -244,67 +242,98 @@ impl SpacesStore {
         entity
     }
 
-    /// Mint a blank space for ⌘N: id-less, instant, no transcript load. The
-    /// registry adopts it once its first exchange persists and assigns an id —
-    /// whether that exchange *succeeds* (`StreamEnded`) or *fails after the
-    /// space was persisted* (`Failed`, where app-core's `ChatFailed` wrapper let
-    /// the space learn its id). Both events populate `Space::id()` before they
-    /// fire, so a single `adopt_blank` covers both.
-    pub fn blank(&mut self, cx: &mut Context<Self>) -> Entity<Space> {
+    /// Create a new space (⌘N) and hand back its registered entity **now**.
+    ///
+    /// The id is minted client-side ([`eidola_app_core::new_space_id`]) and the
+    /// row — the default template instantiated, the same door `post` takes for
+    /// a space-less save — commits behind it, so the window that opens on this
+    /// entity is addressed by a real id from its first frame and the page stays
+    /// instant. The registry holds it immediately, which is what makes every
+    /// store-wide broadcast reach it by ordinary membership.
+    ///
+    /// A refused insert leaves no space, so it leaves no registry entry either:
+    /// the entity is dropped from the registry and told
+    /// ([`Space::creation_failed`]), which is what the window renders.
+    pub fn create(&mut self, cx: &mut Context<Self>) -> Entity<Space> {
+        let id = eidola_app_core::new_space_id();
         let app_core = self.app_core.clone();
-        let entity = cx.new(|_| Space::blank(app_core));
-        let weak = entity.downgrade();
-        let sub = cx.subscribe(&entity, |this, space, event, cx| {
-            // `adopt_blank` is a no-op when the id is still `None` (a `Failed`
-            // before the space was persisted — e.g. `NoAccount` — never adopts).
-            if matches!(event, SpaceEvent::StreamEnded | SpaceEvent::Failed(_)) {
-                this.adopt_blank(&space, cx);
-            }
-        });
-        self.pending_blanks.push((weak, sub));
+        let entity = cx.new(|_| Space::created(app_core.clone(), id.clone()));
+        self.registry.insert(id.clone(), entity.downgrade());
+
+        let Some(core) = app_core else {
+            return entity; // stub stores (tests): nothing to persist against
+        };
+        let key = id.clone();
+        self.instantiations.insert(
+            id.clone(),
+            cx.spawn(async move |this, cx| {
+                let result = bridge(core, move |c| async move {
+                    c.create_space_with_id(id, None).await
+                })
+                .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.instantiations.remove(&key);
+                    match result {
+                        // The index needs nothing here — the write emitted
+                        // `Change::SpaceIndex` and the bus refreshes it the
+                        // ordinary way. What the entity needs is the release:
+                        // a mutation started before this commit is waiting on
+                        // it (see `Space::creation_committed`).
+                        Ok(_) => {
+                            if let Some(space) =
+                                this.registry.get(&key).and_then(WeakEntity::upgrade)
+                            {
+                                space.update(cx, |space, cx| space.creation_committed(cx));
+                            }
+                        }
+                        Err(e) => this.fail_creation(&key, e, cx),
+                    }
+                });
+            }),
+        );
         entity
     }
 
-    /// Adopt a now-id'd blank space into the keyed registry, dropping the
-    /// pending-blank bookkeeping for it. Idempotent: re-adoption of an
-    /// already-registered id (e.g. multiple `StreamEnded`s) just refreshes the
-    /// weak handle.
-    fn adopt_blank(&mut self, space: &Entity<Space>, cx: &mut Context<Self>) {
-        let Some(id) = space.read(cx).id().map(str::to_string) else {
-            return;
-        };
-        self.registry.insert(id, space.downgrade());
-        // Drop the pending-blank entry (and its subscription) for this entity.
-        let target = space.downgrade();
-        self.pending_blanks
-            .retain(|(weak, _)| weak.entity_id() != target.entity_id());
+    /// The insert behind [`Self::create`] was refused: there is no space, so
+    /// there is no registry entry either. Dropping the key is what keeps the
+    /// registry a map of conversations that exist — a later `open` of that id
+    /// would otherwise join an entity standing on an error. The entity itself
+    /// is told, because its window is what has to say so — and because a save
+    /// waiting on the insert has to be released with the refusal rather than
+    /// left waiting on a settle that has already happened.
+    fn fail_creation(&mut self, space_id: &str, error: AppError, cx: &mut Context<Self>) {
+        let entity = self
+            .registry
+            .remove(space_id)
+            .and_then(|weak| weak.upgrade());
+        self.record_op_error(
+            Some(space_id.to_string()),
+            format!("Couldn't create the space: {error}"),
+        );
+        if let Some(space) = entity {
+            space.update(cx, |space, cx| space.creation_failed(error, cx));
+        }
+        cx.notify();
     }
 
-    /// **Every live `Space` this store knows of** — the keyed registry *and*
-    /// the blanks still waiting for an id.
-    ///
-    /// A broadcast that says "every live space" has to mean it, and
-    /// [`Self::blank`] deliberately keeps its entity **outside** the registry
-    /// until an id arrives. That pending window is not idle: it is exactly the
-    /// window in which the blank's first save reads the transcript. The
-    /// operation's own `get_space_tree` is several reads, so a rename
-    /// committing while they run is captured by none of them — and the
-    /// `Change::Participants` announcing it arrives while the space is still
-    /// id-less. A registry-only loop never reached that entity at all, so no
-    /// debt was recorded, and the space was adopted into the registry carrying
-    /// pre-rename names with nothing left to correct them (Codex review, PR
-    /// #292). The busy gate on the entity is what makes this safe *and*
-    /// sufficient: a blank with no id and nothing in flight simply has nothing
-    /// to re-read, and a busy one records the debt its adoption discharges.
-    ///
-    /// No entity is visited twice: [`Self::adopt_blank`] inserts into the
-    /// registry and drops the pending entry in one call, so the two
-    /// collections are disjoint by construction.
+    /// Test seam: drive the production creation-failure arm. A local DB insert
+    /// cannot be made to fail through the real seam (the same reason
+    /// [`Self::settle_for_test`] exists), so this is how that quadrant is
+    /// reachable from a test.
+    #[doc(hidden)]
+    pub fn fail_creation_for_test(
+        &mut self,
+        space_id: &str,
+        error: AppError,
+        cx: &mut Context<Self>,
+    ) {
+        self.fail_creation(space_id, error, cx);
+    }
+
+    /// **Every live `Space` this store knows of** — the registry, minus the
+    /// entries whose entity has been collected.
     fn live_spaces(&self) -> impl Iterator<Item = Entity<Space>> + '_ {
-        self.registry
-            .values()
-            .chain(self.pending_blanks.iter().map(|(weak, _)| weak))
-            .filter_map(WeakEntity::upgrade)
+        self.registry.values().filter_map(WeakEntity::upgrade)
     }
 
     /// React to a `Change::Space(id)` from the bus by telling the live
@@ -315,14 +344,7 @@ impl SpacesStore {
     /// not just the changed one: a quote written in space B changes what space
     /// A's posts should highlight, and the bus event carries only the written
     /// space's id. The indexes are re-fetched lazily per rendered post, so
-    /// this costs a query per *visible* post at most. That sweep goes through
-    /// [`Self::live_spaces`], since "every live space" includes a blank still
-    /// waiting for its id.
-    ///
-    /// **The keyed half stays registry-only, and that is not an omission**: a
-    /// pending blank has no id, which is the whole reason it is pending, so no
-    /// `Change::Space(id)` can name it. It joins the registry in the same
-    /// breath as it learns its id.
+    /// this costs a query per *visible* post at most.
     pub fn notify_space_changed(&mut self, id: &str, cx: &mut Context<Self>) {
         for entity in self.live_spaces() {
             entity.update(cx, |space, cx| space.invalidate_incoming_references(cx));
@@ -360,11 +382,9 @@ impl SpacesStore {
     /// incoming-reference index or a trace round. Each entity's own
     /// `is_busy` gate still applies, and it **defers rather than discards**.
     ///
-    /// **Every live space means the pending blanks too** ([`Self::live_spaces`]
-    /// — Codex review, PR #292): a ⌘N space persisting its first post lives
-    /// only in `pending_blanks`, and that is precisely when its transcript is
-    /// being read, so a registry-only loop dropped the invalidation for the
-    /// one space whose read was in flight.
+    /// A space created a moment ago is an ordinary registry member — its row
+    /// commits when its window opens — so a rename landing while its first
+    /// read is in flight reaches it like any other (Codex review, PR #292).
     pub fn notify_participants_changed(&mut self, cx: &mut Context<Self>) {
         for entity in self.live_spaces() {
             entity.update(cx, |space, cx| space.invalidate_transcript(cx));
@@ -390,11 +410,7 @@ impl SpacesStore {
     /// This is the whole of what `Change::Participants` + `Change::Space` do to
     /// a live space, minus the id — which is right, since a lag knows nothing
     /// about which space changed. Each entity's own busy gate still applies,
-    /// and now defers rather than discards. And "every live space" is
-    /// [`Self::live_spaces`], which is the registry **and** the blanks still
-    /// earning an id: a recovery whose whole contract is "we missed changes,
-    /// re-read everything" cannot quietly skip the one space whose first
-    /// transcript read is in flight.
+    /// and now defers rather than discards.
     pub fn notify_lagged(&mut self, cx: &mut Context<Self>) {
         for entity in self.live_spaces() {
             entity.update(cx, |space, cx| {

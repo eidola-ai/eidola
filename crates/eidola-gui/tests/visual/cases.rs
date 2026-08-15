@@ -295,15 +295,12 @@ fn register_space(s: &mut Snapshots) {
                     cx,
                 );
                 sp.apply_chat_failure_for_test(
-                    eidola_app_core::error::AppError::ChatFailed {
-                        space_id: "s".into(),
-                        source: Box::new(eidola_app_core::error::AppError::Network {
-                            message: "request failed: error sending request for url \
+                    eidola_app_core::error::AppError::Network {
+                        message: "request failed: error sending request for url \
                                  (https://gateway.eidola.containers.tinfoil.sh/v1/models): \
                                  client error (Connect): dns error: failed to look up address \
                                  information: nodename nor servname provided, or not known"
-                                .into(),
-                        }),
+                            .into(),
                     },
                     cx,
                 );

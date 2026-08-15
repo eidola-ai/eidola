@@ -202,8 +202,8 @@ pub(crate) enum ParticipantPicker {
 impl SpaceView {
     // -- Reads -------------------------------------------------------------
 
-    fn space_id(&self, cx: &gpui::App) -> Option<String> {
-        self.space.read(cx).id().map(str::to_string)
+    fn space_id(&self, cx: &gpui::App) -> String {
+        self.space.read(cx).id().to_string()
     }
 
     /// Whether this space is `participant_id`'s own notebook — the one
@@ -213,9 +213,7 @@ impl SpaceView {
         participant_id: &str,
         cx: &gpui::App,
     ) -> bool {
-        let Some(space_id) = self.space_id(cx) else {
-            return false;
-        };
+        let space_id = self.space_id(cx);
         self.stores
             .space_settings
             .read(cx)
@@ -247,7 +245,7 @@ impl SpaceView {
     /// a listing that answered may say anything (the status menu's rule, and
     /// [`Self::sync_inspector_participant_edit`]'s).
     fn inspector_space_is_a_notebook(&self, cx: &gpui::App) -> Option<bool> {
-        let space_id = self.space_id(cx)?;
+        let space_id = self.space_id(cx);
         Some(
             self.stores
                 .space_settings
@@ -268,10 +266,8 @@ impl SpaceView {
 
     /// This space's membership as the store holds it.
     fn inspector_participants(&self, cx: &gpui::App) -> Vec<ParticipantInfo> {
-        match self.space_id(cx) {
-            Some(id) => self.stores.participants.read(cx).list(&id).to_vec(),
-            None => Vec::new(),
-        }
+        let id = self.space_id(cx);
+        self.stores.participants.read(cx).list(&id).to_vec()
     }
 
     /// Whether any of the section's text fields holds the window's focus — read
@@ -561,9 +557,7 @@ impl SpaceView {
     /// Commit the open editor — "edit everywhere" or "override here" per its
     /// mode; an owned participant is always an edit of its own config.
     pub fn inspector_save_participant_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(space_id) = self.space_id(cx) else {
-            return;
-        };
+        let space_id = self.space_id(cx);
         let held = self.inspector_field_focused(window, cx);
         let Some(edit) = self.inspector_participant_edit.take() else {
             return;
@@ -678,9 +672,7 @@ impl SpaceView {
     /// else is view work — the roster's "shared" tag falls out of the same
     /// re-list.
     pub fn inspector_confirm_promote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(space_id) = self.space_id(cx) else {
-            return;
-        };
+        let space_id = self.space_id(cx);
         let held = self.inspector_field_focused(window, cx);
         let Some(edit) = self.inspector_participant_edit.take() else {
             return;
@@ -712,9 +704,7 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(space_id) = self.space_id(cx) else {
-            return;
-        };
+        let space_id = self.space_id(cx);
         let pid = participant_id.to_string();
         self.stores
             .participants
@@ -775,9 +765,7 @@ impl SpaceView {
     }
 
     pub fn inspector_save_add_participant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(space_id) = self.space_id(cx) else {
-            return;
-        };
+        let space_id = self.space_id(cx);
         let held = self.inspector_field_focused(window, cx);
         let Some(add) = self.inspector_participant_add.take() else {
             return;
@@ -845,9 +833,10 @@ impl SpaceView {
             error: None,
             confirming: None,
         });
-        let (Some(space_id), Some(core)) = (self.space_id(cx), self.stores.app_core()) else {
-            // No backend (stub mode) or no space yet: the form stands empty and
-            // honest rather than spinning forever.
+        let space_id = self.space_id(cx);
+        let Some(core) = self.stores.app_core() else {
+            // No backend (stub mode): the form stands empty and honest rather
+            // than spinning forever.
             if let Some(form) = self.inspector_invite.as_mut() {
                 form.candidates = Some(Vec::new());
             }
@@ -935,9 +924,7 @@ impl SpaceView {
     /// `ParticipantsStore::grant_membership`), because another window can share
     /// it between this form's listing and this press.
     pub fn inspector_confirm_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(space_id) = self.space_id(cx) else {
-            return;
-        };
+        let space_id = self.space_id(cx);
         let Some((participant_id, _, _, _)) = self
             .inspector_invite
             .as_ref()
@@ -1039,9 +1026,7 @@ impl SpaceView {
     }
 
     pub fn inspector_save_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(space_id) = self.space_id(cx) else {
-            return;
-        };
+        let space_id = self.space_id(cx);
         let held = self.inspector_field_focused(window, cx);
         let Some(form) = self.inspector_template_form.take() else {
             return;
@@ -1144,9 +1129,7 @@ impl SpaceView {
         else {
             return;
         };
-        let Some(space_id) = self.space_id(cx) else {
-            return;
-        };
+        let space_id = self.space_id(cx);
         // Only a listing that has answered can say anything about a row: a first
         // load in flight, or a failed one with nothing prior, knows nothing.
         let stale = {
@@ -1230,24 +1213,23 @@ impl SpaceView {
     /// Re-fetch this space's membership — the Retry on a failed load (`ensure`
     /// declines once a `Failed` cell exists, so this is the only path back).
     pub fn inspector_retry_participants(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.space_id(cx) {
-            self.stores
-                .participants
-                .update(cx, |s, cx| s.refresh(id, cx));
-        }
+        let id = self.space_id(cx);
+        self.stores
+            .participants
+            .update(cx, |s, cx| s.refresh(id, cx));
         cx.notify();
     }
 
     // -- Render ------------------------------------------------------------
 
-    /// Section 2 — **Participants**. `None` for a blank ⌘N space: there is no
-    /// membership until the space is saved, and the Space section above already
-    /// says so once.
+    /// Section 2 — **Participants**. Every space has membership from birth (it
+    /// is instantiated from a template when its window opens), so this section
+    /// renders unconditionally.
     pub(crate) fn render_inspector_participants_section(
         &self,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let space_id = self.space_id(cx)?;
+    ) -> AnyElement {
+        let space_id = self.space_id(cx);
         let (muted, border, link, fg) = {
             let theme = cx.theme();
             (
@@ -1301,20 +1283,19 @@ impl SpaceView {
                 col =
                     col.child(self.render_inspector_participants_error(&op_errors, &space_id, cx));
             }
-            return Some(col.into_any_element());
+            return col.into_any_element();
         }
 
         let participants = self.inspector_participants(cx);
         if participants.is_empty() && loading {
-            return Some(
-                col.child(
+            return col
+                .child(
                     div()
                         .text_xs()
                         .text_color(muted.opacity(0.8))
                         .child("Loading…"),
                 )
-                .into_any_element(),
-            );
+                .into_any_element();
         }
 
         for p in &participants {
@@ -1417,7 +1398,7 @@ impl SpaceView {
             );
         }
 
-        Some(col.into_any_element())
+        col.into_any_element()
     }
 
     /// One member: the disclosure row, plus its editor when open.

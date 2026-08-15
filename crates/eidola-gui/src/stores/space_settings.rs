@@ -100,6 +100,15 @@ impl SpaceSettingsStore {
         }
     }
 
+    /// Test-only: seed one space's settings after construction — what
+    /// [`Self::stub`] does at construction, for a space whose id is only known
+    /// once it exists (a ⌘N window mints its own).
+    #[doc(hidden)]
+    pub fn seed_for_test(&mut self, space_id: &str, settings: SpaceSettings) {
+        self.spaces
+            .insert(space_id.to_string(), Loadable::loaded(settings));
+    }
+
     /// Test-only: stand a write refusal for a space, the state a refused setter
     /// leaves. Unreachable in stub mode otherwise — the setters need a backend
     /// to be refused by — and it is what a *standing* refusal (one nothing has
