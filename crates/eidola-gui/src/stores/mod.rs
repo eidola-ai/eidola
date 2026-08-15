@@ -93,28 +93,34 @@ pub struct Stores {
     pub record: Entity<RecordStore>,
 }
 
-impl Stores {
-    /// Construct the real, backend-backed stores. Creates one `AppCore`
-    /// (its own tokio runtime) and seeds the synchronous `ConfigStore`
-    /// snapshot; async cells start `NotLoaded` and are filled by the
-    /// startup refreshes and the bus.
-    pub fn new(cx: &mut App) -> Self {
-        let config_dir = eidola_app_core::config::default_config_path()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .expect("could not determine eidola config directory");
-        let data_dir = eidola_app_core::config::default_data_dir()
-            .expect("could not determine eidola data directory");
+/// Open the real `AppCore` over this machine's config and data directories —
+/// the app's one fallible startup step, and deliberately **not** a store
+/// concern.
+///
+/// It is a free function because it is called before there is an `App` to hand
+/// stores to: every way this fails is a way the app cannot come up at all
+/// (`DatabaseInUse` when another Eidola holds the single-writer database, a
+/// directory that will not resolve, a schema version this build refuses), and
+/// the caller reports it through `crate::startup` rather than constructing
+/// anything. Directory resolution returns the same typed error as everything
+/// else here, so one surface renders the whole class.
+pub fn open_app_core() -> Result<Arc<AppCore>, eidola_app_core::error::AppError> {
+    let missing = |what: &str| eidola_app_core::error::AppError::Config {
+        message: format!("could not determine the Eidola {what} directory for this account"),
+    };
+    let config_dir = eidola_app_core::config::default_config_path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .ok_or_else(|| missing("configuration"))?;
+    let data_dir = eidola_app_core::config::default_data_dir().ok_or_else(|| missing("data"))?;
+    Ok(Arc::new(AppCore::new(config_dir, data_dir)?))
+}
 
-        // Construction can fail — notably `AppError::DatabaseInUse` when
-        // another Eidola process already holds the single-writer local
-        // database. There is no startup-failure surface in the GUI yet (the
-        // directory resolution above panics the same way), so this stays a
-        // loud abort with an honest message rather than a silent
-        // half-initialized app; a real startup dialog is a follow-up.
-        let app_core = Arc::new(
-            AppCore::new(config_dir, data_dir)
-                .unwrap_or_else(|e| panic!("could not open the local Eidola database: {e}")),
-        );
+impl Stores {
+    /// Construct the real, backend-backed stores around an already-open
+    /// [`AppCore`] (see [`open_app_core`]) and seed the synchronous
+    /// `ConfigStore` snapshot; async cells start `NotLoaded` and are filled by
+    /// the startup refreshes and the bus.
+    pub fn new(app_core: Arc<AppCore>, cx: &mut App) -> Self {
         Self::with_core(Some(app_core), cx)
     }
 
