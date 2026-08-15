@@ -836,20 +836,33 @@ impl SpaceView {
         // the entity answers whether any other window still draws this
         // conversation, and app-core decides — inside its own transaction —
         // whether there is anything here worth keeping.
+        //
+        // **The release is also the last moment anything can be asked whether
+        // a write is still travelling.** The entity dies with this view, and a
+        // core call outlives the gpui task that issued it, so a save (or a
+        // rename, or a roster edit) started a moment ago can still be on its
+        // way to the database that the disposal is about to reserve. Asked
+        // here, while every owner is alive; honoured by the store, which never
+        // disposes over an outstanding write.
         {
-            let spaces = stores.spaces.clone();
+            let stores = stores.clone();
             let space = space.clone();
             let closing = handle.window_id();
             cx.on_release(move |_, cx| {
-                let (id, alone) = space.read_with(cx, |space, cx| {
+                let (id, alone, busy) = space.read_with(cx, |space, cx| {
                     (
                         space.id().to_string(),
                         !space.has_other_open_window(closing, cx),
+                        space.is_busy(),
                     )
                 });
-                if alone {
-                    spaces.update(cx, |spaces, cx| spaces.window_closed(id, cx));
+                if !alone {
+                    return;
                 }
+                let still_writing = busy || crate::stores::space_writes_in_flight(&stores, &id, cx);
+                stores
+                    .spaces
+                    .update(cx, |spaces, cx| spaces.window_closed(id, still_writing, cx));
             })
             .detach();
         }

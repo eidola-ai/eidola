@@ -1676,6 +1676,16 @@ pub async fn insert_participant(
     provider_id: Option<&str>,
     created_at: i64,
 ) -> Result<(), AppError> {
+    // **Before the insert, not after.** turso autocommits each statement, so a
+    // stamp written afterwards leaves a window in which the new participant is
+    // durable and its space still reads untouched — long enough for a disposal
+    // to take the space and the row together, after which the stamp updates
+    // nothing and the roster change is simply gone. Marking first can only
+    // over-mark (a failed insert leaves a space nothing changed looking
+    // touched), which costs a listing row.
+    if let Some(space_id) = owner_space_id.filter(|_| scope == "space") {
+        touch_space(conn, space_id, created_at).await?;
+    }
     conn.execute(
         "INSERT INTO participant \
          (id, scope, owner_space_id, owner_template_id, kind, label, model_ref, \
@@ -1700,9 +1710,6 @@ pub async fn insert_participant(
     .map_err(|e| AppError::Database {
         message: format!("failed to insert participant: {e}"),
     })?;
-    if let Some(space_id) = owner_space_id.filter(|_| scope == "space") {
-        touch_space(conn, space_id, created_at).await?;
-    }
     Ok(())
 }
 
@@ -7934,6 +7941,73 @@ mod tests {
     /// statements *after* the space row and its owned agents — hits the
     /// composite FK. What a full disk or a future constraint would do to the
     /// same door, at a step we can name.
+    /// **A write marks its space before it writes, so even a write that never
+    /// lands leaves the space kept.**
+    ///
+    /// This is the observable end of the ordering rule. `conn.execute`
+    /// autocommits, so if `insert_participant` stamped *after* its insert there
+    /// would be a moment when the new participant is durable and its space
+    /// still reads pristine — a disposal interleaving there deletes the space
+    /// and the row together, and the stamp that follows finds nothing to
+    /// update. Marking first makes that window impossible, and the price is
+    /// visible here: a refused insert marks a space nothing changed. Keeping a
+    /// listing row is the error worth making.
+    #[tokio::test]
+    async fn a_failed_participant_insert_still_marks_its_space() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "space-mark",
+            None,
+            "unlinked",
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            pristine_space_ids(&conn)
+                .await
+                .unwrap()
+                .contains(&"space-mark".to_string()),
+            "a fresh instantiation is pristine (the premise)"
+        );
+
+        // The insert fails on the primary key — a stand-in for every way a
+        // statement after the stamp can refuse (a full disk, a constraint a
+        // future column adds).
+        let taken = HUMAN_PARTICIPANT_ID;
+        let err = insert_participant(
+            &conn,
+            taken,
+            "space",
+            Some("space-mark"),
+            None,
+            "agent",
+            "Ada",
+            None,
+            None,
+            "explicit",
+            "member",
+            None,
+            2_000,
+        )
+        .await
+        .expect_err("inserting a participant at a taken id must fail");
+        assert!(matches!(err, AppError::Database { .. }), "{err:?}");
+
+        assert!(
+            !pristine_space_ids(&conn)
+                .await
+                .unwrap()
+                .contains(&"space-mark".to_string()),
+            "the space is marked anyway — the stamp precedes the statement it \
+             covers, so no interleaving can see a durable change beside an \
+             untouched space"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_instantiation_leaves_no_space_at_all() {
         let db = open_memory_fresh().await;

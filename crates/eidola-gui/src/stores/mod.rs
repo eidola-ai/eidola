@@ -271,6 +271,30 @@ pub struct StoresStub {
 ///
 /// No-op when there is no backend (stub mode).
 ///
+/// Whether **any write this client has issued about `space_id` is still
+/// outstanding** — the question the disposal of an untouched space has to ask
+/// before it fires (see [`SpacesStore::window_closed`]).
+///
+/// It lives here rather than on one store because the answer is spread across
+/// four owners and no one of them can see the others: the conversation's own
+/// saves and turns are the `Space` entity's (`post_runner`, `streams`,
+/// `turn_runners`), a rename or an archive is `SpacesStore`'s, the cascade
+/// limit and the router are `SpaceSettingsStore`'s, and the roster — adds,
+/// invites, overrides, removals, a share — is `ParticipantsStore`'s. A `bridge`
+/// call outlives the gpui task that issued it, so every one of these can be
+/// travelling to the database at the moment a window closes.
+///
+/// **Asked at the close, while everything is still alive to answer.** The
+/// entity dies with its last window, so afterwards there is nothing left to
+/// ask — which is exactly why the disposal cannot ask for itself. A stale
+/// `true` only keeps a space; a stale `false` cannot happen, because nothing
+/// can begin writing to a space whose last window has gone.
+pub fn space_writes_in_flight(stores: &Stores, space_id: &str, cx: &App) -> bool {
+    stores.spaces.read(cx).writes_in_flight(space_id)
+        || stores.space_settings.read(cx).writes_in_flight(space_id)
+        || stores.participants.read(cx).writes_in_flight(space_id)
+}
+
 /// Returns a [`BusBridge`] handle so the quit path can **stop the dispatch
 /// loop** before anything else — see [`BusBridge::quiesce`].
 pub fn install_bus_bridge(stores: &Stores, cx: &mut App) -> BusBridge {

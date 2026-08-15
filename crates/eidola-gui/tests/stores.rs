@@ -2261,6 +2261,14 @@ fn space_row_exists(core: &std::sync::Arc<AppCore>, space: &str) -> bool {
 ///
 /// The interleaving is staged rather than hoped for: creating and closing in
 /// one pass means the creation task has not been polled yet.
+///
+/// **The absence of the row proves nothing on its own here**, which is the
+/// trap this shape invites: the insert is deliberately unpolled, so the id
+/// names nothing at the moment the close arrives, and a bare "it is gone"
+/// would be satisfied by the state the test starts in. So both ends are
+/// observed instead — the deferral, taken while the row does not exist, and
+/// app-core's own report that it *deleted* a space under this id, which only a
+/// row that existed and was pristine can produce.
 #[gpui::test]
 fn a_window_closed_over_its_own_insert_still_leaves_nothing_behind(cx: &mut TestAppContext) {
     let (stores, _dir) = backed_stores(cx);
@@ -2273,18 +2281,33 @@ fn a_window_closed_over_its_own_insert_still_leaves_nothing_behind(cx: &mut Test
     drop(entity);
     stores
         .spaces
-        .update(cx, |s, cx| s.window_closed(space_id.clone(), cx));
+        .update(cx, |s, cx| s.window_closed(space_id.clone(), false, cx));
 
-    wait_until(
-        cx,
-        "the insert commits and the space is disposed of",
-        |_| !space_row_exists(&core, &space_id),
+    assert!(
+        !space_row_exists(&core, &space_id),
+        "the premise: the insert has not been polled, so there is no row yet"
+    );
+    assert!(
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.disposal_deferred_for_test(&space_id)),
+        "so the close defers rather than disposing of a space that is not there"
+    );
+
+    wait_until(cx, "the insert commits and the space is deleted", |cx| {
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.disposed_for_test().contains(&space_id))
+    });
+    assert!(
+        !space_row_exists(&core, &space_id),
+        "and the row it created is gone"
     );
     assert!(
         !stores
             .spaces
             .read_with(cx, |s, _| s.list().iter().any(|r| r.id == space_id)),
-        "and the Library index shows no residue"
+        "as is the Library index's residue"
     );
 }
 
@@ -2307,18 +2330,71 @@ fn a_space_a_window_took_back_is_not_disposed_of(cx: &mut TestAppContext) {
     // The close, and — before the disposal's task gets a turn — a reopen.
     stores
         .spaces
-        .update(cx, |s, cx| s.window_closed(space_id.clone(), cx));
+        .update(cx, |s, cx| s.window_closed(space_id.clone(), false, cx));
     let reopened = stores
         .spaces
         .update(cx, |s, cx| s.open(space_id.clone(), cx));
 
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    settle(cx);
     assert!(
         space_row_exists(&core, &space_id),
         "the conversation someone reopened is not an abandoned one"
     );
+    assert!(
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.disposed_for_test().is_empty()),
+        "and app-core was never asked to delete it"
+    );
     drop(reopened);
+}
+
+/// Give work that is *not* supposed to happen a real chance to happen.
+fn settle(cx: &mut TestAppContext) {
+    for _ in 0..8 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    cx.run_until_parked();
+}
+
+/// **A write already on its way to the database outranks the disposal.**
+///
+/// `bridge` cancels nothing core-side, so a save started a moment before the
+/// window closed is still travelling while the disposal reserves the writer. If
+/// the disposal gets there first the space is still pristine, so it goes — and
+/// the save then lands on nothing, with no window left to say so. That is a
+/// reader's words gone, which is the one outcome the whole feature exists to
+/// prevent, so the close refuses to dispose over any outstanding write.
+///
+/// The store's half: it honours the answer it is handed. (The answer itself is
+/// taken at the view's release — see `crates/eidola-gui/tests/behavior.rs`,
+/// `a_save_still_in_flight_holds_off_the_disposal`.)
+#[gpui::test]
+fn the_store_never_disposes_over_an_outstanding_write(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
+    let space_id = entity.read_with(cx, |s, _| s.id().to_string());
+    drop(entity);
+    wait_until(cx, "the space's row commits", |_| {
+        space_row_exists(&core, &space_id)
+    });
+
+    stores
+        .spaces
+        .update(cx, |s, cx| s.window_closed(space_id.clone(), true, cx));
+    settle(cx);
+
+    assert!(
+        space_row_exists(&core, &space_id),
+        "an untouched space is kept while anything is still writing to it"
+    );
+    assert!(
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.disposed_for_test().is_empty()),
+        "app-core was never asked"
+    );
 }
