@@ -131,7 +131,10 @@
 //! instantiation under a caller-minted id (`new_space_id`), the door the GUI
 //! takes to open a window on a space whose insert is still in flight, and a
 //! roster or settings read issued in that window answers "empty" / "no such
-//! space" until these announcements take it back. Covered by the
+//! space" until these announcements take it back. A **refused** instantiation
+//! emits nothing and leaves nothing: the whole body is one transaction
+//! (`db::instantiate_template`), so the announcements and the durable state
+//! agree on every exit. Covered by the
 //! `*_emit_participants` / `*_emits_templates` /
 //! `space_born_with_template_participants` /
 //! `create_space_with_id_emits_space_index_under_the_given_id` tests below.

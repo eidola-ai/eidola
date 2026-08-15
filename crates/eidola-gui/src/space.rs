@@ -477,6 +477,17 @@ pub struct Space {
     /// Entries are **addressed** (see [`PendingOffer::to`]) because "which
     /// window" has to mean "the one the reader is looking at".
     offered_quotes: std::collections::VecDeque<PendingOffer>,
+    /// The row this space is being created under, while that insert is still
+    /// in flight (or once it has been refused) — see [`Creation`].
+    ///
+    /// Its whole purpose is to **order the first save against the insert**.
+    /// The two are independent work on one runtime, so without it a Send
+    /// pressed in the frames after ⌘N can reach `post`'s space-existence check
+    /// first and be refused for a space that then exists perfectly well — and
+    /// the failure completion's reload takes the thought the reader had
+    /// already typed off the screen with it. Only *mutations* wait; the first
+    /// frame never does, which is what keeps the blank page instant.
+    creation: Option<Creation>,
     /// The windows currently drawing this space, in the order they opened.
     ///
     /// A space is *not* a singleton on screen (see the GUI AGENTS.md window
@@ -486,6 +497,17 @@ pub struct Space {
     /// a handle whose window has gone is dropped by [`Space::open_windows`],
     /// the only reader, which answers against `cx.windows()`.
     windows: Vec<AnyWindowHandle>,
+}
+
+/// The state of the row a [`Space::created`] space is being written into.
+/// `None` on the entity means the row exists — the ordinary case, and the only
+/// one a reopened space is ever in.
+enum Creation {
+    /// The insert is in flight. Each entry is a save-side mutation that
+    /// started before it settled and is waiting the insert out.
+    Pending(Vec<oneshot::Sender<Result<(), AppError>>>),
+    /// The insert was refused: this id names no row, and never will.
+    Refused(AppError),
 }
 
 /// A quote waiting in the mailbox, and the window it is waiting *for*.
@@ -523,13 +545,16 @@ impl Space {
     /// by construction nothing durable to read — so the transcript starts
     /// answered-and-empty and the page is instant (STATE.md).
     ///
-    /// If that insert fails, [`Self::creation_failed`] replaces the empty
-    /// answer with the error, so the window says so instead of offering a
-    /// composer that would write nowhere.
+    /// The insert's outcome comes back through [`Self::creation_committed`] /
+    /// [`Self::creation_failed`]: the first releases the mutations that were
+    /// waiting it out, the second replaces the empty answer with the error, so
+    /// the window says so instead of offering a composer that would write
+    /// nowhere.
     pub fn created(app_core: Option<Arc<AppCore>>, id: String) -> Self {
         Self {
             app_core,
             id,
+            creation: Some(Creation::Pending(Vec::new())),
             transcript: Loadable::loaded(Vec::new()),
             streams: Vec::new(),
             next_turn_seq: 0,
@@ -552,6 +577,14 @@ impl Space {
         }
     }
 
+    /// The insert behind a [`Self::created`] space committed: the row exists,
+    /// so every mutation that was waiting it out is released.
+    pub fn creation_committed(&mut self, cx: &mut Context<Self>) {
+        self.settle_creation(Ok(()));
+        self.creation = None;
+        cx.notify();
+    }
+
     /// The insert behind a [`Self::created`] space failed: the id names no
     /// row, so there is no conversation to show and nothing a composer could
     /// write into.
@@ -560,14 +593,65 @@ impl Space {
     /// *read* of an existing space lands in — so the whole window reads it
     /// with no second mechanism: `transcript_visible` goes false (no tail
     /// composer minted against a space that does not exist), and the `Failed`
-    /// event raises the window's error band with what went wrong.
+    /// event raises the window's error band with what went wrong. Any mutation
+    /// waiting on the insert is released with the same error, so a Send that
+    /// raced it fails for the reason it actually failed.
     pub fn creation_failed(&mut self, error: AppError, cx: &mut Context<Self>) {
+        self.settle_creation(Err(error.clone()));
+        self.creation = Some(Creation::Refused(error.clone()));
         self.transcript = Loadable::Failed {
             error: error.clone(),
             prior: None,
         };
         cx.emit(SpaceEvent::Failed(error));
         cx.notify();
+    }
+
+    /// Hand the insert's outcome to everything waiting on it. A receiver whose
+    /// mutation has since been dropped is simply gone.
+    fn settle_creation(&mut self, outcome: Result<(), AppError>) {
+        if let Some(Creation::Pending(waiters)) = self.creation.take() {
+            for tx in waiters {
+                let _ = tx.send(outcome.clone());
+            }
+        }
+    }
+
+    /// What a save-side mutation must wait on before its own write leaves —
+    /// `None` when the row already exists, which is every case but the frames
+    /// between ⌘N and its insert committing.
+    ///
+    /// A **refused** creation answers immediately with the refusal, so a
+    /// mutation against a space that was never created fails at once rather
+    /// than waiting forever on a settle that has already happened.
+    fn creation_wait(&mut self) -> Option<oneshot::Receiver<Result<(), AppError>>> {
+        match self.creation.as_mut()? {
+            Creation::Pending(waiters) => {
+                let (tx, rx) = oneshot::channel();
+                waiters.push(tx);
+                Some(rx)
+            }
+            Creation::Refused(error) => {
+                let (tx, rx) = oneshot::channel();
+                let _ = tx.send(Err(error.clone()));
+                Some(rx)
+            }
+        }
+    }
+
+    /// Await what [`Self::creation_wait`] handed back, inside the mutation's
+    /// own task — never on the frame.
+    async fn await_creation(
+        wait: Option<oneshot::Receiver<Result<(), AppError>>>,
+    ) -> Result<(), AppError> {
+        let Some(rx) = wait else {
+            return Ok(());
+        };
+        rx.await.unwrap_or_else(|_| {
+            Err(AppError::Internal {
+                message: "the space's creation task was dropped before it settled".into(),
+            })
+        })
     }
 
     /// Construct a space bound to an existing id and kick off the initial
@@ -577,6 +661,7 @@ impl Space {
         let mut space = Self {
             app_core: app_core.clone(),
             id,
+            creation: None,
             transcript: Loadable::NotLoaded,
             streams: Vec::new(),
             next_turn_seq: 0,
@@ -1400,13 +1485,23 @@ impl Space {
         };
 
         let space_id = self.id.clone();
-        let rx = bridge::submit(app_core.clone(), prompt, space_id, reply_to, references);
+        let wait = self.creation_wait();
         self.post_runner = Some(cx.spawn(async move |this, cx| {
-            let outcome = rx.await.unwrap_or_else(|_| {
-                Err(AppError::Internal {
-                    message: "submit task cancelled".into(),
-                })
-            });
+            // The row this posts into may still be committing (⌘N, then Send).
+            // Waiting here rather than at the call site is what keeps the page
+            // instant: the draft was accepted on the frame, and only the write
+            // is ordered behind the insert.
+            if let Err(e) = Self::await_creation(wait).await {
+                let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
+                return;
+            }
+            let outcome = bridge::submit(app_core.clone(), prompt, space_id, reply_to, references)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AppError::Internal {
+                        message: "submit task cancelled".into(),
+                    })
+                });
             match outcome {
                 Ok(result) => {
                     let space_id = result.post.space_id.clone();
@@ -1501,13 +1596,19 @@ impl Space {
             return true;
         };
         let space_id = self.id.clone();
-        let rx = bridge::post(app_core.clone(), prompt, space_id, reply_to, references);
+        let wait = self.creation_wait();
         self.post_runner = Some(cx.spawn(async move |this, cx| {
-            let outcome = rx.await.unwrap_or_else(|_| {
-                Err(AppError::Internal {
-                    message: "post task cancelled".into(),
-                })
-            });
+            if let Err(e) = Self::await_creation(wait).await {
+                let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
+                return;
+            }
+            let outcome = bridge::post(app_core.clone(), prompt, space_id, reply_to, references)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AppError::Internal {
+                        message: "post task cancelled".into(),
+                    })
+                });
             Self::finish_reload(this, cx, app_core, outcome.map(|r| r.space_id)).await;
         }));
         true
@@ -1539,13 +1640,20 @@ impl Space {
         let Some(app_core) = self.app_core.clone() else {
             return true; // stub: no backend
         };
-        let rx = bridge::edit_post(app_core.clone(), action_id, new_prompt, remove_references);
+        let wait = self.creation_wait();
         self.post_runner = Some(cx.spawn(async move |this, cx| {
-            let outcome = rx.await.unwrap_or_else(|_| {
-                Err(AppError::Internal {
-                    message: "edit task cancelled".into(),
-                })
-            });
+            if let Err(e) = Self::await_creation(wait).await {
+                let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
+                return;
+            }
+            let outcome =
+                bridge::edit_post(app_core.clone(), action_id, new_prompt, remove_references)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(AppError::Internal {
+                            message: "edit task cancelled".into(),
+                        })
+                    });
             Self::finish_reload(this, cx, app_core, outcome.map(|r| r.space_id)).await;
         }));
         true
@@ -1570,13 +1678,19 @@ impl Space {
         let Some(app_core) = self.app_core.clone() else {
             return true; // stub: no backend
         };
-        let rx = bridge::regenerate(app_core.clone(), action_id, model);
+        let wait = self.creation_wait();
         self.post_runner = Some(cx.spawn(async move |this, cx| {
-            let outcome = rx.await.unwrap_or_else(|_| {
-                Err(AppError::Internal {
-                    message: "regenerate task cancelled".into(),
-                })
-            });
+            if let Err(e) = Self::await_creation(wait).await {
+                let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
+                return;
+            }
+            let outcome = bridge::regenerate(app_core.clone(), action_id, model)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AppError::Internal {
+                        message: "regenerate task cancelled".into(),
+                    })
+                });
             Self::finish_reload(this, cx, app_core, outcome.map(|r| r.space_id)).await;
         }));
         true

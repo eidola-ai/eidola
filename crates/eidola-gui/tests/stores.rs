@@ -1955,6 +1955,107 @@ fn a_participants_change_arriving_mid_operation_is_replayed(cx: &mut TestAppCont
     });
 }
 
+/// A ⌘N space's row commits behind its window, and the very first Send must
+/// not race it.
+///
+/// The store's insert and the entity's post are independent work on the same
+/// runtime, so nothing but an explicit wait orders them — and losing that race
+/// is not a delay, it is a loss: `post` refuses with "space not found", the
+/// failure completion reloads the transcript, and the thought the reader had
+/// already typed disappears from a space that then exists perfectly well.
+///
+/// The interleaving is staged rather than hoped for: creating and submitting in
+/// the same pass means the creation task has not been polled yet, so its insert
+/// has not reached the runtime when the post's does.
+#[gpui::test]
+fn a_first_post_into_a_brand_new_space_waits_out_its_insert(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let space = stores.spaces.update(cx, |s, cx| s.create(cx));
+    let accepted = space.update(cx, |s, cx| {
+        s.submit("The tide is the moon's doing.".into(), None, Vec::new(), cx)
+    });
+    assert!(accepted, "the composer's first post is accepted");
+    let space_id = space.read_with(cx, |s, _| s.id().to_string());
+
+    wait_until(
+        cx,
+        "the post lands durably in the space ⌘N created",
+        |_| {
+            core.runtime()
+                .block_on(core.get_space_messages(space_id.clone()))
+                .is_ok_and(|m| m.len() == 1)
+        },
+    );
+    space.read_with(cx, |s, _| {
+        assert_eq!(
+            s.messages().len(),
+            1,
+            "and the thought the reader typed is still on screen"
+        );
+    });
+}
+
+/// The mirror of the test above: a save into a space whose creation was
+/// **refused** fails at once with that refusal, rather than waiting forever on
+/// a settle that has already happened — or writing into whatever the id turns
+/// out to name.
+#[gpui::test]
+fn a_post_into_a_space_that_was_never_created_is_refused(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let space = stores.spaces.update(cx, |s, cx| s.create(cx));
+    let space_id = space.read_with(cx, |s, _| s.id().to_string());
+    stores.spaces.update(cx, |s, cx| {
+        s.fail_creation_for_test(
+            &space_id,
+            eidola_app_core::error::AppError::Database {
+                message: "disk is full".into(),
+            },
+            cx,
+        )
+    });
+
+    // The insert this test countermands still lands (nothing cancels a `bridge`
+    // call), so the id really does name a row — which is what makes "the post
+    // was not written" a statement about the refusal rather than about a
+    // missing space.
+    wait_until(cx, "the underlying row commits", |_| {
+        core.runtime()
+            .block_on(core.list_spaces(false))
+            .is_ok_and(|spaces| spaces.iter().any(|s| s.id == space_id))
+    });
+
+    assert!(
+        space.update(cx, |s, cx| s.submit(
+            "into thin air".into(),
+            None,
+            Vec::new(),
+            cx
+        )),
+        "the draft is still accepted — the refusal is reported, not guessed at"
+    );
+    for _ in 0..40 {
+        cx.run_until_parked();
+        if !space.read_with(cx, |s, _| s.is_busy()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        !space.read_with(cx, |s, _| s.is_busy()),
+        "the save settles instead of waiting on a creation that already failed"
+    );
+    assert!(
+        core.runtime()
+            .block_on(core.get_space_messages(space_id))
+            .is_ok_and(|m| m.is_empty()),
+        "and nothing was written"
+    );
+}
+
 /// REGRESSION (Codex review, PR #292, round 3): the deferral above has to reach
 /// a space that was created a moment ago and whose first save is in flight.
 ///
