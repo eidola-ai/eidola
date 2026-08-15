@@ -3504,12 +3504,11 @@ fn respond_stream_failure_keeps_single_post() {
 }
 
 // ===========================================================================
-// Setup-failure wrapping: a `prepare_turn` failure (e.g. the `/v1/models`
-// fetch the PR #218 screenshot failed on) happens *before* the turn's inline
-// `wrap` closure — it must still carry the persisted space id, or a blank
-// GUI space can't adopt its id (Retry suppressed; a follow-up strands a
-// second space). Both transports share the fix (the wrapped prepare_turn
-// call), so both are asserted.
+// Setup failures: a `prepare_turn` failure (e.g. the `/v1/models` fetch the
+// PR #218 screenshot failed on) happens after `post` has already committed the
+// user's turn, so the saved thought survives it and exactly one space stands —
+// never a stranded second one. Both transports share the path, so both are
+// asserted.
 // ===========================================================================
 
 #[test]

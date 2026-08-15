@@ -1308,11 +1308,8 @@ fn space_error_notice_exposes_recovery_probes(cx: &mut TestAppContext) {
             s.apply_turn_failure_for_test(
                 "agent-1",
                 "a1",
-                eidola_app_core::error::AppError::ChatFailed {
-                    space_id: "s".into(),
-                    source: Box::new(eidola_app_core::error::AppError::Network {
-                        message: "dns error".into(),
-                    }),
+                eidola_app_core::error::AppError::Network {
+                    message: "dns error".into(),
                 },
                 cx,
             )

@@ -809,10 +809,10 @@ impl SpaceView {
     ) -> Self {
         let focus_handle = cx.focus_handle();
 
-        // A brand-new (blank ⌘N) space opens with the composer ready — the
-        // cursor at the top of an empty notebook. A reopened space with history
-        // opens **without** a composer: you start one by clicking a band's "+".
-        let is_blank = space_id.is_none();
+        // A brand-new (⌘N) space opens with the composer ready — the cursor at
+        // the top of an empty notebook. A reopened space opens **without** a
+        // composer: you start one by clicking a band's "+".
+        let opens_composing = space_id.is_none();
 
         // Get-or-create the shared `Space` through the registry (join-existing).
         let spaces = stores.spaces.clone();
@@ -979,8 +979,8 @@ impl SpaceView {
         this.ensure_participants(cx);
         // Name the window before its first frame; the observer keeps it current.
         this.sync_window_title(window, cx);
-        if is_blank {
-            // The blank notebook: a root draft, focused and ready.
+        if opens_composing {
+            // The new notebook: a root draft, focused and ready.
             this.create_draft(None, window, cx);
         } else {
             // No composer yet — focus the root so action dispatch still works.

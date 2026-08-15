@@ -652,6 +652,31 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_new_inspector",
+                description: "Space view: a brand-new (⌘N) space with zero posts — its Participants section is live from birth, because the space is created when its window opens",
+                default_size: size(px(1040.), px(760.)),
+                build: |window, cx| {
+                    let stores = inspector_stores(cx, None);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(stores.clone(), None, WindowInput::new(cx), window, cx)
+                    });
+                    // ⌘N mints the id, so the fixtures are seeded onto the
+                    // space this window just created rather than a constant.
+                    let space_id = view.read(cx).space().read(cx).id().to_string();
+                    stores.participants.update(cx, |p, _| {
+                        p.seed_for_test(&space_id, participants_fixture().1)
+                    });
+                    stores.space_settings.update(cx, |s, _| {
+                        s.seed_for_test(&space_id, eidola_app_core::SpaceSettings::default())
+                    });
+                    view.update(cx, |v, cx| {
+                        v.set_inspector_open_for_test(true, window, cx);
+                        v.inspector_toggle_participant("agent-assistant", window, cx);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_inspector_share_agent",
                 description: "Space view: the inspector's Participants section with a space-owned agent's disclosure open and its share confirmation armed — the one-way promote affordance (task 36)",
                 default_size: size(px(1040.), px(760.)),

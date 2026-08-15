@@ -5,9 +5,8 @@
 //! conversation: the transcript (`Loadable<Vec<ChatMessageView>>`), the live
 //! streaming turns, and the space id — which it has from birth, because a
 //! space is created durably when its window opens. It is created and shared
-//! through
-//! [`crate::stores::SpacesStore`]'s registry, so **two windows on the same
-//! space hold the same entity** — a submit/stream in one window appears in the
+//! through [`crate::stores::SpacesStore`]'s registry, so **two windows on the
+//! same space hold the same entity** — a submit/stream in one window appears in the
 //! other, structurally (the wave-2 bug-4 fix).
 //!
 //! Tasks-as-fields, per the doctrine:
@@ -600,34 +599,6 @@ impl Space {
         };
         space.load_transcript(cx);
         space
-    }
-
-    /// A stub space with a fixture transcript (tests). No backend, so async
-    /// methods early-return after the local mutation.
-    pub fn stub(id: String, messages: Vec<ChatMessageView>) -> Self {
-        Self {
-            app_core: None,
-            id,
-            transcript: Loadable::loaded(messages),
-            streams: Vec::new(),
-            next_turn_seq: 0,
-            last_submitted_model: None,
-            last_submitted_references: Vec::new(),
-            last_edit_removals: Vec::new(),
-            last_edit_text: String::new(),
-            post_runner: None,
-            turn_runners: HashMap::new(),
-            failed_turn: None,
-            load_task: None,
-            pending_transcript_refresh: false,
-            incoming_refs: HashMap::new(),
-            incoming_ref_tasks: HashMap::new(),
-            traces: Loadable::NotLoaded,
-            traces_task: None,
-            traces_expanded: std::collections::HashSet::new(),
-            offered_quotes: std::collections::VecDeque::new(),
-            windows: Vec::new(),
-        }
     }
 
     // -- Readers -----------------------------------------------------------
@@ -1495,8 +1466,8 @@ impl Space {
     /// Save a post **quietly** — no notification plan, nobody is asked to
     /// respond (`⌘⇧↩` / the ⌥-revealed "Post quietly"). Appends the user's
     /// turn and persists it via `AppCore::post`; on completion the transcript
-    /// reloads from the tree and a blank space adopts its new id. Returns
-    /// `true` if accepted, `false` if a no-op (empty / busy).
+    /// reloads from the tree. Returns `true` if accepted, `false` if a no-op
+    /// (empty / busy).
     /// `references`: see [`Self::submit`].
     pub fn post_only(
         &mut self,
@@ -2140,10 +2111,9 @@ impl Space {
 
     /// Test-only: drive the exclusive-mutation failure completion exactly as
     /// the post/edit/regenerate runners' error arms do (they delegate to the
-    /// same [`Self::fail_mutation`]): adopt the id from a `ChatFailed` wrapper
-    /// if the space is still blank, clear synthetic streams, restart the
-    /// transcript load, and emit `Failed` with the unwrapped source. Drives
-    /// the blank-space id-adoption and failure-restarts-load regressions.
+    /// same [`Self::fail_mutation`]): clear synthetic streams, restart the
+    /// transcript load, and emit `Failed`. Drives the
+    /// failure-restarts-the-superseded-load regression.
     #[doc(hidden)]
     pub fn apply_chat_failure_for_test(&mut self, error: AppError, cx: &mut Context<Self>) {
         self.fail_mutation(error, cx);

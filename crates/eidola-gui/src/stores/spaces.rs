@@ -43,6 +43,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use eidola_app_core::error::AppError;
 use eidola_app_core::{AppCore, SpaceInfo};
 use gpui::{AppContext, Context, Entity, Task, WeakEntity};
 
@@ -262,7 +263,6 @@ impl SpacesStore {
         let Some(core) = app_core else {
             return entity; // stub stores (tests): nothing to persist against
         };
-        let weak = entity.downgrade();
         let key = id.clone();
         self.instantiations.insert(
             id.clone(),
@@ -274,18 +274,7 @@ impl SpacesStore {
                 let _ = this.update(cx, |this, cx| {
                     this.instantiations.remove(&key);
                     if let Err(e) = result {
-                        // No row, so no space: drop the key rather than leave
-                        // the registry pointing at a conversation that does not
-                        // exist, and let the window say what happened.
-                        this.registry.remove(&key);
-                        this.record_op_error(
-                            Some(key.clone()),
-                            format!("Couldn't create the space: {e}"),
-                        );
-                        if let Some(space) = weak.upgrade() {
-                            space.update(cx, |space, cx| space.creation_failed(e, cx));
-                        }
-                        cx.notify();
+                        this.fail_creation(&key, e, cx);
                     }
                     // The success arm needs nothing: the write emitted
                     // `Change::SpaceIndex`, which refreshes the index the
@@ -294,6 +283,40 @@ impl SpacesStore {
             }),
         );
         entity
+    }
+
+    /// The insert behind [`Self::create`] was refused: there is no space, so
+    /// there is no registry entry either. Dropping the key is what keeps the
+    /// registry a map of conversations that exist — a later `open` of that id
+    /// would otherwise join an entity standing on an error. The entity itself
+    /// is told, because its window is what has to say so.
+    fn fail_creation(&mut self, space_id: &str, error: AppError, cx: &mut Context<Self>) {
+        let entity = self
+            .registry
+            .remove(space_id)
+            .and_then(|weak| weak.upgrade());
+        self.record_op_error(
+            Some(space_id.to_string()),
+            format!("Couldn't create the space: {error}"),
+        );
+        if let Some(space) = entity {
+            space.update(cx, |space, cx| space.creation_failed(error, cx));
+        }
+        cx.notify();
+    }
+
+    /// Test seam: drive the production creation-failure arm. A local DB insert
+    /// cannot be made to fail through the real seam (the same reason
+    /// [`Self::settle_for_test`] exists), so this is how that quadrant is
+    /// reachable from a test.
+    #[doc(hidden)]
+    pub fn fail_creation_for_test(
+        &mut self,
+        space_id: &str,
+        error: AppError,
+        cx: &mut Context<Self>,
+    ) {
+        self.fail_creation(space_id, error, cx);
     }
 
     /// **Every live `Space` this store knows of** — the registry, minus the

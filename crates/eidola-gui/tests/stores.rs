@@ -246,18 +246,19 @@ fn wait_for_backends(
 /// The space-entity registry's join-existing semantics: two `open` calls for
 /// the same id return the *same* `Space` entity (so two windows on one space
 /// share one transcript + streaming buffer — wave-2 bug 4), while a different
-/// id and each `blank()` yield distinct entities.
+/// id and each `create()` yield distinct entities — two ⌘N windows are two
+/// conversations, each with its own id from birth.
 #[gpui::test]
-fn spaces_registry_joins_existing_and_blanks_are_distinct(cx: &mut TestAppContext) {
+fn spaces_registry_joins_existing_and_new_spaces_are_distinct(cx: &mut TestAppContext) {
     let store = cx.update(|cx| cx.new(|_| SpacesStore::stub(Vec::new())));
 
-    let (a1, a2, b, blank1, blank2) = store.update(cx, |s, cx| {
+    let (a1, a2, b, new1, new2) = store.update(cx, |s, cx| {
         (
             s.open("space-a".into(), cx),
             s.open("space-a".into(), cx),
             s.open("space-b".into(), cx),
-            s.blank(cx),
-            s.blank(cx),
+            s.create(cx),
+            s.create(cx),
         )
     });
 
@@ -272,14 +273,19 @@ fn spaces_registry_joins_existing_and_blanks_are_distinct(cx: &mut TestAppContex
         "distinct ids get distinct entities"
     );
     assert_ne!(
-        blank1.entity_id(),
-        blank2.entity_id(),
-        "each blank (⌘N) is its own id-less space until adopted"
+        new1.entity_id(),
+        new2.entity_id(),
+        "each ⌘N is its own space"
     );
-    assert!(
-        blank1.read_with(cx, |sp, _| sp.id().is_none()),
-        "a blank space starts id-less"
+    let (id1, id2) = (
+        new1.read_with(cx, |sp, _| sp.id().to_string()),
+        new2.read_with(cx, |sp, _| sp.id().to_string()),
     );
+    assert_ne!(id1, id2, "and each carries its own id from birth");
+    // Registered under that id at once, which is what makes every store-wide
+    // broadcast reach a brand-new space by ordinary membership.
+    let rejoined = store.update(cx, |s, cx| s.open(id1, cx));
+    assert_eq!(rejoined.entity_id(), new1.entity_id());
 }
 
 /// A mutation cancels any in-flight transcript load when it is accepted
@@ -1950,44 +1956,53 @@ fn a_participants_change_arriving_mid_operation_is_replayed(cx: &mut TestAppCont
 }
 
 /// REGRESSION (Codex review, PR #292, round 3): the deferral above has to reach
-/// a space that is **not in the registry yet**.
+/// a space that was created a moment ago and whose first save is in flight.
 ///
-/// A ⌘N blank lives only in `pending_blanks` until its first post earns an id
-/// (`SpacesStore::blank` deliberately keeps it there), and that pending window
-/// is exactly when its transcript is read: the save's own `get_space_tree` is
-/// several reads, so a rename committing while they run is captured by none of
-/// them. The `Change::Participants` announcing it then arrived while the space
-/// was still id-less — and a registry-only broadcast never reached that entity
-/// at all, so no debt was recorded, and the space was adopted into the registry
-/// carrying the pre-rename names with nothing left to correct them.
-///
-/// The two halves are both under test here: the store must *deliver* the
-/// invalidation to a pending blank, and the entity must *keep* it across the id
-/// adoption (adoption moves a weak handle between collections and touches no
-/// entity state, so the debt outlives it and the exit that assigns the id is
-/// the one that discharges it).
+/// That window is exactly when a brand-new space's transcript is read — the
+/// save's own `get_space_tree` is several reads, so a rename committing while
+/// they run is captured by none of them — and the `Change::Participants`
+/// announcing it arrives while the space is still busy. The delivery half is
+/// now structural: `SpacesStore::create` registers the entity under its id in
+/// the same breath as it mints it, so a store-wide broadcast reaches it by
+/// ordinary registry membership rather than by a second collection anyone
+/// could forget to sweep. The keeping half is still the entity's: the busy
+/// gate defers rather than discards, and the save's exit replays it.
 #[gpui::test]
-fn a_participants_change_reaches_a_blank_space_still_earning_its_id(cx: &mut TestAppContext) {
+fn a_participants_change_reaches_a_brand_new_space_mid_save(cx: &mut TestAppContext) {
     let (stores, _dir) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
-    // The space this blank's first save is about to persist into.
-    let posted = core
-        .runtime()
-        .block_on(core.post("The tide is the moon's doing.".into(), None))
-        .expect("post");
-
-    // A ⌘N blank: id-less, and held outside the registry until it earns one.
-    let space = stores.spaces.update(cx, |s, cx| s.blank(cx));
-    space.read_with(cx, |s, _| {
-        assert!(s.id().is_none(), "a blank has no id to be registered under")
+    // ⌘N: the id is minted here and the row commits behind the window.
+    let space = stores.spaces.update(cx, |s, cx| s.create(cx));
+    let space_id = space.read_with(cx, |s, _| s.id().to_string());
+    // The registry holds it from this frame — before the insert has landed.
+    let rejoined = stores
+        .spaces
+        .update(cx, |s, cx| s.open(space_id.clone(), cx));
+    assert_eq!(
+        rejoined.entity_id(),
+        space.entity_id(),
+        "a new space is an ordinary registry member from the first frame"
+    );
+    wait_until(cx, "the space's row commits", |_| {
+        core.runtime()
+            .block_on(core.list_spaces(false))
+            .is_ok_and(|spaces| spaces.iter().any(|s| s.id == space_id))
     });
+
+    // Its first post, which the entity's save is about to reload around.
+    core.runtime()
+        .block_on(core.post(
+            "The tide is the moon's doing.".into(),
+            Some(space_id.clone()),
+        ))
+        .expect("post");
 
     // Stage what the save's own multi-read tree query captured — the tree as it
     // read *before* the rename below commits.
     let captured = core
         .runtime()
-        .block_on(core.get_space_tree(posted.space_id.clone()))
+        .block_on(core.get_space_tree(space_id.clone()))
         .expect("tree");
     space.update(cx, |s, cx| {
         s.set_post_tree_for_test(captured, cx);
@@ -2003,11 +2018,10 @@ fn a_participants_change_reaches_a_blank_space_still_earning_its_id(cx: &mut Tes
         "the names the in-flight read captured"
     );
 
-    // The rename commits while the save runs, and its signal arrives while the
-    // space is still id-less.
+    // The rename commits while the save runs.
     core.runtime()
         .block_on(core.set_space_participant_override(
-            posted.space_id.clone(),
+            space_id.clone(),
             eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
             eidola_app_core::ParticipantOverride {
                 label: Some(Some("Skipper".into())),
@@ -2025,23 +2039,11 @@ fn a_participants_change_reaches_a_blank_space_still_earning_its_id(cx: &mut Tes
         "the busy gate still holds the reload off while the save runs"
     );
 
-    // The save lands: the id is adopted (the registry takes the space on the
-    // `StreamEnded` this emits) and the debt is discharged with it.
-    space.update(cx, |s, cx| s.adopt_id_for_test(posted.space_id.clone(), cx));
-    wait_until(cx, "the deferred invalidation survives adoption", |cx| {
+    // The save lands, and the debt it deferred is discharged with it.
+    space.update(cx, |s, cx| s.finish_save_for_test(cx));
+    wait_until(cx, "the deferred invalidation is replayed", |cx| {
         byline(cx).as_deref() == Some("Skipper")
     });
-
-    // And the adoption really happened — the same entity is now what the
-    // registry hands back for that id, so it is no longer a pending blank.
-    let reopened = stores
-        .spaces
-        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
-    assert_eq!(
-        reopened.entity_id(),
-        space.entity_id(),
-        "the blank was adopted rather than duplicated"
-    );
 }
 
 /// An identity switch must not leave the previous account's billing standing

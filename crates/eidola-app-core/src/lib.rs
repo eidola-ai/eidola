@@ -4128,7 +4128,17 @@ impl Inner {
         self.instantiate_default_space(&db_conn, space_id, title, now)
             .await?;
 
+        // Instantiation writes three things, and each one has a reader that may
+        // already be looking at this space: the listing (`SpaceIndex`), the
+        // membership rows (`Participants`), and the space row the per-space
+        // settings live on (`Space(id)`). The last two matter because a client
+        // can hold the id **before** the row exists — the GUI opens a ⌘N window
+        // addressed by the id it just minted and reads that space's roster and
+        // settings on the way — so a read issued before this commit answers
+        // "empty" or "no such space", and only an announcement takes it back.
         self.bus.emit(Change::SpaceIndex);
+        self.bus.emit(Change::Participants);
+        self.bus.emit(Change::Space(space_id.to_string()));
 
         Ok(SpaceInfo {
             id: space_id.to_string(),

@@ -124,9 +124,14 @@
 //! fresh space already carries its participants (the human "User" + the
 //! template's agents) — creation still emits only `SpaceIndex` (the
 //! participants are part of the space's birth, not a separate mutation).
-//! `create_space_with_id` is the same instantiation under a caller-minted id
-//! (`new_space_id`) — the door a client that opens a window before the row
-//! exists takes — and emits exactly what `create_space` does. Covered by the
+//! **Creation nonetheless emits all three of `SpaceIndex` + `Participants` +
+//! `Space(id)`**: instantiation writes the listing row, the membership rows and
+//! the space row the per-space settings live on, and a client can hold the id
+//! *before* any of them exist — `create_space_with_id` is the same
+//! instantiation under a caller-minted id (`new_space_id`), the door the GUI
+//! takes to open a window on a space whose insert is still in flight, and a
+//! roster or settings read issued in that window answers "empty" / "no such
+//! space" until these announcements take it back. Covered by the
 //! `*_emit_participants` / `*_emits_templates` /
 //! `space_born_with_template_participants` /
 //! `create_space_with_id_emits_space_index_under_the_given_id` tests below.
@@ -541,11 +546,17 @@ fn create_space_with_id_emits_space_index_under_the_given_id() {
             .unwrap();
         assert_eq!(info.id, id, "the space is created under the id given");
 
+        // Three announcements, one per thing instantiation wrote: the listing,
+        // the membership rows, and the space row the settings live on. The last
+        // two exist for a client holding the id before the row does.
         let changes = drain(&mut rx);
         assert_eq!(
             changes,
-            vec![Change::SpaceIndex],
-            "creation emits the listing change and nothing else"
+            vec![
+                Change::SpaceIndex,
+                Change::Participants,
+                Change::Space(id.clone()),
+            ],
         );
 
         let spaces = core.runtime().block_on(core.list_spaces(false)).unwrap();
