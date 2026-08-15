@@ -36,6 +36,7 @@
 //! {"cmd":"resize","window":1,"width":480,"height":700}
 //! {"cmd":"screenshot","window":1}                        // optional "path"
 //! {"cmd":"theme","mode":"night"}                         // or "day"; optional "character": cool|neutral|warm
+//! {"cmd":"locale","tag":"zh-Hans"}                       // en|es|fr|zh-Hans|zh-Hant
 //! {"cmd":"settle","ms":250}                              // advance test clock + park
 //! {"cmd":"close","window":1}
 //! {"cmd":"quit"}
@@ -84,6 +85,7 @@ mod driver {
         ParticipantReference, PriceInfo, SpaceInfo, SpaceMessage, SpaceTemplateInfo,
         SubscriptionInfo, SubscriptionState, TemplateParticipantInfo,
     };
+    use eidola_gui::about::AboutView;
     use eidola_gui::library::LibraryView;
     use eidola_gui::loadable::Loadable;
     use eidola_gui::onboarding::OnboardingView;
@@ -199,6 +201,12 @@ mod driver {
             /// (Sunrise/Sunset/Dawn/Dusk) that production derives from the
             /// sun.
             character: Option<String>,
+        },
+        /// Switch the display language to one of the shipped locales (`en`,
+        /// `es`, `fr`, `zh-Hans`, `zh-Hant`). The driver starts on the source
+        /// locale, exactly as tests do.
+        Locale {
+            tag: String,
         },
         Settle {
             ms: Option<u64>,
@@ -949,6 +957,15 @@ mod driver {
                 },
             },
             Scene {
+                name: "about",
+                description: "About window — the localization pilot surface; pair it with the `locale` command",
+                default_size: size(px(360.), px(420.)),
+                build: |window, cx| {
+                    let view = cx.new(|cx| AboutView::new(window, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "library",
                 description: "Library window with six spaces (hover/rename/archive)",
                 default_size: size(px(520.), px(620.)),
@@ -1416,6 +1433,7 @@ mod driver {
             time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
             light_character: eidola_app_core::config::LightCharacter::Neutral,
             font_scale: 1.0,
+            language: None,
         }
     }
 
@@ -2496,6 +2514,20 @@ mod driver {
                     }
                     cx.run_until_parked();
                     Ok(json!({}))
+                }
+
+                Cmd::Locale { tag } => {
+                    let known: Vec<&str> = eidola_gui::i18n::available_locales().collect();
+                    if !known.iter().any(|k| *k == tag) {
+                        return Err(format!("unknown locale \"{tag}\" ({})", known.join("|")));
+                    }
+                    cx.update(|cx| eidola_gui::i18n::apply(&tag, cx));
+                    for w in self.windows.values() {
+                        cx.update_window(w.handle, |_, window, _| window.refresh())
+                            .ok();
+                    }
+                    cx.run_until_parked();
+                    Ok(json!({ "locale": tag }))
                 }
 
                 Cmd::Settle { ms } => {

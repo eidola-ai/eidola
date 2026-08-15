@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod chrome;
 pub mod focus;
 pub mod general;
+pub mod i18n;
 pub mod library;
 pub mod lifecycle;
 pub mod loadable;
@@ -129,6 +130,9 @@ pub fn run_with(opts: LaunchOptions) {
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
         theme::install(cx);
+        // The source locale until `i18n::wire_config` below resolves the real
+        // one — the same install-then-wire shape the theme uses.
+        i18n::install(cx);
 
         let stores = Stores::new(cx);
 
@@ -144,6 +148,11 @@ pub fn run_with(opts: LaunchOptions) {
         // the clock's ~4h slot boundaries. `theme::install` above applied
         // the neutral defaults; this turns the circadian machinery on.
         theme::wire_config(&stores.config, cx);
+
+        // Resolve the display language: the persisted `language` preference if
+        // the reader set one, otherwise the OS's preferred languages negotiated
+        // against the locales this binary ships.
+        i18n::wire_config(&stores.config, cx);
 
         // Startup refreshes — each in its own store task slot, no shared
         // busy flag, so none can starve another (the wave-2 launch-order
@@ -206,6 +215,16 @@ pub fn run_with(opts: LaunchOptions) {
         // created / renamed / removed in Settings. App-lifetime observation
         // (the sanctioned detach); `install_menus` is idempotent.
         cx.observe(&stores.templates, |_, cx| install_menus(cx))
+            .detach();
+
+        // Re-apply the localized OS window titles when the active locale
+        // moves. A title is set once, at open, and lives outside any view's
+        // render — so unlike everything a view draws, it does not follow a
+        // locale change on its own. `i18n::apply` is the single path a locale
+        // changes through and it replaces the global, so observing the global
+        // catches every change without this file knowing how one is decided.
+        // App-lifetime observation (the sanctioned detach).
+        cx.observe_global::<i18n::Localization>(retitle_windows)
             .detach();
 
         // The menu-bar face — and, because it exists, the thing ⌘Q retires
@@ -826,6 +845,24 @@ fn base_window_options(
 #[cfg(not(target_os = "macos"))]
 const APP_ID: &str = "ai.eidola.app";
 
+/// Re-apply the localized OS window titles of the open singleton windows.
+///
+/// Only the About window is localized today; every other `open_*_window` still
+/// sets an English title, and each joins here as its surface is converted. A
+/// window that is not open is simply skipped — the next open reads the title
+/// from the accessor, so it is correct by construction.
+fn retitle_windows(cx: &mut App) {
+    if !cx.has_global::<AppGlobal>() {
+        return;
+    }
+    if let Some(handle) = cx.global::<AppGlobal>().about_window {
+        let title = i18n::msg::about_window_title(cx);
+        handle
+            .update(cx, |_, window, _| window.set_window_title(&title))
+            .ok();
+    }
+}
+
 /// Open the About window — a small singleton (~360×420). Shows the wordmark,
 /// version, a quiet purpose copy (echoing the welcome page's voice), the
 /// license note, and a "View on GitHub" link.
@@ -835,7 +872,7 @@ fn open_about_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        window.set_window_title("About Eidola");
+        window.set_window_title(&i18n::msg::about_window_title(cx));
         let view = cx.new(|cx| AboutView::new(window, cx));
         let view = chrome::ChromeRoot::wrap(view.into(), cx);
         cx.new(|cx| chrome::themed_root(view, window, cx))
