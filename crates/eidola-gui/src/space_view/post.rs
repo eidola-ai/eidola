@@ -519,21 +519,27 @@ impl SpaceView {
     /// offering what it knows would be refused.
     ///
     /// **A pure read, asked at render.** The two cells it reads land
-    /// asynchronously and their store observers only repaint — they do not
-    /// rebuild — so a verdict cached into the render snapshot would go on
-    /// offering verbs after the roster had answered. Loading is
-    /// [`Self::ensure_viewer_gate`]'s job; deciding is this one's, every frame.
+    /// asynchronously and their store observers repaint, so a verdict cached
+    /// into the render snapshot would go on offering verbs after the roster had
+    /// answered. Loading is [`Self::ensure_viewer_gate`]'s job; deciding is
+    /// this one's, every frame.
     ///
-    /// **Every unknown answers `true`.** A reader waiting a frame for a cell
-    /// must not lose their verbs: guessing wrong this way costs a refusal they
-    /// were going to get anyway (and, for Ask, one turn they meant to drive),
-    /// and the other way costs a working affordance that vanished.
+    /// **An unknown answers whichever way costs least, and that is not the same
+    /// answer twice:**
     ///
-    /// The roster decides it alone in every ordinary conversation, where the
-    /// human is a member. Only when the roster has answered and does *not*
-    /// carry the human is a second fact needed — is this an agent's
-    /// **notebook**, which the human is genuinely not a member of and may
-    /// nonetheless write in, a difference app-core draws deliberately.
+    /// * **The roster unanswered ⇒ may act.** It is the cell every window
+    ///   loads, it arrives with the conversation, and until it does there is no
+    ///   reason to suspect anything — an ordinary room, where the human is
+    ///   always a member, must never flicker its verbs on the way in.
+    /// * **The roster answered *without* the reader, the notebook cell
+    ///   unanswered ⇒ may not act.** This is the suspicious window and the only
+    ///   one, so it is the only place the doubt is worth paying for: the reader
+    ///   is provably not a member, and the sole thing that could still make
+    ///   acting legitimate is this being a notebook. Guessing "may act" here
+    ///   exposes an Ask that no one downstream will refuse, which is a billed
+    ///   inference; guessing "may not" costs a notebook's verbs for as long as
+    ///   one cell takes to answer, after which they come back. That trade is
+    ///   the whole reason the two unknowns answer differently.
     pub(crate) fn viewer_may_act(&self, cx: &gpui::App) -> bool {
         let id = self.space.read(cx).id();
         let Loadable::Loaded { value: roster, .. } =
@@ -549,7 +555,7 @@ impl SpaceView {
         }
         match self.stores.space_settings.read(cx).settings(id) {
             Loadable::Loaded { value, .. } => value.notebook_participant_id.is_some(),
-            _ => true,
+            _ => false,
         }
     }
 

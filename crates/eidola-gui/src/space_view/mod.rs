@@ -895,15 +895,28 @@ impl SpaceView {
                 cx.notify();
             }),
             // The space's participants feed the separator Ask menus, the
-            // streaming bylines, and the cascade notice's ask affordances.
-            cx.observe(&stores.participants, |_, _, cx| cx.notify()),
+            // streaming bylines, and the cascade notice's ask affordances —
+            // and the roster is the first half of the acting gate, so its
+            // arrival is what asks for the second (see `ensure_viewer_gate`).
+            // Repainting alone would leave that request unmade: nothing else
+            // here rebuilds, so the gate could sit on "unknown" for the life of
+            // the window.
+            cx.observe(&stores.participants, |this: &mut Self, _, cx| {
+                this.ensure_viewer_gate(cx);
+                cx.notify();
+            }),
             // This space's own settings are the inspector's rows. Every one of
             // this store's announcements is asynchronous — the panel's opening
             // `ensure` load completing or failing, each write's re-read, a bus
             // `Change::Space` refresh — and none of them is accompanied by
             // anything else that would repaint this window, so without this the
             // panel could sit on "Loading…" until an unrelated event redrew it.
-            cx.observe(&stores.space_settings, |_, _, cx| cx.notify()),
+            cx.observe(&stores.space_settings, |this: &mut Self, _, cx| {
+                // Also the acting gate's second cell: a failed load leaves it
+                // unanswered, and only another attempt can end that.
+                this.ensure_viewer_gate(cx);
+                cx.notify();
+            }),
             // Local models feed the request panel (a load/unload while it's
             // open must re-render — offline, the models store is quiet, so
             // this is the *only* signal that would refresh it) *and* the
@@ -1679,7 +1692,18 @@ impl SpaceView {
                 // participant label; split it into the human display pair
                 // (model name over backend name) for the gutter. Everything
                 // else ("You", "Error") passes through with no sub-line.
-                let (byline, byline_backend) = if m.message.role == "assistant" {
+                //
+                // **A recorded model is what earns that chrome**, not the
+                // column. An agent-authored `brief` renders as an assistant
+                // because its author is an agent, but nothing was requested for
+                // it — no model, no backend, no spend — so reading its byline
+                // as a model reference would name a serving backend that never
+                // served it (and `parse_model_ref` would happily take the
+                // author's own label for one). It keeps the column and its
+                // author's plain byline. The accessible label and the backend
+                // chip both derive from `byline_backend`, so both follow.
+                let (byline, byline_backend) = if m.message.role == "assistant" && m.model.is_some()
+                {
                     let (name, backend) = self.model_display(&m.byline, cx);
                     (name, Some(backend))
                 } else {
