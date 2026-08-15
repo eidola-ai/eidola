@@ -57,11 +57,53 @@
 //!     to fill.
 //! 13. **No duplicate message or term ids.** A later definition silently shadows
 //!     the earlier one, so it is refused instead.
+//! 14. **No message may resolve past Fluent's placeable limit**
+//!     ([`MAX_PLACEABLES`]). The resolver counts placeables *through* reference
+//!     expansion on one per-format counter and bails at 100, returning the
+//!     message truncated or with raw ids in it — so a legal, acyclic chain that
+//!     doubles (`a = { b }{ b }`) still breaks. The count is computed through
+//!     the merged view with the resolver's own semantics: one per pattern
+//!     element, references paying their own cost with multiplicity, and a select
+//!     paying only its worst variant.
 
 use std::collections::{BTreeMap, HashSet};
 
 use fluent_syntax::ast;
 use fluent_syntax::parser;
+
+/// The most placeables fluent-bundle will resolve in one `format_pattern` call
+/// before it bails out.
+///
+/// Mirrors `MAX_PLACEABLES` in fluent-bundle 0.16's `src/resolver/pattern.rs`.
+/// The counter lives on the per-call `Scope` (starting at zero, incremented once
+/// per `PatternElement::Placeable` *written*) and the resolver trips on
+/// `> MAX_PLACEABLES` — so exactly this many resolve, and one more does not.
+/// It exists to stop Billion Laughs / quadratic blowup, and it counts through
+/// reference expansion: a referenced message's placeables are written on the
+/// same scope and add to the same total.
+pub const MAX_PLACEABLES: u32 = 100;
+
+/// A pattern's resolved placeable count, kept as a *sum of parts* because what a
+/// reference costs depends on which locale's merged view resolves it.
+///
+/// The shape mirrors the resolver exactly: each `PatternElement::Placeable` is
+/// one, a message or term reference adds whatever its own pattern costs (with
+/// multiplicity — `{ a } { a }` pays twice), and a select adds only the variant
+/// actually written, which statically means the **worst** one. A placeable
+/// nested inside an expression (`{ { -brand } }`) is written through rather than
+/// counted as a pattern element, so it adds nothing of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Cost {
+    /// `PatternElement::Placeable`s in this pattern itself.
+    own: u32,
+    /// Messages referenced, in order and with repeats — each adds its own cost.
+    messages: Vec<String>,
+    /// Terms referenced, in order and with repeats.
+    terms: Vec<String>,
+    /// One entry per select expression: the costs of its variants, of which the
+    /// maximum is what this pattern could pay.
+    selects: Vec<Vec<Cost>>,
+}
 
 /// One message, reduced to what codegen needs. Everything here is **direct** —
 /// what this message's own body says — because what a reference resolves to
@@ -79,6 +121,8 @@ pub struct MessageDef {
     pub terms: Vec<String>,
     /// A one-line rendering of the value, for the accessor's doc comment.
     pub preview: String,
+    /// This message's resolved placeable count, unevaluated (see [`Cost`]).
+    pub cost: Cost,
 }
 
 /// One term of a locale. A term body may not read variables or reference
@@ -91,6 +135,8 @@ pub struct TermDef {
     pub id: String,
     /// Term ids this term references directly.
     pub terms: Vec<String>,
+    /// This term's resolved placeable count, unevaluated (see [`Cost`]).
+    pub cost: Cost,
 }
 
 /// One shipped locale: its tag, its concatenated FTL source, its messages, and
@@ -253,6 +299,7 @@ pub fn parse_locale(tag: &str, source: &str) -> Result<LocaleDef, String> {
                     refs: refs.messages,
                     terms: refs.terms,
                     preview: preview(pattern),
+                    cost: cost_of_pattern(pattern),
                 });
             }
             ast::Entry::Term(term) => {
@@ -298,6 +345,7 @@ pub fn parse_locale(tag: &str, source: &str) -> Result<LocaleDef, String> {
                 terms.push(TermDef {
                     id: term.id.name.to_string(),
                     terms: refs.terms,
+                    cost: cost_of_pattern(&term.value),
                 });
             }
             ast::Entry::Junk { content } => {
@@ -350,6 +398,124 @@ fn walk_term(id: &str, view: &MergedView, stack: &mut Vec<String>) -> Result<(),
     Ok(())
 }
 
+/// Build a pattern's [`Cost`] by mirroring the resolver's own traversal.
+///
+/// Deliberately a second walk rather than a rider on [`walk_pattern`]: that one
+/// deduplicates what it collects (a name is either referenced or it is not),
+/// while counting has to keep every repeat and every nesting level.
+fn cost_of_pattern(pattern: &ast::Pattern<&str>) -> Cost {
+    let mut cost = Cost::default();
+    for element in &pattern.elements {
+        if let ast::PatternElement::Placeable { expression } = element {
+            // The resolver increments once per pattern element it writes.
+            cost.own += 1;
+            add_expression_cost(expression, &mut cost);
+        }
+    }
+    cost
+}
+
+fn add_expression_cost(expr: &ast::Expression<&str>, cost: &mut Cost) {
+    match expr {
+        ast::Expression::Inline(inline) => add_inline_cost(inline, cost),
+        ast::Expression::Select { selector, variants } => {
+            // The selector is resolved to a value, and resolving shares the
+            // scope — so anything it expands is counted too.
+            add_inline_cost(selector, cost);
+            cost.selects
+                .push(variants.iter().map(|v| cost_of_pattern(&v.value)).collect());
+        }
+    }
+}
+
+fn add_inline_cost(inline: &ast::InlineExpression<&str>, cost: &mut Cost) {
+    match inline {
+        ast::InlineExpression::MessageReference { id, .. } => {
+            cost.messages.push(id.name.to_string())
+        }
+        ast::InlineExpression::TermReference { id, arguments, .. } => {
+            cost.terms.push(id.name.to_string());
+            if let Some(arguments) = arguments {
+                for positional in &arguments.positional {
+                    add_inline_cost(positional, cost);
+                }
+                for named in &arguments.named {
+                    add_inline_cost(&named.value, cost);
+                }
+            }
+        }
+        // Written through rather than counted: only a `PatternElement` is a
+        // placeable as far as the resolver's counter is concerned.
+        ast::InlineExpression::Placeable { expression } => add_expression_cost(expression, cost),
+        // Literals and variables resolve to a value with no pattern behind them;
+        // function references are refused outright.
+        ast::InlineExpression::StringLiteral { .. }
+        | ast::InlineExpression::NumberLiteral { .. }
+        | ast::InlineExpression::VariableReference { .. }
+        | ast::InlineExpression::FunctionReference { .. } => {}
+    }
+}
+
+/// Memoized resolved costs for one merged view. Required, not an optimization:
+/// a doubling chain (`a = { b }{ b }`) is exponential to evaluate naively, and
+/// that shape is precisely what the limit exists to catch.
+#[derive(Default)]
+struct CostMemo {
+    messages: BTreeMap<String, u32>,
+    terms: BTreeMap<String, u32>,
+}
+
+/// The placeables `id` resolves to in `view`. Saturating throughout: an
+/// adversarial chain overflows any width, and every value past the limit is
+/// equally refused.
+fn resolved_placeables(id: &str, view: &MergedView, memo: &mut CostMemo) -> u32 {
+    if let Some(known) = memo.messages.get(id) {
+        return *known;
+    }
+    let total = match view.message(id) {
+        // Reachability is validated before this runs, so a miss is not ours to
+        // report; count it as free rather than inventing a second error for it.
+        None => 0,
+        Some(message) => eval_cost(&message.cost.clone(), view, memo),
+    };
+    memo.messages.insert(id.to_string(), total);
+    total
+}
+
+fn resolved_term_placeables(id: &str, view: &MergedView, memo: &mut CostMemo) -> u32 {
+    if let Some(known) = memo.terms.get(id) {
+        return *known;
+    }
+    let total = match view.term(id) {
+        None => 0,
+        Some(term) => eval_cost(&term.cost.clone(), view, memo),
+    };
+    memo.terms.insert(id.to_string(), total);
+    total
+}
+
+fn eval_cost(cost: &Cost, view: &MergedView, memo: &mut CostMemo) -> u32 {
+    let mut total = cost.own;
+    for id in &cost.messages {
+        total = total.saturating_add(resolved_placeables(id, view, memo));
+    }
+    for id in &cost.terms {
+        total = total.saturating_add(resolved_term_placeables(id, view, memo));
+    }
+    for variants in &cost.selects {
+        // Exactly one variant is ever written, so the static bound is the worst
+        // of them: a message that only exceeds under one selection still breaks
+        // for whoever selects it.
+        let worst = variants
+            .iter()
+            .map(|variant| eval_cost(variant, view, memo))
+            .max()
+            .unwrap_or(0);
+        total = total.saturating_add(worst);
+    }
+    total
+}
+
 /// Everything this locale ships resolves through the view it will be formatted
 /// in — `primary` overriding `base`, or `base: None` for the source locale
 /// itself.
@@ -365,6 +531,21 @@ pub fn check_locale(primary: &LocaleDef, base: Option<&LocaleDef>) -> Result<(),
     }
     for term in &primary.terms {
         walk_term(&term.id, &view, &mut Vec::new())?;
+    }
+    // Only after the walks above: they refuse the cycles that would make the
+    // cost of a message undefined, so the traversal below is finite by then.
+    let mut memo = CostMemo::default();
+    for message in &primary.messages {
+        let resolved = resolved_placeables(&message.id, &view, &mut memo);
+        if resolved > MAX_PLACEABLES {
+            return Err(format!(
+                "{}: message `{}` resolves to {resolved} placeables, over Fluent's limit of \
+                 {MAX_PLACEABLES} per format — the resolver stops there and returns the \
+                 message truncated or with unresolved references in it. Flatten the \
+                 references it expands through.",
+                primary.tag, message.id
+            ));
+        }
     }
     Ok(())
 }
