@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Dump the structural facts a code signature moves, per Mach-O slice.
 
-Written for the Apple signing work. The round-trip harness and, later, the
-differential test against the planned `eidola-apple` crate both need to name
-*which field at which offset* differs when a signature is added, replaced,
-or detached — `cmp` alone only says "byte 4183 differs".
+Written for the Apple signing work. The round-trip harness and the
+differential test against `eidola-apple` both need to name *which field at
+which offset* differs when a signature is added, replaced, or detached —
+`cmp` alone only says "byte 4183 differs".
+
+Read-only on purpose: this parser is the instrument the reconstruction is
+graded with, so it must never become the implementation. Nothing here
+writes bytes.
 
 Emits JSON on stdout: one record per slice with the fat-header placement,
 `__LINKEDIT`'s sizing (plus the absolute file offset of each field, so a
@@ -34,7 +38,7 @@ CPU_NAMES = {
 # A `fat_arch` is 20 bytes with 32-bit offset/size; a `fat_arch_64` is 32
 # bytes with 64-bit ones and a trailing reserved word. Both are big-endian.
 # The two are parsed rather than FAT_MAGIC_64 rejected because `fat_offset`
-# is load-bearing — apple-detach.py lifts each superblob from it — so
+# is load-bearing — every reported per-slice fact is read through it — so
 # reading a 64-bit table with the 32-bit layout yields a plausible-looking
 # zero offset rather than an error.
 FAT_ARCH = struct.Struct(">iiIII")
