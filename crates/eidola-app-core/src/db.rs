@@ -1840,7 +1840,7 @@ pub async fn space_capabilities(
 /// grant no parent held.
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
-pub async fn test_insert_space_capability(
+pub(crate) async fn test_insert_space_capability(
     conn: &Connection,
     space_id: &str,
     name: &str,
@@ -1869,7 +1869,10 @@ fn has_model(p: &ParticipantRow) -> bool {
 
 /// Everything a spawn needs, with every id already minted by the caller so the
 /// outcome can be reported without re-reading what was just written.
-pub struct SubspacePlan<'a> {
+///
+/// Crate-private with [`spawn_subspace_tx`]: it is that write's argument, and
+/// an argument type reachable from outside is the write reachable from outside.
+pub(crate) struct SubspacePlan<'a> {
     pub space_id: &'a str,
     pub parent_space_id: &'a str,
     pub owner_participant_id: &'a str,
@@ -1923,7 +1926,19 @@ pub struct SubspacePlan<'a> {
 /// **No human membership row.** This is a new creation door, not
 /// `instantiate_template` — which joins the shared human unconditionally, and
 /// whose template agents have nothing to do with a delegation.
-pub async fn spawn_subspace_tx(
+///
+/// **Crate-private, like every other raw write in this module.** The guards
+/// above are the ones that can only be decided against live state; the ones
+/// that decide against the *caller's own values* — a brief that is empty or
+/// nothing but whitespace — sit in front of the transaction, in
+/// `crate::Inner::spawn_subspace`, because a value cannot be raced and a
+/// message belongs where a caller can read it rather than after a rollback.
+/// That split is only sound while this door is unreachable from outside: a
+/// dependent holding it could commit a room opened by a blank brief, which
+/// would then plan and bill turns off a post that says nothing. Privatizing is
+/// the same cure the membership writers took, and for the same reason —
+/// repeating the check here would put one rule in two places to drift apart.
+pub(crate) async fn spawn_subspace_tx(
     conn: &Connection,
     plan: &SubspacePlan<'_>,
 ) -> Result<Result<String, SpawnRefusal>, AppError> {
