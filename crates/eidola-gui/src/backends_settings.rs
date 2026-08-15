@@ -739,6 +739,11 @@ impl BackendsSettingsView {
         let theme = cx.theme();
         let id = model.id.clone();
 
+        // A row that is nothing but a standing failure is not a model: its
+        // download left no file, so Load could only fail and Delete has
+        // nothing to delete (see [`failed_download_row`]).
+        let failed_download = failed_download_row(model, managed);
+
         let (status_text, progress): (String, Option<f32>) = match &model.status {
             LocalModelStatus::Downloading { received, total } => match total {
                 Some(t) if *t > 0 => (
@@ -747,6 +752,11 @@ impl BackendsSettingsView {
                 ),
                 _ => (format!("downloading — {}", fmt_size(*received)), None),
             },
+            // The state, not the reason — the error line below carries why.
+            // "downloaded" is what this status says for a scanned file, and
+            // saying it over a row with no file is the plainest lie the pane
+            // can tell.
+            LocalModelStatus::Available if failed_download => ("not downloaded".into(), None),
             LocalModelStatus::Available => ("downloaded".into(), None),
             LocalModelStatus::Loading => ("starting engine…".into(), None),
             LocalModelStatus::Loaded { port, pinned, .. } => (
@@ -780,6 +790,43 @@ impl BackendsSettingsView {
                         ),
                     );
                 }
+            }
+            // Retry re-runs the download the row remembers; Dismiss forgets
+            // the report, which is the whole of what this row is. Retry is
+            // offered only where there is a URL to re-run — a row that cannot
+            // remember one affords only the way out.
+            LocalModelStatus::Available if failed_download => {
+                if let Some(url) = model.source_url.clone() {
+                    verbs = verbs.child(
+                        quiet_verb(SharedString::from(format!("model-retry-{id}")), "Retry", cx)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.local_models
+                                    .update(cx, |s, cx| s.download(url.clone(), cx));
+                            }))
+                            .probe(
+                                format!("{probe_prefix}/{idx}/retry"),
+                                gpui::Role::Button,
+                                format!("Retry the download of {}", model.display_name),
+                            ),
+                    );
+                }
+                let id_x = id.clone();
+                verbs = verbs.child(
+                    quiet_verb(
+                        SharedString::from(format!("model-dismiss-{id}")),
+                        "Dismiss",
+                        cx,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.local_models
+                            .update(cx, |s, cx| s.dismiss_failure(id_x.clone(), cx));
+                    }))
+                    .probe(
+                        format!("{probe_prefix}/{idx}/dismiss"),
+                        gpui::Role::Button,
+                        format!("Dismiss the failed download of {}", model.display_name),
+                    ),
+                );
             }
             LocalModelStatus::Available => {
                 let id_l = id.clone();
@@ -2434,5 +2481,81 @@ fn fmt_size(bytes: u64) -> String {
         format!("{:.0} MB", bytes as f64 / 1e6)
     } else {
         format!("{:.0} KB", (bytes as f64 / 1e3).max(1.0))
+    }
+}
+
+/// Whether this row is a **standing failure with nothing behind it** — the row
+/// app-core synthesizes for a download that failed and left no file.
+///
+/// It is the one installed row whose verbs cannot be read off the status:
+/// `Available` is also what a scanned idle file carries, so `on_disk` is the
+/// discriminator (app-core's rule — a row is not always a file). Gating on the
+/// status alone offered Load, which has no file to open, and Delete, which has
+/// no file to remove: two verbs that could only fail or do nothing, on the one
+/// row whose whole content is an error. What it affords instead is Retry (the
+/// download again) and Dismiss (the report acknowledged).
+///
+/// Managed-store only: a `llamacpp` backend's rows are scanned files the user
+/// owns, and Eidola never downloaded them, so there is no download to re-run.
+fn failed_download_row(model: &LocalModelInfo, managed: bool) -> bool {
+    managed
+        && !model.on_disk
+        && model.last_error.is_some()
+        && matches!(model.status, LocalModelStatus::Available)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(on_disk: bool, last_error: Option<&str>, status: LocalModelStatus) -> LocalModelInfo {
+        LocalModelInfo {
+            id: "ghost@local".into(),
+            slug: "ghost".into(),
+            display_name: "Ghost".into(),
+            file_name: "ghost.gguf".into(),
+            size_bytes: None,
+            source_url: None,
+            status,
+            last_error: last_error.map(str::to_string),
+            on_disk,
+        }
+    }
+
+    #[test]
+    fn only_a_managed_error_with_no_file_reads_as_a_failed_download() {
+        // The case itself.
+        assert!(failed_download_row(
+            &row(false, Some("HTTP 500"), LocalModelStatus::Available),
+            true
+        ));
+        // A scanned file carrying a *load* failure is still a file: Load and
+        // Delete both mean something there.
+        assert!(!failed_download_row(
+            &row(true, Some("engine exited"), LocalModelStatus::Available),
+            true
+        ));
+        // A row with no error is an ordinary model.
+        assert!(!failed_download_row(
+            &row(true, None, LocalModelStatus::Available),
+            true
+        ));
+        // Mid-download rows have no file either, and they afford Cancel.
+        assert!(!failed_download_row(
+            &row(
+                false,
+                Some("HTTP 500"),
+                LocalModelStatus::Downloading {
+                    received: 1,
+                    total: None
+                }
+            ),
+            true
+        ));
+        // A user-owned llamacpp directory never had a download to re-run.
+        assert!(!failed_download_row(
+            &row(false, Some("HTTP 500"), LocalModelStatus::Available),
+            false
+        ));
     }
 }

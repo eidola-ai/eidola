@@ -986,6 +986,23 @@ mod driver {
                 },
             },
             Scene {
+                name: "settings_backends_local_failed_download",
+                description: "Settings ▸ Backends ▸ Local: a download that failed and left nothing on disk — the row affords Retry and Dismiss",
+                default_size: size(px(620.), px(560.)),
+                build: |window, cx| {
+                    use eidola_gui::backends_settings::{BackendsSettingsView, BackendsTab};
+                    let stores = stub_stores(cx, |s| {
+                        s.config_state = Some(config_state(true));
+                        s.eidola_trust = Some(eidola_trust());
+                        s.backends = backends();
+                        s.local_models = Some(local_models_with_failed_download());
+                    });
+                    let view = cx.new(|cx| BackendsSettingsView::new(stores, window, cx));
+                    view.update(cx, |v, cx| v.select_tab(BackendsTab::Local, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "settings_account_unsubscribed",
                 description: "Settings ▸ Account: an account that has never transacted — the answer and a re-check, no billing door, the full plans list",
                 default_size: size(px(620.), px(620.)),
@@ -1419,6 +1436,32 @@ mod driver {
                 },
             ],
         }
+    }
+
+    /// [`local_models_state`] plus the row a **failed download** leaves: no
+    /// file, no size, an error, and the URL a retry re-runs.
+    fn local_models_with_failed_download() -> eidola_app_core::LocalModelsState {
+        use eidola_app_core::{LocalModelInfo, LocalModelStatus};
+        let mut state = local_models_state();
+        state.models.insert(
+            0,
+            LocalModelInfo {
+                id: "gemma-4-27b-it-qat-q4_0@local".into(),
+                slug: "gemma-4-27b-it-qat-q4_0".into(),
+                display_name: "Gemma 4 27B".into(),
+                file_name: "gemma-4-27b-it-qat-q4_0.gguf".into(),
+                size_bytes: None,
+                source_url: Some(
+                    "https://huggingface.co/google/gemma-4-27b-it-qat-q4_0-gguf/resolve/main/\
+                     gemma-4-27b-it-qat-q4_0.gguf"
+                        .into(),
+                ),
+                status: LocalModelStatus::Available,
+                last_error: Some("download failed: connection reset by peer".into()),
+                on_disk: false,
+            },
+        );
+        state
     }
 
     fn config_state(has_account: bool) -> ConfigState {
