@@ -390,16 +390,12 @@ fn read_ca_pem(path: Option<&str>, field_name: &str) -> Result<Option<String>, A
 }
 
 /// Print an error plus, for the typed variants a user can act on, a hint.
-///
-/// Looks through the `ChatFailed` wrapper that `chat`/`chat_stream` attach
-/// once a space is persisted, so a wrapped `NoAccount` / `InsufficientBalance`
-/// still routes to its hint.
 fn report(e: &AppError) {
     eprintln!("error: {e}");
     // The typed onboarding errors get actionable hints. (Chat
     // auto-provisions credentials from the account balance, so these
     // only fire when the account itself is missing or unfunded.)
-    match e.root() {
+    match e {
         AppError::NoAccount => {
             eprintln!("hint: run `eidola account create` to create an anonymous account");
         }

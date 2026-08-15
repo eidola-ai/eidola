@@ -18,20 +18,19 @@
 //! `Change::SpaceIndex` (new space / auto-title). `run_turn` then does the
 //! request: `Change::Wallet` at spend start, `Change::Record` (+`Space`) on
 //! non-2xx, `Space`+`Wallet`+`Record` on success, and re-signals `Space` on its
-//! error exits — it never emits `SpaceIndex` (post owns that). Every `run_turn`
-//! error wraps the (always-persisted) space id. The exit-point map below lists
-//! the UNION of emissions across the post + run_turn pair:
+//! error exits — it never emits `SpaceIndex` (post owns that). The exit-point
+//! map below lists the UNION of emissions across the post + run_turn pair:
 //!
 //! The rows marked **`chat_path.rs`** are now *executed* against the in-process
 //! mock-upstream harness (`tests/chat_harness/`), which drives the real `chat` /
 //! `chat_stream` HTTP paths via the `with_test_http_client` seam and asserts
-//! BOTH the typed/wrapped error AND the emitted `Change`s — turning these from
+//! BOTH the typed error AND the emitted `Change`s — turning these from
 //! asserted-by-inspection into regression-gated.
 //!
 //! | Exit point | Writes committed | Emissions | Tested here |
 //! |---|---|---|---|
-//! | `prepare_turn` setup failure (client build / `/v1/models` fetch / attestation flush) — *before* the turn's inline `wrap` | The posted user turn (post committed it) | `Space(id)`, `SpaceIndex` (from post); **error wraps the space id** via the call-site `into_chat_failed` | `chat_path.rs` (`streaming_setup_failure_wraps_space_id_and_keeps_single_space`, `blocking_setup_failure_wraps_space_id`) — these exits used to escape unwrapped, suppressing the GUI's Retry and stranding a second space (PR #218 review) |
-//! | Funding failure at request time (`NoAccount`, `InsufficientBalance`, zero-charge) | The posted user turn (post committed it) | `Space(id)`, `SpaceIndex` (from post); error wraps the space id | `chat_path.rs` (`no_account_persists_post_*`, `insufficient_balance_persists_post_*`) — root() still routes onboarding; the post survives |
+//! | `prepare_turn` setup failure (client build / `/v1/models` fetch / attestation flush) | The posted user turn (post committed it) | `Space(id)`, `SpaceIndex` (from post) | `chat_path.rs` (`streaming_setup_failure_keeps_single_space`, `blocking_setup_failure_leaves_the_saved_post`) — the post survives and exactly one space exists (PR #218 review) |
+//! | Funding failure at request time (`NoAccount`, `InsufficientBalance`, zero-charge) | The posted user turn (post committed it) | `Space(id)`, `SpaceIndex` (from post) | `chat_path.rs` (`no_account_persists_post_*`, `insufficient_balance_persists_post_*`) — the typed error still routes onboarding; the post survives |
 //! | `chat`/`chat_stream` — `insert_pre_credential_refund` succeeds, later step fails | Credential in `spending` state | `Wallet` | `chat_path.rs` (every post-send failure test asserts `Wallet`; the failed-recovery test asserts the credential stays `spending`) |
 //! | `chat`/`chat_stream` — network-error arm (`send` `Err`), `process_refund` `Ok` | Successor credential + user turn | `Wallet`, `Space(id)`, `SpaceIndex`? | `chat_path.rs` (`network_error_after_send_*`; the non-2xx-with-recovery test covers the recovered-successor `Wallet`) |
 //! | `chat`/`chat_stream` — network-error arm, no refund recovered | User turn | `Space(id)`, `SpaceIndex`? | `chat_path.rs` (`network_error_after_send_*`) |
@@ -43,9 +42,9 @@
 //! | `chat`/`chat_stream` — non-2xx that the round loop will retry with the turn's own tools withdrawn (task 21's tool-rejection degrade) | Request row only — deliberately **no** inference generation, so the retry can still claim the turn's item identity | `Space(id)`, `Record`; on a spending backend also `Wallet`, because the retry acquires its own hold (the rejected attempt's is settled first) | `chat_path.rs` (`a_backend_that_rejects_tools_degrades_to_a_toolless_retry`; `a_rejected_tools_field_on_a_spending_backend_settles_both_holds` for the spend arm) |
 //! | `chat_stream` — non-2xx response, after `insert_request` inside that branch | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record`; `Wallet` if refund recovered | `chat_path.rs` (`streaming_non_2xx_*`, `non_2xx_with_refund_recovery_*`, `non_2xx_with_failed_refund_recovery_*`) |
 //!
-//! | `run_turn`/`run_turn_stream` — tool round persisted, then the **round cap** binds | The posted user turn; every executed round's `tool_call` + `tool_result` actions and request rows; the capped round's `tool_call` + request row (its tools are deliberately *not* executed) | `Space(id)`, `Record`; `Wallet` at each round's spend start; **error is `AppError::ToolLoop`, wrapped with the space id** | `chat_path.rs` (`round_cap_ends_the_turn_honestly_with_the_rounds_persisted`) |
-//! | `run_turn`/`run_turn_stream` — tool round persisted, then **`begin_next_round` fails** (budget exceeded / provisioning / the previous round's hold could not be settled, which it refuses to abandon) | The posted user turn; every completed round's `tool_call` + `tool_result` actions and request rows | `Space(id)`, `Record`; `Wallet` at each round's spend start; error wraps the space id | `chat_path.rs` (`budget_exceeded_mid_loop_fails_with_the_first_round_persisted`; `a_retry_will_not_take_a_hold_while_the_last_one_is_unsettled` for the settlement arm, reached from the degrade retry) |
-//! | `run_turn`/`run_turn_stream` — **structurally unusable `tool_calls`** (no call id / no function name, or a present-but-non-array `tool_calls` / `delta.tool_calls`; an absent or explicitly `null` value is an ordinary no-tools completion) | The posted user turn; the round's raw request row, attached to **no action** (nothing could be written as a `tool_use` block) | `Space(id)`, `Record`; **error is `AppError::ToolLoop`**, wrapped with the space id | `chat_path.rs` (`structurally_malformed_tool_call_fails_the_turn_honestly`) |
+//! | `run_turn`/`run_turn_stream` — tool round persisted, then the **round cap** binds | The posted user turn; every executed round's `tool_call` + `tool_result` actions and request rows; the capped round's `tool_call` + request row (its tools are deliberately *not* executed) | `Space(id)`, `Record`; `Wallet` at each round's spend start; **error is `AppError::ToolLoop`** | `chat_path.rs` (`round_cap_ends_the_turn_honestly_with_the_rounds_persisted`) |
+//! | `run_turn`/`run_turn_stream` — tool round persisted, then **`begin_next_round` fails** (budget exceeded / provisioning / the previous round's hold could not be settled, which it refuses to abandon) | The posted user turn; every completed round's `tool_call` + `tool_result` actions and request rows | `Space(id)`, `Record`; `Wallet` at each round's spend start | `chat_path.rs` (`budget_exceeded_mid_loop_fails_with_the_first_round_persisted`; `a_retry_will_not_take_a_hold_while_the_last_one_is_unsettled` for the settlement arm, reached from the degrade retry) |
+//! | `run_turn`/`run_turn_stream` — **structurally unusable `tool_calls`** (no call id / no function name, or a present-but-non-array `tool_calls` / `delta.tool_calls`; an absent or explicitly `null` value is an ordinary no-tools completion) | The posted user turn; the round's raw request row, attached to **no action** (nothing could be written as a `tool_use` block) | `Space(id)`, `Record`; **error is `AppError::ToolLoop`** | `chat_path.rs` (`structurally_malformed_tool_call_fails_the_turn_honestly`) |
 //! | `run_turn`/`run_turn_stream` — the **agent-side decline checkpoint** fires (a round's tool calls include `decline` *and* the turn's registry holds it) | The posted user turn; the round's `tool_call` + `tool_result` actions and request row; a **`decision`** action hanging off the post the turn answers, carrying the stated reason | `Space(id)`, `Record`; `Wallet` when the turn spent. **No `SpaceIndex`** — the would-be post is suppressed, so the listing gains no item — and **no `inference`**: `ChatResult::declined` carries the reason and `response_action_id` names the decision | `participants_orchestration.rs` (`a_declining_agent_writes_a_decision_and_suppresses_the_post`; `the_decline_name_alone_is_not_a_decline_without_the_tool_registered` pins that the checkpoint keys on the registry, never on the name) |
 //!
 //! | `refresh_branch_summaries` — one **branch summary** committed (the background chore behind a post or a turn; see `summaries`) | A `checkpoint` action authored by the global system participant, carrying the summary text and two `reference` edges (branch root, summarized tip); a regeneration **supersedes** the branch's prior summary within one item | `Space(id)` per committed summary. **No `SpaceIndex`** (nothing was posted) and **no `Record`** (a chore writes no request row). A pass that generates nothing — cache hit, no utility model, an unusable answer — emits nothing at all | `branch_summaries.rs` (`a_committed_summary_emits_space`) |
@@ -94,34 +93,24 @@
 //! of `chat_stream` with **no leading `post`** — it requests a response to an
 //! already-persisted user post. So it hits every `run_turn`/`chat_stream` row
 //! above *except* the post-owned `SpaceIndex?` column (it never posts, so it
-//! never emits `SpaceIndex`), and its failures are still wrapped with the
-//! already-known space id. Executed in `chat_path.rs`
+//! never emits `SpaceIndex`). Executed in `chat_path.rs`
 //! (`respond_stream_requests_response_without_reposting`,
-//! `respond_stream_failure_wraps_space_id_and_keeps_single_post`), which assert
-//! the no-duplicate-post and no-`SpaceIndex` distinctions.
+//! `respond_stream_failure_keeps_single_post`), which assert the
+//! no-duplicate-post and no-`SpaceIndex` distinctions.
 //!
 //! **Local turns (`local/<slug>` models).** `prepare_turn` routes these to the
 //! loopback llama.cpp engine with `TurnPrep.spend = None`: no credential is
 //! provisioned, no `Authorization` header is sent, and every `Wallet` emission
 //! above is skipped (spend-start, refund-recovery, and the success emission are
 //! all gated on `spend`). The rows otherwise apply unchanged — same
-//! `Space`/`SpaceIndex`/`Record` placement, same `ChatFailed` wrapping after
-//! the post persists. A local model that is not loaded fails in the routing
-//! step (typed `AppError::LocalModel`, pre-`wrap`, post surviving) — executed
+//! `Space`/`SpaceIndex`/`Record` placement. A local model that is not loaded
+//! fails in the routing step (typed `AppError::LocalModel`, post surviving) — executed
 //! in `tests/local_models.rs` (`local_blocking_chat_has_no_spend_no_auth_no_wallet`,
 //! `local_streaming_chat_streams_and_persists_without_wallet`,
 //! `local_chat_with_unloaded_model_is_typed_error`). The local-domain
 //! lifecycle emissions (`Change::LocalModels` on download start / throttled
 //! progress / completion / failure / delete / engine load / ready / unload /
 //! crash) are asserted there too and never touch the chat-domain rows.
-//!
-//! **Failure-path id adoption (item C).** `post` persists the space before
-//! `run_turn` runs, so every `run_turn` error is wrapped as
-//! `AppError::ChatFailed { space_id }` (its `Display` defers to the source). A
-//! blank GUI `Space` (id=`None`) thus learns its persisted id even on a funding
-//! failure. Only post's own pre-persist errors (e.g. an empty prompt) stay
-//! unwrapped. Unit-tested in `error.rs` (`chat_failed_display_defers_to_source`,
-//! `root_unwraps_*`, `chat_space_id_only_on_wrapper`).
 //!
 //! **Participants & templates (Participants v1).** Two domains outside the
 //! chat path. Per-space participant CRUD emits `Change::Participants`
@@ -135,8 +124,12 @@
 //! fresh space already carries its participants (the human "User" + the
 //! template's agents) — creation still emits only `SpaceIndex` (the
 //! participants are part of the space's birth, not a separate mutation).
-//! Covered by the `*_emit_participants` / `*_emits_templates` /
-//! `space_born_with_template_participants` tests below.
+//! `create_space_with_id` is the same instantiation under a caller-minted id
+//! (`new_space_id`) — the door a client that opens a window before the row
+//! exists takes — and emits exactly what `create_space` does. Covered by the
+//! `*_emit_participants` / `*_emits_templates` /
+//! `space_born_with_template_participants` /
+//! `create_space_with_id_emits_space_index_under_the_given_id` tests below.
 //!
 //! **Global agents (task 36).** `promote_participant` is one transaction —
 //! the scope flip (whose pinned `participant_scope` echo cascades onto every
@@ -528,6 +521,44 @@ fn create_space_emits_space_index() {
         assert!(
             changes.contains(&Change::SpaceIndex),
             "create_space should emit SpaceIndex; got {changes:?}"
+        );
+    });
+}
+
+/// A space created under a caller-minted id is an ordinary new space: the same
+/// single `SpaceIndex`, and the row really is the id the caller opened its
+/// window on.
+#[test]
+fn create_space_with_id_emits_space_index_under_the_given_id() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let mut rx = core.subscribe_changes();
+
+        let id = eidola_app_core::new_space_id();
+        let info = core
+            .runtime()
+            .block_on(core.create_space_with_id(id.clone(), None))
+            .unwrap();
+        assert_eq!(info.id, id, "the space is created under the id given");
+
+        let changes = drain(&mut rx);
+        assert_eq!(
+            changes,
+            vec![Change::SpaceIndex],
+            "creation emits the listing change and nothing else"
+        );
+
+        let spaces = core.runtime().block_on(core.list_spaces(false)).unwrap();
+        assert_eq!(spaces.len(), 1);
+        assert_eq!(spaces[0].id, id);
+        // Born with its participants, exactly as `create_space` is.
+        let members = core
+            .runtime()
+            .block_on(core.list_space_participants(id))
+            .unwrap();
+        assert!(
+            members.iter().any(|m| m.kind == "human"),
+            "the shared human joins at birth; got {members:?}"
         );
     });
 }

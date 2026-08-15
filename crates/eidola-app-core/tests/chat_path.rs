@@ -76,6 +76,33 @@ fn space_changes(changes: &[Change]) -> Vec<&Change> {
         .collect()
 }
 
+/// The id of the one space this core holds — what a `chat`/`chat_stream` with
+/// no space id created on its way to a failure. Panics if the space was not
+/// persisted, which is the property these failure tests are asserting: the
+/// saved thought survives the turn that failed around it.
+fn only_space(core: &AppCore) -> String {
+    let spaces = core
+        .runtime()
+        .block_on(core.list_spaces(false))
+        .expect("list spaces");
+    assert_eq!(
+        spaces.len(),
+        1,
+        "expected exactly one space to have been created"
+    );
+    spaces[0].id.clone()
+}
+
+/// The most recently active space — [`only_space`] for a core that has more
+/// than one, `list_spaces` being ordered by `last_activity_at DESC`.
+fn latest_space(core: &AppCore) -> String {
+    let spaces = core
+        .runtime()
+        .block_on(core.list_spaces(false))
+        .expect("list spaces");
+    spaces.first().expect("a space was created").id.clone()
+}
+
 /// Build a mock + a core wired to it (see `chat_harness::core_for`). Callers
 /// add an account via `with_account` when they want the auto-provisioning path.
 fn setup(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) {
@@ -238,6 +265,63 @@ fn blocking_chat_persists_and_emits() {
             .expect("inference post");
         assert_eq!(inference.participant.kind, "agent");
         assert!(!inference.action_id.is_empty());
+    });
+}
+
+/// **The eagerly-created space's first message is an ordinary post.**
+///
+/// A client that creates the space when its window opens
+/// (`create_space_with_id`) then sends into a space that already exists, so
+/// the send path instantiates nothing: exactly one space before and after, the
+/// row is the one the client named, and the only listing change the turn
+/// causes is the auto-title. This is the property that lets the GUI address a
+/// new conversation by a real id from its first frame.
+#[test]
+fn a_first_message_into_a_pre_created_space_instantiates_nothing() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+
+        let space_id = eidola_app_core::new_space_id();
+        core.runtime()
+            .block_on(core.create_space_with_id(space_id.clone(), None))
+            .expect("the space is created when its window opens");
+        assert_eq!(only_space(&core), space_id);
+
+        let mut rx = core.subscribe_changes();
+        let result = core
+            .runtime()
+            .block_on(core.chat(
+                "First question".into(),
+                MODEL.into(),
+                Some(space_id.clone()),
+            ))
+            .expect("the first message is an ordinary post into an existing space");
+        assert_eq!(result.space_id, space_id, "no second space was minted");
+        assert_eq!(
+            only_space(&core),
+            space_id,
+            "the send path instantiates nothing"
+        );
+
+        // `SpaceIndex` here is the auto-title, not a creation: the space was
+        // already in the listing before the turn ran.
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::SpaceIndex), "got {changes:?}");
+        assert!(changes.contains(&Change::Space(space_id.clone())));
+        let titled = core
+            .runtime()
+            .block_on(core.list_spaces(false))
+            .expect("spaces");
+        assert_eq!(titled[0].title.as_deref(), Some("First question"));
+
+        // One user turn and one reply, in the space the client named.
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
     });
 }
 
@@ -2493,13 +2577,8 @@ fn a_retry_will_not_take_a_hold_while_the_last_one_is_unsettled() {
             .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
             .expect_err("an unsettleable hold must end the turn, not be abandoned");
         assert!(
-            matches!(err.root(), AppError::Credential { .. }),
+            matches!(err, AppError::Credential { .. }),
             "the turn names the settlement failure: {err}"
-        );
-        assert_eq!(
-            err.chat_space_id(),
-            Some(space.as_str()),
-            "and still carries the space id for adoption"
         );
 
         // The retry never reached the wire: refusing happens *before* the hold.
@@ -2617,7 +2696,7 @@ fn a_degraded_turn_costs_one_extra_request_and_no_more() {
             ))
             .expect_err("the model never stops asking, so the round cap binds");
         assert!(
-            matches!(err.root(), AppError::ToolLoop { .. }),
+            matches!(err, AppError::ToolLoop { .. }),
             "the cap still ends the turn after a degrade: {err:?}"
         );
 
@@ -2749,7 +2828,7 @@ fn a_rejection_unrelated_to_tools_does_not_downgrade_the_backend() {
             ))
             .expect_err("the turn fails honestly");
         assert!(
-            matches!(err.root(), AppError::Server { status: 500, .. }),
+            matches!(err, AppError::Server { status: 500, .. }),
             "{err:?}"
         );
 
@@ -2796,7 +2875,7 @@ fn registering_a_reserved_navigation_tool_name_is_refused() {
                 .register_tool(std::sync::Arc::new(Impostor(name)))
                 .expect_err("a reserved name must be refused");
             assert!(
-                matches!(err.root(), AppError::NotConfigured { message } if message.contains(name)),
+                matches!(&err, AppError::NotConfigured { message } if message.contains(name)),
                 "{err:?}"
             );
         }
@@ -3040,13 +3119,10 @@ fn no_account_persists_post_then_fails_routing_to_onboarding() {
             .runtime()
             .block_on(core.chat("hi".into(), MODEL.into(), None))
             .expect_err("should fail with NoAccount");
-        // root() still routes onboarding; the error now carries the persisted
-        // space id (the post survived the funding failure).
-        assert!(matches!(err.root(), AppError::NoAccount), "got {err:?}");
-        let space_id = err
-            .chat_space_id()
-            .expect("post persisted → space id carried")
-            .to_string();
+        // The typed error routes onboarding, and the post survived the funding
+        // failure.
+        assert!(matches!(err, AppError::NoAccount), "got {err:?}");
+        let space_id = only_space(&core);
 
         // The saved thought is emitted (Space + SpaceIndex from post) and durable.
         let changes = drain(&mut rx);
@@ -3090,13 +3166,10 @@ fn insufficient_balance_persists_post_then_fails_routing_to_plans() {
             .block_on(core.chat("hi".into(), MODEL.into(), None))
             .expect_err("should fail with InsufficientBalance");
         assert!(
-            matches!(err.root(), AppError::InsufficientBalance { .. }),
+            matches!(err, AppError::InsufficientBalance { .. }),
             "got {err:?}"
         );
-        let space_id = err
-            .chat_space_id()
-            .expect("post persisted → space id carried")
-            .to_string();
+        let space_id = only_space(&core);
 
         let changes = drain(&mut rx);
         // The post emitted Space + SpaceIndex; the request never spent, so no
@@ -3128,7 +3201,7 @@ fn insufficient_balance_persists_post_then_fails_routing_to_plans() {
 // ===========================================================================
 
 #[test]
-fn network_error_after_send_emits_user_turn_and_wraps_space_id() {
+fn network_error_after_send_emits_user_turn_and_keeps_the_post() {
     run(|| {
         let (_mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::DropBeforeResponse,
@@ -3143,16 +3216,9 @@ fn network_error_after_send_emits_user_turn_and_wraps_space_id() {
             .expect_err("should fail on dropped connection");
 
         // Wrapped with the persisted space id (the user turn committed).
-        let space_id = err
-            .chat_space_id()
-            .expect("network-error arm must carry the space id")
-            .to_string();
+        let space_id = only_space(&core);
         // Underlying error is a transport/network error, not a server error.
-        assert!(
-            matches!(err.root(), AppError::Network { .. }),
-            "got {:?}",
-            err.root()
-        );
+        assert!(matches!(err, AppError::Network { .. }), "got {:?}", err);
 
         let changes = drain(&mut rx);
         // User turn committed → Space(id) + SpaceIndex (new space) emitted.
@@ -3197,12 +3263,9 @@ fn non_2xx_emits_record_and_space_and_persists_request_row() {
             .block_on(core.chat("boom".into(), MODEL.into(), None))
             .expect_err("non-2xx should fail");
 
-        let space_id = err
-            .chat_space_id()
-            .expect("space id on non-2xx")
-            .to_string();
-        match err.root() {
-            AppError::Server { status, .. } => assert_eq!(*status, 500),
+        let space_id = only_space(&core);
+        match err {
+            AppError::Server { status, .. } => assert_eq!(status, 500),
             other => panic!("expected Server(500), got {other:?}"),
         }
 
@@ -3240,9 +3303,9 @@ fn streaming_non_2xx_emits_record_and_space() {
             .block_on(core.chat_stream("boom".into(), MODEL.into(), None, tx))
             .expect_err("non-2xx stream should fail");
 
-        let space_id = err.chat_space_id().expect("space id").to_string();
-        match err.root() {
-            AppError::Server { status, .. } => assert_eq!(*status, 503),
+        let space_id = only_space(&core);
+        match err {
+            AppError::Server { status, .. } => assert_eq!(status, 503),
             other => panic!("expected Server(503), got {other:?}"),
         }
 
@@ -3266,7 +3329,7 @@ fn streaming_non_2xx_emits_record_and_space() {
 // ===========================================================================
 
 #[test]
-fn mid_sse_abort_emits_user_turn_and_wraps_space_id() {
+fn mid_sse_abort_emits_user_turn_and_keeps_the_post() {
     run(|| {
         let (_mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::StreamingMidAbort,
@@ -3281,15 +3344,8 @@ fn mid_sse_abort_emits_user_turn_and_wraps_space_id() {
             .block_on(core.chat_stream("stream me".into(), MODEL.into(), None, tx))
             .expect_err("mid-stream abort should fail");
 
-        let space_id = err
-            .chat_space_id()
-            .expect("mid-SSE abort must carry the space id")
-            .to_string();
-        assert!(
-            matches!(err.root(), AppError::Network { .. }),
-            "got {:?}",
-            err.root()
-        );
+        let space_id = only_space(&core);
+        assert!(matches!(err, AppError::Network { .. }), "got {:?}", err);
 
         let changes = drain(&mut rx);
         // User turn committed before the stream began reading → Space + SpaceIndex
@@ -3394,7 +3450,7 @@ fn respond_stream_requests_response_without_reposting() {
 }
 
 #[test]
-fn respond_stream_failure_wraps_space_id_and_keeps_single_post() {
+fn respond_stream_failure_keeps_single_post() {
     run(|| {
         let (_mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::Non2xx(503),
@@ -3420,15 +3476,8 @@ fn respond_stream_failure_wraps_space_id_and_keeps_single_post() {
             ))
             .expect_err("non-2xx re-request should fail");
 
-        // Wrapped with the (already-known) space id so the GUI routes it the
-        // same way a failed ask is routed.
-        assert_eq!(
-            err.chat_space_id().expect("space id"),
-            posted.space_id,
-            "failure carries the space id"
-        );
-        match err.root() {
-            AppError::Server { status, .. } => assert_eq!(*status, 503),
+        match err {
+            AppError::Server { status, .. } => assert_eq!(status, 503),
             other => panic!("expected Server(503), got {other:?}"),
         }
 
@@ -3464,7 +3513,7 @@ fn respond_stream_failure_wraps_space_id_and_keeps_single_post() {
 // ===========================================================================
 
 #[test]
-fn streaming_setup_failure_wraps_space_id_and_keeps_single_space() {
+fn streaming_setup_failure_keeps_single_space() {
     run(|| {
         let (_mock, core, _dir) = setup(MockConfig {
             // The chat behavior never matters — we fail earlier, in prepare_turn's
@@ -3478,25 +3527,13 @@ fn streaming_setup_failure_wraps_space_id_and_keeps_single_space() {
         let (tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
         // A blank window (space_id None) — post persists the space, then the
         // models fetch fails inside prepare_turn.
-        let err = core
-            .runtime()
+        core.runtime()
             .block_on(core.chat_stream("Hello, what is your name?".into(), MODEL.into(), None, tx))
             .expect_err("models-fetch failure should fail the turn");
 
-        // The persisted space id is carried even though the failure was pre-wrap.
-        let space_id = err
-            .chat_space_id()
-            .expect("setup failure must carry the space id")
-            .to_string();
-
         // The user post survived (post ran before prepare_turn) — exactly one
         // space with exactly one user turn, retryable rather than stranded.
-        let spaces = core
-            .runtime()
-            .block_on(core.list_spaces(false))
-            .expect("spaces");
-        assert_eq!(spaces.len(), 1, "one space, not a stranded pair");
-        assert_eq!(spaces[0].id, space_id);
+        let space_id = only_space(&core);
         let messages = core
             .runtime()
             .block_on(core.get_space_messages(space_id.clone()))
@@ -3504,8 +3541,8 @@ fn streaming_setup_failure_wraps_space_id_and_keeps_single_space() {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
 
-        // post emitted Space+SpaceIndex; the pre-wrap setup failure itself emits
-        // nothing further (no request row, no spend).
+        // post emitted Space+SpaceIndex; the setup failure itself emits nothing
+        // further (no request row, no spend).
         let changes = drain(&mut rx);
         assert!(changes.contains(&Change::Space(space_id.clone())));
         assert!(changes.contains(&Change::SpaceIndex));
@@ -3521,7 +3558,7 @@ fn streaming_setup_failure_wraps_space_id_and_keeps_single_space() {
 }
 
 #[test]
-fn blocking_setup_failure_wraps_space_id() {
+fn blocking_setup_failure_leaves_the_saved_post() {
     run(|| {
         let (_mock, core, _dir) = setup(MockConfig {
             models_status: Some(503),
@@ -3529,15 +3566,11 @@ fn blocking_setup_failure_wraps_space_id() {
         });
         with_account(&core);
 
-        // The blocking `chat` shares the same wrapped prepare_turn call.
-        let err = core
-            .runtime()
+        // The blocking `chat` shares the same prepare_turn call.
+        core.runtime()
             .block_on(core.chat("boom".into(), MODEL.into(), None))
             .expect_err("models-fetch failure should fail the turn");
-        let space_id = err
-            .chat_space_id()
-            .expect("blocking setup failure must carry the space id")
-            .to_string();
+        let space_id = only_space(&core);
         let messages = core
             .runtime()
             .block_on(core.get_space_messages(space_id))
@@ -3593,11 +3626,10 @@ fn non_2xx_with_failed_refund_recovery_still_errors_and_emits_record() {
         with_account(&core);
         let mut rx = core.subscribe_changes();
 
-        let err = core
-            .runtime()
+        core.runtime()
             .block_on(core.chat("boom".into(), MODEL.into(), None))
             .expect_err("non-2xx fails");
-        let space_id = err.chat_space_id().expect("space id").to_string();
+        let space_id = only_space(&core);
 
         // Recovery was attempted but failed (500 from the refund endpoint).
         assert!(mock.refund_hits() >= 1);
@@ -4217,9 +4249,9 @@ fn round_cap_ends_the_turn_honestly_with_the_rounds_persisted() {
             .block_on(core.chat("loop forever".into(), MODEL.into(), None))
             .expect_err("the round cap must fail the turn");
 
-        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        let space_id = only_space(&core);
         assert!(
-            matches!(err.root(), AppError::ToolLoop { .. }),
+            matches!(err, AppError::ToolLoop { .. }),
             "expected a typed ToolLoop error, got {err:?}"
         );
 
@@ -4283,11 +4315,10 @@ fn a_settlement_that_lands_before_a_failed_round_still_emits_wallet() {
         with_echo_tool(&core);
 
         // Round 1's exact hold, so the budget admits it and refuses round 2.
-        let probe = core
-            .runtime()
+        core.runtime()
             .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, i64::MAX))
             .expect_err("the probe hits the round cap");
-        let probe_space = probe.chat_space_id().expect("space id").to_string();
+        let probe_space = only_space(&core);
         let round1 = core
             .runtime()
             .block_on(core.test_space_actions(probe_space))
@@ -4303,7 +4334,7 @@ fn a_settlement_that_lands_before_a_failed_round_still_emits_wallet() {
             .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, round1))
             .expect_err("round 2 must exceed the budget");
         assert!(
-            matches!(err.root(), AppError::Credential { .. }),
+            matches!(err, AppError::Credential { .. }),
             "the budget refusal, not a settlement refusal: {err:?}"
         );
 
@@ -4348,11 +4379,10 @@ fn budget_exceeded_mid_loop_fails_with_the_first_round_persisted() {
         // Find round 1's exact estimate by running an unbudgeted single-round
         // turn against the same mock pricing, then budget exactly that: round 1
         // fits, round 2 (a strictly longer messages array) cannot.
-        let probe = core
-            .runtime()
+        core.runtime()
             .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, i64::MAX))
             .expect_err("the probe also hits the cap eventually");
-        let probe_space = probe.chat_space_id().expect("space id").to_string();
+        let probe_space = only_space(&core);
         let round1 = core
             .runtime()
             .block_on(core.test_space_actions(probe_space))
@@ -4369,10 +4399,11 @@ fn budget_exceeded_mid_loop_fails_with_the_first_round_persisted() {
             .runtime()
             .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, round1))
             .expect_err("round 2 must exceed the budget");
-        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        // The probe above left a space of its own, so this is the newer one.
+        let space_id = latest_space(&core);
         let message = err.to_string();
         assert!(
-            matches!(err.root(), AppError::Credential { .. }),
+            matches!(err, AppError::Credential { .. }),
             "expected the budget refusal, got {err:?}"
         );
         assert!(message.contains("budget"), "got {message}");
@@ -4419,9 +4450,9 @@ fn structurally_malformed_tool_call_fails_the_turn_honestly() {
             .runtime()
             .block_on(core.chat("break it".into(), MODEL.into(), None))
             .expect_err("a malformed tool call must fail the turn");
-        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        let space_id = only_space(&core);
         assert!(
-            matches!(err.root(), AppError::ToolLoop { .. }),
+            matches!(err, AppError::ToolLoop { .. }),
             "expected a typed ToolLoop error, got {err:?}"
         );
         assert_eq!(mock.chat_hits(), 1, "the loop stops at the bad round");
@@ -4704,11 +4735,10 @@ fn a_post_after_a_trace_ending_turn_threads_under_the_last_post() {
         with_account(&core);
         with_echo_tool(&core);
 
-        let err = core
-            .runtime()
+        core.runtime()
             .block_on(core.chat("loop forever".into(), MODEL.into(), None))
             .expect_err("the round cap fails the turn");
-        let space_id = err.chat_space_id().expect("space id").to_string();
+        let space_id = only_space(&core);
 
         core.runtime()
             .block_on(core.post("still there?".into(), Some(space_id.clone())))
@@ -4764,9 +4794,9 @@ fn non_array_tool_calls_fails_the_turn_rather_than_answering_empty() {
             .runtime()
             .block_on(core.chat("break it".into(), MODEL.into(), None))
             .expect_err("a non-array tool_calls must fail the turn");
-        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        let space_id = only_space(&core);
         assert!(
-            matches!(err.root(), AppError::ToolLoop { .. }),
+            matches!(err, AppError::ToolLoop { .. }),
             "expected a typed ToolLoop error, got {err:?}"
         );
         assert_eq!(mock.chat_hits(), 1);
@@ -4807,9 +4837,9 @@ fn non_array_streamed_tool_calls_fails_the_turn() {
             .runtime()
             .block_on(core.chat_stream("break it".into(), MODEL.into(), None, tx))
             .expect_err("a non-array delta.tool_calls must fail the turn");
-        let space_id = err.chat_space_id().expect("space id carried").to_string();
+        let space_id = only_space(&core);
         assert!(
-            matches!(err.root(), AppError::ToolLoop { .. }),
+            matches!(err, AppError::ToolLoop { .. }),
             "expected a typed ToolLoop error, got {err:?}"
         );
         assert_eq!(mock.chat_hits(), 1);
@@ -5016,14 +5046,10 @@ fn space_traces_anchor_a_capped_turn_on_the_post_it_answered() {
         with_account(&core);
         with_echo_tool(&core);
 
-        let err = core
-            .runtime()
+        core.runtime()
             .block_on(core.chat("loop forever".into(), MODEL.into(), None))
             .expect_err("the round cap ends the turn");
-        let space_id = err
-            .chat_space_id()
-            .expect("the post is durable")
-            .to_string();
+        let space_id = only_space(&core);
 
         let tree = core
             .runtime()

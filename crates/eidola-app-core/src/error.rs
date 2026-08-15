@@ -135,27 +135,9 @@ pub enum AppError {
     ///
     /// Everything that *did* happen up to that point (each round's `tool_call`
     /// / `tool_result` actions and its raw request row) is committed before
-    /// this is returned, and the error is wrapped as
-    /// [`AppError::ChatFailed`] by the turn's call site like every other
-    /// post-persist failure.
+    /// this is returned.
     #[error("tool loop error: {message}")]
     ToolLoop { message: String },
-
-    /// A chat failed *after* its space was persisted (or, for an existing
-    /// space, after the user's turn was committed). Carries the `space_id` so
-    /// a blank window's `Space` entity (id=`None` until now) can learn its
-    /// persisted id even though no [`ChatResult`] was produced — closing the
-    /// id-adoption gap on the failure path.
-    ///
-    /// `Display` defers to `source` so user-facing messages never regress; the
-    /// wrapper is purely a carrier for the id. Errors raised *before* the space
-    /// is known/persisted (config, [`AppError::NoAccount`],
-    /// [`AppError::InsufficientBalance`]) stay unwrapped.
-    #[error("{source}")]
-    ChatFailed {
-        space_id: String,
-        source: Box<AppError>,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -194,48 +176,6 @@ impl AppError {
             message: e.to_string(),
         }
     }
-
-    /// Unwrap any [`AppError::ChatFailed`] wrapper(s), returning the underlying
-    /// error. Callers that route on error *variant* (CLI hint matching, the
-    /// GUI's onboarding routing) must look through the wrapper via this helper
-    /// so a wrapped `NoAccount` / `InsufficientBalance` still routes correctly.
-    /// A non-wrapped error is returned as-is.
-    pub fn root(&self) -> &AppError {
-        let mut err = self;
-        while let AppError::ChatFailed { source, .. } = err {
-            err = source;
-        }
-        err
-    }
-
-    /// If this is a [`AppError::ChatFailed`] wrapper, the persisted space id it
-    /// carries; otherwise `None`. Lets a blank `Space` adopt its id on failure.
-    pub fn chat_space_id(&self) -> Option<&str> {
-        match self {
-            AppError::ChatFailed { space_id, .. } => Some(space_id),
-            _ => None,
-        }
-    }
-
-    /// Wrap `self` as [`AppError::ChatFailed`] carrying `space_id`, **unless it
-    /// is already a `ChatFailed` wrapper** (idempotent — the innermost space id,
-    /// stamped where the failure actually occurred, wins). This guarantees that
-    /// *every* error out of a request against an already-persisted space carries
-    /// that space's id — including the early `prepare_turn` setup failures
-    /// (client build / `/v1/models` fetch / attestation flush) that happen
-    /// before the turn's own inline `wrap` closure exists. Without it, those
-    /// setup errors escaped unwrapped, so a blank GUI `Space` could not adopt
-    /// its id and its "Retry" affordance was suppressed while a follow-up could
-    /// silently create a second space (PR #218 review).
-    pub fn into_chat_failed(self, space_id: &str) -> AppError {
-        match self {
-            AppError::ChatFailed { .. } => self,
-            other => AppError::ChatFailed {
-                space_id: space_id.to_string(),
-                source: Box::new(other),
-            },
-        }
-    }
 }
 
 fn format_error_chain(e: &reqwest::Error) -> String {
@@ -247,59 +187,4 @@ fn format_error_chain(e: &reqwest::Error) -> String {
         source = err.source();
     }
     chain
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AppError;
-
-    #[test]
-    fn chat_failed_display_defers_to_source() {
-        let inner = AppError::Server {
-            status: 500,
-            message: "boom".into(),
-        };
-        let wrapped = AppError::ChatFailed {
-            space_id: "space-1".into(),
-            source: Box::new(inner.clone()),
-        };
-        // The wrapper's Display must be identical to its source's so user-facing
-        // messages never regress when an error is wrapped for id-adoption.
-        assert_eq!(wrapped.to_string(), inner.to_string());
-    }
-
-    #[test]
-    fn root_unwraps_through_nested_wrappers() {
-        let leaf = AppError::InsufficientBalance {
-            available: 1,
-            required: 2,
-        };
-        let wrapped = AppError::ChatFailed {
-            space_id: "space-1".into(),
-            // Nesting should be collapsed entirely by `root`.
-            source: Box::new(AppError::ChatFailed {
-                space_id: "space-1".into(),
-                source: Box::new(leaf.clone()),
-            }),
-        };
-        assert!(matches!(
-            wrapped.root(),
-            AppError::InsufficientBalance {
-                available: 1,
-                required: 2
-            }
-        ));
-        // A non-wrapped error returns itself.
-        assert!(matches!(leaf.root(), AppError::InsufficientBalance { .. }));
-    }
-
-    #[test]
-    fn chat_space_id_only_on_wrapper() {
-        let wrapped = AppError::ChatFailed {
-            space_id: "space-7".into(),
-            source: Box::new(AppError::NoAccount),
-        };
-        assert_eq!(wrapped.chat_space_id(), Some("space-7"));
-        assert_eq!(AppError::NoAccount.chat_space_id(), None);
-    }
 }
