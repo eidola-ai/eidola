@@ -1997,7 +1997,7 @@ impl SpaceView {
             AppError::NotAParticipant { .. } => {
                 self.reference_notice = Some(FOLLOW_DENIED_HERE);
             }
-            other => self.error = Some(other.to_string()),
+            other => self.error = Some(other),
         }
         cx.notify();
     }
