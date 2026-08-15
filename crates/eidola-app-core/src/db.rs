@@ -6067,26 +6067,34 @@ pub async fn archive_space(
     Ok(changed > 0)
 }
 
+/// Set a space's title, answering **whether a row took it**.
+///
+/// The answer is the existence check: a caller that read the space a moment ago
+/// and then wrote by id alone would report success for a title that landed
+/// nowhere, because a space can stop existing between the two (an untouched one
+/// is disposed of when its last window closes). Deciding at the write is the
+/// module's rule, and here it costs one `bool`.
 pub async fn update_space_title(
     conn: &Connection,
     space_id: &str,
     title: &str,
     now: i64,
-) -> Result<(), AppError> {
-    conn.execute(
-        "UPDATE space SET title = ?2, touched_at = COALESCE(touched_at, ?3) \
+) -> Result<bool, AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE space SET title = ?2, touched_at = COALESCE(touched_at, ?3) \
          WHERE id = ?1",
-        (
-            Value::Text(space_id.to_string()),
-            Value::Text(title.to_string()),
-            Value::Integer(now),
-        ),
-    )
-    .await
-    .map_err(|e| AppError::Database {
-        message: format!("failed to update space title: {e}"),
-    })?;
-    Ok(())
+            (
+                Value::Text(space_id.to_string()),
+                Value::Text(title.to_string()),
+                Value::Integer(now),
+            ),
+        )
+        .await
+        .map_err(|e| AppError::Database {
+            message: format!("failed to update space title: {e}"),
+        })?;
+    Ok(changed > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -7952,6 +7960,77 @@ mod tests {
     /// update. Marking first makes that window impossible, and the price is
     /// visible here: a refused insert marks a space nothing changed. Keeping a
     /// listing row is the error worth making.
+    /// **A space's existence is decided by the write, not by a read before
+    /// it** — staged as the interleaving that makes the difference visible.
+    ///
+    /// A disposal of an untouched space travels while the Library still lists
+    /// its row, so a rename can be issued after the delete is on its way: the
+    /// read says the space is there, the delete commits, and the write then
+    /// strikes nothing. A door that took its answer from the read reports
+    /// success for a title no row took — and the caller's optimistic edit
+    /// stands over a database that never agreed to it, with nothing on screen
+    /// to say so. `update_space_title` answers whether a row took it, which is
+    /// what lets `rename_space` refuse.
+    ///
+    /// The roster's door is checked in the same breath, from the other
+    /// direction: it has no rows-affected to read, and does not need one — the
+    /// foreign key is what refuses it, and a refusal is all its caller needs.
+    #[tokio::test]
+    async fn a_write_into_a_space_that_has_just_gone_refuses_rather_than_reporting_success() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "space-race",
+            None,
+            "unlinked",
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        // The read a door would have decided from.
+        assert!(
+            get_space(&conn, "space-race").await.unwrap().is_some(),
+            "the space is there when the door is asked (the premise)"
+        );
+
+        // …and the disposal lands between that read and the write.
+        assert!(
+            discard_space_if_pristine(&conn, "space-race")
+                .await
+                .unwrap(),
+            "the untouched space is disposed of"
+        );
+
+        assert!(
+            !update_space_title(&conn, "space-race", "Tides", 2_000)
+                .await
+                .unwrap(),
+            "the title write strikes nothing, and says so"
+        );
+
+        let err = insert_participant(
+            &conn,
+            "p-race",
+            "space",
+            Some("space-race"),
+            None,
+            "agent",
+            "Ada",
+            None,
+            None,
+            "explicit",
+            "member",
+            None,
+            2_000,
+        )
+        .await
+        .expect_err("a roster add into a space that is gone must fail its foreign key");
+        assert!(matches!(err, AppError::Database { .. }), "{err:?}");
+    }
+
     #[tokio::test]
     async fn a_failed_participant_insert_still_marks_its_space() {
         let db = open_memory_fresh().await;

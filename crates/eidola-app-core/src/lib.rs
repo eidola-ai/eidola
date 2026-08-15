@@ -3228,6 +3228,27 @@ impl Inner {
         Ok(())
     }
 
+    /// Name a write that a space's disappearance made impossible.
+    ///
+    /// These doors have no rows-affected to read — a foreign key is what
+    /// refuses them, which is the right enforcement and the wrong sentence.
+    /// The read here only *explains* a write that already failed; it never
+    /// decides one, so no interleaving can put a stale answer in front of a
+    /// refusal. Anything else keeps the error it actually got.
+    async fn name_missing_space(
+        &self,
+        conn: &turso::Connection,
+        space_id: &str,
+        err: AppError,
+    ) -> AppError {
+        match db::get_space(conn, space_id).await {
+            Ok(None) => AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            },
+            _ => err,
+        }
+    }
+
     async fn add_space_participant(
         &self,
         space_id: &str,
@@ -3252,7 +3273,7 @@ impl Inner {
         // Added agents are SPACE-OWNED (a fresh per-space instance). Ownership
         // implies membership, so no reference row.
         let pid = Uuid::now_v7().to_string();
-        db::insert_participant(
+        if let Err(e) = db::insert_participant(
             &conn,
             &pid,
             "space",
@@ -3267,7 +3288,10 @@ impl Inner {
             None,
             now,
         )
-        .await?;
+        .await
+        {
+            return Err(self.name_missing_space(&conn, space_id, e).await);
+        }
         self.bus.emit(Change::Participants);
         let row = db::get_participant(&conn, &pid)
             .await?
@@ -3397,7 +3421,12 @@ impl Inner {
         // right after the write cannot turn a committed join into a failure
         // message (Codex review, PR #280).
         let joined =
-            db::join_space_participant_tx(&conn, space_id, participant_id, role, now_ms()).await?;
+            match db::join_space_participant_tx(&conn, space_id, participant_id, role, now_ms())
+                .await
+            {
+                Ok(joined) => joined,
+                Err(e) => return Err(self.name_missing_space(&conn, space_id, e).await),
+            };
         match joined {
             // Joined now, or already a member — either way it is one, and the
             // emission is honest (an idempotent re-join changes nothing, but
@@ -3485,7 +3514,7 @@ impl Inner {
         // Minted here so the transaction can be handed one: it is used only on
         // the branch that promotes, and an unused uuid costs nothing.
         let notebook_space_id = Uuid::now_v7().to_string();
-        let outcome = db::grant_space_membership_tx(
+        let outcome = match db::grant_space_membership_tx(
             &conn,
             space_id,
             participant_id,
@@ -3493,7 +3522,11 @@ impl Inner {
             &notebook_space_id,
             now_ms(),
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => return Err(self.name_missing_space(&conn, space_id, e).await),
+        };
         if outcome.decision != db::GrantDecision::AlreadyAMember {
             self.bus.emit(Change::Participants);
         }
@@ -4380,8 +4413,7 @@ impl Inner {
             && last_action_id.is_none()
             && let Some(title) = derive_space_title(prompt)
         {
-            db::update_space_title(&db_conn, &space_id, &title, now).await?;
-            auto_titled = true;
+            auto_titled = db::update_space_title(&db_conn, &space_id, &title, now).await?;
         }
 
         // Link the structural `reply` edge: to the explicit `reply_to` target
@@ -4675,14 +4707,20 @@ impl Inner {
         }
     }
 
+    /// Rename a space. **The existence check is the write's own**: a space can
+    /// stop existing between a read and the statement that follows it — an
+    /// untouched one is disposed of when its last window closes — and a rename
+    /// that reported success for a title no row took would be the worst of both
+    /// worlds, since the caller's optimistic edit then stands over a database
+    /// that never agreed to it. `update_space_title` answers whether a row took
+    /// the title, and zero is the refusal.
     async fn rename_space(&self, space_id: &str, title: &str) -> Result<(), AppError> {
         let db_conn = self.db_conn().await?;
-        db::get_space(&db_conn, space_id)
-            .await?
-            .ok_or_else(|| AppError::NotConfigured {
+        if !db::update_space_title(&db_conn, space_id, title, now_ms()).await? {
+            return Err(AppError::NotConfigured {
                 message: format!("space not found: {space_id}"),
-            })?;
-        db::update_space_title(&db_conn, space_id, title, now_ms()).await?;
+            });
+        }
         self.bus.emit(Change::SpaceIndex);
         Ok(())
     }
