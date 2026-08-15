@@ -17,40 +17,151 @@
 //!    it, so it is either dead weight or a typo silently falling back.
 //! 5. **A missing translation is fine** — the runtime falls back to English.
 //!
+//! **Every reference is resolved the way the runtime resolves it.** A locale's
+//! bundle is built as the English resource *overridden by* that locale's own, so
+//! `{ other-message }` in a translation reaches English's `other-message` when
+//! the locale did not translate it. The checks therefore resolve references
+//! against the same merged view — locale first, English behind it — and a
+//! reference that reaches nothing, or that drags in a variable the English
+//! *caller* never passes, is a build error. That is what lets the runtime treat
+//! a formatting error as impossible rather than as a case to recover from.
+//!
 //! Attributes and message-level `Term` accessors are deliberately unsupported:
 //! the model is one message, one accessor. An attribute is rejected loudly
 //! rather than ignored, because ignoring it would let a translator write text
-//! that never reaches a screen.
+//! that never reaches a screen. Terms are kept *closed* for the same reason the
+//! merge makes references safe — a term body may reference other terms but not
+//! messages or variables, so a term contributes nothing beyond its own call
+//! arguments and can never reach across the merge for something to fill.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use fluent_syntax::ast;
 use fluent_syntax::parser;
 
-/// One message of the source locale, reduced to what codegen needs.
+/// One message, reduced to what codegen needs. Everything here is **direct** —
+/// what this message's own body says — because what a reference resolves to
+/// depends on which locale is being built (see [`resolve_vars`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageDef {
     /// The FTL id, e.g. `about-version-value`.
     pub id: String,
-    /// Placeable variables, in first-appearance order — the accessor's
-    /// parameter list.
+    /// Placeable variables read directly by this message, in first-appearance
+    /// order.
     pub vars: Vec<String>,
+    /// Message ids this message references directly (`{ other-message }`).
+    pub refs: Vec<String>,
+    /// Term ids this message references directly (`{ -brand }`).
+    pub terms: Vec<String>,
     /// A one-line rendering of the value, for the accessor's doc comment.
     pub preview: String,
 }
 
-/// One shipped locale: its tag, its concatenated FTL source, and its messages.
+/// One shipped locale: its tag, its concatenated FTL source, its messages, and
+/// the terms it defines.
 #[derive(Debug, Clone)]
 pub struct LocaleDef {
     pub tag: String,
     pub source: String,
     pub messages: Vec<MessageDef>,
+    pub term_ids: Vec<String>,
 }
 
 impl LocaleDef {
     pub fn message(&self, id: &str) -> Option<&MessageDef> {
         self.messages.iter().find(|m| m.id == id)
     }
+
+    fn defines_term(&self, id: &str) -> bool {
+        self.term_ids.iter().any(|t| t == id)
+    }
+}
+
+/// The view a bundle actually resolves against: `primary` overriding `base`.
+/// For the source locale `base` is `None` (it *is* the base).
+struct MergedView<'a> {
+    primary: &'a LocaleDef,
+    base: Option<&'a LocaleDef>,
+}
+
+impl<'a> MergedView<'a> {
+    fn message(&self, id: &str) -> Option<&'a MessageDef> {
+        self.primary
+            .message(id)
+            .or_else(|| self.base.and_then(|b| b.message(id)))
+    }
+
+    fn defines_term(&self, id: &str) -> bool {
+        self.primary.defines_term(id) || self.base.is_some_and(|b| b.defines_term(id))
+    }
+
+    /// How to describe this view in an error — the locale being built.
+    fn tag(&self) -> &str {
+        &self.primary.tag
+    }
+}
+
+/// The variables `id` needs when formatted in `primary` (with `base` behind it):
+/// its own, plus those of every message it reaches through, transitively.
+///
+/// Errors on anything the runtime could not resolve — an unknown message or
+/// term, an attribute reference (no message may have attributes), or a
+/// reference cycle. Those are exactly the formatting errors the runtime would
+/// otherwise have to survive.
+pub fn resolve_vars(
+    id: &str,
+    primary: &LocaleDef,
+    base: Option<&LocaleDef>,
+) -> Result<Vec<String>, String> {
+    let view = MergedView { primary, base };
+    let mut out = Vec::new();
+    let mut stack = Vec::new();
+    walk_message(id, &view, &mut stack, &mut out)?;
+    Ok(out)
+}
+
+fn walk_message(
+    id: &str,
+    view: &MergedView,
+    stack: &mut Vec<String>,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    if stack.iter().any(|s| s == id) {
+        stack.push(id.to_string());
+        return Err(format!(
+            "{}: message reference cycle {} — Fluent cannot resolve it at runtime",
+            view.tag(),
+            stack.join(" → ")
+        ));
+    }
+    let Some(message) = view.message(id) else {
+        return Err(format!(
+            "{}: message `{}` references `{id}`, which exists in neither this locale nor \
+             the `en` source",
+            view.tag(),
+            stack.last().map(String::as_str).unwrap_or(id)
+        ));
+    };
+    stack.push(id.to_string());
+    for var in &message.vars {
+        if !out.contains(var) {
+            out.push(var.clone());
+        }
+    }
+    for term in &message.terms {
+        if !view.defines_term(term) {
+            return Err(format!(
+                "{}: message `{id}` references term `-{term}`, which exists in neither this \
+                 locale nor the `en` source",
+                view.tag()
+            ));
+        }
+    }
+    for reference in &message.refs {
+        walk_message(reference, view, stack, out)?;
+    }
+    stack.pop();
+    Ok(())
 }
 
 /// Parse one locale's concatenated FTL source.
@@ -67,8 +178,8 @@ pub fn parse_locale(tag: &str, source: &str) -> Result<LocaleDef, String> {
         out
     })?;
 
-    // Pass 1: direct variables and message references, per message.
-    let mut direct: Vec<(String, Vec<String>, Vec<String>, String)> = Vec::new();
+    let mut messages: Vec<MessageDef> = Vec::new();
+    let mut term_ids: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for entry in &resource.body {
         match entry {
@@ -90,26 +201,41 @@ pub fn parse_locale(tag: &str, source: &str) -> Result<LocaleDef, String> {
                 let Some(pattern) = message.value.as_ref() else {
                     return Err(format!("{tag}: message `{id}` has no value"));
                 };
-                let mut vars = Vec::new();
-                let mut refs = Vec::new();
-                walk_pattern(pattern, &mut vars, &mut refs);
-                direct.push((id, vars, refs, preview(pattern)));
+                let mut refs = Refs::default();
+                walk_pattern(pattern, &mut refs)?;
+                messages.push(MessageDef {
+                    id,
+                    vars: refs.vars,
+                    refs: refs.messages,
+                    terms: refs.terms,
+                    preview: preview(pattern),
+                });
             }
             ast::Entry::Term(term) => {
-                // Terms carry no accessor, but a term whose body reads a
-                // variable is a scoping mistake (Fluent gives terms their own
-                // scope), so it is worth refusing early.
-                let mut vars = Vec::new();
-                let mut refs = Vec::new();
-                walk_pattern(&term.value, &mut vars, &mut refs);
-                if !vars.is_empty() {
+                // Terms carry no accessor and are kept *closed*: a term body may
+                // reference other terms, but a variable it reads could never be
+                // filled (Fluent gives terms their own scope) and a message it
+                // reached could drag in a variable nothing passes. Both are
+                // refused so a term contributes only its own call arguments.
+                let mut refs = Refs::default();
+                walk_pattern(&term.value, &mut refs)?;
+                if let Some(var) = refs.vars.first() {
                     return Err(format!(
-                        "{tag}: term `-{}` reads variable `${}` — a term has its own scope \
+                        "{tag}: term `-{}` reads variable `${var}` — a term has its own scope \
                          and never sees a message's arguments; pass it as a term argument \
                          instead",
-                        term.id.name, vars[0]
+                        term.id.name
                     ));
                 }
+                if let Some(message) = refs.messages.first() {
+                    return Err(format!(
+                        "{tag}: term `-{}` references message `{message}` — terms stay closed \
+                         so nothing can reach through one for a variable to fill; inline the \
+                         text or use a term",
+                        term.id.name
+                    ));
+                }
+                term_ids.push(term.id.name.to_string());
             }
             ast::Entry::Junk { content } => {
                 let head: String = content.chars().take(60).collect();
@@ -121,59 +247,24 @@ pub fn parse_locale(tag: &str, source: &str) -> Result<LocaleDef, String> {
         }
     }
 
-    // Pass 2: fold each message's referenced messages into its variable set —
-    // `{ other-message }` needs whatever `other-message` needs.
-    let index: HashMap<&str, usize> = direct
-        .iter()
-        .enumerate()
-        .map(|(i, (id, _, _, _))| (id.as_str(), i))
-        .collect();
-    let mut messages = Vec::with_capacity(direct.len());
-    for (i, (id, _, _, preview)) in direct.iter().enumerate() {
-        let mut vars: Vec<String> = Vec::new();
-        let mut visiting: HashSet<usize> = HashSet::new();
-        collect_transitive(i, &direct, &index, &mut visiting, &mut vars);
-        messages.push(MessageDef {
-            id: id.clone(),
-            vars,
-            preview: preview.clone(),
-        });
-    }
-
     Ok(LocaleDef {
         tag: tag.to_string(),
         source: source.to_string(),
         messages,
+        term_ids,
     })
 }
 
-/// Fold `i`'s own variables plus every referenced message's, depth-first, in
-/// first-appearance order. A reference cycle is walked once and left alone —
-/// Fluent detects it at runtime, and it is not this pass's error to report.
-fn collect_transitive(
-    i: usize,
-    direct: &[(String, Vec<String>, Vec<String>, String)],
-    index: &HashMap<&str, usize>,
-    visiting: &mut HashSet<usize>,
-    out: &mut Vec<String>,
-) {
-    if !visiting.insert(i) {
-        return;
-    }
-    for v in &direct[i].1 {
-        if !out.contains(v) {
-            out.push(v.clone());
-        }
-    }
-    for r in &direct[i].2 {
-        if let Some(&j) = index.get(r.as_str()) {
-            collect_transitive(j, direct, index, visiting, out);
-        }
-    }
-}
-
-/// The cross-locale rules: a translation may only restate messages the source
-/// locale has, using only the variables the source locale passes.
+/// The cross-locale rules, resolved through the same merged view the runtime
+/// formats through: a translation may only restate messages the source locale
+/// has, and — following every reference into whatever the merge resolves it to
+/// — may only end up needing variables the source locale's own message passes.
+///
+/// The second half is what the merge makes necessary. A translation's
+/// `{ other-message }` reaches English's `other-message` when the locale did not
+/// translate it, so the variables it needs are English's, not this locale's; a
+/// check that looked only inside the translation would pass and the runtime
+/// would render an unfilled placeable.
 pub fn check_translation(en: &LocaleDef, other: &LocaleDef) -> Result<(), String> {
     for message in &other.messages {
         let Some(source) = en.message(&message.id) else {
@@ -183,19 +274,23 @@ pub fn check_translation(en: &LocaleDef, other: &LocaleDef) -> Result<(), String
                 other.tag, message.id
             ));
         };
-        for var in &message.vars {
-            if !source.vars.contains(var) {
+        // What the call site actually passes: the source message's own resolved
+        // variables, which is what the generated accessor's parameters are.
+        let passed = resolve_vars(&source.id, en, None)?;
+        let needed = resolve_vars(&message.id, other, Some(en))?;
+        for var in &needed {
+            if !passed.contains(var) {
                 return Err(format!(
-                    "{}: message `{}` reads `${}`, which the `en` source does not pass — \
+                    "{}: message `{}` needs `${}`, which the `en` source does not pass — \
                      the call site has no such argument, so this could only fail at \
                      runtime. Source variables: {}",
                     other.tag,
                     message.id,
                     var,
-                    if source.vars.is_empty() {
+                    if passed.is_empty() {
                         "(none)".to_string()
                     } else {
-                        source.vars.join(", ")
+                        passed.join(", ")
                     }
                 ));
             }
@@ -263,8 +358,12 @@ pub fn generate(en: &LocaleDef, locales: &[LocaleDef]) -> Result<String, String>
             ));
         }
 
+        // The accessor's parameters are the message's *resolved* variables —
+        // its own plus everything it reaches through. This call is also what
+        // validates the source locale's own references (an unknown id, an
+        // attribute reference, a cycle), since nothing else walks them.
         let mut params: Vec<(String, String)> = Vec::new();
-        for var in &message.vars {
+        for var in &resolve_vars(&message.id, en, None)? {
             let ident = rust_ident(var)?;
             if params.iter().any(|(i, _)| *i == ident) {
                 return Err(format!(
@@ -346,60 +445,94 @@ const RUST_KEYWORDS: &[&str] = &[
 // AST walking
 // ---------------------------------------------------------------------------
 
-fn walk_pattern(pattern: &ast::Pattern<&str>, vars: &mut Vec<String>, refs: &mut Vec<String>) {
+/// What one pattern refers to, in first-appearance order.
+#[derive(Default)]
+struct Refs {
+    vars: Vec<String>,
+    messages: Vec<String>,
+    terms: Vec<String>,
+}
+
+fn walk_pattern(pattern: &ast::Pattern<&str>, refs: &mut Refs) -> Result<(), String> {
     for element in &pattern.elements {
         if let ast::PatternElement::Placeable { expression } = element {
-            walk_expression(expression, vars, refs);
+            walk_expression(expression, refs)?;
         }
     }
+    Ok(())
 }
 
-fn walk_expression(expr: &ast::Expression<&str>, vars: &mut Vec<String>, refs: &mut Vec<String>) {
+fn walk_expression(expr: &ast::Expression<&str>, refs: &mut Refs) -> Result<(), String> {
     match expr {
         ast::Expression::Select { selector, variants } => {
-            walk_inline(selector, vars, refs);
+            walk_inline(selector, refs)?;
             for variant in variants {
-                walk_pattern(&variant.value, vars, refs);
+                walk_pattern(&variant.value, refs)?;
             }
         }
-        ast::Expression::Inline(inline) => walk_inline(inline, vars, refs),
+        ast::Expression::Inline(inline) => walk_inline(inline, refs)?,
     }
+    Ok(())
 }
 
-fn walk_inline(
-    inline: &ast::InlineExpression<&str>,
-    vars: &mut Vec<String>,
-    refs: &mut Vec<String>,
-) {
+fn walk_inline(inline: &ast::InlineExpression<&str>, refs: &mut Refs) -> Result<(), String> {
     match inline {
-        ast::InlineExpression::VariableReference { id } => push_unique(vars, id.name),
-        ast::InlineExpression::MessageReference { id, .. } => push_unique(refs, id.name),
+        ast::InlineExpression::VariableReference { id } => push_unique(&mut refs.vars, id.name),
+        // No message may have attributes, so an attribute reference can only
+        // ever fail to resolve. Refusing it here is what lets the runtime treat
+        // a formatting error as impossible.
+        ast::InlineExpression::MessageReference {
+            id,
+            attribute: Some(attribute),
+        } => {
+            return Err(format!(
+                "`{}.{}` references an attribute, which no message may have",
+                id.name, attribute.name
+            ));
+        }
+        ast::InlineExpression::MessageReference { id, .. } => {
+            push_unique(&mut refs.messages, id.name)
+        }
+        ast::InlineExpression::TermReference {
+            id,
+            attribute: Some(attribute),
+            ..
+        } => {
+            return Err(format!(
+                "`-{}.{}` references a term attribute, which the codegen does not support",
+                id.name, attribute.name
+            ));
+        }
         // A term's own body has its own scope; only what is *passed* to it
         // comes from the message's arguments.
-        ast::InlineExpression::TermReference { arguments, .. } => {
-            walk_call_arguments(arguments.as_ref(), vars, refs);
+        ast::InlineExpression::TermReference { id, arguments, .. } => {
+            push_unique(&mut refs.terms, id.name);
+            walk_call_arguments(arguments.as_ref(), refs)?;
         }
         ast::InlineExpression::FunctionReference { arguments, .. } => {
-            walk_call_arguments(Some(arguments), vars, refs);
+            walk_call_arguments(Some(arguments), refs)?;
         }
-        ast::InlineExpression::Placeable { expression } => walk_expression(expression, vars, refs),
+        ast::InlineExpression::Placeable { expression } => walk_expression(expression, refs)?,
         ast::InlineExpression::StringLiteral { .. }
         | ast::InlineExpression::NumberLiteral { .. } => {}
     }
+    Ok(())
 }
 
 fn walk_call_arguments(
     arguments: Option<&ast::CallArguments<&str>>,
-    vars: &mut Vec<String>,
-    refs: &mut Vec<String>,
-) {
-    let Some(arguments) = arguments else { return };
+    refs: &mut Refs,
+) -> Result<(), String> {
+    let Some(arguments) = arguments else {
+        return Ok(());
+    };
     for positional in &arguments.positional {
-        walk_inline(positional, vars, refs);
+        walk_inline(positional, refs)?;
     }
     for named in &arguments.named {
-        walk_inline(&named.value, vars, refs);
+        walk_inline(&named.value, refs)?;
     }
+    Ok(())
 }
 
 fn push_unique(list: &mut Vec<String>, name: &str) {

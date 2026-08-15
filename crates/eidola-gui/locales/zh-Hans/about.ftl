@@ -3,7 +3,7 @@
 # `about-title` is deliberately absent: the wordmark is the same in every
 # locale, so it falls back to the English source rather than being restated.
 
-about-window-title = 关于 Eidola
+about-window-title = 关于 { about-title }
 
 about-version-label = 版本
 about-version-value = v{ $version }
