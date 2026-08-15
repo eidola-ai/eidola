@@ -6661,3 +6661,231 @@ fn a_room_the_reader_belongs_to_keeps_its_verbs(cx: &mut TestAppContext) {
 
     probe::set_probes_enabled(false);
 }
+
+/// **The gate has to converge, and its interim must not be the open one.**
+///
+/// The verdict reads two cells that land asynchronously, and the roster's
+/// arrival is what asks for the second. Two failures live there, and this
+/// walks the ordering that finds both: the observers must *re-drive* the
+/// request rather than merely repaint (otherwise the notebook cell is never
+/// asked for, and the gate sits on "unknown" for the life of the window), and
+/// "unknown" must not mean "may act" once the roster has answered without the
+/// reader in it — that window is exactly where an Ask nobody downstream will
+/// refuse would be a billed inference.
+///
+/// The cost is a notebook's verbs for as long as one cell takes to answer.
+/// That they come back is asserted here rather than assumed.
+#[gpui::test]
+fn the_acting_gate_converges_and_its_interim_withholds(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    // Nothing seeded: neither cell has answered.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
+    });
+    let participants = stores.participants.clone();
+    let settings = stores.space_settings.clone();
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12.");
+    answer.action_type = "inference".into();
+    answer.model = Some("gemma4-31b".into());
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![answer], cx));
+    });
+    draw(cx, window);
+    cx.update(|cx| {
+        view.update(cx, |v, cx| v.reveal_post_affordances_for_test("a1", cx));
+    });
+
+    // **Roster unanswered: the verbs are there.** An ordinary conversation —
+    // where the reader is always a member — must not flicker on the way in,
+    // and until the roster speaks there is nothing to suspect.
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/0/regenerate".to_string()),
+        "an unanswered roster must not cost an ordinary room its verbs: {names:?}"
+    );
+
+    // **The roster answers without the reader.** This is the whole window the
+    // second cell exists to close, and until it answers the verbs go.
+    cx.update(|cx| {
+        participants.update(cx, |p, cx| {
+            p.seed_for_test(
+                "s",
+                vec![eidola_app_core::ParticipantInfo {
+                    id: "agent-a".into(),
+                    scope: "global".into(),
+                    source: "referenced".into(),
+                    kind: "agent".into(),
+                    label: "Surveyor".into(),
+                    model_ref: Some("gemma4-31b".into()),
+                    system_prompt: None,
+                    notify_policy: "all".into(),
+                    role: "member".into(),
+                    reference: None,
+                }],
+            );
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"space/post/0/regenerate".to_string()),
+        "provably not a member, and nothing yet says this is a notebook: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/band/add".to_string()),
+        "and no door into Reply or the billed Ask: {names:?}"
+    );
+
+    // **The notebook cell answers, and the verbs come back.** A notebook
+    // legitimately lacks the human and legitimately allows writing, so the
+    // suppression above has to be an interim rather than a verdict.
+    cx.update(|cx| {
+        settings.update(cx, |s, cx| {
+            s.seed_for_test(
+                "s",
+                eidola_app_core::SpaceSettings {
+                    notebook_participant_id: Some("agent-a".into()),
+                    ..Default::default()
+                },
+            );
+            cx.notify();
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/post/0/regenerate".to_string()),
+        "a notebook's reader gets its verbs back once the cell answers: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/band/add".to_string()),
+        "including the door into Reply and Ask: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **Chrome belongs to a post that made a request.**
+///
+/// A `brief` renders in the assistant column because its author is an agent,
+/// but nothing was requested for it: no model, no backend, no spend. Reading
+/// its byline as a model reference named a serving backend that never served
+/// it — and `parse_model_ref` takes any label, so the author's own name became
+/// one. The accessible label folds the same pair, so both follow one fix.
+#[gpui::test]
+fn a_brief_wears_no_backend_and_an_answer_still_does(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut brief = probe_post("a1", "Check the tide tables for Friday.");
+    brief.action_type = "brief".into();
+    brief.model = None;
+    brief.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Navigator".into(),
+    };
+    let mut answer = probe_post("a2", "Low water at 06:12.");
+    answer.action_type = "inference".into();
+    answer.parent_action_id = Some("a1".into());
+    answer.model = Some("gemma4-31b".into());
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![brief, answer], cx)
+        });
+    });
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+    assert!(
+        !names.contains(&"space/post/a1/metadata/backend".to_string()),
+        "a brief made no request, so it wears no serving backend: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/post/a2/metadata/backend".to_string()),
+        "an inference keeps its chrome: {names:?}"
+    );
+
+    // The accessible label folds the same byline pair, so it is where the
+    // claim was actually spoken: "Navigator · Eidola" for a post that reached
+    // no backend. It now names the author and stops.
+    let label_of = |name: &str| {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name} is probed: {entries:?}"))
+            .1
+            .label
+            .clone()
+    };
+    assert_eq!(
+        label_of("space/post/0"),
+        "Navigator",
+        "the brief's spoken label is its author, not a model name parsed out of it"
+    );
+    assert!(
+        label_of("space/post/1").contains("Eidola"),
+        "an inference still says where it was served: {:?}",
+        label_of("space/post/1")
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **The gate's loading is re-driven by the cells it waits on.**
+///
+/// `viewer_may_act` reads two cells; `ensure_viewer_gate` asks for the second
+/// only once the first has answered without the reader in it. Nothing else in
+/// this window rebuilds on either store, so if their observers merely repaint,
+/// that request is never made and the gate waits forever — which, before the
+/// interim was made to fail closed, meant the billed Ask stayed exposed for the
+/// life of the window.
+///
+/// Asserted lexically because it cannot be asserted otherwise here: a stubbed
+/// store has no `AppCore`, so its `refresh` completes nothing and the request
+/// leaves no trace to observe. What is checkable is that the trigger is wired,
+/// and that is the half that was missing.
+#[test]
+fn the_acting_gates_cells_re_drive_its_loading() {
+    let source = include_str!("../src/space_view/mod.rs");
+    for store in ["stores.participants", "stores.space_settings"] {
+        let at = source
+            .find(&format!("cx.observe(&{store},"))
+            .unwrap_or_else(|| panic!("{store} is observed by SpaceView"));
+        // The observer's own body — up to the next observer registration.
+        let body_end = source[at..]
+            .find("cx.observe")
+            .map(|i| at + i)
+            .and_then(|start| {
+                source[start + 10..]
+                    .find("cx.observe")
+                    .map(|i| start + 10 + i)
+            })
+            .unwrap_or(source.len());
+        assert!(
+            source[at..body_end].contains("ensure_viewer_gate"),
+            "{store}'s observer must re-drive ensure_viewer_gate, not merely repaint: its \
+             arrival is what asks for the acting gate's other cell, and nothing else here \
+             rebuilds"
+        );
+    }
+}
