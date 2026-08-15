@@ -16081,10 +16081,12 @@ async fn an_archived_conversation_explains_itself_without_offering_retry(
         assert!(v.space().read(cx).can_retry(), "and offers another press");
     });
 
-    // The permanent one does not.
+    // The permanent one does not — **and it arrives on top of that standing
+    // record**, deliberately. Not clearing it is the subtler half of the same
+    // rule: the band would explain the archived refusal while Retry re-asked on
+    // the network failure's behalf, into a room that cannot reopen.
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, cx| {
-            s.clear_failed_turn(cx);
             s.apply_turn_failure_for_test(
                 "agent-b",
                 "a1",
@@ -16109,7 +16111,8 @@ async fn an_archived_conversation_explains_itself_without_offering_retry(
         );
         assert!(
             v.space().read(cx).failed_turn().is_none(),
-            "and leaves nothing armed behind the notice either"
+            "and leaves nothing armed behind the notice either — including the record the \
+             earlier retryable failure had left standing"
         );
     });
 

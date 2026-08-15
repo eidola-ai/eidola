@@ -190,6 +190,9 @@ fn a_spawn_opens_a_titled_room_with_no_human_in_it() {
         );
         let owner_row = roster.iter().find(|p| p.id == owner).expect("owner seated");
         assert_eq!(owner_row.role, "owner");
+        // Written, not inherited — see
+        // `a_notify_all_owner_is_quiet_among_its_helpers_and_answers_a_human`.
+        assert_eq!(owner_row.notify_policy, "human");
         let helper_row = roster.iter().find(|p| p.id == helper).expect("sub-agent");
         assert_eq!(helper_row.role, "member");
         // The one override a spawn writes, and the reason a human-less room is
@@ -1875,4 +1878,150 @@ fn the_raw_db_writers_are_not_exported() {
          remove_space_participant_tx, which carries the notebook-owner and sub-space-owner \
          refusals this one has never had"
     );
+}
+
+/// **The owner's notify policy is written at spawn, not inherited.**
+///
+/// The sub-agents are `all` on purpose — nothing else would ever wake them in
+/// a room with no human. The owner must not be, and leaving its override NULL
+/// left that to whatever its global row happened to say: a shared agent
+/// configured `all` is ordinary, and it would then be scheduled by the first
+/// helper's answer, whose own answer would wake every notify-all helper again.
+/// The work one spawn schedules would grow with the square of the roster until
+/// the cascade guard stopped it.
+///
+/// `'human'` is the written policy, and the choice only shows once somebody
+/// joins: both it and `'explicit'` are silent among agents, but `'human'` means
+/// the agent answerable for the delegation answers the human who came to look
+/// at it — which is what that agent is for — while `'explicit'` would leave it
+/// deaf to them. Both halves are asserted below.
+#[test]
+fn a_notify_all_owner_is_quiet_among_its_helpers_and_answers_a_human() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+
+        // An owner whose **own** policy is `all` — an ordinary configuration,
+        // and the one that made the inherited policy a hazard.
+        let owner = core
+            .runtime()
+            .block_on(core.add_space_participant(
+                parent.clone(),
+                NewParticipant {
+                    label: "Loud".into(),
+                    model_ref: Some(MODEL.into()),
+                    system_prompt: None,
+                    notify_policy: "all".into(),
+                },
+            ))
+            .expect("add")
+            .id;
+        core.runtime()
+            .block_on(core.promote_participant(owner.clone(), None, None))
+            .expect("promote");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let second = shared_agent(&core, &parent, "Cartographer");
+
+        let out = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tides.",
+            vec![helper.clone(), second.clone()],
+            vec![],
+        )
+        .expect("spawn");
+
+        // The room writes the owner's policy down rather than adopting one.
+        let roster = core
+            .runtime()
+            .block_on(core.list_space_participants(out.space.id.clone()))
+            .expect("roster");
+        let owner_row = roster.iter().find(|p| p.id == owner).expect("the owner");
+        assert_eq!(owner_row.notify_policy, "human");
+        assert_eq!(
+            owner_row
+                .reference
+                .as_ref()
+                .and_then(|r| r.override_notify_policy.as_deref()),
+            Some("human"),
+            "written as a per-membership override, so the agent's global row is untouched"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.list_space_participants(parent.clone()))
+                .expect("parent roster")
+                .into_iter()
+                .find(|p| p.id == owner)
+                .expect("still in the parent")
+                .notify_policy,
+            "all",
+            "and it is still as loud as ever everywhere else"
+        );
+
+        // A helper's answer schedules the other helper, and never the owner —
+        // which is what keeps one spawn's work linear in the roster.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let answer = core
+            .runtime()
+            .block_on(core.respond_stream_as(
+                out.space.id.clone(),
+                helper.clone(),
+                out.brief_action_id.clone(),
+                tx,
+            ))
+            .expect("the helper answers")
+            .response_action_id
+            .expect("an answer");
+        let planned = match core
+            .runtime()
+            .block_on(core.plan_notifications(out.space.id.clone(), answer))
+            .expect("plan")
+        {
+            NotificationPlan::Turns(t) => {
+                t.into_iter().map(|p| p.participant_id).collect::<Vec<_>>()
+            }
+            other => panic!("expected turns, got {other:?}"),
+        };
+        assert!(
+            !planned.contains(&owner),
+            "an agent's answer must not wake the owner: {planned:?}"
+        );
+        assert_eq!(
+            planned,
+            vec![second.clone()],
+            "only the other helper, and exactly once"
+        );
+
+        // The other half of choosing `'human'`: a human who joins and speaks
+        // does wake the agent answerable for the room.
+        // (Arranged through the roster's add door — the join-on-post surface
+        // this anticipates is not built yet, which is exactly what `post`'s own
+        // refusal says.)
+        core.runtime()
+            .block_on(core.add_global_participant(
+                out.space.id.clone(),
+                eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("a human joins to look at it");
+        let asked = core
+            .runtime()
+            .block_on(core.post("How is this going?".into(), Some(out.space.id.clone())))
+            .expect("and posts");
+        let planned = match core
+            .runtime()
+            .block_on(core.plan_notifications(out.space.id.clone(), asked.action_id))
+            .expect("plan")
+        {
+            NotificationPlan::Turns(t) => {
+                t.into_iter().map(|p| p.participant_id).collect::<Vec<_>>()
+            }
+            other => panic!("expected turns, got {other:?}"),
+        };
+        assert!(
+            planned.contains(&owner),
+            "the owner answers the human who came to look: {planned:?}"
+        );
+    });
 }

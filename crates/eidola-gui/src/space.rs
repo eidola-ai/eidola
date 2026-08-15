@@ -1512,13 +1512,18 @@ impl Space {
     ) {
         self.streams.retain(|s| s.seq != seq);
         self.turn_runners.remove(&seq);
-        // A permanent refusal records nothing: the record is what arms Retry,
-        // and Retry on a closed conversation can only re-hit the guard that
-        // closed it (see [`is_retryable`]). The notice still explains itself —
-        // `SpaceEvent::Failed` carries the error either way.
-        if let (Some(p), Some(t)) = (participant_id, target_action_id)
-            && is_retryable(&e)
-        {
+        // A permanent refusal records nothing **and ends whatever recovery was
+        // already standing**: the record is what arms Retry, and Retry on a
+        // closed conversation can only re-hit the guard that closed it (see
+        // [`is_retryable`]). Not clearing is the subtler half — an earlier
+        // retryable failure leaves a record behind, and the band would then
+        // explain the refusal while Retry re-asked on the *old* record's
+        // behalf, into a room that cannot reopen. One refusal that stands
+        // supersedes any recovery it stands in front of. The notice still
+        // explains itself either way — `SpaceEvent::Failed` carries the error.
+        if !is_retryable(&e) {
+            self.failed_turn = None;
+        } else if let (Some(p), Some(t)) = (participant_id, target_action_id) {
             self.failed_turn = Some(FailedTurn {
                 participant_id: p,
                 target_action_id: t,

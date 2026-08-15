@@ -2114,12 +2114,42 @@ async fn spawn_subspace_tx_body(
         message: format!("failed to insert sub-space: {e}"),
     })?;
 
-    insert_space_participant(
+    // **The owner's policy is written, not inherited.** Leaving the override
+    // NULL means the room adopts whatever that agent's global row happens to
+    // say, and a shared agent configured `notify_policy = 'all'` is ordinary —
+    // it would then be scheduled by the first helper's answer, and its own
+    // answer would wake every notify-all helper again, so a spawn's work grows
+    // with the square of the roster until the cascade guard stops it. The
+    // sub-agents are `all` on purpose (nothing else would ever wake them in a
+    // room with no human); the owner must not be.
+    //
+    // `'human'` rather than `'explicit'`, and the difference only shows once
+    // somebody joins: both are silent among agents, but `'human'` means the
+    // agent answerable for the delegation answers *the human who came to look
+    // at it*, which is what that agent is for, while `'explicit'` would leave
+    // it deaf to them. It is also the seeded default, so the owner behaves like
+    // an ordinary agent toward people and stays quiet among its helpers.
+    // Neither choice is how the owner's own turns get driven — the
+    // orchestration layer plans those deliberately through its own channel —
+    // so this decides one thing only: who a post in this room wakes.
+    insert_participant_ref(
         conn,
+        "space_participant",
+        "space_id",
         plan.space_id,
         plan.owner_participant_id,
         "owner",
         plan.now,
+        &ParticipantRefRow {
+            participant_id: plan.owner_participant_id.to_string(),
+            role: "owner".to_string(),
+            joined_at: plan.now,
+            override_label: None,
+            override_model_ref: None,
+            override_system_prompt: None,
+            override_notify_policy: Some("human".to_string()),
+        },
+        false,
     )
     .await?;
     for id in plan.participant_ids {
