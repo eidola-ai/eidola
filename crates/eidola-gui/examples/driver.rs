@@ -499,7 +499,7 @@ mod driver {
             },
             Scene {
                 name: "space_transcript_stale",
-                description: "Space view: a refresh that failed over posts already on screen — every post stays, with the quiet \"couldn't refresh\" strip above them",
+                description: "Space view: a refresh that failed over a long conversation, parked at the tail — every post stays, and the quiet \"couldn't refresh\" strip floats where the reader is",
                 default_size: size(px(760.), px(680.)),
                 build: |window, cx| {
                     let stores = ready_stores(cx);
@@ -512,10 +512,13 @@ mod driver {
                             cx,
                         )
                     });
-                    let space = view.read(cx).space().clone();
-                    space.update(cx, |s, cx| {
-                        s.set_messages_for_test(conversation(), cx);
-                        s.fail_transcript_refresh_for_test(cx);
+                    view.update(cx, |view, cx| {
+                        view.space().update(cx, |space, cx| {
+                            space.set_messages_for_test(long_conversation(), cx);
+                            space.fail_transcript_refresh_for_test(cx);
+                        });
+                        // Where a conversation actually sits: at its tail.
+                        view.set_page_scroll_for_test(-100_000.0);
                     });
                     root(view, window, cx)
                 },

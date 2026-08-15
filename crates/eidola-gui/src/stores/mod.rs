@@ -104,6 +104,14 @@ pub struct Stores {
 /// the caller reports it through `crate::startup` rather than constructing
 /// anything. Directory resolution returns the same typed error as everything
 /// else here, so one surface renders the whole class.
+///
+/// **It opens the database, not just the core.** `AppCore::new` takes the
+/// single-writer lock but fills its database cell lazily, so a schema this build
+/// refuses ("delete your dev database") would sail past this gate and surface
+/// much later as a pane full of failed refreshes — the honest error, in the one
+/// place that cannot act on it. `AppCore::open_database` makes construction and
+/// validation one moment; see its docs for why running app-core's startup sweep
+/// this early is safe.
 pub fn open_app_core() -> Result<Arc<AppCore>, eidola_app_core::error::AppError> {
     let missing = |what: &str| eidola_app_core::error::AppError::Config {
         message: format!("could not determine the Eidola {what} directory for this account"),
@@ -112,7 +120,9 @@ pub fn open_app_core() -> Result<Arc<AppCore>, eidola_app_core::error::AppError>
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .ok_or_else(|| missing("configuration"))?;
     let data_dir = eidola_app_core::config::default_data_dir().ok_or_else(|| missing("data"))?;
-    Ok(Arc::new(AppCore::new(config_dir, data_dir)?))
+    let core = Arc::new(AppCore::new(config_dir, data_dir)?);
+    core.runtime().block_on(core.open_database())?;
+    Ok(core)
 }
 
 impl Stores {

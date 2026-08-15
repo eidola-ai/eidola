@@ -62,10 +62,11 @@ The other AppKit surface no test platform reaches: it is an `NSAlert` presented 
 27. The same line is on stderr either way, so a terminal launch is legible without the dialog.
 28. **No crash report.** The failure this replaced was a `panic_cannot_unwind` inside AppKit's `applicationDidFinishLaunching:` — SIGABRT, exit 134, and macOS's "Eidola quit unexpectedly" report. If you see that report, the construction has moved back inside `Application::run`.
 29. An ordinary launch with nothing else holding the database is unchanged: no dialog, no extra window, the usual first window.
+30. **A refused schema reaches the same dialog.** Hard to stage by hand — turso keeps `user_version` in the WAL, so patching the `.db` header does nothing — so this one is normally taken on trust from `a_refused_schema_surfaces_at_open_database_not_at_construction`. If you do end up with a database from an older build (a `git checkout` across a `LATEST_VERSION` bump), the launch must show "Eidola can't start" quoting the "delete your dev database" message, **not** a window full of failed panes.
 
 ## Regression sweep (nothing here should have moved)
 
-30. Every window still opens and closes normally: space, Library, Record, Settings, Participants, About, Updates, onboarding.
-31. Dock right-click → New Space / Library… still works while a window is open.
-32. `--windowless` still runs with no window and quits on `SIGTERM`. On macOS it starts retired (`UIElement`) with a status item, and its status-menu Quit is a full shutdown.
-33. **Linux is unchanged:** no tray, the windowed app quits with its last window / Ctrl+Q (a full shutdown), and the background layer is `eidola service` + `--windowless`.
+31. Every window still opens and closes normally: space, Library, Record, Settings, Participants, About, Updates, onboarding.
+32. Dock right-click → New Space / Library… still works while a window is open.
+33. `--windowless` still runs with no window and quits on `SIGTERM`. On macOS it starts retired (`UIElement`) with a status item, and its status-menu Quit is a full shutdown.
+34. **Linux is unchanged:** no tray, the windowed app quits with its last window / Ctrl+Q (a full shutdown), and the background layer is `eidola service` + `--windowless`.

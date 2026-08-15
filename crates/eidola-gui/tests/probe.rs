@@ -597,6 +597,99 @@ fn a_failed_initial_transcript_load_offers_a_retry(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// **The stale-read line has to be where the reader is.** A conversation opens
+/// at its tail and follows it, so the top of the document is the one place they
+/// reliably are not — in the page, the line was off-screen in the common case
+/// and the page was silently stale with its only cure scrolled away.
+///
+/// The property is asserted as the thing that was wrong: the strip paints at the
+/// same window position no matter where the page is scrolled to, and inside the
+/// viewport. The page really moves underneath it — the same scroll takes the
+/// first post's own probe off-screen (or out of the frame entirely, which
+/// virtualization does for a post far above the fold).
+#[gpui::test]
+fn a_stale_transcript_says_so_where_the_reader_is(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // A conversation far taller than the window, with a failed refresh over it.
+    let paragraph = "Sunlight is a fairly even mix across the visible spectrum. As it \
+         crosses the atmosphere it meets molecules far smaller than its wavelength, and \
+         those scatter short (blue) wavelengths far more strongly than long (red) ones. "
+        .repeat(12);
+    let posts: Vec<_> = (0..6)
+        .map(|i| {
+            let mut p = probe_post(&format!("a{i}"), &paragraph);
+            if i > 0 {
+                p.parent_action_id = Some(format!("a{}", i - 1));
+            }
+            p
+        })
+        .collect();
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(posts, cx);
+            s.fail_transcript_refresh_for_test(cx);
+        });
+    });
+
+    let at_top = fresh_entries(cx, window);
+    let strip_at_top = at_top
+        .iter()
+        .find(|(n, _)| n == "space/transcript/refresh-retry")
+        .map(|(_, e)| e.bounds)
+        .expect("the strip paints over a stale transcript");
+    let first_post_at_top = at_top
+        .iter()
+        .find(|(n, _)| n == "space/post/0")
+        .map(|(_, e)| e.bounds.origin.y);
+
+    // Park the reader at the document floor, where a conversation lives.
+    view.update(cx, |v, _| v.set_page_scroll_for_test(-100_000.0));
+
+    let at_tail = fresh_entries(cx, window);
+    let strip_at_tail = at_tail
+        .iter()
+        .find(|(n, _)| n == "space/transcript/refresh-retry")
+        .map(|(_, e)| e.bounds)
+        .expect("the strip is still on screen at the tail");
+    assert_eq!(
+        strip_at_tail.origin.y, strip_at_top.origin.y,
+        "the strip is chrome over the page, so scrolling must not move it"
+    );
+
+    let viewport = cx
+        .update_window(window, |_, window, _| window.viewport_size())
+        .expect("viewport");
+    assert!(
+        strip_at_tail.origin.y >= gpui::px(0.)
+            && strip_at_tail.bottom() <= viewport.height
+            && strip_at_tail.bottom() > gpui::px(0.),
+        "the strip must be inside the viewport at the tail: {strip_at_tail:?} in {viewport:?}"
+    );
+
+    // ...and the page genuinely moved under it.
+    let first_post_at_tail = at_tail
+        .iter()
+        .find(|(n, _)| n == "space/post/0")
+        .map(|(_, e)| e.bounds.origin.y);
+    match (first_post_at_top, first_post_at_tail) {
+        (Some(top), Some(tail)) => assert!(
+            tail < top,
+            "the first post should have travelled up the window: {top:?} → {tail:?}"
+        ),
+        (Some(_), None) => {}
+        (None, _) => panic!("the first post never painted, so the scroll proves nothing"),
+    }
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn a_streaming_reply_is_not_an_article(cx: &mut TestAppContext) {
     // The §4 trap: a value bound to streaming text makes assistive technology

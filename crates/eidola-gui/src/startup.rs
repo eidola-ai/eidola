@@ -140,5 +140,20 @@ mod tests {
         });
         assert_eq!(title, "Eidola can’t start");
         assert!(message.contains("config directory"), "got {message:?}");
+
+        // The schema refusal is the second thing `open_app_core` can hand back
+        // (it opens the database, not just the core), and its message is the
+        // one that says what to do — so it must arrive intact.
+        let (title, message) = dialog_text(&AppError::Database {
+            message: "your local Eidola database is from an incompatible build \
+                      (schema v1; this build expects v6). … delete your dev \
+                      database and restart"
+                .into(),
+        });
+        assert_eq!(title, "Eidola can’t start");
+        assert!(
+            message.contains("incompatible build") && message.contains("delete your dev database"),
+            "the schema refusal must reach the reader whole: {message:?}"
+        );
     }
 }
