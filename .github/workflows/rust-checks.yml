@@ -235,6 +235,14 @@ jobs:
         if: steps.scope.outputs.rust == 'true'
         run: cargo test
 
+      # The committed Apple fixtures are the crate's golden, so an
+      # Apple-only change (fixture tree, harness, instruments) must still run
+      # the placement regressions. A full `cargo test` above already covers
+      # them when the Rust scope is selected.
+      - name: Run Apple placement regressions
+        if: steps.scope.outputs.rust != 'true' && steps.scope.outputs.apple == 'true'
+        run: cargo test -p eidola-apple
+
       - name: Test Apple archive verifier with read-only directories
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true'
         run: ./scripts/test-verify-apple.sh

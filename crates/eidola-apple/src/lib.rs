@@ -185,12 +185,19 @@ pub enum InspectError {
 
 /// Reconstruct a signed bundle in place from a detached signature directory.
 ///
-/// Both roots must be privately staged and not concurrently modified. Static
-/// symbolic links are refused, but this API does not defend against a
-/// same-privilege process racing filesystem validation. Input validation
-/// finishes before mutation preparation. Preparation may make mutation targets
-/// and parent directories writable or create empty signing directories; if it
-/// fails, file contents have not changed.
+/// `detached` is the archive root holding `eidola-placement.json`; nothing
+/// outside it or the bundle is read. Both roots must be privately staged and
+/// not concurrently modified. Static symbolic links are refused, but this API
+/// does not defend against a same-privilege process racing filesystem
+/// validation. Input validation finishes before mutation preparation.
+/// Preparation may make mutation targets and parent directories writable or
+/// create empty signing directories; if it fails, file contents have not
+/// changed.
+///
+/// Atomicity covers validation only. Once content writes begin, a write
+/// failure leaves a partially reconstructed bundle: the temporary-directory
+/// verifier flow discards such a tree, but a caller reconstructing a bundle it
+/// intends to keep should stage a private copy and promote it on success.
 pub fn apply(unsigned_bundle: &Path, detached: &Path) -> Result<(), ApplyError> {
     apply::apply(unsigned_bundle, detached)
 }
