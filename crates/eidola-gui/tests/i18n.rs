@@ -607,3 +607,133 @@ fn every_shipped_locale_validates_on_its_own_terms() {
             .unwrap_or_else(|e| panic!("shipped locale failed the contract: {e}"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// The resolver's placeable limit
+// ---------------------------------------------------------------------------
+
+/// Build `n` literal placeables — the cheapest way to hit a known count.
+fn placeables(n: usize) -> String {
+    "{\"x\"}".repeat(n)
+}
+
+/// The limit is fluent-bundle's, so the boundary has to be its boundary: it
+/// trips on `> MAX_PLACEABLES`, meaning exactly 100 resolve and 101 do not.
+#[test]
+fn the_placeable_limit_boundary_is_the_resolvers() {
+    let en = parse("en", &format!("m = {}\n", placeables(100)));
+    codegen::check_locale(&en, None).expect("100 placeables is legal");
+
+    let en = parse("en", &format!("m = {}\n", placeables(101)));
+    let err = codegen::check_locale(&en, None).expect_err("101 is over the limit");
+    assert!(err.contains("101"), "the count is named: {err}");
+    assert!(err.contains("100"), "the limit is named: {err}");
+    assert!(err.contains("`m`"), "the message is named: {err}");
+}
+
+/// The count follows reference expansion, which is the whole point — a chain
+/// that doubles is the Billion Laughs shape the limit exists to stop, and every
+/// other rule is satisfied by it.
+#[test]
+fn a_doubling_reference_chain_is_refused() {
+    let mut ftl = String::from("c0 = {\"x\"}\n");
+    for i in 1..8 {
+        ftl.push_str(&format!("c{i} = {{ c{} }}{{ c{} }}\n", i - 1, i - 1));
+    }
+    let en = parse("en", &ftl);
+    let err = codegen::check_locale(&en, None).expect_err("the chain blows the limit");
+    // c5 costs 94 and is legal; c6 is the first over, at 190.
+    assert!(err.contains("`c6`"), "names the first message over: {err}");
+    assert!(err.contains("190"), "{err}");
+}
+
+/// Deep chains must be evaluated, not walked exponentially, and must not
+/// overflow — 60 levels of doubling is far past any integer width.
+#[test]
+fn a_deep_chain_terminates_instead_of_exploding() {
+    let mut ftl = String::from("c0 = {\"x\"}\n");
+    for i in 1..60 {
+        ftl.push_str(&format!("c{i} = {{ c{} }}{{ c{} }}\n", i - 1, i - 1));
+    }
+    let en = parse("en", &ftl);
+    assert!(codegen::check_locale(&en, None).is_err());
+}
+
+/// A term reference costs what the term's own pattern costs, plus the placeable
+/// that reaches it.
+#[test]
+fn a_terms_placeables_count_where_it_is_referenced() {
+    let en = parse(
+        "en",
+        &format!("-heavy = {}\nm = {{ -heavy }}\n", placeables(99)),
+    );
+    codegen::check_locale(&en, None).expect("1 + 99 == 100 is legal");
+
+    let en = parse(
+        "en",
+        &format!("-heavy = {}\nm = {{ -heavy }}\n", placeables(100)),
+    );
+    let err = codegen::check_locale(&en, None).expect_err("1 + 100 == 101 is over");
+    assert!(err.contains("101"), "{err}");
+}
+
+/// Exactly one variant of a select is ever written, so the bound is the worst
+/// variant — not the sum of them, which would refuse legal FTL.
+#[test]
+fn a_select_costs_its_worst_variant_not_all_of_them() {
+    // Two 60-placeable variants: 1 + max(60, 60) == 61 legal; summing would be 121.
+    let ftl = format!(
+        "m = {{ $n ->\n    [one] {}\n   *[other] {}\n  }}\n",
+        placeables(60),
+        placeables(60)
+    );
+    let en = parse("en", &ftl);
+    codegen::check_locale(&en, None).expect("the worst variant is 60, well under the limit");
+
+    // But a single variant over the line still fails, because it is selectable.
+    let ftl = format!(
+        "m = {{ $n ->\n    [one] {}\n   *[other] {}\n  }}\n",
+        placeables(100),
+        placeables(1)
+    );
+    let en = parse("en", &ftl);
+    let err =
+        codegen::check_locale(&en, None).expect_err("that variant breaks for whoever picks it");
+    assert!(err.contains("101"), "{err}");
+}
+
+/// A placeable nested inside an expression is written through rather than
+/// counted as a pattern element — counting it would refuse legal FTL.
+#[test]
+fn a_nested_inline_placeable_adds_no_count_of_its_own() {
+    let en = parse(
+        "en",
+        &format!("-t = {}\nm = {{ {{ -t }} }}\n", placeables(99)),
+    );
+    codegen::check_locale(&en, None).expect("1 + 99 == 100, the nesting adds nothing");
+}
+
+/// Cost is resolved through the merged view, like every other reference rule:
+/// a translation reaching an untranslated message pays *English's* cost.
+#[test]
+fn placeable_cost_resolves_through_the_merged_view() {
+    let en = parse("en", &format!("heavy = {}\nm = plain\n", placeables(100)));
+    let es = parse("es", "m = { heavy }\n");
+    let err = codegen::check_locale(&es, Some(&en)).expect_err("1 + 100 == 101 through the merge");
+    assert!(err.contains("101"), "{err}");
+    assert!(err.contains("es"), "the error names the locale: {err}");
+}
+
+/// The shipped tree is nowhere near the limit, and stays checked.
+#[test]
+fn every_shipped_locale_is_within_the_placeable_limit() {
+    let parsed: Vec<codegen::LocaleDef> = i18n::LOCALES
+        .iter()
+        .map(|(tag, source)| parse(tag, source))
+        .collect();
+    let en = parsed.iter().find(|l| l.tag == "en").expect("source ships");
+    for locale in &parsed {
+        let base = (locale.tag != "en").then_some(en);
+        codegen::check_locale(locale, base).unwrap_or_else(|e| panic!("{e}"));
+    }
+}
