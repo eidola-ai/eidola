@@ -5955,10 +5955,27 @@ pub async fn post_authors(
 // Layer 2 — Semantic: Space query operations
 // ---------------------------------------------------------------------------
 
+/// A space's own row, as the one statement that reads it answers.
+///
+/// **Existence, availability and the cascade budget arrive together on
+/// purpose.** Every caller that asks "is this space there" is about to do
+/// something in it, and whether it is *archived* decides that just as
+/// completely as whether it exists — so the two are one read rather than a
+/// check a later statement could be interleaved with (see
+/// [`get_space`] and the two gates in `crate::Inner::prepare_turn` and
+/// `crate::Inner::mechanical_plan`).
 pub struct SpaceRow {
     pub id: String,
     pub title: Option<String>,
     pub created_at: i64,
+    /// The space's runaway guard, read here so a planner needs one statement
+    /// for its whole verdict. [`space_cascade_limit`] remains for the two
+    /// callers that want the column alone.
+    pub cascade_limit: i64,
+    /// When the space was archived, if it has been. **Archived means it takes
+    /// no new turns**: not a soft delete, not a departure — every membership
+    /// and every read goes on working exactly as before.
+    pub archived_at: Option<i64>,
 }
 
 /// One row of the space listing, with the cheap activity signals the UI
@@ -6073,7 +6090,9 @@ pub async fn space_is_archived(conn: &Connection, space_id: &str) -> Result<bool
 
 pub async fn get_space(conn: &Connection, space_id: &str) -> Result<Option<SpaceRow>, AppError> {
     let mut stmt = conn
-        .prepare("SELECT id, title, created_at FROM space WHERE id = ?1")
+        .prepare(
+            "SELECT id, title, created_at, cascade_limit, archived_at FROM space WHERE id = ?1",
+        )
         .await
         .map_err(AppError::db)?;
     let mut rows = stmt
@@ -6086,6 +6105,8 @@ pub async fn get_space(conn: &Connection, space_id: &str) -> Result<Option<Space
             id: row.get::<String>(0).map_err(AppError::db)?,
             title: row.get::<Option<String>>(1).map_err(AppError::db)?,
             created_at: row.get::<i64>(2).map_err(AppError::db)?,
+            cascade_limit: row.get::<i64>(3).map_err(AppError::db)?,
+            archived_at: row.get::<Option<i64>>(4).map_err(AppError::db)?,
         })),
     }
 }

@@ -8,6 +8,23 @@ pub enum AppError {
     #[error("not configured: {message}")]
     NotConfigured { message: String },
 
+    /// A turn was asked for in a space that has been **archived**.
+    ///
+    /// Archival is what closes a conversation: the Library stops offering it,
+    /// and retiring an agent archives every room it owned. That has to mean
+    /// *no new work*, or a cascade planned a moment earlier goes on spending
+    /// in a room somebody closed — which matters most exactly where nobody is
+    /// watching, in a human-less sub-space of agents answering each other.
+    ///
+    /// **It stops future turns; it does not abort one already in flight.** A
+    /// turn that got past this gate finishes and persists — the request was
+    /// made, the tokens were spent, and dropping the answer would bill for
+    /// nothing — but its completion re-plans, and planning yields no turns in
+    /// an archived space. Nothing else changes: every membership stands, every
+    /// read still works, the transcript is whole.
+    #[error("this conversation is archived, so it takes no new turns")]
+    SpaceArchived { space_id: String },
+
     /// The human tried to write into an agent-spawned sub-space they have not
     /// joined.
     ///

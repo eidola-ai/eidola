@@ -1707,3 +1707,89 @@ fn retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts() {
         );
     });
 }
+
+/// **Retirement has to stop the work, not just close the door.**
+///
+/// Archiving the rooms a retired agent owned takes them out of the Library,
+/// but a sub-space's whole point is agents answering each other with no window
+/// open — so a helper's turn planned a moment before the retirement would
+/// otherwise have run, persisted, and re-planned the next one, billing on in a
+/// room that was closed precisely to stop it. This is the scenario the general
+/// archival gates exist for; the general regression lives beside the cascade
+/// doctrine in `participants_orchestration.rs`, and this one drives it through
+/// the door that made it matter.
+#[test]
+fn retiring_an_owner_stops_the_helpers_mid_cascade() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables for Friday.",
+            vec![helper.clone()],
+            vec![],
+        )
+        .expect("spawn");
+        let sub = out.space.id.clone();
+
+        // The helper's turn is planned while the room is live — this is the
+        // pending work retirement has to catch.
+        let pending = match core
+            .runtime()
+            .block_on(core.plan_notifications(sub.clone(), out.brief_action_id.clone()))
+            .expect("plan")
+        {
+            NotificationPlan::Turns(t) => t.into_iter().next().expect("the helper's turn"),
+            other => panic!("expected turns, got {other:?}"),
+        };
+        assert_eq!(pending.participant_id, helper);
+
+        core.runtime()
+            .block_on(core.retire_participant(owner.clone()))
+            .expect("retire");
+
+        let requests_before = mock.chat_bodies().len();
+
+        // The pending turn refuses instead of starting.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = core
+            .runtime()
+            .block_on(core.respond_stream_as(
+                sub.clone(),
+                helper.clone(),
+                out.brief_action_id.clone(),
+                tx,
+            ))
+            .expect_err("a turn planned before the retirement must not start after it");
+        match &err {
+            AppError::SpaceArchived { space_id } => assert_eq!(space_id, &sub),
+            other => panic!("expected SpaceArchived, got {other:?}"),
+        }
+
+        // And nothing new is planned there either, so a driver that re-plans
+        // finds no work rather than looping.
+        assert!(
+            matches!(
+                core.runtime()
+                    .block_on(core.plan_notifications(sub.clone(), out.brief_action_id.clone()))
+                    .expect("plan"),
+                NotificationPlan::Turns(t) if t.is_empty()
+            ),
+            "a closed room schedules nothing"
+        );
+
+        // Nothing was spent past the retirement, and the brief is still the
+        // only thing in the room.
+        assert_eq!(mock.chat_bodies().len(), requests_before);
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(sub))
+            .expect("tree");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].action_type, "brief");
+    });
+}
