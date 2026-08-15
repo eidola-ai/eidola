@@ -263,7 +263,17 @@ impl SpacesStore {
             return entity;
         }
         let app_core = self.app_core.clone();
-        let entity = cx.new(|cx| Space::existing(app_core, id.clone(), cx));
+        // **A reopen that lands while a disposal is judging this id waits for
+        // the verdict.** The Library goes on listing an untouched space until
+        // the delete commits and its `Change::SpaceIndex` arrives, so the row
+        // stays clickable for the width of one local transaction — and a
+        // window opened in there would otherwise read the space (loaded, empty,
+        // composer minted) and could write into it, against a row that is being
+        // decided. Whichever way the verdict goes the entity is told
+        // (`row_committed` / `row_is_gone`), so the wait is bounded by that one
+        // transaction and ends in the truth.
+        let being_decided = self.reap_tasks.contains_key(&id);
+        let entity = cx.new(|cx| Space::existing(app_core, id.clone(), being_decided, cx));
         self.registry.insert(id, entity.downgrade());
         entity
     }
@@ -309,7 +319,7 @@ impl SpacesStore {
                             if let Some(space) =
                                 this.registry.get(&key).and_then(WeakEntity::upgrade)
                             {
-                                space.update(cx, |space, cx| space.creation_committed(cx));
+                                space.update(cx, |space, cx| space.row_committed(cx));
                             }
                             // The window may already have closed over this
                             // insert (⌘N, then close a keystroke later). The
@@ -349,7 +359,7 @@ impl SpacesStore {
             format!("Couldn't create the space: {error}"),
         );
         if let Some(space) = entity {
-            space.update(cx, |space, cx| space.creation_failed(error, cx));
+            space.update(cx, |space, cx| space.row_is_gone(error, cx));
         }
         cx.notify();
     }
@@ -442,53 +452,109 @@ impl SpacesStore {
 
     /// Ask app-core to delete `space_id` if it is provably pristine.
     ///
-    /// **Whether a window took the space back is asked in the task, not here.**
-    /// The entity outlives the frame its last window closes in, so a check at
-    /// the close would see it either way; by the task's first poll the release
-    /// has run, and a registry entry that still upgrades therefore means a
-    /// *new* window is drawing this space. Asking too early only ever keeps a
-    /// space, which is the direction to be wrong in.
+    /// What a window reopened onto a space is told when the disposal it was
+    /// waiting on took that space.
     ///
-    /// Residual, stated: a reopen landing after the call is issued races the
-    /// delete and can lose it, leaving a window on a space that no longer
-    /// exists. It costs no work — a pristine space contains none by definition
-    /// — and closing it properly would mean app-core knowing what a window is.
+    /// It reads as a statement about the conversation rather than about a
+    /// failure, because from where the reader sits nothing failed: they clicked
+    /// a row for an empty conversation that was already on its way out.
+    fn discarded_error() -> AppError {
+        AppError::NotConfigured {
+            message: "This conversation was empty and untouched, so it was \
+                      discarded when its last window closed."
+                .into(),
+        }
+    }
+
+    /// **A reopen and a disposal can never both proceed, and the boundary is a
+    /// main-thread segment.** Store calls run on gpui's main thread, and so does
+    /// every stretch of a spawned task between its `await` points — and
+    /// `bridge` issues its core call on the *first poll* of the future being
+    /// awaited, before it suspends. So the registry recheck below and the
+    /// issuance of the delete are one uninterrupted segment, and an
+    /// [`Self::open`] can only land on one side of it:
     ///
-    /// A refused or failed disposal says nothing to anyone: nobody asked for
-    /// it, the Library is unchanged either way, and the next launch's sweep
+    /// - **Before**: the recheck upgrades a live entity and the disposal
+    ///   abandons the space untouched, releasing the window it found
+    ///   (`row_committed`). A reopen cancels a disposal.
+    /// - **After**: the delete is already travelling, so `open` may not proceed
+    ///   blind — it constructs its entity with the row *undecided*, and that
+    ///   entity's reads and writes queue behind the verdict this task settles.
+    ///   A disposal never judges a space a window is already using, because the
+    ///   window is not using it yet.
+    ///
+    /// There is no third position. Every arm below therefore ends by telling
+    /// whatever window is there what the verdict was — kept (`row_committed`,
+    /// proceed normally) or taken (`row_is_gone`, and the window says so
+    /// instead of offering a composer over nothing).
+    ///
+    /// A refused or failed disposal says nothing to anyone else: nobody asked
+    /// for it, the Library is unchanged either way, and the next launch's sweep
     /// gets another go.
     fn dispose_if_pristine(&mut self, space_id: String, cx: &mut Context<Self>) {
         let Some(core) = self.app_core.clone() else {
             return;
         };
+        // One verdict per id at a time. Replacing a live disposal would drop
+        // its task, and with it the settle that a window reopened onto this id
+        // is waiting for — the wait is bounded by that task existing.
+        if self.reap_tasks.contains_key(&space_id) {
+            return;
+        }
         let key = space_id.clone();
         self.reap_tasks.insert(
             key.clone(),
             cx.spawn(async move |this, cx| {
-                let reopened = this
-                    .update(cx, |this, _| {
-                        this.registry
-                            .get(&key)
-                            .and_then(WeakEntity::upgrade)
-                            .is_some()
+                // --- one uninterrupted main-thread segment: recheck, then
+                // issue. Nothing may `await` between these two statements.
+                let abandoned = this
+                    .update(cx, |this, cx| {
+                        let Some(space) = this.registry.get(&key).and_then(WeakEntity::upgrade)
+                        else {
+                            return false;
+                        };
+                        // A window took this conversation back before the
+                        // verdict was even asked for. Nothing is judged, and
+                        // the entity — which `open` may have constructed with
+                        // its row undecided — is released with the truth.
+                        this.reap_tasks.remove(&key);
+                        space.update(cx, |space, cx| space.row_committed(cx));
+                        true
                     })
                     .unwrap_or(true);
-                if reopened {
-                    let _ = this.update(cx, |this, _| this.reap_tasks.remove(&key));
+                if abandoned {
                     return;
                 }
                 let discarded = bridge(core, move |c| async move {
                     c.discard_if_pristine(space_id).await
                 })
                 .await;
-                let _ = this.update(cx, |this, _| {
+                // --- end of the segment ---
+                let _ = this.update(cx, |this, cx| {
                     this.reap_tasks.remove(&key);
-                    // The listing refreshes through the bus like any other
-                    // write; what the store has to drop is the registry entry,
-                    // so it stays a map of conversations that exist.
+                    let reopened = this.registry.get(&key).and_then(WeakEntity::upgrade);
                     if matches!(discarded, Ok(true)) {
-                        this.registry.remove(&key);
                         this.disposed.push(key.clone());
+                        match reopened {
+                            // A window opened on this id while the delete was
+                            // in flight and has been holding everything behind
+                            // the verdict. The verdict is that the conversation
+                            // is gone; it renders that instead.
+                            Some(space) => space.update(cx, |space, cx| {
+                                space.row_is_gone(Self::discarded_error(), cx)
+                            }),
+                            // The listing refreshes through the bus like any
+                            // other write; what the store has to drop is the
+                            // registry entry, so it stays a map of
+                            // conversations that exist.
+                            None => {
+                                this.registry.remove(&key);
+                            }
+                        }
+                    } else if let Some(space) = reopened {
+                        // Kept — refused, or the call itself failed. Either way
+                        // the row is there and the window may proceed.
+                        space.update(cx, |space, cx| space.row_committed(cx));
                     }
                 });
             }),
