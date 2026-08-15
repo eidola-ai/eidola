@@ -84,6 +84,12 @@ pub struct ConfigState {
     /// range if set, otherwise [`config::FONT_SCALE_DEFAULT`]). The GUI applies
     /// it over the whole type ramp.
     pub font_scale: f32,
+    /// The stored display-language preference (the `language` config key), or
+    /// `None` for "follow the system". An **opaque** string: this crate never
+    /// parses it, and nothing here changes behavior with it — app-core stays
+    /// locale-free and the presentation layer resolves it against the
+    /// languages it actually ships.
+    pub language: Option<String>,
 }
 
 /// The eidola backend's resolved connection + trust bundle, honest about
@@ -7228,6 +7234,7 @@ impl AppCore {
             time_of_day_tint: cfg.time_of_day_tint(),
             light_character: cfg.light_character(),
             font_scale: cfg.font_scale(),
+            language: cfg.language().map(str::to_string),
         }
     }
 
@@ -7341,6 +7348,22 @@ impl AppCore {
     pub fn set_font_scale(&self, scale: f32) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.font_scale_override = Some(config::clamp_font_scale(scale));
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
+    }
+
+    /// Persist the display-language preference (the `language` config key), or
+    /// clear it with `None`/blank to follow the system. The value is stored
+    /// **verbatim and unparsed** — this crate ships no strings of its own and
+    /// has no opinion on which languages exist; the presentation layer decides
+    /// what a tag resolves to and what an unrecognized one falls back to.
+    /// Emits [`Change::Config`] so every window re-reads it.
+    pub fn set_language(&self, language: Option<String>) -> Result<(), AppError> {
+        let mut cfg = self.inner.load_config();
+        cfg.language_override = language
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty());
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
         Ok(())
@@ -12665,6 +12688,38 @@ mod tests {
         assert_eq!(state.appearance, config::AppearanceSetting::Day);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);
         assert_eq!(state.font_scale, config::FONT_SCALE_DEFAULT);
+    }
+
+    /// The `language` key is stored verbatim and never interpreted here: an
+    /// unset key and a blank one both mean "follow the system", and a tag this
+    /// crate has never heard of round-trips untouched, because deciding what
+    /// it means belongs to whoever owns the strings.
+    #[test]
+    fn language_preference_round_trips_and_stays_opaque() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().to_path_buf();
+        let data_dir = dir.path().join("data");
+
+        let core = AppCore::new(config_dir.clone(), data_dir.clone()).unwrap();
+        assert_eq!(core.config_state().language, None);
+
+        core.set_language(Some("zh-Hans".to_string())).unwrap();
+        assert_eq!(core.config_state().language.as_deref(), Some("zh-Hans"));
+
+        // A tag with no meaning here is still stored as written.
+        core.set_language(Some("qya-Tngr".to_string())).unwrap();
+        assert_eq!(core.config_state().language.as_deref(), Some("qya-Tngr"));
+
+        // Blank clears, exactly as `None` does.
+        core.set_language(Some("   ".to_string())).unwrap();
+        assert_eq!(core.config_state().language, None);
+
+        core.set_language(Some("fr".to_string())).unwrap();
+        drop(core);
+        let core2 = AppCore::new(config_dir, data_dir).unwrap();
+        assert_eq!(core2.config_state().language.as_deref(), Some("fr"));
+        core2.set_language(None).unwrap();
+        assert_eq!(core2.config_state().language, None);
     }
 
     // --- Auto-provisioning decision logic ---------------------------------
