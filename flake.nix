@@ -253,8 +253,18 @@
         # Full repo source for checks that compare committed vs generated files
         repoSrc = craneLib.path ./.;
 
-        # Full source for workspace-wide operations
-        fullSrc = craneLib.cleanCargoSource ./.;
+        # Full source for workspace-wide operations. Carries the same `.ftl`
+        # exception as `filteredSrc`: craneLib's filter keeps only Rust and
+        # Cargo files, and the GUI's build script reads `locales/` to generate
+        # its typed accessors, so the workspace-wide clippy/test derivations
+        # cannot compile it without them.
+        fullSrc = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter =
+            path: type:
+            craneLib.filterCargoSources path type
+            || (type == "regular" && pkgs.lib.hasSuffix ".ftl" path);
+        };
 
         # Base RUSTFLAGS for deterministic builds (extended per-target in mkTargetConfig)
         baseRustFlags = "-C debuginfo=0 -C target-cpu=generic";
