@@ -1391,6 +1391,7 @@ mod driver {
             time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
             light_character: eidola_app_core::config::LightCharacter::Neutral,
             font_scale: 1.0,
+            language: None,
         }
     }
 
