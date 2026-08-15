@@ -491,3 +491,62 @@ fn the_shipped_locales_satisfy_the_contract() {
         "every source message gets an accessor"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Terms, functions, and locale tags
+// ---------------------------------------------------------------------------
+
+/// A term body is validated like any other pattern: a term reaching a term that
+/// exists nowhere is unresolvable at runtime, however many hops away it is.
+#[test]
+fn a_term_reaching_an_undefined_term_is_a_build_error() {
+    let en = parse("en", "-brand = { -missing }\nhello = { -brand }\n");
+    let err = codegen::resolve_vars("hello", &en, None).expect_err("should refuse");
+    assert!(err.contains("-missing"), "{err}");
+}
+
+/// Terms cycle the same way messages do, and Fluent gives up on it the same way.
+#[test]
+fn a_term_reference_cycle_is_a_build_error() {
+    let en = parse("en", "-a = { -b }\n-b = { -a }\nhello = { -a }\n");
+    let err = codegen::resolve_vars("hello", &en, None).expect_err("should refuse");
+    assert!(err.contains("cycle"), "{err}");
+}
+
+/// A term defined only in the source locale still resolves for a translation
+/// that reaches it, because the bundle is merged.
+#[test]
+fn a_term_chain_resolves_through_the_merged_view() {
+    let en = parse(
+        "en",
+        "-inner = Eidola\n-brand = { -inner }\nhello = { -brand }\n",
+    );
+    let es = parse("es", "hello = Hola de { -brand }\n");
+    codegen::resolve_vars("hello", &es, Some(&en)).expect("the merge supplies the term chain");
+}
+
+/// No function is callable: the bundle registers none, and fluent-bundle
+/// registers none of its own.
+#[test]
+fn a_function_reference_is_a_build_error() {
+    let err = codegen::parse_locale("en", "count = { NUMBER($n) }\n").expect_err("should refuse");
+    assert!(err.contains("NUMBER"), "{err}");
+
+    // Including a misspelling that would otherwise look plausible.
+    let err = codegen::parse_locale("en", "count = { NUMBR($n) }\n").expect_err("should refuse");
+    assert!(err.contains("NUMBR"), "{err}");
+}
+/// A directory name becomes the locale's tag verbatim, and negotiation matches
+/// on canonical tags — so a non-canonical directory would ship a translation
+/// nothing could ever select.
+#[test]
+fn a_locale_directory_must_be_a_canonical_language_tag() {
+    for good in ["en", "es", "fr", "zh-Hans", "zh-Hant", "pt-BR"] {
+        codegen::validate_locale_tag(good).unwrap_or_else(|e| panic!("`{good}` refused: {e}"));
+    }
+    for bad in ["zh_Hans", "zh-hans", "ZH-HANS", "en_US", "not a tag", ""] {
+        let err =
+            codegen::validate_locale_tag(bad).expect_err(&format!("`{bad}` should be refused"));
+        assert!(err.contains(bad) || bad.is_empty(), "{err}");
+    }
+}

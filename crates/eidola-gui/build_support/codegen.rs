@@ -4,35 +4,54 @@
 //! `tests/i18n.rs` (which exercises the contract directly), so the rules below
 //! are testable without committing deliberately-broken FTL to the locales tree.
 //!
-//! The contract this module enforces, in one place:
+//! **The contract this module enforces — the complete list.** Anything not
+//! refused here has to be safe at runtime, because `Localization::format`
+//! treats a formatting error as impossible rather than as a case to recover
+//! from. Add a rule here when you add a way to fail.
 //!
-//! 1. **English is the source.** One accessor per English message, taking one
-//!    parameter per placeable variable — so a mistyped id or a changed argument
-//!    set is a compile error at the call site.
+//! *Shape of the tree*
+//!
+//! 1. **A locale directory must be a canonical language tag**
+//!    ([`validate_locale_tag`]). The directory name *is* the tag at runtime, and
+//!    negotiation resolves to canonical spellings — so `zh_Hans` would ship a
+//!    translation nothing could ever select.
 //! 2. **Malformed FTL in any locale is a build error.** Every shipped locale is
 //!    parsed, not just English.
-//! 3. **A translation may not reference a variable English lacks** — nothing
-//!    would ever pass it, so it could only fail at runtime.
+//!
+//! *What English defines*
+//!
+//! 3. **English is the source.** One accessor per English message, taking one
+//!    parameter per placeable variable — so a mistyped id or a changed argument
+//!    set is a compile error at the call site.
 //! 4. **A translation may not invent a message id.** Nothing would ever ask for
 //!    it, so it is either dead weight or a typo silently falling back.
-//! 5. **A missing translation is fine** — the runtime falls back to English.
+//! 5. **A translation may not need a variable English does not pass** — not in
+//!    its own body and not through anything it references. The call site has no
+//!    such argument, so it could only fail at runtime.
+//! 6. **A missing translation is fine** — it renders as English (see the merge
+//!    in `src/i18n.rs`).
 //!
-//! **Every reference is resolved the way the runtime resolves it.** A locale's
-//! bundle is built as the English resource *overridden by* that locale's own, so
-//! `{ other-message }` in a translation reaches English's `other-message` when
-//! the locale did not translate it. The checks therefore resolve references
-//! against the same merged view — locale first, English behind it — and a
-//! reference that reaches nothing, or that drags in a variable the English
-//! *caller* never passes, is a build error. That is what lets the runtime treat
-//! a formatting error as impossible rather than as a case to recover from.
+//! *What a pattern may contain*
 //!
-//! Attributes and message-level `Term` accessors are deliberately unsupported:
-//! the model is one message, one accessor. An attribute is rejected loudly
-//! rather than ignored, because ignoring it would let a translator write text
-//! that never reaches a screen. Terms are kept *closed* for the same reason the
-//! merge makes references safe — a term body may reference other terms but not
-//! messages or variables, so a term contributes nothing beyond its own call
-//! arguments and can never reach across the merge for something to fill.
+//! 7. **Every reference must resolve through the merged view** — locale first,
+//!    English behind it, which is exactly what the runtime bundle contains. A
+//!    message or term that exists in neither is refused, and **term chains are
+//!    followed to their end**, not checked one hop deep.
+//! 8. **No reference cycles**, message or term. Fluent gives up on one at
+//!    runtime; the build gives up first.
+//! 9. **No function references.** Nothing registers a Fluent function — see the
+//!    note at the `FunctionReference` arm — so `{ NUMBER($n) }` would render
+//!    `{NUMBER()}`. The number/date formatting work is what will register some
+//!    and loosen this to the registered names.
+//! 10. **No attributes and no attribute references.** The model is one message,
+//!     one accessor. An attribute is refused loudly rather than ignored, because
+//!     ignoring it would let a translator write text that never reaches a
+//!     screen — and a reference to one could then only fail.
+//! 11. **Terms stay closed.** A term body may reference other terms, never
+//!     messages or variables, so nothing can reach through a term for a variable
+//!     to fill.
+//! 12. **No duplicate message or term ids.** A later definition silently shadows
+//!     the earlier one, so it is refused instead.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -57,6 +76,18 @@ pub struct MessageDef {
     pub preview: String,
 }
 
+/// One term of a locale. A term body may not read variables or reference
+/// messages (both refused at parse time), so the only thing left to follow is
+/// the terms it reaches — which still has to be followed, since a term chain
+/// ending nowhere fails at runtime exactly like a message chain does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermDef {
+    /// The id without its leading `-`.
+    pub id: String,
+    /// Term ids this term references directly.
+    pub terms: Vec<String>,
+}
+
 /// One shipped locale: its tag, its concatenated FTL source, its messages, and
 /// the terms it defines.
 #[derive(Debug, Clone)]
@@ -64,7 +95,7 @@ pub struct LocaleDef {
     pub tag: String,
     pub source: String,
     pub messages: Vec<MessageDef>,
-    pub term_ids: Vec<String>,
+    pub terms: Vec<TermDef>,
 }
 
 impl LocaleDef {
@@ -72,8 +103,8 @@ impl LocaleDef {
         self.messages.iter().find(|m| m.id == id)
     }
 
-    fn defines_term(&self, id: &str) -> bool {
-        self.term_ids.iter().any(|t| t == id)
+    fn term(&self, id: &str) -> Option<&TermDef> {
+        self.terms.iter().find(|t| t.id == id)
     }
 }
 
@@ -91,13 +122,24 @@ impl<'a> MergedView<'a> {
             .or_else(|| self.base.and_then(|b| b.message(id)))
     }
 
-    fn defines_term(&self, id: &str) -> bool {
-        self.primary.defines_term(id) || self.base.is_some_and(|b| b.defines_term(id))
+    fn term(&self, id: &str) -> Option<&'a TermDef> {
+        self.primary
+            .term(id)
+            .or_else(|| self.base.and_then(|b| b.term(id)))
     }
 
     /// How to describe this view in an error — the locale being built.
     fn tag(&self) -> &str {
         &self.primary.tag
+    }
+
+    /// Where a reference could have been satisfied from, for an error message.
+    fn scope(&self) -> &'static str {
+        if self.base.is_some() {
+            "this locale or the `en` source"
+        } else {
+            "the `en` source"
+        }
     }
 }
 
@@ -136,10 +178,10 @@ fn walk_message(
     }
     let Some(message) = view.message(id) else {
         return Err(format!(
-            "{}: message `{}` references `{id}`, which exists in neither this locale nor \
-             the `en` source",
+            "{}: message `{}` references `{id}`, which is not defined in {}",
             view.tag(),
-            stack.last().map(String::as_str).unwrap_or(id)
+            stack.last().map(String::as_str).unwrap_or(id),
+            view.scope()
         ));
     };
     stack.push(id.to_string());
@@ -149,13 +191,9 @@ fn walk_message(
         }
     }
     for term in &message.terms {
-        if !view.defines_term(term) {
-            return Err(format!(
-                "{}: message `{id}` references term `-{term}`, which exists in neither this \
-                 locale nor the `en` source",
-                view.tag()
-            ));
-        }
+        // A term chain is followed, not merely checked one hop deep: `-brand`
+        // being defined says nothing about the `-missing` it reaches for.
+        walk_term(term, view, &mut Vec::new())?;
     }
     for reference in &message.refs {
         walk_message(reference, view, stack, out)?;
@@ -179,7 +217,7 @@ pub fn parse_locale(tag: &str, source: &str) -> Result<LocaleDef, String> {
     })?;
 
     let mut messages: Vec<MessageDef> = Vec::new();
-    let mut term_ids: Vec<String> = Vec::new();
+    let mut terms: Vec<TermDef> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for entry in &resource.body {
         match entry {
@@ -202,7 +240,8 @@ pub fn parse_locale(tag: &str, source: &str) -> Result<LocaleDef, String> {
                     return Err(format!("{tag}: message `{id}` has no value"));
                 };
                 let mut refs = Refs::default();
-                walk_pattern(pattern, &mut refs)?;
+                walk_pattern(pattern, &mut refs)
+                    .map_err(|e| format!("{tag}: message `{id}`: {e}"))?;
                 messages.push(MessageDef {
                     id,
                     vars: refs.vars,
@@ -218,7 +257,8 @@ pub fn parse_locale(tag: &str, source: &str) -> Result<LocaleDef, String> {
                 // reached could drag in a variable nothing passes. Both are
                 // refused so a term contributes only its own call arguments.
                 let mut refs = Refs::default();
-                walk_pattern(&term.value, &mut refs)?;
+                walk_pattern(&term.value, &mut refs)
+                    .map_err(|e| format!("{tag}: term `-{}`: {e}", term.id.name))?;
                 if let Some(var) = refs.vars.first() {
                     return Err(format!(
                         "{tag}: term `-{}` reads variable `${var}` — a term has its own scope \
@@ -235,7 +275,17 @@ pub fn parse_locale(tag: &str, source: &str) -> Result<LocaleDef, String> {
                         term.id.name
                     ));
                 }
-                term_ids.push(term.id.name.to_string());
+                if terms.iter().any(|t| t.id == term.id.name) {
+                    return Err(format!(
+                        "{tag}: duplicate term `-{}` — a later definition silently shadows \
+                         the earlier one, so it is refused here instead",
+                        term.id.name
+                    ));
+                }
+                terms.push(TermDef {
+                    id: term.id.name.to_string(),
+                    terms: refs.terms,
+                });
             }
             ast::Entry::Junk { content } => {
                 let head: String = content.chars().take(60).collect();
@@ -251,8 +301,40 @@ pub fn parse_locale(tag: &str, source: &str) -> Result<LocaleDef, String> {
         tag: tag.to_string(),
         source: source.to_string(),
         messages,
-        term_ids,
+        terms,
     })
+}
+
+/// Follow a term through the merged view: it must exist, and so must everything
+/// it reaches, without cycling. Terms carry no variables of their own (a term
+/// body reading `$var` is refused at parse time), so this validates reachability
+/// rather than collecting anything.
+fn walk_term(id: &str, view: &MergedView, stack: &mut Vec<String>) -> Result<(), String> {
+    if stack.iter().any(|s| s == id) {
+        stack.push(id.to_string());
+        return Err(format!(
+            "{}: term reference cycle {} — Fluent cannot resolve it at runtime",
+            view.tag(),
+            stack
+                .iter()
+                .map(|t| format!("-{t}"))
+                .collect::<Vec<_>>()
+                .join(" → ")
+        ));
+    }
+    let Some(term) = view.term(id) else {
+        return Err(format!(
+            "{}: term `-{id}` is not defined in {}",
+            view.tag(),
+            view.scope()
+        ));
+    };
+    stack.push(id.to_string());
+    for nested in &term.terms {
+        walk_term(nested, view, stack)?;
+    }
+    stack.pop();
+    Ok(())
 }
 
 /// The cross-locale rules, resolved through the same merged view the runtime
@@ -408,6 +490,32 @@ pub fn generate(en: &LocaleDef, locales: &[LocaleDef]) -> Result<String, String>
     Ok(out)
 }
 
+/// A locale directory name must be a **canonical** language identifier.
+///
+/// The directory name becomes the locale's tag verbatim — it is what the
+/// runtime parses to build the bundle and what negotiation matches against. A
+/// tag that is merely *parseable* is not enough: negotiation resolves to the
+/// canonical spelling (`zh-Hans`), so a `zh_Hans` or `zh-hans` directory ships a
+/// translation inside the binary that nothing can ever select, silently. The
+/// round-trip through `LanguageIdentifier` is what makes "canonical" precise.
+pub fn validate_locale_tag(tag: &str) -> Result<(), String> {
+    let parsed: unic_langid::LanguageIdentifier = tag.parse().map_err(|e| {
+        format!(
+            "locale directory `{tag}` is not a language tag ({e}) — name it for the locale \
+             it holds, e.g. `en`, `fr`, `zh-Hans`"
+        )
+    })?;
+    let canonical = parsed.to_string();
+    if canonical != tag {
+        return Err(format!(
+            "locale directory `{tag}` is not the canonical spelling of the tag it parses to \
+             (`{canonical}`) — negotiation resolves to the canonical form, so the directory \
+             must be `{canonical}` or its translations could never be selected"
+        ));
+    }
+    Ok(())
+}
+
 /// A message or variable name turned into a Rust identifier: `-` becomes `_`,
 /// and a name that collides with a keyword takes a trailing `_`.
 pub fn rust_ident(name: &str) -> Result<String, String> {
@@ -509,8 +617,20 @@ fn walk_inline(inline: &ast::InlineExpression<&str>, refs: &mut Refs) -> Result<
             push_unique(&mut refs.terms, id.name);
             walk_call_arguments(arguments.as_ref(), refs)?;
         }
-        ast::InlineExpression::FunctionReference { arguments, .. } => {
-            walk_call_arguments(Some(arguments), refs)?;
+        // No function is callable. `FluentBundle::new` starts with an empty
+        // entry table and fluent-bundle registers nothing of its own — its
+        // `add_builtins()` is opt-in and, at 0.16, supplies only `NUMBER`
+        // (`DATETIME` is still a TODO upstream). `bundle_for` calls neither, so
+        // every function reference resolves to nothing and renders its own error
+        // text. Refusing them here keeps that impossible; the number/date
+        // formatting work is what will register functions and loosen this to a
+        // list of the registered names.
+        ast::InlineExpression::FunctionReference { id, .. } => {
+            return Err(format!(
+                "`{}()` is a function reference, but no Fluent function is registered — \
+                 the runtime would render `{{{}()}}` instead of a value",
+                id.name, id.name
+            ));
         }
         ast::InlineExpression::Placeable { expression } => walk_expression(expression, refs)?,
         ast::InlineExpression::StringLiteral { .. }
