@@ -16698,3 +16698,128 @@ fn backends_a_catalog_row_stands_down_while_its_transfer_starts(cx: &mut TestApp
         "only this entry's door yields — the rest of the catalog is untouched: {during:?}"
     );
 }
+
+/// **A transcript Retry hands the keyboard back, because pressing it takes the
+/// surface away.** Both failure surfaces in the reading column carry exactly
+/// one tab stop — their Retry (`probe(Role::Button)` derives a real one) — and
+/// the press ends the state the surface renders: the read leaves `Failed` as
+/// it restarts, so the centred panel and the stale strip each unmount under
+/// the keyboard that activated them. Left alone the window points at a handle
+/// nobody paints, no keystroke reaches anything, and Tab restarts from the
+/// root — the class the bottom bands and `RecordView::close_detail` cure, and
+/// this branch's failed-download verbs cured beside them.
+///
+/// The target is `keyboard_home()`, this window's one answer for a surface
+/// that borrowed the keyboard going away — the view root where the panel left
+/// nothing to stand on, the reader's own place among the posts the strip kept.
+///
+/// Real-core, because a stub never starts the read: the unmount *is* the cell
+/// leaving `Failed`, and this asserts it alongside the focus rather than
+/// taking the surface's disappearance on trust. Both failures are staged after
+/// the window has settled, and the assertions are taken synchronously, so no
+/// in-flight load can clear them instead of the press.
+#[gpui::test]
+fn space_a_transcript_retry_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    let (stores, core, _dir, space_id) = participants_scene(cx);
+    let (window, view) = open_space(cx, &stores, Some(space_id));
+    cx.run_until_parked();
+
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let root = view.read_with(cx, |v, _| v.focus_handle());
+    let surface = view.read_with(cx, |v, _| v.transcript_retry_focus_for_test());
+
+    // The centred panel: a failed initial read, nothing on the page. Seeded,
+    // drawn — so the panel has painted and its handle is tracked — and seeded
+    // again, since the window's own read can land during that pump.
+    let seed_dead_end = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| s.fail_initial_transcript_load_for_test(cx));
+        })
+        .unwrap();
+    };
+    seed_dead_end(cx);
+    draw_window(cx, window);
+    seed_dead_end(cx);
+    assert!(
+        space.read_with(cx, |s, _| s.transcript_load_failure().is_some()),
+        "the panel is standing, which is what the press is about"
+    );
+    cx.update_window(window, |_, window, cx| window.focus(&surface, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.retry_transcript_load(window, cx));
+    })
+    .unwrap();
+    assert!(
+        space.read_with(cx, |s, _| s.transcript_load_failure().is_none()),
+        "the read restarted, so the panel the reader was standing in is gone"
+    );
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "so the keyboard goes home rather than staying on a surface nobody paints"
+    );
+
+    // The stale strip: a failed refresh over posts this window still holds.
+    // Seeded, drawn — so the strip has painted and its handle is tracked — and
+    // then seeded again, because the real read the first Retry started lands
+    // during that pump and would otherwise resolve the cell for us.
+    cx.run_until_parked();
+    let seed_stale = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.set_post_tree_for_test(vec![fixture_user_post("a1", "the question")], cx);
+                s.fail_transcript_refresh_for_test(cx);
+            });
+        })
+        .unwrap();
+    };
+    seed_stale(cx);
+    draw_window(cx, window);
+    seed_stale(cx);
+    assert!(
+        space.read_with(cx, |s, _| s.transcript_refresh_failure().is_some()),
+        "the strip is standing"
+    );
+    cx.update_window(window, |_, window, cx| window.focus(&surface, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.retry_transcript_load(window, cx));
+    })
+    .unwrap();
+    assert!(
+        space.read_with(cx, |s, _| s.transcript_refresh_failure().is_none()),
+        "the strip stands down while the read it asked for is in flight"
+    );
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "and its Retry owed the keyboard back exactly as the panel's did"
+    );
+
+    // …and a reader who was not standing in the surface keeps their place: a
+    // pointer press moves focus nowhere, so an unconditional restore would take
+    // a composing reader's caret away.
+    cx.run_until_parked();
+    seed_stale(cx);
+    draw_window(cx, window);
+    open_space_draft(&view, window, cx, Some("a1"));
+    seed_stale(cx);
+    let composer = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("a draft is open");
+    let caret = composer.read_with(cx, |e, cx| e.focus_handle(cx));
+    cx.update_window(window, |_, window, cx| window.focus(&caret, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.retry_transcript_load(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| caret.is_focused(window))
+            .unwrap(),
+        "a reader composing beside the strip keeps their caret"
+    );
+
+    drain_runtime(&core);
+}
