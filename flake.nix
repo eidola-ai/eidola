@@ -215,13 +215,17 @@
                 # Keep directories that are parents of crate paths
                 else if type == "directory" && isParentOfCrate relPath then
                   true
-                # Include .sql files (used by include_str! in the CLI) and
-                # .ttf font files (used by include_bytes! in the GUI). These
-                # both feed compile-time macros; craneLib.filterCargoSources
+                # Include .sql files (used by include_str! in the CLI), .ttf
+                # font files (used by include_bytes! in the GUI), and .ftl
+                # localization files (read by the GUI's build.rs, which emits
+                # them as string literals — every shipped string is a build
+                # input inside the measured artifact, never loaded at runtime).
+                # All three feed compile-time inputs; craneLib.filterCargoSources
                 # discards them by default because they aren't Rust source.
                 else if type == "regular" && (
                   pkgs.lib.hasSuffix ".sql" path
                   || pkgs.lib.hasSuffix ".ttf" path
+                  || pkgs.lib.hasSuffix ".ftl" path
                 ) then
                   true
                 # For everything else, use crane's filter (which handles .rs, Cargo.toml, etc.)
