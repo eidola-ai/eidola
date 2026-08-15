@@ -831,6 +831,42 @@ impl SpaceView {
         let handle = window.window_handle();
         space.update(cx, |space, _| space.attach_window(handle));
 
+        // Closing the last window on an untouched space disposes of it. A view
+        // lives exactly as long as its window, so its release *is* the close;
+        // the entity answers whether any other window still draws this
+        // conversation, and app-core decides — inside its own transaction —
+        // whether there is anything here worth keeping.
+        //
+        // **The release is also the last moment anything can be asked whether
+        // a write is still travelling.** The entity dies with this view, and a
+        // core call outlives the gpui task that issued it, so a save (or a
+        // rename, or a roster edit) started a moment ago can still be on its
+        // way to the database that the disposal is about to reserve. Asked
+        // here, while every owner is alive; honoured by the store, which never
+        // disposes over an outstanding write.
+        {
+            let stores = stores.clone();
+            let space = space.clone();
+            let closing = handle.window_id();
+            cx.on_release(move |_, cx| {
+                let (id, alone, busy) = space.read_with(cx, |space, cx| {
+                    (
+                        space.id().to_string(),
+                        !space.has_other_open_window(closing, cx),
+                        space.is_busy(),
+                    )
+                });
+                if !alone {
+                    return;
+                }
+                let still_writing = busy || crate::stores::space_writes_in_flight(&stores, &id, cx);
+                stores
+                    .spaces
+                    .update(cx, |spaces, cx| spaces.window_closed(id, still_writing, cx));
+            })
+            .detach();
+        }
+
         let _subs = vec![
             // Any space change re-derives the render snapshot and re-renders.
             cx.observe(&space, |this: &mut Self, _, cx| {

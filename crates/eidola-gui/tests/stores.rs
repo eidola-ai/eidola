@@ -2240,3 +2240,332 @@ fn a_refused_account_operation_leaves_the_subscription_alone(cx: &mut TestAppCon
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Disposing of untouched spaces — the store's half
+// ---------------------------------------------------------------------------
+
+/// Whether the core still holds `space`, archived or not.
+fn space_row_exists(core: &std::sync::Arc<AppCore>, space: &str) -> bool {
+    core.runtime()
+        .block_on(core.list_spaces(true))
+        .is_ok_and(|spaces| spaces.iter().any(|s| s.id == space))
+}
+
+/// **A window can close over its own insert, and the space is still disposed
+/// of.** The store owns the insert precisely so a ⌘N closed a keystroke later
+/// leaves a *whole* space rather than half of one — which means the close can
+/// arrive while the row does not exist yet, where a disposal would answer "no
+/// such space" and leave behind the very orphan it exists to prevent. So the id
+/// waits for the insert's completion and is disposed of from there.
+///
+/// The interleaving is staged rather than hoped for: creating and closing in
+/// one pass means the creation task has not been polled yet.
+///
+/// **The absence of the row proves nothing on its own here**, which is the
+/// trap this shape invites: the insert is deliberately unpolled, so the id
+/// names nothing at the moment the close arrives, and a bare "it is gone"
+/// would be satisfied by the state the test starts in. So both ends are
+/// observed instead — the deferral, taken while the row does not exist, and
+/// app-core's own report that it *deleted* a space under this id, which only a
+/// row that existed and was pristine can produce.
+#[gpui::test]
+fn a_window_closed_over_its_own_insert_still_leaves_nothing_behind(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
+    let space_id = entity.read_with(cx, |s, _| s.id().to_string());
+    // The entity dies with its last window in production; here the test is the
+    // only holder, so it has to let go for the release to mean anything.
+    drop(entity);
+    stores
+        .spaces
+        .update(cx, |s, cx| s.window_closed(space_id.clone(), false, cx));
+
+    assert!(
+        !space_row_exists(&core, &space_id),
+        "the premise: the insert has not been polled, so there is no row yet"
+    );
+    assert!(
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.disposal_deferred_for_test(&space_id)),
+        "so the close defers rather than disposing of a space that is not there"
+    );
+
+    wait_until(cx, "the insert commits and the space is deleted", |cx| {
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.disposed_for_test().contains(&space_id))
+    });
+    assert!(
+        !space_row_exists(&core, &space_id),
+        "and the row it created is gone"
+    );
+    assert!(
+        !stores
+            .spaces
+            .read_with(cx, |s, _| s.list().iter().any(|r| r.id == space_id)),
+        "as is the Library index's residue"
+    );
+}
+
+/// **A reopen that lands before the verdict is asked for cancels the
+/// disposal** — and the window it opened is released to work normally.
+///
+/// Store calls and every stretch of a spawned task between its `await` points
+/// run on gpui's main thread, and `bridge` issues its core call on the first
+/// poll of the future being awaited — so the disposal's registry recheck and
+/// the issuance of the delete are one uninterrupted segment. A reopen can only
+/// land on one side of it. This is the *before* side: the recheck upgrades a
+/// live entity, nothing is judged, and the entity — which `open` constructed
+/// with its row undecided, because a disposal was in flight for that id — is
+/// told the row is there. The submit at the end is what proves the release:
+/// a save waits on exactly that gate, so a space left undecided would hang
+/// instead of writing.
+#[gpui::test]
+fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
+    let space_id = entity.read_with(cx, |s, _| s.id().to_string());
+    drop(entity);
+    wait_until(cx, "the space's row commits", |_| {
+        space_row_exists(&core, &space_id)
+    });
+
+    // The close, and — before the disposal's task gets a turn — a reopen.
+    stores
+        .spaces
+        .update(cx, |s, cx| s.window_closed(space_id.clone(), false, cx));
+    let reopened = stores
+        .spaces
+        .update(cx, |s, cx| s.open(space_id.clone(), cx));
+    assert!(
+        reopened.read_with(cx, |s, _| s.row_undecided_for_test()),
+        "the window opens undecided — a disposal is in flight for this id, so \
+         its reads and writes queue behind the verdict rather than racing it"
+    );
+    assert!(
+        !reopened.read_with(cx, |s, _| s.transcript_visible()),
+        "and it has answered nothing, so no composer stands over it"
+    );
+
+    settle(cx);
+    assert!(
+        space_row_exists(&core, &space_id),
+        "the conversation someone reopened is not an abandoned one"
+    );
+    assert!(
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.disposed_for_test().is_empty()),
+        "and app-core was never asked to delete it"
+    );
+
+    // Released, not merely un-deleted: a save waits on the same gate.
+    assert!(reopened.update(cx, |s, cx| {
+        s.submit("The tide is the moon's doing.".into(), None, Vec::new(), cx)
+    }));
+    wait_until(cx, "the post lands in the space that was kept", |_| {
+        core.runtime()
+            .block_on(core.get_space_messages(space_id.clone()))
+            .is_ok_and(|m| m.len() == 1)
+    });
+}
+
+/// **A window that opens while a verdict is outstanding waits for it, and then
+/// reports it** — the *after* side of that same segment boundary, where the
+/// delete is already travelling and `open` may not proceed blind.
+///
+/// The store cannot stage this arm: a window opened before the recheck cancels
+/// the disposal outright (the test above), so "gated **and** deleted" is
+/// unreachable from there — which is itself the point. So the two halves are
+/// driven directly: an entity constructed the way `open` constructs one inside
+/// the window, and the verdict the disposal's task delivers to it. What must
+/// hold is that nothing escapes in either direction — no read answers, no write
+/// reaches the database, and when the verdict is *taken* the window says so
+/// rather than offering a composer over nothing.
+#[gpui::test]
+fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestAppContext) {
+    use eidola_gui::space::Space;
+
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+    let space_id = core
+        .runtime()
+        .block_on(core.create_space(None))
+        .expect("create space")
+        .id;
+
+    // Exactly what `SpacesStore::open` builds when a disposal is in flight.
+    let app_core = stores.app_core();
+    let space = cx.new(|cx| Space::existing(app_core, space_id.clone(), true, cx));
+    assert!(space.read_with(cx, |s, _| s.row_undecided_for_test()));
+    assert!(
+        !space.read_with(cx, |s, _| s.transcript_visible()),
+        "no read has answered, so no composer is minted"
+    );
+
+    // A save issued into that window is accepted on the frame and held.
+    assert!(space.update(cx, |s, cx| {
+        s.submit("The tide is the moon's doing.".into(), None, Vec::new(), cx)
+    }));
+    settle(cx);
+    assert_eq!(
+        core.runtime()
+            .block_on(core.get_space_messages(space_id.clone()))
+            .unwrap()
+            .len(),
+        0,
+        "and nothing reached the database while the verdict was outstanding"
+    );
+
+    // The verdict: the space was untouched, and it is gone.
+    assert!(
+        core.runtime()
+            .block_on(core.discard_if_pristine(space_id.clone()))
+            .unwrap()
+    );
+    space.update(cx, |s, cx| {
+        s.row_is_gone(
+            eidola_app_core::error::AppError::NotConfigured {
+                message: "This conversation was empty and untouched, so it was \
+                          discarded when its last window closed."
+                    .into(),
+            },
+            cx,
+        )
+    });
+    settle(cx);
+
+    assert!(
+        !space.read_with(cx, |s, _| s.row_undecided_for_test()),
+        "the verdict settled the gate rather than leaving the window waiting"
+    );
+    assert!(
+        matches!(
+            space.read_with(cx, |s, _| s.transcript().clone()),
+            eidola_gui::loadable::Loadable::Failed { .. }
+        ),
+        "the window *reports* the conversation is gone — `Loading` is equally \
+         invisible and would be a permanent spinner instead"
+    );
+    assert!(
+        !space.read_with(cx, |s, _| s.transcript_visible()),
+        "and it never offers a composer over a space that does not exist"
+    );
+    assert!(
+        !space_row_exists(&core, &space_id),
+        "and the held save never resurrected it"
+    );
+}
+
+/// Give work that is *not* supposed to happen a real chance to happen.
+fn settle(cx: &mut TestAppContext) {
+    for _ in 0..8 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    cx.run_until_parked();
+}
+
+/// **A write already on its way to the database outranks the disposal.**
+///
+/// `bridge` cancels nothing core-side, so a save started a moment before the
+/// window closed is still travelling while the disposal reserves the writer. If
+/// the disposal gets there first the space is still pristine, so it goes — and
+/// the save then lands on nothing, with no window left to say so. That is a
+/// reader's words gone, which is the one outcome the whole feature exists to
+/// prevent, so the close refuses to dispose over any outstanding write.
+///
+/// The store's half: it honours the answer it is handed. (The answer itself is
+/// taken at the view's release — see `crates/eidola-gui/tests/behavior.rs`,
+/// `a_save_still_in_flight_holds_off_the_disposal`.)
+#[gpui::test]
+fn the_store_never_disposes_over_an_outstanding_write(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
+    let space_id = entity.read_with(cx, |s, _| s.id().to_string());
+    drop(entity);
+    wait_until(cx, "the space's row commits", |_| {
+        space_row_exists(&core, &space_id)
+    });
+
+    stores
+        .spaces
+        .update(cx, |s, cx| s.window_closed(space_id.clone(), true, cx));
+    settle(cx);
+
+    assert!(
+        space_row_exists(&core, &space_id),
+        "an untouched space is kept while anything is still writing to it"
+    );
+    assert!(
+        stores
+            .spaces
+            .read_with(cx, |s, _| s.disposed_for_test().is_empty()),
+        "app-core was never asked"
+    );
+}
+
+/// **A window on a space that turned out not to exist says so — it never
+/// spins.**
+///
+/// The path is ordinary: a Send pressed in the frames after ⌘N waits out the
+/// insert, the insert is refused, and the waiter is released with that
+/// refusal. Every save-side failure completion then restarts the transcript
+/// load — the debt a superseded load owes — and a restart over a settled
+/// negative row is the trap: `Failed { prior: None }.to_loading()` is
+/// `Loading`, so the reload flips the cell to a spinner, its own gate refuses
+/// before anything can resolve it, and the window is left spinning forever
+/// with the real error thrown away on the way. So a read against a row known
+/// not to exist does not start at all, and the verdict stands.
+///
+/// The same shape reaches the disposal's verdict, which settles the identical
+/// gate; the assertion is on the cell rather than on `transcript_visible`,
+/// because `Loading` and `Failed` are both invisible and only one of them is
+/// honest.
+#[gpui::test]
+fn a_refused_creation_after_an_early_send_says_so_instead_of_spinning(cx: &mut TestAppContext) {
+    use eidola_gui::loadable::Loadable;
+
+    let (stores, _dir) = backed_stores(cx);
+
+    let space = stores.spaces.update(cx, |s, cx| s.create(cx));
+    let space_id = space.read_with(cx, |s, _| s.id().to_string());
+    assert!(space.update(cx, |s, cx| {
+        s.submit("The tide is the moon's doing.".into(), None, Vec::new(), cx)
+    }));
+
+    stores.spaces.update(cx, |s, cx| {
+        s.fail_creation_for_test(
+            &space_id,
+            eidola_app_core::error::AppError::Database {
+                message: "disk is full".into(),
+            },
+            cx,
+        )
+    });
+    settle(cx);
+
+    let cell = space.read_with(cx, |s, _| match s.transcript() {
+        Loadable::Failed { error, .. } => format!("failed: {error}"),
+        Loadable::Loading => "loading".to_string(),
+        Loadable::NotLoaded => "not loaded".to_string(),
+        Loadable::Loaded { .. } => "loaded".to_string(),
+    });
+    assert!(
+        cell.starts_with("failed:"),
+        "the window holds the refusal, not a spinner — got {cell:?}"
+    );
+    assert!(
+        cell.contains("disk is full"),
+        "and it is the creation's own error, not something a reload replaced \
+         it with — got {cell:?}"
+    );
+}

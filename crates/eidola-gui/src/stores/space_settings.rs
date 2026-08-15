@@ -142,6 +142,13 @@ impl SpaceSettingsStore {
         }
     }
 
+    /// Whether a settings write (cascade limit, router model) is in flight for
+    /// `space_id` — read by the disposal of untouched spaces
+    /// (`stores::space_writes_in_flight`), for the reason stated there.
+    pub(crate) fn writes_in_flight(&self, space_id: &str) -> bool {
+        self.op_tasks.contains_key(space_id)
+    }
+
     /// Re-read one space's settings. Deferred when that space's mutation holds
     /// the read (a read resolving after the mutation's own re-read can only be
     /// fresher than one racing it).

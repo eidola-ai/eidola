@@ -17,7 +17,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 5;
+const LATEST_VERSION: i64 = 6;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -1370,6 +1370,211 @@ pub async fn insert_space(
 }
 
 // ---------------------------------------------------------------------------
+// Layer 2 — Semantic: the pristineness stamp and the disposal of untouched
+// spaces.
+//
+// A space's window opens the space, so an abandoned new window (and every
+// launch that opens a blank one) leaves a durable empty conversation behind.
+// These two doors reap them, under one rule: **reap only what is provably
+// pristine; when unsure, keep.** A wrongly-kept orphan costs a Library row; a
+// wrongly-reaped space costs someone's work, so every mechanism below is
+// arranged so that the safe error is the one a mistake makes.
+//
+// Pristine is two legs, both asked inside the disposal's own transaction:
+//   * no `action` row in the space — every post, inference, trace, decision,
+//     memory revision and branch summary is its own witness, which is why the
+//     action write path carries no stamp; and
+//   * `space.touched_at IS NULL` — nothing has changed the space's
+//     configuration footprint (its own row, its `space_participant` rows, the
+//     `participant` rows it owns) since it was instantiated.
+//
+// The stamp is written by the db-layer write functions themselves, so the
+// enumeration lives where the writes live rather than in a caller's memory;
+// `pristine_spaces_stamp_ledger` (tests/reap_pristine.rs) scans this module for
+// statements against those three tables and fails on one that is not accounted
+// for. `instantiate_template` is the one door that *un*-stamps: it writes
+// `touched_at` last, inside its own transaction, because a fresh instantiation
+// is pristine by definition.
+// ---------------------------------------------------------------------------
+
+/// Mark a space as touched — the first write that changes its configuration
+/// footprint wins, so the value names the moment it stopped being untouched
+/// and every later write is a cheap no-op.
+///
+/// An unknown id strikes nothing, deliberately: a caller writing into a space
+/// that does not exist has a bigger problem than the stamp, and the write it
+/// is about will fail on its own terms.
+pub async fn touch_space(conn: &Connection, space_id: &str, now: i64) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE space SET touched_at = ?2 WHERE id = ?1 AND touched_at IS NULL",
+        (Value::Text(space_id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// Mark the space a **space-owned** participant belongs to, deriving the space
+/// inside the statement rather than from anything the caller captured — the
+/// module's derive-authority-at-the-write idiom. A global or template-owned
+/// participant owns no space, so the statement strikes nothing.
+pub async fn touch_space_of_participant(
+    conn: &Connection,
+    participant_id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE space SET touched_at = ?2 \
+         WHERE touched_at IS NULL \
+           AND id = (SELECT owner_space_id FROM participant WHERE id = ?1)",
+        (Value::Text(participant_id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// Every space that currently looks pristine — the sweep's candidate read.
+///
+/// Advisory only: each candidate is re-decided inside
+/// [`discard_space_if_pristine`]'s own transaction, so a write landing between
+/// this read and that transaction keeps its space.
+pub async fn pristine_space_ids(conn: &Connection) -> Result<Vec<String>, AppError> {
+    let mut rows = conn
+        .query(PRISTINE_SPACE_IDS_SQL, ())
+        .await
+        .map_err(AppError::db)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        ids.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(ids)
+}
+
+/// The pristineness predicate, as one query over the whole table.
+///
+/// A **notebook is excluded unconditionally**: it exists only for the agent
+/// that owns it, is the residence of that agent's `core` memory, and is
+/// created by a promotion — a deliberate act, whose freshly-minted space would
+/// otherwise be the most obviously pristine thing in the database. The stamp
+/// covers it too (`insert_notebook_space` writes one), so this clause is the
+/// second lock on the one mistake with the highest cost.
+const PRISTINE_SPACE_IDS_SQL: &str = "\
+SELECT s.id FROM space s \
+WHERE s.touched_at IS NULL \
+  AND s.notebook_participant_id IS NULL \
+  AND NOT EXISTS (SELECT 1 FROM action a WHERE a.space_id = s.id) \
+  AND NOT EXISTS (SELECT 1 FROM memory_block m WHERE m.space_id = s.id) \
+  AND NOT EXISTS (SELECT 1 FROM space c WHERE c.parent_space_id = s.id) \
+  AND NOT EXISTS ( \
+        SELECT 1 FROM participant p \
+        WHERE p.owner_space_id = s.id \
+          AND (EXISTS (SELECT 1 FROM action a2 WHERE a2.participant_id = p.id) \
+            OR EXISTS (SELECT 1 FROM memory_block m2 WHERE m2.owner_participant_id = p.id)))";
+
+/// The raw row counts of a space's whole footprint — `(space, membership,
+/// owned participants)`. The test seam behind
+/// `AppCore::test_space_footprint`; see it for why counting rows rather than
+/// reading a roster is the only way to hold a delete to its scope.
+#[doc(hidden)]
+pub async fn space_footprint_counts(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<(i64, i64, i64), AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT \
+               (SELECT COUNT(*) FROM space WHERE id = ?1), \
+               (SELECT COUNT(*) FROM space_participant WHERE space_id = ?1), \
+               (SELECT COUNT(*) FROM participant \
+                 WHERE scope = 'space' AND owner_space_id = ?1)",
+            (Value::Text(space_id.to_string()),),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(AppError::db)?
+        .ok_or_else(|| AppError::Database {
+            message: "footprint count returned no row".into(),
+        })?;
+    Ok((
+        row.get::<i64>(0).map_err(AppError::db)?,
+        row.get::<i64>(1).map_err(AppError::db)?,
+        row.get::<i64>(2).map_err(AppError::db)?,
+    ))
+}
+
+/// Delete a space **if it is provably pristine**, and say whether it did.
+///
+/// This is the app's first real delete (archival is the only other removal, and
+/// it is soft), so its scope is stated exactly. Inside one `BEGIN IMMEDIATE`
+/// transaction it re-asks the whole predicate — never trusting the caller's
+/// earlier read, which is what closes the window where a write lands between a
+/// check and a delete — and then removes, in FK order:
+///
+/// 1. the space's `space_participant` rows (memberships *of this space*: the
+///    referenced globals stay, they are the shared library);
+/// 2. the `participant` rows the space **owns** (`scope = 'space'`), which by
+///    the predicate have authored nothing and own no memory anywhere;
+/// 3. the `space` row.
+///
+/// Nothing shared is reachable from there. The full inbound-edge graph of
+/// `space(id)` is `space.parent_space_id`, `participant.owner_space_id`,
+/// `space_participant.space_id`, `action.space_id` and `memory_block.space_id`
+/// — the last two are empty by the predicate's first leg, the first is checked
+/// explicitly, and the middle two are what this deletes. The inbound edges of a
+/// space-owned `participant` are `action` and `memory_block` (both checked;
+/// `space_participant` / `space_template_participant` are CHECK-pinned to
+/// globals and `space.notebook_participant_id` names only a global). FK
+/// enforcement is on for every connection, so anything this reasoning missed
+/// aborts the transaction and the space is kept — which is the direction the
+/// whole feature errs in.
+pub async fn discard_space_if_pristine(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<bool, AppError> {
+    begin_write(conn).await?;
+    match discard_space_if_pristine_body(conn, space_id).await {
+        Ok(discarded) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(discarded)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn discard_space_if_pristine_body(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<bool, AppError> {
+    let sql = format!("{PRISTINE_SPACE_IDS_SQL} AND s.id = ?1");
+    let mut rows = conn
+        .query(&sql, (Value::Text(space_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    if rows.next().await.map_err(AppError::db)?.is_none() {
+        return Ok(false);
+    }
+
+    for stmt in [
+        "DELETE FROM space_participant WHERE space_id = ?1",
+        "DELETE FROM participant WHERE scope = 'space' AND owner_space_id = ?1",
+        "DELETE FROM space WHERE id = ?1",
+    ] {
+        conn.execute(stmt, (Value::Text(space_id.to_string()),))
+            .await
+            .map_err(AppError::db)?;
+    }
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
 // Layer 2 — Semantic: Participants (scope-owned) + space templates
 //
 // Every participant row has exactly one scope: 'global' (the shared library —
@@ -1448,6 +1653,13 @@ impl ParticipantRefRow {
 /// Insert a participant row with an explicit scope + owner. `provider_id` is
 /// transport/forensic linkage (not a mirrored config column); copied instances
 /// carry `None`.
+///
+/// A `scope = 'space'` row **stamps its owner space** — a space's agent roster
+/// is part of its configuration footprint, and both doors that grow it (the
+/// roster's Add, and the model picker's mint of an agent for an unmatched
+/// model) are changes to the space. Instantiation uses this primitive too and
+/// takes its stamp back at the end of its own transaction, which is where the
+/// birth-vs-change distinction belongs (see [`instantiate_template`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_participant(
     conn: &Connection,
@@ -1464,6 +1676,16 @@ pub async fn insert_participant(
     provider_id: Option<&str>,
     created_at: i64,
 ) -> Result<(), AppError> {
+    // **Before the insert, not after.** turso autocommits each statement, so a
+    // stamp written afterwards leaves a window in which the new participant is
+    // durable and its space still reads untouched — long enough for a disposal
+    // to take the space and the row together, after which the stamp updates
+    // nothing and the roster change is simply gone. Marking first can only
+    // over-mark (a failed insert leaves a space nothing changed looking
+    // touched), which costs a listing row.
+    if let Some(space_id) = owner_space_id.filter(|_| scope == "space") {
+        touch_space(conn, space_id, created_at).await?;
+    }
     conn.execute(
         "INSERT INTO participant \
          (id, scope, owner_space_id, owner_template_id, kind, label, model_ref, \
@@ -1545,10 +1767,18 @@ pub async fn get_participant(
 /// `false` therefore means "nothing to set, or nothing live to set it on"; the
 /// caller distinguishes them (the read only *explains* a write that struck
 /// nothing — it never decides one).
+///
+/// **The pristineness stamp is written first, and unconditionally.** turso
+/// autocommits each statement, so stamping after a successful update leaves a
+/// window in which the edit is durable and the space still reads as untouched
+/// — precisely the state a reaper must never see. Stamping first can only
+/// over-mark (a refused write leaves a space that nothing changed looking
+/// touched), which costs a Library row; the other order costs the edit.
 pub async fn update_participant_config(
     conn: &Connection,
     id: &str,
     write: &PersonaWrite,
+    now: i64,
 ) -> Result<bool, AppError> {
     let mut sets: Vec<String> = Vec::new();
     let mut params: Vec<Value> = vec![Value::Text(id.to_string())];
@@ -1592,6 +1822,7 @@ pub async fn update_participant_config(
         "UPDATE participant SET {} WHERE id = ?1{premise}",
         sets.join(", ")
     );
+    touch_space_of_participant(conn, id, now).await?;
     let n = conn.execute(&sql, params).await.map_err(AppError::db)?;
     Ok(n > 0)
 }
@@ -1739,8 +1970,13 @@ impl PersonaWrite {
     /// Apply it, reporting whether any row changed. Every caller writes through
     /// here, so "a persona write" is one statement builder
     /// ([`update_participant_config`]) with one set of semantics.
-    pub async fn apply(&self, conn: &Connection, participant_id: &str) -> Result<bool, AppError> {
-        update_participant_config(conn, participant_id, self).await
+    pub async fn apply(
+        &self,
+        conn: &Connection,
+        participant_id: &str,
+        now: i64,
+    ) -> Result<bool, AppError> {
+        update_participant_config(conn, participant_id, self, now).await
     }
 }
 
@@ -1826,6 +2062,12 @@ async fn promote_participant_tx_body(
     promotion: &Promotion<'_>,
 ) -> Result<(), AppError> {
     let participant_id = promotion.participant_id;
+    // Sharing an agent changes the space that owned it — it loses an owned
+    // participant and gains a reference to a shared one. Stamped explicitly
+    // rather than left to the membership insert below, because the flip is
+    // what the change *is*, and `touch_space_of_participant` cannot see it
+    // afterwards (the statement nulls the owner it would have derived from).
+    touch_space(conn, promotion.home_space_id, promotion.now).await?;
     // Both key columns move in one statement: the three-way scope/owner CHECK
     // must hold at statement end, and the cascade fires off the (id, scope)
     // parent key.
@@ -1852,7 +2094,7 @@ async fn promote_participant_tx_body(
         });
     }
     if let Some(persona) = promotion.persona {
-        persona.apply(conn, participant_id).await?;
+        persona.apply(conn, participant_id, promotion.now).await?;
     }
     insert_space_participant(
         conn,
@@ -1904,10 +2146,14 @@ pub async fn insert_notebook_space(
     title: &str,
     created_at: i64,
 ) -> Result<(), AppError> {
+    // Born stamped: a notebook exists because a human shared an agent, which
+    // is as deliberate a gesture as naming a conversation. The disposal
+    // predicate excludes notebooks outright as well — two locks on the one
+    // mistake that would cost an agent the residence of its core memory.
     conn.execute(
         "INSERT INTO space (id, parent_space_id, title, linkability, \
-                            notebook_participant_id, created_at) \
-         VALUES (?1, NULL, ?2, 'unlinked', ?3, ?4)",
+                            notebook_participant_id, created_at, touched_at) \
+         VALUES (?1, NULL, ?2, 'unlinked', ?3, ?4, ?4)",
         (
             Value::Text(id.to_string()),
             Value::Text(title.to_string()),
@@ -2343,7 +2589,7 @@ async fn retire_participant_tx_body(
         return Ok(false);
     }
     conn.execute(
-        "UPDATE space SET archived_at = ?2 \
+        "UPDATE space SET archived_at = ?2, touched_at = COALESCE(touched_at, ?2) \
          WHERE notebook_participant_id = ?1 AND archived_at IS NULL",
         (Value::Text(participant_id.to_string()), Value::Integer(now)),
     )
@@ -2641,6 +2887,11 @@ pub async fn ensure_space_participant(
     // so the template instantiation's "User" (inserted a few lines earlier with
     // the template's own role and overrides) survives the `ensure` that follows
     // it, exactly as `OR IGNORE` made it.
+    //
+    // The membership stamps the space (see `insert_participant_ref`), before
+    // the write and whether or not it changes anything: an over-mark keeps a
+    // space, and this door is reached by the invite as well as by birth.
+    touch_space(conn, space_id, joined_at).await?;
     let n = conn
         .execute(
             "INSERT INTO space_participant \
@@ -2687,6 +2938,14 @@ async fn insert_participant_ref(
     overrides: &ParticipantRefRow,
     ignore: bool,
 ) -> Result<(), AppError> {
+    // A space's membership is part of its configuration footprint, so a join
+    // stamps it (a template's does not — templates are not reaped). Stamped
+    // before the insert for the ordering reason `update_participant_config`
+    // states; instantiation's own copies are un-stamped wholesale at the end of
+    // its transaction, so birth is still pristine.
+    if table == "space_participant" {
+        touch_space(conn, owner_id, joined_at).await?;
+    }
     let verb = if ignore { "INSERT OR IGNORE" } else { "INSERT" };
     let sql = format!(
         "{verb} INTO {table} \
@@ -2724,6 +2983,7 @@ async fn insert_participant_ref(
 /// retired) is refused rather than parked in columns nothing reads, which is
 /// what keeps "your write was refused" from meaning "your write is waiting to
 /// reappear".
+#[allow(clippy::too_many_arguments)]
 pub async fn update_space_participant_override(
     conn: &Connection,
     space_id: &str,
@@ -2732,6 +2992,7 @@ pub async fn update_space_participant_override(
     override_model_ref: Option<Option<&str>>,
     override_system_prompt: Option<Option<&str>>,
     override_notify_policy: Option<Option<&str>>,
+    now: i64,
 ) -> Result<bool, AppError> {
     let mut sets: Vec<String> = Vec::new();
     let mut params: Vec<Value> = vec![
@@ -2760,6 +3021,10 @@ pub async fn update_space_participant_override(
            )",
         sets.join(", ")
     );
+    // An override is per-space configuration, so it stamps the space — before
+    // the write, and whether or not the write lands (see
+    // `update_participant_config` for why that order is the safe one).
+    touch_space(conn, space_id, now).await?;
     let n = conn.execute(&sql, params).await.map_err(AppError::db)?;
     Ok(n > 0)
 }
@@ -2850,6 +3115,10 @@ async fn remove_space_participant_tx_body(
     participant_id: &str,
     now: i64,
 ) -> Result<SpaceRemoval, AppError> {
+    // Either branch changes the space's roster, and the transaction makes the
+    // stamp atomic with whichever one lands; a `NothingToDo` over-marks, which
+    // keeps a space rather than losing one.
+    touch_space(conn, space_id, now).await?;
     let struck = conn
         .execute(
             "UPDATE participant SET removed_at = ?3 \
@@ -2928,6 +3197,7 @@ pub async fn leave_space_participant(
     participant_id: &str,
     now: i64,
 ) -> Result<bool, AppError> {
+    touch_space(conn, space_id, now).await?;
     let n = conn
         .execute(
             "UPDATE space_participant SET left_at = ?3 \
@@ -3122,13 +3392,16 @@ pub async fn set_space_cascade_limit(
     conn: &Connection,
     space_id: &str,
     cascade_limit: i64,
+    now: i64,
 ) -> Result<bool, AppError> {
     let n = conn
         .execute(
-            "UPDATE space SET cascade_limit = ?2 WHERE id = ?1",
+            "UPDATE space SET cascade_limit = ?2, \
+             touched_at = COALESCE(touched_at, ?3) WHERE id = ?1",
             (
                 Value::Text(space_id.to_string()),
                 Value::Integer(cascade_limit),
+                Value::Integer(now),
             ),
         )
         .await
@@ -3164,11 +3437,17 @@ pub async fn set_space_router_model(
     conn: &Connection,
     space_id: &str,
     router_model: Option<&str>,
+    now: i64,
 ) -> Result<bool, AppError> {
     let n = conn
         .execute(
-            "UPDATE space SET router_model = ?2 WHERE id = ?1",
-            (Value::Text(space_id.to_string()), opt_str(router_model)),
+            "UPDATE space SET router_model = ?2, \
+             touched_at = COALESCE(touched_at, ?3) WHERE id = ?1",
+            (
+                Value::Text(space_id.to_string()),
+                opt_str(router_model),
+                Value::Integer(now),
+            ),
         )
         .await
         .map_err(AppError::db)?;
@@ -3525,6 +3804,28 @@ async fn instantiate_template_body(
 
     // The shared human "User" joins every instantiated space (idempotent).
     ensure_space_participant(conn, new_space_id, HUMAN_PARTICIPANT_ID, "owner", now).await?;
+
+    // **Birth is not a change.** Every copy above went through a primitive that
+    // stamps the space it writes into, which is what makes the enumeration live
+    // where the writes live — so instantiation takes the stamp back here, last,
+    // inside the same transaction, and a fresh space is pristine by definition.
+    //
+    // The one thing an instantiation carries that is *not* birth is a
+    // caller-supplied `title`: a human saying what this conversation is for.
+    // So a titled creation is born stamped, and an untitled one — the ⌘N door,
+    // and "New Space from Template", both of which pass `None` — is not.
+    conn.execute(
+        "UPDATE space SET touched_at = ?2 WHERE id = ?1",
+        (
+            Value::Text(new_space_id.to_string()),
+            match title {
+                Some(_) => Value::Integer(now),
+                None => Value::Null,
+            },
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
     Ok(())
 }
 
@@ -5751,7 +6052,9 @@ pub async fn archive_space(
 ) -> Result<bool, AppError> {
     let changed = conn
         .execute(
-            "UPDATE space SET archived_at = ?2 WHERE id = ?1 AND archived_at IS NULL",
+            "UPDATE space SET archived_at = ?2, \
+             touched_at = COALESCE(touched_at, ?2) \
+             WHERE id = ?1 AND archived_at IS NULL",
             (
                 Value::Text(space_id.to_string()),
                 Value::Integer(archived_at),
@@ -5764,23 +6067,34 @@ pub async fn archive_space(
     Ok(changed > 0)
 }
 
+/// Set a space's title, answering **whether a row took it**.
+///
+/// The answer is the existence check: a caller that read the space a moment ago
+/// and then wrote by id alone would report success for a title that landed
+/// nowhere, because a space can stop existing between the two (an untouched one
+/// is disposed of when its last window closes). Deciding at the write is the
+/// module's rule, and here it costs one `bool`.
 pub async fn update_space_title(
     conn: &Connection,
     space_id: &str,
     title: &str,
-) -> Result<(), AppError> {
-    conn.execute(
-        "UPDATE space SET title = ?2 WHERE id = ?1",
-        (
-            Value::Text(space_id.to_string()),
-            Value::Text(title.to_string()),
-        ),
-    )
-    .await
-    .map_err(|e| AppError::Database {
-        message: format!("failed to update space title: {e}"),
-    })?;
-    Ok(())
+    now: i64,
+) -> Result<bool, AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE space SET title = ?2, touched_at = COALESCE(touched_at, ?3) \
+         WHERE id = ?1",
+            (
+                Value::Text(space_id.to_string()),
+                Value::Text(title.to_string()),
+                Value::Integer(now),
+            ),
+        )
+        .await
+        .map_err(|e| AppError::Database {
+            message: format!("failed to update space title: {e}"),
+        })?;
+    Ok(changed > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -7441,6 +7755,7 @@ mod tests {
                 None,
                 None,
                 None,
+                2_000,
             )
             .await
             .unwrap()
@@ -7455,6 +7770,7 @@ mod tests {
                 notify_policy: Some("all".into()),
                 ..Default::default()
             },
+            2_000,
         )
         .await
         .unwrap();
@@ -7470,7 +7786,7 @@ mod tests {
         // Turn the may-decline router on for this space, so the projection
         // below carries it exactly like cascade_limit.
         assert!(
-            set_space_router_model(&conn, "space-x", Some("router@local"))
+            set_space_router_model(&conn, "space-x", Some("router@local"), 2_000)
                 .await
                 .unwrap()
         );
@@ -7579,6 +7895,7 @@ mod tests {
             None,
             None,
             None,
+            2_000,
         )
         .await
         .unwrap();
@@ -7594,6 +7911,7 @@ mod tests {
             None,
             None,
             None,
+            2_000,
         )
         .await
         .unwrap();
@@ -7631,6 +7949,144 @@ mod tests {
     /// statements *after* the space row and its owned agents — hits the
     /// composite FK. What a full disk or a future constraint would do to the
     /// same door, at a step we can name.
+    /// **A write marks its space before it writes, so even a write that never
+    /// lands leaves the space kept.**
+    ///
+    /// This is the observable end of the ordering rule. `conn.execute`
+    /// autocommits, so if `insert_participant` stamped *after* its insert there
+    /// would be a moment when the new participant is durable and its space
+    /// still reads pristine — a disposal interleaving there deletes the space
+    /// and the row together, and the stamp that follows finds nothing to
+    /// update. Marking first makes that window impossible, and the price is
+    /// visible here: a refused insert marks a space nothing changed. Keeping a
+    /// listing row is the error worth making.
+    /// **A space's existence is decided by the write, not by a read before
+    /// it** — staged as the interleaving that makes the difference visible.
+    ///
+    /// A disposal of an untouched space travels while the Library still lists
+    /// its row, so a rename can be issued after the delete is on its way: the
+    /// read says the space is there, the delete commits, and the write then
+    /// strikes nothing. A door that took its answer from the read reports
+    /// success for a title no row took — and the caller's optimistic edit
+    /// stands over a database that never agreed to it, with nothing on screen
+    /// to say so. `update_space_title` answers whether a row took it, which is
+    /// what lets `rename_space` refuse.
+    ///
+    /// The roster's door is checked in the same breath, from the other
+    /// direction: it has no rows-affected to read, and does not need one — the
+    /// foreign key is what refuses it, and a refusal is all its caller needs.
+    #[tokio::test]
+    async fn a_write_into_a_space_that_has_just_gone_refuses_rather_than_reporting_success() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "space-race",
+            None,
+            "unlinked",
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        // The read a door would have decided from.
+        assert!(
+            get_space(&conn, "space-race").await.unwrap().is_some(),
+            "the space is there when the door is asked (the premise)"
+        );
+
+        // …and the disposal lands between that read and the write.
+        assert!(
+            discard_space_if_pristine(&conn, "space-race")
+                .await
+                .unwrap(),
+            "the untouched space is disposed of"
+        );
+
+        assert!(
+            !update_space_title(&conn, "space-race", "Tides", 2_000)
+                .await
+                .unwrap(),
+            "the title write strikes nothing, and says so"
+        );
+
+        let err = insert_participant(
+            &conn,
+            "p-race",
+            "space",
+            Some("space-race"),
+            None,
+            "agent",
+            "Ada",
+            None,
+            None,
+            "explicit",
+            "member",
+            None,
+            2_000,
+        )
+        .await
+        .expect_err("a roster add into a space that is gone must fail its foreign key");
+        assert!(matches!(err, AppError::Database { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_participant_insert_still_marks_its_space() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "space-mark",
+            None,
+            "unlinked",
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            pristine_space_ids(&conn)
+                .await
+                .unwrap()
+                .contains(&"space-mark".to_string()),
+            "a fresh instantiation is pristine (the premise)"
+        );
+
+        // The insert fails on the primary key — a stand-in for every way a
+        // statement after the stamp can refuse (a full disk, a constraint a
+        // future column adds).
+        let taken = HUMAN_PARTICIPANT_ID;
+        let err = insert_participant(
+            &conn,
+            taken,
+            "space",
+            Some("space-mark"),
+            None,
+            "agent",
+            "Ada",
+            None,
+            None,
+            "explicit",
+            "member",
+            None,
+            2_000,
+        )
+        .await
+        .expect_err("inserting a participant at a taken id must fail");
+        assert!(matches!(err, AppError::Database { .. }), "{err:?}");
+
+        assert!(
+            !pristine_space_ids(&conn)
+                .await
+                .unwrap()
+                .contains(&"space-mark".to_string()),
+            "the space is marked anyway — the stamp precedes the statement it \
+             covers, so no interleaving can see a durable change beside an \
+             untouched space"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_instantiation_leaves_no_space_at_all() {
         let db = open_memory_fresh().await;
