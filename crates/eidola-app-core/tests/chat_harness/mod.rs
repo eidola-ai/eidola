@@ -349,6 +349,12 @@ pub struct MockServer {
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     /// Number of `POST /v1/credentials/refund` requests received.
     refund_hits: Arc<AtomicU64>,
+    /// Number of `GET /v1/models` requests received — the catalogue fetch a
+    /// turn's *setup* makes, and so the earliest thing on the wire that says
+    /// preparation got as far as building a client. Tests that assert a turn
+    /// was refused before it did any work read this rather than `chat_hits`,
+    /// which only notices once the turn is fully prepared.
+    models_hits: Arc<AtomicU64>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -358,6 +364,10 @@ impl MockServer {
     }
     pub fn refund_hits(&self) -> u64 {
         self.refund_hits.load(Ordering::SeqCst)
+    }
+    /// Catalogue fetches (see `models_hits`).
+    pub fn models_hits(&self) -> u64 {
+        self.models_hits.load(Ordering::SeqCst)
     }
     /// The recorded chat request bodies (see `chat_bodies`).
     pub fn chat_bodies(&self) -> Vec<serde_json::Value> {
@@ -746,6 +756,7 @@ pub async fn start(config: MockConfig) -> MockServer {
     let chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let refund_hits = Arc::new(AtomicU64::new(0));
+    let models_hits = Arc::new(AtomicU64::new(0));
 
     let task = {
         let issuer = issuer.clone();
@@ -754,6 +765,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         let chat_auths = chat_auths.clone();
         let chat_auth_values = chat_auth_values.clone();
         let refund_hits = refund_hits.clone();
+        let models_hits = models_hits.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -766,6 +778,7 @@ pub async fn start(config: MockConfig) -> MockServer {
                 let chat_auths = chat_auths.clone();
                 let chat_auth_values = chat_auth_values.clone();
                 let refund_hits = refund_hits.clone();
+                let models_hits = models_hits.clone();
                 tokio::spawn(async move {
                     let _ = handle_conn(
                         stream,
@@ -776,6 +789,7 @@ pub async fn start(config: MockConfig) -> MockServer {
                         chat_auths,
                         chat_auth_values,
                         refund_hits,
+                        models_hits,
                     )
                     .await;
                 });
@@ -790,6 +804,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         chat_auths,
         chat_auth_values,
         refund_hits,
+        models_hits,
         _task: task,
     }
 }
@@ -868,6 +883,7 @@ async fn handle_conn(
     chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     refund_hits: Arc<AtomicU64>,
+    models_hits: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
     // Each connection serves at most one request (reqwest opens a fresh
     // connection per request here; HTTP/1.1 keep-alive is unnecessary for the
@@ -880,7 +896,10 @@ async fn handle_conn(
 
     // Route. Paths are matched without the `?...` query (none used here).
     match (req.method.as_str(), path) {
-        ("GET", "/v1/models") => match config.models_status {
+        ("GET", "/v1/models") => match {
+            models_hits.fetch_add(1, Ordering::SeqCst);
+            config.models_status
+        } {
             Some(status) => {
                 write_json(&mut stream, status, r#"{"error":"models unavailable"}"#).await?;
             }

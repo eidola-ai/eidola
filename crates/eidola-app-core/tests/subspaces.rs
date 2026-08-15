@@ -1793,3 +1793,56 @@ fn retiring_an_owner_stops_the_helpers_mid_cascade() {
         assert_eq!(tree[0].action_type, "brief");
     });
 }
+
+/// **A guard that wraps a statement protects nothing if the statement is
+/// exported.**
+///
+/// The rules a membership write has to respect live in the transactions —
+/// `remove_space_participant_tx` refuses to end the two structural
+/// memberships, `join_space_participant_tx` and `grant_space_membership_tx`
+/// refuse a second owner of a sub-space, `retire_participant_tx` archives the
+/// rooms a retirement closes. Every one of them wraps a raw primitive, and a
+/// `pub` on any of those primitives is a way to do the guarded thing without
+/// the guard — reachable by a release dependent, since `db` is a public module.
+///
+/// So the primitives are private, and this pins the class: adding one, or
+/// exporting one for convenience, fails here rather than quietly reopening the
+/// hole. It is the sibling of `the_raw_space_insert_has_no_production_caller`
+/// in `reap_pristine.rs`, which holds the raw space insert to the same rule.
+#[test]
+fn the_raw_membership_writers_are_not_exported() {
+    let source = include_str!("../src/db.rs");
+    let production = source
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .map(|(before, _)| before)
+        .expect("db.rs ends in its test module");
+
+    for raw in [
+        "insert_space_participant",
+        "ensure_space_participant",
+        "insert_participant_ref",
+        "leave_space_participant",
+        "soft_remove_participant",
+    ] {
+        assert!(
+            production.contains(&format!("async fn {raw}(")),
+            "{raw} should still exist — if it was renamed, rename it here too"
+        );
+        assert!(
+            !production.contains(&format!("pub async fn {raw}(")),
+            "{raw} is a raw membership write and must stay private to db.rs: exported, it is a \
+             way to end a sub-space owner's membership, mint a second owner, or retire an agent \
+             without archiving the rooms it owned — each of which the wrapping transaction \
+             exists to refuse"
+        );
+    }
+
+    // The leave is the sharpest of them: it is the guarded statement *minus*
+    // the two refusals, so it may not even be compiled into a release build.
+    assert!(
+        production.contains("#[cfg(test)]\nasync fn leave_space_participant("),
+        "leave_space_participant must stay test-only — the real leave is the statement inside \
+         remove_space_participant_tx, which carries the notebook-owner and sub-space-owner \
+         refusals this one has never had"
+    );
+}
