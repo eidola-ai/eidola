@@ -1871,6 +1871,14 @@ pub async fn first_quotable_block(
 /// tail has been reported, which is true after a report, false again the moment
 /// somebody posts into the room, and identical after a restart. A status column
 /// would have to be written, kept in step with continuation, and believed.
+///
+/// **Only a current generation answers it**, because the question is really
+/// "does the parent show this?" — and a superseded generation shows nobody
+/// anything. A report that was regenerated carries its edges forward
+/// (`prepare_turn`'s replication, the rule `edit_post` has always followed), so
+/// the tip answers yes and nothing changes; the join is what makes the driver's
+/// belief and the reader's footnote the same fact rather than two that can
+/// drift, and it errs toward reporting again rather than toward silence.
 pub async fn has_reference_from(
     conn: &Connection,
     space_id: &str,
@@ -1881,6 +1889,7 @@ pub async fn has_reference_from(
         .query(
             "SELECT 1 FROM action_antecedent aa \
              JOIN action a ON a.id = aa.action_id \
+             JOIN item_current ic ON ic.current_action_id = a.id \
              WHERE aa.relation = 'reference' AND aa.antecedent_action_id = ?1 \
                AND a.space_id = ?2 AND a.participant_id = ?3 \
              LIMIT 1",

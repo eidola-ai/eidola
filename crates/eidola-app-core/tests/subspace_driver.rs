@@ -537,6 +537,47 @@ fn a_report_waits_for_the_answer_it_belongs_under_and_never_waits_twice() {
     });
 }
 
+/// **The wait registers before it asks, so an answer landing in between is not
+/// lost.** The room's registration is what a change in the parent looks for;
+/// asking first and registering second leaves a window in which the answer
+/// commits, its change finds nothing registered, and the registration that
+/// follows waits for a wake-up that has already gone by — the room then never
+/// reports at all. Staged exactly: the walk is stopped inside that window and
+/// the answer is committed there.
+#[test]
+fn an_answer_landing_inside_the_anchor_window_is_not_lost() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        let mut window = core.test_open_anchor_window();
+        let answer = std::thread::scope(|scope| {
+            let walking = scope.spawn(|| drive(&core, &out.space.id));
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the walk reaches the anchor window");
+            // The spawning turn's answer commits *here* — after the room has
+            // registered, before it asks.
+            let answer = ask(&core, &parent, &owner, &asked);
+            resume.send(()).expect("the walk resumes");
+            walking.join().expect("the walk finishes").expect("driven");
+            answer
+        });
+
+        let report = report(&core, &parent).expect("the delegation is reported, not lost");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(answer.as_str()),
+            "and beneath the answer that landed in the window"
+        );
+    });
+}
+
 /// The other half of the wait: an answer that is never coming. A walk armed by
 /// the startup sweep reports against the post the work was asked on, because at
 /// that moment nothing can still be in flight.
@@ -597,6 +638,83 @@ fn a_retired_author_is_still_named_in_the_report() {
             attached.contains("[1] Surveyor"),
             "a retired author keeps the name they wrote under: {attached}"
         );
+    });
+}
+
+/// **Re-wording a report does not orphan its delegation.** A regeneration is a
+/// new generation of the same turn, and the finding it quotes and the ending it
+/// records are facts of the delegation rather than of the sentence — so they
+/// travel with it, exactly as an edit's references do. Without that the visible
+/// footnote disappears while the driver goes on believing the room reported.
+#[test]
+fn regenerating_a_report_keeps_its_finding_and_its_ending() {
+    run(|| {
+        // The driver streams and `regenerate` does not, so this one test needs
+        // an upstream that answers both twins.
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let before = report(&core, &parent).expect("the delegation is reported");
+        let quoted = before.references[0].antecedent_action_id.clone();
+        let requests_before = mock.chat_bodies().len();
+
+        core.runtime()
+            .block_on(core.regenerate(before.action_id.clone(), MODEL.to_string()))
+            .expect("regenerate the report");
+
+        // The visible footnote survives, on the generation a reader now sees.
+        let after = report(&core, &parent).expect("the report still carries its finding");
+        assert_ne!(
+            after.action_id, before.action_id,
+            "it really is a new generation"
+        );
+        assert_eq!(after.references.len(), 1);
+        assert_eq!(after.references[0].antecedent_action_id, quoted);
+        assert_eq!(after.references[0].ordinal, 1, "at the ordinal it had");
+        assert_eq!(
+            after.references[0].delegation_end,
+            Some(DelegationEnd::Concluded),
+            "and the ending with it"
+        );
+        assert!(
+            after.references[0].snippet.is_some(),
+            "the passage still resolves"
+        );
+
+        // The regenerating model was shown what it was re-wording: `Revise`
+        // withholds the generation being replaced, so without the attachment
+        // the finding would be absent from its context entirely.
+        let body = mock
+            .chat_bodies()
+            .get(requests_before)
+            .cloned()
+            .expect("the regeneration's request");
+        let messages = flat_messages(&body);
+        assert!(
+            messages
+                .iter()
+                .any(|(_, c)| c.contains("Attached to your reply") && c.contains("[1] Surveyor")),
+            "the finding is in front of the turn re-wording it: {messages:?}"
+        );
+
+        // And the driver still reads the room as reported — off the generation
+        // a reader can see, not a superseded one.
+        let requests = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("a second walk");
+        assert_eq!(
+            mock.chat_bodies().len(),
+            requests,
+            "nothing is re-reported and nothing is re-billed"
+        );
+        assert_eq!(reports(&core, &parent).len(), 1, "still one report");
     });
 }
 

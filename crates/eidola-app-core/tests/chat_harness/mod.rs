@@ -82,6 +82,12 @@ pub enum ChatBehavior {
     OkBlockingNoInlineRefund,
     /// 200 SSE stream: content + reasoning deltas, usage, `[DONE]`.
     OkStreaming,
+    /// A plain success in **whichever transport asked** — SSE for a streaming
+    /// request, JSON for a blocking one. One behaviour for a test that must
+    /// exercise both twins against one upstream, which is otherwise impossible:
+    /// `OkBlocking` answers a streamed ask with a body its parser reads as no
+    /// content at all.
+    OkEitherTransport,
     /// As `OkStreaming`, but the model mimics the per-message header
     /// scaffolding: its content starts with a header-shaped line. Exercises
     /// strip-on-receipt.
@@ -1265,6 +1271,22 @@ async fn handle_chat(
                     &error_body("tools param requires --jinja flag"),
                 )
                 .await;
+            }
+            let mut body = serde_json::json!({
+                "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "Hello from the mock.",
+                } }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+            });
+            if let Some(refund) = inline_refund {
+                body["refund"] = refund;
+            }
+            write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::OkEitherTransport => {
+            if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+                return write_sse_stream(stream, true, &[STREAM_CONTENT]).await;
             }
             let mut body = serde_json::json!({
                 "choices": [{ "message": {
