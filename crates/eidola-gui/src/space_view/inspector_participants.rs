@@ -1995,6 +1995,11 @@ impl SpaceView {
                         // The single tab stop, on the element carrying the
                         // role, with the roving key map riding it.
                         .track_focus(&form.list_focus)
+                        // The candidate list is bounded and nested in the
+                        // inspector body; its wheel must not scroll that body.
+                        .on_scroll_wheel(cx.listener(|_, _: &gpui::ScrollWheelEvent, _, cx| {
+                            cx.stop_propagation();
+                        }))
                         .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
                             if this.handle_invite_key(ev, window, cx) {
                                 cx.stop_propagation();
