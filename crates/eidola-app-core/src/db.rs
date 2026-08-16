@@ -2089,12 +2089,22 @@ async fn spawn_subspace_tx_body(
     // left is a brief that yields no line at all (pure markdown scaffolding,
     // say). A row with neither a title nor a snippet — briefs are not what
     // `first_user_text` reads — would be unrecognizable, and refusing the
-    // spawn would punish a model for its formatting, so the room is named
-    // after the agent answerable for it instead.
+    // spawn would punish a model for its formatting, so the room takes the
+    // name of the agent answerable for it.
+    //
+    // **The owner's label alone, not a sentence about it.** A title is
+    // persisted, and a persisted string can never pass through the
+    // presentation layer's translations — so anything this crate writes there
+    // is read as-is in every language. A label is a *name*: it is already
+    // whatever its owner called it, it is locale-neutral by nature, and it
+    // says the one thing a reader scanning the Library needs (whose room this
+    // is). A phrase like "Delegated by …" would have been English copy stored
+    // in the database, which is exactly what the layering keeps out of here —
+    // this crate ships no user-facing strings.
     let title = plan
         .title
         .map(str::to_string)
-        .unwrap_or_else(|| format!("Delegated by {}", owner.label));
+        .unwrap_or_else(|| owner.label.clone());
 
     // ---- writes -----------------------------------------------------------
     //

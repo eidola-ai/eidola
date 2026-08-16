@@ -505,6 +505,14 @@ impl SpaceView {
     /// its leaf, when no composer is open) and inject the embed marker at the
     /// caret.
     pub fn quote(&mut self, _: &Quote, window: &mut Window, cx: &mut Context<Self>) {
+        // A quote opens a draft *here*, so it is composition like any other:
+        // a reader who may not act in this conversation is not handed a
+        // populated, focused composer whose submit is refused. Guarded at the
+        // handler as well as at the two surfaces that offer it, because a
+        // keystroke reaches this without passing either.
+        if !self.viewer_may_act(cx) {
+            return;
+        }
         let Some(selection) = self.post_selection.clone() else {
             return;
         };
@@ -525,6 +533,10 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Lands a draft here too — see [`Self::quote`].
+        if !self.viewer_may_act(cx) {
+            return;
+        }
         let Some(selection) = self.post_selection.clone() else {
             return;
         };

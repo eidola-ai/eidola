@@ -79,6 +79,11 @@ pub(crate) struct PostContextMenu {
     pub(crate) can_copy: bool,
     pub(crate) can_paste: bool,
     pub(crate) quotable: bool,
+    /// Whether this reader may compose here at all (`viewer_may_act`), asked
+    /// at open time like everything else on this snapshot. It separates the
+    /// two quote rows that land a draft *in this conversation* from
+    /// `Quote Elsewhere…`, which lands one wherever the reader chooses.
+    pub(crate) may_act: bool,
 }
 
 /// One menu row: its label, its probe slug, and what it runs. Every row that
@@ -168,6 +173,7 @@ impl SpaceView {
             can_copy,
             can_paste,
             quotable,
+            may_act: self.viewer_may_act(cx),
         });
         cx.notify();
     }
@@ -241,16 +247,29 @@ impl SpaceView {
                     });
                 }
                 if menu.quotable {
-                    items.push(Item {
-                        slug: "quote",
-                        label: "Quote",
-                        action: ItemAction::Quote,
-                    });
-                    items.push(Item {
-                        slug: "quote-in-reply",
-                        label: "Quote in Reply",
-                        action: ItemAction::QuoteInReply,
-                    });
+                    // **Where the draft lands decides who may ask for it.**
+                    // These two open one *here*, so a reader who may not act
+                    // in this conversation is not offered them — the window
+                    // must not invite composition it cannot accept.
+                    if menu.may_act {
+                        items.push(Item {
+                            slug: "quote",
+                            label: "Quote",
+                            action: ItemAction::Quote,
+                        });
+                        items.push(Item {
+                            slug: "quote-in-reply",
+                            label: "Quote in Reply",
+                            action: ItemAction::QuoteInReply,
+                        });
+                    }
+                    // Quoting *elsewhere* stays: the draft lands in whichever
+                    // conversation the reader picks, which is very likely one
+                    // they take part in, and the passage is theirs to quote
+                    // because they can read it. Refusing it here would deny a
+                    // legitimate act on account of where they happened to be
+                    // reading; the destination's own gate answers for the
+                    // destination.
                     items.push(Item {
                         slug: "quote-elsewhere",
                         label: "Quote Elsewhere…",
