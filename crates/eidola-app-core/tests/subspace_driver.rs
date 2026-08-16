@@ -669,6 +669,95 @@ fn an_unrelated_post_in_the_parent_does_not_spend_the_wait() {
     });
 }
 
+/// **A room that can never run again stops being waited on.** An anchor wait is
+/// a standing registration against the parent, and every post there wakes every
+/// room registered under it — so a room that has been archived and stays
+/// registered makes its parent's every post pay for it, for as long as the
+/// process lives.
+#[test]
+fn an_archived_room_stops_waiting_on_its_parent() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        drive(&core, &out.space.id).expect("the room is driven");
+        assert_eq!(
+            core.test_rooms_awaiting(parent.clone()),
+            vec![out.space.id.clone()],
+            "it is registered against its parent while it waits"
+        );
+
+        core.runtime()
+            .block_on(core.archive_space(out.space.id.clone()))
+            .expect("archive the room");
+        let requests = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("an archived room is a no-op");
+
+        assert!(
+            core.test_rooms_awaiting(parent.clone()).is_empty(),
+            "and it lets go the moment it can never run again"
+        );
+        assert_eq!(mock.chat_bodies().len(), requests, "having done nothing");
+    });
+}
+
+/// **Falling behind the bus is not the same as starting fresh.** A process that
+/// has just started can say nothing is in flight, and stop waiting on that
+/// basis; a process recovering from a bus it lagged cannot — an owner's turn
+/// may be running at that very moment. So lag recovery arms as an ordinary
+/// signal, the wait survives it, and the answer still lands where it belongs.
+#[test]
+fn recovering_from_a_lagged_bus_does_not_end_a_wait() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        // Started before the spawn, so the room is armed by the spawn's own
+        // change — a startup sweep is a fresh process and would rightly not
+        // wait at all.
+        core.start_subspace_driver();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        wait_until(&core, || {
+            core.test_rooms_awaiting(parent.clone()) == vec![out.space.id.clone()]
+        });
+        assert!(report(&core, &parent).is_none(), "it waits");
+
+        // The bus overflows while the owner's turn is still in flight, and the
+        // supervisor re-asks the question of every live room. A recovery that
+        // helped itself to the sweep's premise would deliver the report here,
+        // against the anchor, while the answer was still on its way.
+        let before = mock.chat_bodies().len();
+        core.runtime().block_on(core.test_recover_from_lag());
+        settle(&core);
+        assert_eq!(
+            mock.chat_bodies().len(),
+            before,
+            "the recovery started nothing"
+        );
+        assert!(
+            report(&core, &parent).is_none(),
+            "the wait survives the recovery"
+        );
+
+        // The turn lands, and the report goes where it always belonged.
+        let answer = ask(&core, &parent, &owner, &asked);
+        wait_until(&core, || report(&core, &parent).is_some());
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(answer.as_str()),
+            "beneath the answer, not beside it"
+        );
+    });
+}
+
 /// The other half of the wait: an answer that is never coming. A walk armed by
 /// the startup sweep reports against the post the work was asked on, because at
 /// that moment nothing can still be in flight.
@@ -1251,6 +1340,17 @@ fn a_post_into_a_stopped_room_starts_it_again() {
             "the second report names what has been said since"
         );
     });
+}
+
+/// Let whatever the driver was going to do, happen. Generous enough that a
+/// mock-backed walk is long finished — which is what makes "nothing happened"
+/// mean something.
+fn settle(core: &AppCore) {
+    for _ in 0..25 {
+        core.runtime().block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        });
+    }
 }
 
 /// Poll for a condition the background driver brings about. Generous, because

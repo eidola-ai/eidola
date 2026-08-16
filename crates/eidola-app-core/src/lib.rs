@@ -9144,6 +9144,30 @@ impl AppCore {
         rx
     }
 
+    /// Test-only seam: the delegated rooms currently waiting on `space_id` as
+    /// their parent — the registration that makes a change there wake them.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_rooms_awaiting(&self, space_id: String) -> Vec<String> {
+        self.inner.rooms_awaiting(&space_id)
+    }
+
+    /// Test-only seam: recover from a bus this process fell behind on, the way
+    /// the supervisor does — without having to overflow a real channel.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_recover_from_lag(&self) {
+        let inner = self.inner.clone();
+        let _ = self
+            .runtime
+            .spawn(async move {
+                inner
+                    .rearm_live_subspaces(subspace_driver::Arm::Signal)
+                    .await;
+            })
+            .await;
+    }
+
     /// Test-only seam: stop the next walk once inside its cascade, after its
     /// first driven turn (see `Inner::cascade_window`).
     #[doc(hidden)]

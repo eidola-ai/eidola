@@ -69,13 +69,38 @@ pub(crate) type DriverRegistry = HashMap<String, bool>;
 
 /// Why a room is being armed, which decides one thing: whether it may wait for
 /// its anchor to be answered (see [`Inner::report_delegation`]).
+///
+/// **The two are told apart by provenance, not by shape**, and the distinction
+/// is load-bearing enough to be worth stating twice: the whole of `Sweep`'s
+/// licence to stop waiting is the claim that *nothing can still be in flight*,
+/// and that claim is true only of a process that has just started. Anything a
+/// **live** process does — including recovering from a bus it fell behind on —
+/// is a `Signal`, because a turn it cannot see may be running right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Arm {
-    /// Something was written into the room and the bus said so.
+    /// Something happened that this room might care about: a write the bus
+    /// announced, or a re-ask by a process that is already running (lag
+    /// recovery). A waiting room keeps waiting.
     Signal,
-    /// The startup sweep. A process that has just started cannot be waiting on
-    /// a turn of its own, so nothing it finds is still in flight.
+    /// **The startup sweep, and only that.** A process that has just started
+    /// cannot be waiting on a turn of its own, so nothing it finds is still in
+    /// flight — which is what makes it safe, and the only thing that makes it
+    /// safe, to stop waiting for an answer here.
     Sweep,
+}
+
+/// What a report attempt did.
+///
+/// The difference matters exactly once: a walk that ended by waiting spent no
+/// attempt, because it tried nothing (see [`Inner::drive_subspace`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Report {
+    /// The report was delivered, or the room turned out to have nothing to
+    /// report to (an empty parent, a room archived under us).
+    Settled,
+    /// The post this delegation was opened from has not been answered yet, so
+    /// the report is holding until it is.
+    Waiting,
 }
 
 /// What one process has done about one room's last word — the meter that stops
@@ -418,7 +443,8 @@ impl Inner {
         });
     }
 
-    /// Arm every live sub-space — the startup path.
+    /// Arm every live sub-space. `arm` says on whose authority — see [`Arm`];
+    /// only a process that has just started may pass [`Arm::Sweep`].
     ///
     /// A process that comes back mid-delegation has to pick the room up, and
     /// "mid-delegation" is not a thing that was written down anywhere: each
@@ -431,7 +457,7 @@ impl Inner {
     /// Failures are warned about and swallowed: picking delegations back up is
     /// housekeeping, and a process that refused to start over it would cost the
     /// reader everything else.
-    pub(crate) async fn rearm_live_subspaces(self: &Arc<Self>) {
+    pub(crate) async fn rearm_live_subspaces(self: &Arc<Self>, arm: Arm) {
         let rooms = async {
             let conn = self.db_conn().await?;
             db::live_subspaces(&conn).await
@@ -440,7 +466,7 @@ impl Inner {
         match rooms {
             Ok(rooms) => {
                 for room in rooms {
-                    self.arm_subspace_driver(&room.id, Arm::Sweep);
+                    self.arm_subspace_driver(&room.id, arm);
                 }
             }
             Err(e) => eprintln!("warning: delegated conversations could not be enumerated: {e}"),
@@ -491,6 +517,18 @@ impl Inner {
         true
     }
 
+    /// Give back the attempt a walk claimed, when it turns out not to have been
+    /// one. Only a walk that ended by waiting does this — everything else
+    /// either changed the room's last word (a fresh count) or genuinely tried.
+    fn release_walk(&self, space_id: &str, tail: &str) {
+        let mut walks = self.subspace_walks.lock().expect("walk map poisoned");
+        if let Some(walk) = walks.get_mut(space_id)
+            && walk.tail == tail
+        {
+            walk.attempts = walk.attempts.saturating_sub(1);
+        }
+    }
+
     /// Drive one delegated room to a stop, then report it to its parent.
     ///
     /// Returns without doing anything at all when the room is not one this
@@ -499,13 +537,21 @@ impl Inner {
     /// raises.
     pub(crate) async fn drive_subspace(&self, space_id: String, arm: Arm) -> Result<(), AppError> {
         let conn = self.db_conn().await?;
+        // **A room that is done stops being waited on.** An anchor wait is a
+        // standing registration against the parent, and every post there wakes
+        // every room registered under it — so a room that can never run again
+        // and stays registered makes the parent's every post pay for it, for as
+        // long as the process lives. Each terminal exit below clears it.
         let Some(sub) = db::subspace(&conn, &space_id).await? else {
+            self.end_anchor_wait(&space_id);
             return Ok(()); // not a delegated room
         };
         if sub.archived_at.is_some() {
+            self.end_anchor_wait(&space_id);
             return Ok(()); // archival stops new work, here as everywhere
         }
         let Some(tail) = db::last_action_in_space(&conn, &space_id).await? else {
+            self.end_anchor_wait(&space_id);
             return Ok(()); // a room with no posts — unreachable, a brief opens every one
         };
         // The whole of "is there anything to do here", asked of the rows. A
@@ -519,6 +565,7 @@ impl Inner {
         )
         .await?
         {
+            self.end_anchor_wait(&space_id);
             return Ok(());
         }
         drop(conn);
@@ -531,10 +578,22 @@ impl Inner {
         // Boxed, like every other await on the turn path: `run_turn_stream`'s
         // state machine is the largest in the crate, and stacking this walk's
         // frame on top of it overflows a worker stack.
-        let Some((end, witness)) = Box::pin(self.cascade_subspace(&space_id, tail)).await? else {
+        let Some((end, witness)) = Box::pin(self.cascade_subspace(&space_id, tail.clone())).await?
+        else {
+            self.end_anchor_wait(&space_id);
             return Ok(()); // the room closed under us; nothing to report
         };
-        Box::pin(self.report_delegation(&sub, end, witness, arm)).await
+        let outcome = Box::pin(self.report_delegation(&sub, end, witness, arm)).await;
+        // **Waiting is not an attempt.** The meter bounds retries of work that
+        // failed; a walk that ended by waiting for the post it was delegated
+        // from tried nothing and failed at nothing, and the room's last word is
+        // unchanged — so counting it would spend the room's whole allowance on
+        // three unrelated posts in the parent and then refuse the walk that the
+        // real answer finally arms.
+        if matches!(outcome, Ok(Report::Waiting)) {
+            self.release_walk(&space_id, &tail);
+        }
+        outcome.map(|_| ())
     }
 
     /// The plan → drive → re-plan walk, ending at the first terminal outcome.
@@ -717,7 +776,7 @@ impl Inner {
         end: DelegationEnd,
         witness: String,
         arm: Arm,
-    ) -> Result<(), AppError> {
+    ) -> Result<Report, AppError> {
         let conn = self.db_conn().await?;
         // **The room is re-read one last time before anything acts.** An
         // archival can land during the walk — a retirement archives every room
@@ -725,7 +784,8 @@ impl Inner {
         // is a message nobody asked for about work nobody wants continued. One
         // read, the same shape as every other liveness gate here.
         if !db::is_live_subspace(&conn, &sub.id).await? {
-            return Ok(());
+            self.end_anchor_wait(&sub.id);
+            return Ok(Report::Settled);
         }
         // The passage: the post the walk ended on, whole. A delegation's last
         // word is its finding, and clipping it here would report a fragment
@@ -809,7 +869,7 @@ impl Inner {
                     // flight, so the answer either exists or never will, and the
                     // anchor is then the right attachment because there is
                     // nothing for the report to sit beneath.
-                    None if arm == Arm::Signal => return Ok(()),
+                    None if arm == Arm::Signal => return Ok(Report::Waiting),
                     None => {
                         self.end_anchor_wait(&sub.id);
                         Some(anchor.to_string())
@@ -832,7 +892,8 @@ impl Inner {
             },
         };
         let Some(target) = target else {
-            return Ok(()); // an empty parent has nothing to reply to
+            self.end_anchor_wait(&sub.id);
+            return Ok(Report::Settled); // an empty parent has nothing to reply to
         };
         drop(conn);
 
@@ -884,7 +945,7 @@ impl Inner {
             });
         }
         self.end_anchor_wait(&sub.id);
-        Ok(())
+        Ok(Report::Settled)
     }
 
     /// Register `sub` against its parent, so a change there wakes it.
@@ -928,7 +989,7 @@ impl Inner {
     /// The rooms waiting on a change in `space_id` — see
     /// [`Inner::begin_anchor_wait`]. A pure in-memory lookup, because it is
     /// asked of every `Change::Space` in the process.
-    fn rooms_awaiting(&self, space_id: &str) -> Vec<String> {
+    pub(crate) fn rooms_awaiting(&self, space_id: &str) -> Vec<String> {
         self.awaiting_anchor
             .lock()
             .expect("anchor wait map poisoned")
@@ -971,7 +1032,9 @@ pub(crate) async fn supervise(
     inner: Arc<Inner>,
     mut bus: tokio::sync::broadcast::Receiver<crate::changes::ChangeEvent>,
 ) {
-    inner.rearm_live_subspaces().await;
+    // The one place `Arm::Sweep` is honest: this process has just started, so
+    // nothing it finds can still be in flight.
+    inner.rearm_live_subspaces(Arm::Sweep).await;
     loop {
         match bus.recv().await {
             Ok(event) => {
@@ -991,9 +1054,15 @@ pub(crate) async fn supervise(
             }
             // A lagged supervisor missed writes it cannot name, so it re-asks
             // the question of every live room — the same recovery every other
-            // lagged subscriber makes.
+            // lagged subscriber makes. **As signals, not as a sweep**: this
+            // process is already running, and an owner's turn may be in flight
+            // at this very moment, which is exactly the premise `Arm::Sweep`
+            // would be helping itself to. A room waiting for that turn's answer
+            // therefore keeps waiting, and the answer's own commit wakes it —
+            // the wait re-checks on every parent event, so nothing is lost by
+            // declining to guess here.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                inner.rearm_live_subspaces().await;
+                inner.rearm_live_subspaces(Arm::Signal).await;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }

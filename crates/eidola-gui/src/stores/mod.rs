@@ -105,6 +105,8 @@ pub struct Stores {
 /// anything. Directory resolution returns the same typed error as everything
 /// else here, so one surface renders the whole class.
 ///
+/// **It also starts the sub-space turn driver** — see the call below.
+///
 /// **It opens the database, not just the core.** `AppCore::new` takes the
 /// single-writer lock but fills its database cell lazily, so a schema this build
 /// refuses ("delete your dev database") would sail past this gate and surface
@@ -122,6 +124,14 @@ pub fn open_app_core() -> Result<Arc<AppCore>, eidola_app_core::error::AppError>
     let data_dir = eidola_app_core::config::default_data_dir().ok_or_else(|| missing("data"))?;
     let core = Arc::new(AppCore::new(config_dir, data_dir)?);
     core.runtime().block_on(core.open_database())?;
+    // **The app drives delegated conversations; nothing else in it will.** A
+    // sub-space has no window, so app-core gives it its turns — but only if
+    // somebody starts that, and leaving the start to whoever eventually spawns
+    // one would make a room that sits at its brief forever the *default*
+    // outcome of forgetting a line. Started here, at the one place a long-lived
+    // Eidola builds its core, it cannot be forgotten. It costs an install with
+    // no delegated conversations exactly one empty sweep.
+    core.start_subspace_driver();
     Ok(core)
 }
 
