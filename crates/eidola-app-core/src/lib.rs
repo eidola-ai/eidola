@@ -53,6 +53,7 @@ pub use subspaces::{
     MAX_LIVE_SUBSPACES_PER_OWNER, MAX_SPAWN_DEPTH, MAX_SUBAGENTS_PER_SPAWN, SpaceCapability,
     SpawnRefusal, SpawnedSubspace, SubspaceInfo,
 };
+use utility::clip_middle;
 
 // ============================================================================
 // Data transfer types — returned from `AppCore` methods to the apps
@@ -993,10 +994,12 @@ pub(crate) enum AttachmentOrigin {
     /// seam ([`Inner::validate_agent_reference_spec`]) like any other authored
     /// reference.
     Authored,
-    /// Carried forward from the generation this turn supersedes. **Not gated**,
-    /// for the reason `edit_post`'s replication is not: quoting copies, the
-    /// passage is already here, and re-asking permission at a re-wording would
-    /// rewrite history whenever the answer had changed since.
+    /// Carried forward from the generation this turn supersedes. **Not asked
+    /// for permission**, for the reason `edit_post`'s replication is not:
+    /// quoting copies, the passage is already here, and re-asking permission at
+    /// a re-wording would rewrite history whenever the answer had changed
+    /// since. **The shape rule still applies** — what may be quoted at all is
+    /// not a permission (see [`Inner::render_attached_references`]).
     Replicated,
 }
 
@@ -3207,6 +3210,28 @@ impl Inner {
                 action_id: spec.antecedent_action_id.clone(),
             });
         }
+        // **The ending namespace is not a caller's to write.** `annotation`
+        // holds either a person's note about their quote or this crate's own
+        // record of how a delegated conversation ended, and a reader tells them
+        // apart by the prefix alone — so a supplied note that claimed it would
+        // vanish from every surface that shows a note and appear on every
+        // surface that shows an ending, forging lifecycle state on somebody
+        // else's quote. Refused here, at the one door that takes an annotation
+        // from outside, rather than defended in each of the readers: what the
+        // driver writes is not a caller's value and needs no exemption.
+        if spec
+            .annotation
+            .as_deref()
+            .is_some_and(subspace_driver::is_reserved_annotation)
+        {
+            return Err(AppError::NotConfigured {
+                message: format!(
+                    "a reference annotation may not begin with `{}` — that prefix is reserved for \
+                     the app's own record of how a delegated conversation ended",
+                    subspace_driver::DELEGATION_END_PREFIX
+                ),
+            });
+        }
         Self::validate_reference_shape(conn, spec).await
     }
 
@@ -3275,12 +3300,23 @@ impl Inner {
     }
 
     /// Everything about a spec that does not depend on who is writing it: the
-    /// range/block pairing, the block belonging to the antecedent, the block
-    /// being quotable at all, and the byte range mapping honestly onto it.
+    /// antecedent being a post at all, the range/block pairing, the block
+    /// belonging to the antecedent, the block being quotable, and the byte
+    /// range mapping honestly onto it.
+    ///
+    /// **The whole author-independent rule is here**, the post-kind half
+    /// included, because the one thing that must never depend on how an edge
+    /// arrived is *what may be quoted*. The permission gates read the
+    /// antecedent for its space and this reads it again for its type — one
+    /// point read either of them could have handed the other, and worth paying
+    /// twice for a rule no caller can be trusted to have asked half of: the
+    /// half that was left outside is precisely the half a path skipping the
+    /// gate skipped (see [`Inner::render_attached_references`]).
     async fn validate_reference_shape(
         conn: &turso::Connection,
         spec: &ReferenceSpec,
     ) -> Result<(), AppError> {
+        Self::reference_source_space(conn, spec).await?;
         if spec.range_start.is_some() != spec.range_end.is_some() {
             return Err(AppError::NotConfigured {
                 message: "reference range_start/range_end must be given together".into(),
@@ -3362,11 +3398,26 @@ impl Inner {
         let mut out = ATTACHED_BLOCK_HEADING.to_string();
         for a in attached {
             // A replicated edge is not being authored, so it is not asked for
-            // permission — see [`AttachmentOrigin`]. It still renders, because
-            // a turn re-wording a report has to be shown what it is reporting.
-            if a.origin == AttachmentOrigin::Authored {
-                self.validate_agent_reference_spec(conn, author_participant_id, &a.spec)
-                    .await?;
+            // **permission** — see [`AttachmentOrigin`]. It still renders,
+            // because a turn re-wording a report has to be shown what it is
+            // reporting, and that is exactly why the *shape* rule is asked of
+            // it anyway: what may be quoted at all is not a permission, it is
+            // an audience boundary the whole app maintains, and rendering is
+            // the act that would cross it. An edge written below the create
+            // gate (`test_insert_unvalidated_reference`, or some future writer
+            // beneath it) could otherwise name a `tool_call`, a `decision`, a
+            // `memory` block or a post's `thinking` block, and be expanded
+            // straight into the regenerating model's context — the one thing
+            // every other read path withholds. Every read path re-applies the
+            // rule for edges below the seam; this one is a read path.
+            match a.origin {
+                AttachmentOrigin::Authored => {
+                    self.validate_agent_reference_spec(conn, author_participant_id, &a.spec)
+                        .await?
+                }
+                AttachmentOrigin::Replicated => {
+                    Self::validate_reference_shape(conn, &a.spec).await?
+                }
             }
             let ordinal = a.ordinal;
             let target = match thread.node_for_action(&a.spec.antecedent_action_id) {
@@ -3390,7 +3441,25 @@ impl Inner {
                     db::content_block_owner_text(conn, block_id)
                         .await?
                         .and_then(|(_, _, text)| {
-                            text.and_then(|t| quote_snippet(&t, rs, re).map(str::to_string))
+                            text.and_then(|t| {
+                                // **Rendered within a budget, while the edge
+                                // keeps the whole range.** An attached set is
+                                // machine-made and one entry wide per branch
+                                // the walk reached, and a passage is a range
+                                // its author chose with nothing bounding its
+                                // length — so a single finding could fill this
+                                // turn's context by itself and the ones beside
+                                // it would say nothing. Eliding the middle is
+                                // the rule the app's other model-facing prompts
+                                // already use (`utility::clip_middle`), and it
+                                // costs the edge nothing: the range on the
+                                // record still describes the passage exactly,
+                                // and the human's footnote rail resolves it
+                                // whole — this elides a *rendering*, the way a
+                                // preview does.
+                                quote_snippet(&t, rs, re)
+                                    .map(|s| clip_middle(s, ATTACHED_PASSAGE_MAX_BYTES))
+                            })
                         })
                         .map_or(ReferenceBody::UnresolvedRange, ReferenceBody::Passage)
                 }
@@ -4218,8 +4287,13 @@ impl Inner {
         // store reads a *single* space's archival (`SpaceSettings` carries the
         // cascade limit, the router and the notebook owner, not `archived_at`),
         // so a `Space(id)` here would announce a change no subscriber can
-        // observe. `archive_space` emits `SpaceIndex` alone for the same
-        // reason.
+        // observe. `Inner::archive_space` does announce each room it closed,
+        // and for a reason that is not about stores: it is what releases a
+        // delegation registered against one of them as its parent. A retirement
+        // needs no such release — a room waiting on its anchor is waiting for
+        // *this* agent's answer in the parent, and the next post there arms it
+        // and finds it archived — and the transaction answers with a count
+        // rather than a list, which is all the listing question needs.
         self.bus.emit(Change::Participants);
         if retirement.listed_spaces_archived > 0 {
             self.bus.emit(Change::SpaceIndex);
@@ -4670,13 +4744,27 @@ impl Inner {
         })
     }
 
+    /// Archive a conversation **and the delegations it was running** — see
+    /// `db::archive_space_tx` for why closing a room closes what hangs beneath
+    /// it.
+    ///
+    /// **Every closed room announces itself** (`Change::Space`), the Library
+    /// once (`Change::SpaceIndex`). The per-room announcement is what carries
+    /// the closure to the sub-space driver without a second wiring: a delegated
+    /// room registers itself against its parent while it waits for an answer,
+    /// and `Change::Space` on that parent is what wakes it — where it reads its
+    /// own archival, stops, and lets the registration go. A window open on one
+    /// of these rooms learns the same way it learns about a post.
     async fn archive_space(&self, space_id: &str) -> Result<bool, AppError> {
         let db_conn = self.db_conn().await?;
-        let archived = db::archive_space(&db_conn, space_id, now_ms()).await?;
-        if archived {
+        let archived = db::archive_space_tx(&db_conn, space_id, now_ms()).await?;
+        for id in &archived {
+            self.bus.emit(Change::Space(id.clone()));
+        }
+        if !archived.is_empty() {
             self.bus.emit(Change::SpaceIndex);
         }
-        Ok(archived)
+        Ok(!archived.is_empty())
     }
 
     async fn discard_if_pristine(&self, space_id: &str) -> Result<bool, AppError> {
@@ -11538,6 +11626,27 @@ const REFERENCE_BLOCK_HEADING: &str = "Passages this post quotes:";
 const ATTACHED_BLOCK_HEADING: &str = "Attached to your reply as a quoted reference, numbered \
      as shown — write what it means in your own words; the passage travels with your post, so \
      there is no need to repeat it:";
+
+/// How much of one attached passage is *rendered* into the turn that reports on
+/// it. The **edge** keeps the whole range either way — this bounds a prompt,
+/// not a record.
+///
+/// An attached set is the one place a turn's context grows with something
+/// nobody chose post by post: the sub-space driver attaches one passage per
+/// branch its walk reached, and a passage is a range with nothing bounding its
+/// length, so one long finding could take the whole context and leave the
+/// findings beside it saying nothing. That is the same failure the chore
+/// prompts already budget against, and this is the same cure — elide the middle
+/// ([`utility::clip_middle`]), so both ends of a passage are paid for before
+/// its bulk is.
+///
+/// The figure is read off that register rather than invented: it is a small
+/// multiple of the branch summarizer's per-post budget, because a finding is
+/// what a report is *about* rather than chrome around it. With the walk's own
+/// ceiling on how many tips there can be — one per driven turn
+/// (`subspace_driver::MAX_DELEGATION_TURNS`) plus what arrived while it walked
+/// — the whole block is bounded without capping how many branches come back.
+const ATTACHED_PASSAGE_MAX_BYTES: usize = 1_500;
 
 /// The byline of a quoted post this reader cannot address: a reference names a
 /// *concrete generation*, which may have been superseded, or may live in

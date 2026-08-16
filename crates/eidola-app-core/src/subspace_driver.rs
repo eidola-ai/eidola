@@ -63,9 +63,17 @@ use crate::{
     Planner, ReferenceSpec, ResponseMode, TurnDirective, TurnSelector, db, now_ms,
 };
 
-/// The per-room driver registry: room id → whether an arm arrived while its
-/// task was running (see [`Inner::arm_subspace_driver`]).
-pub(crate) type DriverRegistry = HashMap<String, bool>;
+/// The per-room driver registry: room id → the arm that arrived while its task
+/// was running, if one did (see [`Inner::arm_subspace_driver`]).
+///
+/// **The pending entry is a value, not a flag.** An arm carries a licence (see
+/// [`Arm`]), and a room being driven is exactly when the licence that matters
+/// most arrives — a wait's own alarm comes due while an unrelated parent event
+/// has the room rechecking. Recorded as "something happened", that licence is
+/// gone: the next pass runs on the arm the task captured when it started, the
+/// alarm was one-shot and its wait is not fresh, so nothing schedules another
+/// and the delegation waits until the process restarts.
+pub(crate) type DriverRegistry = HashMap<String, Option<Arm>>;
 
 /// Why a room is being armed, which decides one thing: whether it may wait for
 /// its anchor to be answered (see [`Inner::report_delegation`]).
@@ -91,6 +99,42 @@ pub(crate) enum Arm {
     /// had longer than any turn takes and has not come; the room stops holding
     /// out for it.
     Grace,
+}
+
+impl Arm {
+    /// The lattice: `Signal < Grace < Sweep`, **strongest wins** when two arms
+    /// meet on one room (see [`DriverRegistry`]).
+    ///
+    /// The ordering is by licence, not by urgency. `Signal` claims nothing —
+    /// something happened, a waiting room keeps waiting. `Grace` claims that
+    /// *this* wait has outlived any turn that could answer it. `Sweep` claims
+    /// that nothing anywhere can be in flight, which is the broadest of the
+    /// three and true only of a process that has just started.
+    ///
+    /// **A licence, once earned, is not taken back by a later signal**, which
+    /// is what makes merging a `max` rather than a replacement: an elapsed
+    /// clock does not un-elapse because somebody posted in the parent, so a
+    /// `Grace` that arrives mid-walk is honoured on the next pass rather than
+    /// flattened into the walk's own arm. The order between the two upper
+    /// elements is a naming convention and nothing more: [`Arm`] is read in
+    /// exactly one place, where the only question asked of it is whether it is
+    /// `Signal`.
+    fn strength(self) -> u8 {
+        match self {
+            Self::Signal => 0,
+            Self::Grace => 1,
+            Self::Sweep => 2,
+        }
+    }
+
+    /// The stronger of two arms.
+    fn merge(self, other: Self) -> Self {
+        if other.strength() > self.strength() {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 /// What a report attempt did.
@@ -273,7 +317,22 @@ impl DelegationFailure {
 /// of these, and nothing else — which is why the prefix has to be something
 /// nobody types. [`crate::PostReference`] splits the two apart so no reader can
 /// print one where the other belongs.
-const DELEGATION_END_PREFIX: &str = "eidola:delegation/";
+pub(crate) const DELEGATION_END_PREFIX: &str = "eidola:delegation/";
+
+/// Whether an annotation claims the reserved namespace — the question every
+/// door that accepts an annotation **from a caller** asks before writing it.
+///
+/// The column can say two things and a reader tells them apart by this prefix
+/// alone, so a caller allowed to write one would be writing lifecycle state: a
+/// note reading `eidola:delegation/concluded` hides itself from every surface
+/// that shows a person's note *and* makes a quote report an ending nothing
+/// ended. Reserving it at the write is what keeps the parse total — a stored
+/// token is one this crate wrote — and it is the whole rule: only a value
+/// *starting* here is refused, so a note that mentions the prefix in passing is
+/// an ordinary note.
+pub(crate) fn is_reserved_annotation(annotation: &str) -> bool {
+    annotation.starts_with(DELEGATION_END_PREFIX)
+}
 
 /// How a delegated room stopped.
 ///
@@ -400,13 +459,21 @@ impl Inner {
     /// change bus, which raises `Change::Space` for every post in every
     /// conversation, so most calls are about rooms this has nothing to do with.
     ///
-    /// **A room already being driven records the arm rather than dropping it.**
-    /// The driver walks the posts it planned; a post that arrives from
-    /// somewhere else while it is walking — a human asking a question in a room
-    /// they are watching — is not on that walk, and forgetting it would leave
-    /// the answer unanswered until something else woke the room. So the second
-    /// arm sets a flag the running task checks before it retires, and the walk
-    /// simply starts again from the room's new tail.
+    /// **A room already being driven records the arm rather than dropping it,
+    /// and records it whole.** The driver walks the posts it planned; a post
+    /// that arrives from somewhere else while it is walking — a human asking a
+    /// question in a room they are watching — is not on that walk, and
+    /// forgetting it would leave the answer unanswered until something else
+    /// woke the room. So the second arm is kept for the running task to pick
+    /// up, and the walk simply starts again from the room's new tail.
+    ///
+    /// It is kept as the [`Arm`] it is, merged strongest-wins, because an arm
+    /// is a licence rather than a nudge: a wait's own alarm can come due while
+    /// the room is being rechecked for an unrelated reason, and that alarm is
+    /// one-shot. Flattened into "something happened", it is simply lost — the
+    /// next pass waits again on the arm the task started with, the wait is not
+    /// fresh so nothing schedules a replacement, and the delegation holds out
+    /// for an answer that is never coming until the process restarts.
     pub(crate) fn arm_subspace_driver(self: &Arc<Self>, space_id: &str, arm: Arm) {
         if !self.subspace_driver_running() {
             return;
@@ -417,15 +484,19 @@ impl Inner {
         }
         {
             let mut running = self.subspace_drivers.lock().expect("driver map poisoned");
-            if let Some(rearm) = running.get_mut(space_id) {
-                *rearm = true;
+            if let Some(pending) = running.get_mut(space_id) {
+                *pending = Some(match *pending {
+                    Some(waiting) => waiting.merge(arm),
+                    None => arm,
+                });
                 return;
             }
-            running.insert(space_id.to_string(), false);
+            running.insert(space_id.to_string(), None);
         }
         let inner = self.clone();
         let space_id = space_id.to_string();
         tokio::spawn(async move {
+            let mut arm = arm;
             loop {
                 // Everything this task commits is unattended by construction:
                 // no consumer call is outstanding, so a window that drops the
@@ -456,7 +527,17 @@ impl Inner {
                 {
                     let mut running = inner.subspace_drivers.lock().expect("driver map poisoned");
                     match running.get_mut(&space_id) {
-                        Some(rearm) if *rearm || failed => *rearm = false,
+                        // Another pass, on the strongest licence in play: what
+                        // arrived while this one ran, merged with the one it
+                        // ran under, so neither is dropped by the other (see
+                        // [`Arm::merge`]). A retry after a failure keeps its
+                        // own arm for the same reason — the failure did not
+                        // take back what the walk was allowed to conclude.
+                        Some(pending) if pending.is_some() || failed => {
+                            if let Some(next) = pending.take() {
+                                arm = arm.merge(next);
+                            }
+                        }
                         _ => {
                             running.remove(&space_id);
                             return;
@@ -858,9 +939,11 @@ impl Inner {
             return Ok(Report::Settled);
         }
         // One attachment per finding, at ordinals `1..=N` in the order the walk
-        // found them. The passages travel whole: a quote's range is recorded on
-        // its edge, so shortening what the reader is shown would make the edge
-        // describe something the report does not contain.
+        // found them — every one of them, because each is a branch nothing
+        // followed and only the room's own last word among them settles the
+        // delegation (see [`finish`]). The **edge** names the whole passage; the
+        // report turn's *rendering* of it is what is clipped, at the seam every
+        // attached passage renders through.
         let mut attached: Vec<AttachedReference> = Vec::with_capacity(leaves.len());
         for (i, leaf) in leaves.iter().enumerate() {
             let (content_block_id, range_start, range_end) =
@@ -946,11 +1029,17 @@ impl Inner {
                     // the report's sibling instead of its parent. Every wake
                     // re-asks, and only the answer ends the wait.
                     //
-                    // **Termination is the sweep, and only the sweep.** Waiting
-                    // costs nothing — no turn, no spend, no row — so an
+                    // **Termination is a licence, and a signal is not one.**
+                    // Waiting costs nothing — no turn, no spend, no row — so an
                     // indefinite one is not a leak, it is a room correctly
-                    // declining to guess. What it must not be is permanent, and
-                    // the case where the answer never comes at all is a spawning
+                    // declining to guess. What it must not be is permanent, so
+                    // two arms end it and both claim something a wake-up does
+                    // not: this wait's own alarm (`Arm::Grace`), set when it
+                    // began and honoured whenever it arrives — including on a
+                    // room that happens to be mid-walk, which is why the
+                    // pending arm is a value — and the startup sweep behind it
+                    // for a process that died inside the grace. The case where
+                    // the answer never comes at all is a spawning
                     // turn that died; that process cannot outlive its own crash,
                     // and the next start's sweep arms with `Arm::Sweep`, which
                     // never waits — at that moment nothing can still be in
@@ -1125,13 +1214,26 @@ impl Inner {
 /// waiting on its frontier, which nothing followed either. Deduped, oldest first, and never empty: a walk that got no
 /// further than the room's first post still has that post to show.
 ///
-/// **Bounded by the roster, not by clipping.** A room seats at most
-/// [`crate::MAX_SUBAGENTS_PER_SPAWN`] agents, so that is the natural ceiling on
-/// distinct voices with something to report; a deeper tree keeps its most
-/// recent tips. The bound is on *how many* passages travel and never on how
-/// much of one: a quote's range is recorded on its edge, so shortening the text
-/// a reader is shown would make the edge describe something the report does not
-/// contain.
+/// **Every tip, and no cap.** The seat guard bounds a room's roster and never
+/// bounded its frontier: every seat is notify-all, so one post's fan-out puts
+/// an answer from each of them on it, and a walk stopped by the budget or a
+/// failure can be holding many more tips than the room has agents. Dropping the
+/// oldest of those was silently the worst outcome available — each is a branch
+/// nothing followed, the newest one alone settles `db::has_reference_from`, and
+/// a settled room is never walked again, so the findings that were dropped were
+/// dropped permanently.
+///
+/// **The edge and the rendering are different things**, which is what makes
+/// keeping them all affordable. An edge's recorded range must describe its
+/// quoted text exactly, and every tip's does — the human's footnote rail
+/// resolves each one whole, and the room counts as reported because its last
+/// word is among them. What is bounded instead is the *prompt*: the report
+/// turn's context renders each passage through the app's existing clipping
+/// (`crate::ATTACHED_PASSAGE_MAX_BYTES`), exactly as every other model-facing
+/// rendering already elides — previews strip markers, chore prompts clip the
+/// middle out of a post. The block is then bounded by the walk's own ceiling:
+/// at most one tip per driven turn ([`MAX_DELEGATION_TURNS`]) plus whatever
+/// arrived while it walked, each within one clipped passage.
 fn finish(mut leaves: Vec<String>, unwalked: &[String], entry_tail: &str) -> Vec<String> {
     // Anything still on the frontier when the walk stopped is a tip nothing
     // followed either — it just never got its turn.
@@ -1140,10 +1242,6 @@ fn finish(mut leaves: Vec<String>, unwalked: &[String], entry_tail: &str) -> Vec
     leaves.retain(|id| seen.insert(id.clone()));
     if leaves.is_empty() {
         leaves.push(entry_tail.to_string());
-    }
-    let limit = crate::MAX_SUBAGENTS_PER_SPAWN as usize;
-    if leaves.len() > limit {
-        leaves.drain(..leaves.len() - limit);
     }
     leaves
 }

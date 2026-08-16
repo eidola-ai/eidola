@@ -573,6 +573,152 @@ fn an_owner_holds_the_live_limit_and_archiving_frees_a_slot() {
     });
 }
 
+/// **Closing a conversation closes what it delegated, all the way down.**
+///
+/// A delegation exists to serve the room it was opened from. Left live under an
+/// archived one it can never finish: its report is a turn in that archived
+/// parent, which is refused at the gate every turn meets, so the room keeps
+/// being armed, keeps failing to report, holds a live-room slot of an owner
+/// nobody retired, and waits on an anchor no post will ever answer — with no
+/// un-archive door anywhere to get it back out. The rule is therefore held at
+/// the archival's own write, at every depth and whoever owns what it reaches.
+#[test]
+fn archiving_a_conversation_closes_the_delegations_beneath_it() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+
+        // parent → room → nested → deepest, each level opened by whichever
+        // agent is standing in the room above it.
+        let room = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![helper.clone()],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+        let nested = spawn(
+            &core,
+            &room,
+            &helper,
+            "A sub-errand of my own.",
+            vec![owner.clone()],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+        let deepest = spawn(
+            &core,
+            &nested,
+            &owner,
+            "And one below that.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+        // A delegation under a conversation nobody is closing: the descent must
+        // not reach it.
+        let untouched = space(&core);
+        let bystander = shared_agent(&core, &untouched, "Bystander");
+        let elsewhere = spawn(
+            &core,
+            &untouched,
+            &bystander,
+            "Somewhere else.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+
+        let mut rx = core.subscribe_changes();
+        assert!(
+            core.runtime()
+                .block_on(core.archive_space(parent.clone()))
+                .expect("archive")
+        );
+
+        let archived = |id: &str| -> bool {
+            core.runtime()
+                .block_on(core.test_space_archived(id.to_string()))
+                .expect("archived?")
+        };
+        assert!(archived(&parent), "the conversation itself");
+        assert!(archived(&room), "the delegation it was running");
+        assert!(
+            archived(&nested),
+            "and the one that room delegated onward, owned by another agent"
+        );
+        assert!(archived(&deepest), "at every depth, not just the first");
+        assert!(
+            !archived(&elsewhere),
+            "and nothing under a conversation that was not closed"
+        );
+
+        // The slots those rooms held are released with them — derived from
+        // liveness, so nothing had to remember to do it.
+        assert!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(owner.clone()))
+                .unwrap()
+                .is_empty(),
+            "the closed rooms stop counting against the agent that opened them"
+        );
+        assert!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(helper.clone()))
+                .unwrap()
+                .is_empty(),
+            "the other owner's room is closed too — its purpose went with the room above it"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(bystander.clone()))
+                .unwrap()
+                .len(),
+            1,
+            "and an owner whose conversation nobody closed keeps its room"
+        );
+
+        // Every closed room announces itself, which is what releases a
+        // delegation registered against one of them as its parent; the Library
+        // hears once.
+        let seen = drain(&mut rx);
+        for id in [&parent, &room, &nested, &deepest] {
+            assert!(
+                seen.contains(&Change::Space(id.clone())),
+                "each closed room announces itself: {seen:?}"
+            );
+        }
+        assert!(seen.contains(&Change::SpaceIndex), "{seen:?}");
+        assert!(
+            !seen.contains(&Change::Space(elsewhere.clone())),
+            "and a room nothing happened to says nothing: {seen:?}"
+        );
+
+        // Archival is still a visibility choice: the transcripts survive.
+        assert!(listed(&core, &nested));
+        assert_eq!(
+            core.runtime()
+                .block_on(core.get_space_tree(nested.clone()))
+                .expect("tree")
+                .len(),
+            1,
+            "the brief is still there to read"
+        );
+    });
+}
+
 // ===========================================================================
 // Attenuation — the adversarial arm
 // ===========================================================================
@@ -1857,12 +2003,15 @@ fn retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts() {
             live.space.id
         );
 
-        // The other agent's room is left alone — its owner is still live and
-        // still answerable for it — and it reads fine with its parent link
-        // pointing at an archived room.
+        // **The other agent's room goes with it.** Its owner is not being
+        // retired, but its *purpose* is: a delegation exists to serve the
+        // conversation above it, and that conversation is now closed — so its
+        // report would be a turn the archived parent refuses, leaving it
+        // outstanding forever against a meter nobody reads. The relation
+        // survives intact; only its liveness ends.
         assert!(
-            archived_at(&core, &nested).is_none(),
-            "nobody else's delegation is closed by this retirement"
+            archived_at(&core, &nested).is_some(),
+            "a delegation beneath a closed room is closed with it"
         );
         let relation = core
             .runtime()
@@ -1871,13 +2020,12 @@ fn retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts() {
             .expect("still a sub-space");
         assert_eq!(relation.parent_space_id, live.space.id);
         assert_eq!(relation.owner_participant_id, helper);
-        assert_eq!(
+        assert!(
             core.runtime()
                 .block_on(core.live_subspaces_owned_by(helper.clone()))
                 .unwrap()
-                .len(),
-            1,
-            "and it still counts against the agent that opened it"
+                .is_empty(),
+            "and the slot it held against its own owner's quota is released"
         );
 
         // An already-archived room is not archived twice: its timestamp is

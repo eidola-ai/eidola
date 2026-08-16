@@ -426,13 +426,18 @@ fn a_failed_turn_is_reported_rather_than_swallowed() {
     });
 }
 
-/// An archived **parent** takes no new work, so the report meets the same gate
-/// every other turn meets. The delegation's last word then stays unreported,
-/// which is what a later run reads as "still outstanding".
+/// **Closing a conversation stops the delegation it was running, before the
+/// report gate ever comes into it.** An archived parent would refuse the report
+/// at the gate every turn meets — but that state is no longer one a room can
+/// rest in: the archival closes the rooms beneath it in its own transaction, so
+/// what the driver finds is its *own* archival, which is a no-op rather than a
+/// failure and leaves no report about work somebody closed. The parent gate
+/// stays where it is, now as the belt to that brace: it is what a walk already
+/// past the room's liveness read would still meet.
 #[test]
-fn a_report_into_an_archived_parent_is_refused_and_stays_outstanding() {
+fn closing_a_conversation_stops_the_delegation_it_was_running() {
     run(|| {
-        let (_mock, core, _dir) = setup();
+        let (mock, core, _dir) = setup();
         let parent = parent_with_a_post(&core);
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
@@ -440,20 +445,30 @@ fn a_report_into_an_archived_parent_is_refused_and_stays_outstanding() {
 
         core.runtime()
             .block_on(core.archive_space(parent.clone()))
-            .expect("archive the parent");
+            .expect("archive the conversation");
+        assert!(
+            core.runtime()
+                .block_on(core.test_space_archived(out.space.id.clone()))
+                .expect("archived?"),
+            "the delegation is closed with the conversation it serves"
+        );
 
-        let err = drive(&core, &out.space.id).expect_err("a closed parent takes no report");
-        match &err {
-            AppError::SpaceArchived { space_id } => assert_eq!(space_id, &parent),
-            other => panic!("expected SpaceArchived, got {other:?}"),
-        }
+        let requests = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("a closed room is a no-op, not a failure");
+        assert_eq!(
+            mock.chat_bodies().len(),
+            requests,
+            "no turn is driven and no report is attempted"
+        );
         assert!(
             report(&core, &parent).is_none(),
             "nothing was written into the closed conversation"
         );
-        // The room itself was still driven — it is live, and archival of the
-        // parent is not archival of it.
-        assert_eq!(inference_count(&tree(&core, &out.space.id)), 1);
+        assert_eq!(
+            inference_count(&tree(&core, &out.space.id)),
+            0,
+            "and the room itself took no turn"
+        );
     });
 }
 
@@ -860,6 +875,123 @@ fn a_sweep_never_waits_for_an_answer_that_is_not_coming() {
     });
 }
 
+/// **A wait's own alarm is not flattened into a wake-up.** An arm carries a
+/// licence, and the licence that matters most arrives exactly when the room is
+/// busy: the grace comes due while a walk is under way. Recorded as "something
+/// happened", it is lost — the next pass runs on the arm the walk started with,
+/// the alarm was one-shot, the wait is not fresh so nothing schedules another,
+/// and a delegation whose spawning turn failed waits until the process
+/// restarts. Staged exactly: the walk is held inside the anchor window until
+/// the clock it set has run out.
+#[test]
+fn a_grace_arriving_mid_walk_still_ends_the_wait() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        core.test_set_anchor_wait_grace(std::time::Duration::from_millis(150));
+        core.start_subspace_driver();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+
+        // The window is open before the spawn, so the walk the spawn arms
+        // registers its wait — setting the alarm — and is then held there.
+        let mut window = core.test_open_anchor_window();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        let resume = core
+            .runtime()
+            .block_on(window.recv())
+            .expect("the walk reaches the anchor window");
+
+        // The alarm comes due *here*, on a room whose driver is running: it can
+        // only be recorded, and what is recorded is what the next pass runs on.
+        core.runtime().block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        });
+        // Later passes are not held.
+        drop(window);
+        resume.send(()).expect("the walk resumes");
+
+        wait_until(&core, || report(&core, &parent).is_some());
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(asked.as_str()),
+            "attached to the post it was asked on, there being no answer to sit beneath"
+        );
+        assert!(
+            core.test_rooms_awaiting(parent).is_empty(),
+            "and it is no longer waiting on anything"
+        );
+        assert_eq!(out.space.parent_action_id.as_deref(), Some(asked.as_str()));
+    });
+}
+
+/// **A delegation beneath a closed conversation stops, and lets go.** Archiving
+/// a room archives what it delegated (`subspaces.rs`), and each closed room
+/// announces itself — so a nested delegation waiting on its now-archived parent
+/// is woken, reads its own archival, and takes its registration back out. Left
+/// live it would have retried a report the archived parent refuses, forever.
+#[test]
+fn a_delegation_beneath_a_closed_conversation_stops_and_lets_go() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let room = spawn(&core, &parent, &owner, vec![helper.clone()]);
+        // The helper opens a room of its own from the brief, before answering
+        // it — so its report is waiting on an answer that has not been written.
+        let brief = tree(&core, &room.space.id)[0].action_id.clone();
+        let nested = core
+            .runtime()
+            .block_on(core.spawn_subspace(
+                room.space.id.clone(),
+                helper.clone(),
+                "A sub-errand of my own.".to_string(),
+                vec![],
+                vec![],
+                None,
+                Some(brief),
+            ))
+            .expect("spawn");
+
+        drive(&core, &nested.space.id).expect("the nested room is driven");
+        assert_eq!(
+            core.test_rooms_awaiting(room.space.id.clone()),
+            vec![nested.space.id.clone()],
+            "it is waiting for the answer its report belongs under"
+        );
+
+        // The human closes the conversation the whole tree hangs from.
+        core.runtime()
+            .block_on(core.archive_space(parent.clone()))
+            .expect("archive");
+        assert!(
+            core.runtime()
+                .block_on(core.test_space_archived(nested.space.id.clone()))
+                .expect("archived?"),
+            "the nested delegation is closed with everything above it"
+        );
+
+        let requests = mock.chat_bodies().len();
+        drive(&core, &nested.space.id).expect("an archived room is a no-op");
+        assert_eq!(
+            mock.chat_bodies().len(),
+            requests,
+            "it neither works nor reports into a room somebody closed"
+        );
+        assert!(
+            core.test_rooms_awaiting(room.space.id.clone()).is_empty(),
+            "and the registration it held against its parent is released"
+        );
+        assert!(
+            reports(&core, &room.space.id).is_empty(),
+            "nothing was reported into the closed room"
+        );
+    });
+}
+
 /// A quoted passage is attributed by the space it was written in, and that has
 /// to survive the author being retired between saying it and its being
 /// reported — the record retirement promises to leave alone.
@@ -976,6 +1108,126 @@ fn regenerating_a_report_keeps_its_finding_and_its_ending() {
     });
 }
 
+/// **A replicated attachment is not asked for permission, and is still asked
+/// what it may quote.** The two are different questions: quoting copies, so
+/// re-asking permission at a re-wording would rewrite history — but *what may
+/// be quoted at all* is an audience boundary, and a rendering is the act that
+/// crosses it. An edge written below the create gate can name a post's
+/// `thinking` block, which every other read path withholds; carried forward on
+/// a regeneration it would be expanded straight into the model's context.
+#[test]
+fn a_replicated_attachment_cannot_carry_a_hidden_block_into_the_regeneration() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        // The helper's answer carries the model's reasoning as a `thinking`
+        // block at ordinal 0 — durable, render-side, and withheld from every
+        // wire. The seam quotes an antecedent's *first* block, so this edge
+        // names exactly that.
+        let answer = tree(&core, &out.space.id)
+            .last()
+            .expect("the helper answered")
+            .action_id
+            .clone();
+        core.runtime()
+            .block_on(core.test_insert_unvalidated_reference(report.action_id.clone(), answer, 2))
+            .expect("stage an edge below the gate");
+
+        let requests = mock.chat_bodies().len();
+        let err = core
+            .runtime()
+            .block_on(core.regenerate(report.action_id.clone(), MODEL.to_string()))
+            .expect_err("a regeneration carrying that edge is refused");
+        assert!(
+            matches!(err, AppError::NotConfigured { .. }),
+            "refused for what the edge names, not for who is writing it: {err:?}"
+        );
+        assert_eq!(
+            mock.chat_bodies().len(),
+            requests,
+            "and refused before the turn acts — no request, no spend"
+        );
+        assert!(
+            mock.chat_bodies().iter().all(|body| !flat_messages(body)
+                .iter()
+                .any(|(_, c)| c.contains("thinking…"))),
+            "no model has been shown another turn's reasoning"
+        );
+    });
+}
+
+/// **A caller cannot forge a delegation ending.** `annotation` holds either a
+/// person's note about their quote or this crate's own record of how a
+/// delegated conversation ended, and every reader tells them apart by the
+/// reserved prefix alone — so a supplied note claiming it would vanish from
+/// every surface that shows a note and appear on every surface that shows an
+/// ending. The refusal is on the prefix, so a note that merely mentions it is
+/// an ordinary note.
+#[test]
+fn a_supplied_annotation_cannot_claim_the_ending_namespace() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let space = space(&core);
+        let posted = core
+            .runtime()
+            .block_on(core.post("What do the tide tables say?".into(), Some(space.clone())))
+            .expect("post");
+        let block = tree(&core, &space)[0].blocks[0].id.clone();
+        let quote = |annotation: &str| {
+            core.runtime().block_on(core.post_with_references(
+                "About that:".into(),
+                Some(space.clone()),
+                None,
+                vec![eidola_app_core::ReferenceSpec {
+                    antecedent_action_id: posted.action_id.clone(),
+                    content_block_id: Some(block.clone()),
+                    range_start: Some(0),
+                    range_end: Some(4),
+                    annotation: Some(annotation.to_string()),
+                }],
+            ))
+        };
+
+        let err = quote("eidola:delegation/concluded")
+            .expect_err("the reserved namespace is not a caller's to write");
+        assert!(
+            matches!(err, AppError::NotConfigured { .. }),
+            "a typed refusal, not a silent rewrite: {err:?}"
+        );
+        assert_eq!(
+            tree(&core, &space).len(),
+            1,
+            "and it leaves no trace — the post is refused whole"
+        );
+
+        // A note that mentions the prefix without claiming it stays a note, and
+        // reads back as one.
+        quote("not an eidola:delegation/concluded marker, just prose").expect("an ordinary note");
+        let quoting = tree(&core, &space)
+            .into_iter()
+            .find(|n| !n.references.is_empty())
+            .expect("the quoting post");
+        assert_eq!(
+            quoting.references[0].annotation.as_deref(),
+            Some("not an eidola:delegation/concluded marker, just prose")
+        );
+        assert_eq!(
+            quoting.references[0].delegation_end, None,
+            "and nothing reads it as an ending"
+        );
+    });
+}
+
 /// **Every branch's finding comes back, not whichever was written last.** A
 /// delegated room fans out — each helper answers the brief and each branch runs
 /// down to a post nothing follows — and quoting one of those would report one
@@ -1053,6 +1305,145 @@ fn a_fan_out_reports_every_branchs_finding() {
         drive(&core, &out.space.id).expect("a second walk");
         assert_eq!(mock.chat_bodies().len(), requests, "nothing is re-reported");
         assert_eq!(reports(&core, &parent).len(), 1);
+    });
+}
+
+/// **A wide walk reports every tip it reached.** The seat guard bounds a room's
+/// roster and never bounded its frontier: every seat is notify-all, so one
+/// post's fan-out puts an answer from each of them on it, and a walk stopped by
+/// the budget can be holding many more tips than the room has agents. Dropping
+/// the oldest of those was the worst outcome available — the newest tip alone
+/// settles the room, so the branches that were dropped were dropped for good.
+#[test]
+fn a_wide_walk_reports_every_tip_and_not_a_roster_sized_tail() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        // Wide enough that the cascade guard never fires: what is under test is
+        // what the walk is holding when the budget stops it.
+        core.runtime()
+            .block_on(core.set_space_cascade_limit(parent.clone(), 1_000))
+            .expect("cascade limit");
+        let owner = shared_agent(&core, &parent, "Navigator");
+        // A full room: every seat is notify-all, so one answer wakes all the
+        // others and the frontier grows by the roster on every hop.
+        let seats: Vec<String> = (1..=eidola_app_core::MAX_SUBAGENTS_PER_SPAWN)
+            .map(|n| shared_agent(&core, &parent, &format!("Surveyor {n}")))
+            .collect();
+        let out = spawn(&core, &parent, &owner, seats);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let report = report(&core, &parent).expect("a spent budget is reported");
+        assert!(
+            report.references.len() > eidola_app_core::MAX_SUBAGENTS_PER_SPAWN as usize,
+            "the frontier outgrew the roster and every tip on it came back: {} attached",
+            report.references.len()
+        );
+        // Ordinals are still `1..=N` over the whole set, and every passage
+        // resolves — the edges describe their own posts whatever the prompt did
+        // with them.
+        let ordinals: Vec<i64> = report.references.iter().map(|r| r.ordinal).collect();
+        assert_eq!(
+            ordinals,
+            (1..=report.references.len() as i64).collect::<Vec<_>>()
+        );
+        assert!(report.references.iter().all(|r| r.snippet.is_some()));
+        assert!(
+            report.references.iter().all(|r| r.delegation_end
+                == Some(DelegationEnd::BudgetSpent {
+                    limit: MAX_DELEGATION_TURNS
+                })),
+            "each carries the ending the walk stopped at"
+        );
+
+        // And the room settles: its own last word is among what was quoted, so
+        // nothing is walked or billed again.
+        let quoted: std::collections::BTreeSet<String> = report
+            .references
+            .iter()
+            .map(|r| r.antecedent_action_id.clone())
+            .collect();
+        let last = tree(&core, &out.space.id)
+            .last()
+            .expect("a last post")
+            .action_id
+            .clone();
+        assert!(quoted.contains(&last), "the room reads as reported");
+    });
+}
+
+/// **A long finding is elided in the prompt and kept whole on the edge.** A
+/// passage is a range its author chose with nothing bounding its length, and an
+/// attached set is one entry wide per branch the walk reached — so one finding
+/// could fill the report turn's context and leave the ones beside it saying
+/// nothing. The prompt is what is budgeted; the record is not, because the edge
+/// has to describe its passage exactly for the reader's own footnote rail.
+#[test]
+fn a_long_finding_is_elided_in_the_prompt_and_whole_on_the_edge() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        // A brief long enough to be over any per-passage budget, with a
+        // distinctive head, middle and tail. Nobody is seated beside the owner,
+        // so the room concludes on its brief and the brief is the finding.
+        let brief = format!(
+            "OPENING LINE.\n\n{}\n\nCLOSING LINE.",
+            "middle padding that nobody needs to read. ".repeat(200)
+        );
+        let out = core
+            .runtime()
+            .block_on(core.spawn_subspace(
+                parent.clone(),
+                owner.clone(),
+                brief.clone(),
+                vec![],
+                vec![],
+                None,
+                None,
+            ))
+            .expect("spawn");
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        let quoted = &report.references[0];
+        assert_eq!(
+            quoted.range_end,
+            Some(brief.len() as i64),
+            "the edge names the whole passage"
+        );
+        assert_eq!(
+            quoted.snippet.as_deref(),
+            Some(brief.as_str()),
+            "and a reader's rail resolves it whole"
+        );
+
+        let body = mock
+            .chat_bodies()
+            .last()
+            .cloned()
+            .expect("a report request");
+        let attached = flat_messages(&body)
+            .into_iter()
+            .find(|(_, c)| c.contains("Attached to your reply"))
+            .map(|(_, c)| c)
+            .expect("the attached block");
+        assert!(
+            attached.len() < brief.len(),
+            "the prompt is not the whole passage: {} vs {}",
+            attached.len(),
+            brief.len()
+        );
+        assert!(
+            attached.contains("OPENING LINE.") && attached.contains("CLOSING LINE."),
+            "both ends are paid for before the bulk is: {attached}"
+        );
+        assert!(
+            attached.contains('…'),
+            "and the cut is marked rather than silent: {attached}"
+        );
     });
 }
 

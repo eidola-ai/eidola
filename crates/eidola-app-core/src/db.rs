@@ -3506,13 +3506,14 @@ pub struct Retirement {
 /// opposite of what retirement is for, and it would contradict the notebook
 /// arm standing beside it in this very function.
 ///
-/// **Only the retiring agent's own rooms are touched.** The statement selects
-/// by *ownership*, not by descent, so it reaches the agent's sub-spaces at
-/// every depth and reaches nobody else's: a sub-space that another agent
-/// spawned from one of these keeps its live owner and stays live, with its
-/// parent link pointing at an archived room. That is the honest state — its
-/// owner is still answerable for it — and nothing reads a parent's
-/// `archived_at` to decide anything about a child.
+/// **The agent's own rooms are selected by ownership, and what hangs beneath
+/// them goes with them.** The statement selects by *ownership*, not by descent,
+/// so it reaches the agent's sub-spaces at every depth and nobody else's rooms
+/// *by that clause* — and then [`archive_rooms_under_a_closed_one`] closes what
+/// those rooms had delegated onward, whoever owns it. A nested room's owner is
+/// not being retired, but its *purpose* is: it exists to serve the conversation
+/// above it, and that conversation is closed, so its report is a turn an
+/// archived parent refuses and its delegation would stay outstanding forever.
 ///
 /// The participant row itself always survives (soft-remove), so every
 /// `action.participant_id` in the trail stays resolvable; retirement is about
@@ -3576,9 +3577,16 @@ async fn retire_participant_tx_body(
         .map_err(|e| AppError::Database {
             message: format!("failed to archive the retired agent's sub-spaces: {e}"),
         })?;
+    // And the delegations *those* rooms were themselves running, at any depth
+    // and whoever owns them — see [`archive_rooms_under_a_closed_one`]. A room
+    // exists to serve the conversation above it, so one that can never report
+    // is not a room somebody else is still answerable for; it is work nobody
+    // will ever be told the result of. Counted into the listing figure because
+    // every sub-space is a Library row.
+    let beneath = archive_rooms_under_a_closed_one(conn, now).await?;
     Ok(Retirement {
         retired: true,
-        listed_spaces_archived: archived as i64,
+        listed_spaces_archived: archived as i64 + beneath.len() as i64,
     })
 }
 
@@ -7289,11 +7297,51 @@ pub async fn space_action_ids(conn: &Connection, space_id: &str) -> Result<Vec<S
     Ok(ids)
 }
 
-pub async fn archive_space(
+/// Archive a space **and every live delegation beneath it**, in one
+/// transaction, answering with every space id that was archived (the named one
+/// first).
+///
+/// **A delegation exists to serve the conversation it was opened from**, so
+/// closing that conversation closes them: a sub-space under an archived room is
+/// a room whose helpers go on being paid to answer a question nobody will ever
+/// be told the answer to. Its report is a turn in the archived parent, which
+/// that parent refuses at the same gate every other turn meets — so the
+/// delegation stays outstanding forever, retrying against its meter, holding a
+/// live-room slot of an owner who is not being retired, and waiting on an
+/// anchor no post will ever answer. There is no un-archive door anywhere, so
+/// none of that is a state anything recovers from.
+///
+/// **Recursive down `parent_space_id`, and inside the transaction.** The room
+/// being closed may hold delegations of its own at any depth, and a nested one
+/// may be owned by a *different* agent: that agent is not being retired, but
+/// the purpose of its room is gone with the conversation above it, which is the
+/// thing that decides this. Doing it in the archival's own transaction is what
+/// makes "a live room under a closed one" unrepresentable rather than a state
+/// somebody has to notice.
+pub async fn archive_space_tx(
     conn: &Connection,
     space_id: &str,
     archived_at: i64,
-) -> Result<bool, AppError> {
+) -> Result<Vec<String>, AppError> {
+    begin_write(conn).await?;
+    match archive_space_tx_body(conn, space_id, archived_at).await {
+        Ok(archived) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(archived)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn archive_space_tx_body(
+    conn: &Connection,
+    space_id: &str,
+    archived_at: i64,
+) -> Result<Vec<String>, AppError> {
     let changed = conn
         .execute(
             "UPDATE space SET archived_at = ?2, \
@@ -7308,7 +7356,63 @@ pub async fn archive_space(
         .map_err(|e| AppError::Database {
             message: format!("failed to archive space: {e}"),
         })?;
-    Ok(changed > 0)
+    if changed == 0 {
+        // Nothing was closed here — an unknown space, or one already archived —
+        // so there is nothing new beneath it to close either.
+        return Ok(Vec::new());
+    }
+    let mut archived = vec![space_id.to_string()];
+    archived.extend(archive_rooms_under_a_closed_one(conn, archived_at).await?);
+    Ok(archived)
+}
+
+/// Archive every live sub-space whose parent is archived, repeatedly, until
+/// none is left — the descent [`archive_space_tx`] and [`retire_participant_tx`]
+/// both need, stated as the invariant it restores rather than as a walk.
+///
+/// **The invariant is "no live delegation under a closed room"**, and asking it
+/// of the rows rather than carrying a list of roots is what makes one statement
+/// serve both doors: an archival names one space, a retirement names an agent's
+/// whole set, and neither has to tell this how deep to go. Each round archives
+/// the children of everything closed so far, so a chain of any depth is closed
+/// in as many rounds as it is deep; a round that archives nothing ends it, which
+/// also makes the loop cycle-safe (the column is a self-referencing FK with no
+/// cycle constraint, and a space already archived never matches again).
+async fn archive_rooms_under_a_closed_one(
+    conn: &Connection,
+    archived_at: i64,
+) -> Result<Vec<String>, AppError> {
+    const LIVE_UNDER_A_CLOSED_ONE: &str = "archived_at IS NULL AND parent_space_id IN \
+         (SELECT id FROM space WHERE archived_at IS NOT NULL)";
+    let mut archived = Vec::new();
+    loop {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id FROM space WHERE {LIVE_UNDER_A_CLOSED_ONE}"
+            ))
+            .await
+            .map_err(AppError::db)?;
+        let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+        let mut round = Vec::new();
+        while let Some(row) = rows.next().await.map_err(AppError::db)? {
+            round.push(row.get::<String>(0).map_err(AppError::db)?);
+        }
+        if round.is_empty() {
+            return Ok(archived);
+        }
+        conn.execute(
+            &format!(
+                "UPDATE space SET archived_at = ?1, touched_at = COALESCE(touched_at, ?1) \
+                 WHERE {LIVE_UNDER_A_CLOSED_ONE}"
+            ),
+            (Value::Integer(archived_at),),
+        )
+        .await
+        .map_err(|e| AppError::Database {
+            message: format!("failed to archive the delegations under a closed conversation: {e}"),
+        })?;
+        archived.extend(round);
+    }
 }
 
 /// Set a space's title, answering **whether a row took it**.
@@ -8166,7 +8270,10 @@ mod tests {
         insert_space(&conn, "space-d", Some("Old"), "unlinked", 500)
             .await
             .unwrap();
-        assert!(archive_space(&conn, "space-d", 6_000).await.unwrap());
+        assert_eq!(
+            archive_space_tx(&conn, "space-d", 6_000).await.unwrap(),
+            vec!["space-d".to_string()]
+        );
 
         let rows = list_spaces(&conn, false).await.unwrap();
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();

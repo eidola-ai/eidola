@@ -600,7 +600,12 @@ const STAMP_LEDGER: &[(&str, &str)] = &[
     // -- space row writes, stamp folded into the statement --
     ("set_space_cascade_limit", "stamps in the same statement"),
     ("set_space_router_model", "stamps in the same statement"),
-    ("archive_space", "stamps in the same statement"),
+    ("archive_space_tx_body", "stamps in the same statement"),
+    (
+        "archive_rooms_under_a_closed_one",
+        "archives the delegations beneath a closed conversation; stamps in the \
+         same statement",
+    ),
     ("update_space_title", "stamps in the same statement"),
     (
         "retire_participant_tx_body",
