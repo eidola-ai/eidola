@@ -154,3 +154,54 @@ fn an_unparseable_pid_still_refuses_but_reports_no_pid() {
         other => panic!("expected DatabaseInUse, got {other:?}"),
     }
 }
+
+/// **Construction and validation are two different moments unless something
+/// joins them.** `AppCore::new` claims the lock and builds the runtime, but the
+/// database cell is filled lazily — so a schema this build refuses is not found
+/// at construction at all. `open_database` is what a client with a
+/// startup-failure surface calls to learn everything that can end the session
+/// before it comes up; the refusal it hands back is the honest "delete your dev
+/// database" message, not a generic open failure.
+///
+/// The first assertion is the load-bearing one: it pins the laziness, so a
+/// future eager `AppCore::new` cannot quietly make the second call redundant
+/// without this test saying so.
+#[test]
+fn a_refused_schema_surfaces_at_open_database_not_at_construction() {
+    let (_dir, config_dir, data_dir) = dirs();
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+
+    // A database from an incompatible pre-release build.
+    {
+        let core = AppCore::new(config_dir.clone(), data_dir.clone()).expect("stamp a fresh db");
+        core.runtime().block_on(async {
+            let db = db::open(&data_dir).await.expect("open");
+            let conn = db::connect(&db).await.expect("connect");
+            conn.execute("PRAGMA user_version = 1", ())
+                .await
+                .expect("stamp an incompatible version");
+        });
+    }
+
+    let core = AppCore::new(config_dir, data_dir).expect("construction only takes the lock");
+    let err = core
+        .runtime()
+        .block_on(core.open_database())
+        .expect_err("an incompatible schema must be refused");
+
+    assert!(
+        matches!(err, AppError::Database { .. }),
+        "the refusal is typed, not a string: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("incompatible build") && message.contains("delete your dev database"),
+        "the message must be the one that says what to do: {message:?}"
+    );
+
+    // Idempotent: the cell is the same one every read uses.
+    assert!(
+        core.runtime().block_on(core.open_database()).is_err(),
+        "a refused database stays refused"
+    );
+}

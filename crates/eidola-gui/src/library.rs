@@ -782,6 +782,7 @@ impl Render for LibraryView {
                         "library/retry",
                         "Couldn't load your spaces.",
                         err,
+                        "Retry",
                         cx,
                         cx.listener(|this, _, _, cx| {
                             this.spaces.update(cx, |s, cx| s.refresh(cx));

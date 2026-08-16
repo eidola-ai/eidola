@@ -41,7 +41,7 @@ pub use db::HUMAN_PARTICIPANT_ID;
 use error::AppError;
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
-    LocalModelStatus, LocalModelsState, RunningEngine,
+    LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
 };
 
 // ============================================================================
@@ -7297,6 +7297,38 @@ impl AppCore {
         })
     }
 
+    /// Open and validate the local database **now**, rather than at the first
+    /// read that needs it.
+    ///
+    /// [`Self::new`] takes the single-writer lock and builds the runtime, but
+    /// the database itself lives behind a `OnceCell` filled on the first
+    /// `db_conn()` — so the two failures that end a session are found at
+    /// different times: `DatabaseInUse` at construction, and a schema this build
+    /// refuses (`user_version` neither `0` nor `LATEST_VERSION`) only once
+    /// something reads. A client with a startup-failure surface needs both
+    /// before it commits to coming up; this is the call that makes construction
+    /// and validation one moment.
+    ///
+    /// **It also runs the once-per-process startup sweep earlier**
+    /// ([`Inner::sweep_pristine_spaces`], which lives in that initializer), and
+    /// every premise the sweep rests on is *stronger* here than at a first
+    /// read: the exclusive lock is already held, nothing has been spawned, and
+    /// no read can have been answered because none has been issued. Its
+    /// `Change::SpaceIndex` emission then reaches no subscriber — which costs
+    /// nothing, because that emission exists for the case where the initializer
+    /// runs *behind* an already-subscribed reader's query, and after this call
+    /// every reader's first query is issued strictly afterwards.
+    ///
+    /// Idempotent (the `OnceCell` is the same one every read uses) and cheap on
+    /// the happy path.
+    pub async fn open_database(&self) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.db_conn().await.map(|_| ()) })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Subscribe to the invalidation bus.
     ///
     /// Returns a [`tokio::sync::broadcast::Receiver`] that receives a
@@ -8009,6 +8041,22 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.delete_local_model(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Forget the standing failure recorded against a local model, without
+    /// touching any file, engine or row.
+    ///
+    /// A failure is a report of an attempt that already ended. Where that
+    /// attempt left nothing on disk — a download that failed — the report *is*
+    /// the row [`Self::local_models_state`] synthesizes, so this is what makes
+    /// such a row go away once the reader has read it. Idempotent; emits
+    /// [`Change::LocalModels`] only when something was actually forgotten.
+    pub async fn dismiss_local_model_failure(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.dismiss_local_model_failure(&id) })
             .await
             .map_err(join_err)?
     }

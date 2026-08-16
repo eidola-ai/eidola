@@ -419,6 +419,7 @@ impl Render for AgentsSettingsView {
                 "settings/agents/retry",
                 "Couldn't load your shared agents.",
                 &err,
+                "Retry",
                 cx,
                 cx.listener(|this, _, _, cx| this.retry_load(cx)),
             ));

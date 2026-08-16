@@ -757,6 +757,88 @@ impl Space {
         self.transcript.value().is_some()
     }
 
+    /// A failed **initial** read — the window's dead end, and the state the
+    /// centred error panel answers.
+    ///
+    /// With no posts there is no composer either ([`Self::transcript_visible`]
+    /// is false, so `sync_tail_drafts` mints nothing), so nothing the reader can
+    /// do re-runs the load: the page is not merely wrong, it is inert. That is
+    /// what makes a Retry the *only* affordance the surface can carry, and why
+    /// this one gets the full panel rather than the quiet line below.
+    ///
+    /// A settled-negative row ([`Self::row_is_gone`]) answers `None` — see
+    /// [`Self::transcript_failure_is_retryable`], the rule both readers share.
+    pub fn transcript_load_failure(&self) -> Option<&AppError> {
+        if !self.transcript_failure_is_retryable() {
+            return None;
+        }
+        match &self.transcript {
+            Loadable::Failed { error, prior: None } => Some(error),
+            _ => None,
+        }
+    }
+
+    /// A failed **refresh** over posts this window still holds — the state the
+    /// quiet "couldn't refresh" strip answers.
+    ///
+    /// `Failed { prior: Some(..) }` renders as a perfectly ordinary
+    /// conversation: `messages()` reads through `Loadable::value`, so the posts
+    /// stay on screen and the tail composer hangs off them, which is exactly
+    /// right ("Failed is not empty" — a re-fetch must never blank a page). What
+    /// is *not* right is saying nothing: those posts are then silently as of the
+    /// last successful read, and nothing here re-reads on its own — the cell
+    /// moves again only on another writer's `Change::Space` or at a mutation's
+    /// exit. **The composer is not the recovery path**: retrying a read must not
+    /// require writing a message, and a reader with nothing to say has no way to
+    /// ask again at all. So the surface owes the doctrine's other half — keep
+    /// the value, add a quiet retry — which is the Library's strip, not the
+    /// panel: there is nothing empty here to fill.
+    ///
+    /// Same settled-negative exclusion, for the same reason.
+    pub fn transcript_refresh_failure(&self) -> Option<&AppError> {
+        if !self.transcript_failure_is_retryable() {
+            return None;
+        }
+        match &self.transcript {
+            Loadable::Failed {
+                error,
+                prior: Some(_),
+            } => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Whether a failure in the transcript cell is one a later read could learn
+    /// something from — the exclusion both failure surfaces share, stated once
+    /// so the two cannot drift.
+    ///
+    /// A settled-negative row ([`Self::row_is_gone`]) is the case that fails it:
+    /// the space does not exist, [`Self::load_transcript`] declines to start a
+    /// read for exactly that reason, and the window already says so through its
+    /// error band (`SpaceEvent::Failed` carries the refusal). A Retry there
+    /// would be a second, false door onto the same fact.
+    fn transcript_failure_is_retryable(&self) -> bool {
+        !matches!(self.row, Some(RowState::Gone(_)))
+    }
+
+    /// Re-run the transcript load — the reader pressed Retry, on either surface.
+    ///
+    /// An explicit user action is precisely the case the settled-negative rule
+    /// carves out ("a debt-driven reload owes its restart only where a later
+    /// read could learn something"), and the gate inside
+    /// [`Self::load_transcript`] still holds the other side: a row known to be
+    /// gone starts nothing, so a Retry could never flip a terminal failure into
+    /// a permanent spinner. The affordance is not offered there in the first
+    /// place ([`Self::transcript_failure_is_retryable`]).
+    ///
+    /// Over retained posts the retry keeps them: `Failed { prior: Some(..) }`
+    /// `to_loading()`s to `Loaded { stale: true }`, never `Loading`, so the page
+    /// does not blank and the strip simply stands down while the read is in
+    /// flight — returning if it fails again.
+    pub fn retry_transcript_load(&mut self, cx: &mut Context<Self>) {
+        self.load_transcript(cx);
+    }
+
     /// The transcript as a slice (empty if not loaded).
     pub fn messages(&self) -> &[ChatMessageView] {
         self.transcript.value().map(|v| v.as_slice()).unwrap_or(&[])
@@ -2092,6 +2174,21 @@ impl Space {
         self.transcript = std::mem::take(&mut self.transcript).resolve(Err(AppError::Internal {
             message: "database is locked".into(),
         }));
+        cx.notify();
+    }
+
+    /// Test-only: fail the transcript's **initial** load —
+    /// `Failed { prior: None }`, the state a window opened on a conversation it
+    /// could not read lands in. No posts, no composer: the dead end
+    /// [`Self::transcript_load_failure`] is the way out of.
+    #[doc(hidden)]
+    pub fn fail_initial_transcript_load_for_test(&mut self, cx: &mut Context<Self>) {
+        self.transcript = Loadable::Failed {
+            error: AppError::Database {
+                message: "database is locked".into(),
+            },
+            prior: None,
+        };
         cx.notify();
     }
 
