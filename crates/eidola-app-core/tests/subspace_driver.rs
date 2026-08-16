@@ -976,6 +976,54 @@ fn a_sweep_does_not_claim_a_room_this_process_opened() {
     });
 }
 
+/// **A failed enumeration is retried, with its provenance intact.** The
+/// startup sweep is the only recovery a pre-existing room has — nothing else
+/// will ever raise a signal for it — so an enumeration error merely logged
+/// leaves every such room at its brief for the life of the process. And the
+/// spawn record must survive the failure: consumed by an attempt that then
+/// errored, it would have the retry claiming the sweep's licence for exactly
+/// the rooms it is false about — the ones this process opened.
+#[test]
+fn a_failed_sweep_enumeration_retries_and_keeps_its_provenance() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        // This process's own room, opened from a post its owner has not
+        // answered — the state every spawn is in until its turn persists one.
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        // The sweep's first enumeration fails.
+        core.test_fail_next_subspace_enumerations(1);
+        core.start_subspace_driver();
+
+        // The retry still arms the room — and still as this process's own, so
+        // its walk registers a wait instead of reporting against the anchor on
+        // the sweep's licence.
+        wait_until(&core, || {
+            core.test_rooms_awaiting(parent.clone())
+                .contains(&out.space.id)
+        });
+        assert!(
+            report(&core, &parent).is_none(),
+            "armed as a signal: the wait holds for the owner's answer"
+        );
+
+        let answer = ask(&core, &parent, &owner, &asked);
+        wait_until(&core, || report(&core, &parent).is_some());
+        assert_eq!(
+            report(&core, &parent)
+                .expect("the delegation is reported")
+                .parent_action_id
+                .as_deref(),
+            Some(answer.as_str()),
+            "beneath the answer, not against the anchor"
+        );
+    });
+}
+
 /// **A backlog arrives as a trickle, not a stampede.** Arming is per room and
 /// the registry only stops one room being walked twice — so a start that finds
 /// a previous run's rooms outstanding put every walk on the runtime at once,
@@ -1326,6 +1374,69 @@ fn a_spent_meter_still_delivers_the_ending_its_work_decided() {
         drive(&core, &out.space.id).expect("a settled room is a no-op");
         assert_eq!(mock.chat_bodies().len(), after);
         assert_eq!(reports(&core, &parent).len(), 1);
+    });
+}
+
+/// **An ending already decided is delivered, never re-derived.** A walk that
+/// ends while its anchor is unanswered keeps what it decided and hands back
+/// its claim — so a wake before the answer lands would otherwise claim afresh
+/// and re-run the cascade over an unchanged tail: a router inference per wake
+/// where the room routes, and a re-derived ending whose leaves are just the
+/// tail, overwriting the branch tips the walk that did the work collected.
+#[test]
+fn a_wake_while_an_ending_waits_delivers_it_without_rewalking() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        // Two replies deep — the brief plus one answer each — so the walk ends
+        // with a branch tip per helper.
+        core.runtime()
+            .block_on(core.set_space_cascade_limit(parent.clone(), 2))
+            .expect("cascade limit");
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let a = shared_agent(&core, &parent, "Surveyor");
+        let b = shared_agent(&core, &parent, "Pilot");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![a, b], Some(&asked));
+
+        drive(&core, &out.space.id).expect("the walk runs");
+        assert!(report(&core, &parent).is_none(), "it waits for the answer");
+        assert_eq!(
+            inference_count(&tree(&core, &out.space.id)),
+            2,
+            "both helpers answered"
+        );
+
+        // The parent moves without answering, twice. Each wake finds the
+        // ending already decided: nothing to walk, nothing to spend.
+        let requests = mock.chat_bodies().len();
+        for line in ["Meanwhile:", "And another thing:"] {
+            core.runtime()
+                .block_on(core.post(line.into(), Some(parent.clone())))
+                .expect("post");
+            drive(&core, &out.space.id).expect("the room is woken");
+        }
+        assert_eq!(
+            mock.chat_bodies().len(),
+            requests,
+            "a wake with a decided ending asks nothing and drives nothing"
+        );
+
+        // And the report carries the decided ending's leaves — every branch
+        // tip, not a re-derived walk's tail.
+        let answer = ask(&core, &parent, &owner, &asked);
+        drive(&core, &out.space.id).expect("the room reports");
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(answer.as_str()),
+            "beneath the answer it was holding out for"
+        );
+        assert_eq!(
+            report.references.len(),
+            2,
+            "both branch tips survive the wakes in between"
+        );
     });
 }
 
