@@ -60,7 +60,7 @@ use crate::changes::{Change, ChangeOrigin, with_origin};
 use crate::error::AppError;
 use crate::{
     AttachedReference, AttachmentOrigin, ChatStreamEvent, Inner, NotificationPlan, PlannedTurn,
-    Planner, ReferenceSpec, ResponseMode, TurnDirective, TurnSelector, db, now_ms,
+    Planner, ReferenceSpec, ResponseMode, TurnDirective, TurnSelector, db,
 };
 
 /// The per-room driver registry: room id → the arm that arrived while its task
@@ -202,10 +202,34 @@ const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 /// the emission recreates the lost wake-up this wait exists to be ordered
 /// against.
 ///
-/// So the honest end is time: the thing being waited on is bounded work with a
-/// duration, and a wait for something with a duration ends by outliving it. Ten
-/// minutes is far past any turn — one is at most [`crate::MAX_TURN_ROUNDS`]
-/// model round trips — so a wait that reaches it is waiting on nothing.
+/// So the end is time: the thing being waited on is bounded *work* — at most
+/// [`crate::MAX_TURN_ROUNDS`] model round trips — and a wait for work that ends
+/// ends by outliving it.
+///
+/// **What ten minutes is not is a proof.** Nothing here bounds a turn's
+/// wall-clock length: no client in this crate sets a request or read timeout, a
+/// stream stays open as long as the upstream holds it, and a local engine may
+/// generate for as long as it likes. So this is a *policy* about how long a
+/// delegation holds out, not a deduction that no turn can still be running —
+/// and the doc says so rather than helping itself to a bound the code does not
+/// enforce.
+///
+/// **What it costs when the policy is wrong is bounded and positional.** A
+/// legitimately slow spawning turn whose answer lands after the alarm gets a
+/// report attached to the anchor instead of beneath that answer: the report is
+/// delivered whole (every finding quoted, the ending recorded, the delegation
+/// marked reported), the owner's answer lands whole, and the two are *siblings*
+/// under the anchor rather than parent and child — the render's spine follows
+/// the first reply, so the report takes the spine and the answer indents beside
+/// it. Nothing is lost — no post, no edge, no finding, no second spend — and
+/// the one further cost is that the reporting model wrote without sight of an
+/// answer still being composed. Getting it wrong costs a reader a worse-placed
+/// pair of posts, once; refusing to end the wait at all would cost the report
+/// entirely, forever, whenever a spawning turn died.
+///
+/// **And the alarm never overrides an answer that arrived**: every wake
+/// re-asks, this one included, so a turn that finishes inside the grace reports
+/// beneath its own answer like any other.
 ///
 /// **The alarm is the wait's own**, scheduled when it begins, so termination
 /// depends on no other event: an unrelated post in the parent still never
@@ -762,16 +786,24 @@ impl Inner {
     /// which is what makes arming cheap enough to do from a signal every post
     /// raises.
     pub(crate) async fn drive_subspace(&self, space_id: String, arm: Arm) -> Result<(), AppError> {
-        // **Taken before the first read, not after it.** This is the line that
-        // divides "already in front of me" from "arrived while I was working",
-        // and the reads below are several `await`s wide — a post committing
-        // inside them would otherwise fall between the two: too late for the
-        // tail this walk starts from, too early for the refill's window, and
-        // its own change event spent on a walk already in progress. Ordering
-        // closes it, the same way it closes the anchor wait: every arrival is
-        // either in the reads that follow or in the refill.
-        let began = now_ms();
         let conn = self.db_conn().await?;
+        // **Taken before the reads it divides, and taken from the rows.** This
+        // is the line between "already in front of me" and "arrived while I was
+        // working", and the reads below are several `await`s wide — a post
+        // committing inside them would otherwise fall between the two: too late
+        // for the tail this walk starts from, too early for the refill's
+        // window, and its own change event spent on a walk already in progress.
+        //
+        // It is a `rowid` high-water mark rather than a clock because a clock
+        // could not answer it (see [`db::action_watermark`]): every writer here
+        // samples `now_ms()` *above* its own transaction, so a post's
+        // `created_at` can predate this line while its commit lands after it —
+        // and a boundary drawn on that timestamp misses exactly the writes that
+        // raced it. Missing one is not a delay but a loss: the walk drives on,
+        // a newer answer becomes the room's last word, the report settles the
+        // room on that word, and the post nobody served sits in a room that
+        // reads as reported.
+        let since_row = db::action_watermark(&conn).await?;
         // **A room that is done stops being waited on.** An anchor wait is a
         // standing registration against the parent, and every post there wakes
         // every room registered under it — so a room that can never run again
@@ -816,7 +848,7 @@ impl Inner {
         // state machine is the largest in the crate, and stacking this walk's
         // frame on top of it overflows a worker stack.
         let Some((end, leaves)) =
-            Box::pin(self.cascade_subspace(&space_id, tail.clone(), began)).await?
+            Box::pin(self.cascade_subspace(&space_id, tail.clone(), since_row)).await?
         else {
             self.end_anchor_wait(&space_id);
             return Ok(()); // the room closed under us; nothing to report
@@ -846,10 +878,11 @@ impl Inner {
     /// which is exactly what makes its arrival arm the room again and get it the
     /// walk it is owed.
     ///
-    /// **`began` is the caller's**, taken before its first read: the boundary
-    /// between what was already there and what arrived mid-walk has to sit in
-    /// front of every read, or a post committing inside them belongs to
-    /// neither.
+    /// **`since_row` is the caller's**, taken before the reads it divides: the
+    /// boundary between what was already there and what arrived mid-walk has to
+    /// sit in front of every read, or a post committing inside them belongs to
+    /// neither. It is a commit-ordered `rowid` mark rather than a timestamp —
+    /// see [`db::action_watermark`] for why a clock cannot draw this line.
     ///
     /// `Ok(None)` means the room stopped being drivable while we were in it (an
     /// archival landed), which is deliberately **not** an outcome to report: the
@@ -859,7 +892,7 @@ impl Inner {
         &self,
         space_id: &str,
         tail: String,
-        began: i64,
+        since_row: i64,
     ) -> Result<Option<(DelegationEnd, Vec<String>)>, AppError> {
         // **The tips of everything this walk followed, not one of them.** A
         // delegated room fans out: several helpers answer the brief, each
@@ -899,7 +932,7 @@ impl Inner {
                 // the report would name the driven tail, the room would read as
                 // reported, and the question would sit there answered by nobody.
                 let conn = self.db_conn().await?;
-                let arrived = db::posts_in_space_since(&conn, space_id, began).await?;
+                let arrived = db::posts_in_space_since(&conn, space_id, since_row).await?;
                 drop(conn);
                 frontier.extend(arrived.into_iter().filter(|id| !served.contains(id)));
                 if frontier.is_empty() {

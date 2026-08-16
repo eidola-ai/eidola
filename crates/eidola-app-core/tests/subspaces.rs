@@ -573,6 +573,139 @@ fn an_owner_holds_the_live_limit_and_archiving_frees_a_slot() {
     });
 }
 
+/// **An owner leaving a conversation closes what it was running for it.** The
+/// two rules about that one membership are not in tension: an owner cannot
+/// leave the *room* (nothing can grant that membership back), and an owner
+/// leaving the *parent* takes its delegations there with it — every report they
+/// could still write is a turn in a conversation the writer is no longer part
+/// of, refused for that reason, forever, against a meter nobody reads and a
+/// live-room slot nobody gets back. A room under a conversation nobody left is
+/// untouched: leaving one says nothing about another.
+#[test]
+fn an_owner_leaving_a_conversation_closes_the_delegations_it_ran_for_it() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = space(&core);
+        let elsewhere = space(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        // The same agent is also at work in another conversation.
+        core.runtime()
+            .block_on(core.add_global_participant(
+                elsewhere.clone(),
+                owner.clone(),
+                Some(eidola_app_core::MembershipRole::Member),
+            ))
+            .expect("join the other conversation");
+
+        let here = spawn(
+            &core,
+            &parent,
+            &owner,
+            "Check the tide tables.",
+            vec![helper.clone()],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+        // A room the helper opened from *that* room — beneath what is closing.
+        let nested = spawn(
+            &core,
+            &here,
+            &helper,
+            "A sub-errand of my own.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+        let other = spawn(
+            &core,
+            &elsewhere,
+            &owner,
+            "A different errand.",
+            vec![],
+            vec![],
+        )
+        .expect("spawn")
+        .space
+        .id;
+
+        let mut rx = core.subscribe_changes();
+        assert!(
+            core.runtime()
+                .block_on(core.remove_space_participant(parent.clone(), owner.clone()))
+                .expect("an ordinary departure from an ordinary conversation")
+        );
+
+        let archived = |id: &str| -> bool {
+            core.runtime()
+                .block_on(core.test_space_archived(id.to_string()))
+                .expect("archived?")
+        };
+        assert!(
+            archived(&here),
+            "the delegation it was running for this conversation is closed"
+        );
+        assert!(
+            archived(&nested),
+            "and what that room had delegated onward goes with it"
+        );
+        assert!(
+            !archived(&other),
+            "a room under a conversation nobody left is untouched"
+        );
+        assert!(
+            !archived(&parent),
+            "and the conversation itself is not archived by somebody leaving it"
+        );
+
+        // The quota those rooms held is released; the one elsewhere still counts.
+        assert_eq!(
+            core.runtime()
+                .block_on(core.live_subspaces_owned_by(owner.clone()))
+                .unwrap()
+                .len(),
+            1,
+            "only the room under the conversation it is still in"
+        );
+
+        // Each closed room announces itself — what releases a delegation
+        // waiting on one of them as its parent — beside the roster and listing.
+        let seen = drain(&mut rx);
+        for id in [&here, &nested] {
+            assert!(
+                seen.contains(&Change::Space(id.clone())),
+                "each closed room announces itself: {seen:?}"
+            );
+        }
+        assert!(seen.contains(&Change::Participants), "{seen:?}");
+        assert!(seen.contains(&Change::SpaceIndex), "{seen:?}");
+
+        // The owner is out of the parent, and the room's own ownership record
+        // is untouched — archival is not a departure.
+        assert!(
+            core.runtime()
+                .block_on(core.list_space_participants(parent.clone()))
+                .expect("roster")
+                .iter()
+                .all(|p| p.id != owner),
+            "it really left the conversation"
+        );
+        assert_eq!(
+            core.runtime()
+                .block_on(core.subspace(here.clone()))
+                .unwrap()
+                .expect("still a sub-space")
+                .owner_participant_id,
+            owner,
+            "and the closed room still records who was answerable for it"
+        );
+    });
+}
+
 /// **Closing a conversation closes what it delegated, all the way down.**
 ///
 /// A delegation exists to serve the room it was opened from. Left live under an

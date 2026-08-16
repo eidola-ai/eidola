@@ -1096,6 +1096,40 @@ fn a_delegation_beneath_a_closed_conversation_stops_and_lets_go() {
     });
 }
 
+/// **An owner that has left the parent strands nothing.** Its every report
+/// would act as a participant that is no longer in that conversation and be
+/// refused for it — the room outstanding forever, retrying against its meter,
+/// holding a live-room slot, and deaf to the one signal that changed
+/// (`Change::Participants`, which no delegated room listens for). Closing those
+/// rooms in the departure's own transaction is what makes the state
+/// unreachable rather than handled.
+#[test]
+fn an_owners_departure_from_the_parent_leaves_no_room_retrying() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        core.runtime()
+            .block_on(core.remove_space_participant(parent.clone(), owner.clone()))
+            .expect("the owner leaves the conversation");
+
+        let requests = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("a closed room is a no-op, not a failure");
+        assert_eq!(
+            mock.chat_bodies().len(),
+            requests,
+            "nothing is driven and no report is attempted"
+        );
+        assert!(
+            report(&core, &parent).is_none(),
+            "and nothing was written into the conversation it left"
+        );
+    });
+}
+
 /// A quoted passage is attributed by the space it was written in, and that has
 /// to survive the author being retired between saying it and its being
 /// reported — the record retirement promises to leave alone.
