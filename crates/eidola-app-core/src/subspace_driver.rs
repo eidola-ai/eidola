@@ -1147,13 +1147,18 @@ impl Inner {
                 }
                 NotificationPlan::Turns(turns) => turns,
             };
-            // **Nothing follows this one, so it is a finding.** A post whose
+            // **Nothing follows this one, so it is a finding** — decided
+            // after the turns run, not from the plan's shape. A post whose
             // plan comes back empty is where a branch of the room stopped
-            // having anything to add — which is exactly what the parent is owed
-            // a look at.
-            if turns.is_empty() {
-                leaves.push(post.clone());
-            }
+            // having anything to add; a post whose every planned turn
+            // *declines* is in exactly the same position — each decline wrote
+            // a decision, not a post, so nothing follows it and nothing will
+            // re-plan from it — and a plan-shaped test left such a post
+            // neither leaf nor parent: the branch the report silently
+            // dropped, or, as the room's newest word, the tip whose absence
+            // from the quoted set kept the room outstanding for another
+            // billed round of the same declines.
+            let mut answered = false;
             for turn in turns {
                 let conn = self.db_conn().await?;
                 let taken = db::turns_taken_in_space(&conn, space_id).await?;
@@ -1178,6 +1183,7 @@ impl Inner {
                     // the room's newest word; a turn that declined wrote a
                     // decision, which is not something anyone replies to.
                     Ok(Some(post_action_id)) => {
+                        answered = true;
                         frontier.push(post_action_id);
                         #[cfg(feature = "test-support")]
                         if !std::mem::replace(&mut paused_once, true) {
@@ -1205,6 +1211,9 @@ impl Inner {
                             .await;
                     }
                 }
+            }
+            if !answered {
+                leaves.push(post.clone());
             }
         }
     }
@@ -1496,24 +1505,40 @@ impl Inner {
     /// map. Idempotent — a room that is already waiting stays waiting, because
     /// a wake-up that found no answer has established nothing.
     fn begin_anchor_wait(&self, sub: &db::SubspaceRow) {
-        let fresh = self
+        // One alarm per wait, set when the wait begins. A room woken by
+        // unrelated traffic re-registers into the same entry — keeping its
+        // generation — and does not stack a second one; a room that stopped
+        // waiting and later starts again gets a fresh generation and a fresh
+        // alarm, which is right — the clock is per wait, not per room.
+        let mut waits = self
             .awaiting_anchor
             .lock()
-            .expect("anchor wait map poisoned")
-            .insert(sub.id.clone(), sub.parent_space_id.clone())
-            .is_none();
-        // One alarm per wait, set when the wait begins. A room woken by
-        // unrelated traffic re-registers into the same entry and does not stack
-        // a second one; a room that stopped waiting and later starts again gets
-        // a new one, which is right — the clock is per wait, not per room.
-        if fresh {
-            self.schedule_anchor_grace(&sub.id);
+            .expect("anchor wait map poisoned");
+        if let std::collections::hash_map::Entry::Vacant(entry) = waits.entry(sub.id.clone()) {
+            let generation = self
+                .anchor_wait_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            entry.insert((sub.parent_space_id.clone(), generation));
+            drop(waits);
+            self.schedule_anchor_grace(&sub.id, generation);
         }
     }
 
     /// Wake this room once the wait has outlived any turn that could still
     /// answer it (see [`ANCHOR_WAIT_GRACE`]).
-    fn schedule_anchor_grace(&self, space_id: &str) {
+    ///
+    /// **The alarm answers only for its own wait.** It outlives the wait that
+    /// set it — nothing cancels a sleeping task — so when it fires it asks
+    /// whether the registration it was set for is still the live one, by
+    /// generation. Unmarked, an alarm from an ended wait would fire into a
+    /// *later* wait on the same room (an answer arrived, was hidden by a
+    /// failed regeneration, and a continuation began a second wait) and
+    /// expire it on the remainder of the older clock — a report against the
+    /// anchor after a fraction of the grace the new wait was owed. A stale
+    /// alarm with no live successor now costs nothing at all instead of a
+    /// no-op walk.
+    fn schedule_anchor_grace(&self, space_id: &str, generation: u64) {
         // No runtime (a synchronous unit test) ⇒ nothing to spawn onto.
         if tokio::runtime::Handle::try_current().is_err() {
             return;
@@ -1525,7 +1550,15 @@ impl Inner {
         let grace = self.anchor_wait_grace();
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
-            inner.arm_subspace_driver(&space_id, Arm::Grace);
+            let still_this_wait = inner
+                .awaiting_anchor
+                .lock()
+                .expect("anchor wait map poisoned")
+                .get(&space_id)
+                .is_some_and(|(_, live)| *live == generation);
+            if still_this_wait {
+                inner.arm_subspace_driver(&space_id, Arm::Grace);
+            }
         });
     }
 
@@ -1608,7 +1641,7 @@ impl Inner {
             .lock()
             .expect("anchor wait map poisoned")
             .iter()
-            .filter(|(_, parent)| parent.as_str() == space_id)
+            .filter(|(_, (parent, _))| parent.as_str() == space_id)
             .map(|(room, _)| room.clone())
             .collect()
     }
