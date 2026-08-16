@@ -1332,8 +1332,10 @@ impl Inner {
     /// "ordinary" for the life of the process, and the driver costs one read per
     /// space instead of one per post on a signal every post raises.
     ///
-    /// A database failure answers "ordinary", which skips a room rather than
-    /// wedging the supervisor; the next restart's sweep picks it up.
+    /// A database failure answers "ordinary" for *this signal only* — skipping
+    /// one event rather than wedging the supervisor — and caches nothing, so
+    /// the room's next event asks again. Only a successful "not a delegated
+    /// room" answer earns the permanent cache entry.
     async fn is_ordinary_space(&self, space_id: &str) -> bool {
         if self
             .ordinary_spaces
@@ -1347,15 +1349,18 @@ impl Inner {
             let conn = self.db_conn().await?;
             db::is_live_subspace(&conn, space_id).await
         }
-        .await
-        .unwrap_or(false);
-        if !live {
-            self.ordinary_spaces
-                .lock()
-                .expect("ordinary-space cache poisoned")
-                .insert(space_id.to_string());
+        .await;
+        match live {
+            Ok(true) => false,
+            Ok(false) => {
+                self.ordinary_spaces
+                    .lock()
+                    .expect("ordinary-space cache poisoned")
+                    .insert(space_id.to_string());
+                true
+            }
+            Err(_) => true,
         }
-        !live
     }
 }
 
