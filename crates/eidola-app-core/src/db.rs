@@ -1910,8 +1910,9 @@ pub async fn has_reference_from(
 ///
 /// A direct reply rather than any descendant, because the relationship is
 /// exact: a spawn happens inside a turn, and that turn persists its answer as a
-/// reply to the very post it was answering. Newest first, so a regenerated
-/// answer resolves to its latest generation — and a reply edge threads under
+/// reply to the very post it was answering. Newest — by **commit order**, the
+/// one ordering a writer's clock cannot contradict (see [`action_watermark`]) —
+/// so a regenerated answer resolves to its latest generation — and a reply edge threads under
 /// its antecedent's *item tip* anyway, so even picking a superseded generation
 /// renders in the right place.
 ///
@@ -1949,7 +1950,7 @@ pub async fn last_reply_by_participant(
            AND aa.antecedent_action_id = ?3 \
            AND a.status IN ('complete', 'cancelled') \
            AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
-         ORDER BY a.created_at DESC LIMIT 1"
+         ORDER BY a.rowid DESC LIMIT 1"
     );
     let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt
@@ -1966,9 +1967,9 @@ pub async fn last_reply_by_participant(
     }
 }
 
-/// The most recent **post** `participant_id` wrote in `space_id`, or `None`
-/// when they have written none. The fallback a report takes when its spawn
-/// named no anchor — see [`last_reply_by_participant`] for the anchored path.
+/// The most recent — by **commit order** — **post** `participant_id` wrote in
+/// `space_id`, or `None` when they have written none. The fallback a report
+/// takes when its spawn named no anchor — see [`last_reply_by_participant`] for the anchored path.
 pub async fn last_post_by_participant(
     conn: &Connection,
     space_id: &str,
@@ -1979,7 +1980,7 @@ pub async fn last_post_by_participant(
          WHERE space_id = ?1 AND participant_id = ?2 \
            AND status IN ('complete', 'cancelled') \
            AND action_type IN ({POST_ACTION_TYPES_SQL}) \
-         ORDER BY created_at DESC LIMIT 1"
+         ORDER BY rowid DESC LIMIT 1"
     );
     let mut rows = conn
         .query(
@@ -7376,11 +7377,19 @@ pub async fn last_action_in_space(
     // would give the next post a parent that no rendered view contains,
     // orphaning it into a second thread root. Restricting to post types keeps
     // "the space's tail" meaning what every reader means by it.
+    //
+    // **Last means last-committed** ([`action_watermark`]): every writer samples
+    // `now_ms()` above its own transaction, so a post stamped early and
+    // committed late is not the newest by `created_at` and *is* the room's last
+    // word — and picking the other one tells the delegation driver its last
+    // word has already been reported, which retires a room holding a post
+    // nobody answered. `rowid` also totally orders two posts written in the
+    // same millisecond, which `created_at` never did.
     let sql = format!(
         "SELECT id FROM action \
          WHERE space_id = ?1 AND status IN ('complete', 'cancelled') \
            AND action_type IN ({POST_ACTION_TYPES_SQL}) \
-         ORDER BY created_at DESC LIMIT 1"
+         ORDER BY rowid DESC LIMIT 1"
     );
     let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt
@@ -8538,6 +8547,70 @@ mod tests {
         .await
         .unwrap();
         action_id
+    }
+
+    /// **The room's last word is the last one committed**, which is the whole
+    /// of what the delegation driver's lifecycle stands on: *is there work
+    /// outstanding* is "has the owner quoted the room's last word back to the
+    /// parent", so choosing the wrong post as the last word answers the
+    /// question about somebody else's post.
+    ///
+    /// Staged as it actually happens: a reader's post into a watched room is
+    /// stamped (`now_ms()`, above the writer's own transaction) before a
+    /// driven reply that commits first, so it is *older* by `created_at` and
+    /// *newer* by commit. Ordered by the clock, the tail is the driven reply —
+    /// which the owner has already quoted — so the room reads as reported and
+    /// retires holding a post nobody answered, and the rearmed pass reads the
+    /// same wrong tail and exits again.
+    #[tokio::test]
+    async fn the_rooms_last_word_is_the_last_committed_not_the_last_stamped() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        let owner = ensure_participant(&conn, "agent", "Navigator", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "parent", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "room", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+
+        // The room's driven reply, and the owner's report in the parent
+        // quoting it — the room is settled on that word.
+        let driven = add_user_action(&conn, "room", &owner, "the helper's answer", 9_000).await;
+        let report = add_user_action(&conn, "parent", &owner, "reporting back", 9_500).await;
+        insert_reference_antecedent(&conn, &report, &driven, 1, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            has_reference_from(&conn, "parent", &owner, &driven)
+                .await
+                .unwrap(),
+            "the driven reply is the word the parent has"
+        );
+
+        // The reader's post: stamped before that reply, committed after it.
+        let watched = add_user_action(&conn, "room", &user, "but what about Friday?", 8_000).await;
+
+        assert_eq!(
+            last_action_in_space(&conn, "room")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(watched.as_str()),
+            "the last word is the post that landed last, not the one stamped last"
+        );
+        assert!(
+            !has_reference_from(&conn, "parent", &owner, &watched)
+                .await
+                .unwrap(),
+            "and it has not been reported — so the rearmed pass has work to do \
+             rather than reading a settled room and exiting"
+        );
     }
 
     /// **A post is written whole or not at all.** Its action row, its words,

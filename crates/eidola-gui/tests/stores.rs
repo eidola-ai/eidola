@@ -22,8 +22,8 @@
 
 use std::sync::Arc;
 
-use eidola_app_core::AppCore;
 use eidola_app_core::changes::{Change, ChangeOrigin};
+use eidola_app_core::{AppCore, SpaceMessage};
 use gpui::{AppContext, TestAppContext};
 
 use eidola_gui::stores::{self, SpacesStore, Stores};
@@ -2114,6 +2114,84 @@ fn a_caller_space_change_the_read_already_covers_costs_no_re_read(cx: &mut TestA
     );
     cx.run_until_parked();
     assert_eq!(count(cx), 1, "and nothing re-read it afterwards either");
+}
+
+/// **Two reads landing out of order do not take the newer one off the screen,
+/// and the watermark never claims more than the screen holds.** Two reads are
+/// in flight whenever a fan-out settles two turns, and each carries the mark it
+/// began at; `merge_from_db` *replaces* the transcript, so an older snapshot
+/// landing last removes the newer response — and keeping the higher mark anyway
+/// makes it describe a transcript nobody is looking at, so a deferred
+/// invalidation between the two marks discharges as covered while the write it
+/// announced is absent. Rejecting the older read holds both halves.
+#[gpui::test]
+fn a_transcript_read_that_lands_out_of_order_is_rejected(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+
+    let count = |cx: &mut TestAppContext| space.read_with(cx, |s, _| s.messages().len());
+    wait_until(cx, "the transcript loads", |cx| count(cx) == 1);
+
+    let older = core.change_seq();
+    core.runtime()
+        .block_on(core.post(
+            "And the moon is nobody's.".into(),
+            Some(posted.space_id.clone()),
+        ))
+        .expect("a second post");
+    let newer = core.change_seq();
+    assert!(newer > older, "the second post moved the write stream");
+
+    let two = vec![
+        SpaceMessage {
+            role: "user".into(),
+            content: "The tide is the moon's doing.".into(),
+        },
+        SpaceMessage {
+            role: "user".into(),
+            content: "And the moon is nobody's.".into(),
+        },
+    ];
+    let one = vec![SpaceMessage {
+        role: "user".into(),
+        content: "The tide is the moon's doing.".into(),
+    }];
+
+    // The later read lands first — as a fan-out's second turn does when it
+    // finishes ahead of its sibling.
+    space.update(cx, |s, cx| {
+        assert!(
+            s.apply_loaded_transcript_at_for_test(two, newer, cx),
+            "the newer read applies"
+        );
+    });
+    assert_eq!(count(cx), 2);
+
+    // Its sibling, which began earlier, lands after it.
+    space.update(cx, |s, cx| {
+        assert!(
+            !s.apply_loaded_transcript_at_for_test(one, older, cx),
+            "an older read does not apply over a newer one"
+        );
+    });
+    assert_eq!(
+        count(cx),
+        2,
+        "the response the reader can see does not disappear and come back"
+    );
+    assert_eq!(
+        space.read_with(cx, |s, _| s.transcript_covers_through_for_test()),
+        newer,
+        "and the mark still answers for exactly what is on screen"
+    );
 }
 
 /// A ⌘N space's row commits behind its window, and the very first Send must

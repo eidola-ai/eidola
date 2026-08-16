@@ -1403,16 +1403,44 @@ impl Space {
         self.load_transcript(cx);
     }
 
-    /// Record what a completed transcript read is entitled to claim: it began
-    /// after `covers_through` was sampled, so every write announced below that
-    /// number was already durable when it started (see
-    /// `bridge::get_space_tree`, which samples it beside the read so no caller
-    /// can take it late).
+    /// Apply a freshly read transcript — **unless it is older than what is
+    /// already on screen.** Answers whether it applied.
     ///
-    /// Monotone, because two reads can land out of order and the later mark is
-    /// the one that describes what is on screen.
-    fn note_transcript_read(&mut self, covers_through: u64) {
-        self.transcript_covers_through = self.transcript_covers_through.max(covers_through);
+    /// **The invariant is that the watermark answers for exactly what is
+    /// visible**, and this is the one place that can hold it. Two reads in
+    /// flight at once (a fan-out settles two turns; a load races an exit
+    /// reload) can land in either order, and `merge_from_db` *replaces* the
+    /// transcript — it carries disclosure state across by position, but the
+    /// content is whatever it was handed. So an older snapshot landing last
+    /// takes the newer response off the screen, and taking the higher mark
+    /// anyway makes the watermark describe a transcript nobody is looking at:
+    /// a deferred invalidation between the two marks then discharges as
+    /// "already covered" while the write it announced is absent.
+    ///
+    /// Rejecting the older read is the cure that holds both halves at once —
+    /// the visible transcript never goes backwards, and the mark never claims
+    /// more than the transcript contains. The alternative (apply it and lower
+    /// the mark to match) keeps the watermark honest by letting the reader
+    /// watch a response disappear and come back, which is a worse thing to
+    /// show and no cheaper to reason about. Nothing is lost by refusing: the
+    /// snapshot that *is* on screen was read later, so it contains everything
+    /// this one did.
+    ///
+    /// Equal marks apply: two reads that began at the same point describe the
+    /// same writes, and the later one is free to carry the streamed reasoning
+    /// its caller captured.
+    fn apply_transcript_read(
+        &mut self,
+        messages: Vec<ChatMessageView>,
+        covers_through: u64,
+        new_reasoning: Option<(Option<String>, String)>,
+    ) -> bool {
+        if covers_through < self.transcript_covers_through {
+            return false;
+        }
+        self.merge_from_db(messages, new_reasoning);
+        self.transcript_covers_through = covers_through;
+        true
     }
 
     // -- Transcript loading ------------------------------------------------
@@ -1506,8 +1534,11 @@ impl Space {
         }
         match result {
             Ok((messages, covers_through)) => {
-                self.merge_from_db(messages, None);
-                self.note_transcript_read(covers_through);
+                // A load that began before what is already on screen is stale
+                // twice over — see [`Self::apply_transcript_read`].
+                if !self.apply_transcript_read(messages, covers_through, None) {
+                    return false;
+                }
                 cx.emit(SpaceEvent::MessagesChanged);
             }
             Err(error) => {
@@ -1563,8 +1594,13 @@ impl Space {
                     .filter(|r| !r.is_empty())
                     .filter(|_| result.declined.is_none())
                     .map(|r| (result.response_action_id.clone(), r));
-                self.merge_from_db(messages, attach);
-                self.note_transcript_read(covers);
+                // A sibling turn's later read may already be on screen; this
+                // one does not take it back off (see
+                // [`Self::apply_transcript_read`]). The reasoning it captured
+                // goes with it, which costs nothing — the snapshot that *is*
+                // showing was read later, so it carries the same `thinking`
+                // block from the row.
+                self.apply_transcript_read(messages, covers, attach);
                 cx.emit(SpaceEvent::MessagesChanged);
                 cx.emit(SpaceEvent::StreamEnded);
             }
@@ -1809,8 +1845,7 @@ impl Space {
                         this.post_runner = None;
                         match msgs {
                             Ok((messages, covers)) => {
-                                this.merge_from_db(messages, None);
-                                this.note_transcript_read(covers);
+                                this.apply_transcript_read(messages, covers, None);
                                 cx.emit(SpaceEvent::MessagesChanged);
                                 // A plain post ends no stream, but it is the
                                 // same "this space settled" announcement the
@@ -2014,8 +2049,7 @@ impl Space {
                     this.post_runner = None;
                     match msgs {
                         Ok((messages, covers)) => {
-                            this.merge_from_db(messages, None);
-                            this.note_transcript_read(covers);
+                            this.apply_transcript_read(messages, covers, None);
                             cx.emit(SpaceEvent::MessagesChanged);
                             cx.emit(SpaceEvent::StreamEnded);
                         }
@@ -2532,9 +2566,31 @@ impl Space {
         messages: Vec<SpaceMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let views: Vec<ChatMessageView> = messages.into_iter().map(ChatMessageView::new).collect();
         let covers = self.app_core.as_ref().map_or(u64::MAX, |c| c.change_seq());
-        self.apply_loaded_transcript(Ok((views, covers)), cx)
+        self.apply_loaded_transcript_at_for_test(messages, covers, cx)
+    }
+
+    /// [`Self::apply_loaded_transcript_for_test`] naming the change-bus
+    /// watermark the read began at — the seam for staging two reads that land
+    /// out of order, which is not something a test can arrange from outside
+    /// (both reads sample the mark inside the bridge, in the order they are
+    /// issued).
+    #[doc(hidden)]
+    pub fn apply_loaded_transcript_at_for_test(
+        &mut self,
+        messages: Vec<SpaceMessage>,
+        covers_through: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let views: Vec<ChatMessageView> = messages.into_iter().map(ChatMessageView::new).collect();
+        self.apply_loaded_transcript(Ok((views, covers_through)), cx)
+    }
+
+    /// Test-only: the change-bus watermark the transcript on screen was read
+    /// at — the claim [`Self::apply_transcript_read`] keeps honest.
+    #[doc(hidden)]
+    pub fn transcript_covers_through_for_test(&self) -> u64 {
+        self.transcript_covers_through
     }
 
     /// Test-only: drive the exclusive-mutation failure completion exactly as
