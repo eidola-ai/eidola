@@ -876,11 +876,17 @@ fn the_brief_notifies_the_sub_agents_and_reaches_their_turn_as_a_post() {
 
         // A brief is a post, so planning off it is planning off a post — and
         // the sub-agent's `all` override is what makes it fire in a room with
-        // no human to post.
-        let plan = core
-            .runtime()
-            .block_on(core.plan_notifications(out.space.id.clone(), out.brief_action_id.clone()))
-            .expect("plan");
+        // no human to post. Asked of the mechanical computation, because the
+        // consumer-facing door deliberately answers no turns for a delegated
+        // room — those belong to app-core's own driver (see
+        // `tests/subspace_driver.rs`).
+        let plan =
+            core.runtime()
+                .block_on(core.mechanical_notification_plan(
+                    out.space.id.clone(),
+                    out.brief_action_id.clone(),
+                ))
+                .expect("plan");
         let turns = match plan {
             NotificationPlan::Turns(t) => t,
             other => panic!("expected turns, got {other:?}"),
@@ -952,7 +958,7 @@ fn a_brief_is_agent_authored_so_the_room_opens_one_cascade_hop_in() {
 
         match core
             .runtime()
-            .block_on(core.plan_notifications(out.space.id, out.brief_action_id))
+            .block_on(core.mechanical_notification_plan(out.space.id, out.brief_action_id))
             .expect("plan")
         {
             NotificationPlan::Paused { depth, limit } => {
@@ -1793,7 +1799,7 @@ fn retiring_an_owner_stops_the_helpers_mid_cascade() {
         // pending work retirement has to catch.
         let pending = match core
             .runtime()
-            .block_on(core.plan_notifications(sub.clone(), out.brief_action_id.clone()))
+            .block_on(core.mechanical_notification_plan(sub.clone(), out.brief_action_id.clone()))
             .expect("plan")
         {
             NotificationPlan::Turns(t) => t.into_iter().next().expect("the helper's turn"),
@@ -1828,7 +1834,12 @@ fn retiring_an_owner_stops_the_helpers_mid_cascade() {
         assert!(
             matches!(
                 core.runtime()
-                    .block_on(core.plan_notifications(sub.clone(), out.brief_action_id.clone()))
+                    .block_on(
+                        core.mechanical_notification_plan(
+                            sub.clone(),
+                            out.brief_action_id.clone(),
+                        ),
+                    )
                     .expect("plan"),
                 NotificationPlan::Turns(t) if t.is_empty()
             ),
@@ -2017,7 +2028,7 @@ fn a_notify_all_owner_is_quiet_among_its_helpers_and_answers_a_human() {
             .expect("an answer");
         let planned = match core
             .runtime()
-            .block_on(core.plan_notifications(out.space.id.clone(), answer))
+            .block_on(core.mechanical_notification_plan(out.space.id.clone(), answer))
             .expect("plan")
         {
             NotificationPlan::Turns(t) => {
@@ -2053,7 +2064,7 @@ fn a_notify_all_owner_is_quiet_among_its_helpers_and_answers_a_human() {
             .expect("and posts");
         let planned = match core
             .runtime()
-            .block_on(core.plan_notifications(out.space.id.clone(), asked.action_id))
+            .block_on(core.mechanical_notification_plan(out.space.id.clone(), asked.action_id))
             .expect("plan")
         {
             NotificationPlan::Turns(t) => {
@@ -2185,7 +2196,7 @@ fn a_sub_space_owners_policy_cannot_be_edited_back_into_the_cascade() {
             .expect("an answer");
         match core
             .runtime()
-            .block_on(core.plan_notifications(sub.clone(), answer))
+            .block_on(core.mechanical_notification_plan(sub.clone(), answer))
             .expect("plan")
         {
             NotificationPlan::Turns(t) => {

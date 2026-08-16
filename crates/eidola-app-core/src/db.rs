@@ -1721,7 +1721,7 @@ fn subspace_row(row: &turso::Row) -> Result<SubspaceRow, AppError> {
 async fn subspace_rows(
     conn: &Connection,
     where_clause: &str,
-    param: &str,
+    param: Option<&str>,
 ) -> Result<Vec<SubspaceRow>, AppError> {
     let sql = format!(
         "SELECT s.id, s.parent_space_id, {SUBSPACE_OWNER_SQL}, s.title, s.created_at, \
@@ -1731,10 +1731,11 @@ async fn subspace_rows(
            AND {where_clause} \
          ORDER BY s.created_at ASC"
     );
-    let mut rows = conn
-        .query(&sql, (Value::Text(param.to_string()),))
-        .await
-        .map_err(AppError::db)?;
+    let mut rows = match param {
+        Some(p) => conn.query(&sql, (Value::Text(p.to_string()),)).await,
+        None => conn.query(&sql, ()).await,
+    }
+    .map_err(AppError::db)?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(AppError::db)? {
         out.push(subspace_row(&row)?);
@@ -1748,7 +1749,7 @@ pub async fn subspaces_of(
     conn: &Connection,
     parent_space_id: &str,
 ) -> Result<Vec<SubspaceRow>, AppError> {
-    subspace_rows(conn, "s.parent_space_id = ?1", parent_space_id).await
+    subspace_rows(conn, "s.parent_space_id = ?1", Some(parent_space_id)).await
 }
 
 /// Every **live** (non-archived) sub-space this participant owns — the set the
@@ -1761,7 +1762,7 @@ pub async fn live_subspaces_owned_by(
     subspace_rows(
         conn,
         &format!("s.archived_at IS NULL AND {SUBSPACE_OWNER_SQL} = ?1"),
-        owner_participant_id,
+        Some(owner_participant_id),
     )
     .await
 }
@@ -1770,7 +1771,155 @@ pub async fn live_subspaces_owned_by(
 /// row, i.e. when it is an ordinary space. The read behind "who do I report to,
 /// and where" for a sub-space id.
 pub async fn subspace(conn: &Connection, space_id: &str) -> Result<Option<SubspaceRow>, AppError> {
-    Ok(subspace_rows(conn, "s.id = ?1", space_id).await?.pop())
+    Ok(subspace_rows(conn, "s.id = ?1", Some(space_id))
+        .await?
+        .pop())
+}
+
+/// Every **live** sub-space, whoever owns it — what a turn driver enumerates
+/// when it starts, to pick up the rooms a previous run left mid-delegation.
+///
+/// Ordered oldest first, so a restart resumes delegations in the order they
+/// were opened rather than in whatever order the planner reached them.
+pub async fn live_subspaces(conn: &Connection) -> Result<Vec<SubspaceRow>, AppError> {
+    subspace_rows(conn, "s.archived_at IS NULL", None).await
+}
+
+/// Whether `space_id` is a sub-space that still takes work: it has a parent, it
+/// has an owner, and it is not archived.
+///
+/// One row read on the space's primary key. It is the question asked of every
+/// `Change::Space` a driver hears, so it is deliberately narrower than
+/// [`subspace`] — no owner join, no columns to build a row out of.
+pub async fn is_live_subspace(conn: &Connection, space_id: &str) -> Result<bool, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM space \
+             WHERE id = ?1 AND parent_space_id IS NOT NULL AND archived_at IS NULL",
+            (Value::Text(space_id.to_string()),),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(rows.next().await.map_err(AppError::db)?.is_some())
+}
+
+/// How many turns have been taken in `space_id` — the count a per-delegation
+/// turn budget is spent against.
+///
+/// **Derived, never stored.** A turn ends in exactly one durable act: the
+/// `inference` it persists, or the `decision` the decline checkpoint writes
+/// instead. Counting those rows is counting turns, and the answer survives a
+/// restart because the rows do — an in-memory tally would reset the meter every
+/// time the process came back, which is the one way a budget can be escaped.
+/// A turn that failed wrote neither and is deliberately not counted: nothing
+/// was produced and nothing was persisted to produce it from.
+pub async fn turns_taken_in_space(conn: &Connection, space_id: &str) -> Result<i64, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM action \
+             WHERE space_id = ?1 AND action_type IN ('inference', 'decision')",
+            (Value::Text(space_id.to_string()),),
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<i64>(0).map_err(AppError::db),
+        None => Ok(0),
+    }
+}
+
+/// `(id, text)` of an action's first quotable ([`QUOTABLE_BLOCK_TYPE`]) content
+/// block — what a driver quotes when it attaches a post to a turn it is about
+/// to run. `None` for an action with no text block (a decline, a trace).
+pub async fn first_quotable_block(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<(String, String)>, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT id, text_content FROM content_block \
+             WHERE action_id = ?1 AND block_type = ?2 AND text_content IS NOT NULL \
+             ORDER BY ordinal ASC LIMIT 1",
+            (
+                Value::Text(action_id.to_string()),
+                Value::Text(QUOTABLE_BLOCK_TYPE.to_string()),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<String>(1).map_err(AppError::db)?,
+        ))),
+    }
+}
+
+/// Whether `participant_id` has already quoted `antecedent_action_id` in
+/// `space_id` — the read that answers "has this delegation already been
+/// reported?"
+///
+/// **This is what keeps a delegation's lifecycle derived** rather than stored.
+/// A driver's terminal act is a turn in the parent quoting the delegated room's
+/// last post; asking whether that edge exists asks whether the room's *current*
+/// tail has been reported, which is true after a report, false again the moment
+/// somebody posts into the room, and identical after a restart. A status column
+/// would have to be written, kept in step with continuation, and believed.
+pub async fn has_reference_from(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    antecedent_action_id: &str,
+) -> Result<bool, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM action_antecedent aa \
+             JOIN action a ON a.id = aa.action_id \
+             WHERE aa.relation = 'reference' AND aa.antecedent_action_id = ?1 \
+               AND a.space_id = ?2 AND a.participant_id = ?3 \
+             LIMIT 1",
+            (
+                Value::Text(antecedent_action_id.to_string()),
+                Value::Text(space_id.to_string()),
+                Value::Text(participant_id.to_string()),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(rows.next().await.map_err(AppError::db)?.is_some())
+}
+
+/// The most recent **post** `participant_id` wrote in `space_id`, or `None`
+/// when they have written none. Where a report attaches: replying to the
+/// owner's own last word keeps the one-reply spine the rest of the thread
+/// model depends on.
+pub async fn last_post_by_participant(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = format!(
+        "SELECT id FROM action \
+         WHERE space_id = ?1 AND participant_id = ?2 \
+           AND status IN ('complete', 'cancelled') \
+           AND action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY created_at DESC LIMIT 1"
+    );
+    let mut rows = conn
+        .query(
+            &sql,
+            (
+                Value::Text(space_id.to_string()),
+                Value::Text(participant_id.to_string()),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
 }
 
 /// How deep a space sits in the `parent_space_id` chain: 0 for a space nobody
