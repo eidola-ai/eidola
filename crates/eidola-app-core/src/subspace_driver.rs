@@ -169,12 +169,17 @@ pub(crate) struct Walk {
     /// has not answered the post the delegation was opened from yet, so the
     /// report has nowhere to sit. The decision is not re-derivable afterwards
     /// (a failed turn leaves nothing durable saying it failed), so it is kept
-    /// here, beside the meter, keyed on the same last word: while the room's
-    /// last word is unchanged the ending is still true of it, and the moment
-    /// anything is posted the key changes and this goes with it.
+    /// here, beside the meter. It stays true of the room for exactly as long
+    /// as the room's **current last word is among its leaves** — the memory
+    /// twin of `db::has_reference_from`'s premise — which is what recognizes a
+    /// walk by its own newest driven post (`tail` cannot: it is the word the
+    /// walk *started* from, and the walk's own turns move the room past it)
+    /// while a stranger's post falls outside the leaves and gets the walk it
+    /// is owed. See [`Inner::remembered_ending`].
     ///
-    /// It is what lets a room whose *work* allowance is spent still deliver
-    /// what that work already decided — see [`Inner::drive_subspace`].
+    /// It is what lets every wake while the anchor goes unanswered be delivery
+    /// only, and a room whose *work* allowance is spent still deliver what
+    /// that work already decided — see [`Inner::drive_subspace`].
     decided: Option<(DelegationEnd, Vec<String>)>,
 }
 
@@ -704,34 +709,65 @@ impl Inner {
     /// mark that lands after its row leaves a window in which the row is
     /// visible and unmarked, and here that window is the hazard itself.
     ///
-    /// Failures are warned about and swallowed: picking delegations back up is
-    /// housekeeping, and a process that refused to start over it would cost the
-    /// reader everything else.
+    /// A failed enumeration is retried rather than swallowed: this pass is the
+    /// only recovery a pre-existing room has — nothing else will ever raise a
+    /// signal for it — so giving up on an error leaves such a room at its
+    /// brief for the life of the process. The spawn record is consumed only by
+    /// an enumeration that succeeded, so a retry finds it intact and still
+    /// growing, and the ordering above holds of the attempt that finally
+    /// answers. The caller sits out each pause, which is safe where blocking
+    /// usually is not: the supervisor's bus traffic surfaces as lag if it
+    /// overflows the wait, and lag recovery re-asks this very question of
+    /// every live room.
     pub(crate) async fn rearm_live_subspaces(self: &Arc<Self>, arm: Arm) {
-        let rooms = async {
-            let conn = self.db_conn().await?;
-            db::live_subspaces(&conn).await
-        }
-        .await;
-        // Read after the enumeration, and only where it can matter: this is
-        // the sweep's licence being checked, and every other arm already
-        // claims nothing.
-        let spawned_here = match arm {
-            Arm::Sweep => self.take_rooms_spawned_here(),
-            _ => std::collections::HashSet::new(),
-        };
-        match rooms {
-            Ok(rooms) => {
-                for room in rooms {
-                    let arm = if spawned_here.contains(&room.id) {
-                        Arm::Signal
-                    } else {
-                        arm
+        loop {
+            let rooms = async {
+                let conn = self.db_conn().await?;
+                db::live_subspaces(&conn).await
+            }
+            .await;
+            #[cfg(feature = "test-support")]
+            let rooms = match self.enumeration_faults.fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            ) {
+                Ok(_) => Err(crate::AppError::Config {
+                    message: "test: the enumeration is made to fail".into(),
+                }),
+                Err(_) => rooms,
+            };
+            match rooms {
+                Ok(rooms) => {
+                    // Read after an enumeration that **succeeded** — after,
+                    // because that order is the sweep's licence (above), and
+                    // only on success so a failed attempt cannot consume the
+                    // record a retry still needs. Until then it goes on
+                    // growing: the record ends when the sweep has been, and a
+                    // sweep that could not enumerate has not. Only the sweep
+                    // reads it — every other arm already claims nothing.
+                    let spawned_here = match arm {
+                        Arm::Sweep => self.take_rooms_spawned_here(),
+                        _ => std::collections::HashSet::new(),
                     };
-                    self.arm_subspace_driver(&room.id, arm);
+                    for room in rooms {
+                        let arm = if spawned_here.contains(&room.id) {
+                            Arm::Signal
+                        } else {
+                            arm
+                        };
+                        self.arm_subspace_driver(&room.id, arm);
+                    }
+                    return;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: delegated conversations could not be enumerated \
+                         (will retry): {e}"
+                    );
+                    tokio::time::sleep(RETRY_PAUSE).await;
                 }
             }
-            Err(e) => eprintln!("warning: delegated conversations could not be enumerated: {e}"),
         }
     }
 
@@ -786,29 +822,35 @@ impl Inner {
         }
     }
 
-    /// The ending this room already reached against `tail`, if one is waiting
-    /// to be delivered.
+    /// The ending this room already reached, if one is waiting to be delivered
+    /// and is still true of the room — that is, if `tail` (the room's current
+    /// last word) is **among the ending's own leaves**. That containment is
+    /// the memory twin of [`db::has_reference_from`]'s premise: the walk's
+    /// leaves are every word it accounted for, its own newest driven post
+    /// included, so a room nothing has touched since is recognized whether or
+    /// not the walk moved it — and a stranger's post is in nobody's leaves,
+    /// so it falls through to the walk it is owed.
     fn remembered_ending(
         &self,
         space_id: &str,
         tail: &str,
     ) -> Option<(DelegationEnd, Vec<String>)> {
         let walks = self.subspace_walks.lock().expect("walk map poisoned");
-        walks
-            .get(space_id)
-            .filter(|walk| walk.tail == tail)
-            .and_then(|walk| walk.decided.clone())
+        walks.get(space_id).and_then(|walk| {
+            walk.decided
+                .as_ref()
+                .filter(|(_, leaves)| leaves.iter().any(|leaf| leaf == tail))
+                .cloned()
+        })
     }
 
     /// Drop a remembered ending: it was delivered, or the attempt to deliver it
     /// failed. **A failed delivery forgets**, which is what bounds delivery to
-    /// the work that earned it: the next pass finds nothing to deliver and
-    /// meets the work meter, which is spent.
-    fn forget_ending(&self, space_id: &str, tail: &str) {
+    /// the work that earned it: the next pass finds nothing to deliver, and
+    /// what it may do instead is bounded by the work meter.
+    fn forget_ending(&self, space_id: &str) {
         let mut walks = self.subspace_walks.lock().expect("walk map poisoned");
-        if let Some(walk) = walks.get_mut(space_id)
-            && walk.tail == tail
-        {
+        if let Some(walk) = walks.get_mut(space_id) {
             walk.decided = None;
         }
     }
@@ -884,25 +926,45 @@ impl Inner {
             return Ok(());
         }
         drop(conn);
-        // Asked *after* the outstanding check, so a settled room costs no
-        // attempt and a room that is genuinely stuck cannot spend forever.
+        // **An ending already decided against this last word is delivered, not
+        // re-derived.** A walk that ends while its anchor is unanswered keeps
+        // what it decided (see [`Walk::decided`]), and a wait hands back the
+        // attempt it claimed — so a wake while the answer is pending would
+        // otherwise claim afresh and re-run the cascade over an unchanged
+        // tail: a router inference per wake where the room routes, a
+        // nondeterministic chance of scheduling helpers again, and a
+        // re-derived ending whose leaves are just the tail, overwriting the
+        // branch tips the walk that did the work collected. The lookup answers
+        // only while the room's current last word is among the decided
+        // ending's leaves — nothing has landed the walk did not account for,
+        // the same premise `has_reference_from` reads durably — so the ending
+        // is still true of the room, and the pass is delivery only: no plan,
+        // no turn, no re-derivation — the one report the delegation has owed
+        // all along.
         //
-        // **The meter bounds work, and delivering a decision is not work.** A
-        // walk that failed keeps its claim, so three failures against one last
-        // word close the room to further walking — correctly, because each one
-        // drove billed turns. But the ending those walks decided may still be
-        // undelivered: with the anchor unanswered, every one of them held its
-        // report back. When the answer finally lands, the arm it raises used to
-        // meet the spent meter and exit, and the failure the parent was owed
-        // was never told — the notification the meter exists to protect,
-        // refused by the meter itself. So a refused walk asks whether an ending
-        // is waiting to go out (see [`Walk::decided`]) and, if one is, delivers
-        // it: no plan, no turn, no re-derivation — the pass costs exactly the
-        // one report the delegation has owed all along. Delivery cannot loop,
-        // because a failed delivery forgets the ending and the next pass meets
-        // the same spent meter with nothing to deliver.
-        let claimed = self.claim_walk(&space_id, &tail);
-        let walked = if claimed {
+        // A decided **failure** is the exception, while the meter has room: it
+        // is provisional rather than final — a blip has to be able to heal —
+        // so it takes the claim path below and the walk is retried. What makes
+        // it final is the meter refusing, and the refused walk then delivers
+        // it: the ending the spent work decided, which the arm the anchor's
+        // answer raises must meet rather than the meter (the notification the
+        // meter exists to protect, refused by the meter itself, was the
+        // alternative). Delivery cannot loop, because a failed delivery
+        // forgets the ending, and whatever the next wake does — retry while
+        // the meter has room, nothing once it is spent — is bounded by the
+        // meter like all work.
+        //
+        // The claim is asked *after* the outstanding check, so a settled room
+        // costs no attempt and a room that is genuinely stuck cannot spend
+        // forever.
+        let remembered = self.remembered_ending(&space_id, &tail);
+        let decided_and_final = remembered
+            .as_ref()
+            .is_some_and(|(end, _)| !matches!(end, DelegationEnd::TurnFailed { .. }));
+        let claimed = !decided_and_final && self.claim_walk(&space_id, &tail);
+        let walked = if decided_and_final {
+            remembered.expect("checked just above")
+        } else if claimed {
             // Boxed, like every other await on the turn path:
             // `run_turn_stream`'s state machine is the largest in the crate,
             // and stacking this walk's frame on top of it overflows a worker
@@ -914,18 +976,15 @@ impl Inner {
                     return Ok(()); // the room closed under us; nothing to report
                 }
             }
+        } else if let Some(decided) = remembered {
+            decided
         } else {
-            match self.remembered_ending(&space_id, &tail) {
-                Some(decided) => decided,
-                None => {
-                    eprintln!(
-                        "warning: the delegated conversation {space_id} has been tried \
-                         {MAX_ATTEMPTS_PER_TAIL} times against the same last post and is being \
-                         left alone; a post there, or a restart, will pick it up again"
-                    );
-                    return Ok(());
-                }
-            }
+            eprintln!(
+                "warning: the delegated conversation {space_id} has been tried \
+                 {MAX_ATTEMPTS_PER_TAIL} times against the same last post and is being \
+                 left alone; a post there, or a restart, will pick it up again"
+            );
+            return Ok(());
         };
         let (end, leaves) = walked;
         // **A wait tried nothing — but a failure before the wait tried
@@ -944,21 +1003,24 @@ impl Inner {
         let failed_a_turn = matches!(end, DelegationEnd::TurnFailed { .. });
         let outcome = Box::pin(self.report_delegation(&sub, end, leaves.clone(), arm)).await;
         match outcome {
-            // Held back: keep the ending, so the arm that finally finds the
-            // anchor answered can deliver it whether or not the meter has room
-            // for more work by then.
+            // Held back: keep the ending, so every wake until the anchor is
+            // answered is delivery only — whether or not the meter has room
+            // for more work by then. A delivery pass stores nothing: what it
+            // delivered is the stored ending, untouched.
             Ok(Report::Waiting) => {
-                self.remember_ending(&space_id, &tail, end, &leaves);
-                if claimed && !failed_a_turn {
-                    self.release_walk(&space_id, &tail);
+                if claimed {
+                    self.remember_ending(&space_id, &tail, end, &leaves);
+                    if !failed_a_turn {
+                        self.release_walk(&space_id, &tail);
+                    }
                 }
             }
             // Delivered, or there was nothing to deliver to. Either way this
             // ending is done with.
-            Ok(Report::Settled) => self.forget_ending(&space_id, &tail),
+            Ok(Report::Settled) => self.forget_ending(&space_id),
             // The delivery itself failed. Forgetting is what keeps a decided
             // ending from being retried past the work that earned it.
-            Err(_) => self.forget_ending(&space_id, &tail),
+            Err(_) => self.forget_ending(&space_id),
         }
         outcome.map(|_| ())
     }

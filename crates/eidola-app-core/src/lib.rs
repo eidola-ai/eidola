@@ -1607,6 +1607,12 @@ struct Inner {
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
     ordinary_spaces: Mutex<std::collections::HashSet<String>>,
+    /// How many upcoming live-room enumerations should fail, the way a
+    /// transient store error would — the seam behind the sweep's retry (see
+    /// `Inner::rearm_live_subspaces`). Set only by
+    /// [`AppCore::test_fail_next_subspace_enumerations`].
+    #[cfg(feature = "test-support")]
+    enumeration_faults: std::sync::atomic::AtomicU32,
     summary_gate: tokio::sync::Mutex<()>,
     /// Space id → the most recent summary trigger's timestamp: the trailing
     /// debounce that keeps an exchange (the post, then the answer it draws)
@@ -8078,6 +8084,8 @@ impl AppCore {
                 #[cfg(feature = "test-support")]
                 entry_window: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
+                #[cfg(feature = "test-support")]
+                enumeration_faults: std::sync::atomic::AtomicU32::new(0),
                 summary_gate: tokio::sync::Mutex::new(()),
                 summary_triggers: Mutex::new(std::collections::HashMap::new()),
                 memory_gate: tokio::sync::Mutex::new(()),
@@ -9317,6 +9325,17 @@ impl AppCore {
                     .await;
             })
             .await;
+    }
+
+    /// Test-only seam: make the next `n` live-room enumerations fail, the way
+    /// a transient store error would — what the sweep's retry recovers from
+    /// (see `Inner::rearm_live_subspaces`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_fail_next_subspace_enumerations(&self, n: u32) {
+        self.inner
+            .enumeration_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Test-only seam: stop the next walk between reading the room's last post

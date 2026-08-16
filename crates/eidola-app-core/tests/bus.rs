@@ -1629,12 +1629,14 @@ fn add_update_remove_participant_emit_participants() {
     });
 }
 
-/// The two library exit points of task 36 — promotion and retirement — each
-/// emit **`Participants` and nothing else**, though both write a `space` row.
-/// The space in question is a notebook, which `list_spaces` excludes
-/// unconditionally, so a `SpaceIndex` would invalidate a store with nothing new
-/// to read. (`archive_space` emits `SpaceIndex` for exactly the opposite
-/// reason: the space it archives is one the Library lists.)
+/// The two library exit points — promotion and retirement — both write a
+/// notebook's `space` row without ever moving the Library's listing: a
+/// notebook is excluded from `list_spaces` unconditionally, so a `SpaceIndex`
+/// would invalidate a store with nothing new to read. (`archive_space` emits
+/// `SpaceIndex` for exactly the opposite reason: the space it archives is one
+/// the Library lists.) Retirement still announces the notebook it closed with
+/// a `Change::Space(id)` — every room an archival closes is announced — which
+/// is pinned here beside the listing silence.
 #[test]
 fn promote_and_retire_move_no_library_listing() {
     run_in_thread(|| {
