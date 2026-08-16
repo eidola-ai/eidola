@@ -1333,6 +1333,33 @@ impl Inner {
         pause_in_window(&self.entry_window).await;
     }
 
+    /// **What every door that closes a room owes it**: announce the room, and
+    /// end any wait it was holding.
+    ///
+    /// The two halves answer different readers and neither substitutes for the
+    /// other. The **announcement** (`Change::Space`) is what tells a window
+    /// open on that room it has stopped, and what wakes any *other* delegation
+    /// registered against it as a parent — that one arrives through
+    /// `rooms_awaiting`, which is keyed by parent. The **clearing** is the
+    /// room's own registration, and nothing on the bus can deliver it: an
+    /// archived room is not a live delegated room, so `is_ordinary_space`
+    /// answers "ordinary" and the supervisor never arms it — the terminal path
+    /// that would have cleared the wait is precisely the path that no longer
+    /// runs. Left standing, that registration makes every post in the room's
+    /// parent pay for a walk that can only no-op, until the grace alarm comes
+    /// due.
+    ///
+    /// A walk already in flight for one of these rooms may register again after
+    /// this; it then finds the room archived at its next hop or at the report
+    /// gate and clears it there, which is the same one-walk cost that door
+    /// always had. Ending it here is what removes the standing one.
+    pub(crate) fn close_rooms(&self, space_ids: &[String]) {
+        for id in space_ids {
+            self.end_anchor_wait(id);
+            self.bus.emit(Change::Space(id.clone()));
+        }
+    }
+
     /// Stop waiting: the answer arrived, or there is no longer one to wait for.
     /// Called on every path out of the anchor question that is not a wait, so
     /// the registration a wait needed cannot outlive it.

@@ -2168,13 +2168,21 @@ fn retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts() {
 
         // Emissions: the roster changed, and so did the Library — because a
         // sub-space *is* a Library row, unlike the notebook this same
-        // transaction also archived.
+        // transaction also archived. And **every room it closed is announced**,
+        // the notebook included: a room can be opened from one, so a wait can
+        // be registered against one, and the announcement is what wakes it.
         let seen = drain(&mut rx);
         assert!(seen.contains(&Change::Participants), "{seen:?}");
         assert!(
             seen.contains(&Change::SpaceIndex),
             "archiving a listed room moved the listing: {seen:?}"
         );
+        for id in [&live.space.id, &nested] {
+            assert!(
+                seen.contains(&Change::Space(id.clone())),
+                "each closed room announces itself: {seen:?}"
+            );
+        }
 
         // And the unchanged half: retiring an agent that owns no live room
         // says nothing about the Library, because the notebook it archives is

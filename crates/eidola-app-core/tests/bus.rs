@@ -69,7 +69,7 @@
 //!
 //! | `run_turn`/`run_turn_stream` — the space is **archived** (`AppError::SpaceArchived`, raised by `prepare_turn`'s single read of the space row, which answers existence and availability together) | Nothing at all. The refusal lands before the credential, before the request and before any action — a turn planned while the space was open and driven after it closed writes nothing and spends nothing. `chat`/`chat_stream` still committed their *post* first, so that post's `Space(id)` (+`SpaceIndex`) is the post's own emission, exactly as it is for a funding failure; `respond_stream`, `respond_stream_as` and `regenerate` add no post and so emit nothing whatsoever | **No emissions** | `participants_orchestration.rs` (`an_archived_space_plans_no_turns_and_starts_none` — every entry point refused, no upstream request, no action written); `subspaces.rs` (`retiring_an_owner_stops_the_helpers_mid_cascade`, the case that made it matter) |
 //!
-//! | `retire_participant` — a shared agent **retired**, which also archives every space that existed only because of it: its notebook, every **live sub-space it owned** (owner-scoped, so at every depth), and the delegations *those* rooms were themselves running, whoever owns them (see `subspaces`) | `Participants` always; `SpaceIndex` **exactly when a space the Library lists was archived** — never for the notebook (excluded from `list_spaces` on both axes), always for a sub-space (an ordinary Library row). The count is returned from inside the transaction (`db::Retirement`), never re-read after it. No per-space emission: nothing reads a single space's `archived_at`, so a `Space(id)` would announce what no subscriber can observe | `subspaces.rs` (`retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts`, which pins both arms); `bus.rs` (`promote_and_retire_emit_participants_only` for the notebook-only case) |
+//! | `retire_participant` — a shared agent **retired**, which also archives every space that existed only because of it: its notebook, every **live sub-space it owned** (owner-scoped, so at every depth), and the delegations *those* rooms were themselves running, whoever owns them (see `subspaces`) | `Participants` always; `SpaceIndex` **exactly when a space the Library lists was archived** — never for the notebook (excluded from `list_spaces` on both axes), always for a sub-space (an ordinary Library row). The count is returned from inside the transaction (`db::Retirement`), never re-read after it. **Plus `Space(id)` per closed room**, notebook included, and the wait each room was holding is ended beside it (`Inner::close_rooms`, what all three archival doors owe a room): retirement reaches a room without touching its parent, so nothing about the parent can announce it, and the room's own registration would otherwise stand until the grace alarm — making every post in that parent pay for a no-op walk until then | `subspaces.rs` (`retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts`, which pins both arms); `subspace_driver.rs` (`retiring_an_owner_releases_the_wait_its_room_was_holding`); `bus.rs` (`promote_and_retire_move_no_library_listing` for the notebook-only case) |
 //!
 //! | `discard_if_pristine` — an **untouched space deleted** (the app's one real delete; every other removal is soft). The space's `space_participant` rows, the `participant` rows it owns and the `space` row itself, in one transaction that re-asks the whole pristineness predicate before it strikes | `SpaceIndex`, **and only when it deleted**. Nothing else: no `Participants` (the roster it removed belonged to a space that no longer exists, and no surface can be reading it — the trigger is the last window closing) and no `Space(id)` (there is no space to announce). A refusal — any action in the space, any configuration ever written, a notebook — commits nothing and says nothing | `reap_pristine.rs` (`an_untouched_space_is_discarded_with_its_whole_footprint`, `discarding_an_unknown_space_is_a_plain_no`, and the door sweep for the refusals) |
 //! | The **startup sweep** — the same delete applied to every pristine space at the local database's first open, catching the blanks a session that crashed never closed its windows on | `SpaceIndex` once, when the sweep took at least one space; nothing at all when it took none. The sweep runs inside the database's first-open initializer, so it is over before any read in this process is answered | `reap_pristine.rs` (`the_startup_sweep_takes_the_orphans_and_leaves_the_rest`, `a_sweep_with_nothing_to_take_says_nothing`) |
@@ -205,13 +205,22 @@
 //! keeps its id and its scope, the trail still resolves it, and its memory is
 //! untouched; what ends is its availability. One transaction — the
 //! `participant.removed_at` soft-remove **and** its notebook's archival ("the
-//! notebook is archived with its agent") — emitting **`Change::Participants`
-//! only**. Not `SpaceIndex`, by the same argument promotion makes and for the
+//! notebook is archived with its agent") — emitting **`Change::Participants`**
+//! always. Not `SpaceIndex`, by the same argument promotion makes and for the
 //! same reason `archive_space` *does* emit it: the rule is "did the Library
-//! listing change", and a notebook was never in it. `list_global_agents` is a
+//! listing change", and a notebook was never in it. **Every space the
+//! transaction archived is also announced** (`Change::Space` per room, the
+//! notebook included) and released from any wait it was holding — the one
+//! thing all three archival doors owe a room (`Inner::close_rooms`), and
+//! retirement is the door that reaches a room without touching its parent, so
+//! nothing about the parent could ever announce it. Covered by
+//! `retiring_an_agent_archives_the_rooms_it_owned_and_keeps_their_transcripts`
+//! (`subspaces.rs`) and
+//! `retiring_an_owner_releases_the_wait_its_room_was_holding`
+//! (`subspace_driver.rs`). `list_global_agents` is a
 //! pure read and emits nothing. Refusals (unknown, already retired, the shared
 //! human, a space-owned participant, a non-agent) are decided before any write.
-//! Covered by `promote_and_retire_emit_participants_only` below and
+//! Covered by `promote_and_retire_move_no_library_listing` below and
 //! `global_agents.rs`'s `retiring_a_shared_agent_archives_its_notebook_and_keeps_its_trail`
 //! / `retirement_refuses_everything_that_is_not_a_shared_agent`.
 //!
@@ -1627,7 +1636,7 @@ fn add_update_remove_participant_emit_participants() {
 /// to read. (`archive_space` emits `SpaceIndex` for exactly the opposite
 /// reason: the space it archives is one the Library lists.)
 #[test]
-fn promote_and_retire_emit_participants_only() {
+fn promote_and_retire_move_no_library_listing() {
     run_in_thread(|| {
         let (core, _dir) = make_core();
         let space = core.runtime().block_on(core.create_space(None)).unwrap();
@@ -1698,6 +1707,13 @@ fn promote_and_retire_emit_participants_only() {
         assert!(
             !emitted.contains(&Change::SpaceIndex),
             "the notebook it archived was never listed: {emitted:?}"
+        );
+        // The notebook is still a space this transaction closed, and every
+        // closed room is announced — a delegation can be opened from a
+        // notebook, so a wait can be registered against one.
+        assert!(
+            emitted.contains(&Change::Space(outcome.notebook_space_id.clone())),
+            "the notebook it closed announces itself: {emitted:?}"
         );
         assert!(
             core.runtime()
