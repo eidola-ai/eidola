@@ -1760,6 +1760,27 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
     (mock, core, dir)
 }
 
+/// Re-open an `AppCore` over a directory a previous one used — the **restart**
+/// seam.
+///
+/// The single-writer lock is held for the life of an `AppCore`, so the caller
+/// must have dropped the previous one. Everything durable is on disk, so what
+/// comes back is the same profile with none of the previous process's memory:
+/// exactly the state a guard that is supposed to survive a restart has to be
+/// held against.
+pub fn reopen_core(dir: &tempfile::TempDir, base_url: &str) -> AppCore {
+    let config_dir = dir.path().to_path_buf();
+    let data_dir = dir.path().join("data");
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("plain http client");
+    let core = AppCore::with_test_http_client(config_dir, data_dir, client).expect("reopen core");
+    core.runtime()
+        .block_on(core.set_base_url(base_url.to_string()))
+        .expect("set base url");
+    core
+}
+
 /// Configure account credentials so auto-provisioning can reach the balance /
 /// allocate endpoints. The actual basic-auth password is never verified by the
 /// mock, so any non-empty values work.
