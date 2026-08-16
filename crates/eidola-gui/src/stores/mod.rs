@@ -341,7 +341,7 @@ pub fn install_bus_bridge(stores: &Stores, cx: &mut App) -> BusBridge {
             match bus.recv().await {
                 Ok(event) => {
                     if tx
-                        .send(BridgeEvent::Change(event.change, event.origin))
+                        .send(BridgeEvent::Change(event.change, event.origin, event.seq))
                         .is_err()
                     {
                         break; // gpui loop gone — app shutting down
@@ -377,7 +377,9 @@ pub fn install_bus_bridge(stores: &Stores, cx: &mut App) -> BusBridge {
             // `AsyncApp::update` here yields `()` (the dispatch returns unit);
             // ignore via a statement-position call so the loop keeps draining.
             cx.update(|cx| match event {
-                BridgeEvent::Change(change, origin) => dispatch_change(&stores, change, origin, cx),
+                BridgeEvent::Change(change, origin, seq) => {
+                    dispatch_change(&stores, change, origin, seq, cx)
+                }
                 BridgeEvent::Lagged => refresh_everything(&stores, cx),
             });
         }
@@ -424,7 +426,7 @@ impl BusBridge {
 }
 
 enum BridgeEvent {
-    Change(Change, ChangeOrigin),
+    Change(Change, ChangeOrigin, u64),
     Lagged,
 }
 
@@ -434,31 +436,35 @@ enum BridgeEvent {
 /// runtime, not by a test). `Lagged` is modelled by passing `None`.
 ///
 /// The origin defaults to [`ChangeOrigin::Caller`] — what every write made on
-/// a consumer's own call path carries; [`dispatch_change_event_for_test`] is
-/// the seam for the unattended half.
+/// a consumer's own call path carries — and the sequence to `u64::MAX`, which
+/// no read can ever claim to cover, so a surface deciding by coverage replays
+/// it. Both are the conservative reading; [`dispatch_change_event_for_test`] is
+/// the seam for naming either.
 #[doc(hidden)]
 pub fn dispatch_change_for_test(stores: &Stores, change: Option<Change>, cx: &mut App) {
-    dispatch_change_event_for_test(stores, change, ChangeOrigin::Caller, cx)
+    dispatch_change_event_for_test(stores, change, ChangeOrigin::Caller, u64::MAX, cx)
 }
 
-/// [`dispatch_change_for_test`] naming the origin the change was emitted
-/// under — the seam for asserting what a busy surface does with a write
-/// nobody is waiting on.
+/// [`dispatch_change_for_test`] naming the origin the change was emitted under
+/// and its place in the write stream — the seam for asserting what a busy
+/// surface does with a write nobody is waiting on, and with one its own read
+/// has or has not already covered.
 #[doc(hidden)]
 pub fn dispatch_change_event_for_test(
     stores: &Stores,
     change: Option<Change>,
     origin: ChangeOrigin,
+    seq: u64,
     cx: &mut App,
 ) {
     match change {
-        Some(change) => dispatch_change(stores, change, origin, cx),
+        Some(change) => dispatch_change(stores, change, origin, seq, cx),
         None => refresh_everything(stores, cx),
     }
 }
 
 /// Route one [`Change`] to the store(s) that own the affected domain.
-fn dispatch_change(stores: &Stores, change: Change, origin: ChangeOrigin, cx: &mut App) {
+fn dispatch_change(stores: &Stores, change: Change, origin: ChangeOrigin, seq: u64, cx: &mut App) {
     match change {
         Change::Config => {
             stores.config.update(cx, |s, cx| s.refresh(cx));
@@ -487,7 +493,7 @@ fn dispatch_change(stores: &Stores, change: Change, origin: ChangeOrigin, cx: &m
         Change::Space(id) => {
             stores
                 .spaces
-                .update(cx, |s, cx| s.notify_space_changed(&id, origin, cx));
+                .update(cx, |s, cx| s.notify_space_changed(&id, origin, seq, cx));
             stores
                 .space_settings
                 .update(cx, |s, cx| s.refresh_if_cached(&id, cx));

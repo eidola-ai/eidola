@@ -312,6 +312,15 @@ impl Inner {
             parent_action_id,
             now,
         };
+        // **Recorded as this process's before the room exists.** A spawn
+        // happens inside its owner's turn, so this room is one whose anchor may
+        // still be waiting on a turn that is running right now — the one thing
+        // the driver's startup sweep may not assume otherwise about a room it
+        // finds (see `Inner::note_room_spawned_here`). Written ahead of the
+        // transaction because a record that landed after it would leave a
+        // window in which the row is enumerable and unrecorded, which is the
+        // whole hazard; a refused spawn just leaves an id naming nothing.
+        self.note_room_spawned_here(&space_id);
         let title = match db::spawn_subspace_tx(&conn, &plan).await? {
             Ok(title) => title,
             Err(refusal) => return Err(AppError::SpawnRefused { refusal }),

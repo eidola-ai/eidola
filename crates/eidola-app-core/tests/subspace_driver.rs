@@ -26,8 +26,8 @@ use chat_harness::{ChatBehavior, MockConfig, MockServer, flat_messages};
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AppCore, DelegationEnd, DelegationFailure, ExpectedScope, MAX_ATTEMPTS_PER_TAIL,
-    MAX_DELEGATION_TURNS, NewParticipant, NotificationPlan, ParticipantUpdate, PostNode,
-    SpawnedSubspace,
+    MAX_CONCURRENT_WALKS, MAX_DELEGATION_TURNS, NewParticipant, NotificationPlan,
+    ParticipantUpdate, PostNode, SpawnedSubspace,
 };
 
 /// These turns run over an `openai` backend, so none of them needs a
@@ -924,6 +924,110 @@ fn a_grace_arriving_mid_walk_still_ends_the_wait() {
             "and it is no longer waiting on anything"
         );
         assert_eq!(out.space.parent_action_id.as_deref(), Some(asked.as_str()));
+    });
+}
+
+/// **The startup sweep does not claim a room this process opened.** Its whole
+/// licence to stop waiting is that no turn which could answer these rooms'
+/// anchors is still running — true of rooms an earlier run left behind, whose
+/// turns died with it, and false of a room *this* process spawned, because a
+/// spawn happens inside its owner's turn. Claiming it there reports against the
+/// anchor while the owner's answer is still on its way, and the corrective
+/// signal cannot take it back: the merge is strongest-wins, correctly.
+#[test]
+fn a_sweep_does_not_claim_a_room_this_process_opened() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        // Opened from a post its owner has not answered — the state every
+        // spawn is in until the turn it happened inside persists its answer.
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+
+        // The driver starts *after* the spawn, so the sweep's enumeration finds
+        // this room. It is still this process's room, and the owner's turn is
+        // still the thing being waited for.
+        core.start_subspace_driver();
+        settle(&core);
+        assert!(
+            report(&core, &parent).is_none(),
+            "the sweep armed it as an ordinary signal, so it holds out for the \
+             owner's answer instead of planting the report against the anchor"
+        );
+        assert_eq!(
+            core.test_rooms_awaiting(parent.clone()),
+            vec![out.space.id.clone()],
+            "and it is registered against its parent, waiting"
+        );
+
+        // The owner's turn lands, and the report goes where it always belonged.
+        let answer = ask(&core, &parent, &owner, &asked);
+        wait_until(&core, || report(&core, &parent).is_some());
+        assert_eq!(
+            report(&core, &parent)
+                .expect("the delegation is reported")
+                .parent_action_id
+                .as_deref(),
+            Some(answer.as_str()),
+            "beneath the answer, not beside it"
+        );
+    });
+}
+
+/// **A backlog arrives as a trickle, not a stampede.** Arming is per room and
+/// the registry only stops one room being walked twice — so a start that finds
+/// a previous run's rooms outstanding put every walk on the runtime at once,
+/// each of them a chain of billed turns. The bound is on execution and nothing
+/// else: a room whose turn has not come keeps its registry entry, so arms still
+/// merge into it.
+#[test]
+fn no_more_than_the_bound_of_rooms_is_walked_at_once() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+
+        // Every walk stops at its first read and stays there, which is what
+        // makes "in flight" countable: one handle arrives per walk that ran.
+        let mut window = core.test_open_entry_window();
+        core.start_subspace_driver();
+        let rooms: Vec<String> = (0..MAX_CONCURRENT_WALKS + 2)
+            .map(|_| spawn(&core, &parent, &owner, vec![helper.clone()]).space.id)
+            .collect();
+        assert!(rooms.len() > MAX_CONCURRENT_WALKS);
+
+        let mut held = Vec::new();
+        for n in 0..MAX_CONCURRENT_WALKS {
+            held.push(
+                core.runtime()
+                    .block_on(window.recv())
+                    .unwrap_or_else(|| panic!("walk {n} runs")),
+            );
+        }
+        // And no more, while those hold the permits.
+        assert!(
+            core.runtime()
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_millis(400), window.recv()).await
+                })
+                .is_err(),
+            "a room past the bound waits its turn rather than starting"
+        );
+
+        // Letting one go admits exactly one more — the queue drains, it does
+        // not stall.
+        held.remove(0).send(()).expect("a walk resumes");
+        assert!(
+            core.runtime()
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(2), window.recv()).await
+                })
+                .expect("the next walk starts once a permit is free")
+                .is_some()
+        );
     });
 }
 

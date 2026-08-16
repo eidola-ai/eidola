@@ -1995,6 +1995,7 @@ fn an_unattended_space_change_arriving_mid_operation_is_replayed(cx: &mut TestAp
             &stores,
             Some(Change::Space(posted.space_id.clone())),
             ChangeOrigin::Unattended,
+            core.change_seq(),
             cx,
         )
     });
@@ -2011,13 +2012,14 @@ fn an_unattended_space_change_arriving_mid_operation_is_replayed(cx: &mut TestAp
     });
 }
 
-/// **And an own write buys no redundant re-read.** Every post raises
-/// `Change::Space`, and almost all of them are the busy operation's own — its
-/// exit reload already covers those, so recording them would cost a whole-tree
-/// re-read at the end of every turn to close a window only a write from
-/// somewhere else can open.
+/// **And a caller-origin write is not dropped for being somebody's.**
+/// `ChangeOrigin::Caller` says a call is outstanding, never that the call is
+/// *this* entity's — so another window's write into the conversation this one
+/// is streaming in was dropped as though some read of ours contained it, and
+/// nothing did. Archiving from the Library is the live case (that write
+/// announces the room it closed); a post is what makes the loss observable.
 #[gpui::test]
-fn a_caller_space_change_arriving_mid_operation_is_dropped(cx: &mut TestAppContext) {
+fn a_caller_space_change_from_another_window_is_replayed(cx: &mut TestAppContext) {
     let (stores, _dir) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
@@ -2039,20 +2041,79 @@ fn a_caller_space_change_arriving_mid_operation_is_dropped(cx: &mut TestAppConte
             Some(posted.space_id.clone()),
         ))
         .expect("a second post");
+    // Announced the way another window's write is: a caller is waiting on it,
+    // and it is nothing this entity has read.
     cx.update(|cx| {
         stores::dispatch_change_for_test(&stores, Some(Change::Space(posted.space_id.clone())), cx)
     });
     cx.run_until_parked();
-
-    // The operation settles with no debt outstanding: the reload that lands is
-    // the operation's own, not one this signal bought.
-    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
-    cx.run_until_parked();
     assert_eq!(
         count(cx),
         1,
-        "a caller-origin change is contained by the operation's own exit reload"
+        "the busy gate still holds the reload off while the operation runs"
     );
+
+    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    wait_until(
+        cx,
+        "the deferred write is replayed once the space settles",
+        |cx| count(cx) == 2,
+    );
+}
+
+/// **And an own write still buys no redundant re-read.** Every post raises
+/// `Change::Space`, and almost all of them are the busy operation's own — its
+/// exit reload covers those, and the entity can now say so exactly: a write
+/// announced below the mark that reload was taken at had already committed when
+/// it began. Discharging by comparison rather than by re-reading is what keeps
+/// the property the ownership test was protecting, without its false premise.
+#[gpui::test]
+fn a_caller_space_change_the_read_already_covers_costs_no_re_read(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    let posted = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("post");
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(posted.space_id.clone(), cx));
+
+    let count = |cx: &mut TestAppContext| space.read_with(cx, |s, _| s.messages().len());
+    wait_until(cx, "the transcript loads", |cx| count(cx) == 1);
+
+    // A write from before that read: its announcement is numbered below the
+    // mark the load took, which is what "already on screen" means here.
+    space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+    core.runtime()
+        .block_on(core.post(
+            "And the moon is nobody's.".into(),
+            Some(posted.space_id.clone()),
+        ))
+        .expect("a second post");
+    cx.update(|cx| {
+        stores::dispatch_change_event_for_test(
+            &stores,
+            Some(Change::Space(posted.space_id.clone())),
+            ChangeOrigin::Caller,
+            1,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+
+    // Asked of the settle itself: a replay issues the read synchronously, so
+    // an empty load slot the instant the operation clears is the observable
+    // that no re-read was bought (a count taken here would also read 1 while
+    // one was merely in flight).
+    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    assert!(
+        space.read_with(cx, |s, _| !s.has_pending_load_for_test()),
+        "a change the entity's own read already contained is discharged silently"
+    );
+    cx.run_until_parked();
+    assert_eq!(count(cx), 1, "and nothing re-read it afterwards either");
 }
 
 /// A ⌘N space's row commits behind its window, and the very first Send must

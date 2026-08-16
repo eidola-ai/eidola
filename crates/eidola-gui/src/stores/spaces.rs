@@ -578,11 +578,19 @@ impl SpacesStore {
     /// space's id. The indexes are re-fetched lazily per rendered post, so
     /// this costs a query per *visible* post at most.
     ///
-    /// `origin` says whether a caller is waiting on the write, and it reaches
-    /// the entity untouched: the entity is the only thing that knows whether it
-    /// is busy, and therefore the only thing that can decide what to do about
-    /// a write that arrived while it was.
-    pub fn notify_space_changed(&mut self, id: &str, origin: ChangeOrigin, cx: &mut Context<Self>) {
+    /// `origin` says whether a caller is waiting on the write and `seq` says
+    /// where it falls in this process's stream of durable writes; both reach
+    /// the entity untouched, because the entity is the only thing that knows
+    /// whether it is busy and what its own last read covered — and therefore
+    /// the only thing that can decide what to do about a write that arrived
+    /// while it was.
+    pub fn notify_space_changed(
+        &mut self,
+        id: &str,
+        origin: ChangeOrigin,
+        seq: u64,
+        cx: &mut Context<Self>,
+    ) {
         for entity in self.live_spaces() {
             entity.update(cx, |space, cx| space.invalidate_incoming_references(cx));
         }
@@ -594,7 +602,7 @@ impl SpacesStore {
                 // written in the space that ran them), so only the changed
                 // space drops its index.
                 space.invalidate_traces(cx);
-                space.on_space_changed(id, origin, cx);
+                space.on_space_changed(id, origin, seq, cx);
             });
         }
     }
